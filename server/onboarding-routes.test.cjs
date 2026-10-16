@@ -60,42 +60,27 @@ async function request(url, { method = 'GET', headers = {}, body = '' } = {}) {
 
 let admin, member;
 function headers(session) { return { cookie: session.cookie, origin: 'http://localhost', 'x-csrf-token': session.csrf, 'content-type': 'application/json' }; }
-function session(response) {
-  const body = JSON.parse(response.text);
-  return { user: body.user, csrf: body.csrfToken, cookie: response.headers['Set-Cookie'].map(c => c.split(';')[0]).join('; ') };
-}
-test.before(async () => {
-  const r = await request('/api/setup/complete', { method: 'POST', headers: { origin: 'http://localhost' }, body: JSON.stringify({ setupCode: fs.readFileSync(path.join(testDataDir, 'first-run-setup-code'), 'utf8').trim(), publicOrigin: 'http://localhost', username: 'owner', password: 'synthetic onboarding password', diaryEnabled: true }) });
-  assert.equal(r.status, 201); admin = session(r);
-  const invite = await request('/api/admin/invitations', { method: 'POST', headers: headers(admin), body: JSON.stringify({ role: 'member' }) });
-  assert.equal(invite.status, 201);
-  const joined = await request('/api/auth/invitations/accept', { method: 'POST', headers: { origin: 'http://localhost' }, body: JSON.stringify({ token: JSON.parse(invite.text).token, username: 'member', password: 'synthetic onboarding password', diaryEnabled: false }) });
-  assert.equal(joined.status, 201); member = session(joined);
+test.before(() => {
+  // Sign-in, invitations and completing onboarding are the Rust front's (#1071): an owner and an
+  // invited member who has not finished onboarding are seeded directly.
+  const { seedAccount } = require('../tests/server/seed-account.cjs');
+  admin = seedAccount(testDataDir, { username: 'owner', diaryEnabled: true, onboarded: false, publicOrigin: 'http://localhost' });
+  member = seedAccount(testDataDir, { username: 'member', role: 'member', onboarded: false });
 });
-test('invited member can finish only its own onboarding, with CSRF required', async () => {
-  assert.equal(member.user.onboarded, false);
-  assert.equal((await request('/api/profile/onboarding', { method: 'POST', headers: { cookie: member.cookie, origin: 'http://localhost' }, body: '{}' })).status, 403);
-  const done = await request('/api/profile/onboarding', { method: 'POST', headers: headers(member), body: JSON.stringify({ userId: admin.user.id, diaryEnabled: true }) });
-  assert.equal(done.status, 200);
-  const me = JSON.parse((await request('/api/auth/session', { headers: headers(member) })).text).user;
-  assert.equal(me.onboarded, true); assert.equal(me.diaryEnabled, false);
-  const owner = JSON.parse((await request('/api/auth/session', { headers: headers(admin) })).text).user;
-  assert.equal(owner.onboarded, false); assert.equal(owner.diaryEnabled, true);
-});
-test('onboarding does not grant members administrator or global model access', async () => {
-  for (const url of ['/api/admin/users', '/api/admin/invitations', '/api/models/download', '/api/models/preset/suggest?model=synthetic', '/api/models/calibration', '/api/models/calibration/cancel', '/api/models/presets/reload', '/api/model-manager/sections', '/api/model-manager/backends/cowork-llama-1/logs']) {
-    const method = url === '/api/admin/users' || url.startsWith('/api/models/preset/suggest') || url.endsWith('/logs') ? 'GET' : 'POST';
+test('a member who has not finished onboarding gets no administrator or global model access', async () => {
+  for (const url of ['/api/admin/features', '/api/models/download', '/api/models/preset/suggest?model=synthetic', '/api/models/calibration', '/api/models/calibration/cancel', '/api/models/presets/reload', '/api/model-manager/sections', '/api/model-manager/backends/cowork-llama-1/logs']) {
+    const method = url === '/api/admin/features' || url.startsWith('/api/models/preset/suggest') || url.endsWith('/logs') ? 'GET' : 'POST';
     assert.equal((await request(url, { method, headers: headers(member), body: method === 'POST' ? '{}' : '' })).status, 403, url);
   }
   assert.equal((await request('/api/providers', { method: 'POST', headers: headers(member), body: JSON.stringify({ label: 'Forbidden shared', baseUrl: 'https://example.test', shared: true }) })).status, 403);
 });
-test('member diary and storage choices stay within the authenticated account', async () => {
-  const r = await request('/api/profile/features', { method: 'PUT', headers: headers(member), body: JSON.stringify({ userId: admin.user.id, diaryEnabled: false }) });
-  assert.equal(r.status, 200);
-  const owner = JSON.parse((await request('/api/auth/session', { headers: headers(admin) })).text).user;
-  assert.equal(owner.diaryEnabled, true);
-  const saved = await request('/api/integrations/storage', { method: 'PUT', headers: headers(member), body: JSON.stringify({ kind: 'local', corpusRoot: 'synthetic-member-only', userId: admin.user.id }) });
+test('a member\'s storage choice stays within the authenticated account', async () => {
+  const saved = await request('/api/integrations/storage', { method: 'PUT', headers: headers(member), body: JSON.stringify({ kind: 'local', corpusRoot: 'synthetic-member-only', userId: admin.id }) });
   assert.equal(saved.status, 200);
-  const storage = JSON.parse((await request('/api/integrations/storage', { headers: headers(admin) })).text);
-  assert.notEqual(storage.corpusRoot, 'synthetic-member-only');
+  // GET /api/integrations/storage is the Rust front's (#1071): the saved rows are read directly.
+  const db = new (require('better-sqlite3'))(path.join(testDataDir, 'cowork.db'), { readonly: true });
+  try {
+    assert.equal(db.prepare('SELECT corpus_root FROM storage_connections WHERE user_id=?').get(member.id)?.corpus_root, 'synthetic-member-only');
+    assert.notEqual(db.prepare('SELECT corpus_root FROM storage_connections WHERE user_id=?').get(admin.id)?.corpus_root, 'synthetic-member-only');
+  } finally { db.close(); }
 });

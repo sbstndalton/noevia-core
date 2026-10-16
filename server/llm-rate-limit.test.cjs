@@ -61,20 +61,8 @@ let cookie = '';
 let csrf = '';
 
 test.before(async () => {
-  const setupCode = fs.readFileSync(path.join(testDataDir, 'first-run-setup-code'), 'utf8').trim();
-  const setup = await request('/api/setup/complete', {
-    method: 'POST', headers: { origin: 'http://localhost' },
-    body: JSON.stringify({ setupCode, publicOrigin: 'http://localhost', username: 'admin', displayName: 'Admin', password: 'correct horse battery staple' }),
-  });
-  assert.equal(setup.status, 201);
-  const login = await request('/api/auth/login/password', {
-    method: 'POST', headers: { origin: 'http://localhost' },
-    body: JSON.stringify({ username: 'admin', password: 'correct horse battery staple' }),
-  });
-  const setCookies = login.headers['set-cookie'] || login.headers['Set-Cookie'] || [];
-  cookie = setCookies.map((c) => c.split(';')[0]).join('; ');
-  const csrfPair = setCookies.map((c) => c.split(';')[0]).find((c) => c.startsWith('cowork_csrf='));
-  csrf = decodeURIComponent(csrfPair.split('=').slice(1).join('='));
+  // Sign-in is the Rust front's (#1071): the account and its session are seeded directly.
+  ({ cookie, csrf } = require('../tests/server/seed-account.cjs').seedAccount(testDataDir, { username: 'admin', displayName: 'Admin', publicOrigin: 'http://localhost' }));
 });
 
 const mutationHeaders = () => ({ origin: 'http://localhost', cookie, 'content-type': 'application/json', 'x-csrf-token': csrf });
@@ -104,19 +92,8 @@ test('other routes are unaffected by the LLM throttle', async () => {
 });
 
 test('the throttle bucket is per user, not global', async () => {
-  // Spin up a second user through an invitation: their bucket must be empty.
-  const adminAuth = { authorization: 'Bearer test-cowork-token', origin: 'http://localhost' };
-  const invite = await request('/api/admin/invitations', { method: 'POST', headers: { ...adminAuth, 'content-type': 'application/json' }, body: JSON.stringify({ role: 'member' }) });
-  assert.equal(invite.status, 201);
-  const { token } = JSON.parse(invite.text);
-  const accepted = await request('/api/auth/invitations/accept', {
-    method: 'POST', headers: { origin: 'http://localhost' },
-    body: JSON.stringify({ token, username: 'member', displayName: 'Member', password: 'grumpy engineers count beans' }),
-  });
-  assert.equal(accepted.status, 201);
-  const cookies = accepted.headers['Set-Cookie'].map((c) => c.split(';')[0]);
-  const memberCookie = cookies.filter((c) => c.startsWith('cowork_session=') || c.startsWith('cowork_csrf=')).join('; ');
-  const memberCsrf = JSON.parse(accepted.text).csrfToken;
+  // A second, signed-in user (seeded: sign-in is the Rust front's, #1071): their bucket must be empty.
+  const { cookie: memberCookie, csrf: memberCsrf } = require('../tests/server/seed-account.cjs').seedAccount(testDataDir, { username: 'member', displayName: 'Member', role: 'member' });
 
   const response = await request('/api/chat', {
     method: 'POST',

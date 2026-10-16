@@ -1,10 +1,11 @@
 'use strict';
-// rust-auth.cjs on a stand-in database (no native modules): which statements the guard refuses
-// while NOEVIA_RUST_AUTH is on, that reads and exempt writers still run, and that the switch needs
-// NOEVIA_FRONT=rust. auth-rust-mode.test.cjs covers the same on createAuth's real database.
+// rust-auth.cjs on a stand-in database (no native modules): which statements the guard refuses,
+// that reads and exempt writers still run, that the guard is unconditional (sbstndalton/noevia#1071:
+// no switch, no environment), and which sign-in and account routes Node refuses as the Rust front's.
+// auth-rust-mode.test.cjs covers the same on createAuth's real database and the real router.
 const assert = require('node:assert/strict');
 const test = require('node:test');
-const { createRustAuthGuard, enabledFrom, writeTarget, writeTargets, OWNED_TABLES, FRONT_SETTING_KEYS } = require('./rust-auth.cjs');
+const { createRustAuthGuard, ownedRoute, refuseOwned, OWNED_ROUTES, ROUTE_REFUSAL, writeTarget, writeTargets, OWNED_TABLES, FRONT_SETTING_KEYS } = require('./rust-auth.cjs');
 
 function fakeDb() {
   const ran = [];
@@ -23,26 +24,72 @@ function fakeDb() {
   return { ran, prepare: (sql) => stmt(sql), exec: (sql) => { ran.push(['exec', sql, []]); } };
 }
 
-const on = () => createRustAuthGuard({ enabled: true });
+const on = () => createRustAuthGuard();
 
-test('the switch needs NOEVIA_RUST_AUTH=1 and NOEVIA_FRONT=rust', () => {
-  const warned = [];
-  const warn = (m) => warned.push(m);
-  assert.equal(enabledFrom({ NOEVIA_RUST_AUTH: '1', NOEVIA_FRONT: 'rust', NOEVIA_RUST_AUTH_CONFIRMED: '1' }, warn), true);
-  for (const env of [{}, { NOEVIA_RUST_AUTH: 'true', NOEVIA_FRONT: 'rust', NOEVIA_RUST_AUTH_CONFIRMED: '1' }, { NOEVIA_RUST_AUTH: ' 1', NOEVIA_FRONT: 'rust', NOEVIA_RUST_AUTH_CONFIRMED: '1' }, { NOEVIA_FRONT: 'rust', NOEVIA_RUST_AUTH_CONFIRMED: '1' }]) {
-    assert.equal(enabledFrom(env, warn), false, JSON.stringify(env));
+test('#1071: the guard is unconditional: no option or environment turns it off', () => {
+  const saved = { ...process.env };
+  try {
+    for (const env of [{}, { NOEVIA_RUST_AUTH: '0' }, { NOEVIA_RUST_AUTH: '1', NOEVIA_FRONT: 'node' }, { NOEVIA_RUST_AUTH_CONFIRMED: '' }]) {
+      for (const k of ['NOEVIA_RUST_AUTH', 'NOEVIA_RUST_AUTH_CONFIRMED', 'NOEVIA_FRONT']) delete process.env[k];
+      Object.assign(process.env, env);
+      for (const guard of [createRustAuthGuard(), createRustAuthGuard({ enabled: false })]) {
+        assert.equal(guard.enabled, true, JSON.stringify(env));
+        const raw = fakeDb();
+        const original = raw.prepare;
+        const db = guard.install(raw);
+        assert.notEqual(db.prepare, original, 'installed');
+        assert.throws(() => db.prepare('DELETE FROM sessions').run(), (e) => e.code === 'RUST_AUTH_OWNED' && e.status === 503);
+        assert.throws(() => db.prepare("INSERT OR REPLACE INTO settings(key,value) VALUES('public_origin',?)").run('x'), (e) => e.code === 'RUST_AUTH_OWNED');
+      }
+    }
+  } finally { for (const k of Object.keys(process.env)) if (!(k in saved)) delete process.env[k]; Object.assign(process.env, saved); }
+  // No source decides it from the environment any more: the switch, its confirmation and the
+  // front selector are not read by the guard or by index.cjs to build it.
+  const fs = require('node:fs'); const path = require('node:path');
+  const src = fs.readFileSync(path.join(__dirname, 'rust-auth.cjs'), 'utf8').replace(/^\s*\/\/.*$/gm, '');
+  assert.doesNotMatch(src, /process\.env|NOEVIA_RUST_AUTH|NOEVIA_FRONT/);
+  assert.equal(require('./rust-auth.cjs').enabledFrom, undefined);
+  const index = fs.readFileSync(path.join(__dirname, 'index.cjs'), 'utf8');
+  assert.match(index, /createRustAuthGuard\(\)/);
+  assert.doesNotMatch(index.replace(/^\s*\/\/.*$/gm, ''), /NOEVIA_RUST_AUTH/);
+});
+
+// noevia-rs contracts/http/routes.toml, the owner = "rust" sign-in and account entries with the
+// methods Rust answers (a method not listed stays Node's).
+const RUST_ROUTES = [
+  ['/api/account/instructions', null], ['/api/account/memory', null], ['/api/account/preferences', null],
+  ['/api/admin/invitations', ['POST']], ['/api/admin/users', ['GET']], ['/api/admin/users/u1/disabled', ['PUT']], ['/api/admin/users/u1/recovery', ['POST']],
+  ['/api/auth/device/approve', null], ['/api/auth/device/code', null], ['/api/auth/device/token', null], ['/api/auth/device/lookup', null],
+  ['/api/auth/devices', null], ['/api/auth/devices/g1', null], ['/api/auth/invitations/accept', ['POST']],
+  ['/api/auth/login/passkey/options', ['POST']], ['/api/auth/login/passkey/verify', ['POST']], ['/api/auth/login/password', ['POST']],
+  ['/api/auth/logout', ['POST']], ['/api/auth/passkeys/register/options', ['POST']], ['/api/auth/passkeys/register/verify', ['POST']],
+  ['/api/auth/passkeys/k1', ['DELETE', 'PATCH']], ['/api/auth/recovery/complete', ['POST']], ['/api/auth/session', ['GET']],
+  ['/api/auth/sessions/s1', ['DELETE']], ['/api/profile', ['GET', 'PATCH']], ['/api/profile/app-passwords', ['GET', 'POST']],
+  ['/api/profile/app-passwords/0123456789abcdef0123456789abcdef', ['DELETE']], ['/api/profile/appearance', null],
+  ['/api/profile/features', ['PUT']], ['/api/profile/onboarding', ['POST']], ['/api/setup/complete', ['POST']], ['/api/setup/status', ['GET']],
+];
+const METHODS = ['GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'];
+
+test('#1071: Node refuses exactly the sign-in and account routes the Rust front answers', () => {
+  assert.equal(OWNED_ROUTES.length, 23);
+  for (const [p, methods] of RUST_ROUTES) {
+    for (const m of METHODS) assert.equal(ownedRoute(m, p), methods === null || methods.includes(m), `${m} ${p}`);
   }
-  assert.equal(warned.length, 0);
-  assert.equal(enabledFrom({ NOEVIA_RUST_AUTH: '1', NOEVIA_FRONT: 'node' }, warn), false);
-  assert.equal(enabledFrom({ NOEVIA_RUST_AUTH: '1' }, warn), false);
-  assert.equal(warned.length, 2);
-  // Without the supervisor's confirmation the switch stays off and says so.
-  for (const c of [undefined, '', '0', 'true']) {
-    assert.equal(enabledFrom({ NOEVIA_RUST_AUTH: '1', NOEVIA_FRONT: 'rust', NOEVIA_RUST_AUTH_CONFIRMED: c }, warn), false, String(c));
-  }
-  assert.equal(warned.length, 6);
-  assert.match(warned[5], /NOEVIA_RUST_AUTH_CONFIRMED/);
-  assert.ok(!warned.join('').match(/[0-9a-f]{32}/), 'no values in the warning');
+  // What stays Node's: account deletion, Settings -> Web address and Sharing, the Diary connectors,
+  // retention, the feature switches, the device approval page, and look-alike paths.
+  for (const [m, p] of [
+    ['DELETE', '/api/admin/users/u1'], ['GET', '/api/admin/web-address'], ['POST', '/api/admin/web-address'], ['POST', '/api/admin/secrets/rotate'],
+    ['GET', '/api/admin/features'], ['GET', '/api/profile/sharing'], ['PUT', '/api/profile/sharing'], ['GET', '/api/profile/diary-connectors'],
+    ['GET', '/api/account/retention'], ['PUT', '/api/account/retention'], ['GET', '/device'], ['GET', '/api/auth/sessionx'], ['GET', '/api/profile/'],
+    ['GET', '/api/auth/session/x'], ['DELETE', '/api/auth/passkeys/a/b'], ['GET', '/api/workspace'], ['GET', '/api/auth/status'],
+  ]) assert.equal(ownedRoute(m, p), false, `${m} ${p}`);
+  const sent = [];
+  const json = (_res, status, body) => sent.push({ status, body });
+  assert.equal(refuseOwned({ method: 'POST' }, {}, '/api/auth/login/password', json), true);
+  assert.deepEqual(sent.pop(), { status: 503, body: ROUTE_REFUSAL });
+  assert.deepEqual(ROUTE_REFUSAL, { error: 'Sign-in and the account are owned by the Rust front.', code: 'RUST_AUTH_OWNED' });
+  assert.equal(refuseOwned({ method: 'GET' }, {}, '/api/workspace', json), false);
+  assert.equal(sent.length, 0);
 });
 
 test('write targets are read off the statement', () => {
@@ -101,16 +148,6 @@ test('exempt writers run, and only inside exempt()', () => {
   // Nested and throwing exemptions restore the guard.
   assert.throws(() => guard.exempt(() => guard.exempt(() => { throw new Error('boom'); })), /boom/);
   assert.throws(() => del.run('u'), (e) => e.code === 'RUST_AUTH_OWNED');
-});
-
-test('off, nothing changes', () => {
-  const guard = createRustAuthGuard({ enabled: false });
-  const raw = fakeDb();
-  const db = guard.install(raw);
-  assert.equal(db.prepare, raw.prepare);
-  db.prepare('DELETE FROM sessions').run();
-  db.prepare("INSERT OR REPLACE INTO settings(key,value) VALUES('public_origin',?)").run('x');
-  assert.equal(db.ran.length, 2);
 });
 
 test('write detection: CTE writes, schema-qualified and quoted names, REPLACE/UPSERT, multi-target', () => {
@@ -172,7 +209,7 @@ test('#1071: under native auth the front\'s setting keys are refused in real SQL
     const db = new Database(':memory:');
     try {
       db.exec(`CREATE TABLE settings(key TEXT PRIMARY KEY,value); INSERT INTO settings VALUES('${key}','before'),('synthetic_node_key','medium')`);
-      const guard = createRustAuthGuard({ enabled: true });
+      const guard = createRustAuthGuard();
       guard.install(db);
       db.prepare('INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)').run('synthetic_node_key', 'high');
       db.prepare("INSERT OR REPLACE INTO settings(key,value) VALUES('synthetic_node_key',?)").run('low');
@@ -206,7 +243,7 @@ test('quoted identifiers are detected without treating string/comment payloads a
   const db = new Database(':memory:');
   try {
     db.exec("CREATE TABLE users(id TEXT);CREATE TABLE audit_events(detail TEXT);INSERT INTO users VALUES('synthetic')");
-    createRustAuthGuard({enabled:true}).install(db);
+    createRustAuthGuard().install(db);
     assert.throws(() => db.prepare("DELETE FROM 'users'").run(),{code:'RUST_AUTH_OWNED'});
     assert.throws(() => db.exec("SELECT '--'; DELETE FROM 'main'.'users'"),{code:'RUST_AUTH_OWNED'});
     for (const sql of [
@@ -229,7 +266,7 @@ test('auth settings guard refuses unproven writes and retains actual SQLite bind
   const db = new Database(':memory:');
   try {
     db.exec("CREATE TABLE settings(key TEXT PRIMARY KEY,value); INSERT INTO settings VALUES('public_origin','before'),('synthetic_node_key','medium')");
-    const guard = createRustAuthGuard({ enabled: true }); guard.install(db);
+    const guard = createRustAuthGuard(); guard.install(db);
     const before = () => db.prepare('SELECT key,value FROM settings ORDER BY key').all();
     const original = before();
     const attempts = [
@@ -276,21 +313,21 @@ test('auth settings guard refuses unproven writes and retains actual SQLite bind
   } finally { db.close(); }
 });
 
-test('settings: without native auth nothing is guarded; with it the front\'s keys stay refused inside exempt()', () => {
+test('settings: an old "off" option guards anyway, and the front\'s keys stay refused inside exempt()', () => {
   const Database = require('better-sqlite3');
   const db = new Database(':memory:');
   try {
     db.exec("CREATE TABLE settings(key TEXT PRIMARY KEY,value);INSERT INTO settings VALUES('public_origin','before'),('auto_sampling_presets_enabled','true')");
     createRustAuthGuard({ enabled: false }).install(db);
-    db.prepare('UPDATE settings SET value=? WHERE key=?').run('after','public_origin');
-    db.prepare('INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)').bind('public_origin','bound').run();
-    db.prepare('INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)').bind('auto_sampling_presets_enabled','false').run();
-    assert.equal(db.prepare("SELECT value FROM settings WHERE key='public_origin'").get().value,'bound');
+    assert.throws(() => db.prepare('UPDATE settings SET value=? WHERE key=?').run('after','public_origin'), { code: 'RUST_AUTH_OWNED' });
+    assert.throws(() => db.prepare('INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)').bind('public_origin','bound').run(), { code: 'RUST_AUTH_OWNED' });
+    assert.throws(() => db.prepare('INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)').bind('auto_sampling_presets_enabled','false').run(), { code: 'RUST_SAMPLING_SETTINGS_OWNED' });
+    assert.equal(db.prepare("SELECT value FROM settings WHERE key='public_origin'").get().value,'before');
   } finally { db.close(); }
   const guarded = new Database(':memory:');
   try {
     guarded.exec("CREATE TABLE settings(key TEXT PRIMARY KEY,value);INSERT INTO settings VALUES('auto_sampling_presets_enabled','true')");
-    const guard = createRustAuthGuard({ enabled: true }); guard.install(guarded);
+    const guard = createRustAuthGuard(); guard.install(guarded);
     assert.throws(() => guard.exempt(() => guarded.prepare('INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)').bind('auto_sampling_presets_enabled','false').run()),{code:'RUST_SAMPLING_SETTINGS_OWNED'});
     assert.equal(guarded.prepare('SELECT value FROM settings').get().value,'true');
   } finally { guarded.close(); }

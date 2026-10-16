@@ -52,26 +52,13 @@ async function request(url, { method = 'GET', headers = {}, body = '' } = {}) {
   return { status: res.statusCode, headers: responseHeaders, text: Buffer.concat(chunks).toString('utf8'), bytes: Buffer.concat(chunks) };
 }
 
+const { seedAccount, setUserFeatures } = require('../tests/server/seed-account.cjs');
 let cookie = '';
 let csrf = '';
-test.before(async () => {
-  const setupCode = fs.readFileSync(path.join(testDataDir, 'first-run-setup-code'), 'utf8').trim();
-  const setup = await request('/api/setup/complete', {
-    method: 'POST', headers: { origin: 'http://localhost' },
-    body: JSON.stringify({ setupCode, publicOrigin: 'http://localhost', username: 'admin', displayName: 'Admin', password: 'correct horse battery staple' }),
-  });
-  assert.equal(setup.status, 201);
-  const login = await request('/api/auth/login/password', {
-    method: 'POST', headers: { origin: 'http://localhost' },
-    body: JSON.stringify({ username: 'admin', password: 'correct horse battery staple' }),
-  });
-  assert.equal(login.status, 200);
-  const setCookies = login.headers['set-cookie'] || login.headers['Set-Cookie'] || [];
-  cookie = setCookies.map((c) => c.split(';')[0]).join('; ');
-  assert.ok(cookie, 'login must set a session cookie');
-  const csrfPair = setCookies.map((c) => c.split(';')[0]).find((c) => c.startsWith('cowork_csrf='));
-  assert.ok(csrfPair, 'login must set the CSRF cookie');
-  csrf = decodeURIComponent(csrfPair.split('=').slice(1).join('='));
+let adminId = '';
+test.before(() => {
+  // Sign-in is the Rust front's (#1071): the account and its session are seeded directly.
+  ({ cookie, csrf, id: adminId } = seedAccount(testDataDir, { username: 'admin', displayName: 'Admin', publicOrigin: 'http://localhost' }));
 });
 
 const mutationHeaders = () => ({ origin: 'http://localhost', cookie, 'content-type': 'application/json', 'x-csrf-token': csrf });
@@ -130,14 +117,7 @@ test('document originals and pages are inaccessible to another authenticated use
     assert.equal((await request(docUrl(otherProject.id, kind), { headers: { cookie } })).status, 404);
     assert.equal((await request(docUrl(p.id, kind))).status, 401);
   }
-  const invite = await post('/api/admin/invitations', { role: 'member' });
-  assert.equal(invite.status, 201);
-  const body = JSON.parse(invite.text);
-  const accepted = await post('/api/auth/invitations/accept', { token: body.token, username: 'reader', displayName: 'Reader', password: 'correct horse battery staple', diaryEnabled: false }, { origin: 'http://localhost', 'content-type': 'application/json' });
-  assert.equal(accepted.status, 201);
-  const login = await post('/api/auth/login/password', { username: 'reader', password: 'correct horse battery staple' }, { origin: 'http://localhost', 'content-type': 'application/json' });
-  assert.equal(login.status, 200);
-  const otherCookie = (login.headers['set-cookie'] || login.headers['Set-Cookie'] || []).map(c => c.split(';')[0]).join('; ');
+  const otherCookie = seedAccount(testDataDir, { username: 'reader', displayName: 'Reader', role: 'member' }).cookie;
   for (const kind of ['original', 'pages']) {
     assert.equal((await request(docUrl(p.id, kind), { headers: { cookie: otherCookie } })).status, 404);
   }
@@ -198,7 +178,7 @@ test('unified uploads accept DOCX, preserve opaque bytes, protect metadata and e
 });
 
 test('diary extras are lazy, private to the tenant, and hidden from ordinary projects', async () => {
-  await request('/api/profile/features', { method:'PUT', headers:mutationHeaders(), body:JSON.stringify({diaryEnabled:true}) });
+  setUserFeatures(testDataDir, adminId, { diaryEnabled: true });
   assert.equal(JSON.parse((await request('/api/diary/context', {headers:{cookie}})).text).project, null);
   assert.equal((await post('/api/chat', {spaceId:'diary-extras',message:'fixture'})).status,400);
   assert.equal((await request('/api/diary/context')).status,401);
@@ -211,8 +191,7 @@ test('diary extras are lazy, private to the tenant, and hidden from ordinary pro
   const workspace = JSON.parse((await request('/api/workspace',{headers:{cookie}})).text);
   assert.ok(!workspace.projects.some(item=>item.id===p.id));
   assert.equal(JSON.parse((await post('/api/diary/context',{})).text).project.files.length,1);
-  const login = await post('/api/auth/login/password', {username:'reader',password:'correct horse battery staple'}, {origin:'http://localhost','content-type':'application/json'});
-  const otherCookie = (login.headers['set-cookie'] || login.headers['Set-Cookie'] || []).map(c=>c.split(';')[0]).join('; ');
+  const otherCookie = seedAccount(testDataDir, { username: 'reader', role: 'member' }).cookie;
   assert.equal((await request('/api/diary/context',{headers:{cookie:otherCookie}})).status,404);
   assert.equal((await request(`/api/projects/${p.id}/uploads/original?name=context.txt`,{headers:{cookie:otherCookie}})).status,404);
   assert.equal((await post('/api/chats/c-fixture/context',{})).status,200);

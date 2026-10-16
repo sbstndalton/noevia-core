@@ -19,28 +19,20 @@ delete process.env.NOEVIA_FEATURE_NATIVE_CLIENT_AUTH; // administrator-controlle
 process.env.TRUST_PROXY = 'true'; // N3: without it the feature is unavailable and cannot be switched on
 
 const ORIGIN = 'http://localhost';
-const PASSWORD = 'synthetic toggle password';
-const DEVICE_GRANT = 'urn:ietf:params:oauth:grant-type:device_code';
 const quiet = (fn) => { const warn = console.warn; console.warn = () => {}; try { return fn(); } finally { console.warn = warn; } };
 
-// Before the server starts: an account and a grant left over from when the feature was on.
-const { createAuth, createRateLimiter } = require('./auth.cjs');
-const device = require('./device-auth.cjs');
-let leftover;
+// Before the server starts: an account and a grant left over from when the feature was on. The
+// device flow and the accounts are the Rust front's (#1071): both are seeded as it writes them.
+const { createAuth } = require('./auth.cjs');
+const { seedAccount, seedDeviceToken } = require('../tests/server/seed-account.cjs');
+let admin;
 let adminId;
-test.before(async () => {
+test.before(() => {
   const auth = quiet(() => createAuth({ dataDir, publicOrigin: ORIGIN }));
-  const res = { setHeader() {} };
-  const setup = await auth.setup({ headers: { origin: ORIGIN }, socket: { remoteAddress: '127.0.0.1' } }, res,
-    { setupCode: fs.readFileSync(path.join(dataDir, 'first-run-setup-code'), 'utf8').trim(), publicOrigin: ORIGIN, username: 'toggleqa', password: PASSWORD });
-  adminId = setup.body.user.id;
-  const deviceAuth = device.createDeviceAuth({ db: auth.db, audit: auth.audit, publicUser: auth.publicUser, rate: createRateLimiter(),
-    clientAddress: () => '127.0.0.1', origin: () => ORIGIN });
-  const started = deviceAuth.start({ headers: {} }, { client_name: 'Left over' }).body;
-  deviceAuth.decide(adminId, started.user_code, true, 0); // a new account's credential epoch
-  leftover = deviceAuth.token({ headers: {} }, { grant_type: DEVICE_GRANT, device_code: started.device_code }).body;
-  assert.ok(leftover.access_token);
   auth.db.close();
+  admin = seedAccount(dataDir, { username: 'toggleqa', publicOrigin: ORIGIN });
+  adminId = admin.id;
+  seedDeviceToken(dataDir, adminId, { clientName: 'Left over' });
 });
 
 let handleRequest;
@@ -84,17 +76,13 @@ test('starting with the feature off deletes grants left from an earlier "on" per
 });
 
 test('an administrator switching the feature off revokes every device; switching it on again does not revive them', async () => {
-  const login = await request('/api/auth/login/password', { method: 'POST', headers: { origin: ORIGIN }, body: { username: 'toggleqa', password: PASSWORD } });
-  const cookies = login.headers['set-cookie'].map((c) => c.split(';')[0]);
-  const cookie = cookies.join('; ');
-  const csrf = decodeURIComponent(cookies.find((c) => c.startsWith('cowork_csrf=')).split('=').slice(1).join('='));
+  const { cookie, csrf } = admin;
   const write = (url, body, method = 'POST') => request(url, { method, body, headers: { cookie, origin: ORIGIN, 'x-csrf-token': csrf } });
 
   assert.equal((await write('/api/admin/features/nativeClientAuth', { enabled: true }, 'PUT')).status, 200);
-  const flow = (await request('/api/auth/device/code', { method: 'POST', body: { client_name: 'Toggle Mac' } })).json;
-  assert.equal((await write('/api/auth/device/approve', { user_code: flow.user_code, approve: true })).status, 200);
-  const tokens = (await request('/api/auth/device/token', { method: 'POST', body: { grant_type: DEVICE_GRANT, device_code: flow.device_code } })).json;
-  assert.equal((await request('/api/workspace', { headers: { authorization: `Bearer ${tokens.access_token}` } })).status, 200);
+  // A device signed in through the front while the feature is on.
+  const tokens = seedDeviceToken(dataDir, adminId, { clientName: 'Toggle Mac' });
+  assert.equal((await request('/api/workspace', { headers: { authorization: `Bearer ${tokens.access}` } })).status, 200);
   assert.equal(grantCount(), 1);
 
   assert.equal((await write('/api/admin/features/nativeClientAuth', { enabled: false }, 'PUT')).status, 200);
@@ -104,6 +92,5 @@ test('an administrator switching the feature off revokes every device; switching
   assert.equal(rows[1].actor_user_id, adminId, 'the administrator who switched it off is the actor');
 
   assert.equal((await write('/api/admin/features/nativeClientAuth', { enabled: true }, 'PUT')).status, 200);
-  assert.equal((await request('/api/workspace', { headers: { authorization: `Bearer ${tokens.access_token}` } })).status, 401);
-  assert.equal((await request('/api/auth/device/token', { method: 'POST', body: { grant_type: 'refresh_token', refresh_token: tokens.refresh_token } })).json.error, 'invalid_grant');
+  assert.equal((await request('/api/workspace', { headers: { authorization: `Bearer ${tokens.access}` } })).status, 401);
 });

@@ -1,7 +1,8 @@
 'use strict';
 // Settings → Assistant → Custom instructions and response style: one standing instruction for
 // every chat of this user (not the Diary, which has its own prompt). Stored per user beside
-// projects.json.
+// projects.json. The Rust front writes it (PUT /api/account/instructions, sbstndalton/noevia#1071);
+// chat.cjs reads it here.
 //
 // The style is a quick-start preset (default/concise/detailed) plus four optional advanced
 // controls (#229) and a default response language (#231). Every advanced control starts at
@@ -26,8 +27,6 @@ const ADVANCED = {
   emoji: { none: 'Do not use emoji.', some: 'An occasional emoji is fine where it fits.' },
 };
 const ADVANCED_DEFAULT = Object.freeze({ length: 'auto', tone: 'auto', formatting: 'auto', emoji: 'auto' });
-
-function readable(message, status = 400) { return Object.assign(Error(message), { publicMessage: message, status }); }
 
 function cleanAdvanced(value) {
   const out = { ...ADVANCED_DEFAULT };
@@ -58,39 +57,6 @@ function read(dir) {
   } catch { return empty(); }
 }
 
-/** `extras` fields left undefined keep what is saved, so an older client that sends only text and
- *  style never wipes the advanced controls or the language. */
-function write(dir, text, now = Date.now(), style = 'default', extras = {}) {
-  if (typeof text !== 'string') throw readable('Send the instructions as text.');
-  if (!Object.hasOwn(STYLES, style)) throw readable('Choose a response style: default, concise or detailed.');
-  const clean = text.trim();
-  if (clean.length > MAX_CHARS) throw readable(`Keep custom instructions under ${MAX_CHARS} characters.`);
-  const previous = read(dir);
-  let advanced = previous.advanced;
-  if (extras.advanced !== undefined) {
-    if (!extras.advanced || typeof extras.advanced !== 'object') throw readable('Send the advanced style as an object.');
-    for (const [key, value] of Object.entries(extras.advanced)) {
-      if (!Object.hasOwn(ADVANCED, key)) throw readable(`Unknown style control: ${key}.`);
-      if (value !== 'auto' && !Object.hasOwn(ADVANCED[key], value)) throw readable(`Choose auto, ${Object.keys(ADVANCED[key]).join(' or ')} for ${key}.`);
-    }
-    advanced = cleanAdvanced(extras.advanced);
-  }
-  let language = previous.language;
-  if (extras.language !== undefined) {
-    if (extras.language !== '' && !cleanLanguage(extras.language)) throw readable('Name the response language in a few letters, for example Norwegian.');
-    language = cleanLanguage(extras.language);
-  }
-  const file = path.join(dir, FILE);
-  const plain = !clean && style === 'default' && !language && Object.values(advanced).every((v) => v === 'auto');
-  if (plain) { fs.rmSync(file, { force: true }); return empty(); }
-  fs.mkdirSync(dir, { recursive: true });
-  const record = { text: clean, style, advanced, language, updatedAt: now };
-  const tmp = `${file}.${process.pid}.tmp`;
-  fs.writeFileSync(tmp, JSON.stringify(record), { mode: 0o600 });
-  fs.renameSync(tmp, file);
-  return record;
-}
-
 /** The lines the model sees, in order: preset, advanced controls, language, then free text.
  *  Pure, so Settings can preview exactly what is sent. */
 function styleLines(settings) {
@@ -112,4 +78,4 @@ function systemPart(textOrSettings, style = 'default') {
   return `The user's custom instructions for all chats (project instructions, and any format or language the user asks for in a message, take precedence where they conflict):\n${lines.join('\n')}`;
 }
 
-module.exports = { read, write, systemPart, styleLines, MAX_CHARS, MAX_LANGUAGE_CHARS, STYLES: Object.keys(STYLES), ADVANCED: Object.fromEntries(Object.entries(ADVANCED).map(([k, v]) => [k, ['auto', ...Object.keys(v)]])) };
+module.exports = { read, systemPart, styleLines, MAX_CHARS, MAX_LANGUAGE_CHARS, STYLES: Object.keys(STYLES), ADVANCED: Object.fromEntries(Object.entries(ADVANCED).map(([k, v]) => [k, ['auto', ...Object.keys(v)]])) };

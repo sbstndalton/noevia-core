@@ -6,9 +6,9 @@
 // its chat list (GET and POST /api/projects/{id}/chats); the third the free-chat list (GET and POST
 // /api/freechats; DELETE /api/freechats/{id} stays Node's, see "free-chats.json" below).
 //
-// The switch is NOEVIA_RUST_PROJECTS=1 (exactly) together with NOEVIA_FRONT=rust, the M3 switch
-// (NOEVIA_RUST_AUTH=1, confirmed: the front gates Rust-owned routes itself) and the supervisor's
-// NOEVIA_RUST_PROJECTS_CONFIRMED=1 (set only once the front's --features lists rust-projects).
+// The switch is NOEVIA_RUST_PROJECTS=1 (exactly) together with NOEVIA_FRONT=rust (M3, Rust-owned
+// sign-in, is permanent since sbstndalton/noevia#1071: the front gates Rust-owned routes itself)
+// and the supervisor's NOEVIA_RUST_PROJECTS_CONFIRMED=1 (set only once the front's --features lists rust-projects).
 // Anything less and the switch is ignored here (a warning is printed) and Node keeps doing
 // everything, as before. Each slice after the first is confirmed on its own, because a front that
 // lists rust-projects may predate it: the chat-list save is refused here only with
@@ -98,10 +98,6 @@ function enabledFrom(env = process.env, warn = console.warn) {
   if (env.NOEVIA_RUST_PROJECTS !== '1') return false;
   if (env.NOEVIA_FRONT !== 'rust') {
     warn('NOEVIA_RUST_PROJECTS=1 is ignored: the Rust front answers project routes only with NOEVIA_FRONT=rust.');
-    return false;
-  }
-  if (env.NOEVIA_RUST_AUTH !== '1' || env.NOEVIA_RUST_AUTH_CONFIRMED !== '1') {
-    warn('NOEVIA_RUST_PROJECTS=1 is ignored: it needs NOEVIA_RUST_AUTH=1, confirmed, because the front gates the routes it owns itself.');
     return false;
   }
   if (env.NOEVIA_RUST_PROJECTS_CONFIRMED !== '1') {

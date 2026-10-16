@@ -9,6 +9,10 @@ const temp = () => { const d = fs.mkdtempSync(path.join(os.tmpdir(), 'noevia-add
 test.after(() => { for (const d of temps) fs.rmSync(d, { recursive: true, force: true }); });
 
 const req = (origin) => ({ headers: { origin } });
+// The account tables are the Rust front's (#1071): this process's connection refuses to write them, so
+// the synthetic users and passkeys are written through a separate connection, as the front would.
+const Database = require('better-sqlite3');
+const asFront = (dir, fn) => { const db = new Database(path.join(dir, 'cowork.db')); try { return fn(db); } finally { db.close(); } };
 
 test('an admin-chosen address wins over PUBLIC_ORIGIN, survives a restart, and keeps the old one for sign-in', () => {
   const dir = temp();
@@ -87,11 +91,13 @@ test('a rename: new passkeys use the new address, old ones keep their name and t
   const dir = temp();
   const auth = createAuth({ dataDir: dir, publicOrigin: 'https://cowork.example.test' });
   const now = Date.now();
-  auth.db.prepare("INSERT INTO users(id,username,username_norm,display_name,role,password_hash,webauthn_user_id,created_at,updated_at) VALUES('u','u','u','u','admin','x','w',?,?)").run(now, now);
   const cols = auth.db.prepare('PRAGMA table_info(passkeys)').all();
   const row = Object.fromEntries(cols.filter((c) => c.notnull && c.dflt_value === null && !c.pk).map((c) => [c.name, /INT/i.test(c.type) ? 1 : c.type === 'BLOB' ? Buffer.from('k') : 'x']));
   row.id = 'cred'; row.user_id = 'u';
-  auth.db.prepare(`INSERT INTO passkeys(${Object.keys(row).join(',')}) VALUES(${Object.keys(row).map(() => '?').join(',')})`).run(...Object.values(row));
+  asFront(dir, (db) => {
+    db.prepare("INSERT INTO users(id,username,username_norm,display_name,role,password_hash,webauthn_user_id,created_at,updated_at) VALUES('u','u','u','u','admin','x','w',?,?)").run(now, now);
+    db.prepare(`INSERT INTO passkeys(${Object.keys(row).join(',')}) VALUES(${Object.keys(row).map(() => '?').join(',')})`).run(...Object.values(row));
+  });
   assert.equal(auth.changeOrigin('https://noevia.example.test', 'u'), null);
   assert.equal(auth.rpId, 'noevia.example.test', 'new passkeys are made for the new address');
   assert.equal(auth.db.prepare("SELECT rp_id FROM passkeys WHERE id='cred'").get().rp_id, 'cowork.example.test', 'the old one keeps its name');
@@ -106,25 +112,7 @@ test('a rename: new passkeys use the new address, old ones keep their name and t
   again.db.close();
 });
 
-test('sign-in uses the new address once the user has a passkey for it, the old name until then', async () => {
-  const auth = createAuth({ dataDir: temp(), publicOrigin: 'https://cowork.example.test' });
-  const now = Date.now();
-  auth.db.prepare("INSERT INTO users(id,username,username_norm,display_name,role,password_hash,webauthn_user_id,created_at,updated_at) VALUES('u','sam','sam','Sam','admin','x','w',?,?)").run(now, now);
-  const add = (id, rp) => auth.db.prepare("INSERT INTO passkeys(id,user_id,name,public_key,webauthn_user_id,counter,device_type,backed_up,transports,created_at,rp_id) VALUES(?,'u','k',?,'w',0,'singleDevice',0,'[]',?,?)").run(id, Buffer.from('k'), now, rp);
-  add('old-key', 'cowork.example.test');
-  auth.changeOrigin('https://noevia.example.test', 'u');
-  let { options } = await auth.authenticationOptions('sam');
-  assert.equal(options.rpId, 'cowork.example.test', 'only an old passkey: sign in under its name');
-  assert.ok(options.allowCredentials.some((c) => c.id === 'old-key'));
-  add('new-key', 'noevia.example.test');
-  ({ options } = await auth.authenticationOptions('sam'));
-  assert.equal(options.rpId, 'noevia.example.test');
-  assert.ok(options.allowCredentials.some((c) => c.id === 'new-key'));
-  assert.equal(options.allowCredentials.some((c) => c.id === 'old-key'), false);
-  const reg = await auth.registrationOptions('u');
-  assert.equal(reg.options.rp.id, 'noevia.example.test', 'new passkeys are made for the current address');
-  auth.db.close();
-});
+// Passkey sign-in and registration options are the Rust front's (#1071; noevia-rs crates/server-account).
 
 test('a pinned WEBAUTHN_RP_ID stops applying once the address moves to a name it does not cover', () => {
   const dir = temp();
@@ -163,8 +151,10 @@ test('an admin removes an earlier address: sign-in, related origins and the save
   assert.equal(auth.changeOrigin('https://noevia.example.test', 'u1'), null);
   assert.deepEqual(auth.previousOrigins, ['https://cowork.example.test']);
   const now = Date.now();
-  auth.db.prepare("INSERT INTO users(id,username,username_norm,display_name,role,password_hash,webauthn_user_id,created_at,updated_at) VALUES('u1','u1','u1','u1','admin','x','w',?,?)").run(now, now);
-  auth.db.prepare("INSERT INTO passkeys(id,user_id,name,public_key,webauthn_user_id,counter,device_type,backed_up,transports,created_at,rp_id) VALUES('old-key','u1','k',?,'w',0,'singleDevice',0,'[]',?,'cowork.example.test')").run(Buffer.from('k'), now);
+  asFront(dir, (db) => {
+    db.prepare("INSERT INTO users(id,username,username_norm,display_name,role,password_hash,webauthn_user_id,created_at,updated_at) VALUES('u1','u1','u1','u1','admin','x','w',?,?)").run(now, now);
+    db.prepare("INSERT INTO passkeys(id,user_id,name,public_key,webauthn_user_id,counter,device_type,backed_up,transports,created_at,rp_id) VALUES('old-key','u1','k',?,'w',0,'singleDevice',0,'[]',?,'cowork.example.test')").run(Buffer.from('k'), now);
+  });
 
   assert.equal(auth.removeEarlierOrigin('https://cowork.example.test/', 'u1').error, null, 'trailing slash is tolerated');
   const removed = auth.removeEarlierOrigin('https://cowork.example.test', 'u1');

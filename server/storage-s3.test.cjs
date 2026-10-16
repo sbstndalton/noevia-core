@@ -55,23 +55,8 @@ async function request(url, { method = 'GET', headers = {}, body = '' } = {}) {
 let cookie = '';
 let csrf = '';
 test.before(async () => {
-  const setupCode = fs.readFileSync(path.join(testDataDir, 'first-run-setup-code'), 'utf8').trim();
-  const setup = await request('/api/setup/complete', {
-    method: 'POST', headers: { origin: 'http://localhost' },
-    body: JSON.stringify({ setupCode, publicOrigin: 'http://localhost', username: 'admin', displayName: 'Admin', password: 'correct horse battery staple' }),
-  });
-  assert.equal(setup.status, 201);
-  const login = await request('/api/auth/login/password', {
-    method: 'POST', headers: { origin: 'http://localhost' },
-    body: JSON.stringify({ username: 'admin', password: 'correct horse battery staple' }),
-  });
-  assert.equal(login.status, 200);
-  const setCookies = login.headers['set-cookie'] || login.headers['Set-Cookie'] || [];
-  cookie = setCookies.map((c) => c.split(';')[0]).join('; ');
-  assert.ok(cookie, 'login must set a session cookie');
-  const csrfPair = setCookies.map((c) => c.split(';')[0]).find((c) => c.startsWith('cowork_csrf='));
-  assert.ok(csrfPair, 'login must set the CSRF cookie');
-  csrf = decodeURIComponent(csrfPair.split('=').slice(1).join('='));
+  // Sign-in is the Rust front's (#1071): the account and its session are seeded directly.
+  ({ cookie, csrf } = require('../tests/server/seed-account.cjs').seedAccount(testDataDir, { username: 'admin', displayName: 'Admin', publicOrigin: 'http://localhost' }));
 });
 
 const mutationHeaders = () => ({ origin: 'http://localhost', cookie, 'content-type': 'application/json', 'x-csrf-token': csrf });

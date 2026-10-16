@@ -419,20 +419,8 @@ test.before(async () => {
   // No model/inference endpoint: the owned DAV fixture refuses embedding POSTs with 405.
   process.env.EMBEDDING_BASE_URL = `http://127.0.0.1:${sharedDav.port}/dav`;
   ({ handleRequest } = require('./index.cjs'));
-  const setupCode = fs.readFileSync(path.join(testDataDir, 'first-run-setup-code'), 'utf8').trim();
-  const setup = await request('/api/setup/complete', {
-    method: 'POST', headers: { origin: 'http://localhost' },
-    body: JSON.stringify({ setupCode, publicOrigin: 'http://localhost', username: 'admin', displayName: 'Admin', password: 'correct horse battery staple' }),
-  });
-  assert.equal(setup.status, 201);
-  const login = await request('/api/auth/login/password', {
-    method: 'POST', headers: { origin: 'http://localhost' },
-    body: JSON.stringify({ username: 'admin', password: 'correct horse battery staple' }),
-  });
-  const setCookies = login.headers['set-cookie'] || login.headers['Set-Cookie'] || [];
-  cookie = setCookies.map((c) => c.split(';')[0]).join('; ');
-  const csrfPair = setCookies.map((c) => c.split(';')[0]).find((c) => c.startsWith('cowork_csrf='));
-  csrf = decodeURIComponent(csrfPair.split('=').slice(1).join('='));
+  // Sign-in is the Rust front's (#1071): the account and its session are seeded directly.
+  ({ cookie, csrf } = require('../tests/server/seed-account.cjs').seedAccount(testDataDir, { username: 'admin', displayName: 'Admin', publicOrigin: 'http://localhost' }));
   // Connect the fake WebDAV as the user's storage.
   const save = await request('/api/integrations/storage', {
     method: 'PUT',

@@ -13,7 +13,7 @@ const { Readable, Writable } = require('node:stream');
 // sbstndalton/noevia#1071: GET /api/integrations/storage is the Rust front's with no switch of its
 // own; the deployment below is the live one (native auth), with no storage selector at all.
 const OWNER = {
-  NOEVIA_FRONT: 'rust', NOEVIA_RUST_AUTH: '1', NOEVIA_RUST_AUTH_CONFIRMED: '1',
+  NOEVIA_FRONT: 'rust',
 };
 const digest = bytes => crypto.createHash('sha256').update(bytes).digest('hex');
 
@@ -121,8 +121,8 @@ test('M4_ENTRY/complete_original_index', { concurrency: false }, async t => {
     const { createSecretStore } = require('./secrets.cjs');
     const { createAuth } = require('./auth.cjs');
     const secrets = createSecretStore(dir);
-    // Existing genuine setup/session constructor, before index installs its native
-    // auth guard. No fake authenticate/getStorage/saveStorage implementation.
+    // The genuine auth constructor (migrations), before index installs its own. No fake
+    // authenticate/getStorage/saveStorage implementation.
     const realWarn = console.warn;
     try {
       console.warn = (...args) => {
@@ -134,16 +134,10 @@ test('M4_ENTRY/complete_original_index', { concurrency: false }, async t => {
       };
       auth = createAuth({ dataDir: dir, publicOrigin: 'http://localhost', secrets });
     } finally { console.warn = realWarn; }
-    const setupHeaders = {};
-    const setupReq = { headers: { origin: 'http://localhost' }, socket: { remoteAddress: '127.0.0.1' } };
-    const setup = await auth.setup(setupReq, { setHeader(name, value) { setupHeaders[name.toLowerCase()] = value; } }, {
-      setupCode: fs.readFileSync(path.join(dir, 'first-run-setup-code'), 'utf8').trim(),
-      username: 'synthetic-owner', displayName: 'Synthetic', password: 'synthetic owner password',
-      publicOrigin: 'http://localhost', diaryEnabled: true,
+    // First-run setup is the Rust front's (#1071): the owner and its session are seeded directly.
+    const { id, cookie } = require('../tests/server/seed-account.cjs').seedAccount(dir, {
+      username: 'synthetic-owner', displayName: 'Synthetic', diaryEnabled: true, publicOrigin: 'http://localhost',
     });
-    assert.equal(setup.status, 201, 'M4_ENTRY/real_setup');
-    const id = setup.body.user.id;
-    const cookie = setupHeaders['set-cookie'].map(value => value.split(';')[0]).join('; ');
     assert.equal(auth.authenticate(request('/api/integrations/storage', { cookie }).req)?.user.id, id, 'M4_ENTRY/valid_identity');
     // Deliberately legacy plaintext/local state: if an early refusal moves after
     // migration, actual getStorage can reseal and saveStorage can migrate it.

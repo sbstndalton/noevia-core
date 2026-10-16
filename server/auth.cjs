@@ -6,28 +6,9 @@ const net = require('net');
 const path = require('path');
 const Database = require('better-sqlite3');
 const { DEFAULT_S3_REGION, normalizeS3Region } = require('./s3-region.cjs');
-const { hash, verify, Algorithm } = require('@node-rs/argon2');
-const {
-  generateRegistrationOptions,
-  verifyRegistrationResponse,
-  generateAuthenticationOptions,
-  verifyAuthenticationResponse,
-} = require('@simplewebauthn/server');
 
-const USERNAME_RE = /^[A-Za-z0-9._-]{3,32}$/;
+// Sessions are issued by the Rust front (#1071); the gate still refuses one idle this long.
 const IDLE_MS = 7 * 24 * 60 * 60 * 1000;
-const ABSOLUTE_MS = 30 * 24 * 60 * 60 * 1000;
-const CHALLENGE_MS = 5 * 60 * 1000;
-// Allow concurrent ceremonies while bounding persistent storage from the public
-// options endpoint. At capacity, existing challenges keep their full lifetime.
-const MAX_PENDING_CHALLENGES = 4096;
-// Registration (signed-in only) has its own, separate budget, so anonymous sign-in
-// challenges filling theirs can never starve a signed-in account adding a passkey (#783).
-const MAX_PENDING_REGISTRATIONS = 256;
-// Anonymous sign-in options per client address per challenge lifetime (#783). Applied only when
-// the client address is real (trustProxy): behind a proxy without it every browser shares the
-// proxy's address, and a per-address limit would lock everyone out of passkey sign-in.
-const PASSKEY_OPTIONS_PER_ADDRESS = 30;
 
 // Client IP resolution. By default the direct socket address is used.
 // Behind a reverse proxy (a documented first-class deployment), every
@@ -130,19 +111,6 @@ function createRateLimiter({ sweepMs = 60 * 1000, maxEntries = 10000, now: clock
   };
 }
 
-// Password sign-in limits (#927), all fixed 15-minute windows.
-const LOGIN_WINDOW_MS = 15 * 60 * 1000;
-// Failed sign-ins per address and username; the next attempt is refused even with the right
-// password, so a lock can't be used as a guessing oracle. Cleared by a successful sign-in.
-const LOGIN_FAILURES_PER_ACCOUNT = 5;
-// Failed sign-ins per address, for real and unknown usernames alike (counting only unknown ones
-// would make the 401-to-429 switch reveal which usernames exist). Past 30, further failures answer
-// 429 instead of 401; a correct username and password still signs in. Past 200, a last-resort
-// ceiling refuses every password sign-in from that address before any hashing (passkeys still
-// work), which bounds the Argon2 work one address can cause.
-const LOGIN_FAILURES_BEFORE_429 = 30;
-const LOGIN_FAILURES_PER_ADDRESS = 200;
-
 /** The startup warning for a public https address with TRUST_PROXY off, or '' (#927). Only says
  *  what is wrong and what to set; no configuration values are included. */
 function trustProxyWarning(origin, trustProxy) {
@@ -193,9 +161,9 @@ function parseCookies(req) {
 }
 
 function createAuth({ dataDir, publicOrigin, rpId, legacyToken = '', legacyCompat = false, secrets = null, trustProxy = false, additionalOrigins = [], rustAuth = null }) {
-  // M3 (rust-auth.cjs): with NOEVIA_RUST_AUTH on, the Rust front writes the account tables and this
-  // process only reads them. Off (the default), nothing here changes.
-  const guard = rustAuth || require('./rust-auth.cjs').createRustAuthGuard({ enabled: false });
+  // M3 (rust-auth.cjs), permanent since sbstndalton/noevia#1071: the Rust front answers sign-in and
+  // the account and writes their tables; this process only reads them (plus the exemptions).
+  const guard = rustAuth || require('./rust-auth.cjs').createRustAuthGuard();
   fs.mkdirSync(dataDir, { recursive: true, mode: 0o700 });
   const db = new Database(path.join(dataDir, 'cowork.db'));
   db.pragma('journal_mode = WAL');
@@ -323,7 +291,6 @@ function createAuth({ dataDir, publicOrigin, rpId, legacyToken = '', legacyCompa
   if (!db.prepare('PRAGMA table_info(passkeys)').all().some((c) => c.name === 'rp_id')) db.exec('ALTER TABLE passkeys ADD COLUMN rp_id TEXT');
   db.prepare('UPDATE passkeys SET rp_id=? WHERE rp_id IS NULL').run(setting('passkey_rp_id') || relyingPartyId);
   db.prepare("DELETE FROM settings WHERE key='passkey_rp_id'").run();
-  const keyRp = (key) => key.rp_id || relyingPartyId;
   // A random, public id so noevia can tell whether a new address really reaches this server.
   if (!setting('instance_id')) db.prepare("INSERT OR IGNORE INTO settings(key,value) VALUES('instance_id',?)").run(crypto.randomUUID());
   const instanceId = setting('instance_id');
@@ -339,10 +306,9 @@ function createAuth({ dataDir, publicOrigin, rpId, legacyToken = '', legacyCompa
   for (const o of previousOrigins) trustedOrigins.add(o);
   const setupFile = path.join(dataDir, 'first-run-setup-code');
 
-  /** With the Rust front owning first-run setup (M3), the address it chose is in settings only:
+  /** The Rust front owns first-run setup (M3), so the address it chose is in settings only:
    *  every use reads it again, the way a restart would (settings -> PUBLIC_ORIGIN -> setup). */
   function refreshOrigin() {
-    if (!guard.enabled) return;
     const admin = setting('public_origin_admin');
     const configured = setting('public_origin');
     origin = admin || publicOrigin || configured || '';
@@ -375,18 +341,8 @@ function createAuth({ dataDir, publicOrigin, rpId, legacyToken = '', legacyCompa
   if (proxyWarning) console.warn(proxyWarning);
 
   // Everything above is the boot (migrations, the first-run setup code); from here on the
-  // Rust-owned tables are written only by the Rust front while the switch is on.
+  // Rust-owned tables are written only by the Rust front.
   guard.install(db);
-
-  const rate = createRateLimiter();
-  function rateLimited(key, limit = 5, windowMs = 15 * 60 * 1000) {
-    return rate.rateLimited(key, limit, windowMs);
-  }
-
-  /** The user's credential epoch, or null when the account does not exist. */
-  function credentialEpoch(userId) {
-    return db.prepare('SELECT credential_epoch FROM users WHERE id=?').get(userId)?.credential_epoch ?? null;
-  }
 
   function publicUser(row) {
     if (!row) return null;
@@ -395,46 +351,17 @@ function createAuth({ dataDir, publicOrigin, rpId, legacyToken = '', legacyCompa
       disabled: !!row.disabled_at, diaryEnabled: !!feature?.diary_enabled, onboarded: !!(feature?.onboarded ?? 1) };
   }
 
-  function issueSession(req, res, user) {
-    const raw = randomToken();
-    const csrf = randomToken();
-    const now = Date.now();
-    db.prepare('INSERT INTO sessions(id_hash,user_id,csrf_hash,created_at,last_seen_at,expires_at,user_agent,ip) VALUES(?,?,?,?,?,?,?,?)')
-      .run(digest(raw), user.id, digest(csrf), now, now, now + ABSOLUTE_MS, String(req.headers['user-agent'] || '').slice(0, 300), clientAddress(req, trustProxy));
-    // Cookies are host-scoped (no Domain= is set), so this is safe to key off
-    // whichever origin the request actually came from: a plain-HTTP trusted
-    // origin (e.g. a LAN IP) needs a non-Secure cookie or the browser drops
-    // it, while the primary/tunnel origin keeps Secure as before.
-    const requestOrigin = String(req.headers.origin || '');
-    const secure = (requestOrigin || origin).startsWith('https://') ? '; Secure' : '';
-    res.setHeader('Set-Cookie', [
-      `cowork_session=${raw}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${ABSOLUTE_MS / 1000}${secure}`,
-      `cowork_csrf=${csrf}; Path=/; SameSite=Lax; Max-Age=${ABSOLUTE_MS / 1000}${secure}`,
-    ]);
-    return csrf;
-  }
-
-  /** Issue a session only if the account is still active and no recovery revoked its credentials
-   *  since `epoch` was read (#929 review): a sign-in still checking a password or passkey when a
-   *  recovery commits must not come out signed in. Returns { user, csrfToken } or null. */
-  const issueSessionIfCurrent = db.transaction((req, res, userId, epoch) => {
-    const user = db.prepare('SELECT * FROM users WHERE id=? AND credential_epoch=? AND disabled_at IS NULL').get(userId, epoch);
-    return user ? { user, csrfToken: issueSession(req, res, user) } : null;
-  });
-
   function authenticate(req) {
     const raw = parseCookies(req).cowork_session;
     const now = Date.now();
     if (raw) {
       const row = db.prepare(`SELECT s.*,u.id AS id,u.username,u.display_name,u.role,u.disabled_at,u.credential_epoch
         FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.id_hash=?`).get(digest(raw));
-      // With the Rust front owning sessions (M3) the gate is read-only: the front made these two
-      // writes before it proxied the request (noevia-rs server-auth upkeep).
+      // The Rust front owns sessions (M3): the gate is read-only. The front moved last_seen_at and
+      // deleted a rejected row before it proxied the request (noevia-rs server-auth upkeep).
       if (row && !row.disabled_at && row.expires_at > now && row.last_seen_at + IDLE_MS > now) {
-        if (!guard.enabled) db.prepare('UPDATE sessions SET last_seen_at=? WHERE id_hash=?').run(now, row.id_hash);
         return { user: publicUser(row), session: row, legacy: false };
       }
-      if (!guard.enabled) db.prepare('DELETE FROM sessions WHERE id_hash=?').run(digest(raw));
     }
     if (legacyCompat && legacyToken && userCount() > 0) {
       const supplied = String(req.headers.authorization || '').replace(/^Bearer\s+/i, '');
@@ -459,59 +386,6 @@ function createAuth({ dataDir, publicOrigin, rpId, legacyToken = '', legacyCompa
     if (!origin) return true;
     const supplied = String(req.headers.origin || '');
     return !supplied || supplied === origin || trustedOrigins.has(supplied);
-  }
-
-  const PASSKEY_LIST_SIZE = 5;
-  let decoySecret = null;
-  const decoyKey = () => {
-    if (decoySecret) return decoySecret;
-    let value = db.prepare("SELECT value FROM settings WHERE key='passkey_decoy_key'").get()?.value;
-    if (!value) { value = crypto.randomBytes(32).toString('hex'); db.prepare("INSERT OR IGNORE INTO settings(key,value) VALUES('passkey_decoy_key',?)").run(value); value = db.prepare("SELECT value FROM settings WHERE key='passkey_decoy_key'").get().value; }
-    return (decoySecret = Buffer.from(value, 'hex'));
-  };
-  let dummyHash = null;
-  const timingHash = () => (dummyHash ||= createPasswordHash(randomToken()));
-  async function createPasswordHash(password) {
-    if (typeof password !== 'string' || password.length < 12 || password.length > 128) throw new Error('password must be 12-128 characters');
-    return hash(password, { algorithm: Algorithm.Argon2id, memoryCost: 19456, timeCost: 2, parallelism: 1 });
-  }
-
-  const deleteExpiredChallenges = db.prepare('DELETE FROM challenges WHERE expires_at<=?');
-  // Each kind is counted against its own cap: 'register' rows are created only by signed-in
-  // accounts, 'authenticate' rows by anyone, so the two never compete for one table budget.
-  const pendingChallengeCount = db.prepare("SELECT count(*) AS n FROM challenges WHERE kind=?");
-  const insertChallenge = db.prepare('INSERT INTO challenges(id_hash,user_id,kind,challenge,expires_at) VALUES(?,?,?,?,?)');
-  // Sign-in at capacity evicts the oldest sign-in challenge, anonymous (unknown-username) rows
-  // first, so a flood of anonymous options requests delays nobody's real sign-in for long and
-  // never blocks it outright (#783).
-  const evictOldestSignIn = db.prepare(`DELETE FROM challenges WHERE id_hash=(SELECT id_hash FROM challenges
-    WHERE kind='authenticate' ORDER BY (user_id IS NOT NULL), expires_at LIMIT 1)`);
-  const persistChallenge = db.transaction((idHash, userId, kind, challenge, now) => {
-    deleteExpiredChallenges.run(now);
-    if (kind === 'authenticate') {
-      while (pendingChallengeCount.get(kind).n >= MAX_PENDING_CHALLENGES) {
-        if (!evictOldestSignIn.run().changes) return false;
-      }
-    } else {
-      // Registration rejects new work at capacity instead of invalidating a live ceremony.
-      const cap = kind === 'register' ? MAX_PENDING_REGISTRATIONS : MAX_PENDING_CHALLENGES;
-      if (pendingChallengeCount.get(kind).n >= cap) return false;
-    }
-    insertChallenge.run(idHash, userId, kind, challenge, now + CHALLENGE_MS);
-    return true;
-  });
-  function saveChallenge(userId, kind, challenge) {
-    const token = randomToken();
-    if (!persistChallenge(digest(token), userId || null, kind, challenge, Date.now())) {
-      throw Object.assign(new Error('passkey challenge capacity reached'), { code: 'CHALLENGE_CAPACITY' });
-    }
-    return token;
-  }
-
-  function takeChallenge(token, kind) {
-    const row = db.prepare('SELECT * FROM challenges WHERE id_hash=? AND kind=? AND expires_at>?').get(digest(token), kind, Date.now());
-    if (row) db.prepare('DELETE FROM challenges WHERE id_hash=?').run(row.id_hash);
-    return row || null;
   }
 
   function audit(action, actor, target, detail = {}) {
@@ -561,7 +435,7 @@ function createAuth({ dataDir, publicOrigin, rpId, legacyToken = '', legacyCompa
   }
 
   return {
-    appPasswords: require('./app-passwords.cjs').createAppPasswords({ db, audit, rateLimited, guard }),
+    appPasswords: require('./app-passwords.cjs').createAppPasswords({ db, guard }),
     /** The M3 single-writer guard (rust-auth.cjs), for the modules wired to this database. */
     rustAuth: guard,
     db, get origin() { refreshOrigin(); return origin; }, get rpId() { refreshOrigin(); return relyingPartyId; }, get originSource() { refreshOrigin(); return originSource; }, instanceId,
@@ -574,296 +448,14 @@ function createAuth({ dataDir, publicOrigin, rpId, legacyToken = '', legacyCompa
     changeOrigin(next, actorId) { refreshOrigin(); return guard.exempt(() => changeOriginNow(next, actorId)); },
     /** Settings -> Web address -> remove an earlier address (#1460). Same Node-owned write as changeOrigin. */
     removeEarlierOrigin(next, actorId) { refreshOrigin(); return guard.exempt(() => removeEarlierOriginNow(next, actorId)); },
-    userCount, authenticate, csrfValid, originValid, publicUser, issueSession,
+    userCount, authenticate, csrfValid, originValid, publicUser,
     // Exposed for the tool permission gate (step 16): every write tool call is
     // recorded here, so "what did the model actually do on my behalf" is
     // answerable from the same log as logins and storage changes.
     audit,
-    async setup(req, res, body) {
-      if (userCount() !== 0) return { status: 409, body: { error: 'setup already complete' } };
-      if (rateLimited(`setup:${clientAddress(req, trustProxy)}`)) return { status: 429, body: { error: 'try again later' } };
-      const expected = db.prepare("SELECT value FROM settings WHERE key='setup_code_hash'").get()?.value;
-      if (!expected || digest(body.setupCode || '') !== expected) return { status: 401, body: { error: 'setup could not be completed' } };
-      if (!USERNAME_RE.test(String(body.username || ''))) return { status: 400, body: { error: 'invalid username' } };
-      const selectedOrigin = String(body.publicOrigin || origin || '').replace(/\/$/, '');
-      const envOrigin = String(publicOrigin || '').replace(/\/$/, '');
-      if (!isAcceptablePublicOrigin(selectedOrigin)) {
-        return { status: 400, body: { error: 'use https://, or a private-network address (a LAN IP, a bare LAN hostname, or localhost) over http://' } };
-      }
-      let passwordHash;
-      try { passwordHash = await createPasswordHash(body.password); } catch (e) { return { status: 400, body: { error: e.message } }; }
-      const now = Date.now(); const id = crypto.randomUUID();
-      const tx = db.transaction(() => {
-        // Hashing above is asynchronous: a concurrent setup may have finished meanwhile.
-        if (userCount() !== 0 || db.prepare("DELETE FROM settings WHERE key='setup_code_hash' AND value=?").run(expected).changes !== 1) throw Object.assign(Error('setup already complete'), { raced: true });
-        db.prepare('INSERT INTO users(id,username,username_norm,display_name,role,password_hash,webauthn_user_id,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)')
-          .run(id, body.username, body.username.toLowerCase(), String(body.displayName || body.username).trim().slice(0, 80), 'admin', passwordHash, randomToken(32), now, now);
-        db.prepare('INSERT INTO user_features(user_id,diary_enabled,onboarded,updated_at) VALUES(?,?,?,?)')
-          .run(id, body.diaryEnabled ? 1 : 0, 0, now);
-        db.prepare("INSERT OR REPLACE INTO settings(key,value) VALUES('public_origin',?)").run(selectedOrigin);
-        // PUBLIC_ORIGIN outranks the setup address at boot. When the operator chose another
-        // address here, record it as the administrator's choice so the origin served until the next
-        // restart is the one served after it (noevia#1254). There is no earlier address to keep:
-        // no account exists yet.
-        if (envOrigin && selectedOrigin !== envOrigin) {
-          db.prepare("INSERT OR REPLACE INTO settings(key,value) VALUES('public_origin_admin',?)").run(selectedOrigin);
-        }
-      });
-      try { tx(); } catch (e) { if (e.raced) return { status: 409, body: { error: 'setup already complete' } }; throw e; }
-      origin = selectedOrigin;
-      if (envOrigin && selectedOrigin !== envOrigin) originSource = 'settings';
-      else if (!originSource || originSource === 'none') originSource = 'setup';
-      relyingPartyId = rpFor(selectedOrigin);
-      try { fs.unlinkSync(setupFile); } catch {}
-      const user = db.prepare('SELECT * FROM users WHERE id=?').get(id);
-      audit('setup.complete', id, id);
-      return { status: 201, body: { user: publicUser(user), csrfToken: issueSession(req, res, user), migrationRequired: true } };
-    },
-    async passwordLogin(req, res, body) {
-      const address = clientAddress(req, trustProxy);
-      const username = String(body.username || '').toLowerCase();
-      const key = `login:${address}:${username}`;
-      const failures = `login-failed:${address}`;
-      // Limits that refuse even correct credentials apply before the lookup and the hash, the same
-      // for every username (#927). Each attempt is counted now, before the await, so concurrent
-      // requests cannot all slip past a limit; a successful sign-in gives its count back, so only
-      // failures remain counted.
-      if (rate.blocked(failures, LOGIN_FAILURES_PER_ADDRESS - 1)) return { status: 429, body: { error: 'sign-in failed' } };
-      if (rateLimited(key, LOGIN_FAILURES_PER_ACCOUNT, LOGIN_WINDOW_MS)) return { status: 429, body: { error: 'sign-in failed' } };
-      // Many failures from one address (spraying, enumeration) turn its failed sign-ins into 429s.
-      // That never refuses correct credentials: behind a tunnel without TRUST_PROXY every visitor
-      // shares one address.
-      const probing = rate.blocked(failures, LOGIN_FAILURES_BEFORE_429);
-      const charged = rate.charge(failures, LOGIN_FAILURES_PER_ADDRESS, LOGIN_WINDOW_MS);
-      const row = db.prepare('SELECT * FROM users WHERE username_norm=?').get(username);
-      // Always pay for one Argon2 verification, so response time doesn't reveal whether a username exists.
-      const usable = row && !row.disabled_at;
-      const ok = await verify(usable ? row.password_hash : await timingHash(), String(body.password || '')).catch(() => false) && usable;
-      // The hash checked above was read before the await; a recovery since then makes it stale.
-      const signedIn = ok ? issueSessionIfCurrent(req, res, row.id, row.credential_epoch) : null;
-      if (!signedIn) return { status: probing ? 429 : 401, body: { error: 'sign-in failed' } };
-      rate.clear(key);
-      rate.release(failures, charged.window);
-      audit('auth.password', row.id, row.id);
-      return { status: 200, body: { user: publicUser(signedIn.user), csrfToken: signedIn.csrfToken } };
-    },
-    logout(req, res, authn) {
-      const raw = parseCookies(req).cowork_session;
-      // The cookies are cleared even when the delete throws (a read-only or guarded database): the
-      // browser must not keep a cookie the user asked to drop.
-      if (raw) { try { db.prepare('DELETE FROM sessions WHERE id_hash=?').run(digest(raw)); } catch (e) { console.warn(`logout: session delete failed (${e.code || e.message})`); } }
-      res.setHeader('Set-Cookie', [
-        'cowork_session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0',
-        'cowork_csrf=; Path=/; SameSite=Lax; Max-Age=0',
-      ]);
-      return { status: 200, body: { ok: true } };
-    },
-    async registrationOptions(userId) {
-      const user = db.prepare('SELECT * FROM users WHERE id=?').get(userId);
-      const keys = db.prepare('SELECT * FROM passkeys WHERE user_id=?').all(userId);
-      const options = await generateRegistrationOptions({ rpName: 'noevia', rpID: relyingPartyId, userName: user.username,
-        userDisplayName: user.display_name, userID: Buffer.from(user.webauthn_user_id, 'base64url'), attestationType: 'none',
-        excludeCredentials: keys.filter(k => keyRp(k) === relyingPartyId).map(k => ({ id: k.id, transports: JSON.parse(k.transports) })),
-        authenticatorSelection: { residentKey: 'preferred', userVerification: 'required' } });
-      return { options, challengeToken: saveChallenge(userId, 'register', options.challenge) };
-    },
-    async registrationVerify(userId, body) {
-      const epoch = credentialEpoch(userId);
-      const challenge = takeChallenge(body.challengeToken || '', 'register');
-      if (!challenge || challenge.user_id !== userId) throw new Error('registration challenge expired');
-      const verification = await verifyRegistrationResponse({ response: body.response, expectedChallenge: challenge.challenge,
-        expectedOrigin: passkeyOrigins(), expectedRPID: relyingPartyId,
-        requireUserVerification: true });
-      const madeFor = relyingPartyId;
-      if (!verification.verified || !verification.registrationInfo) throw new Error('passkey registration failed');
-      const info = verification.registrationInfo; const cred = info.credential;
-      db.transaction(() => {
-        // A recovery that committed while the response was verified revoked this ceremony too.
-        if (epoch === null || credentialEpoch(userId) !== epoch) throw new Error('registration challenge expired');
-        db.prepare('INSERT INTO passkeys(id,user_id,name,public_key,webauthn_user_id,counter,device_type,backed_up,transports,created_at,rp_id) VALUES(?,?,?,?,?,?,?,?,?,?,?)')
-          .run(cred.id, userId, String(body.name || 'Passkey').slice(0, 80), Buffer.from(cred.publicKey), db.prepare('SELECT webauthn_user_id FROM users WHERE id=?').get(userId).webauthn_user_id,
-            cred.counter, info.credentialDeviceType, info.credentialBackedUp ? 1 : 0, JSON.stringify(cred.transports || []), Date.now(), madeFor);
-      })();
-      audit('passkey.add', userId, userId, { credentialId: cred.id });
-      return { verified: true };
-    },
-    /** `req` is the incoming request. With trustProxy on (a real client address), anonymous
-     *  options are limited per address before any lookup or challenge is stored (#783); without
-     *  it the address is the proxy's, shared by every browser, so only the table's eviction
-     *  bounds a flood. */
-    async authenticationOptions(username, req = null) {
-      if (trustProxy && req && rateLimited(`passkey-opt:${clientAddress(req, trustProxy)}`, PASSKEY_OPTIONS_PER_ADDRESS, CHALLENGE_MS)) {
-        throw Object.assign(new Error('too many passkey sign-in attempts'), { code: 'RATE_LIMITED' });
-      }
-      const norm = String(username || '').toLowerCase();
-      const user = db.prepare('SELECT * FROM users WHERE username_norm=? AND disabled_at IS NULL').get(norm);
-      const all = user ? db.prepare('SELECT * FROM passkeys WHERE user_id=?').all(user.id) : [];
-      // One ceremony has one RP ID: the current address if the user has a passkey for it,
-      // otherwise the name their passkeys were made under (related origins carry it across).
-      const signInRp = all.some(k => keyRp(k) === relyingPartyId) || !all.length ? relyingPartyId : keyRp(all[0]);
-      const keys = all.filter(k => keyRp(k) === signInRp);
-      // Pad every list with stable decoy ids so known and unknown usernames get the same shape.
-      // Authenticators ignore credential ids they do not hold, so real sign-in is unaffected.
-      const real = keys.map(k => ({ id: k.id, transports: JSON.parse(k.transports) }));
-      const decoys = [];
-      for (let i = 0; real.length + decoys.length < PASSKEY_LIST_SIZE; i++) {
-        decoys.push({ id: crypto.createHmac('sha256', decoyKey()).update(`${norm}:${i}`).digest('base64url'), transports: ['internal', 'hybrid'] });
-      }
-      const allowCredentials = [...real, ...decoys].sort((a, b) => (a.id < b.id ? -1 : 1));
-      const options = await generateAuthenticationOptions({ rpID: signInRp, userVerification: 'required', allowCredentials });
-      return { options, challengeToken: saveChallenge(user?.id || null, 'authenticate', options.challenge) };
-    },
-    async authenticationVerify(req, res, body) {
-      const challenge = takeChallenge(body.challengeToken || '', 'authenticate');
-      const key = db.prepare('SELECT * FROM passkeys WHERE id=?').get(body.response?.id || '');
-      if (!challenge || !key || challenge.user_id !== key.user_id) throw new Error('authentication failed');
-      const epoch = credentialEpoch(key.user_id);
-      const verification = await verifyAuthenticationResponse({ response: body.response, expectedChallenge: challenge.challenge,
-        expectedOrigin: passkeyOrigins(), expectedRPID: keyRp(key),
-        credential: { id: key.id, publicKey: new Uint8Array(key.public_key), counter: key.counter, transports: JSON.parse(key.transports) }, requireUserVerification: true });
-      if (!verification.verified) throw new Error('authentication failed');
-      // The passkey must still exist (a recovery deletes it) and the account must be unchanged since
-      // the key was read, or the sign-in fails like any other (#929 review).
-      const signedIn = db.transaction(() => {
-        if (db.prepare('UPDATE passkeys SET counter=?,last_used_at=? WHERE id=? AND user_id=?').run(verification.authenticationInfo.newCounter, Date.now(), key.id, key.user_id).changes !== 1) return null;
-        return issueSessionIfCurrent(req, res, key.user_id, epoch);
-      })();
-      if (!signedIn) throw new Error('authentication failed');
-      audit('auth.passkey', signedIn.user.id, signedIn.user.id, { credentialId: key.id });
-      return { user: publicUser(signedIn.user), csrfToken: signedIn.csrfToken };
-    },
-    listPasskeys(userId) {
-      return db.prepare('SELECT id,name,device_type AS deviceType,backed_up AS backedUp,created_at AS createdAt,last_used_at AS lastUsedAt FROM passkeys WHERE user_id=? ORDER BY created_at').all(userId);
-    },
-    // #404: `currentId` (the calling request's own session, i.e. `authn.session.id_hash`) marks
-    // which row is "this device" so the client can show a real current/other state instead of an
-    // unconditional dot. A legacy bearer-token caller (session: null) has no row of its own —
-    // every session then reads as "other", which is correct: none of them is this request.
-    // #1483: a row past its absolute expiry, or idle longer than IDLE_MS, can never authenticate
-    // (authenticate refuses it), so it is not listed; where this process may write, it is also
-    // removed. `expiresAt` is the moment the session actually ends: the earlier of the absolute
-    // limit and the idle limit counted from its last use.
-    listSessions(userId, currentId) {
-      const now = Date.now();
-      if (!guard.enabled) db.prepare('DELETE FROM sessions WHERE user_id=? AND (expires_at<=? OR last_seen_at+?<=?)').run(userId, now, IDLE_MS, now);
-      return db.prepare('SELECT id_hash AS id,created_at AS createdAt,last_seen_at AS lastSeenAt,MIN(expires_at,last_seen_at+?) AS expiresAt,user_agent AS userAgent,ip FROM sessions WHERE user_id=? AND expires_at>? AND last_seen_at+?>? ORDER BY last_seen_at DESC').all(IDLE_MS, userId, now, IDLE_MS, now)
-        .map((s) => ({ ...s, current: !!currentId && s.id === currentId }));
-    },
-    revokeSession(userId, id) { return db.prepare('DELETE FROM sessions WHERE id_hash=? AND user_id=?').run(id, userId).changes > 0; },
-    // #863: never remove the account's last way to sign in. A passkey is the last credential when
-    // the account has no usable password and no other passkey. Today every account carries a
-    // password hash (setup, invitations and recovery all require one), so this is the invariant that
-    // keeps a future password-less account from locking itself out. Throws code LAST_CREDENTIAL;
-    // the route answers 409. Today only the owner's own route calls this; any future caller (an admin acting for a user) inherits the rule.
-    deletePasskey(userId, id) {
-      const row = db.prepare('SELECT id FROM passkeys WHERE id=? AND user_id=?').get(id, userId);
-      if (!row) return false;
-      const user = db.prepare('SELECT password_hash FROM users WHERE id=?').get(userId);
-      const hasPassword = typeof user?.password_hash === 'string' && user.password_hash.trim() !== '';
-      const others = db.prepare('SELECT count(*) AS n FROM passkeys WHERE user_id=? AND id<>?').get(userId, id).n;
-      if (!hasPassword && others === 0) {
-        throw Object.assign(new Error('This is your only way to sign in. Add a password or another passkey before removing it.'), { code: 'LAST_CREDENTIAL' });
-      }
-      return db.prepare('DELETE FROM passkeys WHERE id=? AND user_id=?').run(id, userId).changes > 0;
-    },
-    renamePasskey(userId, id, name) { return db.prepare('UPDATE passkeys SET name=? WHERE id=? AND user_id=?').run(String(name).trim().slice(0,80), id, userId).changes > 0; },
     listUsers() { return db.prepare('SELECT * FROM users ORDER BY created_at').all().map(publicUser); },
-    createInvite(adminId, role = 'member') {
-      const token = randomToken(); const now = Date.now();
-      db.prepare('INSERT INTO invitations(token_hash,created_by,role,expires_at,created_at) VALUES(?,?,?,?,?)').run(digest(token), adminId, role === 'admin' ? 'admin' : 'member', now + 86400000, now);
-      audit('invite.create', adminId, null, { role }); return { token, expiresAt: now + 86400000 };
-    },
-    async acceptInvite(req, res, body) {
-      const invite = db.prepare('SELECT * FROM invitations WHERE token_hash=? AND used_at IS NULL AND expires_at>?').get(digest(body.token || ''), Date.now());
-      if (!invite) return { status: 400, body: { error: 'invitation is invalid or expired' } };
-      if (!USERNAME_RE.test(String(body.username || ''))) return { status: 400, body: { error: 'invalid username' } };
-      let passwordHash; try { passwordHash = await createPasswordHash(body.password); } catch (e) { return { status: 400, body: { error: e.message } }; }
-      const id = crypto.randomUUID(); const now = Date.now();
-      try {
-        db.transaction(() => {
-          // Claim the invitation first; a concurrent accept that got here earlier wins.
-          if (db.prepare('UPDATE invitations SET used_at=? WHERE token_hash=? AND used_at IS NULL AND expires_at>?').run(now, invite.token_hash, now).changes !== 1) throw Object.assign(Error('used'), { raced: true });
-          db.prepare('INSERT INTO users(id,username,username_norm,display_name,role,password_hash,webauthn_user_id,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)')
-            .run(id, body.username, body.username.toLowerCase(), String(body.displayName || body.username).slice(0,80), invite.role, passwordHash, randomToken(32), now, now);
-          db.prepare('INSERT INTO user_features(user_id,diary_enabled,onboarded,updated_at) VALUES(?,?,0,?)')
-            .run(id, body.diaryEnabled ? 1 : 0, now);
-        })();
-      } catch (e) { return e.raced ? { status: 400, body: { error: 'invitation is invalid or expired' } } : { status: 409, body: { error: 'username is unavailable' } }; }
-      const user = db.prepare('SELECT * FROM users WHERE id=?').get(id); audit('invite.accept', id, id);
-      return { status: 201, body: { user: publicUser(user), csrfToken: issueSession(req, res, user) } };
-    },
-    setDisabled(actorId, userId, disabled) {
-      const user = db.prepare('SELECT * FROM users WHERE id=?').get(userId); if (!user) return false;
-      if (user.role === 'admin' && disabled && db.prepare("SELECT count(*) AS n FROM users WHERE role='admin' AND disabled_at IS NULL").get().n <= 1) throw new Error('cannot disable the last administrator');
-      db.prepare('UPDATE users SET disabled_at=?,updated_at=? WHERE id=?').run(disabled ? Date.now() : null, Date.now(), userId);
-      if (disabled) {
-        db.prepare('DELETE FROM sessions WHERE user_id=?').run(userId);
-        db.prepare('DELETE FROM device_grants WHERE user_id=?').run(userId);
-        // A disabled admin's still-open invitations must not outlive them.
-        db.prepare('DELETE FROM invitations WHERE created_by=? AND used_at IS NULL').run(userId);
-      }
-      audit(disabled ? 'user.disable' : 'user.enable', actorId, userId); return true;
-    },
-    createRecovery(actorId, userId) {
-      if (!db.prepare('SELECT 1 FROM users WHERE id=?').get(userId)) return null;
-      const token = randomToken(); const now = Date.now();
-      db.prepare('INSERT INTO recoveries(token_hash,user_id,created_by,expires_at,created_at) VALUES(?,?,?,?,?)').run(digest(token), userId, actorId, now + 3600000, now);
-      audit('recovery.create', actorId, userId); return { token, expiresAt: now + 3600000 };
-    },
-    async completeRecovery(body) {
-      const row = db.prepare('SELECT * FROM recoveries WHERE token_hash=? AND used_at IS NULL AND expires_at>?').get(digest(body.token || ''), Date.now());
-      if (!row) return false; const passwordHash = await createPasswordHash(body.password);
-      const claimed = db.transaction(() => {
-        if (db.prepare('UPDATE recoveries SET used_at=? WHERE token_hash=? AND used_at IS NULL').run(Date.now(), row.token_hash).changes !== 1) return false;
-        db.prepare('UPDATE users SET password_hash=?,updated_at=?,credential_epoch=credential_epoch+1 WHERE id=?').run(passwordHash, Date.now(), row.user_id); db.prepare('DELETE FROM sessions WHERE user_id=?').run(row.user_id);
-        db.prepare('DELETE FROM device_grants WHERE user_id=?').run(row.user_id);
-        // Approved native-app sign-in requests not yet redeemed would otherwise become grants later.
-        db.prepare('DELETE FROM device_authorizations WHERE user_id=?').run(row.user_id);
-        // Recovery revokes every other credential (#928): whoever had the account may have added a
-        // passkey, an app password or a Diary connector, or still hold another recovery link.
-        // The user signs in with the new password and sets passkeys and app passwords up again.
-        const revoked = {
-          // Only links that still work; used and expired ones are inert and stay as history.
-          recoveries: db.prepare('DELETE FROM recoveries WHERE user_id=? AND token_hash<>? AND used_at IS NULL AND expires_at>?').run(row.user_id, row.token_hash, Date.now()).changes,
-          passkeys: db.prepare('DELETE FROM passkeys WHERE user_id=?').run(row.user_id).changes,
-          appPasswords: db.prepare('DELETE FROM app_passwords WHERE user_id=?').run(row.user_id).changes,
-          // diary_connectors is created by diary-connectors.cjs when the server wires it up.
-          diaryConnectors: db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='diary_connectors'").get()
-            ? db.prepare('DELETE FROM diary_connectors WHERE user_id=?').run(row.user_id).changes : 0,
-        };
-        db.prepare('DELETE FROM challenges WHERE user_id=?').run(row.user_id);
-        return revoked;
-      })();
-      if (!claimed) return false;
-      audit('recovery.complete', row.user_id, row.user_id, { revoked: claimed }); return true;
-    },
-    getAppearance(userId) {
-      const row=db.prepare('SELECT value FROM user_appearance WHERE user_id=?').get(userId);
-      return row ? JSON.parse(row.value) : null;
-    },
-    setAppearance(userId, input) {
-      const value=require('./appearance.cjs').validateAppearance(input);
-      db.prepare('INSERT INTO user_appearance(user_id,value,updated_at) VALUES(?,?,?) ON CONFLICT(user_id) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at').run(userId,JSON.stringify(value),Date.now());
-      return value;
-    },
-    updateProfile(userId, displayName) { db.prepare('UPDATE users SET display_name=?,updated_at=? WHERE id=?').run(String(displayName).trim().slice(0,80), Date.now(), userId); },
     diaryEnabled(userId) {
       return !!db.prepare('SELECT diary_enabled FROM user_features WHERE user_id=?').get(userId)?.diary_enabled;
-    },
-    setDiaryEnabled(userId, enabled) {
-      db.prepare(`INSERT INTO user_features(user_id,diary_enabled,updated_at) VALUES(?,?,?)
-        ON CONFLICT(user_id) DO UPDATE SET diary_enabled=excluded.diary_enabled,updated_at=excluded.updated_at`)
-        .run(userId, enabled ? 1 : 0, Date.now());
-      audit('feature.diary', userId, userId, { enabled: !!enabled });
-      return { diaryEnabled: !!enabled };
-    },
-    markOnboarded(userId) {
-      // Completion is not consent: preserve the latest stored choice atomically.
-      // With no feature row there is no recorded opt-in, so Diary stays off.
-      db.prepare(`INSERT INTO user_features(user_id,diary_enabled,onboarded,updated_at) VALUES(?,?,1,?)
-        ON CONFLICT(user_id) DO UPDATE SET onboarded=1,updated_at=excluded.updated_at`)
-        .run(userId, 0, Date.now());
-      return { onboarded: true };
     },
     deleteUser(actorId, userId, username) {
       const user = db.prepare('SELECT * FROM users WHERE id=?').get(userId); if (!user || user.username !== username) return false;
@@ -879,7 +471,8 @@ function createAuth({ dataDir, publicOrigin, rpId, legacyToken = '', legacyCompa
         audit('user.delete', actorId, userId);
       })());
       return true;
-    },    getStorage(userId, includeSecret = false) {
+    },
+    getStorage(userId, includeSecret = false) {
       const row = db.prepare('SELECT * FROM storage_connections WHERE user_id=?').get(userId);
       if (!row) return { kind: 'local', baseUrl: '', bucket: '', region: DEFAULT_S3_REGION, username: '', corpusRoot: '' };
       let plain = ''; let needsReauth = false;
@@ -909,4 +502,4 @@ function createAuth({ dataDir, publicOrigin, rpId, legacyToken = '', legacyCompa
   };
 }
 
-module.exports = { createAuth, USERNAME_RE, digest, createRateLimiter, clientAddress, parseCookies, trustProxyWarning };
+module.exports = { createAuth, digest, createRateLimiter, clientAddress, parseCookies, trustProxyWarning };

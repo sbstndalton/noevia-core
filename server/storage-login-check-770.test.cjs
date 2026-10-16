@@ -23,8 +23,12 @@ function fixture(t, respond) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'noevia-770-'));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
   const auth = createAuth({ dataDir: root, publicOrigin: 'https://noevia.example.test', secrets: createSecretStore(root) });
-  auth.db.prepare(`INSERT INTO users(id,username,username_norm,display_name,role,password_hash,webauthn_user_id,created_at,updated_at)
-    VALUES('u1','u1','u1','u1','member','x','w-u1',0,0)`).run();
+  // The accounts are the Rust front's (#1071): the user is written through the front's own connection.
+  const front = new (require('better-sqlite3'))(path.join(root, 'cowork.db'));
+  try {
+    front.prepare(`INSERT INTO users(id,username,username_norm,display_name,role,password_hash,webauthn_user_id,created_at,updated_at)
+      VALUES('u1','u1','u1','u1','member','x','w-u1',0,0)`).run();
+  } finally { front.close(); }
   auth.saveStorage('u1', OLD);
   const sent = [], requests = [], logs = [];
   for (const level of ['log', 'warn', 'error', 'info']) {

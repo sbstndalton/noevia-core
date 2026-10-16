@@ -22,7 +22,7 @@ const write = (file, projects) => atomicJson(file, { projects });
 const own = (o, k) => Object.prototype.hasOwnProperty.call(o, k);
 const read = (file) => JSON.parse(fs.readFileSync(file, 'utf8')).projects;
 
-test('the switch needs the M3 switch confirmed, NOEVIA_FRONT=rust and its own confirmation', async () => {
+test('the switch needs NOEVIA_FRONT=rust and its own confirmation (the retired M3 switch is not read, #1071)', async () => {
   const warned = [];
   const warn = (m) => warned.push(m);
   const full = { NOEVIA_RUST_PROJECTS: '1', NOEVIA_FRONT: 'rust', NOEVIA_RUST_AUTH: '1', NOEVIA_RUST_AUTH_CONFIRMED: '1', NOEVIA_RUST_PROJECTS_CONFIRMED: '1' };
@@ -30,12 +30,15 @@ test('the switch needs the M3 switch confirmed, NOEVIA_FRONT=rust and its own co
   assert.equal(rp.enabledFrom({}, warn), false);
   assert.equal(warned.length, 0, 'off is silent');
   assert.equal(rp.enabledFrom({ ...full, NOEVIA_RUST_PROJECTS: 'true' }, warn), false);
-  for (const drop of ['NOEVIA_FRONT', 'NOEVIA_RUST_AUTH', 'NOEVIA_RUST_AUTH_CONFIRMED', 'NOEVIA_RUST_PROJECTS_CONFIRMED']) {
+  for (const drop of ['NOEVIA_FRONT', 'NOEVIA_RUST_PROJECTS_CONFIRMED']) {
     const env = { ...full }; delete env[drop];
     assert.equal(rp.enabledFrom(env, warn), false, drop);
   }
   assert.equal(rp.enabledFrom({ ...full, NOEVIA_FRONT: 'node' }, warn), false);
-  assert.equal(warned.length, 5);
+  assert.equal(warned.length, 3);
+  // Sign-in is the front's permanently: the old M3 switch's absence changes nothing.
+  const { NOEVIA_RUST_AUTH: _a, NOEVIA_RUST_AUTH_CONFIRMED: _c, ...noAuth } = full;
+  assert.equal(rp.enabledFrom(noAuth, warn), true);
 });
 
 test('the chat-list slice needs the switch and its own confirmation, and is silent without it (#1409)', async () => {
@@ -46,7 +49,7 @@ test('the chat-list slice needs the switch and its own confirmation, and is sile
   assert.equal(rp.chatsEnabledFrom(full, warn), false, 'a front with the images only');
   assert.equal(rp.chatsEnabledFrom({ ...full, NOEVIA_RUST_PROJECT_CHATS_CONFIRMED: 'true' }, warn), false);
   assert.equal(warned.length, 0, 'an images-only front is not a misconfiguration');
-  for (const drop of ['NOEVIA_RUST_PROJECTS', 'NOEVIA_FRONT', 'NOEVIA_RUST_AUTH', 'NOEVIA_RUST_AUTH_CONFIRMED', 'NOEVIA_RUST_PROJECTS_CONFIRMED']) {
+  for (const drop of ['NOEVIA_RUST_PROJECTS', 'NOEVIA_FRONT', 'NOEVIA_RUST_PROJECTS_CONFIRMED']) {
     const env = { ...full, NOEVIA_RUST_PROJECT_CHATS_CONFIRMED: '1' }; delete env[drop];
     assert.equal(rp.chatsEnabledFrom(env, () => {}), false, drop);
   }
@@ -63,7 +66,7 @@ test('the free-chat slice needs the switch and its own confirmation, and is sile
   assert.equal(rp.freeChatsEnabledFrom({ ...full, NOEVIA_RUST_PROJECT_CHATS_CONFIRMED: '1' }, warn), false);
   assert.equal(rp.chatsEnabledFrom({ ...full, NOEVIA_RUST_FREE_CHATS_CONFIRMED: '1' }, warn), false);
   assert.equal(warned.length, 0);
-  for (const drop of ['NOEVIA_RUST_PROJECTS', 'NOEVIA_FRONT', 'NOEVIA_RUST_AUTH', 'NOEVIA_RUST_AUTH_CONFIRMED', 'NOEVIA_RUST_PROJECTS_CONFIRMED']) {
+  for (const drop of ['NOEVIA_RUST_PROJECTS', 'NOEVIA_FRONT', 'NOEVIA_RUST_PROJECTS_CONFIRMED']) {
     const env = { ...full, NOEVIA_RUST_FREE_CHATS_CONFIRMED: '1' }; delete env[drop];
     assert.equal(rp.freeChatsEnabledFrom(env, () => {}), false, drop);
   }
@@ -82,7 +85,7 @@ test('#1264: the project-writes slices need the projects switch, their own switc
   for (const v of ['0', 'true', ' 1', '']) assert.equal(rp.projectWritesEnabledFrom({ ...on, NOEVIA_RUST_PROJECT_WRITES: v }, warn), false, v);
   assert.equal(rp.projectWritesEnabledFrom({ ...on, NOEVIA_RUST_PROJECT_WRITES_CONFIRMED: '' }, warn), false);
   assert.match(warned.at(-1), /NOEVIA_RUST_PROJECT_WRITES_CONFIRMED/);
-  for (const drop of ['NOEVIA_RUST_PROJECTS', 'NOEVIA_FRONT', 'NOEVIA_RUST_AUTH', 'NOEVIA_RUST_AUTH_CONFIRMED', 'NOEVIA_RUST_PROJECTS_CONFIRMED']) {
+  for (const drop of ['NOEVIA_RUST_PROJECTS', 'NOEVIA_FRONT', 'NOEVIA_RUST_PROJECTS_CONFIRMED']) {
     const env = { ...on }; delete env[drop];
     assert.equal(rp.projectWritesEnabledFrom(env, () => {}), false, drop);
   }
