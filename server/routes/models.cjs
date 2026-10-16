@@ -66,7 +66,7 @@ function statsRustOwned(env) {
   return env.NOEVIA_FRONT === 'rust' && env.NOEVIA_RUST_AUTH === '1' && env.NOEVIA_RUST_AUTH_CONFIRMED === '1'
     && env.NOEVIA_RUST_STATS === '1' && env.NOEVIA_RUST_STATS_CONFIRMED === '1';
 }
-function createModelRoutes({ servedEmbeddingModels = (target) => require('../rag.cjs').servedModelsCached(target), json, readBody, readJson, fetchJson, env, modelManager, getProvider, providerHeaders, DEFAULT_PROVIDER_ID, createVisionProbe, reportedTokenRate, missingRoles, currentWorkspace, service, inferenceBudget = null, sweepGuardOptions = {}, decisionSettings = null, rerankSettings = null, localRoles = (roles) => roles, machineModels = () => [] }) {
+function createModelRoutes({ servedEmbeddingModels = (target) => require('../rag.cjs').servedModelsCached(target), json, readBody, readJson, fetchJson, env, modelManager, getProvider, providerHeaders, DEFAULT_PROVIDER_ID, createVisionProbe, reportedTokenRate, missingRoles, currentWorkspace, service, inferenceBudget = null, idleUnload = null, sweepGuardOptions = {}, decisionSettings = null, rerankSettings = null, localRoles = (roles) => roles, machineModels = () => [] }) {
   const { modelScanCache, refreshModelScan, autoRoles, setAutoRoles, ensureRolesLoaded, servedCatalogue, modelsInstalled, deriveUserModelName, lastLoadedModel, clearLastLoadedModel, clearRoleReferences } = service;
   // #1461: the installed list is shared for a moment (service.modelsInstalled). A decision that must confirm
   // the engine's state right now (a delete that checks the model exists, a load that checks it is not missing)
@@ -602,6 +602,21 @@ function createModelRoutes({ servedEmbeddingModels = (target) => require('../rag
         if(Array.isArray(installed)){const gone=new Set(installed.filter(m=>m?.missingFile===true).map(m=>m.name));models=models.filter(m=>!gone.has(m?.model));}
       }
       return json(res,200,{...inferenceBudget.get(),models,...(estimateError?{estimateError}:{})});
+    }
+
+    // noevia#1863: how long an idle chat model stays loaded (admin setting; the model manager
+    // stores it and rewrites the preset; a change reloads the router when nothing is running).
+    if (p === '/api/models/idle-unload') {
+      if(authn.user.role!=='admin')return json(res,403,{error:'Administrator required for shared model profiles'});
+      if(!idleUnload)return json(res,404,{error:'The idle unload setting is unavailable',errorId:'idleUnloadUnavailable'});
+      res.setHeader('Cache-Control','no-store');
+      const fail=(e)=>json(res,e.status||500,{error:e.status?e.message:'Could not change the idle unload time',...(e.errorId?{errorId:e.errorId}:{}),...(e.minSeconds?{minSeconds:e.minSeconds,maxSeconds:e.maxSeconds}:{})});
+      if(req.method==='PUT'){
+        let body;try{body=await readJson(req);}catch{return json(res,400,{error:'invalid JSON'});}
+        try{return json(res,200,await idleUnload.save(body,authn.user.id));}catch(e){return fail(e);}
+      }
+      if(req.method!=='GET')return json(res,405,{error:'Method not allowed'});
+      try{return json(res,200,await idleUnload.get());}catch(e){return fail(e);}
     }
 
     if (p === '/api/models/preset') {

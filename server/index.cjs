@@ -360,6 +360,10 @@ const modelManager = createModelManager({
 });
 // #697 runtime safety net: unload the engine's models when measured inference memory stays
 // above the budget by more than INFERENCE_BUDGET_OVERSHOOT_PCT (default 10). Native engine only.
+// noevia#1863: the chat-model idle unload time (admin setting, stored by the model manager).
+const idleUnload = process.env.MODEL_LOADER_URL ? require('./idle-unload-setting.cjs').createIdleUnloadSetting({ env: process.env, fetchJson,
+  reloadPresets: (o) => modelManager.reloadPresets ? modelManager.reloadPresets(o) : { ok: false },
+  audit: (action, actor, detail) => authService.audit(action, actor, actor, detail) }) : null;
 const inferenceBudgetWatch = modelManager.kind === 'llamacpp' ? (() => {
   const watch = require('./inference-budget-watch.cjs');
   const files = watch.gpuMemoryFiles(process.env);
@@ -1035,7 +1039,7 @@ const providerRoutes = require('./routes/providers.cjs').createProviderRoutes({
 });
 // Statistics, the auto-router roles, the model manager proxy and /api/models/* (routes/models.cjs).
 const modelRoutes = require('./routes/models.cjs').createModelRoutes({
-  json, readBody, readJson, fetchJson, env: process.env, modelManager, getProvider, providerHeaders, DEFAULT_PROVIDER_ID, createVisionProbe: engineVisionProbe, reportedTokenRate, missingRoles, currentWorkspace, service: modelService, inferenceBudget, decisionSettings, rerankSettings,
+  json, readBody, readJson, fetchJson, env: process.env, modelManager, getProvider, providerHeaders, DEFAULT_PROVIDER_ID, createVisionProbe: engineVisionProbe, reportedTokenRate, missingRoles, currentWorkspace, service: modelService, inferenceBudget, idleUnload, decisionSettings, rerankSettings,
   localRoles: (roles) => chatMachines.localRoles(roles),
   machineModels: () => chatMachines.machineModels(), // #1849
 });
