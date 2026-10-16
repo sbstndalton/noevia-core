@@ -1,6 +1,7 @@
 #!/bin/bash
 # noevia#1866 chunker eval runner for DaServer. Throwaway containers only (rr3-*, --rm, exact names, <= 2 CPU / 2 GB).
 #   W=<workdir> SRC=<dir with chunk-eval.cjs + dataset.json> run.sh [smoke|full|clean]
+# RESUME=1 keeps out/ and skips arms already embedded (same dataset only).
 # smoke: all arms, embed + gte rerank, hard deadline 15 min. full: same, deadline 3 h (the coordinator schedules it off-hours).
 # Live services are read only: the live embed service gets throttled embedding requests (paused while chat is active);
 # rerank uses its OWN gte TEI container (rr3-gte, --network none), never cowork-rerank-1. No downloads (--pull never;
@@ -19,6 +20,8 @@ NAMES="rr3-embed rr3-gte rr3-client rr3-score rr3-hc"
 case $MODE in smoke) DEADLINE=$(( $(date +%s) + 900 )); EBUDGET=300; RBUDGET=200 ;; full) DEADLINE=$(( $(date +%s) + 10800 )); EBUDGET=900; RBUDGET=2400 ;;   # budgets are PER ARM
   clean) for n in $NAMES; do docker rm -f $n >/dev/null 2>&1; done; echo cleaned; exit 0 ;; *) echo "smoke|full|clean"; exit 2 ;; esac
 mkdir -p $W/bin $W/data $W/out; LOG=$W/out/run.log
+[ -n "${RESUME:-}" ] || [ ! -s $W/out/embed.meta.json ] || { echo "out/ has results; set RESUME=1 to continue them or clear $W/out"; exit 2; }
+rm -f $W/out/DONE $W/out/PAUSE
 log() { echo "$(date -u +%H:%M:%S) $*" | tee -a $LOG; }
 left() { echo $(( DEADLINE - $(date +%s) )); }
 avail_mib() { awk '/MemAvailable/{print int($2/1024)}' /proc/meminfo; }
@@ -35,7 +38,7 @@ gate() {
   grep -lsE '"status":"(running|queued|starting)"' /mnt/docker/appdata/cowork/state/web/native-autotune-*.json >/dev/null && { log "GATE_FAIL autotune running"; return 1; }
   pgrep -f 'preflight/up.sh|compose.* up' >/dev/null && { log "GATE_FAIL compose up running"; return 1; }
   local docw; docw=$( { docker logs --since 3m cowork-docling-1 2>&1; docker logs --since 3m cowork-ocr-1 2>&1; } | grep -vciE 'GET /health|healthz|^\s*$')
-  local webw; webw=$(docker logs --since 3m cowork-web-1 2>&1 | grep -ciE 'extract|indexProject|reindex|indexing|docling')
+  local webw; webw=$(docker logs --since 3m cowork-web-1 2>&1 | grep -iE 'extract|indexProject|reindex|indexing|docling' | grep -vcE 'extracted=0 reopened=0 .*errors=0')   # idle [sources] syncs (nothing extracted) are not document work
   [ "$docw" = 0 ] && [ "$webw" = 0 ] || { log "GATE_FAIL document work in progress (docling/ocr lines=$docw, web index lines=$webw)"; return 1; }
   for n in $NAMES; do [ "$n" = "${GATE_ALLOW:-}" ] && continue; docker ps -a --format '{{.Names}}' | grep -qx $n && { log "GATE_FAIL leftover container $n"; return 1; }; done
   [ -e $W/out/ABORT ] && { log "GATE_FAIL ABORT"; return 1; }
@@ -80,6 +83,7 @@ gate || exit 3
 watch_chat & WP=$!
 embed_arm() { # $1 arm, rest extra flags. Live embed service read only, throttled; cowork_default only to reach http://embed:8080
   local a=$1; shift
+  if [ -n "${RESUME:-}" ] && [ -s $W/out/pools-$a.json ] && grep -q "\"$a\":" $W/out/embed.meta.json 2>/dev/null; then log "RESUME: arm $a already embedded"; return 0; fi
   gate_wait || { log "SKIP embed $a (gate)"; return 1; }
   ( sleep 1; guard rr3-embed $a ) & local g=$!
   hrun rr3-embed cowork_default 1 1g $EBUDGET embed /data/dataset.json /out http://embed:8080/v1 --model=$EMBED_MODEL --arms=$a --dim=768 --budget=$EBUDGET "$@"; local rc=$?
