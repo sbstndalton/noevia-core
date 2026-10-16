@@ -34,7 +34,26 @@ function createMaintenanceGate() {
       });
     }
   }
-  return {
+  const gate = {
+    // #1896: like enter(), but a gate held only for a moment (a preset apply, or a tune that took the gate the instant
+    // the previous reply ended) is waited for, at most waitMs and never past `signal`, before the 503 is answered.
+    // The refusal carries code 'inferenceMaintenance' and retryable: true.
+    async enterWithin(waitMs=0,signal) {
+      const deadline=Date.now()+Math.max(0,Number(waitMs)||0);
+      for(;;) {
+        try{return gate.enter();}catch(e){
+          const remaining=deadline-Date.now();
+          if(e.status!==503||remaining<=0||signal?.aborted)throw Object.assign(e,{code:e.code||'inferenceMaintenance',retryable:true});
+          await new Promise(resolve=>{
+            let timer;
+            const done=()=>{clearTimeout(timer);waiting.delete(done);signal?.removeEventListener('abort',done);resolve();};
+            waiting.add(done);signal?.addEventListener('abort',done,{once:true});
+            timer=setTimeout(done,remaining);
+            if(!maintenance)done();
+          });
+        }
+      }
+    },
     enter() {if(maintenance)throw Object.assign(Error(reason||'Model configuration is being applied. Try again shortly.'),{status:503});active++;let released=false;return ()=>{if(!released){released=true;active--;wake();}};},
     async exclusive(fn) {const release=hold();try{return await fn();}finally{release();}},
     hold,
@@ -44,5 +63,6 @@ function createMaintenanceGate() {
     // Read-only: inference requests in flight (#1785: the chat title skips a busy engine).
     active: () => active,
   };
+  return gate;
 }
 module.exports={createMaintenanceGate};

@@ -1115,14 +1115,8 @@ const inferenceMachineRoutes = require('./routes/inference-machines.cjs').create
     decision: (url) => { const b = decisionSettings.backend(); return b?.baseUrl && new URL(b.baseUrl).origin === new URL(url).origin ? b.healthHeaders : null; },
     sensitivity: (url) => { const b = decisionSettings.sensitivityBackend(); return b?.baseUrl && new URL(b.baseUrl).origin === new URL(url).origin ? b.healthHeaders : null; },
   },
-  // #1856: this machine's own engine: the model loader models.cjs asks (/api/v1/models, its token), else the default provider (/v1/models, its key).
-  engine: () => {
-    const loader = String(process.env.MODEL_LOADER_URL || '').trim();
-    if (loader) { try { const u = new URL(loader); return { url: u.origin, path: `${u.pathname.replace(/\/+$/, '')}/api/v1/models`, headers: process.env.MODEL_LOADER_TOKEN ? { 'X-Model-Loader-Token': process.env.MODEL_LOADER_TOKEN } : null }; } catch { return null; } }
-    const p = getProvider(DEFAULT_PROVIDER_ID);
-    if (!p?.baseUrl) return null;
-    try { const u = new URL(String(p.baseUrl).replace(/\/+$/, '').replace(/\/v1$/, '')); const h = providerHeaders(p); const auth = h?.Authorization ? { Authorization: h.Authorization } : null; return { url: u.origin, path: `${u.pathname.replace(/\/+$/, '')}/v1/models`, headers: auth }; } catch { return null; }
-  },
+  // #1856/#1894: this machine's own engine: the model loader's /api/v1/health (its token), else the default provider (/v1/models, its key).
+  engine: () => require('./local-engine-target.cjs').localEngineTarget({ env: process.env, getProvider, providerHeaders, defaultProviderId: DEFAULT_PROVIDER_ID }),
   effective: {
     decision: () => { const c = require('./decision-endpoint.cjs').configuration({ COWORK_DECISION_URL: decisionSettings.get().url }); return c.reason ? null : c.baseUrl; },
     // #1844: its own address (a machine, else COWORK_SENSITIVITY_DECISION_URL), or null while it is shared with the decision service.
@@ -1266,6 +1260,7 @@ async function handleRequestScoped(req, res) {
     } else {
       const failure = errorResponse(err);
       if (failure.status >= 500) console.error('[request] unhandled error:', err);
+      if (failure.status === 503 && p === '/api/chat') require('./chat-admission.cjs').log503('internal');
       json(res, failure.status, failure.body);
     }
   }
@@ -1281,8 +1276,15 @@ async function handleRequest(req,res) {
   if (pathname.startsWith('/api/')) res.setHeader('X-Noevia-API', '1');
   const inference=req.method!=='GET' && (pathname==='/api/chat' || pathname.startsWith('/api/diary/'));
   let leave;
-  try {if(inference && modelManager.enterInference)leave=modelManager.enterInference();}
-  catch(error){return json(res,error.status||503,{error:error.message});}
+  // #1896: a chat turn waits a moment (<= 3 s) for a briefly held gate, then answers a retryable 503 and logs its reason.
+  const chatAdmission=require('./chat-admission.cjs');
+  const aborted=new AbortController();res.once('close',()=>aborted.abort());
+  try {if(inference)leave=await chatAdmission.enterChatInference(modelManager,{signal:aborted.signal});}
+  catch(error){
+    const status=error.status||503;
+    if(pathname==='/api/chat'&&status===503){chatAdmission.log503('maintenance');res.setHeader('Retry-After','3');return json(res,503,chatAdmission.refusalBody(error));}
+    return json(res,status,{error:error.message});
+  }
   if(leave){res.once('finish',leave);res.once('close',leave);}
   // #1881: while a chat or Diary turn runs, the long-document backfill makes no embed request (rag.cjs foreground).
   if(inference){const fg=rag.foreground();res.once('finish',fg);res.once('close',fg);}

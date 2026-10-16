@@ -1187,6 +1187,7 @@ function createChatHandler({
         const code = ready.code || 'machineUnreachable'; // #1851: or machineWrongModel
         console.warn(`[machines] ${routedRole || machineTarget.role} role's machine is ${ready.state}; the turn is not sent`);
         if (earlyStream) { send({ type: 'error', code, text: ready.error }); res.end(); return; }
+        require('./chat-admission.cjs').log503(code === 'machineWrongModel' ? 'machine-wrong-model' : 'machine-unreachable'); // #1896
         return json(res, 503, { error: ready.error, code });
       }
       // #1854: the row carries what this machine's /props says (context, thinking switch), cached per machine + model.
