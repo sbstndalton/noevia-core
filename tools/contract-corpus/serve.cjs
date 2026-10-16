@@ -25,8 +25,9 @@ async function main() {
   // and the chat-list save too when the front's chat slice is confirmed separately (#1409), and the
   // free-chat save when its slice is.
   if (process.env.NOEVIA_RUST_PROJECTS === '1') Object.assign(env, { NOEVIA_RUST_PROJECTS: '1', NOEVIA_FRONT: 'rust', NOEVIA_RUST_PROJECTS_CONFIRMED: process.env.NOEVIA_RUST_PROJECTS_CONFIRMED === '1' ? '1' : '', NOEVIA_RUST_PROJECT_CHATS_CONFIRMED: process.env.NOEVIA_RUST_PROJECT_CHATS_CONFIRMED === '1' ? '1' : '', NOEVIA_RUST_FREE_CHATS_CONFIRMED: process.env.NOEVIA_RUST_FREE_CHATS_CONFIRMED === '1' ? '1' : '', NOEVIA_RUST_PROJECT_WRITES: process.env.NOEVIA_RUST_PROJECT_WRITES === '1' ? '1' : '', NOEVIA_RUST_PROJECT_WRITES_CONFIRMED: process.env.NOEVIA_RUST_PROJECT_WRITES_CONFIRMED === '1' ? '1' : '' });
-  // #1264: Node's projects.json / free-chats.json saves through the front's internal store.
-  if (process.env.NOEVIA_RUST_PROJECT_STORE === '1') Object.assign(env, { NOEVIA_RUST_PROJECT_STORE: '1', NOEVIA_RUST_PROJECT_STORE_CONFIRMED: process.env.NOEVIA_RUST_PROJECT_STORE_CONFIRMED === '1' ? '1' : '', NOEVIA_PROJECT_STORE_PORT: process.env.NOEVIA_PROJECT_STORE_PORT || '', NOEVIA_PROJECT_STORE_TOKEN: process.env.NOEVIA_PROJECT_STORE_TOKEN || '' });
+  // #1264: Node's projects.json / free-chats.json saves through the front's internal store
+  // (permanent: passed through whenever the harness hands over a store port).
+  if (process.env.NOEVIA_PROJECT_STORE_PORT) Object.assign(env, { NOEVIA_RUST_PROJECT_STORE_CONFIRMED: process.env.NOEVIA_RUST_PROJECT_STORE_CONFIRMED === '1' ? '1' : '', NOEVIA_PROJECT_STORE_PORT: process.env.NOEVIA_PROJECT_STORE_PORT || '', NOEVIA_PROJECT_STORE_TOKEN: process.env.NOEVIA_PROJECT_STORE_TOKEN || '' });
   // sbstndalton/noevia#1071: usage, sampling/reasoning/routing settings, routing default, stats,
   // export, ChatGPT status and storage reads have no switch any more; Node refuses them always.
   const child = spawn(process.execPath, ['--require', GUARD, SERVER], { env, stdio: ['ignore', 'ignore', 'pipe'] });

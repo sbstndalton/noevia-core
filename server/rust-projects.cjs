@@ -306,7 +306,7 @@ function parseProjectsText(text) {
  *  through the Rust store (a compare-and-swap, async, no flock) and returns a promise; without
  *  it, the flock path below, unchanged. */
 function createProjectsFile(file, { warn = console.warn, remote } = {}) {
-  if (!remote) throw new Error('projects.json is written only through the Rust project store (NOEVIA_RUST_PROJECT_STORE, #1264)');
+  if (!remote) throw new Error('projects.json is written only through the Rust project store (#1264)');
   const state = { base: new Map(), stamp: null };
   const byId = (list) => { const m = new Map(); for (const p of list) { const id = idOf(p); if (id !== null && !m.has(id)) m.set(id, p); } return m; };
 
@@ -462,7 +462,7 @@ function mergeFreeChats(ours, base, theirs) {
  */
 /** `remote`: as createProjectsFile's. */
 function createFreeChatsFile(file, { warn = console.warn, remote } = {}) {
-  if (!remote) throw new Error('free-chats.json is written only through the Rust project store (NOEVIA_RUST_PROJECT_STORE, #1264)');
+  if (!remote) throw new Error('free-chats.json is written only through the Rust project store (#1264)');
   // base: JSON.stringify of the value as last read from (or written to) disk.
   const state = { base: JSON.stringify([]), stamp: null };
   const baseList = () => { try { const v = JSON.parse(state.base); return Array.isArray(v) ? v : null; } catch { return null; } };

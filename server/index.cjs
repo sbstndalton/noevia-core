@@ -105,7 +105,7 @@ const RUST_PROJECT_WRITES = RUST_PROJECTS && require('./rust-projects.cjs').proj
 if (RUST_PROJECTS && !(RUST_FREE_CHATS && require('./project-store-client.cjs').enabledFrom(process.env))) {
   // #1264: Node no longer locks or writes projects.json itself; with the front sharing it, every
   // save must go through the front's store.
-  console.error('NOEVIA_RUST_PROJECTS=1 needs the confirmed free-chat slice and NOEVIA_RUST_PROJECT_STORE=1 (confirmed): Node writes projects.json only through the Rust project store.');
+  console.error('NOEVIA_RUST_PROJECTS=1 needs the confirmed free-chat slice and the confirmed Rust project store (the web supervisor sets it up): Node writes projects.json only through it.');
   process.exit(2);
 }
 const PROJECT_STORE = RUST_FREE_CHATS && require('./project-store-client.cjs').enabledFrom(process.env)
