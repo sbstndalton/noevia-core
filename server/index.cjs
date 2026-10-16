@@ -366,6 +366,7 @@ const modelManager = createModelManager({
 // noevia#1863: the chat-model idle unload time (admin setting, stored by the model manager).
 const idleUnload = process.env.MODEL_LOADER_URL ? require('./idle-unload-setting.cjs').createIdleUnloadSetting({ env: process.env, fetchJson,
   reloadPresets: (o) => modelManager.reloadPresets ? modelManager.reloadPresets(o) : { ok: false },
+  presetsInRouter: () => modelManager.presetsInRouter ? modelManager.presetsInRouter() : null,
   audit: (action, actor, detail) => authService.audit(action, actor, actor, detail) }) : null;
 const inferenceBudgetWatch = modelManager.kind === 'llamacpp' ? (() => {
   const watch = require('./inference-budget-watch.cjs');

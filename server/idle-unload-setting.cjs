@@ -8,8 +8,30 @@
 // restarts and every models.ini save. llama.cpp passes the key to a model's process when it
 // starts it, and the router only re-reads presets on a reload, so after a change this asks the
 // router to reload (reloadPresets, #1012). With a model running, a reload would unload it: that
-// is refused here and the admin is offered "Unload and apply" (POST /api/models/presets/reload
-// with unload), exactly as other preset changes are.
+// is refused here and the admin is offered "Apply now" (POST /api/models/presets/reload with
+// unload), exactly as other preset changes are. Any model the router runs (loaded, loading or
+// sleeping after its idle time) blocks that reload, so a save is usually NOT live yet: `applied`
+// says whether the router is known to run on the saved value (see presetsInRouter), and it is
+// computed on every GET, so it survives a page reload.
+
+/** The `[*]` `sleep-idle-seconds` value in a models.ini text, as the model manager writes it
+ *  (noevia-rs idle_unload.rs: `ident = value`, optional leading dashes; no key means Never, 0).
+ *  null when the text has a value that is not a whole number. */
+function globalIdleSeconds(text) {
+  let inGlobal = false;
+  for (const raw of String(text).split(/\r?\n/)) {
+    const line = raw.trim();
+    if (line.startsWith('[') && line.endsWith(']')) { inGlobal = line === '[*]'; continue; }
+    if (!inGlobal) continue;
+    const at = raw.indexOf('=');
+    if (at < 0) continue;
+    const key = raw.slice(0, at).trim().replace(/^--?/, '');
+    if (key !== 'sleep-idle-seconds') continue;
+    const value = raw.slice(at + 1).trim();
+    return /^\d+$/.test(value) ? Number(value) : null;
+  }
+  return 0;
+}
 
 const MIN_SECONDS = 300, MAX_SECONDS = 86400, DEFAULT_SECONDS = 1800;
 
@@ -32,7 +54,7 @@ function view(body) {
   };
 }
 
-function createIdleUnloadSetting({ env = process.env, fetchJson, reloadPresets = null, audit = () => {} } = {}) {
+function createIdleUnloadSetting({ env = process.env, fetchJson, reloadPresets = null, presetsInRouter = null, audit = () => {} } = {}) {
   const base = () => String(env.MODEL_LOADER_URL || '').replace(/\/+$/, '');
   const headers = () => ({ 'Content-Type': 'application/json', ...(env.MODEL_LOADER_TOKEN ? { 'X-Model-Loader-Token': env.MODEL_LOADER_TOKEN } : {}) });
   const fail = (status, error, errorId) => Object.assign(Error(error), { status, errorId });
@@ -51,11 +73,23 @@ function createIdleUnloadSetting({ env = process.env, fetchJson, reloadPresets =
     return { view: v, preset: ['written', 'unchanged', 'failed'].includes(r.body?.preset) ? r.body.preset : null };
   };
 
-  async function get() { return (await call('GET')).view; }
+  /** Is the router known to run on `seconds`? false when it runs on another value or that is
+   *  unknowable (it re-read the file on its own since noevia's last reload). */
+  async function applied(seconds) {
+    if (typeof presetsInRouter !== 'function') return false;
+    let text = null;
+    try { text = await presetsInRouter(); } catch { text = null; }
+    return typeof text === 'string' && globalIdleSeconds(text) === seconds;
+  }
+
+  async function get() { const { view: v } = await call('GET'); return { ...v, applied: await applied(v.seconds) }; }
 
   async function save(body, actor) {
     const seconds = body && Object.prototype.hasOwnProperty.call(body, 'seconds') ? body.seconds : undefined;
     if (!validSeconds(seconds)) throw Object.assign(fail(400, `Choose Never or a time from ${MIN_SECONDS / 60} minutes to ${MAX_SECONDS / 3600} hours.`, 'idleUnloadInvalid'), { minSeconds: MIN_SECONDS, maxSeconds: MAX_SECONDS });
+    // For the audit only: read just before the write, so a concurrent save by another
+    // administrator between the two calls can make it stale. Accepted: the model manager has one
+    // writer route and saves are rare; the audit's `seconds` (from the PUT answer) is exact.
     let previous = null;
     try { previous = (await call('GET')).view.seconds; } catch { previous = null; }
     const { view: next, preset } = await call('PUT', { seconds });
@@ -70,10 +104,10 @@ function createIdleUnloadSetting({ env = process.env, fetchJson, reloadPresets =
         apply = r?.ok ? { state: 'applied' } : { state: 'pending', ...(Array.isArray(r?.body?.loaded) ? { loaded: r.body.loaded.filter((x) => typeof x === 'string') } : {}) };
       } catch { apply = { state: 'pending' }; }
     }
-    return { ...next, apply };
+    return { ...next, apply, applied: apply.state === 'applied' ? await applied(next.seconds) : false };
   }
 
   return { get, save };
 }
 
-module.exports = { createIdleUnloadSetting, validSeconds, MIN_SECONDS, MAX_SECONDS, DEFAULT_SECONDS };
+module.exports = { createIdleUnloadSetting, validSeconds, globalIdleSeconds, MIN_SECONDS, MAX_SECONDS, DEFAULT_SECONDS };
