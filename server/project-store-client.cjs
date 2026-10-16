@@ -109,4 +109,46 @@ function createQueue() {
   };
 }
 
-module.exports = { enabledFrom, createClient, createQueue, busy, MAX_ATTEMPTS, TIMEOUT_MS };
+/** The answer a save failure gave on the synchronous path (http.cjs saveFailureReply): 503
+ *  PROJECTS_BUSY with Retry-After: 1, 410 account no longer exists, anything else 500. */
+function failureReply(err) {
+  const status = Number.isInteger(err?.status) && err.status >= 401 && err.status <= 599 ? err.status : 500;
+  if (status === 500) return { status, headers: {}, body: { error: 'Internal error' } };
+  const body = { error: String(err.message || 'Request failed') };
+  if (err.code) body.code = err.code;
+  return { status, headers: status === 503 ? { 'Retry-After': '1' } : {}, body };
+}
+
+/** #1264: a response is held until the store saves its request caused (`saves`, filled by
+ *  workspace.cjs onStoreSave) are written, so the next request reads its writes, and a save that
+ *  fails replaces the answer with the error the synchronous path gave. Only a buffered answer
+ *  (writeHead, then end) is held; one that streams (write()) is sent as it goes, and its saves'
+ *  failures are logged, as for a background writer. */
+function holdForStoreSaves(res, saves) {
+  const writeHead = res.writeHead, write = res.write, end = res.end;
+  let head = null, streaming = false, ended = false;
+  const flushHead = () => { if (head) { const h = head; head = null; writeHead.apply(res, h); } };
+  res.writeHead = function heldWriteHead(...args) {
+    if (ended) return this;
+    if (streaming) return writeHead.apply(this, args);
+    head = args;
+    return this;
+  };
+  res.write = function heldWrite(...args) { streaming = true; flushHead(); return write.apply(this, args); };
+  res.end = function heldEnd(...args) {
+    if (ended) return this;
+    ended = true;
+    if (streaming || saves.length === 0) { flushHead(); return end.apply(this, args); }
+    Promise.all(saves).then(() => { flushHead(); end.apply(res, args); }, (err) => {
+      head = null;
+      const f = failureReply(err);
+      // The security headers set before the route stay; what described the held body goes.
+      for (const name of ['content-length', 'content-disposition', 'content-encoding', 'etag', 'location', 'set-cookie']) if (res.hasHeader?.(name)) res.removeHeader(name);
+      writeHead.call(res, f.status, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store', ...f.headers });
+      end.call(res, JSON.stringify(f.body));
+    });
+    return this;
+  };
+}
+
+module.exports = { enabledFrom, createClient, createQueue, busy, failureReply, holdForStoreSaves, MAX_ATTEMPTS, TIMEOUT_MS };

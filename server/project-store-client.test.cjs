@@ -187,3 +187,120 @@ test('the store\'s errors become Node\'s: busy 503 PROJECTS_BUSY, removed accoun
   await assert.rejects(f.save([{ id: 'p' }]), (e) => e.code === 'PROJECTS_BUSY');
   assert.equal(reads, psc.MAX_ATTEMPTS);
 });
+
+// ── #1264 review: a save that fails is the request's error, and memory goes back to the disk ──
+
+/** A store whose writes answer `status` (503 busy, 409 conflict forever) or that is down. */
+async function failingStore(root, mode) {
+  const s = await fakeStore(root);
+  if (mode === 'down') { await s.close(); return s; }
+  s.server.removeAllListeners('request');
+  s.server.on('request', (req, res) => {
+    let raw = ''; req.on('data', (c) => { raw += c; });
+    req.on('end', () => {
+      const b = JSON.parse(raw);
+      const f = path.join(root, 'users', b.user, b.file);
+      const text = fs.existsSync(f) ? fs.readFileSync(f, 'utf8') : null;
+      const version = text === null ? '' : sha(text);
+      res.writeHead(req.url === '/v1/read' ? 200 : mode === 'busy' ? 503 : 409, { 'content-type': 'application/json' });
+      res.end(JSON.stringify(req.url === '/v1/read' ? { version, text }
+        : mode === 'busy' ? { error: 'The project store is busy. Try again shortly.', code: 'PROJECTS_BUSY' } : { version: `${version}x`, text }));
+    });
+  });
+  return s;
+}
+
+/** A request as index.cjs runs it: its saves counted, its answer held (holdForStoreSaves). */
+async function request(port, route) {
+  const server = http.createServer((req, res) => {
+    const saves = [];
+    psc.holdForStoreSaves(res, saves);
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    route(saves, res);
+  });
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  try {
+    const r = await fetch(`http://127.0.0.1:${server.address().port}/`);
+    return { status: r.status, headers: r.headers, body: await r.json() };
+  } finally { await new Promise((r) => server.close(r)); }
+}
+
+for (const mode of ['busy', 'conflict', 'down']) {
+  test(`store ${mode}: the route answers 503 PROJECTS_BUSY and a fresh read shows the old state`, async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), `store-fail-${mode}-`));
+    const dir = path.join(root, 'users', USER);
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, 'projects.json'), JSON.stringify({ projects: [{ id: 'p1', name: 'Before', chats: [], instructionSkills: {} }] }, null, 2));
+    const store = await failingStore(root, mode);
+    try {
+      let collect = null;
+      const client = psc.createClient({ port: store.port, token: TOKEN, timeoutMs: 2000 });
+      const wsStore = createWorkspaceStore(root, { id: 'local', label: 'Local', baseUrl: '', apiKey: '' }, null, { rustProjects: true, rustFreeChats: true, projectStore: client, onStoreSave: (p) => collect && collect.push(p) });
+      const res = await request(store.port, (saves, out) => {
+        collect = saves;
+        const ws = wsStore.get(USER);
+        ws.projects[0].name = 'After';
+        ws.saveProjects();
+        collect = null;
+        out.writeHead(200, { 'Content-Type': 'application/json' });
+        out.end(JSON.stringify({ ok: true }));
+      });
+      assert.equal(res.status, 503);
+      assert.deepEqual(res.body, { error: 'The project store is busy. Try again shortly.', code: 'PROJECTS_BUSY' });
+      assert.equal(res.headers.get('retry-after'), '1');
+      assert.equal(res.headers.get('x-content-type-options'), 'nosniff', 'headers set before the route stay');
+      // Memory agrees with the disk again: the next access reads the file.
+      assert.equal(wsStore.get(USER).projects[0].name, 'Before');
+      assert.equal(JSON.parse(fs.readFileSync(path.join(dir, 'projects.json'), 'utf8')).projects[0].name, 'Before');
+    } finally { if (mode !== 'down') await store.close(); }
+  });
+}
+
+test('a save queued behind a failed one never writes the failed change later', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'store-poison-'));
+  fs.mkdirSync(path.join(root, 'users', USER), { recursive: true });
+  const store = await fakeStore(root);
+  try {
+    let fail = true;
+    const real = psc.createClient({ port: store.port, token: TOKEN });
+    const client = { read: real.read, write: async (...a) => { if (fail) throw psc.busy(); return real.write(...a); } };
+    const ws = createWorkspaceStore(root, { id: 'local', label: 'Local', baseUrl: '', apiKey: '' }, null, { rustProjects: true, rustFreeChats: true, projectStore: client }).get(USER);
+    ws.projects.push({ id: 'lost', chats: [], instructionSkills: {} });
+    const first = ws.saveProjects();
+    const second = ws.saveProjects();
+    await assert.rejects(first, (e) => e.code === 'PROJECTS_BUSY');
+    fail = false;
+    await assert.rejects(second, (e) => e.code === 'PROJECTS_BUSY');
+    await assert.rejects(ws.saveProjects(), (e) => e.code === 'PROJECTS_BUSY');
+    assert.deepEqual(store.writes, [], 'the stale view wrote nothing');
+  } finally { await store.close(); }
+});
+
+test('success is unchanged: the held answer goes out as written, after the save', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'store-ok-'));
+  fs.mkdirSync(path.join(root, 'users', USER), { recursive: true });
+  const store = await fakeStore(root);
+  try {
+    let collect = null;
+    const client = psc.createClient({ port: store.port, token: TOKEN });
+    const wsStore = createWorkspaceStore(root, { id: 'local', label: 'Local', baseUrl: '', apiKey: '' }, null, { rustProjects: true, rustFreeChats: true, projectStore: client, onStoreSave: (p) => collect && collect.push(p) });
+    const res = await request(store.port, (saves, out) => {
+      collect = saves;
+      const ws = wsStore.get(USER);
+      ws.projects.push({ id: 'p2', chats: [], instructionSkills: {} });
+      ws.saveProjects();
+      collect = null;
+      out.writeHead(201, { 'Content-Type': 'application/json', 'X-Route': 'yes' });
+      out.end(JSON.stringify({ created: 'p2' }));
+    });
+    assert.equal(res.status, 201);
+    assert.deepEqual(res.body, { created: 'p2' });
+    assert.equal(res.headers.get('x-route'), 'yes');
+    assert.deepEqual(store.writes, ['projects.json'], 'written before the answer');
+  } finally { await store.close(); }
+});
+
+test('a streamed answer is not held; with no saves nothing waits', async () => {
+  const res = await request(1, (_saves, out) => { out.writeHead(200, { 'Content-Type': 'application/json' }); out.write('{"a"'); out.end(':1}'); });
+  assert.deepEqual([res.status, res.body], [200, { a: 1 }]);
+});

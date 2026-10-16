@@ -404,6 +404,8 @@ function createProjectsFile(file, { atomicJson, warn = console.warn, lock = with
    *  that change asked for, queued behind this one). */
   async function saveRemote(localArray, afterWrite) {
     const { MAX_ATTEMPTS, busy } = require('./project-store-client.cjs');
+    // A save before this one failed: this view holds a change the disk does not, so it never writes.
+    if (remote.failed) throw remote.failed;
     for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt += 1) {
       const snap = await remote.client.read(remote.user, 'projects.json');
       const disk = parseProjectsText(snap.text);
@@ -535,6 +537,8 @@ function createFreeChatsFile(file, { atomicJson, warn = console.warn, lock = wit
   /** save()'s merge against the store's copy, compare-and-swapped (see createProjectsFile). */
   async function saveRemote(workspace) {
     const { MAX_ATTEMPTS, busy } = require('./project-store-client.cjs');
+    // A save before this one failed: this view holds a change the disk does not, so it never writes.
+    if (remote.failed) throw remote.failed;
     for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt += 1) {
       const snap = await remote.client.read(remote.user, 'free-chats.json');
       let disk; let invalid = false;

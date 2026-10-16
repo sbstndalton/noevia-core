@@ -202,6 +202,8 @@ const DEFAULT_PROVIDER_CAPABILITIES = require('./providers.cjs').engineCapabilit
 let projectsChangedElsewhere = () => {};
 const workspaceStore = createWorkspaceStore(DATA_DIR, { id: DEFAULT_PROVIDER_ID, label: DEFAULT_PROVIDER_LABEL, baseUrl: INFERENCE_BASE, apiKey: INFERENCE_KEY, shared: true,
   ...(DEFAULT_PROVIDER_CAPABILITIES ? { capabilities: DEFAULT_PROVIDER_CAPABILITIES } : {}) }, secretStore, { rustProjects: RUST_PROJECTS, rustFreeChats: RUST_FREE_CHATS, projectStore: PROJECT_STORE,
+  // #1264: each store save is counted against the request that caused it (holdForStoreSaves).
+  onStoreSave: (promise) => { const scope = requestScope.getStore(); if (scope && scope.storeSaves) scope.storeSaves.push(promise); },
   // M4: the front saved a project or free-chat write Node's request would have followed with a
   // mirror nudge (chat-vault-mirror.cjs mirrorTrigger: any successful write under /api/projects or
   // /api/freechats).
@@ -1184,22 +1186,11 @@ async function handleRequestInner(req, res) {
       process.env.CORPUS_BACKEND === 'webdav' && authService.getStorage(preAuth.user.id).kind === 'local') {
     authService.saveStorage(preAuth.user.id, { kind: 'webdav', baseUrl: process.env.WEBDAV_BASE_URL || '', username: process.env.WEBDAV_USERNAME || '', secret: process.env.WEBDAV_PASSWORD || '', corpusRoot: process.env.CORPUS_ROOT || '' });
   }
-  if (workspace && PROJECT_STORE) deferEndUntilStored(res, workspace);
-  return requestScope.run({ workspace, authn: preAuth }, () => handleRequestScoped(req, res));
+  const storeSaves = PROJECT_STORE ? [] : null;
+  if (storeSaves) require('./project-store-client.cjs').holdForStoreSaves(res, storeSaves);
+  return requestScope.run({ workspace, authn: preAuth, storeSaves }, () => handleRequestScoped(req, res));
 }
 
-// #1264: a response ends only once the project-store saves it caused (and any before them) are
-// written, so the next request, answered by Node or the Rust front, reads its own writes. A failed
-// save does not hold the response: it is logged (workspace.cjs) and goes with the next save.
-function deferEndUntilStored(res, workspace) {
-  const end = res.end;
-  res.end = function deferredEnd(...args) {
-    const pending = workspace.pendingStoreWrites();
-    if (!pending) return end.apply(this, args);
-    pending.then(() => end.apply(this, args), () => end.apply(this, args));
-    return this;
-  };
-}
 
 async function handleRequestScoped(req, res) {
   // A Host header that is not a valid host makes this parse fail even when the path did not.

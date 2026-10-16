@@ -53,7 +53,11 @@ function sealProviderRow(row, secrets) {
 // `projectStore` (#1264, project-store-client.cjs createClient): both files are written through the
 // Rust store instead of under flock (needs rustProjects and rustFreeChats). Each workspace gets its
 // own save queue; `pendingStoreWrites()` is a promise for the saves still in flight, or null.
-function createWorkspaceStore(rootDir, defaultProvider, secrets, { rustProjects = false, rustFreeChats = false, projectStore = null, onProjectsChanged = () => {} } = {}) {
+// `onStoreSave(promise)` is told of every such save, so the request that caused it can wait for it
+// and answer its failure (index.cjs). A failed save leaves memory ahead of the disk: the workspace
+// is then dropped from the cache (the next request reads the files again) and every save still
+// queued on it fails too, so nothing of the failed change reaches the disk later.
+function createWorkspaceStore(rootDir, defaultProvider, secrets, { rustProjects = false, rustFreeChats = false, projectStore = null, onStoreSave = () => {}, onProjectsChanged = () => {} } = {}) {
   // Per-user workspaces are cached, but shared providers are NEVER baked
   // into the cached object: the shared file is re-read and re-merged on
   // every workspace access. This closes the load-time-merge race where a
@@ -199,6 +203,20 @@ function createWorkspaceStore(rootDir, defaultProvider, secrets, { rustProjects 
       revoked: false,
       /** #1264: the project-store saves still in flight (a promise), or null. */
       pendingStoreWrites() { return storeQueue ? storeQueue.pending() : null; },
+      /** #1264: a store save this workspace made: reported, and on failure the workspace is
+       *  invalidated (see the header). Background writers get the rejection logged; they retry on
+       *  their next pass against the re-read files. */
+      storeSaved(promise, name) {
+        const done = promise.catch((e) => {
+          if (remote) remote.failed = e;
+          if (cache.get(userId) === this) cache.delete(userId);
+          console.warn(`[projects] could not save ${name} through the project store; this workspace is read again from disk:`, e.message);
+          throw e;
+        });
+        done.catch(() => {});
+        try { onStoreSave(done); } catch { /* the hook never breaks a save */ }
+        return done;
+      },
       assertActive() {
         if (this.revoked) throw Object.assign(new Error('account no longer exists'), { status: 410 });
       },
@@ -246,9 +264,7 @@ function createWorkspaceStore(rootDir, defaultProvider, secrets, { rustProjects 
         // is written; a failure is logged here and the change, still in memory, goes with the next save.
         if (saved && typeof saved.then === 'function') {
           const restore = restoreModes; restoreModes = () => {};
-          const done = saved.finally(restore);
-          done.catch((e) => console.warn('[projects] could not save projects.json through the project store:', e.message));
-          return done;
+          return this.storeSaved(saved.finally(restore), 'projects.json');
         }
         } finally { restoreModes(); }
       },
@@ -315,10 +331,7 @@ function createWorkspaceStore(rootDir, defaultProvider, secrets, { rustProjects 
       saveFreeChats() {
         this.assertActive();
         const saved = freeChatsFile ? freeChatsFile.save(this) : atomicJson(path.join(dir, 'free-chats.json'), this.freeChats);
-        if (saved && typeof saved.then === 'function') {
-          saved.catch((e) => console.warn('[projects] could not save free-chats.json through the project store:', e.message));
-          return saved;
-        }
+        if (saved && typeof saved.then === 'function') return this.storeSaved(saved, 'free-chats.json');
       },
       savePreferences() { this.assertActive(); atomicJson(path.join(dir, 'preferences.json'), this.preferences); },
       saveAutoRoles() { this.assertActive(); atomicJson(path.join(dir, 'auto-roles.json'), this.autoRoles); },
