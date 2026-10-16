@@ -62,47 +62,33 @@ function withoutFlock(fn) {
 }
 
 const ON = { NOEVIA_RUST_PROJECTS: '1', NOEVIA_FRONT: 'rust', NOEVIA_RUST_AUTH: '1', NOEVIA_RUST_AUTH_CONFIRMED: '1', NOEVIA_RUST_PROJECTS_CONFIRMED: '1', NOEVIA_RUST_FREE_CHATS_CONFIRMED: '1',
-  NOEVIA_RUST_PROJECT_STORE: '1', NOEVIA_RUST_PROJECT_STORE_CONFIRMED: '1', NOEVIA_PROJECT_STORE_PORT: '19021', NOEVIA_PROJECT_STORE_TOKEN: TOKEN };
+  NOEVIA_RUST_PROJECT_STORE_CONFIRMED: '1', NOEVIA_PROJECT_STORE_PORT: '19021', NOEVIA_PROJECT_STORE_TOKEN: TOKEN };
 
-test('the store is used only with its switch, its confirmation, both confirmed slices, a port and the secret', () => {
+test('the store is permanent: used with its confirmation, both confirmed slices, a port and the secret; the retired switch is never read', () => {
   const warned = [];
   const warn = (m) => warned.push(m);
   assert.equal(psc.enabledFrom(ON, warn), true);
-  // Live today: the slices confirmed, the store switch off. Silent.
-  const { NOEVIA_RUST_PROJECT_STORE: _s, ...live } = ON;
-  assert.equal(psc.enabledFrom(live, warn), false);
+  for (const v of ['0', 'true', '', '1']) assert.equal(psc.enabledFrom({ ...ON, NOEVIA_RUST_PROJECT_STORE: v }, warn), true, v);
   assert.equal(warned.length, 0);
-  for (const v of ['0', 'true', ' 1', '']) assert.equal(psc.enabledFrom({ ...ON, NOEVIA_RUST_PROJECT_STORE: v }, warn), false, v);
-  for (const drop of ['NOEVIA_RUST_PROJECT_STORE_CONFIRMED', 'NOEVIA_RUST_FREE_CHATS_CONFIRMED', 'NOEVIA_RUST_PROJECTS_CONFIRMED', 'NOEVIA_PROJECT_STORE_PORT', 'NOEVIA_PROJECT_STORE_TOKEN']) {
+  // Projects (or the free-chat slice) off: no store, silently.
+  for (const drop of ['NOEVIA_RUST_FREE_CHATS_CONFIRMED', 'NOEVIA_RUST_PROJECTS_CONFIRMED', 'NOEVIA_RUST_PROJECTS']) {
+    const env = { ...ON }; delete env[drop];
+    assert.equal(psc.enabledFrom(env, warn), false, drop);
+  }
+  assert.equal(warned.length, 0);
+  for (const drop of ['NOEVIA_RUST_PROJECT_STORE_CONFIRMED', 'NOEVIA_PROJECT_STORE_PORT', 'NOEVIA_PROJECT_STORE_TOKEN']) {
     const env = { ...ON }; delete env[drop];
     assert.equal(psc.enabledFrom(env, () => {}), false, drop);
   }
   assert.equal(psc.enabledFrom({ ...ON, NOEVIA_PROJECT_STORE_TOKEN: 'short' }, () => {}), false);
+  const src = fs.readFileSync(path.join(__dirname, 'project-store-client.cjs'), 'utf8') + fs.readFileSync(path.join(__dirname, 'index.cjs'), 'utf8');
+  assert.equal(/env\.NOEVIA_RUST_PROJECT_STORE\b(?!_)/.test(src), false, 'no source reads the retired switch');
 });
 
-test('off: a save takes the flock path (the lock is called); on: never', async () => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'store-off-'));
-  const file = path.join(dir, 'projects.json');
-  let locks = 0;
-  const lock = (_f, fn) => { locks += 1; return fn(); };
-  const atomicJson = (f, v) => fs.writeFileSync(f, JSON.stringify(v, null, 2));
-  const off = rp.createProjectsFile(file, { atomicJson, lock });
-  const list = off.load();
-  list.push({ id: 'p1' });
-  assert.equal(off.save(list), undefined, 'synchronous, as before');
-  assert.equal(locks, 1);
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'store-on-'));
-  fs.mkdirSync(path.join(root, 'users', USER), { recursive: true });
-  const store = await fakeStore(root);
-  try {
-    const client = psc.createClient({ port: store.port, token: TOKEN });
-    const remote = { client, user: USER, queue: psc.createQueue() };
-    const on = rp.createProjectsFile(path.join(root, 'users', USER, 'projects.json'), { atomicJson: () => { throw Error('Node wrote the file'); }, lock: () => { throw Error('Node took the flock'); }, remote });
-    const l2 = on.load();
-    l2.push({ id: 'p1' });
-    await on.save(l2);
-    assert.deepEqual(store.writes, ['projects.json']);
-  } finally { await store.close(); }
+test('no flock path is left: a coordinated file without the store is refused', () => {
+  assert.throws(() => rp.createProjectsFile('/nonexistent/projects.json', {}), /Rust project store/);
+  assert.throws(() => rp.createFreeChatsFile('/nonexistent/free-chats.json', {}), /Rust project store/);
+  assert.equal(rp.withFileLock, undefined);
 });
 
 test('on: a whole workspace saves both files only through the store, with no flock on PATH, and responses can wait for it', async () => {

@@ -1,7 +1,7 @@
 'use strict';
-// sbstndalton/noevia#1264 (option 2 of the lead's 2026-10-16 decision): with
-// NOEVIA_RUST_PROJECT_STORE=1 Node no longer writes projects.json or free-chats.json itself and no
-// longer takes their flock with a blocking spawnSync(flock). Each save reads the file and its
+// sbstndalton/noevia#1264 (option 2 of the lead's 2026-10-16 decision): Node no longer writes
+// projects.json or free-chats.json itself and no longer takes their flock with a blocking
+// spawnSync(flock). Each save reads the file and its
 // version from the Rust front's internal store (noevia-rs bins/noevia-server src/project_store.rs:
 // 127.0.0.1:NOEVIA_PROJECT_STORE_PORT, secret NOEVIA_PROJECT_STORE_TOKEN), merges this process's
 // changes into it exactly as before (rust-projects.cjs merge / mergeFreeChats), and asks Rust to
@@ -9,10 +9,11 @@
 // the current file and the merge runs again, at most MAX_ATTEMPTS times. Rust writes atomically
 // under the same lock its own routes take, so it is the single writer of both files.
 //
-// Everything here is async (fetch with a timeout): nothing blocks the event loop. The switch is
-// read with the supervisor's confirmation (NOEVIA_RUST_PROJECT_STORE_CONFIRMED=1, once the front
-// lists `project-store`), over the confirmed projects and free-chat slices; off, Node keeps the
-// withFileLock path, unchanged.
+// Everything here is async (fetch with a timeout): nothing blocks the event loop. Permanent: the
+// NOEVIA_RUST_PROJECT_STORE switch is retired and not read. The store is used whenever the
+// supervisor confirms it (NOEVIA_RUST_PROJECT_STORE_CONFIRMED=1, which it sets whenever projects are
+// confirmed and the front lists `project-store`) with a port and secret, over the confirmed
+// projects and free-chat slices; index.cjs refuses to start projects without it.
 
 const MAX_ATTEMPTS = 8;
 const TIMEOUT_MS = 10000;
@@ -21,19 +22,15 @@ const FILES = new Set(['projects.json', 'free-chats.json']);
 
 /** Whether Node saves through the Rust store (see the header). */
 function enabledFrom(env = process.env, warn = console.warn) {
-  if (env.NOEVIA_RUST_PROJECT_STORE !== '1') return false;
   const rp = require('./rust-projects.cjs');
-  if (!rp.freeChatsEnabledFrom(env, warn)) {
-    warn('NOEVIA_RUST_PROJECT_STORE=1 is ignored: it needs the confirmed NOEVIA_RUST_PROJECTS projects and free-chat slices.');
-    return false;
-  }
+  if (!rp.freeChatsEnabledFrom(env, () => {})) return false;
   if (env.NOEVIA_RUST_PROJECT_STORE_CONFIRMED !== '1') {
-    warn('NOEVIA_RUST_PROJECT_STORE=1 is ignored: the supervisor has not confirmed that the Rust front serves the project store (NOEVIA_RUST_PROJECT_STORE_CONFIRMED).');
+    warn('The Rust project store is not used: the supervisor has not confirmed that the Rust front serves it (NOEVIA_RUST_PROJECT_STORE_CONFIRMED).');
     return false;
   }
   const port = Number(env.NOEVIA_PROJECT_STORE_PORT);
   if (!Number.isInteger(port) || port < 1 || port > 65535 || String(env.NOEVIA_PROJECT_STORE_TOKEN || '').length < 32) {
-    warn('NOEVIA_RUST_PROJECT_STORE=1 is ignored: NOEVIA_PROJECT_STORE_PORT or NOEVIA_PROJECT_STORE_TOKEN is missing.');
+    warn('The Rust project store is not used: NOEVIA_PROJECT_STORE_PORT or NOEVIA_PROJECT_STORE_TOKEN is missing.');
     return false;
   }
   return true;

@@ -22,16 +22,9 @@
 // delete, the config route) still change it. So while the switch is on, both processes write it only under one shared lock and
 // never from a stale copy:
 //
-//   - the lock is an OS advisory lock, flock(2) LOCK_EX, on `projects.json.lock` beside the file
-//     (mode 0600), created once and never unlinked: unlinking would let two writers lock two
-//     different inodes. flock and fcntl locks do not interoperate on Linux, so both sides use
-//     flock: Rust through std's File::try_lock, Node (no flock in node:fs, no native addon) through
-//     util-linux flock(1) run on an inherited descriptor: flock belongs to the open file
-//     description, so the lock the child takes stays held by this process's descriptor after the
-//     child exits, until it is closed. A holder that dies releases it with its descriptors: no
-//     staleness rule. A writer waits up to LOCK_WAIT_MS, then answers 503 PROJECTS_BUSY. Holds
-//     are one read-modify-write, a few milliseconds. noevia-rs crates/server-projects `lock` is
-//     the other half; keep LOCK_SUFFIX and LOCK_WAIT_MS equal.
+//   - Rust is the only process that writes either file (sbstndalton/noevia#1264): Node saves
+//     through the front's internal project store (project-store-client.cjs), a compare-and-swap
+//     the front applies under its own flock. Node never takes a lock and never blocks on one.
 //   - Rust re-reads the file under the lock and changes only the project it serves.
 //   - Node keeps its cached workspace, but a save is a three-way merge under the lock: the
 //     projects this process changed, added or removed since it last read the file are applied to
@@ -75,12 +68,7 @@
 // free-chats.json writer.
 
 const fs = require('fs');
-const { spawnSync } = require('child_process');
 
-const LOCK_SUFFIX = '.lock';
-const LOCK_WAIT_MS = 3000;
-// flock(1)'s exit status when -w ran out (-E); anything else non-zero is a failure, not "busy".
-const FLOCK_BUSY_STATUS = 75;
 
 /** The routes a Rust front can answer under the switch: METHOD path-pattern. noevia-rs
  *  contracts/http/routes.toml (switch = "NOEVIA_RUST_PROJECTS") is the other half; noevia's
@@ -121,26 +109,6 @@ function enabledFrom(env = process.env, warn = console.warn) {
 
 function busy() {
   return Object.assign(new Error('The project store is busy. Try again shortly.'), { status: 503, code: 'PROJECTS_BUSY' });
-}
-
-/** Runs `fn` (synchronously) holding flock(LOCK_EX) on `<file>.lock` (see the header). Throws
- *  503 PROJECTS_BUSY after LOCK_WAIT_MS. `flockBin`: tests. */
-function withFileLock(file, fn, { flockBin = 'flock' } = {}) {
-  const fd = fs.openSync(file + LOCK_SUFFIX, fs.constants.O_RDWR | fs.constants.O_CREAT, 0o600);
-  try {
-    const r = spawnSync(flockBin, ['-x', '-w', String(LOCK_WAIT_MS / 1000), '-E', String(FLOCK_BUSY_STATUS), '3'], {
-      stdio: ['ignore', 'ignore', 'pipe', fd],
-    });
-    if (r.error) {
-      if (r.error.code === 'ENOENT') throw Object.assign(new Error('NOEVIA_RUST_PROJECTS needs flock(1) (util-linux) on PATH to lock projects.json'), { status: 500, code: 'PROJECTS_LOCK_UNAVAILABLE' });
-      throw r.error;
-    }
-    if (r.status === FLOCK_BUSY_STATUS) throw busy();
-    if (r.status !== 0) throw new Error(`flock(1) failed (status ${r.status}${r.signal ? ', ' + r.signal : ''}): ${String(r.stderr || '').trim()}`);
-    return fn();
-  } finally {
-    fs.closeSync(fd); // releases the lock (the child's copy closed when it exited)
-  }
 }
 
 const idOf = (p) => (p && typeof p === 'object' && typeof p.id === 'string' ? p.id : null);
@@ -333,7 +301,8 @@ function parseProjectsText(text) {
 /** `remote` (#1264, project-store-client.cjs): { client, user, queue }. Given, save() writes
  *  through the Rust store (a compare-and-swap, async, no flock) and returns a promise; without
  *  it, the flock path below, unchanged. */
-function createProjectsFile(file, { atomicJson, warn = console.warn, lock = withFileLock, remote = null } = {}) {
+function createProjectsFile(file, { warn = console.warn, remote } = {}) {
+  if (!remote) throw new Error('projects.json is written only through the Rust project store (#1264)');
   const state = { base: new Map(), stamp: null };
   const byId = (list) => { const m = new Map(); for (const p of list) { const id = idOf(p); if (id !== null && !m.has(id)) m.set(id, p); } return m; };
 
@@ -369,7 +338,7 @@ function createProjectsFile(file, { atomicJson, warn = console.warn, lock = with
     refresh(localArray) {
       // #1264: a store save in flight re-reads the file itself and leaves the stamp unset, so the
       // first request after it takes in the rest; refreshing now would move its base under it.
-      if (remote && remote.queue.pending()) return false;
+      if (remote.queue.pending()) return false;
       if (stampOf(statOrNull(file)) === state.stamp) return false;
       const read = readProjectsFile(file);
       if (read.corrupt) return false; // keep this view; the next save replaces the file
@@ -386,21 +355,7 @@ function createProjectsFile(file, { atomicJson, warn = console.warn, lock = with
     /** saveProjects: the merge, written under the lock. `afterWrite(result)` runs still holding it
      *  (#1806: the source-text collection, so it sees exactly what was written). */
     save(localArray, afterWrite = null) {
-      if (remote) return remote.queue.run('projects.json', () => saveRemote(localArray, afterWrite));
-      lock(file, () => {
-        const read = readProjectsFile(file);
-        if (read.corrupt) {
-          warn(`[rust-projects] ${file} is not readable as { projects: [...] }; replacing it with this process's view`);
-          atomicJson(file, { projects: localArray });
-        } else {
-          const { result, adopt } = merge(localArray, state.base, read.projects);
-          atomicJson(file, { projects: result });
-          apply(localArray, result, adopt);
-        }
-        rebase(localArray);
-        state.stamp = stampOf(statOrNull(file));
-        if (afterWrite) afterWrite(localArray);
-      });
+      return remote.queue.run('projects.json', () => saveRemote(localArray, afterWrite));
     },
   };
 
@@ -502,7 +457,8 @@ function mergeFreeChats(ours, base, theirs) {
  * start and save(workspace) for saveFreeChats; an array is updated in place.
  */
 /** `remote`: as createProjectsFile's. */
-function createFreeChatsFile(file, { atomicJson, warn = console.warn, lock = withFileLock, remote = null } = {}) {
+function createFreeChatsFile(file, { warn = console.warn, remote } = {}) {
+  if (!remote) throw new Error('free-chats.json is written only through the Rust project store (#1264)');
   // base: JSON.stringify of the value as last read from (or written to) disk.
   const state = { base: JSON.stringify([]), stamp: null };
   const baseList = () => { try { const v = JSON.parse(state.base); return Array.isArray(v) ? v : null; } catch { return null; } };
@@ -522,7 +478,7 @@ function createFreeChatsFile(file, { atomicJson, warn = console.warn, lock = wit
     },
     /** At each request start: takes in the other writer's change (no lock: its writes are renames). */
     refresh(workspace) {
-      if (remote && remote.queue.pending()) return false; // #1264: as createProjectsFile's
+      if (remote.queue.pending()) return false; // #1264: as createProjectsFile's
       if (stampOf(statOrNull(file)) === state.stamp) return false;
       const read = readFreeChatsFile(file);
       if (read.invalid) return false; // keep this view; the next save replaces the file
@@ -535,18 +491,7 @@ function createFreeChatsFile(file, { atomicJson, warn = console.warn, lock = wit
     },
     /** saveFreeChats: this process's list, merged with the other writer's when it wrote since. */
     save(workspace) {
-      if (remote) return remote.queue.run('free-chats.json', () => saveRemote(workspace));
-      lock(file, () => {
-        const read = readFreeChatsFile(file);
-        const local = workspace.freeChats, base = baseList();
-        let out = local;
-        if (read.invalid) warn(`[rust-projects] ${file} is not JSON; replacing it with this process's list`);
-        else if (JSON.stringify(read.value) !== state.base && Array.isArray(local) && Array.isArray(read.value) && base) out = mergeFreeChats(local, base, read.value);
-        atomicJson(file, out);
-        put(workspace, out);
-        state.base = JSON.stringify(out);
-        state.stamp = stampOf(statOrNull(file));
-      });
+      return remote.queue.run('free-chats.json', () => saveRemote(workspace));
     },
   };
 
@@ -593,7 +538,7 @@ function refuseOwned(enabled, json, res) {
 }
 
 module.exports = {
-  enabledFrom, chatsEnabledFrom, freeChatsEnabledFrom, projectWritesEnabledFrom, withFileLock, merge, mergeFields, mergeIdList, createProjectsFile, readProjectsFile, refuseOwned, replaceContents,
+  enabledFrom, chatsEnabledFrom, freeChatsEnabledFrom, projectWritesEnabledFrom, merge, mergeFields, mergeIdList, createProjectsFile, readProjectsFile, refuseOwned, replaceContents,
   createFreeChatsFile, readFreeChatsFile, mergeFreeChats,
-  OWNED_ROUTES, PROJECT_WRITE_ROUTES, LOCK_SUFFIX, LOCK_WAIT_MS, FLOCK_BUSY_STATUS, FREE_LIST_CAP,
+  OWNED_ROUTES, PROJECT_WRITE_ROUTES, FREE_LIST_CAP,
 };
