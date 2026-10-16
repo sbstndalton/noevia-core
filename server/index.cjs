@@ -1,4 +1,3 @@
-const { reportedTokenRate } = require('./engine-stats.cjs');
 const reasoningEffort = require('./reasoning-effort.cjs');
 const diaryExtras = require('./diary-extras.cjs');
 const { projectAppearance } = require('./project-appearance.cjs');
@@ -92,7 +91,7 @@ const serveStatic = require('./spa-routes.cjs').createStaticFallback({ staticFil
 const secretStore = createSecretStore(DATA_DIR);
 // M3 of the full-Rust migration: NOEVIA_RUST_AUTH=1 with NOEVIA_FRONT=rust hands sign-in, the
 // account routes and their tables to the Rust front (rust-auth.cjs). Off by default.
-const rustAuth = require('./rust-auth.cjs').createRustAuthGuard({ enabled: require('./rust-auth.cjs').enabledFrom(process.env), samplingSettingsEnabled: require('./routes/sampling-settings.cjs').enabledFrom(process.env), reasoningSettingsEnabled: require('./routes/reasoning-settings.cjs').enabledFrom(process.env), routingModeEnabled: require('./routing-modes.cjs').rustOwned(process.env) });
+const rustAuth = require('./rust-auth.cjs').createRustAuthGuard({ enabled: require('./rust-auth.cjs').enabledFrom(process.env) });
 // M4: NOEVIA_RUST_PROJECTS=1 (on top of M3) shares projects.json with the Rust front, which answers
 // the project image routes (rust-projects.cjs). Off by default.
 const RUST_PROJECTS = require('./rust-projects.cjs').enabledFrom(process.env);
@@ -154,7 +153,8 @@ const features = require('./features.cjs').createFeatures({ store: require('./fe
 const featureRoutes = require('./routes/features.cjs').createFeatureRoutes({ features, json, readJson, decisionSettings });
 const pluginDirectoryRoutes = require('./routes/plugin-directory.cjs').createPluginDirectoryRoutes({ json });
 // Settings → Data: the signed-in user's conversations as a ZIP (routes/export.cjs).
-const exportRoutes = require('./routes/export.cjs').createExportRoutes({ json, workspace: () => ({ freeChats: Array.from(FREE_CHATS), projects: PROJECTS.filter((proj) => !diaryExtras.internalProject(proj)) }), readHistory: (id) => readHistory(id), audit: (action, actor, detail) => authService.audit(action, actor, actor, detail) });
+// GET /api/export/conversations is the Rust front's (#1071): this mount only refuses a bypass.
+const exportRoutes = require('./routes/export.cjs').createExportRoutes({ json });
 const retentionLists = () => ({ freeChats: Array.from(FREE_CHATS), projects: PROJECTS.filter((proj) => !diaryExtras.internalProject(proj)) });
 const removeRetainedChat = ({ projectId, id }) => (projectId ? deleteChat(projectId, id) : deleteFreeChat(id));
 const accountRoutes = require('./routes/account.cjs').createAccountRoutes({ json, readJson, dir: () => currentWorkspace().dir, chatLists: retentionLists, removeChat: removeRetainedChat });
@@ -698,11 +698,8 @@ const browserRoutes = require('./routes/browser.cjs').createBrowserRoutes({
   features, getProject, workspace: () => currentWorkspace(), json, readJson, service: browserService,
 });
 
-const usageRoutes = require('./routes/usage.cjs').createUsageRoutes({
-  readUsage, usageDayKey, retentionDays: USAGE_RETENTION_DAYS, json,
-  workspace: () => currentWorkspace(),
-  listUsers: () => authService.listUsers(), userDir: (id) => workspaceStore.userDir(id),
-});
+// GET /api/usage[/aggregate] is the Rust front's (#1071): this mount only refuses a bypass.
+const usageRoutes = require('./routes/usage.cjs').createUsageRoutes({ json });
 
 // ── Deep research (D12): module in research-service.cjs, routes in routes/research.cjs ──
 // The model a research step asks and its one completion (research-model.cjs); #1849: Smart on an Inference machine runs there.
@@ -1047,11 +1044,10 @@ const projectRoutes = require('./routes/projects.cjs').createProjectRoutes({
 const providerRoutes = require('./routes/providers.cjs').createProviderRoutes({
   json, readBody, readJson, fetchJson, endpointApproved, PROVIDERS, PROJECTS, DEFAULT_PROVIDER_ID, modelManager, currentWorkspace, saveProjects, registry: providerRegistry,
   chatgptOAuth, chatgptEnabled: () => features.enabled('chatgptOAuth'),
-  chatgptStatusOwned: () => require('./features.cjs').rustChatgptStatusOwned(process.env),
 });
 // Statistics, the auto-router roles, the model manager proxy and /api/models/* (routes/models.cjs).
 const modelRoutes = require('./routes/models.cjs').createModelRoutes({
-  json, readBody, readJson, fetchJson, env: process.env, modelManager, getProvider, providerHeaders, DEFAULT_PROVIDER_ID, createVisionProbe: engineVisionProbe, reportedTokenRate, missingRoles, currentWorkspace, service: modelService, inferenceBudget, idleUnload, decisionSettings, rerankSettings,
+  json, readBody, readJson, fetchJson, env: process.env, modelManager, getProvider, providerHeaders, DEFAULT_PROVIDER_ID, createVisionProbe: engineVisionProbe, missingRoles, currentWorkspace, service: modelService, inferenceBudget, idleUnload, decisionSettings, rerankSettings,
   localRoles: (roles) => chatMachines.localRoles(roles),
   machineModels: () => chatMachines.machineModels(), // #1849
 });
@@ -1099,8 +1095,6 @@ const authRoutes = require('./routes/auth.cjs').createAuthRoutes({
 // #1431: pending Login Flow v2 sign-ins survive a web restart; the poll token is sealed with the credential key.
 const storageRoutes = require('./routes/storage.cjs').createStorageRoutes({ json, readJson, authService, storageClient, endpointApproved, fetch: (...args) => globalThis.fetch(...args), crypto,
   flowStore: require('./nextcloud-flows.cjs').createNextcloudFlowStore({ file: path.join(DATA_DIR, 'nextcloud-login-flows.json'), secrets: secretStore }),
-  storageReadsOwned: () => require('./features.cjs').rustStorageReadsOwned(process.env),
-  storageBrowseOwned: () => require('./features.cjs').rustStorageBrowseOwned(process.env),
   storageLatch,
 });
 // The human's answer to a pending write (routes/approvals.cjs); the gate itself is approvals.cjs.
@@ -1112,13 +1106,13 @@ const chatListRoutes = require('./routes/chat-lists.cjs').createChatListRoutes({
   chatLists: retentionLists, removeChat: removeRetainedChat, store: projectStore, revokeChatGrant,
   rustFreeChats: RUST_FREE_CHATS,
 });
-// The reasoning-effort default and per-project resolution (routes/reasoning-settings.cjs).
-const routingModeRoutes = require('./routes/routing-mode.cjs').createRoutingModeRoutes({ json, readBody, enabled: () => features.enabled('routingModes'), currentWorkspace,
-  store: require('./features.cjs').settingsStore(authService.db), audit: (action, actor, detail) => authService.audit(action, actor, actor, detail) });
-const reasoningSettingsRoutes = require('./routes/reasoning-settings.cjs').createReasoningSettingsRoutes({ json, readBody, authService, getProject, getProvider, reasoningEffort, DEFAULT_PROVIDER_ID });
-// The automatic sampling presets on/off default (routes/sampling-settings.cjs). Selection and
-// precedence live in sampling-presets.cjs; this only toggles whether chat.cjs applies a preset.
-const samplingSettingsRoutes = require('./routes/sampling-settings.cjs').createSamplingSettingsRoutes({ json, readBody, authService });
+// The routing configuration and the sampling-presets switch are the Rust front's (#1071): these
+// mounts only refuse a bypass. Chat still reads both settings (routing-modes.cjs, chat.cjs).
+const routingModeRoutes = require('./routes/routing-mode.cjs').createRoutingModeRoutes({ json });
+// The reasoning-effort default and per-project resolution (routes/reasoning-settings.cjs); its PUT
+// is the Rust front's.
+const reasoningSettingsRoutes = require('./routes/reasoning-settings.cjs').createReasoningSettingsRoutes({ json, authService, getProject, getProvider, reasoningEffort, DEFAULT_PROVIDER_ID });
+const samplingSettingsRoutes = require('./routes/sampling-settings.cjs').createSamplingSettingsRoutes({ json });
 // GET /api/health: the default provider, the Diary sidecar and retrieval (routes/health.cjs).
 // The embedding model of retrieval, for administrators (routes/embedding.cjs, #1636).
 const embeddingRoutes = require('./routes/embedding.cjs').createEmbeddingRoutes({ json, readJson, migration: embeddingMigration, authService, fetchJson, DIARY_BASE, diaryServiceHeaders: diary.serviceHeaders,
@@ -1176,9 +1170,8 @@ const mcpDirectoryRoutes = require('./routes/mcp-directory.cjs').createMcpDirect
 });
 
 async function handleRequestInner(req, res) {
-  if (require('./features.cjs').refuseRustStorageRead(req, res, {
-    owned: require('./features.cjs').rustStorageReadsOwned(process.env), parseRequestUrl, badRequestUrl, json,
-  })) return;
+  // GET /api/integrations/storage is the Rust front's (#1071): refused before authentication.
+  if (require('./features.cjs').refuseRustStorageRead(req, res, { parseRequestUrl, badRequestUrl, json })) return;
   const preAuth = requestAuth.authenticate(req);
   // accountRole: a device token acts as a member, but its account's workspace is the same one.
   const workspace = preAuth ? workspaceStore.get(preAuth.user.id, { claim: (preAuth.accountRole || preAuth.user.role) === 'admin' }) : null;

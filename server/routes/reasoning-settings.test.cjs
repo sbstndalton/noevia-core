@@ -1,10 +1,11 @@
 'use strict';
 // The reasoning-settings route over a fake settings table: what a member reads, what only an
-// administrator may change, and the words each refusal keeps. Resolution is reasoning-effort.test.cjs.
+// administrator may change (nothing: the PUT is the Rust front's since #1071), and the words each
+// refusal keeps. Resolution is reasoning-effort.test.cjs.
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const { Readable } = require('node:stream');
-const { createReasoningSettingsRoutes } = require('./reasoning-settings.cjs');
+const { createReasoningSettingsRoutes, PUT_REFUSAL } = require('./reasoning-settings.cjs');
 
 function fixture() {
   const sent = [], audits = [];
@@ -39,7 +40,7 @@ function fixture() {
   return { call, sent, audits, settings };
 }
 
-test('a member reads the default and a project resolution; only an admin changes the default', async () => {
+test('a member reads the default and a project resolution; every PUT is the Rust front\'s and refused (#1071)', async () => {
   const f = fixture();
   assert.equal(await f.call('GET', '/api/reasoning-setting'), false);
   await f.call('GET', '/api/reasoning-settings');
@@ -48,15 +49,14 @@ test('a member reads the default and a project resolution; only an admin changes
   assert.deepEqual(f.sent.pop(), { status: 200, body: { default: 'default', effort: 'high', mode: 'mine:m:high', admin: false } });
   await f.call('GET', '/api/reasoning-settings', undefined, 'member', '?projectId=ghost');
   assert.deepEqual(f.sent.pop(), { status: 404, body: { error: 'no such project' } });
-  await f.call('PUT', '/api/reasoning-settings', { default: 'low' });
-  assert.deepEqual(f.sent.pop(), { status: 403, body: { error: 'Administrator required' } });
-  await f.call('PUT', '/api/reasoning-settings', '{', 'admin');
-  assert.deepEqual(f.sent.pop(), { status: 400, body: { error: 'invalid JSON' } });
-  await f.call('PUT', '/api/reasoning-settings', { default: 'max' }, 'admin');
-  assert.deepEqual(f.sent.pop(), { status: 400, body: { error: 'default must be default, low or high' } });
-  await f.call('PUT', '/api/reasoning-settings', { default: 'low' }, 'admin');
-  assert.deepEqual(f.sent.pop(), { status: 200, body: { default: 'low' } });
-  assert.deepEqual(f.audits, [['reasoning.default', 'u1', null, { effort: 'low' }]]);
+  // No role, body or leftover switch value gets a PUT past Node: nothing read, written or audited.
+  for (const [body, role] of [[{ default: 'low' }, 'member'], ['{', 'admin'], [{ default: 'max' }, 'admin'], [{ default: 'low' }, 'admin']]) {
+    await f.call('PUT', '/api/reasoning-settings', body, role);
+    assert.deepEqual(f.sent.pop(), { status: 503, body: PUT_REFUSAL });
+  }
+  assert.deepEqual(f.audits, []);
+  assert.equal(f.settings.size, 0);
+  f.settings.set('d', 'low');
   await f.call('GET', '/api/reasoning-settings', undefined, 'admin');
   assert.deepEqual(f.sent.pop(), { status: 200, body: { default: 'low', effort: 'low', mode: 'default::low', admin: true } });
   await f.call('DELETE', '/api/reasoning-settings');

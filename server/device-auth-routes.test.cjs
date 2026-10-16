@@ -267,7 +267,8 @@ test('scope limits: a device token never reaches administration or account secur
     assert.equal(r.json.code, 'browser_session_required', `${method} ${url}`);
   }
   // Role-gated routes outside /api/admin see a member, too.
-  assert.equal((await asDevice(tokens.access_token, '/api/reasoning-settings', { method: 'PUT', body: { default: 'low' } })).status, 403);
+  // (The reasoning default's PUT was the example until it moved to the Rust front, #1071.)
+  assert.equal((await asDevice(tokens.access_token, '/api/models/unload', { method: 'POST', body: { name: 'synthetic' } })).status, 403);
   // The admin's own browser session can still do all of it.
   assert.equal((await admin.read('/api/admin/users')).status, 200);
   assert.equal((await admin.read('/api/profile')).status, 200);

@@ -53,13 +53,13 @@ function modelIdsFrom(body, max = MODEL_LIST_MAX) {
  * @param {object} deps.registry   providers.cjs
  * @param {object|null} [deps.chatgptOAuth]   chatgpt-oauth.cjs; null leaves Sign in with ChatGPT out entirely
  * @param {() => boolean} [deps.chatgptEnabled]   features.enabled('chatgptOAuth')
- * @param {() => boolean} [deps.chatgptStatusOwned]   confirmed native GET handoff
  */
-function createProviderRoutes({ json, readBody, readJson, fetchJson, endpointApproved, PROVIDERS, PROJECTS, DEFAULT_PROVIDER_ID, modelManager, currentWorkspace, saveProjects, registry, chatgptOAuth = null, chatgptEnabled = () => false, chatgptStatusOwned = () => false, now = () => Date.now() }) {
+function createProviderRoutes({ json, readBody, readJson, fetchJson, endpointApproved, PROVIDERS, PROJECTS, DEFAULT_PROVIDER_ID, modelManager, currentWorkspace, saveProjects, registry, chatgptOAuth = null, chatgptEnabled = () => false, now = () => Date.now() }) {
   const { saveProviders, saveSharedProviders, maskKey } = registry;
   const { parseContextTokens, validContextTokens, parseCapabilities, effectiveCapabilities } = require('../providers.cjs');
   const chatgpt = require('../chatgpt-oauth.cjs');
   const egress = require('../provider-egress.cjs');
+  const { RUST_CHATGPT_STATUS_REFUSAL } = require('../features.cjs');
   // #1209: provider addresses are short; a long one only costs every listing and chat.
   const MAX_BASE_URL = 2048;
   const chatgptOn = () => !!chatgptOAuth && chatgptEnabled();
@@ -83,18 +83,15 @@ function createProviderRoutes({ json, readBody, readJson, fetchJson, endpointApp
   }
 
   async function handleChatGpt(req, res, p, authn, url) {
-    // The main router's auth/browser gate has already run. Never execute Node
-    // status when a selected native GET reaches this mount through a failed front.
-    if (p === '/api/providers/chatgpt' && req.method === 'GET' && chatgptStatusOwned()) {
-      return json(res, 503, { error: 'ChatGPT status is owned by the Rust front.', code: 'RUST_CHATGPT_STATUS_OWNED' });
+    // The main router's auth/browser gate has already run. The status GET is the Rust front's
+    // (sbstndalton/noevia#1071): one that reaches this mount is a bypass, refused before any read.
+    if (p === '/api/providers/chatgpt' && req.method === 'GET') {
+      return json(res, 503, RUST_CHATGPT_STATUS_REFUSAL);
     }
     if (!chatgptOn()) return json(res, 404, { error: 'Sign in with ChatGPT is turned off on this server.' });
     const userId = authn?.user?.id;
     if (!userId) return json(res, 401, { error: 'Sign in to noevia first.' });
     try {
-      if (p === '/api/providers/chatgpt' && req.method === 'GET') {
-        return json(res, 200, { ...chatgptOAuth.status(userId), providerId: chatgpt.PROVIDER_ID, external: true });
-      }
       if (p === '/api/providers/chatgpt' && req.method === 'DELETE') {
         chatgptOAuth.disconnect(userId);
         removeChatGptRow();

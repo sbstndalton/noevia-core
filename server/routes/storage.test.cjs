@@ -1,14 +1,15 @@
 'use strict';
 // The storage routes over a fake storage client and a fake network: the Nextcloud login flow
 // from start to poll (its own bookkeeping, its guards on the URLs the remote hands back), the
-// WebDAV probe, browsing and the one folder write. The S3 probe and the origin policy end to
+// WebDAV probe and the one folder write. The metadata GET, browsing and the text read are the Rust
+// front's (#1071): Node refuses them always. The S3 probe and the origin policy end to
 // end are storage-s3.test.cjs and ssrf.test.cjs.
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const { Readable } = require('node:stream');
 const { createStorageRoutes, STORAGE_PRIVATE_URL_ERROR, nextcloudServerRoot } = require('./storage.cjs');
 
-function fixture({ storage = { kind: 'local' }, browsable = false, approved = () => true, network = async () => ({ ok: true, status: 200, json: async () => ({}) }), storageReadsOwned, storageBrowseOwned, storageLatch } = {}) {
+function fixture({ storage = { kind: 'local' }, browsable = false, approved = () => true, network = async () => ({ ok: true, status: 200, json: async () => ({}) }), storageLatch } = {}) {
   const sent = [], saved = [], requests = [], storageReads = [];
   const routes = createStorageRoutes({
     json: (res, status, body) => { sent.push({ status, body }); },
@@ -23,7 +24,7 @@ function fixture({ storage = { kind: 'local' }, browsable = false, approved = ()
     endpointApproved: (authn, url) => approved(authn, url),
     fetch: async (url, init) => { requests.push({ url, init }); return network(url, init); },
     crypto: { randomUUID: () => 'flow-1' },
-    storageReadsOwned, storageBrowseOwned, storageLatch,
+    storageLatch,
   });
   const call = (method, path, body, userId = 'u1') => {
     const req = Readable.from(body === undefined ? [] : [Buffer.from(JSON.stringify(body))]);
@@ -33,47 +34,46 @@ function fixture({ storage = { kind: 'local' }, browsable = false, approved = ()
   return { call, sent, saved, requests, storageReads };
 }
 
-test('confirmed storage metadata ownership refuses scoped GET before any storage collaborator', async () => {
+test('#1071: the storage metadata GET is always refused before any storage collaborator', async () => {
   const { RUST_STORAGE_READS_REFUSAL } = require('../features.cjs');
-  const poison = () => assert.fail('owned metadata GET touched a collaborator');
+  const poison = () => assert.fail('the refused metadata GET touched a collaborator');
   const sent = [];
   const routes = createStorageRoutes({
     json: (_res, status, body) => sent.push({ status, body }), readJson: poison,
     authService: new Proxy({}, { get: poison }), storageClient: new Proxy({}, { get: poison }),
     endpointApproved: poison, fetch: poison, crypto: new Proxy({}, { get: poison }),
-    storageReadsOwned: () => true,
   });
   assert.equal(await routes({ method: 'GET' }, {}, { path: '/api/integrations/storage', authn: null }), true);
   assert.deepEqual(sent, [{ status: 503, body: RUST_STORAGE_READS_REFUSAL }]);
 });
-
-test('storage ownership preserves default reads, other methods and adjacent routes', async () => {
-  const off = fixture();
-  await off.call('GET', '/api/integrations/storage');
-  assert.deepEqual(off.storageReads, [['u1', undefined]]);
-  const owned = fixture({ storageReadsOwned: () => true, browsable: true });
+test('#1071: the refusals leave other methods, adjacent routes and the Node-owned writes alone', async () => {
+  const { RUST_STORAGE_READS_REFUSAL, RUST_STORAGE_BROWSE_REFUSAL } = require('../features.cjs');
+  const f = fixture({ browsable: true });
   for (const method of [undefined, 'HEAD', 'OPTIONS', 'POST', 'DELETE', 'get']) {
-    assert.equal(await owned.call(method, '/api/integrations/storage'), false);
+    assert.equal(await f.call(method, '/api/integrations/storage'), false, String(method));
   }
   for (const target of ['/api/integrations/storage/', '/api/integrations/storage-other']) {
-    assert.equal(await owned.call('GET', target), false);
+    assert.equal(await f.call('GET', target), false);
   }
-  await owned.call('PUT', '/api/integrations/storage', { kind: 'local' });
-  assert.equal(owned.saved.length, 1);
-  await owned.call('GET', '/api/integrations/storage/files');
-  await owned.call('POST', '/api/integrations/storage/file', { path: 'synthetic.txt' });
-  await owned.call('POST', '/api/integrations/storage/folder', { path: 'synthetic' });
-  await owned.call('POST', '/api/integrations/storage/test', { kind: 'local' });
-  assert.equal(owned.storageReads.length, 3);
-  assert.equal(owned.sent.some(reply => reply.status === 503), false);
+  for (const [method, path] of [['POST', '/api/integrations/storage/files'], ['GET', '/api/integrations/storage/file']]) {
+    assert.equal(await f.call(method, path), false, `${method} ${path}`);
+  }
+  await f.call('GET', '/api/integrations/storage');
+  assert.deepEqual(f.sent.pop(), { status: 503, body: RUST_STORAGE_READS_REFUSAL });
+  await f.call('GET', '/api/integrations/storage/files');
+  assert.deepEqual(f.sent.pop(), { status: 503, body: RUST_STORAGE_BROWSE_REFUSAL });
+  await f.call('POST', '/api/integrations/storage/file', { path: 'synthetic.txt' });
+  assert.deepEqual(f.sent.pop(), { status: 503, body: RUST_STORAGE_BROWSE_REFUSAL });
+  assert.equal(f.storageReads.length, 0, 'the refused routes never read the saved row');
+  await f.call('PUT', '/api/integrations/storage', { kind: 'local' });
+  assert.equal(f.saved.length, 1);
+  await f.call('POST', '/api/integrations/storage/folder', { path: 'synthetic' });
+  assert.equal(f.storageReads.length, 1, 'the folder write still reads the saved row');
 });
-
-test('reading, saving and the local shortcut keep their shapes; other paths fall through', async () => {
+test('saving and the local shortcut keep their shapes; other paths fall through', async () => {
   const f = fixture();
   assert.equal(await f.call('GET', '/api/integrations/storage/nothing'), false);
   assert.equal(await f.call('DELETE', '/api/integrations/storage'), false);
-  await f.call('GET', '/api/integrations/storage');
-  assert.deepEqual(f.sent.pop(), { status: 200, body: { kind: 'local' } });
   await f.call('PUT', '/api/integrations/storage', { kind: 'webdav', baseUrl: 'https://cloud.example/dav' });
   assert.deepEqual(f.sent.pop(), { status: 400, body: { error: 'server URL, username, and app password are required' } });
   await f.call('PUT', '/api/integrations/storage', { kind: 'local' });
@@ -87,30 +87,19 @@ test('reading, saving and the local shortcut keep their shapes; other paths fall
   assert.equal(refused.saved.length, 0);
 });
 
-test('browsing, reading and the one folder write need a browsable, approved connection', async () => {
+test('the one folder write needs a browsable, approved connection', async () => {
   const none = fixture();
-  await none.call('GET', '/api/integrations/storage/files/Docs');
-  assert.deepEqual(none.sent.pop(), { status: 400, body: { error: 'no browsable storage connected (local storage needs no browsing — upload files directly)' } });
   await none.call('POST', '/api/integrations/storage/folder', { path: 'x' });
   assert.deepEqual(none.sent.pop(), { status: 400, body: { error: 'no browsable storage connected' } });
   const f = fixture({ storage: { kind: 'webdav', baseUrl: 'https://cloud.example/dav' }, browsable: true });
-  await f.call('GET', '/api/integrations/storage/files/Docs%2FNotes');
-  assert.deepEqual(f.sent.pop(), { status: 200, body: { entries: [{ name: 'a.txt', path: 'Docs/Notes/a.txt' }] } });
-  await f.call('GET', '/api/integrations/storage/files');
-  assert.deepEqual(f.sent.pop().body.entries[0].path, '/a.txt');
-  await f.call('GET', '/api/integrations/storage/files/boom');
-  assert.deepEqual(f.sent.pop(), { status: 502, body: { error: 'listing failed' } });
   await f.call('POST', '/api/integrations/storage/folder', { path: 'taken' });
   assert.deepEqual(f.sent.pop(), { status: 409, body: { error: 'exists' } });
   await f.call('POST', '/api/integrations/storage/folder', { path: 'new' });
   assert.deepEqual(f.sent.pop(), { status: 200, body: { created: 'new' } });
-  await f.call('POST', '/api/integrations/storage/file', { path: 'a.txt' });
-  assert.deepEqual(f.sent.pop(), { status: 200, body: { path: 'a.txt', content: 'hi' } });
   const demoted = fixture({ storage: { kind: 'webdav', baseUrl: 'http://10.0.0.5/dav' }, browsable: true, approved: () => false });
-  await demoted.call('GET', '/api/integrations/storage/files/Docs');
-  assert.deepEqual(demoted.sent.pop(), { status: 400, body: { error: STORAGE_PRIVATE_URL_ERROR } }, 'a saved connection is re-checked on every browse');
+  await demoted.call('POST', '/api/integrations/storage/folder', { path: 'new' });
+  assert.deepEqual(demoted.sent.pop(), { status: 400, body: { error: STORAGE_PRIVATE_URL_ERROR } }, 'a saved connection is re-checked on every write');
 });
-
 test('the WebDAV probe accepts 207 and reports the status otherwise', async () => {
   const f = fixture({ network: async (url) => ({ ok: false, status: url.includes('Bad') ? 401 : 207 }) });
   await f.call('POST', '/api/integrations/storage/test', { kind: 'webdav', baseUrl: 'https://cloud.example/dav/', username: 'u', secret: 's', corpusRoot: 'Cowork/Diary' });
@@ -320,14 +309,6 @@ test('edited S3 endpoint path, bucket and access key are signed with the saved s
   assert.deepEqual(f.sent,[{status:200,body:{ok:true}}]);
 });
 
-test('browsing a refused path answers 400, not 502 (#984)', async () => {
-  const f = fixture({ storage: { kind: 'webdav', baseUrl: 'https://cloud.example/dav' }, browsable: true });
-  await f.call('GET', '/api/integrations/storage/files/..%2Fx');
-  assert.deepEqual(f.sent.pop(), { status: 400, body: { error: 'Use a relative path inside the storage folder.' } });
-  await f.call('GET', '/api/integrations/storage/files/boom');
-  assert.equal(f.sent.pop().status, 502);
-});
-
 test('#1427: a manual save says when the server was throttling or too slow to check the login', async () => {
   const body = { kind: 'webdav', baseUrl: 'https://cloud.example/remote.php/dav/files/ada', username: 'ada', secret: 'synthetic-secret' };
   const throttled = fixture({ network: async () => ({ ok: false, status: 429, headers: new Headers({ 'Retry-After': '60' }), body: null }) });
@@ -466,20 +447,17 @@ function held(opts = {}) {
   return Object.assign(f, { isHeld: () => storageLatch.status('u1', HELD) !== null });
 }
 
-test('#1589: browsing, reading and creating a folder over the saved login end the hold when they work', async () => {
-  for (const [method, path, body] of [['GET', '/api/integrations/storage/files/Docs'], ['POST', '/api/integrations/storage/file', { path: 'a.txt' }], ['POST', '/api/integrations/storage/folder', { path: 'new' }]]) {
-    const f = held();
-    assert.equal(f.isHeld(), true);
-    await f.call(method, path, body);
-    assert.equal(f.sent.pop().status, 200, path);
-    assert.equal(f.isHeld(), false, path);
-  }
+test('#1589: creating a folder over the saved login ends the hold when it works', async () => {
+  const f = held();
+  assert.equal(f.isHeld(), true);
+  await f.call('POST', '/api/integrations/storage/folder', { path: 'new' });
+  assert.equal(f.sent.pop().status, 200);
+  assert.equal(f.isHeld(), false);
   const failing = held();
-  await failing.call('GET', '/api/integrations/storage/files/boom');
-  assert.equal(failing.sent.pop().status, 502);
+  await failing.call('POST', '/api/integrations/storage/folder', { path: 'taken' });
+  assert.equal(failing.sent.pop().status, 409);
   assert.equal(failing.isHeld(), true, 'a failed call proves nothing');
 });
-
 test('#1589: Test connection with the saved login ends the hold; a failed test or other credentials do not', async () => {
   const ok = held({ network: async () => ({ ok: true, status: 207 }) });
   await ok.call('POST', '/api/integrations/storage/test', { kind: 'webdav', baseUrl: HELD.baseUrl, username: HELD.username, secret: HELD.secret });
@@ -510,36 +488,17 @@ test('#1589: saving a login the server accepted ends the hold, and an unchecked 
   assert.equal(unchecked.isHeld(), true, 'the server was not reached, so the login is still unproven');
 });
 
-test('confirmed storage browse ownership refuses the list and the read before any collaborator (#1368)', async () => {
+test('#1071: the storage list and the read are always refused before any collaborator', async () => {
   const { RUST_STORAGE_BROWSE_REFUSAL } = require('../features.cjs');
-  const poison = () => assert.fail('owned storage browse touched a collaborator');
+  const poison = () => assert.fail('a refused storage browse touched a collaborator');
   for (const [method, path] of [['GET', '/api/integrations/storage/files'], ['GET', '/api/integrations/storage/files/docs/a'], ['POST', '/api/integrations/storage/file']]) {
     const sent = [];
     const routes = createStorageRoutes({
       json: (_res, status, body) => sent.push({ status, body }), readJson: poison,
       authService: new Proxy({}, { get: poison }), storageClient: new Proxy({}, { get: poison }),
       endpointApproved: poison, fetch: poison, crypto: new Proxy({}, { get: poison }),
-      storageBrowseOwned: () => true,
     });
     assert.equal(await routes({ method }, {}, { path, authn: { user: { id: 'u1', role: 'member' } } }), true);
     assert.deepEqual(sent, [{ status: 503, body: RUST_STORAGE_BROWSE_REFUSAL }], `${method} ${path}`);
-  }
-});
-
-test('storage browse ownership leaves metadata, folder creation and other methods to Node (#1368)', async () => {
-  const owned = fixture({ storageBrowseOwned: () => true, browsable: true });
-  await owned.call('GET', '/api/integrations/storage');
-  assert.deepEqual(owned.storageReads, [['u1', undefined]]);
-  for (const [method, path] of [['POST', '/api/integrations/storage/files'], ['GET', '/api/integrations/storage/file']]) {
-    assert.equal(await owned.call(method, path), false, `${method} ${path}`);
-  }
-});
-
-test('storage browse ownership needs the switch, the confirmation and native auth (#1368)', () => {
-  const { rustStorageBrowseOwned } = require('../features.cjs');
-  const on = { NOEVIA_RUST_STORAGE_BROWSE: '1', NOEVIA_RUST_STORAGE_BROWSE_CONFIRMED: '1', NOEVIA_RUST_AUTH: '1', NOEVIA_RUST_AUTH_CONFIRMED: '1', NOEVIA_FRONT: 'rust' };
-  assert.equal(rustStorageBrowseOwned(on), true);
-  for (const key of Object.keys(on)) {
-    assert.equal(rustStorageBrowseOwned({ ...on, [key]: '' }), false, key);
   }
 });

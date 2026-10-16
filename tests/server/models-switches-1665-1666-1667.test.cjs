@@ -124,7 +124,7 @@ function routesFixture({ env = TEI_ENV, rerankSettings = rerankFixture(env).sett
     fetchJson: async () => ({ ok: false, status: 404, body: {} }),
     env, modelManager: { enabled: true, kind: 'other', capabilities: {} },
     getProvider: () => ({}), providerHeaders: () => ({}), DEFAULT_PROVIDER_ID: 'default', createVisionProbe: () => async () => ({}),
-    reportedTokenRate: () => null, missingRoles: () => [], currentWorkspace: () => ({ userId: 'u1' }),
+    missingRoles: () => [], currentWorkspace: () => ({ userId: 'u1' }),
     service: { modelScanCache: { clear() {} }, modelsInstalled: installed, servedCatalogue: installed, autoRoles: () => roles.current, setAutoRoles: (next) => { roles.current = next; }, ensureRolesLoaded() {} },
     decisionSettings, rerankSettings,
   });

@@ -52,37 +52,6 @@ function loadOptions(model, enabled) {
   options.llamacpp_args=`${args} --spec-type ${enabled?'draft-mtp':'none'}`.trim();
   return options;
 }
-function acceptance(metrics, models, installed=[], owner) {
-  const rows=[];
-  for(const m of models || []) {
-    const registered=installed.find(row=>(row.id || row.model_name)===m.model_name);
-    const type=specType(m.recipe_options?.llamacpp_args);
-    const enabled=type===null ? !!(registered && capability(registered).enabled) : type.split(',').includes('draft-mtp');
-    if(!m.loaded || m.type!=='llm' || !enabled) continue;
-    const counters={};
-    for(const line of String(metrics || '').split('\n')) {
-      const match=/^lemonade_llamacpp_spec_decode_num_(draft|accepted)_tokens_total\{([^}]*)\}\s+([^\s]+)/.exec(line);
-      if(!match) continue;
-      const name=/(?:^|,)model_name=("(?:[^"\\]|\\.)*")/.exec(match[2]);
-      if(!name || JSON.parse(name[1])!==m.model_name)continue;
-      const n=Number(match[3]);if(!Number.isFinite(n)||n<0)continue;
-      counters[match[1]]=(counters[match[1]]||0)+n;
-    }
-    const drafted=counters.draft,accepted=counters.accepted;
-    const rate=Number.isFinite(drafted)&&drafted>0&&Number.isFinite(accepted)&&accepted<=drafted ? accepted/drafted : null;
-    const last=samples.get(`${owner}:${m.model_name}`);
-    const fallback=last && Date.now()-last.at < 10*60*1000 ? last : null;
-    rows.push(rate===null && fallback ? {model:m.model_name,rate:fallback.accepted/fallback.drafted,drafted:fallback.drafted,accepted:fallback.accepted,source:'last response'} : {model:m.model_name,rate,drafted:drafted??null,accepted:accepted??null,source:'backend total'});
-  }
-  return rows;
-}
-const samples=new Map();
-function record(owner,model,timings) {
-  const drafted=timings?.draft_n,accepted=timings?.draft_n_accepted;
-  if(!owner || typeof model!=='string' || !model || drafted===undefined)return;
-  const key=`${owner}:${model}`;
-  if(!Number.isFinite(drafted) || drafted<=0 || !Number.isFinite(accepted) || accepted<0 || accepted>drafted){samples.delete(key);return;}
-  samples.delete(key);samples.set(key,{drafted,accepted,at:Date.now()});
-  while(samples.size>200)samples.delete(samples.keys().next().value);
-}
-module.exports={capability,loadOptions,acceptance,specType,record};
+// The MTP acceptance rate (and the last-response samples it fell back to) left with GET /api/stats:
+// it is the Rust front's since sbstndalton/noevia#1071 (noevia-rs crates/server-stats).
+module.exports={capability,loadOptions,specType};

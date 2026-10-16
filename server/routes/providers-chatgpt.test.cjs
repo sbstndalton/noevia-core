@@ -11,6 +11,7 @@ const path = require('node:path');
 const { Readable } = require('node:stream');
 const Database = require('better-sqlite3');
 const { createProviderRoutes } = require('./providers.cjs');
+const STATUS_REFUSAL = { status: 503, body: { error: 'ChatGPT status is owned by the Rust front.', code: 'RUST_CHATGPT_STATUS_OWNED' } };
 const { createSecretStore } = require('../secrets.cjs');
 const chatgpt = require('../chatgpt-oauth.cjs');
 
@@ -77,7 +78,9 @@ async function signIn(f, userId) {
 test('flag off: every ChatGPT route answers 404, and an existing row is hidden from the listing', async (t) => {
   const f = fixture(t, { flag: false });
   const a = f.routesFor('user-a');
-  for (const [method, p] of [['GET', '/api/providers/chatgpt'], ['POST', '/api/providers/chatgpt/device'], ['POST', '/api/providers/chatgpt/device/poll'],
+  // The status GET is the Rust front's (#1071): refused whatever the flag says.
+  assert.deepEqual(await a.call('GET', '/api/providers/chatgpt'), STATUS_REFUSAL);
+  for (const [method, p] of [['POST', '/api/providers/chatgpt/device'], ['POST', '/api/providers/chatgpt/device/poll'],
     ['GET', '/api/providers/chatgpt/models'], ['DELETE', '/api/providers/chatgpt']]) {
     assert.deepEqual(await a.call(method, p, method === 'POST' ? {} : undefined), { status: 404, body: { error: 'Sign in with ChatGPT is turned off on this server.' } }, `${method} ${p}`);
   }
@@ -94,22 +97,23 @@ test('flag on: sign-in adds a private, external row for that account only; nothi
   const a = f.routesFor('user-a');
   assert.deepEqual(a.providers.at(-1), chatgpt.providerRow());
   assert.equal(a.saved.private, 1, 'saved to the private provider file');
-  const status = await a.call('GET', '/api/providers/chatgpt');
-  assert.deepEqual(status.body, { state: 'connected', account: { email: 'm…@example.test', plan: 'plus' }, providerId: 'chatgpt-oauth', external: true });
+  // The status itself is the Rust front's GET (#1071); Node only refuses it.
+  assert.deepEqual(await a.call('GET', '/api/providers/chatgpt'), STATUS_REFUSAL);
+  assert.deepEqual(f.oauth.status('user-a'), { state: 'connected', account: { email: 'm…@example.test', plan: 'plus' } });
   const list = await a.call('GET', '/api/providers');
   const row = list.body.providers.find((p) => p.id === 'chatgpt-oauth');
   assert.deepEqual(row, { id: 'chatgpt-oauth', label: 'ChatGPT', baseUrl: chatgpt.DEFAULTS.codexBaseUrl, apiKeyMasked: null, isDefault: false, managed: false, shared: false, defaultModel: undefined, kind: 'chatgpt-oauth', external: true, connection: 'connected' });
-  for (const reply of [start, done, status, list]) assert.equal(/AT-secret|RT-secret|DAID|acct-synthetic/.test(JSON.stringify(reply.body)), false);
+  for (const reply of [start, done, list]) assert.equal(/AT-secret|RT-secret|DAID|acct-synthetic/.test(JSON.stringify(reply.body)), false);
   assert.deepEqual((await a.call('GET', '/api/providers/chatgpt/models')).body, { models: ['gpt-synthetic'], cached: false, fetchedAt: f.clock.t });
 
   // user B: separate workspace, no row, not connected, cannot finish A's login.
   const b = f.routesFor('user-b');
-  assert.equal((await b.call('GET', '/api/providers/chatgpt')).body.state, 'disconnected');
+  assert.equal(f.oauth.status('user-b').state, 'disconnected');
   assert.deepEqual((await b.call('GET', '/api/providers')).body.providers.map((p) => p.id), ['default']);
   const again = await a.call('POST', '/api/providers/chatgpt/device');
   const stolen = await b.call('POST', '/api/providers/chatgpt/device/poll', { loginId: again.body.loginId });
   assert.equal(stolen.status, 403);
-  assert.equal((await b.call('GET', '/api/providers/chatgpt')).body.state, 'disconnected');
+  assert.equal(f.oauth.status('user-b').state, 'disconnected');
   const models = await b.call('GET', '/api/providers/chatgpt/models');
   assert.equal(models.status, 401);
   assert.match(models.body.error, /not connected/);
@@ -168,7 +172,7 @@ test('#454: Disconnect while the sign-in is being exchanged wins, and the route 
   release();
   assert.deepEqual((await polling).body, { state: 'cancelled' });
   assert.equal(a.providers.some((p) => p.id === 'chatgpt-oauth'), false);
-  assert.equal((await a.call('GET', '/api/providers/chatgpt')).body.state, 'disconnected');
+  assert.equal(f.oauth.status('user-a').state, 'disconnected');
 });
 
 test('review: too many sign-in starts answer 429 through the route', async (t) => {
@@ -180,8 +184,8 @@ test('review: too many sign-in starts answer 429 through the route', async (t) =
   assert.match(sixth.body.error, /Too many ChatGPT sign-in attempts/);
 });
 
-function nativeStatusFixture({ env, enabled = () => true } = {}) {
-  const { rustChatgptStatusOwned } = require('../features.cjs');
+// `env` is ignored by the routes since #1071; callers pass leftover switch values to prove it.
+function nativeStatusFixture({ env: _env, enabled = () => true } = {}) {
   const calls = { status: 0, disconnect: 0, device: 0, poll: 0, cancel: 0, models: 0 };
   const sent = [];
   const oauth = {
@@ -200,7 +204,6 @@ function nativeStatusFixture({ env, enabled = () => true } = {}) {
     modelManager: { enabled: false }, currentWorkspace: () => ({ removeProvider: () => false }), saveProjects: () => {},
     registry: { saveProviders: () => {}, saveSharedProviders: () => {}, maskKey: () => null },
     chatgptOAuth: oauth, chatgptEnabled: enabled,
-    chatgptStatusOwned: () => rustChatgptStatusOwned(env),
   });
   const call = async (method, target) => {
     const req = { method, url: target, headers: {} };
@@ -210,20 +213,20 @@ function nativeStatusFixture({ env, enabled = () => true } = {}) {
   };
   return { call, calls };
 }
-const confirmedStatusEnv = () => ({ NOEVIA_FRONT: 'rust', NOEVIA_RUST_AUTH: '1', NOEVIA_RUST_AUTH_CONFIRMED: '1', NOEVIA_RUST_CHATGPT_STATUS: '1', NOEVIA_RUST_CHATGPT_STATUS_CONFIRMED: '1' });
+// Leftover values of the retired switch, which must change nothing (#1071).
+const leftoverEnvs = () => [{}, { NOEVIA_RUST_CHATGPT_STATUS: '0' }, { NOEVIA_FRONT: 'rust', NOEVIA_RUST_AUTH: '1', NOEVIA_RUST_AUTH_CONFIRMED: '1', NOEVIA_RUST_CHATGPT_STATUS: '1', NOEVIA_RUST_CHATGPT_STATUS_CONFIRMED: '1' }];
 
-test('native ChatGPT status: exact GET refuses before product and never falls back', async () => {
-  const first = nativeStatusFixture({ env: confirmedStatusEnv(), enabled: () => false });
-  assert.equal((await first.call('GET', '/api/providers/chatgpt')).status, 503, 'M6_STATUS_POLICY:owned_get');
-  const refusal = { status: 503, body: { error: 'ChatGPT status is owned by the Rust front.', code: 'RUST_CHATGPT_STATUS_OWNED' } };
-  for (const enabled of [() => false, () => true, () => { throw new Error('product must not run for owned GET'); }]) {
-    const f = nativeStatusFixture({ env: confirmedStatusEnv(), enabled });
-    for (const target of ['/api/providers/chatgpt', '/api/providers/chatgpt?query=synthetic', '/api/providers/x/../chatgpt', '/api/providers/%2e/chatgpt']) {
-      assert.deepEqual(await f.call('GET', target), refusal);
+test('#1071: the status GET is the Rust front\'s, so Node always refuses it before the product flag and never reads it', async () => {
+  for (const env of leftoverEnvs()) {
+    for (const enabled of [() => false, () => true, () => { throw new Error('product must not run for the owned GET'); }]) {
+      const f = nativeStatusFixture({ env, enabled });
+      for (const target of ['/api/providers/chatgpt', '/api/providers/chatgpt?query=synthetic', '/api/providers/x/../chatgpt', '/api/providers/%2e/chatgpt']) {
+        assert.deepEqual(await f.call('GET', target), STATUS_REFUSAL, `${JSON.stringify(env)} ${target}`);
+      }
+      assert.equal(f.calls.status, 0);
     }
-    assert.equal(f.calls.status, 0);
   }
-  const owned = nativeStatusFixture({ env: confirmedStatusEnv() });
+  const owned = nativeStatusFixture({ env: {} });
   for (const [method, target, status] of [
     ['get', '/api/providers/chatgpt', 405], ['HEAD', '/api/providers/chatgpt', 405], ['OPTIONS', '/api/providers/chatgpt', 405],
     ['POST', '/api/providers/chatgpt', 405], ['GET', '/api/providers/chatgpt/', 405], ['GET', '/api/providers/chatgpt/sibling', 405],
@@ -233,19 +236,14 @@ test('native ChatGPT status: exact GET refuses before product and never falls ba
   ]) assert.equal((await owned.call(method, target)).status, status, `${method} ${target}`);
   assert.equal(await owned.call('GET', '/api/providers/chatgpt-sibling'), null);
   assert.deepEqual(owned.calls, { status: 0, disconnect: 1, device: 1, poll: 1, cancel: 1, models: 1 });
-  for (const env of [{}, { ...confirmedStatusEnv(), NOEVIA_FRONT: 'node' }, { ...confirmedStatusEnv(), NOEVIA_RUST_CHATGPT_STATUS: '0' }, { ...confirmedStatusEnv(), NOEVIA_RUST_AUTH_CONFIRMED: '0' }, { ...confirmedStatusEnv(), NOEVIA_RUST_CHATGPT_STATUS_CONFIRMED: '0' }]) {
-    const f = nativeStatusFixture({ env });
-    assert.equal((await f.call('GET', '/api/providers/chatgpt')).status, 200);
-    assert.equal(f.calls.status, 1, 'Node retains status only while the handoff is unconfirmed');
-  }
 });
 
 test('native ChatGPT status: Node writes use current feature truth and device gate stays prior', async () => {
   const { createFeatures, REGISTRY } = require('../features.cjs');
   const rows = new Map([['feature:chatgptOAuth', 'true']]);
   const store = { get: key => rows.get(key), set: (key, value) => { rows.set(key, value); } };
-  const features = createFeatures({ env: confirmedStatusEnv(), store, registry: { chatgptOAuth: REGISTRY.chatgptOAuth } });
-  const f = nativeStatusFixture({ env: confirmedStatusEnv(), enabled: () => features.enabled('chatgptOAuth') });
+  const features = createFeatures({ env: {}, store, registry: { chatgptOAuth: REGISTRY.chatgptOAuth } });
+  const f = nativeStatusFixture({ env: {}, enabled: () => features.enabled('chatgptOAuth') });
   rows.set('feature:chatgptOAuth', 'false');
   assert.equal((await f.call('POST', '/api/providers/chatgpt/device')).status, 404);
   assert.equal(f.calls.device, 0);

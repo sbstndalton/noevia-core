@@ -24,7 +24,7 @@ const { parseCookies } = require('./auth.cjs');
 test('storage early refusal uses the real parser and fixed no-store reply before identity access', () => {
   const { refuseRustStorageRead, RUST_STORAGE_READS_REFUSAL } = require('./features.cjs');
   const { parseRequestUrl, badRequestUrl, json } = require('./http.cjs');
-  function gate(target, { method = 'GET', owned = true, host = 'localhost' } = {}) {
+  function gate(target, { method = 'GET', host = 'localhost' } = {}) {
     const headers = { host };
     for (const key of ['cookie', 'authorization']) {
       Object.defineProperty(headers, key, { get() { assert.fail(`identity header ${key} was read`); } });
@@ -37,7 +37,7 @@ test('storage early refusal uses the real parser and fixed no-store reply before
       writeHead(status, values) { response.status = status; Object.assign(response.headers, values); },
       end(body) { response.body = JSON.parse(body); },
     };
-    const handled = refuseRustStorageRead(req, res, { owned, parseRequestUrl, badRequestUrl, json });
+    const handled = refuseRustStorageRead(req, res, { parseRequestUrl, badRequestUrl, json });
     return { handled, ...response };
   }
   for (const target of ['/api/integrations/storage', '/api/integrations/storage?q=secret', '/api/integrations/./storage', '/api/integrations/x/../storage', '/api/integrations/%2e/storage']) {
@@ -64,11 +64,12 @@ test('storage early refusal uses the real parser and fixed no-store reply before
   for (const target of ['/api/integrations/storage/', '/api/integrations/storage/files', '/api/integrations/%73torage', '/api/integrations/storage-other']) {
     assert.equal(gate(target).handled, false, target);
   }
-  const poison = () => assert.fail('unowned/non-GET request parsed early');
+  const poison = () => assert.fail('non-GET request parsed early');
   for (const method of [undefined, 'HEAD', 'PUT', 'POST', 'OPTIONS', 'DELETE', 'get']) {
-    assert.equal(refuseRustStorageRead({ method }, {}, { owned: true, parseRequestUrl: poison }), false);
+    assert.equal(refuseRustStorageRead({ method }, {}, { parseRequestUrl: poison }), false);
   }
-  assert.equal(refuseRustStorageRead({ method: 'GET' }, {}, { owned: false, parseRequestUrl: poison }), false);
+  // #1071: there is no ownership switch any more; a leftover `owned: false` changes nothing.
+  assert.equal(gate('/api/integrations/storage', { owned: false }).status, 503);
 });
 
 const realFetch = global.fetch;
@@ -148,7 +149,6 @@ test('#786: a JSON body of null is a 400 on every route that reads its body', as
     ['POST', '/api/admin/invitations', writeHeaders()],
     ['PUT', '/api/integrations/storage', writeHeaders()],
     ['POST', '/api/integrations/storage/folder', writeHeaders()],
-    ['POST', '/api/integrations/storage/file', writeHeaders()],
     ['POST', '/api/profile/diary-connectors', writeHeaders()],
   ];
   for (const [method, url, headers] of routes) {
