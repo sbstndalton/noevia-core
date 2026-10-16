@@ -196,6 +196,21 @@ test('random-looking ids get placeholders, fixed names stay literal', () => {
   assert.equal(norm.text('the 1760000000000 count'), 'the 1760000000000 count', 'digit-only runs are not hex ids');
 });
 
+test('a generated image id is an id even when it has no digit (#1900)', () => {
+  // img-<base36 ms>-<base36 random>: both parts can be all letters.
+  const allLetters = 'img-mvafsnen-hulwyv';
+  assert.ok(!/\d/.test(allLetters));
+  const norm = createNormaliser();
+  const out = norm.value({ asset: { id: allLetters }, other: { id: 'proj-1760000000000-abcdef' } });
+  assert.equal(out.asset.id, '<id:1>');
+  assert.equal(out.other.id, '<id:2>', 'the next id is numbered the same whether or not the image id had a digit');
+  assert.equal(norm.text(`/api/projects/p/assets/${allLetters}`), '/api/projects/p/assets/<id:1>');
+  const withDigit = createNormaliser().value({ asset: { id: 'img-mvafsn3n-hulwy6' }, other: { id: 'proj-1760000000000-abcdef' } });
+  assert.deepEqual(withDigit, { asset: { id: '<id:1>' }, other: { id: '<id:2>' } });
+  // names that merely start with img- stay literal
+  assert.equal(createNormaliser().value({ id: 'img-gallery' }).id, 'img-gallery');
+});
+
 test('a value revealed as a secret by a later exchange is removed from the earlier file', async () => {
   const dir = tmp();
   const recorder = createContractRecorder({ dir, env: {} });
