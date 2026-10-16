@@ -123,6 +123,11 @@ function createChatMachines({ machines, health = null, fetchImpl = defaultServic
       if (n > 0) turns.set(id, n); else turns.delete(id);
     };
   }
+  /** #1880: count `t`'s machine as busy while `fn` runs (a role on this machine: just runs it). */
+  async function during(t, fn) {
+    const release = t?.machine?.id ? beginTurn(t.machine.id) : () => {};
+    try { return await fn(); } finally { release(); }
+  }
   /** Whether `machineId` serves a chat turn now. */
   const busy = (machineId) => (turns.get(String(machineId || '')) || 0) > 0;
   /** Called with the machine id whenever a turn starts there; returns the unsubscribe. */
@@ -367,7 +372,7 @@ function createChatMachines({ machines, health = null, fetchImpl = defaultServic
     return visionProbe(`${t.baseUrl}/v1`, headers, t.model);
   }
 
-  return { target, remoteRoles, effectiveRoles, localRoles, ready, provider, measuredProvider, measurements, visionFor, contextTokens, connectError, listModels, modelsAt, visionProbe, manualTarget, machineModels, propsSource, fetchJson, fetch: machineFetch, beginTurn, busy, onTurn, label: (role) => ROLE_LABEL[role] || role };
+  return { target, remoteRoles, effectiveRoles, localRoles, ready, provider, measuredProvider, measurements, visionFor, contextTokens, connectError, listModels, modelsAt, visionProbe, manualTarget, machineModels, propsSource, fetchJson, fetch: machineFetch, beginTurn, busy, onTurn, during, label: (role) => ROLE_LABEL[role] || role };
 }
 
 module.exports = { createChatMachines, modelIds, propsFactsOf, NOT_MEASURED_ON_MACHINES, ROLE_LABEL, CHAT_ROLES };

@@ -12,7 +12,9 @@
 //  - administrator-started only (routes/inference-machines.cjs: admin, `confirm: true`), never automatic;
 //  - one run at a time across all machines, and never while that machine serves a chat turn: it does not start when
 //    chatMachines.busy(machine) and stops (state 'interrupted') the moment a turn starts there (chatMachines.onTurn);
-//  - an abort that stops the request in flight;
+//  - an abort that stops the request in flight. It closes noevia's connection at once; a llama-server answering a
+//    non-streaming request may still finish (or only notice the closed socket at its next check) the work it had
+//    started, so the machine can stay busy briefly after Stop;
 //  - every request through the role's on-this-network fetch (chatMachines.fetch: serviceFetch, link-local refused,
 //    redirects never followed) with no Authorization header: no local key reaches another host.
 //
@@ -22,7 +24,8 @@
 //    else completion tokens over wall time), and speculative-decoding acceptance where the server drafts
 //    (`timings.draft_n` / `draft_n_accepted`; a server without a draft model reports none, and nothing is guessed);
 //  - `prefill:<tokens>`: prompt reading speed at a few context sizes up to 3/4 of its context (max_tokens 1, the prompt
-//    cache off, a per-run marker so no earlier prompt is reused).
+//    cache off, a per-run marker so no earlier prompt is reused). The filler is ~16 tokens per sentence on common
+//    tokenizers, more on some, so the largest size is kept to 2/3 of the context to leave room for an underestimate.
 // The result is kept per machine id + model as served (the #1854 keys, never a file name) in the settings store, and
 // shown on that role's measured line in Settings → Inference machines, apart from this machine's numbers.
 //
@@ -144,7 +147,7 @@ function createMachineTune({ machines, chatMachines, store, audit = () => {}, no
   }
 
   function planSteps(contextTokens) {
-    const sizes = PREFILL_SIZES.filter((n) => !contextTokens || n <= Math.floor(contextTokens * 0.75));
+    const sizes = PREFILL_SIZES.filter((n) => !contextTokens || n <= Math.floor((contextTokens * 2) / 3));
     return ['props', ...WORKLOADS.map((w) => `decode:${w.id}`), ...(sizes.length ? sizes : [PREFILL_SIZES[0]]).map((n) => `prefill:${n}`)];
   }
 

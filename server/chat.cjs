@@ -745,7 +745,11 @@ function createChatHandler({
     const VISION_DESCRIBE_MAX_TOKENS = 1536;
     let describeFailure = null; // 'timeout' | 'failed' | 'unreachable' (#1840) once a describe attempt did not produce text
     let describeUnreachable = '';
-    const describeImages = async (visionModel, baseUrl, headers, question, onMachine = null) => {
+    // #1880: a description on the Vision role's machine counts as a turn there while it runs.
+    const describeImages = (visionModel, baseUrl, headers, question, onMachine = null) => (onMachine && typeof chatMachines?.during === 'function'
+      ? chatMachines.during(onMachine, () => describeImagesNow(visionModel, baseUrl, headers, question, onMachine))
+      : describeImagesNow(visionModel, baseUrl, headers, question, onMachine));
+    const describeImagesNow = async (visionModel, baseUrl, headers, question, onMachine = null) => {
       const key = crypto.createHash('sha256').update(JSON.stringify([currentWorkspace().userId, baseUrl, visionModel, project.id, headers, attachedImages, question])).digest('hex');
       const cached = visionDescriptions.get(key);
       if (cached && cached.until > Date.now()) return cached.text;
@@ -1525,6 +1529,8 @@ function createChatHandler({
             }
             let bytes;
             try { bytes = image.bytes(); } catch { return null; }
+            // #1880: a caption on the Vision role's machine counts as a turn there while it runs.
+            const releaseCaption = captionRemote && typeof chatMachines?.beginTurn === 'function' ? chatMachines.beginTurn(captionRemote.machine.id) : () => {};
             try {
               const r = await (captionRemote ? chatMachines.fetch : fetch)(`${String(captionProvider.baseUrl).replace(/\/+$/, '').replace(/\/v1$/, '')}/v1/chat/completions`, {
                 method: 'POST', headers: { 'Content-Type': 'application/json', ...providerHeaders(captionProvider) }, redirect: 'error',
@@ -1539,6 +1545,7 @@ function createChatHandler({
               if (!text || out?.choices?.[0]?.finish_reason === 'length') return null;
               return { caption: text, model: visionModel };
             } catch (err) { console.warn(`[vision] caption failed: ${String((err && err.message) || err)}`); return null; }
+            finally { releaseCaption(); }
           },
         });
       };
