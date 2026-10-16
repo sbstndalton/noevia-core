@@ -310,7 +310,34 @@ function readProjectsFile(file) {
  * workspace calls load() once, refresh(projects) at each request start and save(projects) for
  * saveProjects; the array is updated in place.
  */
-function createProjectsFile(file, { atomicJson, warn = console.warn, lock = withFileLock } = {}) {
+/** The file's stamp when it still holds exactly `text` (what this process just had the store
+ *  write), so the next request start does not take its own save for the other writer's; else null
+ *  (re-read). Node only reads the file here. */
+function stampIfStill(file, text) {
+  try {
+    const fd = fs.openSync(file, 'r');
+    try { const st = fs.fstatSync(fd); return fs.readFileSync(fd, 'utf8') === text ? stampOf(st) : null; } finally { fs.closeSync(fd); }
+  } catch { return null; }
+}
+
+/** projects.json text as Node's atomicJson writes it. */
+const projectsText = (projects) => JSON.stringify({ projects }, null, 2);
+
+/** The store's text of projects.json as readProjectsFile reads the file: `{ projects }` or corrupt. */
+function parseProjectsText(text) {
+  if (text === null) return { projects: [], corrupt: false };
+  try {
+    const v = JSON.parse(text);
+    if (v && typeof v === 'object' && !Array.isArray(v) && (v.projects === undefined || v.projects === null)) return { projects: [], corrupt: false };
+    if (v && Array.isArray(v.projects)) return { projects: v.projects, corrupt: false };
+  } catch { /* corrupt */ }
+  return { projects: null, corrupt: true };
+}
+
+/** `remote` (#1264, project-store-client.cjs): { client, user, queue }. Given, save() writes
+ *  through the Rust store (a compare-and-swap, async, no flock) and returns a promise; without
+ *  it, the flock path below, unchanged. */
+function createProjectsFile(file, { atomicJson, warn = console.warn, lock = withFileLock, remote = null } = {}) {
   const state = { base: new Map(), stamp: null };
   const byId = (list) => { const m = new Map(); for (const p of list) { const id = idOf(p); if (id !== null && !m.has(id)) m.set(id, p); } return m; };
 
@@ -344,6 +371,9 @@ function createProjectsFile(file, { atomicJson, warn = console.warn, lock = with
     },
     /** At each request start: takes in the other writer's changes (no lock: its writes are renames). */
     refresh(localArray) {
+      // #1264: a store save in flight re-reads the file itself and leaves the stamp unset, so the
+      // first request after it takes in the rest; refreshing now would move its base under it.
+      if (remote && remote.queue.pending()) return false;
       if (stampOf(statOrNull(file)) === state.stamp) return false;
       const read = readProjectsFile(file);
       if (read.corrupt) return false; // keep this view; the next save replaces the file
@@ -360,6 +390,7 @@ function createProjectsFile(file, { atomicJson, warn = console.warn, lock = with
     /** saveProjects: the merge, written under the lock. `afterWrite(result)` runs still holding it
      *  (#1806: the source-text collection, so it sees exactly what was written). */
     save(localArray, afterWrite = null) {
+      if (remote) return remote.queue.run('projects.json', () => saveRemote(localArray, afterWrite));
       lock(file, () => {
         const read = readProjectsFile(file);
         if (read.corrupt) {
@@ -376,6 +407,44 @@ function createProjectsFile(file, { atomicJson, warn = console.warn, lock = with
       });
     },
   };
+
+  /** The same merge as save(), against the store's copy, written only if it is still that copy.
+   *  Nothing awaits between a merge and its text, so the text is one consistent view; what this
+   *  process changes while the write is in flight is merged in after it (and saved by the save
+   *  that change asked for, queued behind this one). */
+  async function saveRemote(localArray, afterWrite) {
+    const { MAX_ATTEMPTS, busy } = require('./project-store-client.cjs');
+    // A save before this one failed: this view holds a change the disk does not, so it never writes.
+    if (remote.failed) throw remote.failed;
+    try { return await attempts(); }
+    // #1915: marked here, synchronously, before any other queued save of this view can start.
+    catch (e) { remote.failed = remote.failed || e; throw e; }
+    async function attempts() {
+    for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt += 1) {
+      const snap = await remote.client.read(remote.user, 'projects.json');
+      const disk = parseProjectsText(snap.text);
+      let written;
+      if (disk.corrupt) {
+        warn(`[rust-projects] ${file} is not readable as { projects: [...] }; replacing it with this process's view`);
+        written = Array.from(localArray);
+      } else written = merge(localArray, state.base, disk.projects).result;
+      const text = projectsText(written);
+      const done = await remote.client.write(remote.user, 'projects.json', snap.version, text);
+      if (done.conflict) continue;
+      // `written` is on disk now: take it in as a refresh would, keeping what changed here since.
+      const writtenCopy = JSON.parse(projectsText(written)).projects;
+      const { result, adopt } = merge(localArray, state.base, writtenCopy);
+      apply(localArray, result, adopt);
+      rebase(writtenCopy);
+      state.stamp = stampIfStill(file, text);
+      // The source-text collection keeps what either list points at: this view now, and anything
+      // written that it no longer holds (each project once).
+      if (afterWrite) { const here = new Set(localArray.map(idOf)); afterWrite([...localArray, ...writtenCopy.filter((p) => !here.has(idOf(p)))]); }
+      return;
+    }
+    throw busy();
+    }
+  }
 }
 
 /** Whether the chat-list slice is on (see the header): the switch, and the supervisor's
@@ -434,7 +503,8 @@ function mergeFreeChats(ours, base, theirs) {
  * header). The workspace calls load() once for its `freeChats`, refresh(workspace) at each request
  * start and save(workspace) for saveFreeChats; an array is updated in place.
  */
-function createFreeChatsFile(file, { atomicJson, warn = console.warn, lock = withFileLock } = {}) {
+/** `remote`: as createProjectsFile's. */
+function createFreeChatsFile(file, { atomicJson, warn = console.warn, lock = withFileLock, remote = null } = {}) {
   // base: JSON.stringify of the value as last read from (or written to) disk.
   const state = { base: JSON.stringify([]), stamp: null };
   const baseList = () => { try { const v = JSON.parse(state.base); return Array.isArray(v) ? v : null; } catch { return null; } };
@@ -454,6 +524,7 @@ function createFreeChatsFile(file, { atomicJson, warn = console.warn, lock = wit
     },
     /** At each request start: takes in the other writer's change (no lock: its writes are renames). */
     refresh(workspace) {
+      if (remote && remote.queue.pending()) return false; // #1264: as createProjectsFile's
       if (stampOf(statOrNull(file)) === state.stamp) return false;
       const read = readFreeChatsFile(file);
       if (read.invalid) return false; // keep this view; the next save replaces the file
@@ -466,6 +537,7 @@ function createFreeChatsFile(file, { atomicJson, warn = console.warn, lock = wit
     },
     /** saveFreeChats: this process's list, merged with the other writer's when it wrote since. */
     save(workspace) {
+      if (remote) return remote.queue.run('free-chats.json', () => saveRemote(workspace));
       lock(file, () => {
         const read = readFreeChatsFile(file);
         const local = workspace.freeChats, base = baseList();
@@ -479,6 +551,40 @@ function createFreeChatsFile(file, { atomicJson, warn = console.warn, lock = wit
       });
     },
   };
+
+  /** save()'s merge against the store's copy, compare-and-swapped (see createProjectsFile). */
+  async function saveRemote(workspace) {
+    const { MAX_ATTEMPTS, busy } = require('./project-store-client.cjs');
+    // A save before this one failed: this view holds a change the disk does not, so it never writes.
+    if (remote.failed) throw remote.failed;
+    try { return await attempts(); }
+    // #1915: marked here, synchronously, before any other queued save of this view can start.
+    catch (e) { remote.failed = remote.failed || e; throw e; }
+    async function attempts() {
+    for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt += 1) {
+      const snap = await remote.client.read(remote.user, 'free-chats.json');
+      let disk; let invalid = false;
+      if (snap.text === null) disk = [];
+      else { try { disk = JSON.parse(snap.text); } catch { invalid = true; } }
+      const local = workspace.freeChats, base = baseList();
+      const localJson = JSON.stringify(local);
+      let out = local;
+      if (invalid) warn(`[rust-projects] ${file} is not JSON; replacing it with this process's list`);
+      else if (JSON.stringify(disk) !== state.base && Array.isArray(local) && Array.isArray(disk) && base) out = mergeFreeChats(local, base, disk);
+      const text = JSON.stringify(out, null, 2);
+      const done = await remote.client.write(remote.user, 'free-chats.json', snap.version, text);
+      if (done.conflict) continue;
+      const written = JSON.parse(text);
+      const now = workspace.freeChats;
+      // Changed here while the write was in flight: those changes over what was written.
+      put(workspace, JSON.stringify(now) === localJson || !Array.isArray(now) || !Array.isArray(written) ? written : mergeFreeChats(now, JSON.parse(localJson), written));
+      state.base = JSON.stringify(written);
+      state.stamp = stampIfStill(file, text);
+      return;
+    }
+    throw busy();
+    }
+  }
 }
 
 /** For Node's copies of the Rust-owned write routes: true when it answered 503. */

@@ -102,6 +102,10 @@ const RUST_PROJECT_CHATS = RUST_PROJECTS && require('./rust-projects.cjs').chats
 const RUST_FREE_CHATS = RUST_PROJECTS && require('./rust-projects.cjs').freeChatsEnabledFrom(process.env, () => {});
 // sbstndalton/noevia#1264: the project writes ported to the front, on their own confirmed switch.
 const RUST_PROJECT_WRITES = RUST_PROJECTS && require('./rust-projects.cjs').projectWritesEnabledFrom(process.env);
+// sbstndalton/noevia#1264: both files written through the Rust front's internal store, not under flock.
+const PROJECT_STORE = RUST_FREE_CHATS && require('./project-store-client.cjs').enabledFrom(process.env)
+  ? require('./project-store-client.cjs').clientFromEnv(process.env)
+  : (delete process.env.NOEVIA_PROJECT_STORE_TOKEN, null); // #1916: never kept, used or not
 const authService = createAuth({
   rustAuth,
   dataDir: DATA_DIR,
@@ -197,7 +201,9 @@ const DEFAULT_PROVIDER_CAPABILITIES = require('./providers.cjs').engineCapabilit
 // Set once the chat vault mirror exists (below); until then there is nothing to nudge.
 let projectsChangedElsewhere = () => {};
 const workspaceStore = createWorkspaceStore(DATA_DIR, { id: DEFAULT_PROVIDER_ID, label: DEFAULT_PROVIDER_LABEL, baseUrl: INFERENCE_BASE, apiKey: INFERENCE_KEY, shared: true,
-  ...(DEFAULT_PROVIDER_CAPABILITIES ? { capabilities: DEFAULT_PROVIDER_CAPABILITIES } : {}) }, secretStore, { rustProjects: RUST_PROJECTS, rustFreeChats: RUST_FREE_CHATS,
+  ...(DEFAULT_PROVIDER_CAPABILITIES ? { capabilities: DEFAULT_PROVIDER_CAPABILITIES } : {}) }, secretStore, { rustProjects: RUST_PROJECTS, rustFreeChats: RUST_FREE_CHATS, projectStore: PROJECT_STORE,
+  // #1264: each store save is counted against the request that caused it (holdForStoreSaves).
+  onStoreSave: (promise) => { const scope = requestScope.getStore(); if (scope && scope.storeSaves) scope.storeSaves.push(promise); },
   // M4: the front saved a project or free-chat write Node's request would have followed with a
   // mirror nudge (chat-vault-mirror.cjs mirrorTrigger: any successful write under /api/projects or
   // /api/freechats).
@@ -1180,8 +1186,11 @@ async function handleRequestInner(req, res) {
       process.env.CORPUS_BACKEND === 'webdav' && authService.getStorage(preAuth.user.id).kind === 'local') {
     authService.saveStorage(preAuth.user.id, { kind: 'webdav', baseUrl: process.env.WEBDAV_BASE_URL || '', username: process.env.WEBDAV_USERNAME || '', secret: process.env.WEBDAV_PASSWORD || '', corpusRoot: process.env.CORPUS_ROOT || '' });
   }
-  return requestScope.run({ workspace, authn: preAuth }, () => handleRequestScoped(req, res));
+  const storeSaves = PROJECT_STORE ? [] : null;
+  if (storeSaves) require('./project-store-client.cjs').holdForStoreSaves(res, storeSaves);
+  return requestScope.run({ workspace, authn: preAuth, storeSaves }, () => handleRequestScoped(req, res));
 }
+
 
 async function handleRequestScoped(req, res) {
   // A Host header that is not a valid host makes this parse fail even when the path did not.

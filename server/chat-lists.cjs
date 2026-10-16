@@ -30,6 +30,16 @@ function addTombstone(dir, id) {
   fs.renameSync(tmp, file);
 }
 
+/** #1914: takes back a tombstone this process just wrote for a delete whose save then failed (the
+ *  chat is still in its list on disk, so it must stay reachable). Best effort. */
+function removeTombstone(dir, id) {
+  const drop = new Set([String(id), safeChatId(id)].filter(Boolean));
+  const ids = [...readTombstones(dir)].filter((x) => !drop.has(x));
+  const file = tombstoneFile(dir), tmp = `${file}.${process.pid}.tmp`;
+  fs.writeFileSync(tmp, JSON.stringify(ids));
+  fs.renameSync(tmp, file);
+}
+
 /** Chat framing (#737): a client that does not know about frames (an older tab) sends metas without
  *  one, which must not erase the stored frame; `frame: null` clears it on purpose. createdAt is set
  *  once and never moves. An invalid frame is ignored rather than stored. */
@@ -79,4 +89,4 @@ function listHolding(chatId, freeChats, projects) {
   return proj ? proj.id : null;
 }
 
-module.exports = { mergeChats, skippedElsewhere, readTombstones, addTombstone, safeChatId, listHolding, LIST_CAP };
+module.exports = { mergeChats, skippedElsewhere, readTombstones, addTombstone, removeTombstone, safeChatId, listHolding, LIST_CAP };

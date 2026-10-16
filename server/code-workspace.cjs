@@ -115,9 +115,18 @@ function pinnedPaths(list) {
 // projection bounds what is sent on.
 const CHANGE_MAX_BUFFER = 16 * 1024 * 1024;
 
+// #1916: git gets what it needs to run, not the server's environment (its secrets: provider keys,
+// the project-store secret). The caller's own GIT_* settings are added on top.
+const GIT_ENV_KEYS = ['PATH', 'HOME', 'LANG', 'LC_ALL', 'LC_CTYPE', 'TZ', 'TMPDIR', 'USER', 'LOGNAME'];
+function gitEnv(env = {}, base = process.env) {
+  const out = {};
+  for (const key of GIT_ENV_KEYS) if (typeof base[key] === 'string') out[key] = base[key];
+  return { ...out, ...env };
+}
+
 /** `options.maxBuffer` overrides the default; `options.raw` keeps the output untrimmed. */
 function defaultRun(args, cwd, env = {}, { maxBuffer, raw = false } = {}) {
-  const out = execFileSync('git', args, { cwd, env: { ...process.env, ...env }, encoding: 'utf8',
+  const out = execFileSync('git', args, { cwd, env: gitEnv(env), encoding: 'utf8',
     stdio: ['ignore', 'pipe', 'pipe'], timeout: 120_000, ...(maxBuffer ? { maxBuffer } : {}) });
   return raw ? out : out.trim();
 }
@@ -749,4 +758,4 @@ function defaultChown(target, uid, gid) {
   walk(target);
 }
 
-module.exports = { createCodeWorkspaces, defaultChown, BRANCH_PREFIX };
+module.exports = { gitEnv, createCodeWorkspaces, defaultChown, BRANCH_PREFIX };
