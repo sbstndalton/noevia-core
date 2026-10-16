@@ -100,9 +100,11 @@ function createQueue() {
     run(key, task) {
       if (waiting.has(key)) return waiting.get(key);
       inFlight += 1;
-      const p = tail.then(() => { waiting.delete(key); return task(); });
+      // Counted down before the save's own promise settles, so a caller that awaited it never
+      // sees it still in flight (a request-start refresh would be skipped).
+      const p = tail.then(async () => { waiting.delete(key); try { return await task(); } finally { inFlight -= 1; } });
       waiting.set(key, p);
-      tail = p.catch(() => {}).finally(() => { inFlight -= 1; });
+      tail = p.catch(() => {});
       return p;
     },
     pending() { return inFlight > 0 ? tail : null; },

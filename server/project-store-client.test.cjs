@@ -326,3 +326,22 @@ test('a request start does not take this process\'s own store save for the other
     assert.deepEqual(ws.projects.map((p) => p.id), ['p1', 'rust']);
   } finally { await store.close(); }
 });
+
+test('the queue: a save that settled is no longer pending for the code awaiting it', async () => {
+  const q = psc.createQueue();
+  const p = q.run('k', async () => 1);
+  assert.ok(q.pending());
+  assert.equal(await p, 1);
+  assert.equal(q.pending(), null);
+  const f = q.run('k', async () => { throw psc.busy(); });
+  await assert.rejects(f);
+  assert.equal(q.pending(), null);
+  // A not-yet-started save is shared.
+  let runs = 0;
+  const gate = q.run('a', () => new Promise((r) => setTimeout(r, 20)));
+  const one = q.run('b', async () => { runs += 1; });
+  const two = q.run('b', async () => { runs += 1; });
+  assert.equal(one, two);
+  await Promise.all([gate, one]);
+  assert.equal(runs, 1);
+});
