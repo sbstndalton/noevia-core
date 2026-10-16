@@ -1,6 +1,7 @@
 'use strict';
 const { readCappedJson } = require('./http.cjs');
 const workers = require('./document-workers.cjs');
+const { uploadInit } = require('./upload-body.cjs');
 // Client for the private Docling worker (services/docling). Only the
 // operator-configured worker receives bytes, never a model or a cloud API —
 // same rule as ocr.cjs, and the same shape, deliberately.
@@ -67,7 +68,7 @@ async function extractDocument(name, bytes, options = {}) {
   const url = options.url === undefined ? target.url : options.url;
   const fetchImpl = options.fetchImpl || (options.url === undefined ? target.fetch : fetch);
   if (!url) throw new Error('Document extraction is not configured.');
-  const response = await fetchImpl(`${url.replace(/\/+$/, '')}/extract`, {
+  const response = await fetchImpl(`${url.replace(/\/+$/, '')}/extract`, uploadInit(bytes, {
     method: 'POST',
     redirect: 'error',
     // The worker reads the suffix and nothing else, and refuses a name that could be a path —
@@ -77,7 +78,7 @@ async function extractDocument(name, bytes, options = {}) {
     // is why a synthetic test did not catch it (2026-09-21).
     headers: { 'Content-Type': 'application/octet-stream', 'X-Document-Name': headerSafeName(documentName(name)), ...(figures ? { 'X-Document-Figures': '1' } : {}),
       ...(range ? { 'X-Document-Pages': `${range[0]}-${range[1]}` } : {}) },
-    body: bytes,
+    // #1885: a SAB-backed read goes as a sized stream (upload-body.cjs).
     // Measured on DaServer (2 CPUs, CPU-only torch), not assumed:
     //   scanned prose, OCR   3.4 s/page
     //   table-heavy native   10.9 s/page  <- TableFormer, not OCR, is the cost
@@ -89,7 +90,7 @@ async function extractDocument(name, bytes, options = {}) {
     // A range is bounded by its own length instead (#1864): two minutes plus a minute a page, five
     // times the measured worst case per page, and never more than the whole-document limit.
     signal: AbortSignal.timeout(range ? Math.min(3900000, 120000 + (range[1] - range[0] + 1) * 60000) : 3900000),
-  });
+  }));
   if (!response.ok) {
     // 503 and 415 are the two a user can act on, so they say something useful;
     // everything else is a retry.

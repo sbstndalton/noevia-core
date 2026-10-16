@@ -30,7 +30,8 @@ const sizeBlocked = (p) => p.retry?.outcome === 'failed' && String(p.retry.error
 /** #1867: a completed result that a worker accepting larger bodies could still finish: its OCR was refused
  *  for size alone. completeDocument re-opens it once, when the worker now takes the file. */
 const reopenable = (out) => out?.completion === COMPLETION && Array.isArray(out.pageTexts)
-  && (out.errorId === 'ocrTooLarge' || out.pageTexts.some(sizeBlocked));
+  && (out.errorId === 'ocrTooLarge' || out.pageTexts.some(sizeBlocked) || sabFailed(out));
+// (#1885: or one an upload of a large shared-memory read failed, reopened once; sabFailed below.)
 /** The OCR worker's capabilities (ocr.cjs), or null when it cannot be asked; never throws. */
 const capabilitiesOf = async (ocrCapabilities) => { try { return await ocrCapabilities(); } catch { return null; } };
 // #1864/#1865: the pass that reads the pages past the first window and retries incomplete pages with OCR.
@@ -219,7 +220,7 @@ async function ocrNativePages(bytes, candidates, { extractPages, remaining, cap,
         p.status = p.truncated ? 'truncated' : 'ocr';
         p.method = 'native+ocr';
       }
-    } catch (err) { retryable = true; ocrError = String(err.message || err).slice(0, 300); ocrErrorId = undefined; }
+    } catch (err) { retryable = true; ocrError = userReason(err, 'OCR').slice(0, 300); ocrErrorId = undefined; }
   }
   if (candidates.length > Math.max(0, cap)) { ocrError = 'OCR limited to 50 image-bearing pages per document.'; ocrErrorId = 'ocrPageLimit'; }
   return { retryable, ocrError, ocrErrorId, remaining, sent: chosen.length };
@@ -309,6 +310,38 @@ const isBusy = (err) => err?.status === 503 || err?.limit === 'queue';
 // timeout is NOT one: the same page would time out again (document-sources.cjs serviceDown, #1770).
 const isPassing = (err) => isBusy(err) || err?.status === 400
   || /busy|unavailable|not configured|fetch failed|ECONNREFUSED|ECONNRESET|ENOTFOUND|EAI_AGAIN|EHOSTUNREACH/i.test(String(err?.message || ''));
+// #1885: a raw JavaScript error (a TypeError from fetch, say) is noevia's own fault, not the worker's or
+// the document's; its text means nothing to a user. It is logged (name and message only, never document
+// content) and stored as a short reason. The worker's own errors and noevia's worded ones are kept.
+const INTERNAL_ERRORS = new Set(['TypeError', 'RangeError', 'ReferenceError', 'SyntaxError', 'DataCloneError']);
+const INTERNAL_REASON = 'noevia could not send this document to the reader (an internal error); it will be tried again after an update';
+function userReason(err, where) {
+  const message = String(err?.message || err || '');
+  const internal = (INTERNAL_ERRORS.has(err?.name) && !/fetch failed|terminated/i.test(message)) || /SharedArrayBuffer|ArrayBuffer/.test(message);
+  if (!internal) return message;
+  console.warn(`[documents] ${where}: internal error (${String(err?.name || 'Error').slice(0, 40)}): ${message.slice(0, 200)}`);
+  return INTERNAL_REASON;
+}
+// #1885: results stored while uploads of large (SAB-backed) reads failed. Such a failure is not final: the
+// pages, the stopped range read and the OCR error it left are reopened once on the next read. A rerun that
+// fails again stores the worded reason above, which never matches, so it is reopened once and no more.
+const SAB_FAILURE = /SharedArrayBuffer is not allowed/;
+const sabFailedPage = (p) => p?.retry?.outcome === 'failed' && SAB_FAILURE.test(String(p.retry.error || ''));
+const sabFailed = (out) => !!out && (SAB_FAILURE.test(String(out.error || '')) || SAB_FAILURE.test(String(out.stoppedAt?.error || ''))
+  || (Array.isArray(out.pageTexts) && out.pageTexts.some(sabFailedPage)));
+function reopenSabFailure(out) {
+  if (!sabFailed(out)) return out;
+  const pageTexts = Array.isArray(out.pageTexts) ? out.pageTexts.map((p) => {
+    if (!sabFailedPage(p)) return p;
+    const { retry: _r, ...rest } = p; return rest;
+  }) : out.pageTexts;
+  const { completion: _c, rangeAttempts: _a, ...rest } = out;
+  const next = { ...rest, pageTexts };
+  if (SAB_FAILURE.test(String(out.stoppedAt?.error || ''))) delete next.stoppedAt;
+  if (SAB_FAILURE.test(String(out.error || ''))) { delete next.error; delete next.errorId; }
+  return next;
+}
+
 /** A page whose retry failed for a passing reason and may be tried again on a later read. */
 const retryDue = (p) => RETRY_STATUSES.has(p.status) && p.retry?.outcome === 'failed' && p.retry.again === true;
 /** `fn`, asked again while the worker answers busy (it has one slot), BUSY_WAITS_MS apart; then the error. */
@@ -328,6 +361,7 @@ async function patiently(fn, waits = BUSY_WAITS_MS) {
  * A result that is itself a transient failure (`retryable`) is left alone: it is read again whole anyway.
  */
 async function completeDocument(name, bytes, out, deps = {}) {
+  out = reopenSabFailure(out);
   if (!out || (out.completion === COMPLETION && !reopenable(out)) || out.retryable || !Array.isArray(out.pageTexts) || !out.pageTexts.length) return out;
   if (!/\.pdf$/i.test(String(name || ''))) return { ...out, completion: COMPLETION };
   return largeLock.ifLarge(bytes.length, () => completeUnlocked(name, bytes, out, deps), () => byteRef(bytes));
@@ -398,7 +432,7 @@ async function completeUnlocked(name, bytes, out, deps) {
     } catch (err) {
       // A worker that said it reads ranges but did not: the rest is read here instead.
       if (viaDocling && err?.code === 'no-ranges') { viaDocling = false; continue; }
-      stoppedAt = { page: next - 1, limit: 'error', error: String(err?.limit ? nativeFailure(err) : err?.message || err).slice(0, 200) };
+      stoppedAt = { page: next - 1, limit: 'error', error: String(err?.limit ? nativeFailure(err) : userReason(err, 'range read')).slice(0, 200) };
       // #1871: a passing stop (busy, unreachable) is resumed on later reads, at most RETRY_ATTEMPTS in all;
       // then the stop is stored as final.
       rangeAttempts = (Number(out.rangeAttempts) || 0) + 1;
@@ -494,7 +528,7 @@ async function retryIncompletePages(bytes, pages, { ocrEnabled, extractPages, ro
       if (!Array.isArray(results)) throw new Error('Invalid OCR response.');
     } catch (err) {
       const timedOut = /timeout|aborted/i.test(String(err?.name || '') + String(err?.message || ''));
-      const reason = timedOut ? 'OCR took too long' : String(err?.message || err).slice(0, 200);
+      const reason = timedOut ? 'OCR took too long' : userReason(err, 'OCR retry').slice(0, 200);
       // #1882: core giving up on a whole batch says nothing about one page: it is tried again on a later
       // read (bounded by RETRY_ATTEMPTS), not marked final.
       const passingFailure = isPassing(err) || timedOut;
@@ -527,4 +561,4 @@ async function retryIncompletePages(bytes, pages, { ocrEnabled, extractPages, ro
 
 // A test may pin the version (multimodal-followups-1770-1772.test.cjs assigns it); production never does.
 let versionOverride = null;
-module.exports = { ocrDeferrals, isDocument, documentExtensions, extractDocumentText, completeDocument, ocrBudget, COMPLETION, WHOLE_BYTES, RETRY_PAGE_CAP, RETRY_DPI, RETRY_ATTEMPTS, RETRY_BATCH, retryTimeoutMs, OCR_MAX_BYTES, reopenable, DOCUMENT_EXTENSIONS, EXTRACT_CAP, get EXTRACTOR_VERSION() { return versionOverride ?? extractorVersion(); }, set EXTRACTOR_VERSION(v) { versionOverride = v; }, PAGE_CAP, TOTAL_TEXT_CAP };
+module.exports = { userReason, reopenSabFailure, ocrDeferrals, isDocument, documentExtensions, extractDocumentText, completeDocument, ocrBudget, COMPLETION, WHOLE_BYTES, RETRY_PAGE_CAP, RETRY_DPI, RETRY_ATTEMPTS, RETRY_BATCH, retryTimeoutMs, OCR_MAX_BYTES, reopenable, DOCUMENT_EXTENSIONS, EXTRACT_CAP, get EXTRACTOR_VERSION() { return versionOverride ?? extractorVersion(); }, set EXTRACTOR_VERSION(v) { versionOverride = v; }, PAGE_CAP, TOTAL_TEXT_CAP };

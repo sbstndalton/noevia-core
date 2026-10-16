@@ -451,13 +451,13 @@ async function writeFile(conn, rawPath, bytes, { ifMatch, ifNoneMatch } = {}) {
   const conditional = !!ifMatch || ifNoneMatch === '*';
   let response;
   try {
-    response = await withRetry(() => fetch(davUrl(conn, path), {
+    // #1885: a re-written large read is SAB-backed; a fresh stream per attempt.
+    response = await withRetry(() => fetch(davUrl(conn, path), require('./upload-body.cjs').uploadInit(bytes, {
       method: 'PUT',
       headers: davHeaders(conn, { 'Content-Type': 'application/octet-stream', ...(ifMatch ? { 'If-Match': quoteEtag(ifMatch) } : {}), ...(ifNoneMatch === '*' ? { 'If-None-Match': '*' } : {}) }),
-      body: bytes,
       signal: AbortSignal.timeout(60000),
       redirect: 'error',
-    }), { once: conditional });
+    })), { once: conditional });
   } catch (err) {
     if (!conditional) throw err;
     throw Object.assign(new Error(`the connection to storage failed while writing "${path}"; it may or may not have been saved`), { status: 502, code: 'unknown' });

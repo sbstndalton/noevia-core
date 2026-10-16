@@ -93,6 +93,12 @@ function requestBody(body, headers) {
   if (Buffer.isBuffer(body)) return body;
   if (body instanceof Uint8Array) return Buffer.from(body.buffer, body.byteOffset, body.byteLength);
   if (body instanceof ArrayBuffer) return Buffer.from(body);
+  // #1885: a sized stream (upload-body.cjs, a large SAB-backed read). The length must be given: the
+  // services this reaches refuse a chunked body.
+  if (typeof ReadableStream !== 'undefined' && body instanceof ReadableStream) {
+    if (!headers.has('content-length')) throw new TypeError('publicFetch: a stream body needs a Content-Length');
+    return { stream: body };
+  }
   throw new TypeError('publicFetch: unsupported body type');
 }
 
@@ -140,7 +146,7 @@ function sendWithLookup(url, init, lookup) {
   const method = String(init.method || 'GET').toUpperCase();
   const headers = new Headers(init.headers || {});
   const body = requestBody(init.body, headers);
-  if (body) headers.set('content-length', String(body.length));
+  if (body && !body.stream) headers.set('content-length', String(body.length));
   const outgoing = {};
   headers.forEach((v, k) => { outgoing[k] = v; });
   const signal = init.signal || undefined;
@@ -181,7 +187,11 @@ function sendWithLookup(url, init, lookup) {
       }
     });
     req.on('error', reject);
-    if (body) req.end(body); else req.end();
+    if (body && body.stream) {
+      const source = Readable.fromWeb(body.stream);
+      source.on('error', (err) => req.destroy(err));
+      source.pipe(req);
+    } else if (body) req.end(body); else req.end();
   });
 }
 

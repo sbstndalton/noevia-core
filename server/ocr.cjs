@@ -1,6 +1,7 @@
 'use strict';
 const { readCappedJson } = require('./http.cjs');
 const workers = require('./document-workers.cjs');
+const { uploadInit } = require('./upload-body.cjs');
 // Only the operator-configured private worker receives bytes, never a model or cloud API.
 const OCR_REPLY_CAP = 16 * 1024 * 1024;
 const VERSION = 'tesseract5-eng-deu-poppler-3500-v1';
@@ -15,11 +16,11 @@ async function extractPages(bytes, pages, options = {}) {
   const url = options.url === undefined ? target.url : options.url;
   const fetchImpl = options.fetchImpl || (options.url === undefined ? target.fetch : fetch);
   if (!url) return [];
-  const response = await fetchImpl(`${url.replace(/\/+$/, '')}/extract`, {
+  const response = await fetchImpl(`${url.replace(/\/+$/, '')}/extract`, uploadInit(bytes, {
     method: 'POST', redirect: 'error', headers: { 'Content-Type': 'application/pdf', 'X-OCR-Pages': JSON.stringify(pages.slice(0, 50)),
       ...(RETRY_DPIS.has(options.dpi) ? { 'X-OCR-DPI': String(options.dpi) } : {}) },
-    body: bytes, signal: AbortSignal.timeout(Number.isSafeInteger(options.timeoutMs) && options.timeoutMs > 0 ? Math.min(options.timeoutMs, 610000) : 610000),
-  });
+    signal: AbortSignal.timeout(Number.isSafeInteger(options.timeoutMs) && options.timeoutMs > 0 ? Math.min(options.timeoutMs, 610000) : 610000),
+  }));
   if (!response.ok) throw Object.assign(new Error(response.status === 503 ? 'OCR is busy; refresh to retry.' : `OCR unavailable (HTTP ${response.status}); refresh to retry.`), { status: response.status });
   // 50 pages of recognised text per call; 16 MB is far above that (#920).
   const body = await readCappedJson(response, OCR_REPLY_CAP).catch((e) => { throw e?.code === 'too_large' ? new Error('Invalid OCR response; refresh to retry.') : e; });
