@@ -141,6 +141,8 @@ test('index.cjs starts with the pinned module and every retired switch left at j
   t.after(() => fs.rmSync(dataDir, { recursive: true, force: true }));
   const child = require('node:child_process').spawn(process.execPath, [path.join(__dirname, 'index.cjs')], {
     env: { ...process.env, UI_DATA_DIR: dataDir, UI_PORT: '0', PORT: '0', HOST: '127.0.0.1', PUBLIC_ORIGIN: 'http://localhost', DIARY_AUTH_TOKEN: 'test-cowork-token', DAV_PARSE_WASM: wasmFile,
+      // The project store is required (sbstndalton/noevia#1071); nothing is saved in this test.
+      NOEVIA_PROJECT_STORE_PORT: '9', NOEVIA_PROJECT_STORE_TOKEN: 'synthetic-store-token-'.padEnd(64, 'x'), NOEVIA_RUST_PROJECTS: '0',
       DAV_PARSE_IMPL: 'js', S3_PARSE_IMPL: 'js', CHAT_TEMPLATE_CAPS_IMPL: 'off', AUTOTUNE_PLAN_IMPL: 'js', PRESET_RELOAD_IMPL: 'off', LAYA_LOAD_ADVISOR: 'off',
       MCP_FRAME_IMPL: 'js', UPLOAD_SNIFF_IMPL: 'js', S3_SIGN_IMPL: 'js', PROMPT_FRAMING_IMPL: 'js', SSRF_IMPL: 'js',
       POLICY_LEAVES_IMPL: 'js', CODE_REVIEW_VERDICT_IMPL: 'js', TOOL_EXCHANGE_IMPL: 'js', DECISION_IMPL: 'js', COMPLETENESS_REPORT_IMPL: 'js', TASK_LIFECYCLE_IMPL: 'js', MCP_SERVERS_IMPL: 'js', CODE_NET_GUARD_IMPL: 'js', LLAMACPP_AUTOCONFIG_IMPL: 'js' },
@@ -154,4 +156,16 @@ test('index.cjs starts with the pinned module and every retired switch left at j
   assert.match(out, /\[dav-parse\] dav-parse\.wasm verified/, `stdout ${out.slice(-500)} stderr ${err.slice(-500)}`);
   assert.equal(child.exitCode, null, 'still running');
   for (const flag of Object.keys(davParseWasm.RETIRED_FLAGS)) assert.match(err, new RegExp(`${flag} is retired; Rust is always used`));
+});
+
+test('index.cjs refuses to start without the Rust project store, and a leftover NOEVIA_RUST_PROJECTS is only a warning (#1071)', { skip: skipWasm }, (t) => {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'startup-1071-store-'));
+  t.after(() => fs.rmSync(dataDir, { recursive: true, force: true }));
+  const env = { ...process.env, UI_DATA_DIR: dataDir, UI_PORT: '0', PORT: '0', HOST: '127.0.0.1', PUBLIC_ORIGIN: 'http://localhost', DIARY_AUTH_TOKEN: 'test-cowork-token', DAV_PARSE_WASM: wasmFile, NOEVIA_RUST_PROJECTS: '1' };
+  delete env.NOEVIA_PROJECT_STORE_PORT; delete env.NOEVIA_PROJECT_STORE_TOKEN;
+  const r = spawnSync(process.execPath, [path.join(__dirname, 'index.cjs')], { env, encoding: 'utf8', timeout: 60000 });
+  assert.equal(r.status, 2, `exit ${r.status} signal ${r.signal}\n${r.stderr.slice(-2000)}`);
+  assert.match(r.stderr, /FATAL: the Rust project store is required/);
+  assert.match(r.stderr, /NOEVIA_RUST_PROJECTS is retired/);
+  assert.doesNotMatch(r.stdout, /listening on/);
 });

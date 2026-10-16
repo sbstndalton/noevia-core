@@ -10,6 +10,8 @@ const test = require('node:test');
 const testDataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'noevia-grant-holder-917-'));
 process.env.DIARY_AUTH_TOKEN = 'test-cowork-token';
 process.env.UI_DATA_DIR = testDataDir;
+// #1071: Node saves projects.json / free-chats.json only through the Rust project store.
+require('../tests/server/project-store-server.cjs').installProjectStore(testDataDir);
 process.env.PUBLIC_ORIGIN = 'http://localhost';
 const { chatListHolder } = require('./index.cjs');
 test.after(() => fs.rmSync(testDataDir, { recursive: true, force: true }));

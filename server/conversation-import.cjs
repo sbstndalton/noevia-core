@@ -101,6 +101,10 @@ async function applyRecord(directory, record, ctx, newId) {
     if (active.length) {
       if (group.free) ctx.addFreeChats(active);
       else ctx.addProjectChats(projectId, active);
+      // The lists are saved through the Rust project store (#1264, the only writer since #1071):
+      // the save is written later, so wait for it before reading what is on disk. A failed save
+      // rejects here, and the import answers retry, as a failed synchronous save did.
+      await ctx.whenSaved();
       const committed = ctx.persistedChatIds();
       const dropped = active.filter(c => !committed.has(c.id));
       if (dropped.length) {

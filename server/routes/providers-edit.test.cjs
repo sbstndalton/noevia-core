@@ -3,6 +3,7 @@
 // (who may edit which row, key kept vs replaced, the origin guard, contextTokens bounds); the last
 // tests run the real workspace store so the edit is proven on disk, key encrypted, across a reload.
 const test = require('node:test');
+const { createStubStore } = require('../../tests/server/project-store-stub.cjs');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const os = require('node:os');
@@ -198,7 +199,7 @@ function realStack(t) {
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
   const secrets = createSecretStore(root);
   const defaultProvider = { id: 'default', label: 'Default', baseUrl: 'http://localhost', apiKey: '' };
-  let store = createWorkspaceStore(root, defaultProvider, secrets);
+  let store = createWorkspaceStore(root, defaultProvider, secrets, { projectStore: createStubStore(root) });
   let userId = 'aaaaaaaa-1111-4111-8111-111111111111';
   // Like index.cjs: one workspace per request (requestScope), re-read from the store for each call.
   let current = null;
@@ -224,7 +225,7 @@ function realStack(t) {
   return {
     root, sent, call, ws: () => store.get(userId),
     as(id) { userId = id; },
-    reload() { store = createWorkspaceStore(root, defaultProvider, secrets); },
+    reload() { store = createWorkspaceStore(root, defaultProvider, secrets, { projectStore: createStubStore(root) }); },
   };
 }
 

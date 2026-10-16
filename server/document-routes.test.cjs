@@ -12,6 +12,7 @@ process.env.DIARY_AUTH_TOKEN = 'test-cowork-token';
 process.env.UI_DATA_DIR = testDataDir;
 process.env.LEGACY_AUTH_COMPAT = 'true';
 process.env.PUBLIC_ORIGIN = 'http://localhost';
+require('../tests/server/project-store-server.cjs').installProjectStore(testDataDir);
 
 const { handleRequest } = require('./index.cjs');
 

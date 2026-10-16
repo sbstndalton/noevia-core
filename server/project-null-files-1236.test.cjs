@@ -9,6 +9,7 @@ const os = require('node:os');
 const path = require('node:path');
 const { planEdit } = require('./project-edit-target.cjs');
 const { createWorkspaceStore } = require('./workspace.cjs');
+const { createStubStore } = require('../tests/server/project-store-stub.cjs');
 
 const ROOT = 'noevia projects';
 
@@ -31,7 +32,7 @@ test('#1236: a damaged projects.json with a null file entry loads without the nu
   const userDir = path.join(root, 'users', userId);
   fs.mkdirSync(userDir, { recursive: true });
   fs.writeFileSync(path.join(userDir, 'projects.json'), JSON.stringify({ projects: [{ id: 'p1', name: 'Trip', files: [null, { name: 'a.md', content: 'x' }, 7] }] }));
-  const store = createWorkspaceStore(root, { id: 'default', label: 'Default', apiKey: '' });
+  const store = createWorkspaceStore(root, { id: 'default', label: 'Default', apiKey: '' }, null, { projectStore: createStubStore(root) });
   const workspace = store.get(userId);
   assert.deepEqual(workspace.projects[0].files.map((f) => f.name), ['a.md'], 'only the real entry remains');
 });

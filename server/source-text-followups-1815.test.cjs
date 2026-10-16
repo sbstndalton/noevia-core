@@ -5,6 +5,7 @@
 // projects.json is committed. Synthetic data only.
 
 const assert = require('node:assert/strict');
+const { createStubStore } = require('../tests/server/project-store-stub.cjs');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
@@ -113,12 +114,12 @@ test('#1815: a save fsyncs each text file before its rename and each folder once
   fs.rmSync(dir, { recursive: true, force: true });
 });
 
-test('#1815: workspace.saveProjects commits projects.json only after the batched folder fsync', () => {
+test('#1815: workspace.saveProjects commits projects.json only after the batched folder fsync', async () => {
   const { createWorkspaceStore } = require('./workspace.cjs');
   sourceText._cache.clear();
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'noevia-1815-save-'));
   const USER = '11111111-2222-4333-8444-555555555555';
-  const ws = createWorkspaceStore(root, { id: 'local', label: 'Local', baseUrl: 'http://127.0.0.1:1', apiKey: '' }, null).get(USER);
+  const ws = createWorkspaceStore(root, { id: 'local', label: 'Local', baseUrl: 'http://127.0.0.1:1', apiKey: '' }, null, { projectStore: createStubStore(root) }).get(USER);
   ws.projects.push({ id: 'p1', name: 'P', files: [{ name: 'a.md', content: 'alpha synthetic' }, { name: 'b.md', content: 'bravo synthetic' }], chats: [] });
   const pdir = path.join(ws.dir, 'project-sources', 'p1');
   const log = [];
@@ -128,7 +129,8 @@ test('#1815: workspace.saveProjects commits projects.json only after the batched
   fs.fsyncSync = (fd) => { log.push(['fsync', fdPath.get(fd)]); return orig.fsyncSync(fd); };
   fs.renameSync = (a, b) => { log.push(['rename', String(a), String(b)]); return orig.renameSync(a, b); };
   fs.writeFileSync = (p, ...rest) => { log.push(['write', String(p)]); return orig.writeFileSync(p, ...rest); };
-  try { ws.saveProjects(); } finally { Object.assign(fs, orig); }
+  // #1264: the commit is the project store's write, after the save's await.
+  try { await ws.saveProjects(); } finally { Object.assign(fs, orig); }
   const folderSync = log.findIndex(([k, p]) => k === 'fsync' && p === pdir);
   const commit = log.findIndex(([k, a, b]) => (k === 'rename' && b === path.join(ws.dir, 'projects.json')) || (k === 'write' && a === path.join(ws.dir, 'projects.json')));
   assert.ok(folderSync >= 0, 'the folder is fsynced');

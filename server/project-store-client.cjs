@@ -10,27 +10,21 @@
 // under the same lock its own routes take, so it is the single writer of both files.
 //
 // Everything here is async (fetch with a timeout): nothing blocks the event loop. Permanent: the
-// NOEVIA_RUST_PROJECT_STORE switch is retired and not read. The store is used whenever the
-// supervisor confirms it (NOEVIA_RUST_PROJECT_STORE_CONFIRMED=1, which it sets whenever projects are
-// confirmed and the front lists `project-store`) with a port and secret, over the confirmed
-// projects and free-chat slices; index.cjs refuses to start projects without it.
+// NOEVIA_RUST_PROJECT_STORE switch is retired and not read, and so are NOEVIA_RUST_PROJECTS and the
+// supervisor's confirmations (sbstndalton/noevia#1071): the web supervisor always starts a front
+// that serves the store and hands both processes its port and a secret made for that start.
+// index.cjs refuses to start without them; Node has no other way to save either file.
 
 const MAX_ATTEMPTS = 8;
 const TIMEOUT_MS = 10000;
 const REPLY_CAP = 2 * 32 * 1024 * 1024 + 64 * 1024;
 const FILES = new Set(['projects.json', 'free-chats.json']);
 
-/** Whether Node saves through the Rust store (see the header). */
+/** Whether the environment hands over the Rust store (see the header): its port and secret. */
 function enabledFrom(env = process.env, warn = console.warn) {
-  const rp = require('./rust-projects.cjs');
-  if (!rp.freeChatsEnabledFrom(env, () => {})) return false;
-  if (env.NOEVIA_RUST_PROJECT_STORE_CONFIRMED !== '1') {
-    warn('The Rust project store is not used: the supervisor has not confirmed that the Rust front serves it (NOEVIA_RUST_PROJECT_STORE_CONFIRMED).');
-    return false;
-  }
   const port = Number(env.NOEVIA_PROJECT_STORE_PORT);
   if (!Number.isInteger(port) || port < 1 || port > 65535 || String(env.NOEVIA_PROJECT_STORE_TOKEN || '').length < 32) {
-    warn('The Rust project store is not used: NOEVIA_PROJECT_STORE_PORT or NOEVIA_PROJECT_STORE_TOKEN is missing.');
+    warn('The Rust project store is not configured: NOEVIA_PROJECT_STORE_PORT or NOEVIA_PROJECT_STORE_TOKEN is missing or invalid (the web supervisor sets both).');
     return false;
   }
   return true;

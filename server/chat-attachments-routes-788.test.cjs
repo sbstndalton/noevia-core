@@ -10,6 +10,8 @@ const test = require('node:test');
 const testDataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'noevia-788-route-test-'));
 process.env.DIARY_AUTH_TOKEN = 'test-cowork-token';
 process.env.UI_DATA_DIR = testDataDir;
+// #1071: Node saves projects.json / free-chats.json only through the Rust project store.
+require('../tests/server/project-store-server.cjs').installProjectStore(testDataDir);
 process.env.LEGACY_AUTH_COMPAT = 'true';
 process.env.PUBLIC_ORIGIN = 'http://localhost';
 
@@ -65,8 +67,7 @@ const post = (url, body, headers = mutationHeaders()) => request(url, { method: 
 const realFetch = global.fetch;
 
 
-// #788 end to end through the real wiring: the free-chat context route, the asset upload, the
-// free-chat delete, Delete old chats, the moved-chat delete and the /api/workspace orphan sweep.
+// #788 end to end through the real wiring: the free-chat context route, the free-chat delete, Delete old chats, the moved-chat delete and the /api/workspace orphan sweep.
 // Synthetic chats and bytes only.
 const usersDir = () => path.join(testDataDir, 'users');
 const workspaceDir = () => {
@@ -79,12 +80,34 @@ const ctx = (chatId) => `cowork-chat-context-${chatId}`;
 const PNG = Buffer.from('89504e470d0a1a0a', 'hex').toString('base64');
 const until = async (check) => { for (let i = 0; i < 100 && !check(); i++) await new Promise((r) => setTimeout(r, 10)); };
 
+// The image upload and the free-chat save are the Rust front's (sbstndalton/noevia#1071): here they
+// are the files the front writes (the bytes under project-assets, the row in projects.json, the
+// free-chat list), each replaced whole; Node takes them in at the next request start.
+function frontWrite(file, value) { fs.writeFileSync(`${file}.front`, JSON.stringify(value, null, 2)); fs.renameSync(`${file}.front`, file); }
+function frontUploadImage(projectId) {
+  const id = `img-synthetic-${projectId.slice(-12)}`;
+  const dir = path.join(workspaceDir(), 'project-assets', projectId);
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, id), Buffer.from(PNG, 'base64'));
+  const file = path.join(workspaceDir(), 'projects.json');
+  const data = JSON.parse(fs.readFileSync(file, 'utf8'));
+  const project = data.projects.find((p) => p.id === projectId);
+  project.assets = [...(project.assets || []), { id, name: 'synthetic.png', mime: 'image/png', bytes: 8 }];
+  frontWrite(file, data);
+}
+function frontSaveFree(metas) {
+  const file = path.join(workspaceDir(), 'free-chats.json');
+  let list = [];
+  try { list = JSON.parse(fs.readFileSync(file, 'utf8')) || []; } catch { /* none yet */ }
+  for (const m of metas) { const i = list.findIndex((c) => c.id === m.id); if (i >= 0) list[i] = { ...list[i], ...m }; else list.unshift({ updatedAt: Date.now(), preview: '', ...m }); }
+  frontWrite(file, list);
+}
+
 async function openWithImage(chatId) {
   const opened = await post(`/api/chats/${chatId}/context`, {});
   assert.equal(opened.status, 200);
   assert.equal(JSON.parse(opened.text).project.id, ctx(chatId));
-  const asset = await post(`/api/projects/${ctx(chatId)}/assets`, { name: 'synthetic.png', mime: 'image/png', dataBase64: PNG });
-  assert.equal(asset.status, 200);
+  frontUploadImage(ctx(chatId));
   const assetDir = path.join(workspaceDir(), 'project-assets', ctx(chatId));
   assert.equal(fs.readdirSync(assetDir).length, 1);
   // A RAG index for the context (sqlite-vec may be absent here, so it is seeded).
@@ -98,7 +121,7 @@ test('deleting a free chat removes its attachments project, and a stale tab cann
   const regular = JSON.parse((await post('/api/projects', { name: 'Synthetic regular' })).text);
   const kept = await openWithImage('c788-keep');
   const doomed = await openWithImage('c788-delete');
-  assert.equal((await post('/api/freechats', { chats: [{ id: 'c788-delete', title: 'a' }, { id: 'c788-keep', title: 'b', archived: true }] })).status, 200);
+  frontSaveFree([{ id: 'c788-delete', title: 'a' }, { id: 'c788-keep', title: 'b', archived: true }]);
 
   const deleted = await request('/api/freechats/c788-delete', { method: 'DELETE', headers: mutationHeaders() });
   assert.equal(deleted.status, 200);
@@ -118,7 +141,7 @@ test('deleting a free chat removes its attachments project, and a stale tab cann
 test('a moved chat and Delete old chats take their attachments projects along (#788)', async () => {
   const host = JSON.parse((await post('/api/projects', { name: 'Synthetic host' })).text);
   const moved = await openWithImage('c788-moved');
-  assert.equal((await post('/api/freechats', { chats: [{ id: 'c788-moved', title: 'm' }] })).status, 200);
+  frontSaveFree([{ id: 'c788-moved', title: 'm' }]);
   assert.equal((await post('/api/chats/c788-moved/move', { projectId: host.id })).status, 200);
   assert.equal((await request(`/api/projects/${host.id}/chats/c788-moved`, { method: 'DELETE', headers: mutationHeaders() })).status, 200);
   assert.ok(await gone(moved));
@@ -127,7 +150,7 @@ test('a moved chat and Delete old chats take their attachments projects along (#
   const old = await openWithImage('c788-old');
   const fresh = await openWithImage('c788-fresh');
   const longAgo = Date.now() - 100 * 86400000;
-  assert.equal((await post('/api/freechats', { chats: [{ id: 'c788-old', title: 'o', updatedAt: longAgo }, { id: 'c788-fresh', title: 'f' }] })).status, 200);
+  frontSaveFree([{ id: 'c788-old', title: 'o', updatedAt: longAgo }, { id: 'c788-fresh', title: 'f' }]);
   const preview = JSON.parse((await request('/api/account/retention', { headers: { cookie } })).text).preview;
   const swept = await request('/api/account/retention', { method: 'PUT', headers: mutationHeaders(), body: JSON.stringify({ days: 90, confirmDeletes: preview[90] }) });
   assert.equal(swept.status, 200);

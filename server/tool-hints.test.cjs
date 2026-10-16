@@ -52,8 +52,17 @@ test('hintTool reads the box’s map, and leaves unnamed tools alone', () => {
   assert.equal(hintTool(null, other), other);
 });
 
+// #1071: loading index.cjs needs the Rust project store's port and secret (nothing is saved here).
+function serverModule() {
+  if (!process.env.NOEVIA_PROJECT_STORE_PORT) {
+    const dir = require('node:fs').mkdtempSync(require('node:path').join(require('node:os').tmpdir(), 'tool-hints-store-'));
+    require('../tests/server/project-store-server.cjs').installProjectStore(dir);
+  }
+  return require('./index.cjs');
+}
+
 test('the Tasks box actually carries hints for every tool it binds', () => {
-  const { MCP_TOOLBOX_MANIFEST } = require('./index.cjs');
+  const { MCP_TOOLBOX_MANIFEST } = serverModule();
   const box = MCP_TOOLBOX_MANIFEST.find((b) => b.id === 'nextcloud-tasks');
   assert.ok(box.hints, 'the reported problem was the 4B not calling this box');
   assert.deepEqual(Object.keys(box.hints).sort(), [...box.tools].sort());
@@ -67,7 +76,7 @@ test('the Tasks box actually carries hints for every tool it binds', () => {
 });
 
 test('no box hints a tool it does not bind', () => {
-  const { MCP_TOOLBOX_MANIFEST } = require('./index.cjs');
+  const { MCP_TOOLBOX_MANIFEST } = serverModule();
   for (const box of MCP_TOOLBOX_MANIFEST) {
     for (const name of Object.keys(box.hints || {})) {
       assert.ok(box.tools.includes(name), `${box.id} hints ${name}, which it does not bind`);

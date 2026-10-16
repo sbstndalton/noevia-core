@@ -30,12 +30,10 @@ const { spawn } = require('node:child_process');
 const { MARKER } = require('../../server/contract-record.cjs');
 const { MODEL, SERVER, GUARD, startMocks, serverEnv } = require('./mocks.cjs');
 const { seedAccount } = require('../../tests/server/seed-account.cjs');
+const { startProjectStore } = require('../../tests/server/project-store-server.cjs');
 // Synthetic accounts for a throwaway data dir; the recorder writes their cookies as placeholders only.
 const ADMIN = { username: 'synthetic-admin', displayName: 'Synthetic Admin' };
 const MEMBER = { username: 'synthetic-member', displayName: 'Synthetic Member', role: 'member' };
-// A 1x1 PNG for the project image steps (M4). The recorder takes a value this random-looking for a
-// secret, so the manifest hands it to the replayer as an input like the passwords.
-const PNG = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFBQIAX8jx0gAAAABJRU5ErkJggg==';
 
 function arg(name) {
   const i = process.argv.indexOf(name);
@@ -130,7 +128,13 @@ async function main() {
   const mocks = await startMocks();
   const port = await new Promise((resolve) => { const srv = http.createServer(); srv.listen(0, '127.0.0.1', () => { const p = srv.address().port; srv.close(() => resolve(p)); }); });
   const base = `http://127.0.0.1:${port}`;
+  // Node saves projects.json and free-chats.json only through the Rust front's project store and
+  // refuses to start without one (sbstndalton/noevia#1071): a loopback stand-in with the same
+  // protocol, on this throwaway data dir.
+  const store = await startProjectStore(dataDir);
   const env = serverEnv({ port, dataDir, origin: base, mocks, record: exchanges });
+  Object.assign(env, { NOEVIA_PROJECT_STORE_PORT: String(store.port), NOEVIA_PROJECT_STORE_TOKEN: store.token });
+  env.NOEVIA_CORPUS_ALLOWED_PORTS = `${env.NOEVIA_CORPUS_ALLOWED_PORTS},${store.port}`;
   const log = [];
   const child = spawn(process.execPath, ['--require', GUARD, SERVER], { env, cwd: path.dirname(SERVER), stdio: ['ignore', 'pipe', 'pipe'] });
   // The first-run setup code is printed to the log; keep the log in memory only.
@@ -138,7 +142,7 @@ async function main() {
   child.stderr.on('data', (d) => log.push(String(d)));
   const steps = [];
   // The seeded sessions' raw values, which must never reach the corpus.
-  const secrets = [];
+  const secrets = [store.token];
   try {
     await waitReady(base, child);
     const admin = new Client(base, base);
@@ -174,25 +178,6 @@ async function main() {
     if (!projectId) throw new Error(`project id missing from ${created.text.slice(0, 200)}`);
     await step(admin, 'GET', '/api/workspace', undefined, [200]);
     await step(admin, 'POST', `/api/projects/${encodeURIComponent(projectId)}/config`, { instructions: 'Answer very briefly.' });
-    await step(admin, 'GET', `/api/projects/${encodeURIComponent(projectId)}/chats`);
-
-    // M4 (NOEVIA_RUST_PROJECTS): a project's images, with the refusals and the tenant boundary.
-    const assets = `/api/projects/${encodeURIComponent(projectId)}/assets`;
-    const image = await step(admin, 'POST', assets, { name: 'pixel.png', mime: 'IMAGE/PNG', dataBase64: PNG }, [200]);
-    const assetId = image.json?.asset?.id;
-    if (!assetId) throw new Error(`asset id missing from ${image.text.slice(0, 200)}`);
-    await step(admin, 'POST', assets, { name: 'notes.txt', mime: 'text/plain', dataBase64: PNG }, [400]);
-    await step(admin, 'POST', assets, { name: 'empty.png', mime: 'image/png', dataBase64: '' }, [400]);
-    await step(admin, 'POST', assets, { name: 'loose.gif', mime: 'image/gif', dataBase64: 'R0lG OD lh\nAQAB!AAAA=ignored' }, [200]);
-    await step(admin, 'POST', assets, { name: ['a', null, 7], mime: 'image/webp', dataBase64: PNG }, [200]);
-    // Node reads each UTF-16 unit of a two-byte string by its low byte: U+0144 is 'D', U+D83D '='.
-    await step(admin, 'POST', assets, { name: 'two-byte.png', mime: 'image/png', dataBase64: 'QUJ\u0144QU\u{1F600}JD' }, [200]);
-    await step(admin, 'POST', `/api/projects/no-such-project/assets`, { name: 'x.png', mime: 'image/png', dataBase64: PNG }, [404]);
-    await step(admin, 'GET', `${assets}/${encodeURIComponent(assetId)}`, undefined, [200]);
-    await step(admin, 'GET', `${assets}/no-such-image`, undefined, [404]);
-    await step(noCsrf, 'POST', assets, { name: 'x.png', mime: 'image/png', dataBase64: PNG }, [403]);
-    await step(anon, 'GET', `${assets}/${encodeURIComponent(assetId)}`, undefined, [401]);
-    await step(admin, 'GET', '/api/workspace', undefined, [200]);
 
     // A streamed chat turn against the mock model.
     const chat = await step(admin, 'POST', '/api/chat', { spaceId: projectId, projectId, chatId: null, message: 'Say hello.', history: [] });
@@ -203,14 +188,9 @@ async function main() {
       await step(admin, 'GET', `/api/chats/${encodeURIComponent(chatId)}/context-window`);
       await step(admin, 'GET', `/api/projects/${encodeURIComponent(projectId)}/chats/${encodeURIComponent(chatId)}`);
     }
-    await step(admin, 'GET', '/api/freechats');
 
     // A second account (seeded above): the tenant boundary is part of the contract.
     await step(member, 'GET', '/api/workspace');
-    await step(member, 'GET', `/api/projects/${encodeURIComponent(projectId)}/chats`);
-    // Another account's project image is not this account's (M4).
-    await step(member, 'GET', `/api/projects/${encodeURIComponent(projectId)}/assets/${encodeURIComponent(assetId)}`, undefined, [404]);
-    await step(member, 'DELETE', `/api/projects/${encodeURIComponent(projectId)}/assets/${encodeURIComponent(assetId)}`, undefined, [404]);
     if (chatId) await step(member, 'GET', `/api/chats/${encodeURIComponent(chatId)}/history`);
     await step(member, 'GET', '/api/admin/web-address', undefined, [403]);
     const memberId = seeded.member.id;
@@ -226,82 +206,14 @@ async function main() {
     for (const [method, p, body] of WRITE_PROBES) await step(admin, method, p, body);
 
     // Clean-up is part of the contract too.
-    await step(admin, 'DELETE', `/api/projects/${encodeURIComponent(projectId)}/assets/${encodeURIComponent(assetId)}`, undefined, [200]);
-    await step(admin, 'GET', `/api/projects/${encodeURIComponent(projectId)}/assets/${encodeURIComponent(assetId)}`, undefined, [404]);
     if (chatId) await step(admin, 'DELETE', `/api/projects/${encodeURIComponent(projectId)}/chats/${encodeURIComponent(chatId)}`);
     await step(admin, 'DELETE', `/api/projects/${encodeURIComponent(projectId)}`);
     await step(admin, 'GET', '/api/workspace', undefined, [200]);
     if (memberId) await step(admin, 'DELETE', `/api/admin/users/${encodeURIComponent(memberId)}`, { username: MEMBER.username });
 
-    // M4 (NOEVIA_RUST_PROJECTS): a project's chat list, saved and read back, with the refusals. After
-    // the clean-up, so every earlier exchange keeps its place; the list's project is left in place.
-    const listed = await step(admin, 'POST', '/api/projects', { name: 'Synthetic chat list' }, [200]);
-    const listId = listed.json?.id;
-    if (!listId) throw new Error(`project id missing from ${listed.text.slice(0, 200)}`);
-    const list = `/api/projects/${encodeURIComponent(listId)}/chats`;
-    await step(admin, 'POST', '/api/freechats', { chats: [{ id: 'free-alpha', title: 'Free alpha', updatedAt: 5, preview: '' }] }, [200]);
-    await step(admin, 'GET', list, undefined, [200]);
-    await step(admin, 'POST', list, { chats: [
-      { id: 'chat-alpha', title: 'Alpha', updatedAt: 300, preview: 'First', pinned: true, forceLocal: true, createdAt: 100, mode: 'cowork',
-        frame: { kind: 'question', tags: ['#alpha  beta', 'alpha-beta', 7], links: ['chat-beta', 'chat-beta'], confirmed: true, source: 'user' } },
-      { id: 'chat beta/../x', title: { a: 1 }, preview: ['p', null, 3], updatedAt: 200 },
-      // Another list holds it: skipped, and said so.
-      { id: 'free-alpha', title: 'Moved elsewhere', updatedAt: 400 },
-      // Deleted above: tombstoned, never comes back.
-      ...(chatId ? [{ id: chatId, title: 'Deleted chat', updatedAt: 500 }] : []),
-      { id: 'chat-gamma', title: `${'g'.repeat(118)}\u{1F600}tail`, preview: '', updatedAt: 250, frame: { kind: 'bogus' } },
-      'stray', null, { title: 'no id' },
-    ] }, [200]);
-    await step(admin, 'GET', list, undefined, [200]);
-    // A later save keeps the stored flags and first createdAt; frame null clears the frame.
-    await step(admin, 'POST', list, { chats: [{ id: 'chat-alpha', title: 'Alpha renamed', updatedAt: 350, frame: null }, { id: 'chat-gamma', updatedAt: 260, allowCloud: false, createdAt: 7 }] }, [200]);
-    await step(admin, 'GET', list, undefined, [200]);
-    await step(admin, 'POST', list, { chats: 'not a list' }, [400]);
-    await step(admin, 'POST', list, null, [400]);
-    await step(admin, 'POST', '/api/projects/no-such-project/chats', { chats: [] }, [404]);
-    await step(admin, 'GET', '/api/projects/no-such-project/chats', undefined, [404]);
-    await step(noCsrf, 'POST', list, { chats: [] }, [403]);
-    await step(anon, 'GET', list, undefined, [401]);
-    await step(anon, 'POST', list, { chats: [] }, [401]);
-
-    // M4 (NOEVIA_RUST_PROJECTS, rust-free-chats): the free-chat list, saved and read back while
-    // Node's own writers of free-chats.json (a chat's move, a free chat's delete) run between the
-    // saves, with the refusals. Appended, so every earlier exchange keeps its place.
-    const free = '/api/freechats';
-    await step(admin, 'GET', free, undefined, [200]);
-    await step(admin, 'POST', free, { chats: [
-      { id: 'free-beta', title: 'Beta', updatedAt: 600, preview: 'Second', pinned: true, archived: false, forceLocal: false, createdAt: 50, mode: 'cowork',
-        frame: { kind: 'idea', tags: ['#beta  one', 'beta-one', 3], links: ['free-alpha', 'free-alpha'], confirmed: true, source: 'user' } },
-      { id: 'free gamma/../x', title: { a: 1 }, preview: ['p', null, 3], updatedAt: 550 },
-      // A project's list holds it: skipped, and said so.
-      { id: 'chat-alpha', title: 'Moved elsewhere', updatedAt: 700 },
-      // Deleted above: tombstoned, never comes back.
-      ...(chatId ? [{ id: chatId, title: 'Deleted chat', updatedAt: 800 }] : []),
-      { id: 'free-delta', title: `${'d'.repeat(118)}\u{1F600}tail`, preview: '', updatedAt: 500, frame: { kind: 'bogus' }, mode: 'code' },
-      'stray', null, { title: 'no id' },
-    ] }, [200]);
-    await step(admin, 'GET', free, undefined, [200]);
-    // A later save keeps the stored flags and first createdAt; frame null clears the frame.
-    await step(admin, 'POST', free, { chats: [{ id: 'free-beta', title: 'Beta renamed', updatedAt: 650, frame: null }, { id: 'free-alpha', updatedAt: 6, allowCloud: false, createdAt: 7 }] }, [200]);
-    await step(admin, 'GET', free, undefined, [200]);
-    // Node moves a free chat into a project and back (both lists, both files) between the saves.
-    await step(admin, 'POST', `/api/chats/free-alpha/move`, { projectId: listId }, [200]);
-    await step(admin, 'GET', free, undefined, [200]);
-    await step(admin, 'POST', free, { chats: [{ id: 'free-alpha', title: 'Stale tab', updatedAt: 9 }] }, [200]);
-    await step(admin, 'GET', list, undefined, [200]);
-    await step(admin, 'POST', `/api/chats/free-alpha/move`, { projectId: null }, [200]);
-    await step(admin, 'GET', free, undefined, [200]);
-    // Node deletes one (tombstone, transcript); a stale save cannot bring it back.
-    await step(admin, 'DELETE', `${free}/free-delta`, undefined, [200]);
-    await step(admin, 'GET', free, undefined, [200]);
-    await step(admin, 'POST', free, { chats: [{ id: 'free-delta', title: 'Stale tab', updatedAt: 900 }] }, [200]);
-    await step(admin, 'GET', free, undefined, [200]);
-    await step(admin, 'POST', free, { chats: 'not a list' }, [400]);
-    await step(admin, 'POST', free, null, [400]);
-    await step(admin, 'POST', free, { chats: [{ id: 'free-eps', updatedAt: 1, createdAt: 2 }], extra: 'ignored' }, [200]);
-    await step(noCsrf, 'POST', free, { chats: [] }, [403]);
-    await step(anon, 'GET', free, undefined, [401]);
-    await step(anon, 'POST', free, { chats: [] }, [401]);
+    // The project image routes, the project chat lists and the free-chat list (M4) are the Rust
+    // front's since sbstndalton/noevia#1071: Node refuses them, and their exchanges stay in the
+    // noevia-rs corpus recorded at its contracts/http/core.ref.
     // The recorder writes an exchange on the response's 'finish', which can come after the client
     // has the whole answer: wait for the last files before stopping the server.
     // Done when every file parses and none has appeared for 150 ms (bounded at 5 s).
@@ -317,6 +229,7 @@ async function main() {
     child.kill('SIGTERM');
     await new Promise((r) => (child.exitCode !== null ? r() : child.once('exit', r)));
     mocks.close();
+    await store.close();
     // The throwaway data dir goes whether or not the run got through.
     fs.rmSync(dataDir, { recursive: true, force: true });
   }
@@ -326,17 +239,11 @@ async function main() {
   const files = fs.readdirSync(exchanges).filter((f) => f.endsWith('.json')).sort();
   const dropped = fs.readdirSync(exchanges).filter((f) => f.endsWith('.dropped'));
   const inputs = {};
-  for (const f of files) {
-    const ex = JSON.parse(fs.readFileSync(path.join(exchanges, f), 'utf8'));
-    const b = ex.request.body?.json;
-    if (!b) continue;
-    if (typeof b.dataBase64 === 'string' && b.dataBase64.startsWith('<secret:')) inputs[b.dataBase64] = { value: PNG };
-  }
   const manifest = {
     v: 1,
     generator: 'noevia-core tools/contract-corpus/generate.cjs',
     seed: 'synthetic-accounts',
-    note: 'Recorded with two synthetic accounts and their sessions seeded straight into UI_DATA_DIR/cowork.db (tests/server/seed-account.cjs): sign-in is the Rust front\'s (sbstndalton/noevia#1071), so a replay needs the same seeding and binds the session cookies itself. The image data is synthetic.',
+    note: 'Recorded with two synthetic accounts and their sessions seeded straight into UI_DATA_DIR/cowork.db (tests/server/seed-account.cjs): sign-in is the Rust front\'s (sbstndalton/noevia#1071), so a replay needs the same seeding and binds the session cookies itself. Node saved projects.json and free-chats.json through a loopback stand-in for the front\'s project store (tests/server/project-store-server.cjs).',
     inputs,
     exchanges: files.length,
     dropped: dropped.length,

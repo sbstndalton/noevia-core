@@ -12,7 +12,7 @@ const { AsyncLocalStorage } = require('node:async_hooks');
 const { createProjectRoutes, DOCUMENT_UPLOAD_CAP } = require('./projects.cjs');
 const { createProviderRegistry } = require('../providers.cjs');
 
-function fixture({ projects = [], diary = true, catalogue = null, onToolboxesChange, rustProjects = false, rustProjectChats = false, rustProjectWrites = false } = {}) {
+function fixture({ projects = [], diary = true, catalogue = null, onToolboxesChange, rustProjectWrites = false } = {}) {
   const sent = [];
   const dispatched = [];
   const requestScope = new AsyncLocalStorage();
@@ -49,7 +49,7 @@ function fixture({ projects = [], diary = true, catalogue = null, onToolboxesCha
     PROJECTS: projects, DEFAULT_TOOLBOXES: ['core'], sanitizeToolboxes: (b) => (Array.isArray(b) ? b : null),
     getProvider, ensureRolesLoaded() {},
     servedCatalogue: async () => catalogue, DEFAULT_PROVIDER_ID: 'default',
-    store, onToolboxesChange, rustProjects, rustProjectChats, rustProjectWrites,
+    store, onToolboxesChange, rustProjectWrites,
   });
   const call = (method, path, body, search = '', role = 'member') => {
     const req = Readable.from(body === undefined ? [] : [Buffer.from(typeof body === 'string' ? body : JSON.stringify(body))]);
@@ -186,46 +186,19 @@ test('rejected config patches do not clear the active sampling override', async 
   }
 });
 
-test('chat metas: listing, saving a normalized list and deleting one', async () => {
+// A project's chat list (GET and POST /api/projects/{id}/chats) is the Rust front's (#1071): this
+// mount no longer has it, and index.cjs refuses it first (rust-projects.test.cjs). Deleting one chat
+// stays here.
+test('chat metas: the list is not this mount\'s any more; deleting one chat keeps its answers', async () => {
   const f = fixture({ projects: [{ id: 'p1', chats: [{ id: 'c1', title: 'one' }] }] });
-  await f.call('GET', '/api/projects/p1/chats');
-  assert.deepEqual(f.sent.pop(), { status: 200, body: { chats: [{ id: 'c1', title: 'one' }] } });
-  await f.call('POST', '/api/projects/p1/chats', { chats: [{ id: 'c 2!', updatedAt: 'later' }, { title: 'no id' }] });
-  assert.deepEqual(f.sent.pop(), { status: 200, body: { ok: true } });
-  assert.equal(f.store.savedChats[0], 'p1');
-  assert.equal(f.store.savedChats[1].length, 1);
-  assert.equal(f.store.savedChats[1][0].id, 'c2');
-  assert.equal(f.store.savedChats[1][0].title, 'New task');
-  assert.equal(typeof f.store.savedChats[1][0].updatedAt, 'number');
-  assert.equal('mode' in f.store.savedChats[1][0], false, 'no mode means Chat');
-  // #236: an admin's project chat keeps its Cowork mode; anything else is dropped.
-  await f.call('POST', '/api/projects/p1/chats', { chats: [{ id: 'cw', mode: 'cowork' }, { id: 'cx', mode: 'root' }] }, '', 'admin');
-  assert.equal(f.store.savedChats[1][0].mode, 'cowork');
-  assert.equal('mode' in f.store.savedChats[1][1], false);
-  f.sent.pop();
-  // A member cannot plant a Cowork mode that would fail every turn: it is coerced to Chat.
-  await f.call('POST', '/api/projects/p1/chats', { chats: [{ id: 'cw', mode: 'cowork' }] });
-  assert.equal(f.sent.at(-1).status, 200);
-  assert.equal('mode' in f.store.savedChats[1][0], false);
-  f.sent.pop();
-  await f.call('POST', '/api/projects/p1/chats', { chats: 'x' });
-  assert.deepEqual(f.sent.pop(), { status: 400, body: { error: 'chats array required' } });
+  for (const m of ['GET', 'POST']) assert.equal(await f.call(m, '/api/projects/p1/chats', m === 'POST' ? { chats: [{ id: 'c2' }] } : undefined), false, m);
+  assert.equal(f.sent.length, 0);
+  assert.equal(f.store.savedChats, undefined, 'nothing saved');
   await f.call('DELETE', '/api/projects/p1/chats/c1');
   assert.deepEqual(f.sent.pop(), { status: 200, body: { ok: true } });
   await f.call('DELETE', '/api/projects/p1/chats/c9');
   assert.deepEqual(f.sent.pop(), { status: 404, body: { error: 'no such chat' } });
 });
-
-test('chat meta routes refuse a deleted project instead of reporting an empty list or successful save', async () => {
-  const f = fixture();
-  await f.call('GET', '/api/projects/deleted-project/chats');
-  assert.deepEqual(f.sent.pop(), { status: 404, body: { error: 'no such project' } });
-  await f.call('POST', '/api/projects/deleted-project/chats', { chats: [{ id: 'orphan', title: 'Unsaved' }] });
-  assert.deepEqual(f.sent.pop(), { status: 404, body: { error: 'no such project' } });
-  assert.equal(f.store.savedChats, undefined);
-  assert.equal(f.store.saves, 0);
-});
-
 test('uploads refuse what they always refused', async () => {
   const f = fixture({ projects: [{ id: 'p1', files: [] }] });
   await f.call('POST', '/api/projects/p1/upload', { name: '' });
@@ -236,8 +209,9 @@ test('uploads refuse what they always refused', async () => {
   assert.deepEqual(f.sent.pop(), { status: 400, body: { error: 'file was empty' } });
   await f.call('POST', '/api/projects/p1/documents', { name: 'notes.txt' });
   assert.deepEqual(f.sent.pop(), { status: 400, body: { error: 'notes.txt is not a supported document (PDF).' } });
-  await f.call('POST', '/api/projects/p1/assets', { name: 'a', mime: 'image/bmp' });
-  assert.deepEqual(f.sent.pop(), { status: 400, body: { error: 'image/bmp is not a supported image (png, jpeg, webp or gif).' } });
+  // A project's images are the Rust front's (#1071): not this mount's.
+  assert.equal(await f.call('POST', '/api/projects/p1/assets', { name: 'a', mime: 'image/bmp' }), false);
+  for (const m of ['GET', 'DELETE']) assert.equal(await f.call(m, '/api/projects/p1/assets/img-1'), false, m);
   await f.call('DELETE', '/api/projects/p1/files', { path: 'Elsewhere/x.txt' });
   assert.deepEqual(f.sent.pop(), { status: 400, body: { error: 'That file is not in any folder attached to this project, so it cannot be deleted from here.' } });
   assert.equal(DOCUMENT_UPLOAD_CAP, 25 * 1024 * 1024);
@@ -443,19 +417,6 @@ test('a project id from another tenant 404s on the upload path: getProject reads
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 
-test('project chat saves pass the frame (null too) and createdAt on to the merge (#738)', async () => {
-  const f = fixture({ projects: [{ id: 'p1', chats: [] }] });
-  const frame = { projectId: 'p1', kind: 'code', tags: ['x'], links: [], confirmed: true, source: 'user' };
-  await f.call('POST', '/api/projects/p1/chats', { chats: [{ id: 'a', frame, createdAt: 5 }, { id: 'b', frame: null }, { id: 'c', createdAt: 'soon' }] });
-  assert.equal(f.sent.pop().status, 200);
-  const [a, b, c] = f.store.savedChats[1];
-  assert.deepEqual(a.frame, frame);
-  assert.equal(a.createdAt, 5);
-  assert.equal(b.frame, null, 'null reaches the merge, which clears the stored frame');
-  assert.equal('frame' in c, false, 'no frame in the body: the merge keeps the stored one');
-  assert.equal('createdAt' in c, false);
-});
-
 test('#796: saving a project\'s toolbox selection clears the cached permitted-tools view', async () => {
   let cleared = 0;
   const f = fixture({ projects: [{ id: 'p1', files: [], toolboxes: ['core'] }], onToolboxesChange: () => { cleared += 1; } });
@@ -514,36 +475,9 @@ test('#1079 the context profile: High is stored, Low and null clear it, anything
   assert.equal('contextProfile' in f.projects[0], false);
 });
 
-test('M4: while the Rust front owns it, the chat-list save is refused here before anything is read; listing stays', async () => {
-  const f = fixture({ projects: [{ id: 'p1', chats: [{ id: 'c1', title: 'T' }] }], rustProjects: true, rustProjectChats: true });
-  assert.equal(await f.call('POST', '/api/projects/p1/chats', { chats: [{ id: 'c2' }] }), true);
-  assert.equal(f.sent.at(-1).status, 503);
-  assert.equal(f.sent.at(-1).body.code, 'RUST_PROJECTS_OWNED');
-  assert.equal(await f.call('POST', '/api/projects/%E0%A4%A/chats', '{'), true, 'refused before the id is decoded');
-  assert.equal(f.sent.at(-1).status, 503);
-  assert.equal(f.store.savedChats, undefined, 'nothing saved');
-  assert.equal(await f.call('GET', '/api/projects/p1/chats'), true);
-  assert.deepEqual(f.sent.at(-1), { status: 200, body: { chats: [{ id: 'c1', title: 'T' }] } });
-  // Off, as before.
-  const g = fixture({ projects: [{ id: 'p1', chats: [] }] });
-  assert.equal(await g.call('POST', '/api/projects/p1/chats', { chats: [{ id: 'c2' }] }), true);
-  assert.equal(g.sent.at(-1).status, 200);
-  // sbstndalton/noevia#1409: a front that answers only the images (it lists rust-projects but not
-  // rust-project-chats, so the chat confirmation is missing) forwards the save here: answered.
-  const h = fixture({ projects: [{ id: 'p1', chats: [] }], rustProjects: true });
-  assert.equal(await h.call('POST', '/api/projects/p1/chats', { chats: [{ id: 'c2' }] }), true);
-  assert.equal(h.sent.at(-1).status, 200);
-  assert.equal(h.store.savedChats[0], 'p1', 'saved here');
-  assert.deepEqual(h.store.savedChats[1].map((c) => c.id), ['c2']);
-  // The chat confirmation alone owns nothing.
-  const k = fixture({ projects: [{ id: 'p1', chats: [] }], rustProjectChats: true });
-  assert.equal(await k.call('POST', '/api/projects/p1/chats', { chats: [{ id: 'c2' }] }), true);
-  assert.equal(k.sent.at(-1).status, 200);
-});
-
 test('#1264: off, the chat attachments routes are answered here; with the project-writes slice confirmed, both are refused before anything is read or written', async () => {
-  // Off (NOEVIA_RUST_PROJECTS alone, as live today): Node answers and creates.
-  const off = fixture({ projects: [], rustProjects: true, rustProjectChats: true });
+  // Off (as live today): Node answers and creates.
+  const off = fixture({ projects: [] });
   assert.equal(await off.call('GET', '/api/chats/c1/context'), true);
   assert.deepEqual(off.sent.at(-1), { status: 200, body: { project: null } });
   assert.equal(await off.call('POST', '/api/chats/c1/context'), true);
@@ -551,7 +485,7 @@ test('#1264: off, the chat attachments routes are answered here; with the projec
   assert.equal(off.sent.at(-1).body.project.id, 'chat-c1');
   assert.equal(off.store.saves, 1);
   // On: the front owns them; GET too, since getProject's self-heal writes.
-  const on = fixture({ projects: [{ id: 'chat-c2', routing: 'manual' }], rustProjects: true, rustProjectWrites: true });
+  const on = fixture({ projects: [{ id: 'chat-c2', routing: 'manual' }], rustProjectWrites: true });
   for (const [m, p] of [['GET', '/api/chats/c2/context'], ['POST', '/api/chats/c1/context'], ['POST', '/api/chats/bad%E0%A4%A/context']]) {
     assert.equal(await on.call(m, p), true, `${m} ${p}`);
     assert.equal(on.sent.at(-1).status, 503, `${m} ${p}`);
@@ -560,7 +494,7 @@ test('#1264: off, the chat attachments routes are answered here; with the projec
   assert.equal(on.store.saves, 0, 'nothing saved');
   assert.deepEqual(on.projects.map((p) => p.id), ['chat-c2'], 'nothing created');
   // The other project routes are not this slice's.
-  assert.equal(await on.call('POST', '/api/projects/p1/chats', { chats: [] }), true);
+  assert.equal(await on.call('DELETE', '/api/projects/p1/chats/c1'), true);
   assert.notEqual(on.sent.at(-1).body?.code, 'RUST_PROJECTS_OWNED');
 });
 

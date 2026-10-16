@@ -3,6 +3,7 @@
 // default to us-east-1), returned by getStorage, forwarded in X-Cowork-Storage,
 // and signed into every SigV4 scope. Plus account-bound storage secrets.
 const test = require('node:test');
+const { createStubStore } = require('../tests/server/project-store-stub.cjs');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const os = require('node:os');
@@ -153,13 +154,13 @@ test('encrypt callers re-save plaintext, so repeated saves never double-encrypt'
   const { createWorkspaceStore } = require('./workspace.cjs');
   const WS_USER = '0b6c2d7e-1f4a-4c3b-9e8d-7a6b5c4d3e2f';
   const def = { id: 'default', label: 'Default', baseUrl: 'http://localhost', apiKey: '', shared: true };
-  const ws = createWorkspaceStore(root, def, secrets).get(WS_USER);
+  const ws = createWorkspaceStore(root, def, secrets, { projectStore: createStubStore(root) }).get(WS_USER);
   ws.providers.push({ id: 'p1', label: 'P', baseUrl: 'https://llm.example.test', apiKey: 'synthetic-key' });
   ws.saveProviders(); ws.saveProviders();
-  const reloaded = createWorkspaceStore(root, def, secrets).get(WS_USER);
+  const reloaded = createWorkspaceStore(root, def, secrets, { projectStore: createStubStore(root) }).get(WS_USER);
   assert.equal(reloaded.providers.find((p) => p.id === 'p1').apiKey, 'synthetic-key');
   reloaded.saveProviders();
-  assert.equal(createWorkspaceStore(root, def, secrets).get(WS_USER).providers.find((p) => p.id === 'p1').apiKey, 'synthetic-key');
+  assert.equal(createWorkspaceStore(root, def, secrets, { projectStore: createStubStore(root) }).get(WS_USER).providers.find((p) => p.id === 'p1').apiKey, 'synthetic-key');
   addUser('u2');
   auth.saveStorage('u2', { ...S3 });
   auth.getStorage('u2', true);

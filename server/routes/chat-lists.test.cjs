@@ -1,6 +1,6 @@
 'use strict';
 // The chat-list routes over a fake store: the workspace view with its sanitized chats and the
-// hourly sweep, the free-chat merge, and the transcript's revision check. The merge and
+// hourly sweep, a free chat's delete, and the transcript's revision check. The merge and
 // tombstones are chat-lists.test.cjs; the sweep's rules are chat-retention.test.cjs; the
 // same routes end to end are chat-lists-routes.test.cjs and chat-history-routes.test.cjs.
 const test = require('node:test');
@@ -12,7 +12,7 @@ const path = require('node:path');
 const { Readable } = require('node:stream');
 const { createChatListRoutes } = require('./chat-lists.cjs');
 
-function fixture({ rustFreeChats = false } = {}) {
+function fixture() {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'noevia-chat-lists-'));
   const sent = [], removed = [];
   const projects = [{ id: 'p1', name: 'One', chats: [{ id: 'c1' }, 'orphan'] }, { id: 'diary-extras', name: 'Diary', chats: [] }];
@@ -34,7 +34,7 @@ function fixture({ rustFreeChats = false } = {}) {
     crypto, STORED_HISTORY_BYTES: 200, STORED_HISTORY_CAP: 3,
     chatLists: () => ({ freeChats: Array.from(freeChats), projects }),
     removeChat: (chat) => removed.push(chat),
-    store, rustFreeChats,
+    store,
   });
   const call = (method, path, body, role = 'member') => {
     const req = Readable.from(body === undefined ? [] : [Buffer.from(typeof body === 'string' ? body : JSON.stringify(body))]);
@@ -56,22 +56,13 @@ test('the workspace view hides the internal project and sanitizes chat metas', a
   assert.equal(f.projects[0].chats.length, 2, 'the stored list is left alone');
 });
 
-test('free chats are normalized, merged and deleted with the original answers', async () => {
+// GET and POST /api/freechats are the Rust front's (#1071): this mount no longer has them, and
+// index.cjs refuses them first (rust-projects.test.cjs). A free chat's delete stays here.
+test('the free-chat list is not this mount\'s any more; a free chat is deleted with the original answers', async () => {
   const f = fixture();
-  await f.call('GET', '/api/freechats');
-  assert.deepEqual(f.sent.pop(), { status: 200, body: { chats: [{ id: 'f1', title: 'Free' }] } });
-  await f.call('POST', '/api/freechats', { chats: 'nope' });
-  assert.deepEqual(f.sent.pop(), { status: 400, body: { error: 'chats array required' } });
-  await f.call('POST', '/api/freechats', '{');
-  assert.deepEqual(f.sent.pop(), { status: 400, body: { error: 'invalid JSON' } });
-  await f.call('POST', '/api/freechats', { chats: [{ id: 'f 2!', preview: 'p'.repeat(300) }, { title: 'no id' }] });
-  assert.deepEqual(f.sent.pop(), { status: 200, body: { ok: true } });
-  const added = f.freeChats.find((c) => c.id === 'f2');
-  assert.equal(added.title, 'New chat');
-  assert.equal(added.preview.length, 200);
-  assert.equal(added.pinned, false);
-  assert.deepEqual(f.store.savedFree.map((c) => c.id).sort(), ['f1', 'f2']);
-  assert.equal(await f.call('PUT', '/api/freechats'), false, 'an unhandled method falls through');
+  for (const m of ['GET', 'POST', 'PUT']) assert.equal(await f.call(m, '/api/freechats', m === 'POST' ? { chats: [{ id: 'f2' }] } : undefined), false, m);
+  assert.equal(f.sent.length, 0);
+  assert.equal(f.store.savedFree, undefined, 'nothing saved');
   await f.call('DELETE', '/api/freechats/f1');
   assert.deepEqual(f.sent.pop(), { status: 200, body: { ok: true } });
   await f.call('DELETE', '/api/freechats/f1');
@@ -118,21 +109,6 @@ test('a deleted chat reads the same as one that never existed, even with state w
   require('../chat-lists.cjs').addTombstone(f.dir, 'c-gone');
   await f.call('GET', '/api/chats/c-gone/context-window');
   assert.deepEqual(f.sent.pop(), { status: 200, body: { meter: null } });
-});
-
-test('a member cannot save a Cowork mode on a free chat; it is coerced to Chat (#236)', async () => {
-  const f = fixture();
-  await f.call('POST', '/api/freechats', { chats: [{ id: 'fc', mode: 'cowork' }] });
-  assert.equal(f.sent.pop().status, 200);
-  assert.equal('mode' in f.freeChats.find((c) => c.id === 'fc'), false);
-});
-
-test('an admin free chat keeps its Cowork mode; anything else reads back as Chat (#236)', async () => {
-  const f = fixture();
-  await f.call('POST', '/api/freechats', { chats: [{ id: 'fc', mode: 'cowork' }, { id: 'fx', mode: 'shell' }, { id: 'fy' }] }, 'admin');
-  assert.equal(f.freeChats.find((c) => c.id === 'fc').mode, 'cowork');
-  assert.equal('mode' in f.freeChats.find((c) => c.id === 'fx'), false);
-  assert.equal('mode' in f.freeChats.find((c) => c.id === 'fy'), false);
 });
 
 test('POST /api/chats/:id/move validates, scopes to the caller and maps the store outcome (#738)', async () => {
@@ -216,26 +192,6 @@ test('moving a chat to another list revokes its "Allow for this chat" grant; a f
   assert.equal(gate.chatWideApproved('u1', 'f1', 'space:free'), true);
 });
 
-test('M4: while the Rust front owns it, the free-chat save is refused here before the body is read; the list and the delete stay', async () => {
-  const f = fixture({ rustFreeChats: true });
-  assert.equal(await f.call('POST', '/api/freechats', { chats: [{ id: 'f2', title: 'Two' }] }), true);
-  assert.equal(f.sent.at(-1).status, 503);
-  assert.equal(f.sent.at(-1).body.code, 'RUST_PROJECTS_OWNED');
-  assert.equal(await f.call('POST', '/api/freechats', '{'), true, 'refused before the body is parsed');
-  assert.equal(f.sent.at(-1).status, 503);
-  assert.equal(f.store.savedFree, undefined, 'nothing saved');
-  assert.equal(await f.call('GET', '/api/freechats'), true);
-  assert.deepEqual(f.sent.at(-1), { status: 200, body: { chats: [{ id: 'f1', title: 'Free' }] } });
-  assert.equal(await f.call('DELETE', '/api/freechats/f1'), true);
-  assert.deepEqual(f.sent.at(-1), { status: 200, body: { ok: true } });
-  // Off, as before.
-  const g = fixture();
-  assert.equal(await g.call('POST', '/api/freechats', { chats: [{ id: 'f2', title: 'Two' }] }), true);
-  assert.equal(g.sent.at(-1).status, 200);
-  assert.deepEqual(g.store.savedFree.map((c) => c.id), ['f2', 'f1']);
-});
-
-// #1471: a chat's Markdown export is read from the person's own lists only, and answers like the conversation export.
 test('#1471 a chat exports as one Markdown file from its own lists; unknown, deleted and other-list ids answer 404', async () => {
   const f = fixture();
   f.histories.set('f1', [{ role: 'user', content: 'What is 12 times 3?' }, { role: 'assistant', content: 'Thirty-six.' }]);

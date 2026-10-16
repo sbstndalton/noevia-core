@@ -17,13 +17,18 @@ function createStubStore(root, { flat = false } = {}) {
   const now = (f) => (fs.existsSync(f) ? fs.readFileSync(f, 'utf8') : null);
   return {
     writes,
-    async read(user, file) { const text = now(fileOf(user, file)); return { version: text === null ? '' : sha(text), text }; },
+    async read(user, file) {
+      if (!fs.existsSync(path.dirname(fileOf(user, file)))) throw Object.assign(new Error('account no longer exists'), { status: 410 });
+      const text = now(fileOf(user, file)); return { version: text === null ? '' : sha(text), text };
+    },
     async write(user, file, version, text) {
       const f = fileOf(user, file);
       const cur = now(f);
       const v = cur === null ? '' : sha(cur);
       if (v !== version) return { conflict: true, version: v, text: cur };
-      fs.mkdirSync(path.dirname(f), { recursive: true });
+      // As the Rust store (store_api.rs): the user's directory is never created; a missing one is
+      // a removed account (the client's 410).
+      if (!fs.existsSync(path.dirname(f))) throw Object.assign(new Error('account no longer exists'), { status: 410 });
       fs.writeFileSync(`${f}.stub.tmp`, text); fs.renameSync(`${f}.stub.tmp`, f);
       writes.push(file);
       return { ok: true, version: sha(text) };

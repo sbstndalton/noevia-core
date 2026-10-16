@@ -13,7 +13,7 @@ const { atomicJson, createWorkspaceStore } = require('./workspace.cjs');
 // #1264: the coordinated files are written only through the Rust project store; this stand-in has
 // its protocol (a compare-and-swap) over the same files.
 const { createStubStore, remoteFor } = require('../tests/server/project-store-stub.cjs');
-const storeWith = (root, opts) => createWorkspaceStore(root, DEFAULT, null, { rustFreeChats: true, projectStore: createStubStore(root), ...opts });
+const storeWith = (root, opts) => createWorkspaceStore(root, DEFAULT, null, { projectStore: createStubStore(root), ...opts });
 
 const tmp = () => fs.mkdtempSync(path.join(os.tmpdir(), 'rust-projects-test-'));
 const USER = '11111111-2222-4333-8444-555555555555';
@@ -22,75 +22,82 @@ const write = (file, projects) => atomicJson(file, { projects });
 const own = (o, k) => Object.prototype.hasOwnProperty.call(o, k);
 const read = (file) => JSON.parse(fs.readFileSync(file, 'utf8')).projects;
 
-test('the switch needs NOEVIA_FRONT=rust and its own confirmation (the retired M3 switch is not read, #1071)', async () => {
-  const warned = [];
-  const warn = (m) => warned.push(m);
-  const full = { NOEVIA_RUST_PROJECTS: '1', NOEVIA_FRONT: 'rust', NOEVIA_RUST_AUTH: '1', NOEVIA_RUST_AUTH_CONFIRMED: '1', NOEVIA_RUST_PROJECTS_CONFIRMED: '1' };
-  assert.equal(rp.enabledFrom(full, warn), true);
-  assert.equal(rp.enabledFrom({}, warn), false);
-  assert.equal(warned.length, 0, 'off is silent');
-  assert.equal(rp.enabledFrom({ ...full, NOEVIA_RUST_PROJECTS: 'true' }, warn), false);
-  for (const drop of ['NOEVIA_FRONT', 'NOEVIA_RUST_PROJECTS_CONFIRMED']) {
-    const env = { ...full }; delete env[drop];
-    assert.equal(rp.enabledFrom(env, warn), false, drop);
+// sbstndalton/noevia#1071: NOEVIA_RUST_PROJECTS and the slice confirmations are retired. Nothing
+// turns the project routes back over to Node; a leftover switch only warns.
+test('#1071: the projects switch is retired: no enable check is left and a leftover value only warns', () => {
+  for (const gone of ['enabledFrom', 'chatsEnabledFrom', 'freeChatsEnabledFrom']) assert.equal(rp[gone], undefined, gone);
+  for (const v of ['1', '0', '', 'true']) {
+    const warned = [];
+    assert.deepEqual(rp.warnRetired({ NOEVIA_RUST_PROJECTS: v }, (m) => warned.push(m)), ['NOEVIA_RUST_PROJECTS'], v);
+    assert.equal(warned.length, 1);
+    assert.match(warned[0], /NOEVIA_RUST_PROJECTS is retired .*ignored/);
   }
-  assert.equal(rp.enabledFrom({ ...full, NOEVIA_FRONT: 'node' }, warn), false);
-  assert.equal(warned.length, 3);
-  // Sign-in is the front's permanently: the old M3 switch's absence changes nothing.
-  const { NOEVIA_RUST_AUTH: _a, NOEVIA_RUST_AUTH_CONFIRMED: _c, ...noAuth } = full;
-  assert.equal(rp.enabledFrom(noAuth, warn), true);
-});
-
-test('the chat-list slice needs the switch and its own confirmation, and is silent without it (#1409)', async () => {
-  const warned = [];
-  const warn = (m) => warned.push(m);
-  const full = { NOEVIA_RUST_PROJECTS: '1', NOEVIA_FRONT: 'rust', NOEVIA_RUST_AUTH: '1', NOEVIA_RUST_AUTH_CONFIRMED: '1', NOEVIA_RUST_PROJECTS_CONFIRMED: '1' };
-  assert.equal(rp.chatsEnabledFrom({ ...full, NOEVIA_RUST_PROJECT_CHATS_CONFIRMED: '1' }, warn), true);
-  assert.equal(rp.chatsEnabledFrom(full, warn), false, 'a front with the images only');
-  assert.equal(rp.chatsEnabledFrom({ ...full, NOEVIA_RUST_PROJECT_CHATS_CONFIRMED: 'true' }, warn), false);
-  assert.equal(warned.length, 0, 'an images-only front is not a misconfiguration');
-  for (const drop of ['NOEVIA_RUST_PROJECTS', 'NOEVIA_FRONT', 'NOEVIA_RUST_PROJECTS_CONFIRMED']) {
-    const env = { ...full, NOEVIA_RUST_PROJECT_CHATS_CONFIRMED: '1' }; delete env[drop];
-    assert.equal(rp.chatsEnabledFrom(env, () => {}), false, drop);
+  const quiet = [];
+  assert.deepEqual(rp.warnRetired({}, (m) => quiet.push(m)), []);
+  assert.equal(quiet.length, 0, 'unset is silent');
+  // No server source reads the switch or a slice confirmation any more.
+  const sources = fs.readdirSync(__dirname, { recursive: true })
+    .filter((f) => f.endsWith('.cjs') && !f.endsWith('.test.cjs') && !f.includes('node_modules'))
+    .map((f) => [f, fs.readFileSync(path.join(__dirname, f), 'utf8')]);
+  for (const [f, src] of sources) {
+    assert.equal(/env\.NOEVIA_RUST_PROJECTS\b(?!_)|env\.NOEVIA_RUST_(?:PROJECTS|PROJECT_CHATS|FREE_CHATS|PROJECT_STORE)_CONFIRMED\b/.test(src), false, f);
   }
 });
 
-test('the free-chat slice needs the switch and its own confirmation, and is silent without it', async () => {
-  const warned = [];
-  const warn = (m) => warned.push(m);
-  const full = { NOEVIA_RUST_PROJECTS: '1', NOEVIA_FRONT: 'rust', NOEVIA_RUST_AUTH: '1', NOEVIA_RUST_AUTH_CONFIRMED: '1', NOEVIA_RUST_PROJECTS_CONFIRMED: '1' };
-  assert.equal(rp.freeChatsEnabledFrom({ ...full, NOEVIA_RUST_FREE_CHATS_CONFIRMED: '1' }, warn), true);
-  assert.equal(rp.freeChatsEnabledFrom(full, warn), false, 'a front without the slice');
-  assert.equal(rp.freeChatsEnabledFrom({ ...full, NOEVIA_RUST_FREE_CHATS_CONFIRMED: 'true' }, warn), false);
-  // Each slice is confirmed on its own: the project chat-list confirmation is not this one.
-  assert.equal(rp.freeChatsEnabledFrom({ ...full, NOEVIA_RUST_PROJECT_CHATS_CONFIRMED: '1' }, warn), false);
-  assert.equal(rp.chatsEnabledFrom({ ...full, NOEVIA_RUST_FREE_CHATS_CONFIRMED: '1' }, warn), false);
-  assert.equal(warned.length, 0);
-  for (const drop of ['NOEVIA_RUST_PROJECTS', 'NOEVIA_FRONT', 'NOEVIA_RUST_PROJECTS_CONFIRMED']) {
-    const env = { ...full, NOEVIA_RUST_FREE_CHATS_CONFIRMED: '1' }; delete env[drop];
-    assert.equal(rp.freeChatsEnabledFrom(env, () => {}), false, drop);
+test('#1071: every Rust-owned project route is refused here unconditionally, before anything is read; the rest is not', () => {
+  const calls = [];
+  const json = (res, status, body) => { calls.push({ status, body }); return true; };
+  const owned = [
+    ['POST', '/api/projects/p1/assets'],
+    ['GET', '/api/projects/p1/assets/img-1'],
+    ['DELETE', '/api/projects/p1/assets/img-1'],
+    ['GET', '/api/projects/p1/chats'],
+    ['POST', '/api/projects/p1/chats'],
+    ['GET', '/api/freechats'],
+    ['POST', '/api/freechats'],
+  ];
+  for (const [method, p] of owned) {
+    calls.length = 0;
+    assert.equal(rp.refuseOwnedRoute({ method }, {}, p, json), true, `${method} ${p}`);
+    assert.deepEqual(calls, [{ status: 503, body: { error: 'This route is served by the Rust front.', code: 'RUST_PROJECTS_OWNED' } }]);
   }
-  assert.equal(rp.FREE_LIST_CAP, require('./chat-lists.cjs').LIST_CAP);
+  // The table matches OWNED_ROUTES method by method (noevia-rs routes.toml is the other half).
+  const norm = (p) => p.replace(/\{[^}]*\}/g, 'x');
+  assert.deepEqual(owned.map(([m, p]) => `${m} ${p.replace(/p1|img-1/g, 'x')}`).sort(), [...rp.OWNED_ROUTES].map((r) => norm(r)).sort());
+  for (const [method, p] of [
+    ['PUT', '/api/projects/p1/assets'], ['GET', '/api/projects/p1/assets'], ['POST', '/api/projects/p1/assets/img-1'],
+    ['PUT', '/api/projects/p1/chats'], ['DELETE', '/api/projects/p1/chats'], ['GET', '/api/projects/p1/chats/c1'], ['DELETE', '/api/projects/p1/chats/c1'],
+    ['DELETE', '/api/freechats/c1'], ['PUT', '/api/freechats'], ['GET', '/api/freechats/c1'], ['GET', '/api/freechatsx'],
+    ['GET', '/api/chats/c1/context'], ['POST', '/api/chats/c1/move'], ['POST', '/api/projects'], ['GET', '/api/workspace'],
+    ['POST', '/api/projects/p1/uploads'], ['GET', '/api/projects/p1/assets/img-1/extra'],
+  ]) {
+    calls.length = 0;
+    assert.equal(rp.refuseOwnedRoute({ method }, {}, p, json), false, `${method} ${p}`);
+    assert.equal(calls.length, 0);
+  }
+  assert.ok(![...rp.OWNED_ROUTES].some((r) => r.startsWith('DELETE /api/freechats')), "a free chat's delete stays Node's");
 });
 
-test('#1264: the project-writes slices need the projects switch, their own switch and confirmation', async () => {
+test('#1264: the project-writes slices need their own switch and confirmation (and no longer the retired projects switch)', async () => {
   const warned = [];
   const warn = (m) => warned.push(m);
-  const full = { NOEVIA_RUST_PROJECTS: '1', NOEVIA_FRONT: 'rust', NOEVIA_RUST_AUTH: '1', NOEVIA_RUST_AUTH_CONFIRMED: '1', NOEVIA_RUST_PROJECTS_CONFIRMED: '1' };
-  const on = { ...full, NOEVIA_RUST_PROJECT_WRITES: '1', NOEVIA_RUST_PROJECT_WRITES_CONFIRMED: '1' };
+  const on = { NOEVIA_RUST_PROJECT_WRITES: '1', NOEVIA_RUST_PROJECT_WRITES_CONFIRMED: '1' };
   assert.equal(rp.projectWritesEnabledFrom(on, warn), true);
-  // Live today: the projects switch and every other slice confirmed, this switch off.
-  assert.equal(rp.projectWritesEnabledFrom({ ...full, NOEVIA_RUST_PROJECT_CHATS_CONFIRMED: '1', NOEVIA_RUST_FREE_CHATS_CONFIRMED: '1', NOEVIA_RUST_PROJECT_WRITES_CONFIRMED: '1' }, warn), false);
+  assert.equal(rp.projectWritesEnabledFrom({ NOEVIA_RUST_PROJECT_WRITES_CONFIRMED: '1' }, warn), false);
   assert.equal(warned.length, 0, 'off is not a misconfiguration');
   for (const v of ['0', 'true', ' 1', '']) assert.equal(rp.projectWritesEnabledFrom({ ...on, NOEVIA_RUST_PROJECT_WRITES: v }, warn), false, v);
   assert.equal(rp.projectWritesEnabledFrom({ ...on, NOEVIA_RUST_PROJECT_WRITES_CONFIRMED: '' }, warn), false);
   assert.match(warned.at(-1), /NOEVIA_RUST_PROJECT_WRITES_CONFIRMED/);
-  for (const drop of ['NOEVIA_RUST_PROJECTS', 'NOEVIA_FRONT', 'NOEVIA_RUST_PROJECTS_CONFIRMED']) {
-    const env = { ...on }; delete env[drop];
-    assert.equal(rp.projectWritesEnabledFrom(env, () => {}), false, drop);
-  }
+  // A leftover projects switch, on or off, changes nothing.
+  for (const v of ['0', '1']) assert.equal(rp.projectWritesEnabledFrom({ ...on, NOEVIA_RUST_PROJECTS: v }, () => {}), true, v);
   assert.deepEqual([...rp.PROJECT_WRITE_ROUTES], ['GET /api/chats/{chatId}/context', 'POST /api/chats/{chatId}/context']);
-  for (const r of rp.PROJECT_WRITE_ROUTES) assert.equal(rp.OWNED_ROUTES.has(r), false, `${r} is not NOEVIA_RUST_PROJECTS's`);
+  for (const r of rp.PROJECT_WRITE_ROUTES) assert.equal(rp.OWNED_ROUTES.has(r), false, `${r} is not one of the permanent routes`);
+  assert.equal(rp.FREE_LIST_CAP, require('./chat-lists.cjs').LIST_CAP);
+});
+
+test('#1071: a workspace store without the Rust project store refuses to be made (no local writer to fall back to)', () => {
+  assert.throws(() => createWorkspaceStore(tmp(), DEFAULT, null), /needs the Rust project store/);
+  assert.throws(() => createWorkspaceStore(tmp(), DEFAULT, null, { onProjectsChanged: () => {} }), /needs the Rust project store/);
 });
 
 test('merge: assets and retiredAssets are merged per id (adds union, removals from either side)', async () => {
@@ -216,9 +223,9 @@ test('an unreadable file: the view is kept, and the next save replaces the file'
   assert.deepEqual(missing.load(), []);
 });
 
-test('the workspace store with rustProjects: requests see the other writer, saves keep its changes', async () => {
+test('the workspace store: requests see the other writer, saves keep its changes', async () => {
   const root = tmp();
-  const store = storeWith(root, { rustProjects: true });
+  const store = storeWith(root);
   const ws = store.get(USER);
   ws.projects.push({ id: 'p1', name: 'One', modes: ['chat'], chats: [] });
   await ws.saveProjects();
@@ -234,19 +241,11 @@ test('the workspace store with rustProjects: requests see the other writer, save
   write(file, disk);
   await ws.saveProjects();
   assert.deepEqual(read(file)[0], { id: 'p1', name: 'One', modes: ['chat'], chats: [{ id: 'chat-1' }], assets: [] });
-  // Off: Node writes its own view, as before (the change on disk is overwritten).
-  const plain = createWorkspaceStore(tmp(), DEFAULT, null);
-  const w2 = plain.get(USER);
-  w2.projects.push({ id: 'q', modes: ['chat'] }); await w2.saveProjects();
-  const f2 = path.join(w2.dir, 'projects.json');
-  write(f2, [{ id: 'q', modes: ['chat'], assets: [1] }]);
-  await plain.get(USER).saveProjects();
-  assert.deepEqual(read(f2), [{ id: 'q', modes: ['chat'] }]);
 });
 
 test('uploads.prune (a writer after an await) filters the lists as on disk now, and the save keeps them', async () => {
   const uploads = require('./uploads.cjs');
-  const store = storeWith(tmp(), { rustProjects: true });
+  const store = storeWith(tmp());
   const ws = store.get(USER);
   ws.projects.push({ id: 'p1', name: 'One', modes: ['chat'], chats: [], files: [] });
   await ws.saveProjects();
@@ -260,7 +259,7 @@ test('uploads.prune (a writer after an await) filters the lists as on disk now, 
   assert.deepEqual(read(file)[0].assets.map((a) => a.id), ['img-rust']);
 });
 
-test("Node's copies of the Rust-owned writes answer 503 only while the switch is on", async () => {
+test("Node's copies of the switched project writes answer 503 only while their slice is on; the permanent routes are fixed", async () => {
   const sent = [];
   const json = (res, status, body) => sent.push([status, body]);
   assert.equal(rp.refuseOwned(false, json, {}), false);
@@ -269,14 +268,13 @@ test("Node's copies of the Rust-owned writes answer 503 only while the switch is
   assert.equal(sent[0][0], 503);
   assert.equal(sent[0][1].code, 'RUST_PROJECTS_OWNED');
   assert.deepEqual([...rp.OWNED_ROUTES].sort(), ['DELETE /api/projects/{id}/assets/{assetId}', 'GET /api/freechats', 'GET /api/projects/{id}/assets/{assetId}', 'GET /api/projects/{id}/chats', 'POST /api/freechats', 'POST /api/projects/{id}/assets', 'POST /api/projects/{id}/chats']);
-  assert.ok(![...rp.OWNED_ROUTES].some((r) => r.startsWith('DELETE /api/freechats')), "a free chat's delete stays Node's");
-  // Off by default in a server that is not told otherwise.
-  const r = spawnSync(process.execPath, ['-e', `process.stdout.write(String(require(${JSON.stringify(path.join(__dirname, 'rust-projects.cjs'))}).enabledFrom({}, () => {})))`]);
-  assert.equal(String(r.stdout), 'false');
+  // On in a server that is told nothing (#1071): the refusal reads no environment.
+  const r = spawnSync(process.execPath, ['-e', `const json=(res,s)=>process.stdout.write(String(s)); require(${JSON.stringify(path.join(__dirname, 'rust-projects.cjs'))}).refuseOwnedRoute({ method: 'POST' }, {}, '/api/freechats', json)`], { env: { PATH: process.env.PATH, NOEVIA_RUST_PROJECTS: '0' } });
+  assert.equal(String(r.stdout), '503');
 });
 
 test('chat metas are merged per item: a list the front saved survives a move or delete here, and the delete stands', async () => {
-  const store = storeWith(tmp(), { rustProjects: true });
+  const store = storeWith(tmp());
   const ws = store.get(USER);
   ws.projects.push({ id: 'p1', name: 'One', modes: ['chat'], chats: [{ id: 'keep', title: 'K' }, { id: 'gone', title: 'G' }] });
   await ws.saveProjects();
@@ -296,7 +294,7 @@ test('chat metas are merged per item: a list the front saved survives a move or 
 
 test('a request start that takes in the front\'s change says so once; Node\'s own saves do not', async () => {
   const changed = [];
-  const store = storeWith(tmp(), { rustProjects: true, onProjectsChanged: (id) => changed.push(id) });
+  const store = storeWith(tmp(), { onProjectsChanged: (id) => changed.push(id) });
   const ws = store.get(USER);
   ws.projects.push({ id: 'p1', name: 'One', modes: ['chat'], chats: [] });
   await ws.saveProjects();
@@ -307,14 +305,6 @@ test('a request start that takes in the front\'s change says so once; Node\'s ow
   store.get(USER);
   store.get(USER);
   assert.deepEqual(changed, [USER]);
-  // Off: never called.
-  const off = [];
-  const plain = createWorkspaceStore(tmp(), DEFAULT, null, { onProjectsChanged: (id) => off.push(id) });
-  const w2 = plain.get(USER);
-  w2.projects.push({ id: 'q', modes: ['chat'] }); await w2.saveProjects();
-  write(path.join(w2.dir, 'projects.json'), [{ id: 'q', modes: ['chat'], chats: [] }]);
-  plain.get(USER);
-  assert.deepEqual(off, []);
 });
 
 // ── free-chats.json (the free-chat slice) ──────────────────────────────────
@@ -394,9 +384,9 @@ test('the coordinated free list: unsaved changes here survive a refresh; an unre
   assert.deepEqual(rp.createFreeChatsFile(path.join(dir, 'bad.json'), { remote: remoteFor(dir) }).load(), []);
 });
 
-test('the workspace store with rustFreeChats: a request sees the front, says so once, and a delete here keeps the front\'s save', async () => {
+test('the workspace store and free-chats.json: a request sees the front, says so once, and a delete here keeps the front\'s save', async () => {
   const changed = [];
-  const store = storeWith(tmp(), { rustProjects: true, rustFreeChats: true, onProjectsChanged: (id) => changed.push(id) });
+  const store = storeWith(tmp(), { onProjectsChanged: (id) => changed.push(id) });
   const ws = store.get(USER);
   assert.ok(ws.freeChatsFile);
   ws.freeChats = [meta('keep', 2), meta('gone', 1)];
@@ -417,7 +407,7 @@ test('the workspace store with rustFreeChats: a request sees the front, says so 
 
 test('moveChat and deleteFreeChat through the coordinated free list keep a meta the front saved meanwhile', async () => {
   const { createProjectStore } = require('./projects.cjs');
-  const store = storeWith(tmp(), { rustProjects: true, rustFreeChats: true });
+  const store = storeWith(tmp());
   const ws = store.get(USER);
   ws.projects.push({ id: 'p1', name: 'One', modes: ['chat'], chats: [] });
   await ws.saveProjects();
@@ -447,7 +437,7 @@ test('moveChat and deleteFreeChat through the coordinated free list keep a meta 
 test('setChatFlags reads both lists again first: a meta the front retitled during the turn keeps its title and gets the flags (sbstndalton/noevia#1426)', async () => {
   const { createProjectStore } = require('./projects.cjs');
   const changed = [];
-  const store = storeWith(tmp(), { rustProjects: true, rustFreeChats: true });
+  const store = storeWith(tmp());
   const ws = store.get(USER);
   ws.projects.push({ id: 'p1', name: 'One', modes: ['chat'], chats: [meta('c1', 1)] });
   await ws.saveProjects();

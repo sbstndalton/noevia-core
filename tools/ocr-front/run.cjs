@@ -11,6 +11,7 @@ const { once } = require('node:events');
 const { SERVER, GUARD, startMocks, serverEnv } = require('../contract-corpus/mocks.cjs');
 const { requireScan, requireReducedPdf, REDUCED_CAP } = require('./contracts.cjs');
 const { seedAccount } = require('../../tests/server/seed-account.cjs');
+const { startProjectStore } = require('../../tests/server/project-store-server.cjs');
 const required = name => { assert.ok(process.env[name], `${name} is required; this gate cannot skip`); return path.resolve(process.env[name]); };
 const children = new Set();
 function child(command, args, env) {
@@ -97,12 +98,17 @@ async function scenario(front, mode, workerBase, fixtures, root, calls) {
   const env = serverEnv({ port: nodePort, dataDir, origin: base, mocks });
   env.OCR_BASE_URL = `http://127.0.0.1:${relay.address().port}`;
   env.NOEVIA_CORPUS_ALLOWED_PORTS += `,${relay.address().port}`;
+  // Node saves projects.json only through the Rust front's project store and refuses to start
+  // without one (sbstndalton/noevia#1071): a loopback stand-in on this data dir.
+  const store = await startProjectStore(dataDir);
+  Object.assign(env, { NOEVIA_PROJECT_STORE_PORT: String(store.port), NOEVIA_PROJECT_STORE_TOKEN: store.token });
+  env.NOEVIA_CORPUS_ALLOWED_PORTS += `,${store.port}`;
   const node = child(process.execPath, ['--require', GUARD, SERVER], env);
   let rust;
   try {
     await ready(`http://127.0.0.1:${nodePort}`, '/api/ready', node);
     if (front) {
-      rust = child(front, [], { PATH: process.env.PATH, UI_PORT: String(frontPort), UI_HOST: '127.0.0.1', UI_DATA_DIR: dataDir, PUBLIC_ORIGIN: base, NOEVIA_FRONT: 'rust', NOEVIA_RUST_PROJECTS: '0', NOEVIA_LEGACY_UPSTREAM: `http://127.0.0.1:${nodePort}` });
+      rust = child(front, [], { PATH: process.env.PATH, UI_PORT: String(frontPort), UI_HOST: '127.0.0.1', UI_DATA_DIR: dataDir, PUBLIC_ORIGIN: base, NOEVIA_FRONT: 'rust', NOEVIA_LEGACY_UPSTREAM: `http://127.0.0.1:${nodePort}` });
       await ready(base, '/api/ready', rust);
     }
     const admin = new Client(base); const member = new Client(base);
@@ -181,7 +187,7 @@ async function scenario(front, mode, workerBase, fixtures, root, calls) {
     });
     return stable({ scan, pages, docx, large: comparedLarge, files: files.map(file => file === reduced ? comparedReduced : file).map(({ name, content, document, attachment }) => ({ name, content, document, attachment })), deniedPages, deniedOriginal, deniedUpload });
   } finally {
-    await stop(rust); await stop(node); mocks.close(); relay.closeAllConnections(); await new Promise(resolve => relay.close(resolve));
+    await stop(rust); await stop(node); mocks.close(); await store.close(); relay.closeAllConnections(); await new Promise(resolve => relay.close(resolve));
     fs.rmSync(dataDir, { recursive: true, force: true });
   }
 }

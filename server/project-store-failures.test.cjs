@@ -35,7 +35,7 @@ function harness({ projects = [], free = [], rag = {} } = {}) {
   fs.writeFileSync(path.join(dir, 'projects.json'), JSON.stringify({ projects }, null, 2));
   fs.writeFileSync(path.join(dir, 'free-chats.json'), JSON.stringify(free, null, 2));
   const { stub, state } = failingStub(root);
-  const wsStore = createWorkspaceStore(root, DEFAULT, null, { rustProjects: true, rustFreeChats: true, projectStore: stub });
+  const wsStore = createWorkspaceStore(root, DEFAULT, null, { projectStore: stub });
   const scope = new AsyncLocalStorage();
   const currentWorkspace = () => scope.getStore().workspace;
   const proxy = (field) => new Proxy([], {

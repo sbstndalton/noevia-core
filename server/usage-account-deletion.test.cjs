@@ -5,6 +5,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const { createWorkspaceStore } = require('./workspace.cjs');
+const { createStubStore } = require('../tests/server/project-store-stub.cjs');
 const { readUsage, recordUsage, recordToolUse, usageDayKey } = require('./usage.cjs');
 
 const DELETED_ID = 'aaaaaaaa-1111-4111-8111-111111111111';
@@ -13,7 +14,7 @@ const OTHER_ID = 'bbbbbbbb-2222-4222-8222-222222222222';
 test('stale reply and tool accounting cannot recreate a deleted tenant, while active tenants keep their counts', () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'noevia-usage-account-deletion-'));
   try {
-    const store = createWorkspaceStore(root, { id: 'default', label: 'Default', apiKey: '' });
+    const store = createWorkspaceStore(root, { id: 'default', label: 'Default', apiKey: '' }, null, { projectStore: createStubStore(root) });
     const workspace = store.get(DELETED_ID);
     const other = store.get(OTHER_ID);
     const day = usageDayKey();

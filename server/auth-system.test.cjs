@@ -8,6 +8,7 @@ const test = require('node:test');
 const { createAuth } = require('./auth.cjs');
 const { createSecretStore } = require('./secrets.cjs');
 const { createWorkspaceStore } = require('./workspace.cjs');
+const { createStubStore } = require('../tests/server/project-store-stub.cjs');
 
 // Sign-in, invitations, recovery, disabling an account and first-run setup are the Rust front's
 // (sbstndalton/noevia#1071; noevia-rs crates/server-account). The accounts and their tokens are
@@ -65,7 +66,7 @@ test('the Diary preference is read per account, and workspaces are isolated', (t
   assert.equal(auth.diaryEnabled(owner.id), true);
   assert.equal(auth.diaryEnabled(member.id), false);
   assert.deepEqual(auth.listUsers().map((u) => [u.username, u.role]), [['Owner', 'admin'], ['member', 'member']]);
-  const store = createWorkspaceStore(root, { id: 'default', label: 'Default', baseUrl: 'http://localhost', apiKey: '' }, secrets);
+  const store = createWorkspaceStore(root, { id: 'default', label: 'Default', baseUrl: 'http://localhost', apiKey: '' }, secrets, { projectStore: createStubStore(root) });
   const ownerSpace = store.get(owner.id); const memberSpace = store.get(member.id);
   ownerSpace.projects.push({ id: 'private-project', name: 'Private' }); ownerSpace.saveProjects();
   assert.equal(memberSpace.projects.length, 0);
@@ -95,7 +96,7 @@ test('additionalOrigins lets a second origin (e.g. a LAN IP) pass the origin che
 test('provider secrets are encrypted on disk and decrypt for their owner', () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cowork-secrets-'));
   const secrets = createSecretStore(root); const id = '22222222-2222-4222-8222-222222222222';
-  const store = createWorkspaceStore(root, { id: 'default', label: 'Default', baseUrl: 'http://localhost', apiKey: '' }, secrets);
+  const store = createWorkspaceStore(root, { id: 'default', label: 'Default', baseUrl: 'http://localhost', apiKey: '' }, secrets, { projectStore: createStubStore(root) });
   const workspace = store.get(id); workspace.providers.push({ id: 'private', label: 'Private', baseUrl: 'https://example.test/v1', apiKey: 'super-secret-key' }); workspace.saveProviders();
   const raw = fs.readFileSync(path.join(workspace.dir, 'providers.json'), 'utf8');
   assert.doesNotMatch(raw, /super-secret-key/); assert.match(raw, /enc:v1:/);

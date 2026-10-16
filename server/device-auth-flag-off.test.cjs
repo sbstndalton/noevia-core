@@ -14,6 +14,8 @@ const test = require('node:test');
 
 const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'noevia-device-off-'));
 process.env.UI_DATA_DIR = dataDir;
+// #1071: Node saves projects.json / free-chats.json only through the Rust project store.
+require('../tests/server/project-store-server.cjs').installProjectStore(dataDir);
 process.env.PUBLIC_ORIGIN = 'http://localhost';
 process.env.LEGACY_AUTH_COMPAT = 'false';
 delete process.env.NOEVIA_FEATURE_NATIVE_CLIENT_AUTH;
@@ -63,7 +65,7 @@ test('with the feature off, the approval page is 404 and the device endpoints ar
   assert.equal((await request('/api/workspace', { headers: { authorization: 'Bearer nva_synthetic' } })).status, 401);
   const both = await request('/api/workspace', { headers: { authorization: 'Bearer nva_synthetic', cookie } });
   assert.equal(both.status, 200, 'with the feature off, a bearer beside a cookie is ignored as before');
-  assert.equal((await request('/api/freechats', { method: 'POST', body: { chats: [] }, headers: { cookie, origin: 'http://localhost', 'content-type': 'application/json' } })).status, 403, 'CSRF still required');
+  assert.equal((await request('/api/workspace/model', { method: 'PUT', body: {}, headers: { cookie, origin: 'http://localhost', 'content-type': 'application/json' } })).status, 403, 'CSRF still required');
   const flags = JSON.parse((await request('/api/features', { headers: { cookie } })).text).flags;
   assert.equal(flags.nativeClientAuth, false);
 });

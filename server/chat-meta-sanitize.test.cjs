@@ -9,6 +9,8 @@ const path = require('node:path');
 // Each test file gets its own data dir so parallel runs never race on the
 // default server/ui-data/secrets.key (EEXIST).
 process.env.UI_DATA_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'cowork-chatsanitize-test-'));
+// #1071: Node saves projects.json / free-chats.json only through the Rust project store.
+require('../tests/server/project-store-server.cjs').installProjectStore(process.env.UI_DATA_DIR);
 const { sanitizeChats } = require('./index.cjs');
 
 // Regression: a bare chat-id string in a project's chats[] reached the browser
