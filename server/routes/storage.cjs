@@ -7,7 +7,7 @@ const { RUST_STORAGE_READS_REFUSAL, RUST_STORAGE_BROWSE_REFUSAL } = require('../
 // A Nextcloud login-flow reply is a few hundred bytes; a server that streams more is refused (#902).
 const NEXTCLOUD_REPLY_CAP = 64 * 1024;
 // The user's own storage connection (Settings → Diary & storage): read and save it, test it,
-// browse and read files over it for project knowledge, create one folder, and the Nextcloud
+// create one folder (browsing and reading files over it are the Rust front's, #1071), and the Nextcloud
 // Login Flow v2 that turns a URL into an app password without the user typing a secret here.
 //
 // Returns true when it handled the request. Auth and CSRF run before routes are mounted.
@@ -87,10 +87,8 @@ const PASS = Symbol('unhandled');
  * @param {(authn, url:string) => boolean} deps.endpointApproved
  * @param {(...args) => Promise<Response>} deps.fetch     resolved per call so tests can swap the global
  * @param {{ randomUUID: () => string }} deps.crypto
- * @param {() => boolean} [deps.storageReadsOwned] confirmed deployment owner; defaults off
- * @param {() => boolean} [deps.storageBrowseOwned] confirmed owner of the list/read (#1368); defaults off
  */
-function createStorageRoutes({ json, readJson: readAnyJson, authService, storageClient, endpointApproved, fetch, crypto, storageReadsOwned = () => false, storageBrowseOwned = () => false, flowStore, storageLatch = null }) {
+function createStorageRoutes({ json, readJson: readAnyJson, authService, storageClient, endpointApproved, fetch, crypto, flowStore, storageLatch = null }) {
   // Every body these routes read is a JSON object; `null`, an array or a number is a 400 (#786).
   const readJson = requireJsonObject(readAnyJson);
   // #1431: the pending sign-ins. index.cjs passes the persisted, sealed store; without one (tests) they
@@ -111,30 +109,13 @@ function createStorageRoutes({ json, readJson: readAnyJson, authService, storage
   }
 
   async function handle(req, res, { path: p, authn }) {
-    if (p === '/api/integrations/storage' && req.method === 'GET') {
-      if (storageReadsOwned()) return json(res, 503, RUST_STORAGE_READS_REFUSAL);
-      return json(res, 200, authService.getStorage(authn.user.id));
-    }
-    // Browse/read over the user's own connected storage (project knowledge
-    // intake; read-only). The saved connection's own credentials are used
-    // server-side and never returned to the client.
-    const storageBrowse = p.match(/^\/api\/integrations\/storage\/files(?:\/(.*))?$/);
-    if (storageBrowse && req.method === 'GET') {
-      // The Rust front answers this once confirmed; Node must not read or reseal the row.
-      if (storageBrowseOwned()) return json(res, 503, RUST_STORAGE_BROWSE_REFUSAL);
-      const connection = authService.getStorage(authn.user.id, true);
-      if (!storageClient.isBrowsable(connection)) return json(res, 400, { error: 'no browsable storage connected (local storage needs no browsing — upload files directly)' });
-      // Defense in depth: also guard connections saved before the save-time
-      // guard existed, and saved by an admin that has since been demoted.
-      if (!(await storageEndpointAllowed(authn, connection.baseUrl))) return json(res, 400, { error: STORAGE_PRIVATE_URL_ERROR });
-      try {
-        const entries = await storageClient.listFiles(connection, decodeURIComponent(storageBrowse[1] || ''));
-        loginProven(authn, connection);
-        return json(res, 200, { entries });
-      } catch (e) {
-        return json(res, e?.status === 400 ? 400 : 502, { error: e?.message || 'storage browse failed' });
-      }
-    }
+    // sbstndalton/noevia#1071: the connection's metadata GET, the list and the text read belong to
+    // the Rust front (noevia-rs crates/server-storage-reads). One that reaches Node is a bypass,
+    // refused before the row is read or resealed. (The metadata GET is normally refused even
+    // earlier, before authentication: features.cjs refuseRustStorageRead.)
+    if (p === '/api/integrations/storage' && req.method === 'GET') return json(res, 503, RUST_STORAGE_READS_REFUSAL);
+    if (/^\/api\/integrations\/storage\/files(?:\/.*)?$/.test(p) && req.method === 'GET') return json(res, 503, RUST_STORAGE_BROWSE_REFUSAL);
+    if (p === '/api/integrations/storage/file' && req.method === 'POST') return json(res, 503, RUST_STORAGE_BROWSE_REFUSAL);
     // Creating a directory is the one write this integration performs. It is
     // deliberately narrow: MKCOL only, no file writes, no overwrite, no delete.
     const storageMkdir = p.match(/^\/api\/integrations\/storage\/folder$/);
@@ -153,22 +134,6 @@ function createStorageRoutes({ json, readJson: readAnyJson, authService, storage
       }
     }
 
-    const storageRead = p.match(/^\/api\/integrations\/storage\/file$/);
-    if (storageRead && req.method === 'POST') {
-      if (storageBrowseOwned()) return json(res, 503, RUST_STORAGE_BROWSE_REFUSAL);
-      const body = await readJson(req);
-      const connection = authService.getStorage(authn.user.id, true);
-      if (!storageClient.isBrowsable(connection)) return json(res, 400, { error: 'no browsable storage connected' });
-      if (!(await storageEndpointAllowed(authn, connection.baseUrl))) return json(res, 400, { error: STORAGE_PRIVATE_URL_ERROR });
-      try {
-        const file = await storageClient.readTextFile(connection, body.path);
-        loginProven(authn, connection);
-        return json(res, 200, file);
-      } catch (e) {
-        const status = e && e.status ? e.status : 502;
-        return json(res, status, { error: e?.message || 'storage read failed' });
-      }
-    }
     if (p === '/api/integrations/storage' && req.method === 'PUT') {
       const body = await readJson(req);
       if (body.kind !== 'local' && (!/^https?:\/\//.test(String(body.baseUrl || '')) || !body.username || !body.secret)) {

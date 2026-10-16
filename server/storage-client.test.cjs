@@ -444,38 +444,15 @@ test.before(async () => {
 
 const mutationHeaders = () => ({ origin: 'http://localhost', cookie, 'content-type': 'application/json', 'x-csrf-token': csrf });
 
-test('browse route lists the connected WebDAV root through the proxy', async (t) => {
-  const response = await request('/api/integrations/storage/files', { headers: { cookie } });
-  assert.equal(response.status, 200);
-  const body = JSON.parse(response.text);
-  assert.deepEqual(body.entries.map((e) => [e.name, e.isDir]), [['Cowork', true]]);
-});
-
-test('browse route serves a nested directory and rejects traversal', async () => {
+test('#1071: the storage list and the text read are the Rust front\'s; Node refuses them with 503', async () => {
+  const list = await request('/api/integrations/storage/files', { headers: { cookie } });
+  assert.equal(list.status, 503);
+  assert.equal(JSON.parse(list.text).code, 'RUST_STORAGE_BROWSE_OWNED');
   const nested = await request('/api/integrations/storage/files/Cowork/Docs', { headers: { cookie } });
-  assert.equal(nested.status, 200);
-  assert.ok(JSON.parse(nested.text).entries.some((e) => e.name === 'notes.md'));
-
-  const evil = await request('/api/integrations/storage/files/..%2F..%2Fetc', { headers: { cookie } });
-  // #984: traversal is refused (400), no longer neutralized into a root listing.
-  assert.equal(evil.status, 400);
-  assert.match(JSON.parse(evil.text).error, /relative path inside the storage folder/);
-});
-
-test('file-read route returns content and enforces the text-extension rule', async () => {
-  const good = await request('/api/integrations/storage/file', {
-    method: 'POST', headers: mutationHeaders(),
-    body: JSON.stringify({ path: 'Cowork/Docs/notes.md' }),
-  });
-  assert.equal(good.status, 200);
-  assert.equal(JSON.parse(good.text).content, '# notes\n\nremote knowledge');
-
-  const bad = await request('/api/integrations/storage/file', {
-    method: 'POST', headers: mutationHeaders(),
-    body: JSON.stringify({ path: 'Docs/image.png' }),
-  });
-  assert.equal(bad.status, 400);
-  assert.match(JSON.parse(bad.text).error, /not a supported text file/);
+  assert.equal(nested.status, 503);
+  const read = await request('/api/integrations/storage/file', { method: 'POST', headers: mutationHeaders(), body: JSON.stringify({ path: 'Cowork/Docs/notes.md' }) });
+  assert.equal(read.status, 503);
+  assert.equal(JSON.parse(read.text).code, 'RUST_STORAGE_BROWSE_OWNED');
 });
 
 test('browse route requires authentication', async () => {

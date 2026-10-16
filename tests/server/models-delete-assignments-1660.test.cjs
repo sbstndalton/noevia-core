@@ -28,7 +28,7 @@ function routes({ installed = [], env = {}, routerDelete = { ok: true, status: 2
     },
     env: { MODEL_LOADER_URL: 'http://loader.invalid', ...env }, modelManager,
     getProvider: () => ({}), providerHeaders: () => ({}), DEFAULT_PROVIDER_ID: 'default',
-    createVisionProbe: () => async () => ({ supported: true }), reportedTokenRate: () => null,
+    createVisionProbe: () => async () => ({ supported: true }),
     missingRoles: () => null, currentWorkspace: () => ({ userId: 'u1' }),
     service: { modelScanCache: new Map(), refreshModelScan: () => {}, autoRoles: () => null, setAutoRoles: () => {}, ensureRolesLoaded: () => {},
       servedCatalogue: async () => [], modelsInstalled: async () => installed, modelsInstalledNow: async () => installed, deriveUserModelName: (c) => c,

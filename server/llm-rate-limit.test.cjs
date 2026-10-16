@@ -98,7 +98,8 @@ test('the removed Insights reflection route is unavailable', async () => {
 });
 
 test('other routes are unaffected by the LLM throttle', async () => {
-  const response = await request('/api/integrations/storage', { headers: { cookie } });
+  // GET /api/integrations/storage is the Rust front's (#1071); the workspace view is still Node's.
+  const response = await request('/api/workspace', { headers: { cookie } });
   assert.equal(response.status, 200);
 });
 

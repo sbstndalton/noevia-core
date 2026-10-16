@@ -5,7 +5,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const { Readable } = require('node:stream');
-const { createModelRoutes, routingDefaultRustOwned, statsRustOwned } = require('./models.cjs');
+const { createModelRoutes, STATS_REFUSAL, ROUTING_DEFAULT_REFUSAL } = require('./models.cjs');
 const { createModelService } = require('../models.cjs');
 
 // A workspace-shaped test double (autoRoles + saveAutoRoles), for tests that pass
@@ -51,7 +51,6 @@ function fixture({ env = {}, enabled = true, kind = 'llamacpp', manager = {}, wo
     env, modelManager, inferenceBudget, idleUnload, sweepGuardOptions, ...(machineModels ? { machineModels } : {}),
     getProvider: () => ({ baseUrl: 'http://engine', apiKey: 'local' }), providerHeaders: () => ({}), DEFAULT_PROVIDER_ID: 'default',
     createVisionProbe: () => async () => ({ supported: true }),
-    reportedTokenRate: (g) => g.tokens_per_second ?? null,
     missingRoles: (r, catalogue) => ({ roles: r, catalogue }),
     currentWorkspace: () => workspace,
     service: {
@@ -83,15 +82,8 @@ test('every write under /api/models/ is refused for members before anything else
   assert.equal(await f.call('DELETE', '/api/auto-roles'), false, 'an unhandled method keeps falling through');
 });
 
-test('stats and capabilities read the adapter; the roles round-trip and warm up', async () => {
+test('capabilities read the adapter; the roles round-trip and warm up', async () => {
   const f = fixture({ env: { MODEL_LOADER_URL: 'http://loader' } });
-  await f.call('GET', '/api/stats');
-  const stats = f.sent.pop();
-  assert.equal(stats.status, 200);
-  assert.equal(stats.body.up, true);
-  assert.equal(stats.body.tokensPerSecond, 41.5);
-  assert.equal(stats.body.cpuPercent, 12);
-  assert.equal(stats.body.gpuPercent, null);
   await f.call('GET', '/api/models/capabilities', undefined, 'admin');
   assert.deepEqual(f.sent.pop(), { status: 200, body: { kind: 'llamacpp', enabled: true, admin: true, routing: true, modelManagement: true } });
   await f.call('GET', '/api/models/capabilities');
@@ -439,13 +431,11 @@ test('#1057 per-model tune settings are admin-only, POST-only, and pass the mode
   assert.deepEqual(old.sent.pop(), { status: 404, body: { error: 'Auto-tune settings are unavailable' } });
 });
 
-test('the default model mode round-trips, and only an explicit apply switches existing projects', async () => {
+test('the default model mode saves, and only an explicit apply switches existing projects', async () => {
   let saves = 0;
   const workspace = { userId: 'u1', preferences: {}, projects: [{ id: 'a', routing: 'manual' }, { id: 'b', routing: 'auto' }],
     savePreferences() {}, saveProjects() { saves += 1; } };
   const f = fixture({ workspace });
-  await f.call('GET', '/api/routing-default');
-  assert.deepEqual(f.sent.pop(), { status: 200, body: { routing: 'auto' } });
   await f.call('PUT', '/api/routing-default', { routing: 'manual' });
   assert.deepEqual(f.sent.pop(), { status: 200, body: { routing: 'manual', updated: 0 } });
   assert.equal(workspace.projects[1].routing, 'auto', 'changing the default alone rewrites nothing');
@@ -457,30 +447,20 @@ test('the default model mode round-trips, and only an explicit apply switches ex
   assert.equal(f.sent.pop().status, 400);
 });
 
-test('#1305: a confirmed Rust front owns GET /api/routing-default, so Node refuses it before reading the workspace; PUT stays Node\'s', async () => {
+test('#1071: GET /api/routing-default is the Rust front\'s, so Node always refuses it before reading the workspace; PUT stays Node\'s', async () => {
   let reads = 0;
   // Reading `preferences` is what a workspace-backed answer does; counting it shows whether the refused GET touched the workspace.
   const workspace = { userId: 'u1', projects: [], get preferences() { reads += 1; return { defaultRouting: 'manual' }; }, set preferences(v) { this.stored = v; }, savePreferences() {}, saveProjects() {} };
-  const owned = { NOEVIA_FRONT: 'rust', NOEVIA_RUST_AUTH: '1', NOEVIA_RUST_AUTH_CONFIRMED: '1', NOEVIA_RUST_ROUTING_DEFAULT: '1', NOEVIA_RUST_ROUTING_DEFAULT_CONFIRMED: '1' };
-  const confirmed = fixture({ env: owned, workspace });
-  await confirmed.call('GET', '/api/routing-default');
-  assert.deepEqual(confirmed.sent.pop(), { status: 503, body: { error: 'Routing default is owned by the Rust front.' } });
-  assert.equal(reads, 0, 'the refused GET never reads the workspace');
-  await confirmed.call('PUT', '/api/routing-default', { routing: 'auto' });
-  assert.equal(confirmed.sent.pop().status, 200, 'PUT keeps answering in Node');
-  for (const env of [
-    { ...owned, NOEVIA_RUST_ROUTING_DEFAULT_CONFIRMED: '0' },
-    { ...owned, NOEVIA_RUST_ROUTING_DEFAULT: '0' },
-    { ...owned, NOEVIA_RUST_AUTH_CONFIRMED: undefined },
-    { ...owned, NOEVIA_FRONT: 'node' },
-    { ...owned, NOEVIA_RUST_ROUTING_DEFAULT_CONFIRMED: 'true' },
-  ]) {
+  // No environment hands it back to Node, a leftover retired switch included.
+  for (const env of [{}, { NOEVIA_RUST_ROUTING_DEFAULT: '0' }, { NOEVIA_FRONT: 'node' }, { NOEVIA_FRONT: 'rust', NOEVIA_RUST_AUTH: '1', NOEVIA_RUST_ROUTING_DEFAULT: '1', NOEVIA_RUST_ROUTING_DEFAULT_CONFIRMED: '1' }]) {
     const f = fixture({ env, workspace });
     await f.call('GET', '/api/routing-default');
-    assert.deepEqual(f.sent.pop(), { status: 200, body: { routing: 'manual' } });
+    assert.deepEqual(f.sent.pop(), { status: 503, body: ROUTING_DEFAULT_REFUSAL }, JSON.stringify(env));
   }
-  assert.equal(routingDefaultRustOwned(owned), true);
-  assert.equal(routingDefaultRustOwned({}), false);
+  assert.equal(reads, 0, 'the refused GET never reads the workspace');
+  const f = fixture({ workspace });
+  await f.call('PUT', '/api/routing-default', { routing: 'auto' });
+  assert.equal(f.sent.pop().status, 200, 'PUT keeps answering in Node');
 });
 
 test('deleting a loaded model unloads first, clears its auto-role and the last-loaded default, and reports what changed', async () => {
@@ -991,20 +971,7 @@ test('#1249: a null or blank model path is refused (400 invalid_path) under ever
   assert.equal(f.fetched.length, 1, 'clearing mmproj / model-draft still goes through');
 });
 
-test('#1461 /api/stats is shared for a moment, and a model or role write drops the shared answer', async () => {
-  let statsCalls = 0;
-  const f = fixture({ env: { MODEL_LOADER_URL: 'http://loader' }, manager: { stats: async () => { statsCalls += 1; return { ok: true, body: { scope: 'engine', tokens_per_second: 41.5, mtp: [] } }; } } });
-  await Promise.all([f.call('GET', '/api/stats'), f.call('GET', '/api/stats')]);
-  assert.equal(statsCalls, 1, 'concurrent tabs share one engine read');
-  await f.call('GET', '/api/stats');
-  assert.equal(statsCalls, 1, 'a poll inside the TTL is served the shared answer');
-  assert.equal(f.sent.pop().body.tokensPerSecond, 41.5, 'the shared answer still carries the engine numbers');
-  await f.call('PUT', '/api/auto-roles', { fast: 'm', smart: 'm' }, 'admin');
-  await f.call('GET', '/api/stats');
-  assert.equal(statsCalls, 2, 'a role save makes the next stats read fresh');
-});
-
-test('#1650: a confirmed Rust front owns GET /api/stats, so Node refuses it before any engine read; other methods stay Node\'s', async () => {
+test('#1071: GET /api/stats is the Rust front\'s, so Node always refuses it before any engine read and answers no other method', async () => {
   const reads = [];
   const count = (name, value) => async () => { reads.push(name); return value; };
   const manager = {
@@ -1014,50 +981,26 @@ test('#1650: a confirmed Rust front owns GET /api/stats, so Node refuses it befo
     metrics: count('metrics', { ok: false }),
     listModels: count('listModels', { ok: true, body: { data: [] } }),
   };
-  const owned = { NOEVIA_FRONT: 'rust', NOEVIA_RUST_AUTH: '1', NOEVIA_RUST_AUTH_CONFIRMED: '1', NOEVIA_RUST_STATS: '1', NOEVIA_RUST_STATS_CONFIRMED: '1' };
-  const confirmed = fixture({ env: owned, manager });
-  for (const role of ['member', 'admin']) {
-    await confirmed.call('GET', '/api/stats', undefined, role);
-    assert.deepEqual(confirmed.sent.pop(), { status: 503, body: { error: 'Engine statistics are owned by the Rust front.' } });
+  for (const env of [{}, { NOEVIA_RUST_STATS: '0' }, { NOEVIA_FRONT: 'rust', NOEVIA_RUST_AUTH: '1', NOEVIA_RUST_STATS: '1', NOEVIA_RUST_STATS_CONFIRMED: '1' }]) {
+    const f = fixture({ env: { MODEL_LOADER_URL: 'http://loader', ...env }, manager });
+    for (const role of ['member', 'admin']) {
+      await f.call('GET', '/api/stats', undefined, role);
+      assert.deepEqual(f.sent.pop(), { status: 503, body: STATS_REFUSAL }, JSON.stringify(env));
+    }
+    for (const method of ['POST', 'HEAD', 'PUT']) {
+      await f.call(method, '/api/stats', undefined, 'admin');
+      assert.deepEqual(f.sent.pop(), { status: 405, body: { error: 'Method not allowed' } }, method);
+    }
   }
-  assert.deepEqual(reads, [], 'the refused GET reads nothing from the engine');
-  for (const method of ['POST', 'HEAD']) {
-    await confirmed.call(method, '/api/stats');
-    const sent = confirmed.sent.pop();
-    assert.equal(sent.status, 200, `${method} keeps answering in Node`);
-    assert.equal(sent.body.up, true);
-  }
-  // The routing default is a separate switch.
-  await confirmed.call('GET', '/api/routing-default');
-  assert.equal(confirmed.sent.pop().status, 200);
-  for (const env of [
-    { ...owned, NOEVIA_RUST_STATS_CONFIRMED: '0' },
-    { ...owned, NOEVIA_RUST_STATS_CONFIRMED: 'true' },
-    { ...owned, NOEVIA_RUST_STATS: '0' },
-    { ...owned, NOEVIA_RUST_AUTH_CONFIRMED: undefined },
-    { ...owned, NOEVIA_RUST_AUTH: '0' },
-    { ...owned, NOEVIA_FRONT: 'node' },
-    { NOEVIA_RUST_ROUTING_DEFAULT: '1', NOEVIA_RUST_ROUTING_DEFAULT_CONFIRMED: '1', NOEVIA_FRONT: 'rust', NOEVIA_RUST_AUTH: '1', NOEVIA_RUST_AUTH_CONFIRMED: '1' },
-  ]) {
-    const f = fixture({ env, manager });
-    await f.call('GET', '/api/stats');
-    const sent = f.sent.pop();
-    assert.equal(sent.status, 200, JSON.stringify(env));
-    assert.equal(sent.body.tokensPerSecond, 9);
-  }
-  assert.equal(statsRustOwned(owned), true);
-  assert.equal(statsRustOwned({}), false);
+  assert.deepEqual(reads, [], 'Node reads nothing from the engine for /api/stats');
+  // A role save still drops the model reads Node keeps (the stats share left with the GET).
+  const f = fixture({ env: { MODEL_LOADER_URL: 'http://loader' }, manager });
+  await f.call('PUT', '/api/auto-roles', { fast: 'm', smart: 'm' }, 'admin');
+  assert.equal(f.sent.pop().status, 200);
 });
 
-test('#1461 /api/stats keeps the tenant-scoped tokens figure per request, not inside the shared read', async () => {
-  let statsCalls = 0;
-  const f = fixture({ env: { MODEL_LOADER_URL: 'http://loader' }, manager: { stats: async () => { statsCalls += 1; return { ok: true, body: { scope: 'engine', tokens_per_second: 9, mtp: [] } }; } } });
-  await f.call('GET', '/api/stats');
-  await f.call('GET', '/api/stats', undefined, 'member');
-  assert.equal(statsCalls, 1);
-  assert.equal(f.sent.length, 2);
-  assert.equal(f.sent[0].body.tokensPerSecond, f.sent[1].body.tokensPerSecond);
-});
+
+
 
 test('#1849 GET /api/auto-roles lists the models chat roles\' machines serve; nothing on a machine leaves the answer as it was', async () => {
   const plain = fixture({ initialRoles: { fast: 'm', smart: 'm' } });

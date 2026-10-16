@@ -1,57 +1,18 @@
 'use strict';
-// GET /api/sampling-settings                 -> whether automatic sampling presets are on, and
-//                                                the preset catalogue (issue #194)
-// PUT /api/sampling-settings { enabled }      -> flips the server default, administrators only
-//
-// Mirrors routes/reasoning-settings.cjs: the toggle lives in the same key/value settings table
-// ('auto_sampling_presets_enabled'), default on (missing/unset reads as enabled). Selection
-// logic and precedence live in sampling-presets.cjs; this route only exposes the on/off switch
-// used by chat.cjs and the model settings UI's "Automatic sampling presets" toggle.
+// /api/sampling-settings belongs to the Rust front (sbstndalton/noevia#1071; noevia-rs
+// crates/server-sampling-settings): it reads and writes the 'auto_sampling_presets_enabled'
+// settings key. Node no longer answers it; a request that reaches Node is a bypass of the front
+// and is refused, whatever the method. chat.cjs still reads the key, and the preset selection
+// lives in sampling-presets.cjs.
 
-const PASS = Symbol('unhandled');
-const { PRESETS, PRESETS_VERSION } = require('../sampling-presets.cjs');
+const REFUSAL = Object.freeze({ error: 'Sampling settings are owned by the Rust front.' });
 
-/**
- * @param {object} deps
- * @param {(res, status, body) => any} deps.json
- * @param {(req) => Promise<string>} deps.readBody
- * @param {object} deps.authService   db and audit
- */
-function enabledFrom(env = process.env) {
-  return env.NOEVIA_FRONT === 'rust' && env.NOEVIA_RUST_AUTH === '1'
-    && env.NOEVIA_RUST_AUTH_CONFIRMED === '1' && env.NOEVIA_RUST_SAMPLING_SETTINGS === '1'
-    && env.NOEVIA_RUST_SAMPLING_SETTINGS_CONFIRMED === '1';
-}
-function createSamplingSettingsRoutes({ json, readBody, authService, env = process.env }) {
-  const rustOwned = enabledFrom(env);
-  const KEY = 'auto_sampling_presets_enabled';
-  const currentlyEnabled = () => {
-    const raw = authService.db.prepare('SELECT value FROM settings WHERE key=?').get(KEY)?.value;
-    return raw === undefined || raw === null ? true : raw !== 'false';
-  };
-  async function handle(req, res, { path: p, authn }) {
-    if (p === '/api/sampling-settings') {
-      if (rustOwned) return json(res, 503, { error: 'Sampling settings are owned by the Rust front.' });
-      if (req.method === 'GET') {
-        return json(res, 200, { enabled: currentlyEnabled(), presets: PRESETS, version: PRESETS_VERSION, admin: authn.user.role === 'admin' });
-      }
-      if (req.method === 'PUT') {
-        if (authn.user.role !== 'admin') return json(res, 403, { error: 'Administrator required' });
-        let body; try { body = JSON.parse(await readBody(req)); } catch { return json(res, 400, { error: 'invalid JSON' }); }
-        if (!body || typeof body !== 'object' || Array.isArray(body) || typeof body.enabled !== 'boolean') return json(res, 400, { error: 'enabled must be true or false' });
-        authService.db.transaction(() => {
-          authService.db.prepare("INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)").run(KEY, String(body.enabled));
-          authService.audit('sampling.autoPresets', authn.user.id, null, { enabled: body.enabled });
-        })();
-        return json(res, 200, { enabled: body.enabled });
-      }
-      return json(res, 405, { error: 'Method not allowed' });
-    }
-    return PASS;
-  }
-  return async function samplingSettingsRoutes(req, res, ctx) {
-    return (await handle(req, res, ctx)) !== PASS;
+function createSamplingSettingsRoutes({ json }) {
+  return async function samplingSettingsRoutes(req, res, { path: p }) {
+    if (p !== '/api/sampling-settings') return false;
+    json(res, 503, REFUSAL);
+    return true;
   };
 }
 
-module.exports = { createSamplingSettingsRoutes, enabledFrom };
+module.exports = { createSamplingSettingsRoutes, REFUSAL };

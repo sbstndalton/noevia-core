@@ -142,7 +142,7 @@ function createDiaryRoutes({ json, readBody, readJson, fetchJson, DIARY_BASE, au
         const target = `${DIARY_BASE}/api${suffix}`;
         return require('../diary-stream.cjs').proxyDiaryStream(res, target, {
           method:'POST', headers:(secret)=>diaryHeaders('POST', target, { secret, body }), body,
-        }, {withStorageCredential:diary.withStorageCredential, onEvent:event=>{if(event.type==='mtp')require('../mtp.cjs').record(authn.user.id,event.model,event.timings);}});
+        }, {withStorageCredential:diary.withStorageCredential});
       }
       // #1168: only an explicit Retry press (the browser sends X-Cowork-Storage-Retry: 1) may reset the
       // sidecar's rejected-login cool-down; every automatic read goes without it.

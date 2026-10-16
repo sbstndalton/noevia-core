@@ -1,45 +1,16 @@
 'use strict';
-// GET /api/usage            -> the signed-in account's own summary
-// GET /api/usage/aggregate  -> every current account merged            admin only
+// /api/usage and /api/usage/aggregate belong to the Rust front (sbstndalton/noevia#1071; noevia-rs
+// crates/server-usage). Node no longer answers them: a request that reaches it is a bypass of the
+// front and is refused, whatever the method. Recording stays Node's (usage.cjs).
 //
-// Returns true when it handled the request. CSRF/origin checks run before routes are mounted.
-// The numbers themselves are `usage.cjs` (recording) and `usage-summary.cjs` (derivation);
-// this file only decides who may ask for which scope.
-const { summarizeUsage, aggregateUsage } = require('../usage-summary.cjs');
+// Returns true when it handled the request.
+const REFUSAL = Object.freeze({ error: 'Usage reporting is owned by the Rust front.' });
 
-// Only the supervisor confirms a compiled native owner. Recording remains Node-owned.
-function enabledFrom(env = process.env) {
-  return env.NOEVIA_FRONT === 'rust' && env.NOEVIA_RUST_AUTH === '1'
-    && env.NOEVIA_RUST_AUTH_CONFIRMED === '1' && env.NOEVIA_RUST_USAGE === '1'
-    && env.NOEVIA_RUST_USAGE_CONFIRMED === '1';
-}
-function createUsageRoutes({ readUsage, usageDayKey, retentionDays, workspace, listUsers, userDir, json, env = process.env }) {
-  const rustOwned = enabledFrom(env);
-  return async function usageRoutes(req, res, { path, authn }) {
+function createUsageRoutes({ json }) {
+  return async function usageRoutes(req, res, { path }) {
     if (path !== '/api/usage' && path !== '/api/usage/aggregate') return false;
-    if (rustOwned) return json(res, 503, { error: 'Usage reporting is owned by the Rust front.' }), true;
-    if (req.method !== 'GET') return json(res, 405, { error: 'method not allowed' }), true;
-
-    const everyone = path === '/api/usage/aggregate';
-    // Another account's usage is another person's record of what they asked for.
-    if (everyone && authn.user.role !== 'admin') return json(res, 403, { error: 'administrator required' }), true;
-
-    let store, aggregate = null;
-    if (everyone) {
-      try {
-        const result = await aggregateUsage(listUsers(), userDir);
-        store = result.store;
-        aggregate = { accounts: result.accounts, unreadableAccounts: result.unreadableAccounts, checkedAt: result.checkedAt };
-      } catch {
-        // Bounded on purpose: too many accounts, or one file too large, is a refusal rather
-        // than a number that took the box down to produce.
-        return json(res, 503, { error: 'Aggregate usage could not be read within its limits.' }), true;
-      }
-    } else {
-      store = readUsage(workspace());
-    }
-    return json(res, 200, { ...summarizeUsage(store, { dayKey: usageDayKey, retentionDays }), ...(aggregate ? { aggregate } : {}) }), true;
+    return json(res, 503, REFUSAL), true;
   };
 }
 
-module.exports = { createUsageRoutes, enabledFrom };
+module.exports = { createUsageRoutes, REFUSAL };

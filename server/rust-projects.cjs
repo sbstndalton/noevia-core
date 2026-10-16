@@ -387,7 +387,9 @@ function createProjectsFile(file, { warn = console.warn, remote } = {}) {
       const done = await remote.client.write(remote.user, 'projects.json', snap.version, text);
       if (done.conflict) continue;
       // `written` is on disk now: take it in as a refresh would, keeping what changed here since.
-      const writtenCopy = JSON.parse(projectsText(written)).projects;
+      // #1920: from the text that was written, never by serialising `written` again: it can hold
+      // this process's own project objects, changed while the write was awaited.
+      const writtenCopy = JSON.parse(text).projects;
       const { result, adopt } = merge(localArray, state.base, writtenCopy);
       apply(localArray, result, adopt);
       rebase(writtenCopy);

@@ -21,7 +21,7 @@ function routes({ manager = {}, loader = async () => ({ ok: true, status: 200, b
     fetchJson: async (url, init) => { fetched.push({ url, method: init.method }); return loader(url, init); },
     env: { MODEL_LOADER_URL: 'http://loader.invalid' }, modelManager,
     getProvider: () => ({}), providerHeaders: () => ({}), DEFAULT_PROVIDER_ID: 'default',
-    createVisionProbe: () => async () => ({ supported: true }), reportedTokenRate: () => null,
+    createVisionProbe: () => async () => ({ supported: true }),
     missingRoles: () => null, currentWorkspace: () => ({ userId: 'u1' }),
     service: { modelScanCache: scan, refreshModelScan: () => {}, autoRoles: () => null, setAutoRoles: () => {}, ensureRolesLoaded: () => {},
       servedCatalogue: async () => [], modelsInstalled: async () => { throw Error('ENOENT /secret/path/models.ini'); }, deriveUserModelName: c => c,

@@ -119,7 +119,7 @@ test('#1796 GET /api/models/assignments takes the decision rows from the decisio
     readBody: async () => '', readJson: async () => ({}), fetchJson: async () => ({ ok: false, status: 404, body: {} }),
     env: KEV_ENV, modelManager: { enabled: true, kind: 'other', capabilities: {} },
     getProvider: () => ({}), providerHeaders: () => ({}), DEFAULT_PROVIDER_ID: 'default', createVisionProbe: () => async () => ({}),
-    reportedTokenRate: () => null, missingRoles: () => null, currentWorkspace: () => ({ userId: 'u1' }),
+    missingRoles: () => null, currentWorkspace: () => ({ userId: 'u1' }),
     service: { modelsInstalled: async () => [{ name: 'laya_multilingual_f16', labels: [], system: true }] },
     decisionSettings: f.settings,
   });

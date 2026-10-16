@@ -268,7 +268,8 @@ function createProjectStore({
     else saved = workspace.saveFreeChats();
     if (saved && typeof saved.then === 'function' && !retried) {
       saved.catch(() => {
-        const fresh = typeof workspace.current === 'function' ? workspace.current() : workspace;
+        let fresh;
+        try { fresh = typeof workspace.current === 'function' ? workspace.current() : workspace; } catch { return; } // #1919: account gone
         // The held view's current() is now the one read again: the retry applies there.
         if (fresh !== workspace) applyChatMeta(projectId, chatId, change, true);
       });
@@ -317,7 +318,9 @@ function createProjectStore({
     const workspace = currentWorkspace();
     const lists = require('./chat-lists.cjs');
     lists.addTombstone(workspace.dir, chatId);
-    try { save(); } catch (err) { try { lists.removeTombstone(workspace.dir, chatId); } catch { /* best effort */ } throw err; }
+    // A synchronous failure is the flock path's (or assertActive): the tombstone stays, as it always
+    // did there (#1919). Only a failed store save, below, takes it back.
+    save();
     const done = whenSaved(() => {
       removeChatBrain(workspace.dir, chatId);
       try {
@@ -748,7 +751,11 @@ function createProjectStore({
       indexSource(project, file);
       saveProjects(PROJECTS);
       // #1914: the plain copy's index entries go once the list without it is on disk.
-      if (adopt) { const userId = currentWorkspace().userId; afterSaved(() => rag.deleteProjectFile(project.id, expectName, userId), 'index cleanup'); }
+      if (adopt) {
+        const userId = currentWorkspace().userId;
+        // #1919: only if no source of that name is listed again by then (a re-upload's entries stay).
+        afterSaved(() => { if (!(getProject(project.id)?.files || []).some((f) => f && f.name === expectName)) rag.deleteProjectFile(project.id, expectName, userId); }, 'index cleanup');
+      }
       return file;
     });
   }
@@ -781,8 +788,10 @@ function createProjectStore({
     // when a failed store save dropped it meanwhile, the one read again from disk (same project
     // and file, by id and name).
     const mark = (state) => {
-      const live = typeof workspace.current === 'function' ? workspace.current() : workspace;
-      if (live.revoked) return;
+      let live;
+      // #1919: an account removed meanwhile (410) ends this writer; it never recreates the account.
+      try { live = typeof workspace.current === 'function' ? workspace.current() : workspace; } catch { return; }
+      if (!live || live.revoked) return;
       const p = live === workspace ? (workspace.projects.includes(project) ? project : null) : (live.projects || []).find((x) => x && x.id === project.id);
       const f = !p ? null : live === workspace ? (project.files.includes(file) ? file : null) : (p.files || []).find((x) => x && x.name === file.name);
       if (!f || !f.document) return;

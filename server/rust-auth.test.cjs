@@ -4,7 +4,7 @@
 // NOEVIA_FRONT=rust. auth-rust-mode.test.cjs covers the same on createAuth's real database.
 const assert = require('node:assert/strict');
 const test = require('node:test');
-const { createRustAuthGuard, enabledFrom, writeTarget, writeTargets, OWNED_TABLES } = require('./rust-auth.cjs');
+const { createRustAuthGuard, enabledFrom, writeTarget, writeTargets, OWNED_TABLES, FRONT_SETTING_KEYS } = require('./rust-auth.cjs');
 
 function fakeDb() {
   const ran = [];
@@ -86,7 +86,10 @@ test('settings: only the owned keys, literal or bound', () => {
   }
   db.prepare('INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)').run('feature:nativeClientAuth', 'false');
   db.prepare("INSERT OR REPLACE INTO settings(key,value) VALUES('previous_origins',?)").run('[]');
-  db.prepare("INSERT OR REPLACE INTO settings(key,value) VALUES('reasoning_effort_default',?)").run('low');
+  // The front's own keys (#1071) are refused with their own codes.
+  for (const [key, [, code]] of Object.entries(FRONT_SETTING_KEYS)) {
+    assert.throws(() => db.prepare(`INSERT OR REPLACE INTO settings(key,value) VALUES('${key}',?)`).run('v'), (e) => e.code === code, key);
+  }
 });
 
 test('exempt writers run, and only inside exempt()', () => {
@@ -163,43 +166,41 @@ test('secrets-rotate.cjs\'s separate database handle writes no owned table', () 
   }
 });
 
-test('sampling capability refuses only its key and ambiguous writes in real SQLite', () => {
+test('#1071: under native auth the front\'s setting keys are refused in real SQLite, exempt or not, and other keys still write', () => {
   const Database = require('better-sqlite3');
-  for (const samplingSettingsEnabled of [false, true]) {
+  for (const [key, [, code]] of Object.entries(FRONT_SETTING_KEYS)) {
     const db = new Database(':memory:');
     try {
-      db.exec("CREATE TABLE settings(key TEXT PRIMARY KEY,value); INSERT INTO settings VALUES('auto_sampling_presets_enabled','true'),('reasoning_effort_default','medium')");
-      const guard = createRustAuthGuard({ enabled: true, samplingSettingsEnabled });
+      db.exec(`CREATE TABLE settings(key TEXT PRIMARY KEY,value); INSERT INTO settings VALUES('${key}','before'),('synthetic_node_key','medium')`);
+      const guard = createRustAuthGuard({ enabled: true });
       guard.install(db);
-      db.prepare('INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)').run('reasoning_effort_default','high');
-      db.prepare("INSERT OR REPLACE INTO settings(key,value) VALUES('reasoning_effort_default',?)").run('low');
-      assert.equal(db.prepare("SELECT value FROM settings WHERE key='reasoning_effort_default'").get().value,'low');
-      const attempts = [
-        () => db.prepare('INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)').run('auto_sampling_presets_enabled','false'),
-        () => db.prepare("INSERT OR REPLACE INTO settings(key,value) VALUES('auto_sampling_presets_enabled',?)").run('false'),
-        () => db.prepare('UPDATE settings SET value=? WHERE key=?').run('false','auto_sampling_presets_enabled'),
-        () => db.prepare("UPDATE settings SET value='false'").run(),
-        () => db.exec('DELETE FROM settings'),
-        () => db.prepare('INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)').bind('auto_sampling_presets_enabled','false').run(),
-        () => db.prepare("/* synthetic */ INSERT OR REPLACE INTO settings(key,value) VALUES('auto_sampling_presets_enabled',?)").run('false'),
-        () => db.prepare('INSERT OR REPLACE INTO main."settings"(key,value) VALUES(?,?)').run('auto_sampling_presets_enabled','false'),
-        () => db.prepare("INSERT OR REPLACE INTO settings(key,value) VALUES('reasoning_effort_default',?),('auto_sampling_presets_enabled',?)").run('low','false'),
-        () => db.prepare("INSERT OR REPLACE INTO settings(key,value) VALUES('auto_sampling_presets_enabled', lower(?))").run('FALSE'),
-        () => guard.exempt(() => db.prepare('INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)').run('auto_sampling_presets_enabled','false')),
-        () => db.prepare("INSERT OR REPLACE INTO 'settings'(key,value) VALUES(?,?)").run('auto_sampling_presets_enabled','false'),
-        () => db.prepare("UPDATE 'settings' SET value='false'").run(),
+      db.prepare('INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)').run('synthetic_node_key', 'high');
+      db.prepare("INSERT OR REPLACE INTO settings(key,value) VALUES('synthetic_node_key',?)").run('low');
+      assert.equal(db.prepare("SELECT value FROM settings WHERE key='synthetic_node_key'").get().value, 'low');
+      const exact = [
+        () => db.prepare('INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)').run(key, 'after'),
+        () => db.prepare(`INSERT OR REPLACE INTO settings(key,value) VALUES('${key}',?)`).run('after'),
+        () => db.prepare('INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)').bind(key, 'after').run(),
+        () => guard.exempt(() => db.prepare('INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)').run(key, 'after')),
       ];
-      if (samplingSettingsEnabled) {
-        for (const attempt of attempts) assert.throws(attempt,{code:'RUST_SAMPLING_SETTINGS_OWNED',status:503});
-        assert.equal(db.prepare("SELECT value FROM settings WHERE key='auto_sampling_presets_enabled'").get().value,'true');
-      } else {
-        attempts[0]();
-        assert.equal(db.prepare("SELECT value FROM settings WHERE key='auto_sampling_presets_enabled'").get().value,'false');
-      }
+      for (const attempt of exact) assert.throws(attempt, { code, status: 503 });
+      // Ambiguous writes may touch the key: refused too, inside exempt() as well.
+      const ambiguous = [
+        () => db.prepare('UPDATE settings SET value=? WHERE key=?').run('after', key),
+        () => db.prepare("UPDATE settings SET value='after'").run(),
+        () => db.exec('DELETE FROM settings'),
+        () => db.prepare(`INSERT OR REPLACE INTO settings(key,value) VALUES('synthetic_node_key',?),('${key}',?)`).run('low', 'after'),
+        () => db.prepare(`INSERT OR REPLACE INTO settings(key,value) VALUES('${key}', lower(?))`).run('AFTER'),
+        () => guard.exempt(() => db.prepare("UPDATE 'settings' SET value='after'").run()),
+        () => db.prepare('INSERT OR REPLACE INTO main."settings"(key,value) VALUES(?,?)').run(key, 'after'),
+        () => db.prepare("INSERT OR REPLACE INTO 'settings'(key,value) VALUES(?,?)").run(key, 'after'),
+        () => db.prepare(`/* synthetic */ INSERT OR REPLACE INTO settings(key,value) VALUES('${key}',?)`).run('after'),
+      ];
+      for (const attempt of ambiguous) assert.throws(attempt, { status: 503 });
+      assert.equal(db.prepare('SELECT value FROM settings WHERE key=?').get(key).value, 'before', key);
     } finally { db.close(); }
   }
 });
-
 test('quoted identifiers are detected without treating string/comment payloads as writes', () => {
   const Database = require('better-sqlite3');
   const db = new Database(':memory:');
@@ -227,7 +228,7 @@ test('auth settings guard refuses unproven writes and retains actual SQLite bind
   const Database = require('better-sqlite3');
   const db = new Database(':memory:');
   try {
-    db.exec("CREATE TABLE settings(key TEXT PRIMARY KEY,value); INSERT INTO settings VALUES('public_origin','before'),('reasoning_effort_default','medium')");
+    db.exec("CREATE TABLE settings(key TEXT PRIMARY KEY,value); INSERT INTO settings VALUES('public_origin','before'),('synthetic_node_key','medium')");
     const guard = createRustAuthGuard({ enabled: true }); guard.install(db);
     const before = () => db.prepare('SELECT key,value FROM settings ORDER BY key').all();
     const original = before();
@@ -239,9 +240,9 @@ test('auth settings guard refuses unproven writes and retains actual SQLite bind
       () => db.prepare('INSERT OR REPLACE INTO settings(key,value) VALUES(@key,@value)').run({key:'public_origin',value:'after'}),
       () => db.prepare('INSERT OR REPLACE INTO main."settings"(key,value) VALUES(?,?)').run('public_origin','after'),
       () => db.prepare("/* synthetic */ INSERT OR REPLACE INTO settings(key,value) VALUES('public_origin',?)").run('after'),
-      () => db.prepare("INSERT OR REPLACE INTO settings(key,value) VALUES('reasoning_effort_default',?),('public_origin',?)").run('low','after'),
+      () => db.prepare("INSERT OR REPLACE INTO settings(key,value) VALUES('synthetic_node_key',?),('public_origin',?)").run('low','after'),
       () => db.prepare("INSERT OR REPLACE INTO settings(key,value) VALUES('public_origin',lower(?))").run('AFTER'),
-      () => db.exec("INSERT OR REPLACE INTO settings(key,value) VALUES('reasoning_effort_default','low');UPDATE settings SET value='after'"),
+      () => db.exec("INSERT OR REPLACE INTO settings(key,value) VALUES('synthetic_node_key','low');UPDATE settings SET value='after'"),
       () => db.prepare('INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)').run(['public_origin','after']),
       () => db.prepare('INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)').bind('public_origin','after').run(),
       () => db.prepare('INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)').bind(['public_origin','after']).safeIntegers().run(),
@@ -257,41 +258,40 @@ test('auth settings guard refuses unproven writes and retains actual SQLite bind
     }
     const bindings = ['public_origin','after'];
     const bound = db.prepare('INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)').bind(bindings);
-    bindings[0] = 'reasoning_effort_default';
+    bindings[0] = 'synthetic_node_key';
     assert.throws(() => bound.run(),{code:'RUST_AUTH_OWNED',status:503}); assert.deepEqual(before(),original);
     // The actual currently supported Node writer forms still work, including bound statements.
-    assert.doesNotThrow(() => db.prepare('INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)').bind('reasoning_effort_default','high').run());
-    db.prepare("INSERT OR REPLACE INTO settings(key,value) VALUES('reasoning_effort_default',?)").run('low');
-    db.prepare("DELETE FROM settings WHERE key='reasoning_effort_default' AND value=?").run('low');
+    assert.doesNotThrow(() => db.prepare('INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)').bind('synthetic_node_key','high').run());
+    db.prepare("INSERT OR REPLACE INTO settings(key,value) VALUES('synthetic_node_key',?)").run('low');
+    db.prepare("DELETE FROM settings WHERE key='synthetic_node_key' AND value=?").run('low');
     assert.equal(before().length,1);
-    // Existing explicitly exempt auth writers remain available; exceptions restore protection.
-    guard.exempt(() => db.prepare('UPDATE settings SET value=? WHERE key=?').run('exempt','public_origin'));
+    // Existing explicitly exempt auth writers (single-key forms) remain available; an unrecognised
+    // shape is refused even inside exempt() (it could touch the front's keys, #1071); exceptions
+    // restore protection.
+    guard.exempt(() => db.prepare("INSERT OR REPLACE INTO settings(key,value) VALUES('public_origin',?)").run('exempt'));
+    assert.throws(() => guard.exempt(() => db.prepare('UPDATE settings SET value=? WHERE key=?').run('x','public_origin')),{code:'RUST_AUTH_OWNED'});
     assert.throws(() => guard.exempt(() => { throw Error('synthetic'); }),/synthetic/);
     assert.throws(() => db.prepare('UPDATE settings SET value=?').run('after'),{code:'RUST_AUTH_OWNED'});
     assert.equal(before()[0].value,'exempt');
   } finally { db.close(); }
 });
 
-test('settings flag-off SQLite writes and sampling nonexempt ownership remain distinct', () => {
+test('settings: without native auth nothing is guarded; with it the front\'s keys stay refused inside exempt()', () => {
   const Database = require('better-sqlite3');
-  for (const enabled of [false,true]) {
-    const db = new Database(':memory:');
-    try {
-      db.exec("CREATE TABLE settings(key TEXT PRIMARY KEY,value);INSERT INTO settings VALUES('public_origin','before'),('auto_sampling_presets_enabled','true')");
-      const guard=createRustAuthGuard({enabled,samplingSettingsEnabled:false});guard.install(db);
-      if (!enabled) {
-        db.prepare('UPDATE settings SET value=? WHERE key=?').run('after','public_origin');
-        db.prepare('INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)').bind('public_origin','bound').run();
-        assert.equal(db.prepare("SELECT value FROM settings WHERE key='public_origin'").get().value,'bound');
-      }
-      db.prepare('INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)').bind('auto_sampling_presets_enabled','false').run();
-    } finally { db.close(); }
-  }
   const db = new Database(':memory:');
   try {
-    db.exec("CREATE TABLE settings(key TEXT PRIMARY KEY,value);INSERT INTO settings VALUES('auto_sampling_presets_enabled','true')");
-    const guard=createRustAuthGuard({enabled:true,samplingSettingsEnabled:true});guard.install(db);
-    assert.throws(() => guard.exempt(() => db.prepare('INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)').bind('auto_sampling_presets_enabled','false').run()),{code:'RUST_SAMPLING_SETTINGS_OWNED'});
-    assert.equal(db.prepare('SELECT value FROM settings').get().value,'true');
+    db.exec("CREATE TABLE settings(key TEXT PRIMARY KEY,value);INSERT INTO settings VALUES('public_origin','before'),('auto_sampling_presets_enabled','true')");
+    createRustAuthGuard({ enabled: false }).install(db);
+    db.prepare('UPDATE settings SET value=? WHERE key=?').run('after','public_origin');
+    db.prepare('INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)').bind('public_origin','bound').run();
+    db.prepare('INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)').bind('auto_sampling_presets_enabled','false').run();
+    assert.equal(db.prepare("SELECT value FROM settings WHERE key='public_origin'").get().value,'bound');
   } finally { db.close(); }
+  const guarded = new Database(':memory:');
+  try {
+    guarded.exec("CREATE TABLE settings(key TEXT PRIMARY KEY,value);INSERT INTO settings VALUES('auto_sampling_presets_enabled','true')");
+    const guard = createRustAuthGuard({ enabled: true }); guard.install(guarded);
+    assert.throws(() => guard.exempt(() => guarded.prepare('INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)').bind('auto_sampling_presets_enabled','false').run()),{code:'RUST_SAMPLING_SETTINGS_OWNED'});
+    assert.equal(guarded.prepare('SELECT value FROM settings').get().value,'true');
+  } finally { guarded.close(); }
 });
