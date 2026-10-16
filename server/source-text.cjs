@@ -451,12 +451,11 @@ function meta(file) {
 }
 
 /** Rollback (see the header): projects.json with every text back inline. Server stopped. */
-function inlineAll(wsDir, { lock = require('./rust-projects.cjs').withFileLock } = {}) {
+function inlineAll(wsDir) {
   const file = path.join(wsDir, 'projects.json');
   let n = 0;
-  // Under the same flock as every projects.json writer (rust-projects.cjs), in case a writer is
-  // still running despite the instructions (stop Node and the Rust front first).
-  lock(file, () => {
+  // An offline tool: stop Node and the Rust front first (#1264: only the front locks projects.json).
+  (() => {
     const data = JSON.parse(fs.readFileSync(file, 'utf8'));
     // Every text is read, strictly, before anything is written: one missing, unreadable or
     // mismatched file aborts the run with projects.json and the backups untouched.
@@ -473,7 +472,7 @@ function inlineAll(wsDir, { lock = require('./rust-projects.cjs').withFileLock }
     try { fs.writeSync(fd, JSON.stringify(data, null, 2)); fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
     fs.renameSync(tmp, file);
     fsyncPath(wsDir);
-  });
+  })();
   return n;
 }
 

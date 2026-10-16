@@ -206,14 +206,15 @@ test('#1806 a save of 1000 sources reads no source text and takes under 50 ms; p
   assert.equal(fs.readdirSync(path.join(dir, 'project-sources', 'proj-big')).length, 1000);
 });
 
-const NO_FLOCK = spawnSync('flock', ['--version']).error ? 'flock(1) not on PATH' : false;
+// #1264: with the front sharing projects.json, Node saves through the Rust project store (a stand-in here).
+const { createStubStore } = require('../tests/server/project-store-stub.cjs');
 
-test('#1806 with the Rust front sharing projects.json: the migration saves under the lock, and a front write keeps the pointers', { skip: NO_FLOCK }, () => {
+test('#1806 with the Rust front sharing projects.json: the migration saves through the store, and a front write keeps the pointers', async () => {
   sourceText._cache.clear();
   const root = tmp();
   const { file } = seed(root);
-  const store = createWorkspaceStore(root, DEFAULT, null, { rustProjects: true });
-  store.get(USER);
+  const store = createWorkspaceStore(root, DEFAULT, null, { rustProjects: true, rustFreeChats: true, projectStore: createStubStore(root) });
+  await store.get(USER).pendingStoreWrites();
   const front = onDisk(file);
   assert.equal(front.projects[0].files[0].textRef, sha('# Synthetic notes\n\nAlpha beta gamma.'));
   // The front (noevia-rs server-projects) saves a chat list: it rewrites the file with every other field as read.
@@ -224,7 +225,7 @@ test('#1806 with the Rust front sharing projects.json: the migration saves under
   assert.equal(ws.projects[0].chats[0].title, 'From the front');
   assert.equal(ws.projects[0].files[0].content, '# Synthetic notes\n\nAlpha beta gamma.', 'the refreshed project still reads its text');
   ws.projects[1].files[0].content = 'edited after the front';
-  ws.saveProjects();
+  await ws.saveProjects();
   const after = onDisk(file);
   assert.equal(after.projects[0].chats[0].title, 'From the front');
   assert.equal(after.projects[1].files[0].textRef, sha('edited after the front'));

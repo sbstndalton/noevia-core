@@ -20,7 +20,8 @@ const USER = '11111111-2222-4333-8444-555555555555';
 const DEFAULT = { id: 'local', label: 'Local', baseUrl: 'http://127.0.0.1:1', apiKey: '' };
 const sha = (s) => crypto.createHash('sha256').update(s, 'utf8').digest('hex');
 const tmp = () => fs.mkdtempSync(path.join(os.tmpdir(), 'noevia-1806r-'));
-const NO_FLOCK = spawnSync('flock', ['--version']).error ? 'flock(1) not on PATH' : false;
+// #1264: with the front sharing projects.json, Node saves through the Rust project store (a stand-in here).
+const { createStubStore, remoteFor } = require('../tests/server/project-store-stub.cjs');
 const A = 'alpha synthetic text', B = 'bravo synthetic text';
 
 function seeded(projects = [{ id: 'p1', name: 'P', files: [{ name: 'a.md', content: A }, { name: 'b.md', content: B }], chats: [] }]) {
@@ -40,7 +41,7 @@ const listing = (dir) => {
   return out.sort();
 };
 
-test('review 1: the inline rollback reads every text strictly; a missing or mismatched one aborts before anything is written', { skip: NO_FLOCK }, () => {
+test('review 1: the inline rollback reads every text strictly; a missing or mismatched one aborts before anything is written', () => {
   for (const damage of ['missing', 'mismatched', 'empty']) {
     const { dir, file, text } = seeded();
     if (damage === 'missing') fs.rmSync(text('p1', B));
@@ -118,28 +119,29 @@ test('review 4: a text is fsynced before its rename and the folder after; a zero
   assert.equal(fs.statSync(f).mtimeMs, stamp, 'an intact file is kept');
 });
 
-test('review 5: the collection runs inside the projects.json lock, after the write', () => {
-  const file = path.join(tmp(), 'projects.json');
+test('review 5: the collection runs after the store has written the file, over what was written', async () => {
+  const dir = tmp(); const file = path.join(dir, 'projects.json');
   fs.writeFileSync(file, JSON.stringify({ projects: [] }));
   const log = [];
-  let held = false;
-  const lock = (_f, fn) => { held = true; log.push('lock'); try { return fn(); } finally { held = false; log.push('unlock'); } };
-  const atomicJson = (f, v) => { log.push('write'); fs.writeFileSync(f, JSON.stringify(v)); };
-  const pf = rustProjects.createProjectsFile(file, { atomicJson, lock });
+  const remote = remoteFor(dir);
+  const write = remote.client.write;
+  remote.client.write = async (...args) => { const r = await write(...args); log.push('write'); return r; };
+  const pf = rustProjects.createProjectsFile(file, { remote });
   const list = pf.load();
   list.push({ id: 'p1', files: [] });
-  pf.save(list, (written) => { log.push(held ? 'collect-held' : 'collect-unheld'); assert.equal(written, list); });
-  assert.deepEqual(log, ['lock', 'write', 'collect-held', 'unlock']);
+  await pf.save(list, (written) => { log.push('collect'); assert.deepEqual(written.map((p) => p.id), ['p1']); });
+  assert.deepEqual(log, ['write', 'collect']);
 });
 
-test('review 5: with the Rust front sharing projects.json, a save collects under the flock', { skip: NO_FLOCK }, () => {
+test('review 5: with the Rust front sharing projects.json, a save collects through the store', async () => {
   const { root, dir, text } = seeded();
-  const ws = createWorkspaceStore(root, DEFAULT, null, { rustProjects: true }).get(USER);
+  const ws = createWorkspaceStore(root, DEFAULT, null, { rustProjects: true, rustFreeChats: true, projectStore: createStubStore(root) }).get(USER);
+  await ws.pendingStoreWrites();
   ws.projects[0].files = ws.projects[0].files.slice(0, 1);
-  ws.saveProjects();
+  await ws.saveProjects();
   assert.ok(!fs.existsSync(text('p1', B)));
   assert.ok(fs.existsSync(text('p1', A)));
-  assert.ok(fs.existsSync(path.join(dir, 'projects.json.lock')));
+  assert.ok(!fs.existsSync(path.join(dir, 'projects.json.lock')), 'Node takes no flock');
 });
 
 test('review 5: a handler that awaited and puts back a source dropped meanwhile still finds its text (collection grace)', () => {

@@ -80,29 +80,10 @@ test('the store is used only with its switch, its confirmation, both confirmed s
   assert.equal(psc.enabledFrom({ ...ON, NOEVIA_PROJECT_STORE_TOKEN: 'short' }, () => {}), false);
 });
 
-test('off: a save takes the flock path (the lock is called); on: never', async () => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'store-off-'));
-  const file = path.join(dir, 'projects.json');
-  let locks = 0;
-  const lock = (_f, fn) => { locks += 1; return fn(); };
-  const atomicJson = (f, v) => fs.writeFileSync(f, JSON.stringify(v, null, 2));
-  const off = rp.createProjectsFile(file, { atomicJson, lock });
-  const list = off.load();
-  list.push({ id: 'p1' });
-  assert.equal(off.save(list), undefined, 'synchronous, as before');
-  assert.equal(locks, 1);
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'store-on-'));
-  fs.mkdirSync(path.join(root, 'users', USER), { recursive: true });
-  const store = await fakeStore(root);
-  try {
-    const client = psc.createClient({ port: store.port, token: TOKEN });
-    const remote = { client, user: USER, queue: psc.createQueue() };
-    const on = rp.createProjectsFile(path.join(root, 'users', USER, 'projects.json'), { atomicJson: () => { throw Error('Node wrote the file'); }, lock: () => { throw Error('Node took the flock'); }, remote });
-    const l2 = on.load();
-    l2.push({ id: 'p1' });
-    await on.save(l2);
-    assert.deepEqual(store.writes, ['projects.json']);
-  } finally { await store.close(); }
+test('no flock path is left: a coordinated file without the store is refused', () => {
+  assert.throws(() => rp.createProjectsFile('/nonexistent/projects.json', {}), /Rust project store/);
+  assert.throws(() => rp.createFreeChatsFile('/nonexistent/free-chats.json', {}), /Rust project store/);
+  assert.equal(rp.withFileLock, undefined);
 });
 
 test('on: a whole workspace saves both files only through the store, with no flock on PATH, and responses can wait for it', async () => {
