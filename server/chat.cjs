@@ -689,7 +689,7 @@ function createChatHandler({
       };
       return require('./diary-stream.cjs').proxyDiaryStream(res, diaryUrl, {
         method: 'POST', headers: (secret) => diaryHeaders('POST', diaryUrl, { secret, body: diaryBody }), body: diaryBody
-      }, {job,diagnose,withStorageCredential:diaryStorageRetry,onEvent:event=>{if(event.type==='mtp')require('./mtp.cjs').record(chatWorkspace?.userId,event.model,event.timings);}});
+      }, {job,diagnose,withStorageCredential:diaryStorageRetry});
     }
 
     // ── Ordinary space / project chat: routed via the project's provider ──
@@ -2036,7 +2036,6 @@ function createChatHandler({
                 // llama-server may split timing fields across the final choice
                 // frame and the following usage-only frame.
                 roundTimings = { ...(roundTimings || {}), ...evt.timings };
-                require('./mtp.cjs').record(chatWorkspace?.userId,model,roundTimings);
               }
               // The include_usage chunk commonly carries no choices. Forward
               // cumulative, request-local facts instead of waiting on /api/stats.
@@ -2117,7 +2116,6 @@ function createChatHandler({
           // Status first (#918): a 5xx HTML page is a provider failure, not a JSON parse error.
           if (!response.ok) { send({ type: 'error', text: await providerFailureText(response, chatgptProvider, shownText) }); throw FALLBACK_REPORTED; }
           const full = {ok:true,status:response.status,body:await readCappedJson(response,FALLBACK_REPLY_CAP)};
-          require('./mtp.cjs').record(chatWorkspace?.userId,model,full.body?.timings);
           const msg = full.body?.choices?.[0]?.message;
           if (msg?.reasoning_content || msg?.content || (Array.isArray(msg?.tool_calls) && msg.tool_calls.length)) markFirstOutput();
           if (msg?.reasoning_content) { roundReasoning += msg.reasoning_content; send({ type: 'reasoning', text: msg.reasoning_content }); }

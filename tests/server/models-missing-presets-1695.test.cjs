@@ -34,7 +34,7 @@ function routes({ installed, sections, reload = { ok: true, status: 200, body: {
     },
     env: { MODEL_LOADER_URL: 'http://loader.invalid', RERANK_MODEL: 'tiny-reranker' }, modelManager,
     getProvider: () => ({}), providerHeaders: () => ({}), DEFAULT_PROVIDER_ID: 'default',
-    createVisionProbe: () => async () => ({ supported: true }), reportedTokenRate: () => null,
+    createVisionProbe: () => async () => ({ supported: true }),
     missingRoles: () => null, currentWorkspace: () => ({ userId: 'u1' }),
     service: { modelScanCache: cache, refreshModelScan: () => {}, autoRoles: () => null, setAutoRoles: () => {}, ensureRolesLoaded: () => {},
       servedCatalogue: async () => [], modelsInstalled: async () => { listedAt.push(cache.has('models')); return routerRows; }, deriveUserModelName: (c) => c,

@@ -17,7 +17,6 @@
 
 const PASS = Symbol('unhandled');
 const { isJsonObject } = require('../http.cjs');
-const { createSharedRead } = require('../short-read.cjs');
 // File-path options of a models.ini section and every spelling llama-server accepts for them (#1235).
 const PATH_OPTION_ALIASES = Object.fromEntries([
   ['model', ['model', 'm', 'LLAMA_ARG_MODEL']],
@@ -47,43 +46,21 @@ function clientMessage(e, fallback) {
  * @param {(provider:object, extra?:object) => object} deps.providerHeaders
  * @param {string} deps.DEFAULT_PROVIDER_ID
  * @param {() => Function} deps.createVisionProbe
- * @param {(stats:object) => number|null} deps.reportedTokenRate
  * @param {(roles:object|null, catalogue:object[]|null) => any} deps.missingRoles
  * @param {() => object} deps.currentWorkspace
  * @param {object} deps.service   models.cjs
  */
-// The Rust front owns GET /api/routing-default only while NOEVIA_RUST_ROUTING_DEFAULT=1 and the
-// supervisor has confirmed it (NOEVIA_RUST_ROUTING_DEFAULT_CONFIRMED=1), under NOEVIA_RUST_AUTH
-// with NOEVIA_FRONT=rust (the same conditions as routes/reasoning-settings.cjs enabledFrom).
-function routingDefaultRustOwned(env) {
-  return env.NOEVIA_FRONT === 'rust' && env.NOEVIA_RUST_AUTH === '1' && env.NOEVIA_RUST_AUTH_CONFIRMED === '1'
-    && env.NOEVIA_RUST_ROUTING_DEFAULT === '1' && env.NOEVIA_RUST_ROUTING_DEFAULT_CONFIRMED === '1';
-}
-// The Rust front owns GET /api/stats (#1650) only while NOEVIA_RUST_STATS=1 and the supervisor has
-// confirmed it (NOEVIA_RUST_STATS_CONFIRMED=1, once `noevia-server --features` lists rust-stats),
-// under NOEVIA_RUST_AUTH with NOEVIA_FRONT=rust, as routingDefaultRustOwned above.
-function statsRustOwned(env) {
-  return env.NOEVIA_FRONT === 'rust' && env.NOEVIA_RUST_AUTH === '1' && env.NOEVIA_RUST_AUTH_CONFIRMED === '1'
-    && env.NOEVIA_RUST_STATS === '1' && env.NOEVIA_RUST_STATS_CONFIRMED === '1';
-}
-function createModelRoutes({ servedEmbeddingModels = (target) => require('../rag.cjs').servedModelsCached(target), json, readBody, readJson, fetchJson, env, modelManager, getProvider, providerHeaders, DEFAULT_PROVIDER_ID, createVisionProbe, reportedTokenRate, missingRoles, currentWorkspace, service, inferenceBudget = null, idleUnload = null, sweepGuardOptions = {}, decisionSettings = null, rerankSettings = null, localRoles = (roles) => roles, machineModels = () => [] }) {
+// sbstndalton/noevia#1071: GET /api/stats and GET /api/routing-default belong to the Rust front
+// (noevia-rs crates/server-stats, crates/server-routing-default). A GET that reaches Node is a
+// bypass of the front, refused before any engine or workspace read.
+const STATS_REFUSAL = Object.freeze({ error: 'Engine statistics are owned by the Rust front.' });
+const ROUTING_DEFAULT_REFUSAL = Object.freeze({ error: 'Routing default is owned by the Rust front.' });
+function createModelRoutes({ servedEmbeddingModels = (target) => require('../rag.cjs').servedModelsCached(target), json, readBody, readJson, fetchJson, env, modelManager, getProvider, providerHeaders, DEFAULT_PROVIDER_ID, createVisionProbe, missingRoles, currentWorkspace, service, inferenceBudget = null, idleUnload = null, sweepGuardOptions = {}, decisionSettings = null, rerankSettings = null, localRoles = (roles) => roles, machineModels = () => [] }) {
   const { modelScanCache, refreshModelScan, autoRoles, setAutoRoles, ensureRolesLoaded, servedCatalogue, modelsInstalled, deriveUserModelName, lastLoadedModel, clearLastLoadedModel, clearRoleReferences } = service;
   // #1461: the installed list is shared for a moment (service.modelsInstalled). A decision that must confirm
   // the engine's state right now (a delete that checks the model exists, a load that checks it is not missing)
   // asks for a fresh read instead.
   const modelsInstalledNow = () => (service.modelsInstalledFresh || modelsInstalled)();
-  // #1461/#1508: /api/stats costs five model-manager calls and every open tab polls it; one answer is shared
-  // for a moment. Any write under the model paths drops it, with the installed list.
-  const statsRead = createSharedRead(async () => {
-    const [gen, sys, mtpHealth, mtpMetrics, mtpModels] = await Promise.allSettled([
-      modelManager.enabled ? modelManager.stats() : Promise.resolve({ ok: false }),
-      modelManager.enabled ? modelManager.systemStats() : Promise.resolve({ ok: false }),
-      modelManager.enabled ? modelManager.health() : Promise.resolve({ok:false}),
-      modelManager.enabled ? modelManager.metrics() : Promise.resolve({ok:false}),
-      modelManager.enabled ? modelManager.listModels() : Promise.resolve({ok:false}),
-    ]);
-    return { gen, sys, mtpHealth, mtpMetrics, mtpModels };
-  }, 2000);
   const loaderHeaders = () => ({ 'Content-Type': 'application/json', ...(env.MODEL_LOADER_TOKEN ? { 'X-Model-Loader-Token': env.MODEL_LOADER_TOKEN } : {}) });
   // #873: the throughput sweep holds the inference maintenance gate for as long as it runs.
   const sweepGuard = typeof modelManager.holdMaintenance === 'function' ? require('../benchmark-sweep-guard.cjs').createSweepGuard({
@@ -184,47 +161,26 @@ function createModelRoutes({ servedEmbeddingModels = (target) => require('../rag
   async function handle(req, res, { path: p, authn, url }) {
     // #1461: a write that can change what the shared reads report drops them first, so the next read is not older than the write.
     if (!['GET', 'HEAD'].includes(req.method || 'GET') && /^\/api\/(models|model-manager|auto-roles)(\/|$)/.test(p)) {
-      statsRead.clear();
       if (service.invalidateModelReads) service.invalidateModelReads();
     }
     if (p.startsWith('/api/models/') && !['GET', 'HEAD'].includes(req.method || 'GET') && authn.user.role !== 'admin') {
       return json(res, 403, { error: 'administrator required' });
     }
 
-    // ── Optional model-manager statistics.
+    // ── Engine statistics: the Rust front's (#1650, #1071). Its GET is refused; Node answers no
+    // other method on it either.
     if (p === '/api/stats') {
-      // M6 (#1650): a confirmed Rust front answers GET; Node refuses it before any engine read, so
-      // the front is its only reader. Every other method is still answered here.
-      if (req.method === 'GET' && statsRustOwned(env)) return json(res, 503, { error: 'Engine statistics are owned by the Rust front.' });
-      const { gen, sys, mtpHealth, mtpMetrics, mtpModels } = await statsRead.get();
-      const g = gen.status === 'fulfilled' && gen.value.ok ? gen.value.body : {};
-      const s = sys.status === 'fulfilled' && sys.value.ok ? sys.value.body : {};
-      return json(res, 200, {
-        up: gen.status === 'fulfilled' && gen.value.ok,
-        telemetryScope: g.scope || null,
-        mtp: modelManager.kind === 'llamacpp' ? (g.mtp || []) : require('../mtp.cjs').acceptance(mtpMetrics.status === 'fulfilled' && mtpMetrics.value.ok ? mtpMetrics.value.body : '', mtpHealth.status === 'fulfilled' && mtpHealth.value.ok ? mtpHealth.value.body.all_models_loaded : [], mtpModels.status === 'fulfilled' && mtpModels.value.ok ? mtpModels.value.body.data : [], currentWorkspace().userId),
-        tokensPerSecond: reportedTokenRate(g),
-        timeToFirstToken: typeof g.time_to_first_token === 'number' ? g.time_to_first_token : null,
-        inputTokens: typeof g.input_tokens === 'number' ? g.input_tokens : null,
-        outputTokens: typeof g.output_tokens === 'number' ? g.output_tokens : null,
-        inputTokensTotal: typeof g.input_tokens_total === 'number' ? g.input_tokens_total : null,
-        outputTokensTotal: typeof g.output_tokens_total === 'number' ? g.output_tokens_total : null,
-        requestCount: typeof g.request_count_total === 'number' ? g.request_count_total : null,
-        cpuPercent: typeof s.cpu_percent === 'number' ? s.cpu_percent : null,
-        gpuPercent: typeof s.gpu_percent === 'number' ? s.gpu_percent : null,
-        vramGb: typeof s.vram_gb === 'number' ? s.vram_gb : null,
-        memoryGb: typeof s.memory_gb === 'number' ? s.memory_gb : null,
-      });
+      if (req.method === 'GET') return json(res, 503, STATS_REFUSAL);
+      return json(res, 405, { error: 'Method not allowed' });
     }
 
     // The default mode new projects start in, and (on request) a one-off switch of every existing
     // project of this user to it. Per workspace, so tenants never touch each other's projects.
     if (p === '/api/routing-default') {
-      // M6 (#1305): the Rust front answers GET under its confirmed switch. Node refuses that GET
-      // before any workspace work, so a confirmed front is the only reader; PUT stays Node's.
-      if (req.method === 'GET' && routingDefaultRustOwned(env)) return json(res, 503, { error: 'Routing default is owned by the Rust front.' });
+      // M6 (#1305, #1071): the Rust front answers GET. Node refuses that GET before any workspace
+      // work, so the front is the only reader; PUT stays Node's.
+      if (req.method === 'GET') return json(res, 503, ROUTING_DEFAULT_REFUSAL);
       const ws = currentWorkspace();
-      if (req.method === 'GET') return json(res, 200, { routing: ws.preferences?.defaultRouting === 'manual' ? 'manual' : 'auto' });
       if (req.method === 'PUT') {
         let body;
         try { body = JSON.parse(await readBody(req)); } catch { return json(res, 400, { error: 'invalid JSON' }); }
@@ -873,4 +829,4 @@ function createModelRoutes({ servedEmbeddingModels = (target) => require('../rag
   return modelRoutes;
 }
 
-module.exports = { createModelRoutes, routingDefaultRustOwned, statsRustOwned };
+module.exports = { createModelRoutes, STATS_REFUSAL, ROUTING_DEFAULT_REFUSAL };

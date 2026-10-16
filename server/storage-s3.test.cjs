@@ -86,14 +86,11 @@ test('S3 storage connection round-trips bucket through the encrypted row', async
   assert.equal(savedBody.kind, 's3');
   assert.equal(savedBody.bucket, 'my-bucket');
   assert.equal(savedBody.secretConfigured, true);
-
+  assert.equal(savedBody.corpusRoot, 'Notes/Diary');
+  assert.ok(!('secret' in savedBody), 'the secret is never returned');
+  // Reading the connection back (GET) is the Rust front's since #1071; Node refuses it.
   const fetched = await request('/api/integrations/storage', { headers: { cookie } });
-  assert.equal(fetched.status, 200);
-  const fetchedBody = JSON.parse(fetched.text);
-  assert.equal(fetchedBody.kind, 's3');
-  assert.equal(fetchedBody.bucket, 'my-bucket');
-  assert.equal(fetchedBody.corpusRoot, 'Notes/Diary');
-  assert.ok(!('secret' in fetchedBody), 'secret must never be returned by GET');
+  assert.equal(fetched.status, 503);
 });
 
 test('S3 test route validates before probing', async () => {

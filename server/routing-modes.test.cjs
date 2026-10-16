@@ -155,20 +155,20 @@ test('sensitivity over chunks: chunks are asked one at a time; any sensitive or 
   assert.deepEqual(await hung(['a']), { flagged: true, flag: 'unavailable', cause: 'deadline' });
 });
 
-test('settings: normalize, validate and the admin allow-list', () => {
+test('settings: normalize and the admin allow-list Node reads (the Rust front writes both, #1071)', () => {
   assert.deepEqual(rm.normalize(null), { mode: null, whenSensitive: 'ask', cloud: { providerId: '', fast: '', smart: '', code: '' } });
-  assert.throws(() => rm.validate({ mode: 'everywhere' }, rm.MODES), /mode must be/);
-  assert.throws(() => rm.validate({ mode: 'cloud' }, ['local']), (e) => e.status === 403);
-  assert.throws(() => rm.validate({ mode: 'hybrid', whenSensitive: 'never' }, rm.MODES), /whenSensitive/);
-  assert.equal(rm.validate({ mode: 'hybrid', cloud: { providerId: 'p1', smart: 'm-1' } }, rm.MODES).cloud.smart, 'm-1');
+  assert.equal(rm.validate, undefined, 'the PUT validation left with the route');
+  assert.equal(rm.setAllowedModes, undefined, 'the allowed-list writer left with the route');
+  assert.equal(rm.write, undefined, 'the account-setting writer left with the route');
   const kv = new Map(); const store = { get: (k) => kv.get(k), set: (k, v) => kv.set(k, v) };
   assert.deepEqual(rm.allowedModes(store), ['local', 'cloud', 'hybrid']);
-  assert.deepEqual(rm.setAllowedModes(store, ['hybrid', 'local']), ['local', 'hybrid']);
-  assert.throws(() => rm.setAllowedModes(store, ['anywhere']));
+  kv.set(rm.ALLOWED_KEY, JSON.stringify(['hybrid', 'local']));
+  assert.deepEqual(rm.allowedModes(store), ['local', 'hybrid']);
+  kv.set(rm.ALLOWED_KEY, 'not json');
+  assert.deepEqual(rm.allowedModes(store), ['local', 'cloud', 'hybrid']);
   assert.equal(rm.effectiveMode({ mode: 'cloud' }, ['local', 'hybrid']), 'local', 'a disallowed mode falls back to local');
   assert.equal(rm.effectiveMode({ mode: null }, ['local']), null);
 });
-
 // ── The sensitivity check: every failure is "flagged" ─────────────────────────
 const backend = (decide) => ({ id: 'stub', locality: 'local', supports: () => true, decide });
 const layer = (decide) => createDecisions({ backends: { b: backend(decide) }, chains: { 'routing.sensitivity': ['b'] } }).decide;
@@ -728,30 +728,23 @@ test('chat-lists merge: forceLocal / allowCloud survive a save that leaves them 
   assert.equal('forceLocal' in mergeChats([], [{ id: 'c2', title: 't', updatedAt: 1, forceLocal: 'yes' }])[0], false);
 });
 
-test('GET/PUT /api/routing-mode: own account, admin allow-list, flag off refuses', async (t) => {
+test('#1071: /api/routing-mode and /allowed are the Rust front\'s; Node refuses every method and reads nothing', async (t) => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'noevia-routing-route-')); t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
-  const kv = new Map(); const store = { get: (k) => kv.get(k), set: (k, v) => kv.set(k, v) };
-  let on = true;
-  const routes = require('./routes/routing-mode.cjs').createRoutingModeRoutes({ json: (r, status, body) => { r.status = status; r.body = body; return true; },
-    readBody: async (req) => req.raw, enabled: () => on, currentWorkspace: () => ({ dir }), store });
-  const call = async (method, p, raw, role = 'member') => { const res = {}; const handled = await routes({ method, raw }, res, { path: p, authn: { user: { id: 'u1', role } } }); return { handled, ...res }; };
-  assert.deepEqual((await call('GET', '/api/routing-mode')).body.mode, null);
-  assert.equal((await call('PUT', '/api/routing-mode', JSON.stringify({ mode: 'cloud' }))).status, 400, 'cloud needs a target');
-  const saved = await call('PUT', '/api/routing-mode', JSON.stringify({ mode: 'hybrid', whenSensitive: 'local', cloud: { providerId: 'cloud-x', smart: 'm1' } }));
-  assert.equal(saved.status, 200); assert.equal(rm.read(dir).whenSensitive, 'local');
-  assert.equal((await call('PUT', '/api/routing-mode/allowed', JSON.stringify({ allowed: ['local'] }))).status, 403);
-  assert.deepEqual((await call('PUT', '/api/routing-mode/allowed', JSON.stringify({ allowed: ['local'] }), 'admin')).body.allowed, ['local']);
-  assert.equal((await call('PUT', '/api/routing-mode', JSON.stringify({ mode: 'hybrid', cloud: { providerId: 'cloud-x', smart: 'm1' } }))).status, 403);
-  assert.equal(rm.effectiveMode(rm.read(dir), rm.allowedModes(store)), 'local', 'a stored mode an admin later disallowed acts as local');
-  // #779 F5: GET shows the mode replies actually use, with the stored choice beside it.
-  const shown = (await call('GET', '/api/routing-mode')).body;
-  assert.equal(shown.mode, 'local'); assert.equal(shown.storedMode, 'hybrid');
-  on = false;
-  assert.deepEqual((await call('GET', '/api/routing-mode')).body, { enabled: false });
-  assert.equal((await call('PUT', '/api/routing-mode', JSON.stringify({ mode: 'local' }))).status, 409);
+  const { createRoutingModeRoutes, REFUSAL } = require('./routes/routing-mode.cjs');
+  const routes = createRoutingModeRoutes({ json: (r, status, body) => { r.status = status; r.body = body; return true; } });
+  const call = async (method, p, role = 'member') => { const res = {}; const handled = await routes({ method }, res, { path: p, authn: { user: { id: 'u1', role } } }); return { handled, ...res }; };
+  for (const p of ['/api/routing-mode', '/api/routing-mode/allowed']) {
+    for (const method of ['GET', 'PUT', 'POST', 'DELETE', 'HEAD']) {
+      for (const role of ['member', 'admin']) assert.deepEqual(await call(method, p, role), { handled: true, status: 503, body: REFUSAL }, `${method} ${p}`);
+    }
+  }
   assert.equal((await call('GET', '/api/other')).handled, false);
+  assert.equal((await call('GET', '/api/routing-mode/other')).handled, false);
+  assert.deepEqual(fs.readdirSync(dir), [], 'nothing was written');
+  // Chat still reads the account setting the front writes.
+  fs.writeFileSync(path.join(dir, rm.FILE), JSON.stringify({ mode: 'hybrid', whenSensitive: 'local', cloud: { providerId: 'cloud-x', smart: 'm1' } }));
+  assert.equal(rm.read(dir).whenSensitive, 'local');
 });
-
 test('linked brain context stays local: dropped on a cloud route and from the router input, kept on a local route (#815)', async (t) => {
   const { CONTEXT_INTRO } = require('./chat-brain.cjs');
   const brain = { brain_schema: 1, summary: 'Synthetic linked summary marker.', decisions: [], facts: [], open_questions: [], entities: [] };

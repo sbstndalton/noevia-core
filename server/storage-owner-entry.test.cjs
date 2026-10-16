@@ -10,9 +10,10 @@ const path = require('node:path');
 const crypto = require('node:crypto');
 const { Readable, Writable } = require('node:stream');
 
+// sbstndalton/noevia#1071: GET /api/integrations/storage is the Rust front's with no switch of its
+// own; the deployment below is the live one (native auth), with no storage selector at all.
 const OWNER = {
   NOEVIA_FRONT: 'rust', NOEVIA_RUST_AUTH: '1', NOEVIA_RUST_AUTH_CONFIRMED: '1',
-  NOEVIA_RUST_STORAGE_READS: '1', NOEVIA_RUST_STORAGE_READS_CONFIRMED: '1',
 };
 const digest = bytes => crypto.createHash('sha256').update(bytes).digest('hex');
 
@@ -198,7 +199,7 @@ test('M4_ENTRY/complete_original_index', { concurrency: false }, async t => {
     await t.test('M4_ENTRY/actual_factory_defense_before_reseal', async () => {
       const { createStorageRoutes } = require('./routes/storage.cjs');
       const { json } = require('./http.cjs');
-      const routes = createStorageRoutes({ json, authService: auth, storageReadsOwned: () => true });
+      const routes = createStorageRoutes({ json, authService: auth });
       const input = request('/api/integrations/storage', { cookie });
       const authn = auth.authenticate(input.req);
       assert.equal(authn?.user.id, id, 'M4_ENTRY/valid_identity');
@@ -210,33 +211,16 @@ test('M4_ENTRY/complete_original_index', { concurrency: false }, async t => {
       assert.equal(sqlDigest(auth.db), beforeSql, 'M4_ENTRY/factory_no_reseal');
     });
 
-    await t.test('M4_ENTRY/unconfirmed_selectors_keep_auth_gate', async () => {
+    await t.test('M4_ENTRY/retired_selector_values_change_nothing', async () => {
       try {
-        for (const value of [undefined, '', '0', 'true', '01', ' 1 ']) {
+        for (const value of [undefined, '', '0', '1', 'true']) {
           if (value === undefined) delete process.env.NOEVIA_RUST_STORAGE_READS;
           else process.env.NOEVIA_RUST_STORAGE_READS = value;
-          assert.equal((await invoke('/api/integrations/storage')).status, 401, 'M4_ENTRY/default_not_owned');
+          const beforeSql = sqlDigest(auth.db);
+          ownedReply(await invoke('/api/integrations/storage', { cookie }));
+          assert.equal(sqlDigest(auth.db), beforeSql, 'M4_ENTRY/no_reseal');
         }
-      } finally { process.env.NOEVIA_RUST_STORAGE_READS = '1'; }
-    });
-
-    await t.test('M4_ENTRY/default_off_actual_node_metadata', async () => {
-      const backend = process.env.CORPUS_BACKEND;
-      process.env.NOEVIA_RUST_STORAGE_READS = '0';
-      process.env.CORPUS_BACKEND = '';
-      try {
-        const reply = await invoke('/api/integrations/storage', { cookie });
-        assert.equal(reply.status, 200, 'M4_ENTRY/default_delegation');
-        assert.equal(reply.body.kind, 'local', 'M4_ENTRY/default_body');
-        assert.equal(reply.body.secretConfigured, true, 'M4_ENTRY/default_secret_flag');
-        assert.equal(Object.hasOwn(reply.body, 'secret'), false, 'M4_ENTRY/default_omission');
-        assert.equal(reply.headers['cache-control'], 'no-store', 'M4_ENTRY/no_store');
-        // Node remains the actual legacy reseal writer while metadata is unowned.
-        assert.match(auth.db.prepare('SELECT secret FROM storage_connections WHERE user_id=?').get(id).secret, /^enc:v2:/, 'M4_ENTRY/default_node_reseal');
-      } finally {
-        process.env.NOEVIA_RUST_STORAGE_READS = '1';
-        process.env.CORPUS_BACKEND = backend;
-      }
+      } finally { delete process.env.NOEVIA_RUST_STORAGE_READS; }
     });
   } finally {
     auth?.db.close();

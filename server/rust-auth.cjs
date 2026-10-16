@@ -112,7 +112,15 @@ function singleSettingKey(sql, args) {
   const del = /^DELETE FROM settings WHERE key='([^']*)'(?: AND value=\?)?$/i.exec(source);
   return del ? del[1] : null;
 }
-function createRustAuthGuard({ enabled = false, samplingSettingsEnabled = false, reasoningSettingsEnabled = false, routingModeEnabled = false } = {}) {
+// sbstndalton/noevia#1071: the routing allowed list, the reasoning default and the sampling-presets
+// switch are written only by the Rust front (their routes left Node). Under NOEVIA_RUST_AUTH this
+// connection refuses those keys too, even inside exempt(), with their own codes.
+const FRONT_SETTING_KEYS = Object.freeze({
+  routing_modes_allowed: ['Routing settings are owned by the Rust front.', 'RUST_ROUTING_MODE_OWNED'],
+  reasoning_effort_default: ['Reasoning settings are written by the Rust front', 'RUST_REASONING_SETTINGS_OWNED'],
+  auto_sampling_presets_enabled: ['Sampling settings are written by the Rust front', 'RUST_SAMPLING_SETTINGS_OWNED'],
+});
+function createRustAuthGuard({ enabled = false } = {}) {
   let exemptDepth = 0;
 
   function refuse(what) {
@@ -121,33 +129,22 @@ function createRustAuthGuard({ enabled = false, samplingSettingsEnabled = false,
 
   /** Throws when running `target` (with `args`) would write what Rust owns. */
   function check(targets, args) {
-    if ((!enabled && !samplingSettingsEnabled && !reasoningSettingsEnabled && !routingModeEnabled) || !targets) return;
+    if (!enabled || !targets) return;
     for (const target of Array.isArray(targets) ? targets : [targets]) checkOne(target, args);
   }
 
   function checkOne(target, args) {
     if (enabled && exemptDepth === 0 && OWNED_TABLES.has(target.table)) refuse(target.table);
     if (target.table === 'settings') {
-      if (routingModeEnabled) {
-        const key = singleSettingKey(target.sql, args);
-        if (key === null || key === 'routing_modes_allowed') throw Object.assign(Error('Routing settings are owned by the Rust front.'), { status: 503, code: 'RUST_ROUTING_MODE_OWNED' });
+      const key = singleSettingKey(target.sql, args);
+      // An unrecognised settings write may touch any key, the front's included: refused even
+      // inside exempt(). The front's own keys are refused with their own codes, exempt or not.
+      if (key === null) refuse('settings key unknown');
+      if (Object.hasOwn(FRONT_SETTING_KEYS, key)) {
+        const [message, code] = FRONT_SETTING_KEYS[key];
+        throw Object.assign(new Error(message), { status: 503, code });
       }
-      if (reasoningSettingsEnabled) {
-        const reasoning = singleSettingKey(target.sql, args);
-        if (reasoning === null || reasoning === 'reasoning_effort_default') {
-          throw Object.assign(new Error('Reasoning settings are written by the Rust front'), { status: 503, code: 'RUST_REASONING_SETTINGS_OWNED' });
-        }
-      }
-      if (samplingSettingsEnabled) {
-        const sampling = singleSettingKey(target.sql, args);
-        if (sampling === null || sampling === 'auto_sampling_presets_enabled') {
-          throw Object.assign(new Error('Sampling settings are written by the Rust front'), { status: 503, code: 'RUST_SAMPLING_SETTINGS_OWNED' });
-        }
-      }
-      if (enabled && exemptDepth === 0) {
-        const key = singleSettingKey(target.sql, args);
-        if (key === null || OWNED_SETTING_KEYS.has(key)) refuse(`settings key ${key ?? 'unknown'}`);
-      }
+      if (exemptDepth === 0 && OWNED_SETTING_KEYS.has(key)) refuse(`settings key ${key}`);
     }
   }
 
@@ -185,12 +182,14 @@ function createRustAuthGuard({ enabled = false, samplingSettingsEnabled = false,
     },
     /** Installs the guard on a better-sqlite3 database (a no-op while the switch is off). */
     install(db) {
-      if ((!enabled && !samplingSettingsEnabled && !reasoningSettingsEnabled && !routingModeEnabled) || db.__rustAuthGuard) return db;
+      if (!enabled || db.__rustAuthGuard) return db;
       const prepare = db.prepare.bind(db);
       const exec = db.exec.bind(db);
       // TEMP triggers protect this Node connection, including indirect trigger writes. Rust's
       // separate connection remains the sole allowed-list writer. Product feature writes stay Node.
-      if (routingModeEnabled) exec(`
+      let hasSettings = false;
+      try { hasSettings = !!prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='settings'").get(); } catch { /* no schema yet */ }
+      if (hasSettings) exec(`
         CREATE TEMP TRIGGER rust_routing_insert BEFORE INSERT ON main.settings WHEN NEW.key='routing_modes_allowed' BEGIN SELECT RAISE(ABORT,'RUST_ROUTING_MODE_OWNED'); END;
         CREATE TEMP TRIGGER rust_routing_update BEFORE UPDATE ON main.settings WHEN OLD.key='routing_modes_allowed' OR NEW.key='routing_modes_allowed' BEGIN SELECT RAISE(ABORT,'RUST_ROUTING_MODE_OWNED'); END;
         CREATE TEMP TRIGGER rust_routing_delete BEFORE DELETE ON main.settings WHEN OLD.key='routing_modes_allowed' BEGIN SELECT RAISE(ABORT,'RUST_ROUTING_MODE_OWNED'); END;
@@ -210,4 +209,4 @@ function createRustAuthGuard({ enabled = false, samplingSettingsEnabled = false,
   };
 }
 
-module.exports = { createRustAuthGuard, enabledFrom, writeTarget, writeTargets, OWNED_TABLES, OWNED_SETTING_KEYS };
+module.exports = { createRustAuthGuard, enabledFrom, writeTarget, writeTargets, OWNED_TABLES, OWNED_SETTING_KEYS, FRONT_SETTING_KEYS };

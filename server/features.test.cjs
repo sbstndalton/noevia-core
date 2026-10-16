@@ -5,25 +5,16 @@ const { createFeatures, REGISTRY, parseEnv } = require('./features.cjs');
 
 const memoryStore = (seed = {}) => { const m = new Map(Object.entries(seed)); return { m, get: k => m.get(k), set: (k, v) => m.set(k, v) }; };
 
-test('storage read ownership requires exact selector, confirmations and native auth', () => {
-  const { rustStorageReadsOwned } = require('./features.cjs');
-  const confirmed = {
-    NOEVIA_FRONT: 'rust', NOEVIA_RUST_AUTH: '1', NOEVIA_RUST_AUTH_CONFIRMED: '1',
-    NOEVIA_RUST_STORAGE_READS: '1', NOEVIA_RUST_STORAGE_READS_CONFIRMED: '1',
-  };
-  assert.equal(rustStorageReadsOwned(confirmed), true);
-  assert.equal(rustStorageReadsOwned({}), false);
-  for (const key of Object.keys(confirmed)) {
-    for (const value of [undefined, '', '0', 'true', '01', ' 1 ', '1\n', 'node']) {
-      assert.equal(rustStorageReadsOwned({ ...confirmed, [key]: value }), false, `${key}=${JSON.stringify(value)}`);
-    }
-  }
-  const features = createFeatures({ env: confirmed, store: memoryStore() });
+test('#1071: the retired storage-read switch is no feature and no ownership selector', () => {
+  const { RUST_STORAGE_READS_REFUSAL } = require('./features.cjs');
+  assert.equal(require('./features.cjs').rustStorageReadsOwned, undefined, 'the switch reader is gone');
+  const env = { NOEVIA_RUST_STORAGE_READS: '1', NOEVIA_RUST_STORAGE_READS_CONFIRMED: '1' };
+  const features = createFeatures({ env, store: memoryStore() });
   assert.equal(features.names().includes('rustStorageReads'), false);
   assert.equal(Object.values(REGISTRY).some(row => row.env === 'NOEVIA_RUST_STORAGE_READS'), false);
   assert.throws(() => features.set('rustStorageReads', true, 'synthetic-admin'), e => e.status === 404);
+  assert.deepEqual(RUST_STORAGE_READS_REFUSAL, { error: 'Storage metadata reads are owned by the Rust front.', code: 'RUST_STORAGE_READS_OWNED' });
 });
-
 test('every registered feature is off by default', () => {
   const features = createFeatures({ env: {}, store: memoryStore() });
   for (const name of Object.keys(REGISTRY)) assert.equal(features.enabled(name), false, name);
@@ -255,24 +246,14 @@ test('#705: the Code pipeline and merge flags are off by default and need the co
   assert.equal(createFeatures({ env: { NOEVIA_FEATURE_CONSTRAINED_PLAN_DECODING: 'true' } }).enabled('constrainedPlanDecoding'), true);
 });
 
-const nativeStatusEnv = () => ({ NOEVIA_FRONT: 'rust', NOEVIA_RUST_AUTH: '1', NOEVIA_RUST_AUTH_CONFIRMED: '1', NOEVIA_RUST_CHATGPT_STATUS: '1', NOEVIA_RUST_CHATGPT_STATUS_CONFIRMED: '1' });
+// The live deployment (native auth); the ChatGPT status needs no switch of its own since #1071.
+const nativeStatusEnv = () => ({ NOEVIA_FRONT: 'rust', NOEVIA_RUST_AUTH: '1', NOEVIA_RUST_AUTH_CONFIRMED: '1' });
 
-test('native ChatGPT status: every ownership selector is exact and confirmed', () => {
-  const { rustChatgptStatusOwned } = require('./features.cjs');
-  const baseline = nativeStatusEnv();
-  for (const key of Object.keys(baseline)) {
-    for (const value of [undefined, '', '0', 'true', 'yes', ' 1', '1 ', 'Rust', ' rust', 'rust ', 1]) {
-      assert.equal(rustChatgptStatusOwned({ ...baseline, [key]: value }), false, 'M6_STATUS_POLICY:confirmed_owner');
-    }
-  }
-  // Finite property: all 32 subsets, only the complete confirmed owner may hand off.
-  const keys = Object.keys(baseline);
-  for (let mask = 0; mask < 32; mask++) {
-    const env = Object.fromEntries(keys.map((key, i) => [key, mask & (1 << i) ? baseline[key] : '0']));
-    assert.equal(rustChatgptStatusOwned(env), mask === 31, 'M6_STATUS_POLICY:confirmed_owner');
-  }
+test('#1071: the ChatGPT status has no ownership selector; Node always refuses it', () => {
+  const lib = require('./features.cjs');
+  assert.equal(lib.rustChatgptStatusOwned, undefined, 'the switch reader is gone');
+  assert.deepEqual(lib.RUST_CHATGPT_STATUS_REFUSAL, { error: 'ChatGPT status is owned by the Rust front.', code: 'RUST_CHATGPT_STATUS_OWNED' });
 });
-
 test('native ChatGPT status: typed SQL projection affects only the two product keys', () => {
   const Database = require('better-sqlite3');
   const { settingsStore } = require('./features.cjs');
@@ -318,11 +299,12 @@ test('native ChatGPT status: refreshed cache follows typed truth on all read sur
       assert.equal(row.locked, false);
     }
   }
-  for (const env of [{}, { ...nativeStatusEnv(), NOEVIA_FRONT: 'node' }, { ...nativeStatusEnv(), NOEVIA_RUST_CHATGPT_STATUS_CONFIRMED: '0' }]) {
+  // Every deployment refreshes: no leftover switch value brings the stale cache back (#1071).
+  for (const env of [{}, { ...nativeStatusEnv(), NOEVIA_FRONT: 'node' }, { ...nativeStatusEnv(), NOEVIA_RUST_CHATGPT_STATUS: '0' }]) {
     store.set('feature:chatgptOAuth', 'true');
     const f = createFeatures({ env, store, registry });
     store.set('feature:chatgptOAuth', 'false');
-    assert.equal(f.enabled('chatgptOAuth'), true, 'unconfirmed Node ownership retains the existing cache');
+    assert.equal(f.enabled('chatgptOAuth'), false, JSON.stringify(env));
   }
 });
 

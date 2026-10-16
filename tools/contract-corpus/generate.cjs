@@ -75,18 +75,21 @@ async function waitReady(base, child) {
   throw new Error('server did not become ready in 30 s');
 }
 
-// GETs for client paths no scenario step reaches; {x} params are filled from the run.
+// GETs for client paths no scenario step reaches; {x} params are filled from the run. The Rust
+// front's permanent routes (sbstndalton/noevia#1071: usage, stats, sampling, routing mode and
+// default, ChatGPT status, storage metadata/list/read, export) are not Node's to record any more;
+// their exchanges stay in the noevia-rs corpus recorded at its contracts/http/core.ref.
 const PROBES = [
   '/api/account/instructions', '/api/account/memory', '/api/account/preferences', '/api/account/retention',
   '/api/admin/decision-settings', '/api/admin/features', '/api/admin/mcp-directory', '/api/admin/offsite-backup', '/api/admin/web-address',
   '/api/auth/devices', '/api/auto-roles', '/api/chat-framing/preferences', '/api/chat-vault-mirror/preferences', '/api/code/active',
   '/api/connectors', '/api/connectors/gdrive/policy', '/api/connectors/nextcloud/policy', '/api/diary', '/api/diary-connector', '/api/diary/source', '/api/diary/storage-status',
-  '/api/integrations/storage', '/api/mcp-keys/servers', '/api/mcp-oauth/servers', '/api/model-manager',
+  '/api/mcp-keys/servers', '/api/mcp-oauth/servers', '/api/model-manager',
   '/api/models/autotune', '/api/models/autotune/settings', '/api/models/autotune/untuned', '/api/models/calibration', '/api/models/capabilities', '/api/models/evidence',
   '/api/models/hardware', '/api/models/inference-budget', '/api/models/installed', '/api/plugins/directory',
   '/api/profile/app-passwords', '/api/profile/appearance', '/api/profile/diary-connectors', '/api/profile/sharing',
-  '/api/providers', '/api/providers/chatgpt', '/api/providers/{providerId}/models', '/api/reasoning-settings', '/api/routing-default', '/api/routing-mode', '/api/routing-mode/allowed',
-  '/api/sampling-settings', '/api/stats', '/api/toolboxes', '/api/toolboxes/permitted', '/api/usage', '/api/usage/aggregate',
+  '/api/providers', '/api/providers/{providerId}/models', '/api/reasoning-settings',
+  '/api/toolboxes', '/api/toolboxes/permitted',
   '/api/projects/{projectId}/browser', '/api/projects/{projectId}/code', '/api/projects/{projectId}/instruction-skills', '/api/projects/{projectId}/instruction-skills/manifests', '/api/projects/{projectId}/research',
 ];
 
@@ -103,7 +106,7 @@ const WRITE_PROBES = [
   ['POST', '/api/integrations/storage/test', { kind: 'local' }], ['POST', '/api/models/estimate', {}],
   ['POST', '/api/models/presets/reload', {}], ['POST', '/api/models/autotune/cancel', {}], ['POST', '/api/models/calibration/cancel', {}],
   ['POST', '/api/providers/test', {}], ['PUT', '/api/profile/features', { diaryEnabled: false }],
-  ['GET', '/api/diary/today'], ['GET', '/api/integrations/storage/files'], ['GET', '/api/export/conversations'],
+  ['GET', '/api/diary/today'],
   ['DELETE', '/api/auth/sessions/missing-session-id'], ['DELETE', '/api/auth/passkeys/missing-passkey-id'],
   ['DELETE', '/api/auth/devices/missing-device-id'], ['DELETE', '/api/profile/app-passwords/missing-app-password'],
   ['DELETE', '/api/freechats/missing-free-chat'],
@@ -218,42 +221,9 @@ async function main() {
     const users = await step(admin, 'GET', '/api/admin/users', undefined, [200]);
     const memberId = (users.json?.users || users.json || []).find?.((u) => u.username === MEMBER.username)?.id;
 
-    // M6: actual default PUT contract; reset before later GET resolution snapshots.
-    await step(anon, 'PUT', '/api/reasoning-settings', { default: 'high' }, [401]);
-    await step(member, 'PUT', '/api/reasoning-settings', { default: 'high' }, [403]);
-    await step(admin, 'PUT', '/api/reasoning-settings', { default: 'HIGH' }, [400]);
-    for (const effort of ['low', 'high', 'default']) {
-      await step(admin, 'PUT', '/api/reasoning-settings', { default: effort }, [200]);
-      await step(admin, 'GET', '/api/reasoning-settings', undefined, [200]);
-    }
-
-    // Opt-in synthetic routing corpus: default recording stays the baseline exchanges.
-    // No provider is used; these are configuration records only.
-    if (process.env.NOEVIA_ROUTING_CORPUS === '1') {
-      await step(admin, 'PUT', '/api/admin/features/routingModes', { enabled: true }, [200]);
-      await step(anon, 'GET', '/api/routing-mode', undefined, [401]);
-      await step(anon, 'PUT', '/api/routing-mode', { mode: 'local' }, [401]);
-      await step(member, 'PUT', '/api/routing-mode', { mode: 'hybrid', whenSensitive: 'local' }, [200]);
-      await step(admin, 'PUT', '/api/routing-mode', { mode: 'cloud', cloud: { providerId: 'synthetic-cloud', code: 'synthetic/model' } }, [200]);
-      await step(admin, 'GET', '/api/routing-mode', undefined, [200]);
-      await step(member, 'GET', '/api/routing-mode', undefined, [200]);
-      await step(member, 'PUT', '/api/routing-mode/allowed', { allowed: ['local'] }, [403]);
-      await step(admin, 'PUT', '/api/routing-mode/allowed', { allowed: ['hybrid','local','local'] }, [200]);
-      await step(admin, 'GET', '/api/routing-mode', undefined, [200]);
-      await step(admin, 'PUT', '/api/routing-mode', { mode: 'cloud', cloud: {} }, [403]);
-      await step(admin, 'PUT', '/api/routing-mode/allowed', { allowed: [] }, [200]);
-      await step(member, 'GET', '/api/routing-mode', undefined, [200]);
-      await step(member, 'PUT', '/api/routing-mode', { mode: null }, [200]);
-      await step(admin, 'PUT', '/api/routing-mode/allowed', { allowed: ['local','cloud','hybrid'] }, [200]);
-      for (const method of ['POST','PATCH','DELETE','OPTIONS']) {
-        await step(admin, method, '/api/routing-mode', undefined, [405]);
-        await step(admin, method, '/api/routing-mode/allowed', undefined, [405]);
-      }
-      await step(admin, 'PUT', '/api/admin/features/routingModes', { enabled: false }, [200]);
-      await step(admin, 'PUT', '/api/routing-mode', { mode: 'local' }, [409]);
-      await step(member, 'PUT', '/api/routing-mode/allowed', { allowed: [] }, [409]);
-      await step(admin, 'GET', '/api/routing-mode', undefined, [200]);
-    }
+    // The reasoning default's PUT and the routing configuration are the Rust front's since #1071
+    // (their exchanges stay in the noevia-rs corpus recorded at its core.ref); the GET is Node's.
+    await step(admin, 'GET', '/api/reasoning-settings', undefined, [200]);
 
     // M3: the account routes the Rust front can take over (NOEVIA_RUST_AUTH), end to end.
     const evil = new Client(base, 'https://evil.example.test');

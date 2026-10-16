@@ -1,12 +1,11 @@
 'use strict';
 // #1517 owner decisions: a turn keeps its last 10 variants (older ones drop off, the chosen one is
-// never dropped), and exports carry only the chosen reply. Synthetic data only.
+// never dropped), and exports carry only the chosen reply (the zip export is the Rust front's since #1071). Synthetic data only.
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const zlib = require('node:zlib');
 const { MAX_VARIANTS, capVariants, capEntry } = require('./chat-variants.cjs');
 const { sanitizeHistory } = require('./chat-sources.cjs');
-const { buildExport, chatMarkdown } = require('./chat-export.cjs');
+const { chatMarkdown } = require('./chat-export.cjs');
 
 const answers = (n) => Array.from({ length: n }, (_, i) => ({ content: `answer ${i}` }));
 const texts = (list) => list.map((v) => v.content);
@@ -76,37 +75,11 @@ test('malformed variant fields are left alone, never thrown on', () => {
 
 // --- exports -----------------------------------------------------------------------------------
 
-function unzip(buf) {
-  const out = {};
-  let at = 0;
-  while (buf.readUInt32LE(at) === 0x04034b50) {
-    const crc = buf.readUInt32LE(at + 14), size = buf.readUInt32LE(at + 18), nameLen = buf.readUInt16LE(at + 26), extraLen = buf.readUInt16LE(at + 28);
-    const name = buf.toString('utf8', at + 30, at + 30 + nameLen);
-    const data = buf.subarray(at + 30 + nameLen + extraLen, at + 30 + nameLen + extraLen + size);
-    assert.equal(zlib.crc32(data), crc);
-    out[name] = data.toString('utf8');
-    at += 30 + nameLen + extraLen + size;
-  }
-  return out;
-}
-
 const variantHistory = () => [
   { role: 'user', content: 'chosen question', answers: [{ content: 'ALTERNATIVE-ANSWER-A' }, { content: 'chosen reply' }, { content: 'ALTERNATIVE-ANSWER-B' }], answer: 1,
     branches: [{ content: 'ALTERNATIVE-EDIT', tail: [{ role: 'assistant', content: 'ALTERNATIVE-TAIL' }] }, { content: 'chosen question', tail: [] }], branch: 1 },
   { role: 'assistant', content: 'chosen reply', reasoning: 'scratch' },
 ];
-
-test('an export carries only the chosen reply: no alternatives in the Markdown or in conversations.json', () => {
-  const zip = buildExport({ freeChats: [{ id: 'c1', title: 'Variants' }], projects: [], readHistory: () => variantHistory(), now: Date.UTC(2026, 9, 13) });
-  const files = unzip(zip);
-  const whole = Object.values(files).join('\n');
-  assert.doesNotMatch(whole, /ALTERNATIVE/);
-  const exported = JSON.parse(files['conversations.json']).chats[0].history;
-  for (const entry of exported) for (const field of ['answers', 'answer', 'branches', 'branch']) assert.equal(field in entry, false, `${field} is not exported`);
-  assert.equal(exported[0].content, 'chosen question');
-  assert.equal(exported[1].content, 'chosen reply');
-  assert.match(Object.entries(files).find(([name]) => name.endsWith('.md') && name !== 'README.md')[1], /chosen reply/);
-});
 
 test('the single-chat Markdown export is the chosen reply only', () => {
   const md = chatMarkdown({ title: 'Variants' }, variantHistory());

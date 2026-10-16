@@ -27,17 +27,10 @@ const WHEN_SENSITIVE = Object.freeze(['ask', 'local']);
 const ROLE_KEYS = Object.freeze(['fast', 'smart', 'code']);
 const MODEL_RE = /^[A-Za-z0-9._:/@+-]{1,200}$/;
 const PROVIDER_RE = /^[A-Za-z0-9_-]{1,80}$/;
+// The account setting and the allowed list are written by the Rust front (sbstndalton/noevia#1071,
+// routes/routing-mode.cjs); Node only reads them.
 const FILE = 'routing-mode.json';
 const ALLOWED_KEY = 'routing_modes_allowed';
-
-function rustOwned(env = process.env) {
-  return env.NOEVIA_FRONT === 'rust' && env.NOEVIA_RUST_AUTH === '1'
-    && env.NOEVIA_RUST_AUTH_CONFIRMED === '1' && env.NOEVIA_RUST_ROUTING_MODE === '1'
-    && env.NOEVIA_RUST_ROUTING_MODE_CONFIRMED === '1';
-}
-function refuseNativeWrite(env) {
-  if (rustOwned(env)) throw Object.assign(Error('Routing settings are owned by the Rust front.'), { status: 503, code: 'RUST_ROUTING_MODE_OWNED' });
-}
 
 // ── Account settings ────────────────────────────────────────────────────────
 
@@ -56,30 +49,6 @@ function read(dir) {
   try { return normalize(JSON.parse(fs.readFileSync(path.join(dir, FILE), 'utf8'))); } catch { return normalize(null); }
 }
 
-/** Validates a PUT body; throws { status: 400 } on anything it cannot store. */
-function validate(body, allowed) {
-  if (!body || typeof body !== 'object' || Array.isArray(body)) throw Object.assign(Error('request body must be a JSON object'), { status: 400 });
-  if (body.mode !== null && !MODES.includes(body.mode)) throw Object.assign(Error("mode must be 'local', 'cloud', 'hybrid' or null"), { status: 400 });
-  if (body.mode && !allowed.includes(body.mode)) throw Object.assign(Error('An administrator has not allowed this routing mode.'), { status: 403 });
-  if (body.whenSensitive !== undefined && !WHEN_SENSITIVE.includes(body.whenSensitive)) throw Object.assign(Error("whenSensitive must be 'ask' or 'local'"), { status: 400 });
-  const c = body.cloud === undefined ? {} : body.cloud;
-  if (!c || typeof c !== 'object' || Array.isArray(c)) throw Object.assign(Error('cloud must be an object'), { status: 400 });
-  if (c.providerId !== undefined && c.providerId !== '' && !(typeof c.providerId === 'string' && PROVIDER_RE.test(c.providerId))) throw Object.assign(Error('cloud.providerId is not a provider id'), { status: 400 });
-  for (const role of ROLE_KEYS) {
-    const v = c[role];
-    if (v !== undefined && v !== '' && !(typeof v === 'string' && MODEL_RE.test(v.trim()))) throw Object.assign(Error(`cloud.${role} must be a model id`), { status: 400 });
-  }
-  return normalize(body);
-}
-
-function write(dir, value, env = process.env) {
-  refuseNativeWrite(env);
-  fs.mkdirSync(dir, { recursive: true });
-  const file = path.join(dir, FILE), tmp = `${file}.${process.pid}.tmp`;
-  fs.writeFileSync(tmp, JSON.stringify(normalize(value)));
-  fs.renameSync(tmp, file);
-}
-
 /** The modes an administrator allows (all three unless restricted). */
 function allowedModes(store) {
   try {
@@ -87,14 +56,6 @@ function allowedModes(store) {
     if (Array.isArray(list)) { const out = MODES.filter((m) => list.includes(m)); return out; }
   } catch { /* fall through */ }
   return [...MODES];
-}
-
-function setAllowedModes(store, list, env = process.env) {
-  refuseNativeWrite(env);
-  if (!Array.isArray(list) || list.some((m) => !MODES.includes(m))) throw Object.assign(Error("allowed must list 'local', 'cloud' and/or 'hybrid'"), { status: 400 });
-  const out = MODES.filter((m) => list.includes(m));
-  store.set(ALLOWED_KEY, JSON.stringify(out));
-  return out;
 }
 
 /** The mode in force. A mode an administrator later disallowed falls back to local, the one
@@ -523,6 +484,6 @@ function decisionCodes(entry) {
     latencyMs: num(e.latencyMs), confidence: num(e.confidence) };
 }
 
-module.exports = { rustOwned, MODES, WHEN_SENSITIVE, OPTIONS, FILE, ALLOWED_KEY, normalize, read, write, validate, allowedModes, setAllowedModes,
+module.exports = { MODES, WHEN_SENSITIVE, OPTIONS, FILE, ALLOWED_KEY, normalize, read, allowedModes,
   effectiveMode, projectOverride, withProjectOverride, preRule, hasDiaryContent, routerChunks, routerInput, chunkCharsFor, ROUTER_CHUNK_CHARS, ROUTER_MAX_CHUNKS, routerMaxChunks, createSensitivity, resolveRoute, chatFlags, cloudModel, ibanValid, luhn,
   SENSITIVITY_DEADLINE_MS, decisionCodes };

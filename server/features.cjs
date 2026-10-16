@@ -90,33 +90,17 @@ function unavailableId(name, reason) {
 
 const SETTING_PREFIX = 'feature:';
 
-// This GET handoff needs the same confirmed RustAuth owner as the front. The
-// supervisor must scrub inherited confirmations and validate both capabilities.
-function rustChatgptStatusOwned(env = process.env) {
-  return env.NOEVIA_RUST_CHATGPT_STATUS === '1'
-    && env.NOEVIA_RUST_CHATGPT_STATUS_CONFIRMED === '1'
-    && require('./rust-auth.cjs').enabledFrom(env, () => {});
-}
-
-// Ownership selectors are deployment contracts, never admin feature toggles.
-function rustStorageReadsOwned(env = process.env) {
-  return env.NOEVIA_RUST_STORAGE_READS === '1'
-    && env.NOEVIA_RUST_STORAGE_READS_CONFIRMED === '1'
-    && require('./rust-auth.cjs').enabledFrom(env, () => {});
-}
-
-// sbstndalton/noevia#1368: the connected-storage list (GET /api/integrations/storage/files[/…]) and
-// text read (POST /api/integrations/storage/file), owned by the Rust front only once the supervisor
-// has confirmed the front lists rust-storage-browse.
-function rustStorageBrowseOwned(env = process.env) {
-  return env.NOEVIA_RUST_STORAGE_BROWSE === '1'
-    && env.NOEVIA_RUST_STORAGE_BROWSE_CONFIRMED === '1'
-    && require('./rust-auth.cjs').enabledFrom(env, () => {});
-}
-
+// sbstndalton/noevia#1071: the ChatGPT status GET, the connected-storage metadata GET and the
+// storage list/read belong to the Rust front permanently. Node refuses them unconditionally with
+// these bodies (routes/providers.cjs, routes/storage.cjs, refuseRustStorageRead below).
 const RUST_STORAGE_BROWSE_REFUSAL = Object.freeze({
   error: 'Storage browsing is owned by the Rust front.',
   code: 'RUST_STORAGE_BROWSE_OWNED',
+});
+
+const RUST_CHATGPT_STATUS_REFUSAL = Object.freeze({
+  error: 'ChatGPT status is owned by the Rust front.',
+  code: 'RUST_CHATGPT_STATUS_OWNED',
 });
 
 const RUST_STORAGE_READS_REFUSAL = Object.freeze({
@@ -124,10 +108,10 @@ const RUST_STORAGE_READS_REFUSAL = Object.freeze({
   code: 'RUST_STORAGE_READS_OWNED',
 });
 
-// Called before request authentication or workspace construction. Unowned requests
-// keep their original parse/order; an owned exact GET cannot reach Node's reseal.
-function refuseRustStorageRead(req, res, { owned = false, parseRequestUrl, badRequestUrl, json }) {
-  if (req.method !== 'GET' || !owned) return false;
+// Called before request authentication or workspace construction. Other requests keep their
+// original parse/order; the exact GET (the Rust front's) cannot reach Node's reseal.
+function refuseRustStorageRead(req, res, { parseRequestUrl, badRequestUrl, json }) {
+  if (req.method !== 'GET') return false;
   const url = parseRequestUrl(req, `http://${req.headers.host || 'localhost'}`) || parseRequestUrl(req);
   if (!url) {
     badRequestUrl(res);
@@ -196,11 +180,11 @@ function createFeatures({ env = process.env, store = null, audit = () => {}, reg
     state.set(name, { value, source, boot: value, unavailable: spec.unavailable?.(env) || null });
   }
   const resolve = name => (state.has(name) ? name : aliases.get(name) || name);
-  // Confirmed native routing configuration reads this one product flag independently. Keep
-  // Node's chat/read surfaces consistent with its SQLite truth, including a failed audit after
-  // a committed admin save. Node remains the sole feature:routingModes writer.
+  // The native routing configuration (the Rust front's, #1071) reads this one product flag
+  // independently. Keep Node's chat/read surfaces consistent with its SQLite truth, including a
+  // failed audit after a committed admin save. Node remains the sole feature:routingModes writer.
   const refreshRoutingModes = () => {
-    if (!store || !state.has('routingModes') || !require('./routing-modes.cjs').rustOwned(env)) return;
+    if (!store || !state.has('routingModes')) return;
     const s = state.get('routingModes');
     if (s.source === 'env') return;
     const saved = store.get(SETTING_PREFIX + 'routingModes');
@@ -211,7 +195,7 @@ function createFeatures({ env = process.env, store = null, audit = () => {}, reg
   // Native status reads only typed SQLite truth for this product flag. Keep the
   // Node writers synchronized even when a committed save reports a later error.
   const refreshChatgptOAuth = () => {
-    if (!store || !state.has('chatgptOAuth') || !rustChatgptStatusOwned(env)) return;
+    if (!store || !state.has('chatgptOAuth')) return;
     const s = state.get('chatgptOAuth');
     if (s.source === 'env') return;
     let saved;
@@ -270,4 +254,4 @@ function settingsStore(db) {
   };
 }
 
-module.exports = { browserRuntimeReason, codeSandboxReason, unavailableId, REGISTRY, createFeatures, settingsStore, parseEnv, migrateLegacySetting, rustChatgptStatusOwned, rustStorageReadsOwned, refuseRustStorageRead, RUST_STORAGE_READS_REFUSAL, rustStorageBrowseOwned, RUST_STORAGE_BROWSE_REFUSAL };
+module.exports = { browserRuntimeReason, codeSandboxReason, unavailableId, REGISTRY, createFeatures, settingsStore, parseEnv, migrateLegacySetting, refuseRustStorageRead, RUST_STORAGE_READS_REFUSAL, RUST_STORAGE_BROWSE_REFUSAL, RUST_CHATGPT_STATUS_REFUSAL };

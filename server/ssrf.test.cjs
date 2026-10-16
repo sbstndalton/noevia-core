@@ -336,9 +336,13 @@ test('member cannot save a private-range storage connection', async () => {
   });
   assert.equal(response.status, 400);
   assert.match(JSON.parse(response.text).error, /approved/i);
-  // Nothing was saved for the member.
-  const stored = await request('/api/integrations/storage', { headers: memberHeaders() });
-  assert.equal(JSON.parse(stored.text).kind, 'local');
+  // Nothing was saved for the member (read from the table: the GET is the Rust front's, #1071).
+  const db = new Database(path.join(testDataDir, 'cowork.db'));
+  try {
+    const member = db.prepare("SELECT id FROM users WHERE username='member'").get();
+    const row = db.prepare('SELECT kind FROM storage_connections WHERE user_id=?').get(member.id);
+    assert.ok(!row || row.kind === 'local', JSON.stringify(row));
+  } finally { db.close(); }
 });
 
 test('member cannot run the storage connection test against a private target', async () => {
@@ -350,7 +354,7 @@ test('member cannot run the storage connection test against a private target', a
   assert.match(JSON.parse(response.text).error, /approved/i);
 });
 
-test('member cannot browse or read through a saved private connection', async () => {
+test('member cannot browse or read through a saved private connection (Node refuses both, #1071)', async () => {
   // Seed a connection bypassing saveStorage: simulates a connection saved by
   // an admin account that was later demoted to member.
   const secrets = createSecretStore(testDataDir);
@@ -362,16 +366,16 @@ test('member cannot browse or read through a saved private connection', async ()
   db.prepare('INSERT INTO storage_connections(user_id,kind,base_url,bucket,username,secret,corpus_root,updated_at) VALUES(?,?,?,?,?,?,?,?)')
     .run(member.id, 'webdav', 'http://169.254.169.254/dav', '', 'u', adminRow.secret, 'Cowork', Date.now());
 
+  // Browsing and reading are the Rust front's since #1071 (it re-checks the saved connection's
+  // origin itself): Node refuses both before reading the row.
   const browse = await request('/api/integrations/storage/files', { headers: memberHeaders() });
-  assert.equal(browse.status, 400);
-  assert.match(JSON.parse(browse.text).error, /approved/i);
+  assert.equal(browse.status, 503);
 
   const read = await request('/api/integrations/storage/file', {
     method: 'POST', headers: { ...memberHeaders(), 'content-type': 'application/json' },
     body: JSON.stringify({ path: 'notes.md' }),
   });
-  assert.equal(read.status, 400);
-  assert.match(JSON.parse(read.text).error, /approved/i);
+  assert.equal(read.status, 503);
 
   db.prepare('DELETE FROM storage_connections WHERE user_id=?').run(member.id);
   db.close();
