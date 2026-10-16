@@ -22,9 +22,9 @@ const DEFAULT = { id: 'local', label: 'Local', baseUrl: '', apiKey: '' };
 /** A stub store whose writes fail (PROJECTS_BUSY) while `fail(file)` says so. */
 function failingStub(root) {
   const stub = createStubStore(root);
-  const state = { fail: () => false };
+  const state = { fail: () => false, gate: null };
   const write = stub.write;
-  stub.write = async (user, file, ...rest) => { if (state.fail(file)) throw psc.busy(); return write(user, file, ...rest); };
+  stub.write = async (user, file, ...rest) => { if (state.gate) await state.gate; if (state.fail(file)) throw psc.busy(); return write(user, file, ...rest); };
   return { stub, state };
 }
 
@@ -46,16 +46,18 @@ function harness({ projects = [], free = [], rag = {} } = {}) {
     has(_t, prop) { return prop in currentWorkspace()[field]; },
   });
   const PROJECTS = proxy('projects'), FREE_CHATS = proxy('freeChats');
+  const ragDeletes = [];
+  const ragImpl = { deleteProjectFile: (pid, name) => ragDeletes.push(`${pid}/${name}`), indexProjectFile: async () => ({ ok: true, embedded: 0, stored: 0 }), ...rag };
   const store = createProjectStore({
     fs, path, currentWorkspace, PROJECTS, FREE_CHATS, sanitizeToolboxes: () => null, defaultToolboxes: () => ['core'],
-    reasoningEffort: {}, projectAppearance: () => ({}), rag: { deleteProjectFile() {}, ...rag }, storageClient: { isBrowsable: () => false }, documentSources: { prune() {}, directory: (w, id) => path.join(w.dir, 'docs', id) },
+    reasoningEffort: {}, projectAppearance: () => ({}), rag: ragImpl, storageClient: { isBrowsable: () => false }, documentSources: { prune() {}, directory: (w, id) => path.join(w.dir, 'docs', id) },
     authService: { getStorage: () => ({ kind: 'local' }) }, PROJECT_ROOT_FOLDER: 'Projects', createProjectFolder: async () => null, projectSweep: { afterDelete: async () => [] },
   });
-  const projectRoutes = createProjectRoutes({ json: http.json, readBody: http.readBody, readJson: http.readJson, store, PROJECTS, currentWorkspace, DEFAULT_TOOLBOXES: ['core'], diaryExtras: require('./diary-extras.cjs'), fs, path });
+  const projectRoutes = createProjectRoutes({ rag: ragImpl, projectAppearance: () => ({}), reasoningEffort: { validEffort: () => true }, json: http.json, readBody: http.readBody, readJson: http.readJson, store, PROJECTS, currentWorkspace, DEFAULT_TOOLBOXES: ['core'], diaryExtras: require('./diary-extras.cjs'), fs, path });
   const chatRoutes = createChatListRoutes({ json: http.json, readBody: http.readBody, currentWorkspace, PROJECTS, FREE_CHATS, diaryExtras: { internalProject: () => false }, crypto: require('node:crypto'),
     STORED_HISTORY_BYTES: 1, STORED_HISTORY_CAP: 1, chatLists: () => ({ freeChats: [], projects: [] }), removeChat: () => false, store });
   /** One request as index.cjs runs it: its saves counted, its answer held. */
-  async function call(method, p) {
+  async function call(method, p, reqBody = null) {
     const saves = [];
     let status = null, body = null;
     const res = { headers: {}, setHeader() {}, hasHeader: () => false, removeHeader() {}, writeHead(s) { status = s; }, write() {}, end(v) { body = v; } };
@@ -68,7 +70,7 @@ function harness({ projects = [], free = [], rag = {} } = {}) {
     await scope.run({ workspace: wsWithHook }, async () => {
       const save = ws.storeSaved.bind(ws);
       ws.storeSaved = (promise, name) => { const p2 = save(promise, name); saves.push(p2); return p2; };
-      const request = { method, headers: {}, async *[Symbol.asyncIterator]() {} };
+      const request = { method, headers: {}, async *[Symbol.asyncIterator]() { if (reqBody !== null) yield Buffer.from(JSON.stringify(reqBody)); } };
       const ctx = { path: p, authn: { user: { id: USER, role: 'admin' } }, url: new URL(`http://h${p}`) };
       try {
         if (!(await projectRoutes(request, res, ctx)) && !(await chatRoutes(request, res, ctx))) throw Error(`${p}: not handled`);
@@ -78,7 +80,7 @@ function harness({ projects = [], free = [], rag = {} } = {}) {
     await done;
     return { status, body: JSON.parse(body) };
   }
-  return { root, dir, wsStore, stub, state, store, scope, call };
+  return { root, dir, wsStore, stub, state, store, scope, call, ragDeletes };
 }
 
 const history = (h, id) => path.join(h.dir, `history-${id}.json`);
@@ -206,4 +208,71 @@ test('#1917: a chat turn\'s generated title is applied again to the view read af
   await new Promise((r) => setTimeout(r, 50));
   await h.wsStore.get(USER).pendingStoreWrites();
   assert.equal(JSON.parse(fs.readFileSync(path.join(h.dir, 'free-chats.json'), 'utf8'))[0].forceLocal, true);
+});
+
+test('#1919: a failed save on the flock path keeps the tombstone it wrote, as before the store', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'flock-busy-'));
+  const dir = path.join(root, 'users', USER);
+  fs.mkdirSync(dir, { recursive: true });
+  const ws = { dir, userId: USER, projects: [{ id: 'p1', chats: [{ id: 'c1' }] }], freeChats: [], historyPath: (id) => path.join(dir, `history-${id}.json`),
+    saveProjects() { throw psc.busy(); }, saveFreeChats() {} };
+  const store = createProjectStore({ fs, path, currentWorkspace: () => ws, PROJECTS: ws.projects, FREE_CHATS: ws.freeChats, sanitizeToolboxes: () => null, defaultToolboxes: () => ['core'],
+    reasoningEffort: {}, projectAppearance: () => ({}), rag: {}, storageClient: {}, documentSources: {}, authService: {}, PROJECT_ROOT_FOLDER: 'P', createProjectFolder: async () => null, projectSweep: { afterDelete: async () => [] } });
+  assert.throws(() => store.deleteChat('p1', 'c1'), (e) => e.code === 'PROJECTS_BUSY');
+  assert.ok(require('./chat-lists.cjs').readTombstones(dir).has('c1'), 'unchanged from the flock path');
+});
+
+test('#1919: a deferred index removal spares a source of the same name uploaded again meanwhile', async () => {
+  const files = [{ name: 'a.md', content: 'old text' }];
+  for (const reupload of [true, false]) {
+    const h = harness({ projects: [{ id: 'p1', name: 'P', chats: [], files: JSON.parse(JSON.stringify(files)), instructionSkills: {} }] });
+    let release;
+    h.state.gate = new Promise((r) => { release = r; });
+    const pending = h.call('POST', '/api/projects/p1/config', { files: [] });
+    await new Promise((r) => setTimeout(r, 30)); // the route has saved; the write waits at the gate
+    if (reupload) h.wsStore.get(USER).projects[0].files.push({ name: 'a.md', content: 'new text' });
+    h.state.gate = null; release();
+    const answered = await pending;
+    assert.equal(answered.status, 200);
+    await new Promise((r) => setTimeout(r, 30));
+    assert.deepEqual(h.ragDeletes.filter((d) => d === 'p1/a.md'), reupload ? [] : ['p1/a.md'], reupload ? 'kept for the re-upload' : 'removed when nothing replaced it');
+  }
+});
+
+test('#1919: a background writer stops on an account removed meanwhile, and never makes its directory again', async () => {
+  let finish;
+  const h = harness({ projects: [{ id: 'p1', chats: [], files: [{ name: 'a.md', content: 'synthetic', document: { indexing: 'pending' } }], instructionSkills: {} }],
+    rag: { indexProjectFile: () => new Promise((r) => { finish = r; }) } });
+  const ws = h.wsStore.get(USER);
+  h.scope.run({ workspace: ws }, () => h.store.indexSource(ws.projects[0], ws.projects[0].files[0]));
+  h.state.fail = () => true;
+  await assert.rejects(ws.saveProjects()); // the view is dropped
+  fs.rmSync(h.dir, { recursive: true, force: true }); // the Rust front deletes the account
+  const unhandled = [];
+  const onUnhandled = (e) => unhandled.push(e);
+  process.on('unhandledRejection', onUnhandled);
+  try {
+    assert.throws(() => ws.current(), (e) => e.status === 410);
+    finish({ ok: true, embedded: 1, stored: 1 });
+    await new Promise((r) => setTimeout(r, 50));
+    assert.deepEqual(unhandled, []);
+    assert.equal(fs.existsSync(h.dir), false, 'users/<id>/ was not made again');
+  } finally { process.off('unhandledRejection', onUnhandled); }
+});
+
+
+test('#1920: a change made while a store write is awaited is not lost', async () => {
+  const h = harness({ projects: [{ id: 'p1', name: 'P', chats: [], instructionSkills: {} }] });
+  const ws = h.wsStore.get(USER);
+  let release;
+  h.state.gate = new Promise((r) => { release = r; });
+  ws.projects[0].name = 'First'; // merged as "ours": `written` holds this very object
+  const first = ws.saveProjects();
+  await new Promise((r) => setTimeout(r, 20)); // read and merged; the write waits at the gate
+  ws.projects[0].name = 'Second'; // changed while the write is awaited
+  const second = ws.saveProjects();
+  h.state.gate = null; release();
+  await Promise.all([first, second]);
+  assert.equal(JSON.parse(fs.readFileSync(path.join(h.dir, 'projects.json'), 'utf8')).projects[0].name, 'Second');
+  assert.equal(h.wsStore.get(USER).projects[0].name, 'Second');
 });
