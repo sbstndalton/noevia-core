@@ -17,10 +17,8 @@ async function main() {
   if (!dataDir || !port) throw new Error('serve.cjs needs UI_DATA_DIR and UI_PORT');
   const mocks = await startMocks();
   const env = serverEnv({ port, dataDir, origin: process.env.PUBLIC_ORIGIN || `http://127.0.0.1:${port}`, mocks });
-  // noevia-rs replays the corpus through its front with the M3 switch on (sign-in and the account
-  // in Rust): Node then runs read-only for those tables, as it would behind that front.
-  // The guard also needs the supervisor's confirmation (rust-auth.cjs enabledFrom), passed through.
-  if (process.env.NOEVIA_RUST_AUTH === '1') Object.assign(env, { NOEVIA_RUST_AUTH: '1', NOEVIA_FRONT: 'rust', NOEVIA_RUST_AUTH_CONFIRMED: process.env.NOEVIA_RUST_AUTH_CONFIRMED === '1' ? '1' : '' });
+  // Sign-in and the account are the Rust front's (sbstndalton/noevia#1071): Node always runs
+  // read-only for those tables and refuses their routes, so there is no switch to pass through.
   // M4 (rust-projects.cjs): projects.json shared with the front, the image writes refused here,
   // and the chat-list save too when the front's chat slice is confirmed separately (#1409), and the
   // free-chat save when its slice is.

@@ -89,10 +89,10 @@ const staticFiles = require('./static-files.cjs').createStaticFiles(DIST_DIR);
 // The build, with index.html for the client's own places (/c/<id>, /p/<id>, /settings/<section>…, #359).
 const serveStatic = require('./spa-routes.cjs').createStaticFallback({ staticFiles, indexFile: path.join(DIST_DIR, 'index.html'), json });
 const secretStore = createSecretStore(DATA_DIR);
-// M3 of the full-Rust migration: NOEVIA_RUST_AUTH=1 with NOEVIA_FRONT=rust hands sign-in, the
-// account routes and their tables to the Rust front (rust-auth.cjs). Off by default.
-const rustAuth = require('./rust-auth.cjs').createRustAuthGuard({ enabled: require('./rust-auth.cjs').enabledFrom(process.env) });
-// M4: NOEVIA_RUST_PROJECTS=1 (on top of M3) shares projects.json with the Rust front, which answers
+// M3 of the full-Rust migration, permanent since sbstndalton/noevia#1071: the Rust front owns
+// sign-in, the account routes and their tables (rust-auth.cjs); this process only reads them.
+const rustAuth = require('./rust-auth.cjs').createRustAuthGuard();
+// M4: NOEVIA_RUST_PROJECTS=1 shares projects.json with the Rust front, which answers
 // the project image routes (rust-projects.cjs). Off by default.
 const RUST_PROJECTS = require('./rust-projects.cjs').enabledFrom(process.env);
 // Its chat-list slice only with the supervisor's separate confirmation (rust-project-chats).
@@ -1062,31 +1062,27 @@ const diaryRoutes = require('./routes/diary.cjs').createDiaryRoutes({
   addressesTrusted: process.env.TRUST_PROXY === 'true',
   storageLatch,
 });
-// Sign-in, the signed-in account and /api/admin/* (routes/auth.cjs). The open set is also the
-// router's own list of what a signed-out browser may call.
+// The router's list of the paths a signed-out browser may call. Their sign-in methods are the Rust
+// front's (#1071, refused above by rust-auth.cjs); any other method passes the gate as before.
 const publicAuthRoutes = new Set([
   '/api/setup/status', '/api/setup/complete', '/api/auth/login/password',
   '/api/auth/login/passkey/options', '/api/auth/login/passkey/verify',
   '/api/auth/invitations/accept', '/api/auth/recovery/complete',
 ]);
-// Native-client sign-in (#555): the RFC 8628 device flow and per-device tokens (device-auth.cjs),
-// only while features.nativeClientAuth is on. requestAuth is the router's single credential check.
+// Native-client sign-in (#555): the device flow is the Rust front's (#1071); this process checks
+// device tokens (read-only), revokes every grant when the feature is switched off, and keeps the
+// /device page hidden while it is off. requestAuth is the router's single credential check.
 const nativeClientAuth = () => features.enabled('nativeClientAuth');
 const deviceAuth = require('./device-auth.cjs').createDeviceAuth({
-  db: authService.db, audit: authService.audit, publicUser: authService.publicUser, rate: createRateLimiter(),
-  clientAddress: (req) => require('./auth.cjs').clientAddress(req, process.env.TRUST_PROXY === 'true'),
-  origin: () => authService.origin || process.env.PUBLIC_ORIGIN || '',
-  // Without TRUST_PROXY every request carries the tunnel's address: not shown, not rate-limited on.
-  addressesTrusted: process.env.TRUST_PROXY === 'true',
-  guard: rustAuth,
+  db: authService.db, audit: authService.audit, publicUser: authService.publicUser, guard: rustAuth,
 });
 // Started with the feature off: grants from an earlier "on" period are revoked, not kept dormant.
 if (!nativeClientAuth()) deviceAuth.revokeAll(null, 'feature-off');
 const requestAuth = require('./device-auth.cjs').createRequestAuth({ enabled: nativeClientAuth, deviceAuth, authService });
-const deviceRoutes = require('./routes/device-auth.cjs').createDeviceAuthRoutes({ json, authResult, readJson, deviceAuth, authService, enabled: nativeClientAuth });
+const deviceRoutes = require('./routes/device-auth.cjs').createDeviceAuthRoutes({ json, enabled: nativeClientAuth });
 const authRoutes = require('./routes/auth.cjs').createAuthRoutes({
-  json, authResult, readJson, authService, publicAuthRoutes, davSettings, davConfig, workspaceStore, driveAccounts, fetchJson, DIARY_BASE, DIARY_TOKEN, diaryTenantHeaders: diary.tenantHeaders, env: process.env,
-  mcpOAuth, directoryMcp, chatgptOAuth, onToolsChange: () => permittedToolsCache.clear(),
+  json, readJson, authService, davSettings, workspaceStore, driveAccounts, fetchJson, DIARY_BASE, DIARY_TOKEN, diaryTenantHeaders: diary.tenantHeaders,
+  mcpOAuth, directoryMcp, chatgptOAuth,
   // POST /api/admin/secrets/rotate (CSRF-checked by the router like every signed-in POST).
   rotateSecrets: (actorId) => require('./secrets-rotate.cjs').runRotation({ secrets: secretStore, db: authService.db, dataDir: DATA_DIR, audit: authService.audit, actorId }),
 });
@@ -1204,10 +1200,11 @@ async function handleRequestScoped(req, res) {
       res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'public, max-age=300' });
       return res.end(req.method === 'HEAD' ? undefined : publicPage(p));
     }
+    // Sign-in and the account are the Rust front's (#1071): a request that reaches Node bypassed it.
+    if (require('./rust-auth.cjs').refuseOwned(req, res, p, json)) return;
     if (await diaryRoutes.connector(req, res, { path: p })) return;
     if ((p === '/api/instance' || p === '/.well-known/webauthn') && await webAddressRoutes(req, res, { path: p, authn: null })) return;
     if (await deviceRoutes.open(req, res, { path: p })) return;
-    if (await authRoutes.open(req, res, { path: p })) return;
     if (await readyRoutes(req, res, { path: p })) return;
 
     const authn = p.startsWith('/api/') ? requestAuth.authenticate(req) : null;
@@ -1218,7 +1215,6 @@ async function handleRequestScoped(req, res) {
     if (requestAuth.browserOnly(authn, p, req.method || 'GET')) {
       return json(res, 403, { error: 'This needs a signed-in browser session.', code: 'browser_session_required' });
     }
-    if (authn && await deviceRoutes.account(req, res, { path: p, authn })) return;
     if (authn && await featureRoutes(req, res, { path: p, authn })) return;
     if (authn && await chatFramingRoutes(req, res, { path: p, authn })) return;
     if (authn && await chatVaultMirrorRoutes(req, res, { path: p, authn })) return;

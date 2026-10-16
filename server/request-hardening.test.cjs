@@ -101,35 +101,25 @@ async function request(url, { method = 'GET', headers = {}, body = '' } = {}) {
   return { status: res.statusCode, headers: responseHeaders, text, json };
 }
 
-const PASSWORD = 'correct horse battery staple';
+const { seedAccount, setUserFeatures } = require('../tests/server/seed-account.cjs');
 let cookie = '';
 let csrf = '';
-test.before(async () => {
-  const setupCode = fs.readFileSync(path.join(testDataDir, 'first-run-setup-code'), 'utf8').trim();
-  const setup = await request('/api/setup/complete', {
-    method: 'POST', headers: { origin: 'http://localhost' },
-    body: JSON.stringify({ setupCode, publicOrigin: 'http://localhost', username: 'synthetic-admin', displayName: 'Synthetic', password: PASSWORD }),
-  });
-  assert.equal(setup.status, 201, setup.text);
-  const login = await request('/api/auth/login/password', {
-    method: 'POST', headers: { origin: 'http://localhost' }, body: JSON.stringify({ username: 'synthetic-admin', password: PASSWORD }),
-  });
-  assert.equal(login.status, 200);
-  const pairs = (login.headers['set-cookie'] || login.headers['Set-Cookie'] || []).map((c) => c.split(';')[0]);
-  cookie = pairs.join('; ');
-  csrf = decodeURIComponent(pairs.find((c) => c.startsWith('cowork_csrf=')).split('=').slice(1).join('='));
+let adminId = '';
+test.before(() => {
+  // Sign-in is the Rust front's (#1071): the account and its session are seeded directly.
+  ({ cookie, csrf, id: adminId } = seedAccount(testDataDir, { username: 'synthetic-admin', displayName: 'Synthetic', publicOrigin: 'http://localhost' }));
 });
 
 const writeHeaders = (extra = {}) => ({ origin: 'http://localhost', cookie, 'content-type': 'application/json', 'x-csrf-token': csrf, ...extra });
 
 test('#781: a malformed cookie escape gets an HTTP answer and does not break a valid session', async () => {
-  const anonymous = await request('/api/setup/status', { headers: { cookie: 'a=%E0' } });
+  // GET /api/profile and /api/setup/status are the Rust front's (#1071); Node-owned routes here.
+  const anonymous = await request('/api/ready', { headers: { cookie: 'a=%E0' } });
   assert.equal(anonymous.status, 200, 'a signed-out request with a bad sibling cookie is answered');
-  const unknown = await request('/api/profile', { headers: { cookie: 'a=%E0%A4%A' } });
+  const unknown = await request('/api/workspace', { headers: { cookie: 'a=%E0%A4%A' } });
   assert.equal(unknown.status, 401, 'no session cookie: an ordinary 401, not a reset');
-  const signedIn = await request('/api/profile', { headers: { cookie: `sibling=%E0%A4%A; ${cookie}` } });
+  const signedIn = await request('/api/workspace', { headers: { cookie: `sibling=%E0%A4%A; ${cookie}` } });
   assert.equal(signedIn.status, 200, 'the session cookie next to a malformed one still signs in');
-  assert.equal(signedIn.json.user.username, 'synthetic-admin');
 });
 
 test('#781: parseCookies keeps a malformed value raw and still decodes the rest', () => {
@@ -138,15 +128,8 @@ test('#781: parseCookies keeps a malformed value raw and still decodes the rest'
 });
 
 test('#786: a JSON body of null is a 400 on every route that reads its body', async () => {
-  const signedOut = { origin: 'http://localhost', 'content-type': 'application/json' };
+  // The sign-in and account routes in this list moved to the Rust front (#1071).
   const routes = [
-    ['POST', '/api/auth/login/password', signedOut],
-    ['POST', '/api/auth/login/passkey/options', signedOut],
-    ['POST', '/api/auth/invitations/accept', signedOut],
-    ['PATCH', '/api/profile', writeHeaders()],
-    ['PUT', '/api/profile/features', writeHeaders()],
-    ['PATCH', '/api/auth/passkeys/synthetic-key', writeHeaders()],
-    ['POST', '/api/admin/invitations', writeHeaders()],
     ['PUT', '/api/integrations/storage', writeHeaders()],
     ['POST', '/api/integrations/storage/folder', writeHeaders()],
     ['POST', '/api/profile/diary-connectors', writeHeaders()],
@@ -155,12 +138,12 @@ test('#786: a JSON body of null is a 400 on every route that reads its body', as
     const res = await request(url, { method, headers, body: 'null' });
     assert.equal(res.status, 400, `${method} ${url} answered ${res.status}: ${res.text}`);
   }
-  // A well-formed body on the same routes is unaffected.
-  assert.equal((await request('/api/profile', { method: 'PATCH', headers: writeHeaders(), body: JSON.stringify({ displayName: 'Synthetic Two' }) })).status, 200);
+  // A well-formed body is unaffected.
+  assert.equal((await request('/api/projects', { method: 'POST', headers: writeHeaders(), body: JSON.stringify({ name: 'Synthetic null-body control' }) })).status, 200);
 });
 
 test('#786: the Diary connector endpoint refuses a null body with 400', async () => {
-  assert.equal((await request('/api/profile/features', { method: 'PUT', headers: writeHeaders(), body: JSON.stringify({ diaryEnabled: true }) })).status, 200);
+  setUserFeatures(testDataDir, adminId, { diaryEnabled: true });
   const made = await request('/api/profile/diary-connectors', { method: 'POST', headers: writeHeaders(), body: JSON.stringify({ name: 'Synthetic connector' }) });
   assert.equal(made.status, 201, made.text);
   const res = await request('/api/diary-connector', { method: 'POST', headers: { authorization: `Bearer ${made.json.token}`, 'content-type': 'application/json' }, body: 'null' });
@@ -216,7 +199,7 @@ test('L3: an unparseable request target is a 400 without a logged stack; a malfo
       assert.equal(res.status, 400, target);
       assert.deepEqual(res.json, { error: 'invalid URL' });
     }
-    const badHost = await request('/api/setup/status', { headers: { host: 'a b[' } });
+    const badHost = await request('/api/ready', { headers: { host: 'a b[' } });
     assert.equal(badHost.status, 200, 'the path alone is enough to route');
   } finally { console.error = realError; }
   assert.deepEqual(logged, [], 'no stack is logged for a client error');

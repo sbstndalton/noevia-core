@@ -1,15 +1,15 @@
 'use strict';
 // The cross-runtime single-writer guard for M3 of the full-Rust migration (noevia
-// docs/adr-0001-rust-and-repo-split.md, "Amendment 2026-10-10"): once the deployment switch is on,
-// the Rust front (noevia-rs bins/noevia-server) owns sign-in and the account routes and the tables
-// they write, and this process refuses to write them, so every owned row has one writer.
+// docs/adr-0001-rust-and-repo-split.md, "Amendment 2026-10-10"): the Rust front (noevia-rs
+// bins/noevia-server) owns sign-in and the account routes and the tables they write, and this
+// process refuses to write them, so every owned row has one writer.
 //
-// The switch is NOEVIA_RUST_AUTH=1 (exactly) together with NOEVIA_FRONT=rust and the supervisor's
-// NOEVIA_RUST_AUTH_CONFIRMED=1 (set only once the front's --features lists rust-auth): the front only
-// answers those routes when it faces the network, so with NOEVIA_FRONT=node the switch is ignored
-// here (a warning is printed) and Node keeps doing everything, as before.
+// Permanent since sbstndalton/noevia#1071: the deployment switch NOEVIA_RUST_AUTH and its
+// confirmation are retired and not read here; the guard is always installed. Node's copies of
+// the routes are gone (OWNED_ROUTES below are refused before anything else runs), and the web
+// supervisor refuses to start without NOEVIA_FRONT=rust and a front that lists rust-auth.
 //
-// While it is on:
+// Always:
 //   - every statement prepared on the auth database that INSERTs into, UPDATEs or DELETEs from an
 //     owned table (or writes an owned settings key) throws when it runs: status 503, code
 //     RUST_AUTH_OWNED. Reads are untouched. Writes made at boot (migrations, the first-run setup
@@ -25,8 +25,6 @@
 // sign-in is switched off, and the DAV listener's app_passwords.last_used_at. audit_events is
 // shared, append-only, by both. noevia-rs crates/server-store OWNED_TABLES is the other half of
 // this list; keep them equal.
-//
-// Removed together with Node's copies of the routes once Rust-owned sign-in is proven.
 
 const OWNED_TABLES = Object.freeze(new Set([
   'sessions', 'users', 'user_features', 'user_appearance', 'passkeys', 'challenges', 'invitations', 'recoveries',
@@ -56,19 +54,49 @@ function scrub(sql) {
 
 const unquote = (id) => id.replace(/^["`[]|["`\]]$/g, '').toLowerCase();
 
-/** Whether the switch is on for this process (see the header). The supervisor sets
- *  NOEVIA_RUST_AUTH_CONFIRMED=1 only after `noevia-server --features` listed rust-auth: without
- *  that the front may not answer these routes, and refusing Node's writes would lock sign-in out. */
-function enabledFrom(env = process.env, warn = console.warn) {
-  if (env.NOEVIA_RUST_AUTH !== '1') return false;
-  if (env.NOEVIA_FRONT !== 'rust') {
-    warn('NOEVIA_RUST_AUTH=1 is ignored: the Rust front answers sign-in only with NOEVIA_FRONT=rust.');
-    return false;
-  }
-  if (env.NOEVIA_RUST_AUTH_CONFIRMED !== '1') {
-    warn('NOEVIA_RUST_AUTH=1 is ignored: the supervisor has not confirmed that the Rust front supports rust-auth (NOEVIA_RUST_AUTH_CONFIRMED).');
-    return false;
-  }
+// The routes the Rust front answers for sign-in and the account (noevia-rs
+// contracts/http/routes.toml, the owner = "rust" account entries; keep them equal). A method that
+// is not listed stays Node's (it answers as before). Node has no handler for these any more: a
+// request that reaches it bypassed the front and is refused with 503 RUST_AUTH_OWNED.
+const ALL = null;
+const OWNED_ROUTES = Object.freeze([
+  [/^\/api\/account\/(?:instructions|memory|preferences)$/, ALL],
+  [/^\/api\/admin\/invitations$/, ['POST']],
+  [/^\/api\/admin\/users$/, ['GET']],
+  [/^\/api\/admin\/users\/[^/]+\/disabled$/, ['PUT']],
+  [/^\/api\/admin\/users\/[^/]+\/recovery$/, ['POST']],
+  [/^\/api\/auth\/device\/(?:approve|code|token|lookup)$/, ALL],
+  [/^\/api\/auth\/devices(?:\/[^/]+)?$/, ALL],
+  [/^\/api\/auth\/invitations\/accept$/, ['POST']],
+  [/^\/api\/auth\/login\/(?:password|passkey\/options|passkey\/verify)$/, ['POST']],
+  [/^\/api\/auth\/logout$/, ['POST']],
+  [/^\/api\/auth\/passkeys\/register\/(?:options|verify)$/, ['POST']],
+  [/^\/api\/auth\/passkeys\/[^/]+$/, ['DELETE', 'PATCH']],
+  [/^\/api\/auth\/recovery\/complete$/, ['POST']],
+  [/^\/api\/auth\/session$/, ['GET']],
+  [/^\/api\/auth\/sessions\/[^/]+$/, ['DELETE']],
+  [/^\/api\/profile$/, ['GET', 'PATCH']],
+  [/^\/api\/profile\/app-passwords$/, ['GET', 'POST']],
+  [/^\/api\/profile\/app-passwords\/[^/]+$/, ['DELETE']],
+  [/^\/api\/profile\/appearance$/, ALL],
+  [/^\/api\/profile\/features$/, ['PUT']],
+  [/^\/api\/profile\/onboarding$/, ['POST']],
+  [/^\/api\/setup\/complete$/, ['POST']],
+  [/^\/api\/setup\/status$/, ['GET']],
+]);
+
+const ROUTE_REFUSAL = Object.freeze({ error: 'Sign-in and the account are owned by the Rust front.', code: 'RUST_AUTH_OWNED' });
+
+/** Whether `method path` (a WHATWG pathname) is one of the Rust front's sign-in and account routes. */
+function ownedRoute(method, pathname) {
+  const m = String(method || 'GET').toUpperCase();
+  return OWNED_ROUTES.some(([re, methods]) => re.test(pathname) && (methods === ALL || methods.includes(m)));
+}
+
+/** Refuses a Rust-owned sign-in or account route (503 RUST_AUTH_OWNED); false for anything else. */
+function refuseOwned(req, res, pathname, json) {
+  if (!ownedRoute(req.method, pathname)) return false;
+  json(res, 503, ROUTE_REFUSAL);
   return true;
 }
 
@@ -113,28 +141,30 @@ function singleSettingKey(sql, args) {
   return del ? del[1] : null;
 }
 // sbstndalton/noevia#1071: the routing allowed list, the reasoning default and the sampling-presets
-// switch are written only by the Rust front (their routes left Node). Under NOEVIA_RUST_AUTH this
-// connection refuses those keys too, even inside exempt(), with their own codes.
+// switch are written only by the Rust front (their routes left Node). This connection refuses those
+// keys too, even inside exempt(), with their own codes.
 const FRONT_SETTING_KEYS = Object.freeze({
   routing_modes_allowed: ['Routing settings are owned by the Rust front.', 'RUST_ROUTING_MODE_OWNED'],
   reasoning_effort_default: ['Reasoning settings are written by the Rust front', 'RUST_REASONING_SETTINGS_OWNED'],
   auto_sampling_presets_enabled: ['Sampling settings are written by the Rust front', 'RUST_SAMPLING_SETTINGS_OWNED'],
 });
-function createRustAuthGuard({ enabled = false } = {}) {
+/** The guard. It takes no options: Rust always owns these tables (sbstndalton/noevia#1071). */
+function createRustAuthGuard() {
+  const enabled = true;
   let exemptDepth = 0;
 
   function refuse(what) {
-    throw Object.assign(new Error(`${what} is written by the Rust front while NOEVIA_RUST_AUTH is on`), { status: 503, code: 'RUST_AUTH_OWNED' });
+    throw Object.assign(new Error(`${what} is written by the Rust front`), { status: 503, code: 'RUST_AUTH_OWNED' });
   }
 
   /** Throws when running `target` (with `args`) would write what Rust owns. */
   function check(targets, args) {
-    if (!enabled || !targets) return;
+    if (!targets) return;
     for (const target of Array.isArray(targets) ? targets : [targets]) checkOne(target, args);
   }
 
   function checkOne(target, args) {
-    if (enabled && exemptDepth === 0 && OWNED_TABLES.has(target.table)) refuse(target.table);
+    if (exemptDepth === 0 && OWNED_TABLES.has(target.table)) refuse(target.table);
     if (target.table === 'settings') {
       const key = singleSettingKey(target.sql, args);
       // An unrecognised settings write may touch any key, the front's included: refused even
@@ -180,9 +210,9 @@ function createRustAuthGuard({ enabled = false } = {}) {
       exemptDepth += 1;
       try { return fn(); } finally { exemptDepth -= 1; }
     },
-    /** Installs the guard on a better-sqlite3 database (a no-op while the switch is off). */
+    /** Installs the guard on a better-sqlite3 database (once per connection). */
     install(db) {
-      if (!enabled || db.__rustAuthGuard) return db;
+      if (db.__rustAuthGuard) return db;
       const prepare = db.prepare.bind(db);
       const exec = db.exec.bind(db);
       // TEMP triggers protect this Node connection, including indirect trigger writes. Rust's
@@ -209,4 +239,4 @@ function createRustAuthGuard({ enabled = false } = {}) {
   };
 }
 
-module.exports = { createRustAuthGuard, enabledFrom, writeTarget, writeTargets, OWNED_TABLES, OWNED_SETTING_KEYS, FRONT_SETTING_KEYS };
+module.exports = { createRustAuthGuard, ownedRoute, refuseOwned, OWNED_ROUTES, ROUTE_REFUSAL, writeTarget, writeTargets, OWNED_TABLES, OWNED_SETTING_KEYS, FRONT_SETTING_KEYS };

@@ -33,7 +33,7 @@ function createToolboxRoutes({ discoverMcpTools, toolboxSummaries, connectedBoxe
       const mode = params.get('mode') || 'chat';
       if (mode !== 'chat' && mode !== 'cowork') return json(res, 400, { error: 'mode must be "chat" or "cowork"' }), true;
       // cacheKeyExtra: per-user state another process may change (the Diary preference, which the
-      // Rust front writes under NOEVIA_RUST_AUTH without clearing this cache), so a change shows at once.
+      // Rust front writes without clearing this cache, #1071), so a change shows at once.
       const key = JSON.stringify([authn.user.id, authn.user.role, projectId, mode, cacheKeyExtra(authn)]);
       let view = cache.get(key);
       if (!view) {

@@ -10,6 +10,7 @@ const { spawn, spawnSync } = require('node:child_process');
 const { once } = require('node:events');
 const { SERVER, GUARD, startMocks, serverEnv } = require('../contract-corpus/mocks.cjs');
 const { requireScan, requireReducedPdf, REDUCED_CAP } = require('./contracts.cjs');
+const { seedAccount } = require('../../tests/server/seed-account.cjs');
 const required = name => { assert.ok(process.env[name], `${name} is required; this gate cannot skip`); return path.resolve(process.env[name]); };
 const children = new Set();
 function child(command, args, env) {
@@ -101,11 +102,14 @@ async function scenario(front, mode, workerBase, fixtures, root, calls) {
   try {
     await ready(`http://127.0.0.1:${nodePort}`, '/api/ready', node);
     if (front) {
-      rust = child(front, [], { PATH: process.env.PATH, UI_PORT: String(frontPort), UI_HOST: '127.0.0.1', UI_DATA_DIR: dataDir, PUBLIC_ORIGIN: base, NOEVIA_FRONT: 'rust', NOEVIA_RUST_AUTH: '0', NOEVIA_RUST_PROJECTS: '0', NOEVIA_LEGACY_UPSTREAM: `http://127.0.0.1:${nodePort}` });
+      rust = child(front, [], { PATH: process.env.PATH, UI_PORT: String(frontPort), UI_HOST: '127.0.0.1', UI_DATA_DIR: dataDir, PUBLIC_ORIGIN: base, NOEVIA_FRONT: 'rust', NOEVIA_RUST_PROJECTS: '0', NOEVIA_LEGACY_UPSTREAM: `http://127.0.0.1:${nodePort}` });
       await ready(base, '/api/ready', rust);
     }
     const admin = new Client(base); const member = new Client(base);
-    await admin.call('POST', '/api/setup/complete', { setupCode: fs.readFileSync(path.join(dataDir, 'first-run-setup-code'), 'utf8').trim(), publicOrigin: base, username: 'synthetic-admin', displayName: 'Synthetic Admin', password: 'synthetic-OCR-front-1271-password', diaryEnabled: false }, 201);
+    // Sign-in is the Rust front's (sbstndalton/noevia#1071): both accounts and their sessions are
+    // seeded the way it writes them, and the clients carry those cookies.
+    const signIn = (client, opts) => { const seeded = seedAccount(dataDir, opts); client.cookies.set('cowork_session', seeded.session); client.cookies.set('cowork_csrf', seeded.csrf); };
+    signIn(admin, { username: 'synthetic-admin', displayName: 'Synthetic Admin', publicOrigin: base });
     const created = await admin.call('POST', '/api/projects', { name: 'Synthetic OCR contract', goal: 'Synthetic documents only' });
     const id = created.id || created.project?.id; assert.ok(id);
     const route = `/api/projects/${encodeURIComponent(id)}`;
@@ -137,8 +141,7 @@ async function scenario(front, mode, workerBase, fixtures, root, calls) {
     const text = async name => (await admin.call('GET', `${route}/sources/text?name=${encodeURIComponent(name)}`)).content;
     assert.ok(files.some(file => file.name === 'body.docx') && (await text('body.docx')).includes('SYNTHETIC DOCX REF 1271'));
     assert.ok(files.some(file => file.name === large.path) && (await text(large.path)).includes('SYNTHETIC NATIVE TEXT FOR REDUCTION'));
-    const invite = await admin.call('POST', '/api/admin/invitations', { role: 'member' }, 201);
-    await member.call('POST', '/api/auth/invitations/accept', { token: invite.token, username: 'synthetic-member', displayName: 'Synthetic Member', password: 'synthetic-member-1271-password', diaryEnabled: false }, 201);
+    signIn(member, { username: 'synthetic-member', displayName: 'Synthetic Member', role: 'member' });
     const before = calls.length;
     const deniedPages = await member.call('GET', route + '/documents/pages?name=scan.pdf', undefined, 404);
     const deniedOriginal = await member.call('GET', route + '/documents/original?name=scan.pdf', undefined, 404);

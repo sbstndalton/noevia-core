@@ -15,6 +15,16 @@ const { createMcpOAuth } = require('./mcp-oauth.cjs');
 const { createDirectoryMcp } = require('./directory-mcp.cjs');
 const { runRotation } = require('./secrets-rotate.cjs');
 const { createAuthRoutes } = require('./routes/auth.cjs');
+// The accounts are the Rust front's (#1071): Node's connection refuses to write them, so the synthetic
+// users are written through a separate connection, as the front would.
+const Database = require('better-sqlite3');
+function seedUsers(root, users) {
+  const db = new Database(path.join(root, 'cowork.db'));
+  try {
+    for (const [id, name] of users) db.prepare(`INSERT INTO users(id,username,username_norm,display_name,role,password_hash,webauthn_user_id,created_at,updated_at)
+      VALUES(?,?,?,?,'member','x',?,0,0)`).run(id, name, name, name, `w-${id}`);
+  } finally { db.close(); }
+}
 
 const U1 = '11111111-1111-4111-8111-111111111111';
 const U2 = '22222222-2222-4222-8222-222222222222';
@@ -52,8 +62,7 @@ test('rotate re-encrypts every stored kind, upgrades plaintext, counts failures,
   const old = createSecretStore(root, noPrev);
   const auth = createAuth({ dataDir: root, publicOrigin: 'https://noevia.example.test', secrets: old });
   const db = auth.db;
-  for (const id of [U1, U2]) db.prepare(`INSERT INTO users(id,username,username_norm,display_name,role,password_hash,webauthn_user_id,created_at,updated_at)
-    VALUES(?,?,?,?,'member','x',?,0,0)`).run(id, id, id, id, `w-${id}`);
+  seedUsers(root, [[U1, U1], [U2, U2]]);
   createMcpOAuth({ db, secrets: old, urlAllowed: async () => true, redirectUri: () => 'https://noevia.example.test/cb' });
   createDirectoryMcp({ db, secrets: old });
   const S3 = { kind: 's3', baseUrl: 'https://s3.example.test', bucket: 'b', username: 'AKID', corpusRoot: 'x' };
@@ -107,8 +116,7 @@ test('an undecryptable token or storage secret reports needs re-auth, not connec
   const root = tmp(t);
   const secrets = createSecretStore(root, noPrev);
   const auth = createAuth({ dataDir: root, publicOrigin: 'https://noevia.example.test', secrets });
-  auth.db.prepare(`INSERT INTO users(id,username,username_norm,display_name,role,password_hash,webauthn_user_id,created_at,updated_at)
-    VALUES(?,?,?,?,'member','x',?,0,0)`).run(U1, 'u', 'u', 'u', 'w');
+  seedUsers(root, [[U1, 'u']]);
   const oauth = createMcpOAuth({ db: auth.db, secrets, urlAllowed: async () => true, redirectUri: () => 'https://noevia.example.test/cb' });
   const foreign = createSecretStore(tmp(t), noPrev);
   auth.db.prepare('INSERT INTO mcp_oauth_tokens VALUES(?,?,?,?)').run(U1, 'lost', foreign.encrypt('{"access_token":"t"}', U1), 0);
@@ -132,9 +140,9 @@ test('an undecryptable token or storage secret reports needs re-auth, not connec
 test('POST /api/admin/secrets/rotate is administrator-only and runs the rotation', async () => {
   const sent = []; const ran = [];
   const routes = createAuthRoutes({
-    json: (_res, status, body) => sent.push({ status, body }), authResult: () => {}, readJson: async () => ({}),
-    authService: {}, publicAuthRoutes: new Set(), davSettings: {}, davConfig: {}, workspaceStore: {}, driveAccounts: {},
-    fetchJson: async () => ({}), DIARY_BASE: '', DIARY_TOKEN: '', env: {},
+    json: (_res, status, body) => sent.push({ status, body }), readJson: async () => ({}),
+    authService: {}, davSettings: {}, workspaceStore: {}, driveAccounts: {},
+    fetchJson: async () => ({}), DIARY_BASE: '', DIARY_TOKEN: '',
     rotateSecrets: (actor) => { ran.push(actor); return { totals: { rotated: 1 } }; },
   });
   const call = (role, method = 'POST') => {

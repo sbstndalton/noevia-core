@@ -38,15 +38,8 @@ async function request(url, { method = 'GET', headers = {}, body = '' } = {}) {
 let cookie = '', csrf = '';
 test.before(async () => {
   ({ handleRequest } = require('./index.cjs'));
-  const setupCode = fs.readFileSync(path.join(testDataDir, 'first-run-setup-code'), 'utf8').trim();
-  const setup = await request('/api/setup/complete', { method: 'POST', headers: { origin: 'http://localhost' },
-    body: JSON.stringify({ setupCode, publicOrigin: 'http://localhost', username: 'admin', displayName: 'Admin', password: 'correct horse battery staple' }) });
-  assert.equal(setup.status, 201);
-  const login = await request('/api/auth/login/password', { method: 'POST', headers: { origin: 'http://localhost' },
-    body: JSON.stringify({ username: 'admin', password: 'correct horse battery staple' }) });
-  const set = login.headers['set-cookie'] || login.headers['Set-Cookie'] || [];
-  cookie = set.map((c) => c.split(';')[0]).join('; ');
-  csrf = decodeURIComponent(set.map((c) => c.split(';')[0]).find((c) => c.startsWith('cowork_csrf=')).split('=').slice(1).join('='));
+  // Sign-in is the Rust front's (#1071): the account and its session are seeded directly.
+  ({ cookie, csrf } = require('../tests/server/seed-account.cjs').seedAccount(testDataDir, { username: 'admin', displayName: 'Admin', publicOrigin: 'http://localhost' }));
 });
 const mutation = () => ({ origin: 'http://localhost', cookie, 'content-type': 'application/json', 'x-csrf-token': csrf });
 const workspace = async () => JSON.parse((await request('/api/workspace', { headers: { cookie } })).text);

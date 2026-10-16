@@ -8,10 +8,15 @@
 // throwaway UI_DATA_DIR, mock inference and Diary servers on loopback, and net-guard.cjs, which
 // refuses every other outbound connection. The child gets a clean environment (PATH and the
 // variables below only), so no real key, token or data directory can leak into the run. It
-// drives the web client's paths (sign-up, sessions, projects, a streamed chat, a second account
+// drives the web client's paths Node still answers (projects, a streamed chat, a second account
 // for the tenant boundary, admin reads, probes of the rest), stops the server, then writes
 // <dir>/manifest.json (how to replay: the seed, which placeholders are inputs) and refuses to
 // finish if any synthetic secret value reached the corpus.
+//
+// Sign-in and the account are the Rust front's (sbstndalton/noevia#1071): Node no longer answers
+// setup, sign-in, invitations, recovery or the profile, so the two accounts and their sessions are
+// seeded in the throwaway data dir (tests/server/seed-account.cjs) once the server has migrated it.
+// Their exchanges stay in the noevia-rs corpus recorded at its contracts/http/core.ref.
 //
 // No model is loaded, no real Diary is called: the mocks answer every model and Diary request.
 // The chat prompt's date line states mocks.cjs CORPUS_NOW (NOEVIA_CONTRACT_FIXED_NOW), not today, so the
@@ -24,13 +29,10 @@ const { spawn } = require('node:child_process');
 
 const { MARKER } = require('../../server/contract-record.cjs');
 const { MODEL, SERVER, GUARD, startMocks, serverEnv } = require('./mocks.cjs');
-// Synthetic credentials for a throwaway data dir. The replayer is given this password through the
-// manifest; the recorder itself writes only placeholders.
-const ADMIN = { username: 'synthetic-admin', displayName: 'Synthetic Admin', password: 'contract-corpus-Synthetic-pw-1' };
-const MEMBER = { username: 'synthetic-member', displayName: 'Synthetic Member', password: 'contract-corpus-Synthetic-pw-2' };
-// The member's password after an account recovery (M3). Typed by the replayer as a generated value:
-// the recovered sign-in uses another spelling of the username, so no manifest input names it.
-const RECOVERED = 'contract-corpus-Synthetic-pw-3';
+const { seedAccount } = require('../../tests/server/seed-account.cjs');
+// Synthetic accounts for a throwaway data dir; the recorder writes their cookies as placeholders only.
+const ADMIN = { username: 'synthetic-admin', displayName: 'Synthetic Admin' };
+const MEMBER = { username: 'synthetic-member', displayName: 'Synthetic Member', role: 'member' };
 // A 1x1 PNG for the project image steps (M4). The recorder takes a value this random-looking for a
 // secret, so the manifest hands it to the replayer as an input like the passwords.
 const PNG = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFBQIAX8jx0gAAAABJRU5ErkJggg==';
@@ -76,18 +78,19 @@ async function waitReady(base, child) {
 }
 
 // GETs for client paths no scenario step reaches; {x} params are filled from the run. The Rust
-// front's permanent routes (sbstndalton/noevia#1071: usage, stats, sampling, routing mode and
-// default, ChatGPT status, storage metadata/list/read, export) are not Node's to record any more;
+// front's permanent routes (sbstndalton/noevia#1071: sign-in and the account, usage, stats,
+// sampling, routing mode and default, ChatGPT status, storage metadata/list/read, export) are not
+// Node's to record any more;
 // their exchanges stay in the noevia-rs corpus recorded at its contracts/http/core.ref.
 const PROBES = [
-  '/api/account/instructions', '/api/account/memory', '/api/account/preferences', '/api/account/retention',
+  '/api/account/retention',
   '/api/admin/decision-settings', '/api/admin/features', '/api/admin/mcp-directory', '/api/admin/offsite-backup', '/api/admin/web-address',
-  '/api/auth/devices', '/api/auto-roles', '/api/chat-framing/preferences', '/api/chat-vault-mirror/preferences', '/api/code/active',
+  '/api/auto-roles', '/api/chat-framing/preferences', '/api/chat-vault-mirror/preferences', '/api/code/active',
   '/api/connectors', '/api/connectors/gdrive/policy', '/api/connectors/nextcloud/policy', '/api/diary', '/api/diary-connector', '/api/diary/source', '/api/diary/storage-status',
   '/api/mcp-keys/servers', '/api/mcp-oauth/servers', '/api/model-manager',
   '/api/models/autotune', '/api/models/autotune/settings', '/api/models/autotune/untuned', '/api/models/calibration', '/api/models/capabilities', '/api/models/evidence',
   '/api/models/hardware', '/api/models/inference-budget', '/api/models/installed', '/api/plugins/directory',
-  '/api/profile/app-passwords', '/api/profile/appearance', '/api/profile/diary-connectors', '/api/profile/sharing',
+  '/api/profile/diary-connectors', '/api/profile/sharing',
   '/api/providers', '/api/providers/{providerId}/models', '/api/reasoning-settings',
   '/api/toolboxes', '/api/toolboxes/permitted',
   '/api/projects/{projectId}/browser', '/api/projects/{projectId}/code', '/api/projects/{projectId}/instruction-skills', '/api/projects/{projectId}/instruction-skills/manifests', '/api/projects/{projectId}/research',
@@ -99,16 +102,12 @@ const PROBES = [
 // uploads (multipart), which start flows a probe cannot finish.
 const WRITE_PROBES = [
   ['POST', '/api/admin/decision-settings/test', {}], ['POST', '/api/admin/mcp-directory/custom/preview', {}],
-  ['POST', '/api/admin/offsite-backup/verify', {}], ['POST', '/api/auth/device/lookup', { code: 'ABCD-EFGH' }],
-  ['POST', '/api/auth/login/passkey/options', { username: 'synthetic-admin' }], ['POST', '/api/auth/passkeys/register/options', {}],
-  ['POST', '/api/auth/recovery/complete', { token: 'not-a-recovery-token', password: 'x' }],
+  ['POST', '/api/admin/offsite-backup/verify', {}],
   ['POST', '/api/chat-framing/suggest', {}], ['POST', '/api/connectors/gdrive/disconnect', {}],
   ['POST', '/api/integrations/storage/test', { kind: 'local' }], ['POST', '/api/models/estimate', {}],
   ['POST', '/api/models/presets/reload', {}], ['POST', '/api/models/autotune/cancel', {}], ['POST', '/api/models/calibration/cancel', {}],
-  ['POST', '/api/providers/test', {}], ['PUT', '/api/profile/features', { diaryEnabled: false }],
+  ['POST', '/api/providers/test', {}],
   ['GET', '/api/diary/today'],
-  ['DELETE', '/api/auth/sessions/missing-session-id'], ['DELETE', '/api/auth/passkeys/missing-passkey-id'],
-  ['DELETE', '/api/auth/devices/missing-device-id'], ['DELETE', '/api/profile/app-passwords/missing-app-password'],
   ['DELETE', '/api/freechats/missing-free-chat'],
 ];
 
@@ -138,6 +137,8 @@ async function main() {
   child.stdout.on('data', (d) => log.push(String(d)));
   child.stderr.on('data', (d) => log.push(String(d)));
   const steps = [];
+  // The seeded sessions' raw values, which must never reach the corpus.
+  const secrets = [];
   try {
     await waitReady(base, child);
     const admin = new Client(base, base);
@@ -150,26 +151,22 @@ async function main() {
       if (expect && !expect.includes(r.status)) throw new Error(`${method} ${p}: expected ${expect.join('/')}, got ${r.status}: ${r.text.slice(0, 300)}`);
       return r;
     };
-    const setupCode = fs.readFileSync(path.join(dataDir, 'first-run-setup-code'), 'utf8').trim();
+    // The accounts and their sessions, as the Rust front writes them (#1071).
+    const seeded = { admin: seedAccount(dataDir, { ...ADMIN, publicOrigin: base }), member: seedAccount(dataDir, MEMBER) };
+    for (const [client, account] of [[admin, seeded.admin], [member, seeded.member]]) {
+      client.jar.set('cowork_session', account.session);
+      client.jar.set('cowork_csrf', account.csrf);
+    }
+    secrets.push(...Object.values(seeded).flatMap((a) => [a.session, a.csrf]));
 
-    // Signed out, before setup.
+    // Signed out, and signed in.
     await step(anon, 'GET', '/api/health');
-    await step(anon, 'GET', '/api/setup/status', undefined, [200]);
-    await step(anon, 'GET', '/api/auth/session', undefined, [401]);
     await step(anon, 'GET', '/api/workspace');
-    await step(anon, 'POST', '/api/setup/complete', { setupCode: 'wrong-code-synthetic', publicOrigin: base, ...ADMIN, diaryEnabled: false }, [401]);
-    // Setup signs the admin in.
-    await step(admin, 'POST', '/api/setup/complete', { setupCode, publicOrigin: base, ...ADMIN, diaryEnabled: false }, [201]);
-    await step(admin, 'GET', '/api/auth/session', undefined, [200]);
-    await step(anon, 'GET', '/api/setup/status', undefined, [200]);
-    await step(admin, 'GET', '/api/profile', undefined, [200]);
-    await step(admin, 'PATCH', '/api/profile', { displayName: 'Synthetic Admin Renamed' }, [200]);
-    await step(admin, 'POST', '/api/profile/onboarding', {}, [200]);
     await step(admin, 'GET', '/api/workspace', undefined, [200]);
     await step(admin, 'GET', '/api/features', undefined, [200]);
     // A write without the CSRF header is refused.
     const noCsrf = new Client(base, base); noCsrf.jar = new Map([...admin.jar].filter(([k]) => k !== 'cowork_csrf'));
-    await step(noCsrf, 'PATCH', '/api/profile', { displayName: 'no csrf' });
+    await step(noCsrf, 'POST', '/api/projects', { name: 'no csrf' });
 
     // Projects.
     const created = await step(admin, 'POST', '/api/projects', { name: 'Synthetic project', goal: 'Contract corpus', instructions: 'Answer briefly.', model: MODEL, files: [{ name: 'notes.md', content: '# Synthetic notes\n\nAlpha beta gamma.' }] }, [200, 201]);
@@ -208,85 +205,19 @@ async function main() {
     }
     await step(admin, 'GET', '/api/freechats');
 
-    // A second account: the tenant boundary is part of the contract.
-    const invite = await step(admin, 'POST', '/api/admin/invitations', { role: 'member' }, [201]);
-    await step(member, 'POST', '/api/auth/invitations/accept', { token: invite.json.token, ...MEMBER, diaryEnabled: false });
+    // A second account (seeded above): the tenant boundary is part of the contract.
     await step(member, 'GET', '/api/workspace');
     await step(member, 'GET', `/api/projects/${encodeURIComponent(projectId)}/chats`);
     // Another account's project image is not this account's (M4).
     await step(member, 'GET', `/api/projects/${encodeURIComponent(projectId)}/assets/${encodeURIComponent(assetId)}`, undefined, [404]);
     await step(member, 'DELETE', `/api/projects/${encodeURIComponent(projectId)}/assets/${encodeURIComponent(assetId)}`, undefined, [404]);
     if (chatId) await step(member, 'GET', `/api/chats/${encodeURIComponent(chatId)}/history`);
-    await step(member, 'GET', '/api/admin/users');
-    const users = await step(admin, 'GET', '/api/admin/users', undefined, [200]);
-    const memberId = (users.json?.users || users.json || []).find?.((u) => u.username === MEMBER.username)?.id;
+    await step(member, 'GET', '/api/admin/web-address', undefined, [403]);
+    const memberId = seeded.member.id;
 
     // The reasoning default's PUT and the routing configuration are the Rust front's since #1071
     // (their exchanges stay in the noevia-rs corpus recorded at its core.ref); the GET is Node's.
     await step(admin, 'GET', '/api/reasoning-settings', undefined, [200]);
-
-    // M3: the account routes the Rust front can take over (NOEVIA_RUST_AUTH), end to end.
-    const evil = new Client(base, 'https://evil.example.test');
-    await step(evil, 'POST', '/api/auth/login/password', { username: ADMIN.username, password: 'not-the-password-synthetic' }, [403]);
-    await step(new Client(base, base), 'POST', '/api/auth/invitations/accept', { token: invite.json.token, ...MEMBER, username: 'synthetic-late' }, [400]);
-    await step(admin, 'PUT', '/api/profile/appearance', { theme: 'dark', light: 'warm', dark: 'iris' }, [200]);
-    await step(admin, 'GET', '/api/profile/appearance', undefined, [200]);
-    await step(admin, 'PUT', '/api/profile/appearance', { theme: 'neon' }, [400]);
-    await step(admin, 'PUT', '/api/account/instructions', { text: ' Answer briefly. ', style: 'concise', language: 'Norwegian', advanced: { tone: 'formal' } }, [200]);
-    await step(admin, 'GET', '/api/account/instructions', undefined, [200]);
-    await step(admin, 'PUT', '/api/account/instructions', { text: 'x', style: 'loud' }, [400]);
-    await step(admin, 'PUT', '/api/account/memory', { memories: ['Likes tea', ' Likes   tea ', 'Works nights'], useProjectMemories: false }, [200]);
-    await step(admin, 'GET', '/api/account/memory', undefined, [200]);
-    await step(admin, 'PUT', '/api/account/memory', { memories: 'not a list' }, [400]);
-    // Not sendKey: the recorder treats a `*Key` field as a secret, so a replay would type a stand-in.
-    await step(admin, 'PUT', '/api/account/preferences', { locale: 'nb-NO', notifications: { replyFinished: false } }, [200]);
-    await step(admin, 'PUT', '/api/account/preferences', { locale: 'xx-XX' }, [400]);
-    await step(admin, 'GET', '/api/account/preferences', undefined, [200]);
-    await step(admin, 'PUT', '/api/profile/features', { diaryEnabled: true }, [200]);
-    await step(admin, 'PUT', '/api/profile/features', { diaryEnabled: false }, [200]);
-    const app = await step(admin, 'POST', '/api/profile/app-passwords', { name: ' Synthetic phone ', scope: 'lan' }, [201]);
-    await step(admin, 'POST', '/api/profile/app-passwords', { name: '', scope: 'lan' }, [400]);
-    await step(admin, 'POST', '/api/profile/app-passwords', { name: 'Synthetic tablet', scope: 'everywhere' }, [400]);
-    await step(admin, 'GET', '/api/profile/app-passwords', undefined, [200]);
-    if (app.json?.id) await step(admin, 'DELETE', `/api/profile/app-passwords/${app.json.id}`, undefined, [200]);
-    await step(anon, 'POST', '/api/auth/login/passkey/options', { username: 'nobody-synthetic' }, [200]);
-    await step(anon, 'POST', '/api/auth/login/passkey/verify', { challengeToken: 'not-a-challenge', response: { id: 'not-a-passkey' } }, [401]);
-    await step(admin, 'POST', '/api/auth/passkeys/register/verify', { challengeToken: 'not-a-challenge', response: {} }, [400]);
-    await step(admin, 'PATCH', '/api/auth/passkeys/missing-passkey-id', { name: 'Renamed' }, [404]);
-    // A recovery link replaces the member's password and revokes the member's session.
-    if (memberId) {
-      const rec = await step(admin, 'POST', `/api/admin/users/${encodeURIComponent(memberId)}/recovery`, undefined, [201]);
-      // Empty, so it stays literal: a non-empty password is a secret the replay types a long stand-in for.
-      await step(anon, 'POST', '/api/auth/recovery/complete', { token: rec.json.token, password: '' }, [400]);
-      await step(anon, 'POST', '/api/auth/recovery/complete', { token: rec.json.token, password: RECOVERED }, [200]);
-      await step(anon, 'POST', '/api/auth/recovery/complete', { token: rec.json.token, password: RECOVERED }, [400]);
-      await step(member, 'GET', '/api/auth/session', undefined, [401]);
-      await step(member, 'POST', '/api/auth/login/password', { username: 'Synthetic-Member', password: RECOVERED }, [200]);
-      await step(member, 'GET', '/api/auth/session', undefined, [200]);
-    }
-    await step(admin, 'POST', '/api/admin/users/00000000-0000-4000-8000-000000000000/recovery', undefined, [404]);
-    // A second admin session, revoked from the first.
-    const second = new Client(base, base);
-    await step(second, 'POST', '/api/auth/login/password', { username: ADMIN.username, password: ADMIN.password }, [200]);
-    const prof = await step(admin, 'GET', '/api/profile', undefined, [200]);
-    const other = (prof.json?.sessions || []).find((x) => !x.current);
-    if (other) await step(admin, 'DELETE', `/api/auth/sessions/${encodeURIComponent(other.id)}`, undefined, [200]);
-    await step(second, 'GET', '/api/auth/session', undefined, [401]);
-    // Too many failed sign-ins for one username from one address.
-    const prober = new Client(base, base);
-    for (let i = 0; i < 6; i += 1) await step(prober, 'POST', '/api/auth/login/password', { username: 'nobody-synthetic', password: 'not-the-password-synthetic' });
-
-    if (memberId) await step(admin, 'PUT', `/api/admin/users/${encodeURIComponent(memberId)}/disabled`, { disabled: true });
-    await step(member, 'GET', '/api/profile');
-    if (memberId) await step(admin, 'PUT', `/api/admin/users/${encodeURIComponent(memberId)}/disabled`, { disabled: false }, [200]);
-
-    // Sign-in, wrong password, sign-out.
-    const relog = new Client(base, base);
-    await step(relog, 'POST', '/api/auth/login/password', { username: ADMIN.username, password: 'not-the-password-synthetic' });
-    await step(relog, 'POST', '/api/auth/login/password', { username: ADMIN.username, password: ADMIN.password }, [200]);
-    await step(relog, 'GET', '/api/auth/session', undefined, [200]);
-    await step(relog, 'POST', '/api/auth/logout', {}, [200]);
-    await step(relog, 'GET', '/api/auth/session', undefined, [401]);
 
     // Read probes for the rest of the client's paths.
     const fill = { projectId, providerId: 'default', chatId: chatId || 'missing-chat' };
@@ -399,18 +330,13 @@ async function main() {
     const ex = JSON.parse(fs.readFileSync(path.join(exchanges, f), 'utf8'));
     const b = ex.request.body?.json;
     if (!b) continue;
-    if (ex.request.path === '/api/setup/complete' && ex.response.status === 201) inputs[b.setupCode] = { file: 'first-run-setup-code' };
     if (typeof b.dataBase64 === 'string' && b.dataBase64.startsWith('<secret:')) inputs[b.dataBase64] = { value: PNG };
-    if (typeof b.password === 'string' && b.password.startsWith('<secret:')) {
-      const known = [ADMIN, MEMBER].find((u) => u.username === b.username);
-      if (known && ex.response.status < 300) inputs[b.password] = { value: known.password };
-    }
   }
   const manifest = {
     v: 1,
     generator: 'noevia-core tools/contract-corpus/generate.cjs',
-    seed: 'empty',
-    note: 'Replay against a server started on an empty UI_DATA_DIR; the setup code is read from that dir once the server has written it. Passwords and the image data are synthetic.',
+    seed: 'synthetic-accounts',
+    note: 'Recorded with two synthetic accounts and their sessions seeded straight into UI_DATA_DIR/cowork.db (tests/server/seed-account.cjs): sign-in is the Rust front\'s (sbstndalton/noevia#1071), so a replay needs the same seeding and binds the session cookies itself. The image data is synthetic.',
     inputs,
     exchanges: files.length,
     dropped: dropped.length,
@@ -421,7 +347,7 @@ async function main() {
 
   // Belt and braces over the recorder's own check: the run's real secret values must not appear.
   const setupCode = log.join('').match(/FIRST-RUN SETUP CODE: (\S+)/)?.[1];
-  const raw = [ADMIN.password, MEMBER.password, RECOVERED, setupCode].filter(Boolean);
+  const raw = [...secrets, setupCode].filter(Boolean);
   for (const f of fs.readdirSync(exchanges)) {
     const text = fs.readFileSync(path.join(exchanges, f), 'utf8');
     for (const v of raw) if (text.includes(v)) throw new Error(`${f} holds a raw secret`);

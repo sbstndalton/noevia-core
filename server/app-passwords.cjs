@@ -2,10 +2,11 @@
 const crypto = require('node:crypto');
 const { hash, verify, Algorithm } = require('@node-rs/argon2');
 
-// DAV credentials have no connection to session issuance or account passwords.
-// `hashPassword` is injectable for tests that need to hold the hashing step open.
+// DAV credentials have no connection to session issuance or account passwords. Creating, listing
+// and revoking them in Settings is the Rust front's (sbstndalton/noevia#1071); this module keeps
+// the DAV listener's read of them (list, verifyDav) and its last_used_at write.
 const ARGON2_OPTIONS = { algorithm: Algorithm.Argon2id, memoryCost: 19456, timeCost: 2, parallelism: 1 };
-function createAppPasswords({ db, audit, rateLimited, guard = null, hashPassword = (password) => hash(password, ARGON2_OPTIONS), verifyHash = (stored, password) => verify(stored, password), makeDecoy = () => hash(crypto.randomBytes(32).toString('base64url'), ARGON2_OPTIONS) }) {
+function createAppPasswords({ db, guard, verifyHash = (stored, password) => verify(stored, password), makeDecoy = () => hash(crypto.randomBytes(32).toString('base64url'), ARGON2_OPTIONS) }) {
   // #1253: a DAV login that names no usable credential still runs one Argon2 verify (against a decoy
   // hash with the same parameters), so the response time does not say whether the username exists,
   // is disabled, or has that credential. Built at start-up (so the first miss is not the slow one) and
@@ -20,46 +21,16 @@ function createAppPasswords({ db, audit, rateLimited, guard = null, hashPassword
   decoy().catch(() => {});
   // The DAV listener stays Node's while the Rust front owns app passwords (rust-auth.cjs): its
   // last_used_at write is the one exemption here.
-  const exempt = guard ? guard.exempt : (fn) => fn();
+  const { exempt } = guard;
   db.exec(`CREATE TABLE IF NOT EXISTS app_passwords(
     id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     name TEXT NOT NULL, scope TEXT NOT NULL CHECK(scope IN ('lan','public')),
     password_hash TEXT NOT NULL, created_at INTEGER NOT NULL, last_used_at INTEGER
   ); CREATE INDEX IF NOT EXISTS app_passwords_user ON app_passwords(user_id);`);
-  const active = id => !!db.prepare('SELECT id FROM users WHERE id=? AND disabled_at IS NULL').get(id);
   const list = userId => db.prepare(`SELECT id,name,scope,created_at AS createdAt,last_used_at AS lastUsedAt
     FROM app_passwords WHERE user_id=? ORDER BY created_at,id`).all(userId);
   return {
     list,
-    async create(userId, { name, scope } = {}) {
-      if (typeof name !== 'string' || !name.trim() || name.trim().length > 80 || /[\x00-\x1f\x7f]/.test(name)) throw Error('Use a device name of 1–80 characters.');
-      if (!['lan', 'public'].includes(scope)) throw Error('Choose a LAN or public credential scope.');
-      if (!active(userId)) throw Error('Account unavailable.');
-      if (rateLimited(`app-password:create:${userId}`, 5, 60000)) throw Error('Wait a minute before generating another app password.');
-      if (list(userId).length >= 20) throw Error('Revoke an app password before creating another (limit 20).');
-      // #928: an account recovery while the password is hashed revokes this request too.
-      const epoch = db.prepare('SELECT credential_epoch FROM users WHERE id=?').get(userId)?.credential_epoch;
-      const id = crypto.randomBytes(16).toString('hex');
-      const password = `nv_dav_${id}.${crypto.randomBytes(32).toString('base64url')}`;
-      const passwordHash = await hashPassword(password);
-      const createdAt = Date.now();
-      db.transaction(() => {
-        // Recheck after asynchronous hashing: disable/delete and concurrent minting win.
-        if (!active(userId) || db.prepare('SELECT credential_epoch FROM users WHERE id=?').get(userId)?.credential_epoch !== epoch) throw Error('Account unavailable.');
-        if (list(userId).length >= 20) throw Error('Revoke an app password before creating another (limit 20).');
-        db.prepare('INSERT INTO app_passwords(id,user_id,name,scope,password_hash,created_at) VALUES(?,?,?,?,?,?)')
-          .run(id, userId, name.trim(), scope, passwordHash, createdAt);
-        audit('app-password.create', userId, userId, { id, scope });
-      })();
-      return { id, name: name.trim(), scope, createdAt, lastUsedAt: null, password };
-    },
-    revoke(userId, id) {
-      return db.transaction(() => {
-        const removed = db.prepare('DELETE FROM app_passwords WHERE id=? AND user_id=?').run(id, userId).changes > 0;
-        if (removed) audit('app-password.revoke', userId, userId, { id });
-        return removed;
-      })();
-    },
     // Only a future dedicated DAV listener may call this after transport/scope
     // validation and request rate limiting. Never use as app authentication.
     async verifyDav(username, password, scope) {
