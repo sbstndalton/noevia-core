@@ -433,7 +433,9 @@ function createProjectsFile(file, { atomicJson, warn = console.warn, lock = with
       apply(localArray, result, adopt);
       rebase(writtenCopy);
       state.stamp = stampIfStill(file, text);
-      if (afterWrite) afterWrite(Array.from(new Set([...writtenCopy, ...localArray])));
+      // The source-text collection keeps what either list points at: this view now, and anything
+      // written that it no longer holds (each project once).
+      if (afterWrite) { const here = new Set(localArray.map(idOf)); afterWrite([...localArray, ...writtenCopy.filter((p) => !here.has(idOf(p)))]); }
       return;
     }
     throw busy();
