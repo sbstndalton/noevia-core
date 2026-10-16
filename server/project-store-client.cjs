@@ -16,6 +16,7 @@
 
 const MAX_ATTEMPTS = 8;
 const TIMEOUT_MS = 10000;
+const REPLY_CAP = 2 * 32 * 1024 * 1024 + 64 * 1024;
 const FILES = new Set(['projects.json', 'free-chats.json']);
 
 /** Whether Node saves through the Rust store (see the header). */
@@ -64,7 +65,8 @@ function createClient({ port, token, fetchImpl = globalThis.fetch, timeoutMs = T
       throw Object.assign(busy(), { cause: err });
     }
     let body = null;
-    try { body = await res.json(); } catch { /* an empty or non-JSON answer */ }
+    // #920: bounded, like every reply read: the store's text limit (32 MiB), JSON-escaped, plus the envelope.
+    try { body = await require('./http.cjs').readCappedJson(res, REPLY_CAP); } catch { /* empty, non-JSON or over the cap */ }
     return { status: res.status, body };
   }
   return {
