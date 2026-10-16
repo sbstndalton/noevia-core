@@ -67,11 +67,12 @@ const PASS = Symbol('unhandled');
  * @param {() => void} [deps.onToolboxesChange]  called after a project's toolbox selection changes (clears the permitted-tools cache)
  * @param {boolean} [deps.rustProjects]  M4 (rust-projects.cjs): the Rust front owns the image writes; this copy refuses them
  * @param {boolean} [deps.rustProjectChats]  M4 (rust-projects.cjs chatsEnabledFrom): the front owns the chat-list save too; this copy refuses it
+ * @param {boolean} [deps.rustProjectWrites]  #1264 (rust-projects.cjs projectWritesEnabledFrom): the front owns PROJECT_WRITE_ROUTES; this copy refuses them
  */
 function createProjectRoutes({
   json, readBody, readJson, requestScope, dispatch, currentWorkspace, authService, storageClient, documents, documentSources, rag, fs, path,
   reasoningEffort, projectAppearance, diaryExtras, PROJECTS, DEFAULT_TOOLBOXES, sanitizeToolboxes, allToolboxes = () => [{ id: 'core' }], getProvider, ensureRolesLoaded, servedCatalogue, DEFAULT_PROVIDER_ID, store,
-  onToolboxesChange = () => {}, rustProjects = false, rustProjectChats = false,
+  onToolboxesChange = () => {}, rustProjects = false, rustProjectChats = false, rustProjectWrites = false,
   storageLatch = require('../storage-latch.cjs').createStorageLatch(),
 }) {
   const { refuseOwned } = require('../rust-projects.cjs');
@@ -170,6 +171,9 @@ function createProjectRoutes({
 
     const freeContext = /^\/api\/chats\/([^/]+)\/context$/.exec(p);
     if (freeContext && ['GET', 'POST'].includes(req.method)) {
+      // #1264: the front answers both (a GET writes too: getProject's self-heal) while its
+      // project-writes slice is confirmed; this copy must not write behind its back.
+      if (refuseOwned(rustProjectWrites, json, res)) return true;
       const id = diaryExtras.chatProjectId(decodeURIComponent(freeContext[1]));
       if (!id) return json(res, 400, { error: 'Invalid chat identifier' });
       let project = getProject(id);

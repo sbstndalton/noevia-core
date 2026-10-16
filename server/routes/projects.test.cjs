@@ -12,7 +12,7 @@ const { AsyncLocalStorage } = require('node:async_hooks');
 const { createProjectRoutes, DOCUMENT_UPLOAD_CAP } = require('./projects.cjs');
 const { createProviderRegistry } = require('../providers.cjs');
 
-function fixture({ projects = [], diary = true, catalogue = null, onToolboxesChange, rustProjects = false, rustProjectChats = false } = {}) {
+function fixture({ projects = [], diary = true, catalogue = null, onToolboxesChange, rustProjects = false, rustProjectChats = false, rustProjectWrites = false } = {}) {
   const sent = [];
   const dispatched = [];
   const requestScope = new AsyncLocalStorage();
@@ -49,7 +49,7 @@ function fixture({ projects = [], diary = true, catalogue = null, onToolboxesCha
     PROJECTS: projects, DEFAULT_TOOLBOXES: ['core'], sanitizeToolboxes: (b) => (Array.isArray(b) ? b : null),
     getProvider, ensureRolesLoaded() {},
     servedCatalogue: async () => catalogue, DEFAULT_PROVIDER_ID: 'default',
-    store, onToolboxesChange, rustProjects, rustProjectChats,
+    store, onToolboxesChange, rustProjects, rustProjectChats, rustProjectWrites,
   });
   const call = (method, path, body, search = '', role = 'member') => {
     const req = Readable.from(body === undefined ? [] : [Buffer.from(typeof body === 'string' ? body : JSON.stringify(body))]);
@@ -529,6 +529,29 @@ test('M4: while the Rust front owns it, the chat-list save is refused here befor
   const k = fixture({ projects: [{ id: 'p1', chats: [] }], rustProjectChats: true });
   assert.equal(await k.call('POST', '/api/projects/p1/chats', { chats: [{ id: 'c2' }] }), true);
   assert.equal(k.sent.at(-1).status, 200);
+});
+
+test('#1264: off, the chat attachments routes are answered here; with the project-writes slice confirmed, both are refused before anything is read or written', async () => {
+  // Off (NOEVIA_RUST_PROJECTS alone, as live today): Node answers and creates.
+  const off = fixture({ projects: [], rustProjects: true, rustProjectChats: true });
+  assert.equal(await off.call('GET', '/api/chats/c1/context'), true);
+  assert.deepEqual(off.sent.at(-1), { status: 200, body: { project: null } });
+  assert.equal(await off.call('POST', '/api/chats/c1/context'), true);
+  assert.equal(off.sent.at(-1).status, 200);
+  assert.equal(off.sent.at(-1).body.project.id, 'chat-c1');
+  assert.equal(off.store.saves, 1);
+  // On: the front owns them; GET too, since getProject's self-heal writes.
+  const on = fixture({ projects: [{ id: 'chat-c2', routing: 'manual' }], rustProjects: true, rustProjectWrites: true });
+  for (const [m, p] of [['GET', '/api/chats/c2/context'], ['POST', '/api/chats/c1/context'], ['POST', '/api/chats/bad%E0%A4%A/context']]) {
+    assert.equal(await on.call(m, p), true, `${m} ${p}`);
+    assert.equal(on.sent.at(-1).status, 503, `${m} ${p}`);
+    assert.equal(on.sent.at(-1).body.code, 'RUST_PROJECTS_OWNED', `${m} ${p}`);
+  }
+  assert.equal(on.store.saves, 0, 'nothing saved');
+  assert.deepEqual(on.projects.map((p) => p.id), ['chat-c2'], 'nothing created');
+  // The other project routes are not this slice's.
+  assert.equal(await on.call('POST', '/api/projects/p1/chats', { chats: [] }), true);
+  assert.notEqual(on.sent.at(-1).body?.code, 'RUST_PROJECTS_OWNED');
 });
 
 test('#1458: renaming a project moves nothing: its storage folder and every source path stay as they are', async () => {
