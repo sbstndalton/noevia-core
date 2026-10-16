@@ -12,6 +12,10 @@
 //                                        { action: 'assign', service, machine, port?, protocol?, model? }
 //                                        a chat role (chatFast, chatSmart, chatCode, chatCreative, vision) on a machine
 //                                        names the model; it must be one the machine lists (#1840)
+//                                        { action: 'tune', service, confirm: true }   #1880: measure that chat role's model on its
+//                                        machine (machine-tune.cjs); 202 { tune }. 409 tuneRunning / machineBusy (a chat turn there)
+//                                        { action: 'tuneAbort' }   stop the measurement in progress; 200 { tune }
+//   GET  /api/models/machines?tune=1     { tune }: the measurement in progress or the last one (null: none since start)
 // An embeddings move answers 409 { code: 'reindexRequired', target } and changes nothing: the client
 // then runs the #1636 re-index (POST /api/embedding set-next → switch → finish) to that target.
 //
@@ -24,6 +28,7 @@ const { SERVICES } = require('../inference-machines.cjs');
 const PASS = Symbol('unhandled');
 const PATH = '/api/models/machines';
 const ACTIONS = new Set(['add', 'update', 'remove', 'assign']);
+const TUNE_ACTIONS = new Set(['tune', 'tuneAbort']);
 
 /**
  * @param {object} deps
@@ -35,7 +40,7 @@ const ACTIONS = new Set(['add', 'update', 'remove', 'assign']);
  * @param {Record<string, (url:string) => (object|null)>} [deps.authHeaders]  #1856: the headers the real client sends to that same address (decision, sensitivity); null/{} when none
  * @param {() => ({url:string, path:string, headers?:object}|null)} [deps.engine]  #1856: what to ask of this machine's own inference engine / model loader
  */
-function createInferenceMachineRoutes({ json, readJson, machines, health, effective = {}, chatMachines = null, authHeaders = {}, engine = null }) {
+function createInferenceMachineRoutes({ json, readJson, machines, health, effective = {}, chatMachines = null, authHeaders = {}, engine = null, machineTune = null }) {
   // #1840: a chat role on a machine reaches that machine's server; on this machine it has no address of its own here.
   const chatUrl = (service) => { const role = SERVICES[service]?.mode === 'chat' ? SERVICES[service].role : null; const t = role && machines.chatTarget ? machines.chatTarget(role) : null; return t ? t.baseUrl : null; };
   const effectiveUrl = (service) => { if (SERVICES[service]?.mode === 'chat') return chatUrl(service); try { return effective[service] ? effective[service]() || null : null; } catch { return null; } };
@@ -72,7 +77,12 @@ function createInferenceMachineRoutes({ json, readJson, machines, health, effect
       await Promise.all(chat.filter((id) => services[id]?.state === 'up').map(async (id) => {
         const t = machines.chatTarget(SERVICES[id].role);
         if (!t) return;
-        try { measured[id] = await chatMachines.measurements(t); } catch { /* not shown */ }
+        try {
+          measured[id] = await chatMachines.measurements(t);
+          // #1880: the last administrator-started measurement of this model on this machine, when there is one.
+          const tuned = machineTune ? machineTune.resultFor(t.machine.id, t.model) : null;
+          if (tuned) measured[id] = { ...measured[id], tune: tuned, notMeasured: (measured[id].notMeasured || []).filter((k) => k !== 'autotune' && !(k === 'speculativeDecoding' && tuned.speculative?.measured)) };
+        } catch { /* not shown */ }
       }));
     }
     return { services, machines: out, reasons, failing, ...(Object.keys(measured).length ? { measured } : {}) };
@@ -106,6 +116,10 @@ function createInferenceMachineRoutes({ json, readJson, machines, health, effect
         try { return json(res, 200, { models: await chatMachines.listModels(modelsOf, url.searchParams.get('port')) }); }
         catch (err) { return json(res, err?.status || 502, { error: err?.status ? err.message : 'The machine could not be asked for its models.', code: err?.code }); }
       }
+      if (url?.searchParams?.get?.('tune') === '1') {
+        if (!machineTune) return json(res, 404, { error: 'Not available' });
+        return json(res, 200, { tune: machineTune.status() });
+      }
       const view = machines.view();
       const wantHealth = url?.searchParams?.get?.('health') === '1';
       return json(res, 200, { ...withUrls(view), ...(wantHealth ? { health: await healthOf(view) } : {}) });
@@ -115,7 +129,16 @@ function createInferenceMachineRoutes({ json, readJson, machines, health, effect
     try { body = await readJson(req); } catch { return json(res, 400, { error: 'invalid JSON' }); }
     if (!body || typeof body !== 'object' || Array.isArray(body)) return json(res, 400, { error: 'A JSON object is required' });
     const action = String(body.action || '');
-    if (!ACTIONS.has(action)) return json(res, 400, { error: `action must be one of ${[...ACTIONS].join(', ')}`, code: 'invalidAction' });
+    if (TUNE_ACTIONS.has(action)) {
+      if (!machineTune) return json(res, 404, { error: 'Not available' });
+      if (action === 'tuneAbort') return json(res, 200, { tune: machineTune.abort(authn.user.id) });
+      try { return json(res, 202, { tune: await machineTune.start({ service: body.service, confirm: body.confirm, actor: authn.user.id }) }); }
+      catch (err) {
+        if (!err?.status) { console.error('[machines] tune', String(err?.message || err).slice(0, 200)); return json(res, 500, { error: 'The measurement could not be started.' }); }
+        return json(res, err.status, { error: err.message, code: err.code });
+      }
+    }
+    if (!ACTIONS.has(action)) return json(res, 400, { error: `action must be one of ${[...ACTIONS, ...(machineTune ? TUNE_ACTIONS : [])].join(', ')}`, code: 'invalidAction' });
     try {
       const actor = authn.user.id;
       const out = action === 'add' ? await machines.add(body, actor)

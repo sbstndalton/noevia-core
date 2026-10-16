@@ -141,6 +141,7 @@ function createEngineRelay({ chatMachines, target, url = null, log = () => {}, b
     controller.signal.addEventListener('abort', () => { if (!res.writableEnded) { try { res.destroy(); } catch { /* gone */ } } }, { once: true });
     const onClose = () => { if (!res.writableEnded) controller.abort(); };
     res.on('close', onClose);
+    let releaseTurn = () => {};
     try {
       let payload;
       try { payload = JSON.parse(await readBody(req)); }
@@ -153,6 +154,8 @@ function createEngineRelay({ chatMachines, target, url = null, log = () => {}, b
       }
       const ready = await chatMachines.ready(t);
       if (!ready.ok) { record({ event: 'relay.refused', taskId: lease.taskId, code: ready.code }); return jsonError(res, 502, ready.error, ready.code); }
+      // #1880: each forwarded request counts as a turn on the machine until its answer has been relayed.
+      if (typeof chatMachines.beginTurn === 'function') releaseTurn = chatMachines.beginTurn(t.machine.id);
       // One task, one model: whatever the harness asked for, the machine's model is what is sent.
       const body = JSON.stringify({ ...payload, model: t.model });
       let upstream;
@@ -181,6 +184,7 @@ function createEngineRelay({ chatMachines, target, url = null, log = () => {}, b
       res.end();
       return undefined;
     } finally {
+      releaseTurn();
       lease.active -= 1;
       lease.controllers.delete(controller);
       res.off('close', onClose);

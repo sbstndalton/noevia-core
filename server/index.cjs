@@ -130,6 +130,9 @@ const inferenceMachines = require('./inference-machines.cjs').createInferenceMac
 const machineHealth = require('./machine-health.cjs').createMachineHealth();
 // #1840: chat roles (Fast, Smart, Code, Creative) and Vision on an Inference machine (chat-machines.cjs).
 const chatMachines = require('./chat-machines.cjs').createChatMachines({ machines: inferenceMachines, health: machineHealth });
+// #1880: an administrator-started measurement of a chat role's model on its machine (nothing on this machine changes).
+const machineTune = require('./machine-tune.cjs').createMachineTune({ machines: inferenceMachines, chatMachines, store: require('./features.cjs').settingsStore(authService.db),
+  audit: (action,actor,detail)=>authService.audit(action,actor,actor,detail) });
 const decisionSettings = require('./decision-settings.cjs').createDecisionSettings({ store: require('./features.cjs').settingsStore(authService.db), audit: (action,actor,detail)=>authService.audit(action,actor,actor,detail), machineUrl: () => inferenceMachines.urlFor('decision'), sensitivityMachineUrl: () => inferenceMachines.urlFor('sensitivity') });
 // #1841: OCR and Docling read their address from the same registry (document-workers.cjs), the environment being the fallback.
 require('./document-workers.cjs').useMachines((kind) => inferenceMachines.urlFor(kind));
@@ -1114,7 +1117,7 @@ const embeddingRoutes = require('./routes/embedding.cjs').createEmbeddingRoutes(
   service: embeddingService, resolveFile: (model) => require('./embedding-service.cjs').resolveModelFile({ env: process.env, fetchJson, model }) });
 // Settings → Inference machines (routes/inference-machines.cjs, #1638), administrators only.
 const inferenceMachineRoutes = require('./routes/inference-machines.cjs').createInferenceMachineRoutes({ json, readJson, machines: inferenceMachines,
-  health: machineHealth, chatMachines,
+  health: machineHealth, chatMachines, machineTune,
   // #1856: the same key the decision client sends, to its own host only (backend().baseUrl must be the probed origin).
   authHeaders: {
     decision: (url) => { const b = decisionSettings.backend(); return b?.baseUrl && new URL(b.baseUrl).origin === new URL(url).origin ? b.healthHeaders : null; },
