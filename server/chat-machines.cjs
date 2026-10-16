@@ -33,6 +33,9 @@
 // modalities.vision, else the image probe through the machine fetch) and the prefill rate (chat.cjs scopes it).
 // Auto-tune, presets, the #1079 long-context profiles and speculative-decoding evidence are this machine's engine's;
 // they are not measured on machines (measurements() says so, and the Settings page shows it).
+// #1880: an administrator may start a bounded measurement of a role's machine (machine-tune.cjs); it never runs while
+// that machine serves a chat turn: beginTurn() counts the turns (and router classifications) on each machine, busy()
+// reads the count, and onTurn() tells a running measurement to stop the moment a turn starts there.
 //
 // With nothing assigned, target() is null for every role and the chat handler does exactly what it did before.
 
@@ -103,6 +106,32 @@ function modelIds(body) {
  */
 function createChatMachines({ machines, health = null, fetchImpl = defaultServiceFetch, createVisionProbe = null } = {}) {
   const machineFetch = (input, init = {}) => fetchImpl(input, { ...init, redirect: 'error' });
+
+  // #1880: chat turns in flight per machine id, and who wants to know when one starts.
+  const turns = new Map();
+  const turnListeners = new Set();
+  /** A turn (or classification) starts on `machineId`: counted until the returned release is called (idempotent). */
+  function beginTurn(machineId) {
+    const id = String(machineId || '');
+    turns.set(id, (turns.get(id) || 0) + 1);
+    for (const fn of [...turnListeners]) { try { fn(id); } catch { /* a listener never fails a turn */ } }
+    let done = false;
+    return () => {
+      if (done) return;
+      done = true;
+      const n = (turns.get(id) || 1) - 1;
+      if (n > 0) turns.set(id, n); else turns.delete(id);
+    };
+  }
+  /** #1880: count `t`'s machine as busy while `fn` runs (a role on this machine: just runs it). */
+  async function during(t, fn) {
+    const release = t?.machine?.id ? beginTurn(t.machine.id) : () => {};
+    try { return await fn(); } finally { release(); }
+  }
+  /** Whether `machineId` serves a chat turn now. */
+  const busy = (machineId) => (turns.get(String(machineId || '')) || 0) > 0;
+  /** Called with the machine id whenever a turn starts there; returns the unsubscribe. */
+  function onTurn(fn) { turnListeners.add(fn); return () => turnListeners.delete(fn); }
 
   /** The role's machine, or null when it runs here. Never throws. */
   function target(role) {
@@ -304,6 +333,14 @@ function createChatMachines({ machines, health = null, fetchImpl = defaultServic
 
   /** #1849: a small JSON request to a machine (the router classifier): { ok, status, body } like http.cjs fetchJson. */
   async function fetchJson(url, init = {}, timeoutMs = 15000) {
+    // #1880: a classification on a machine counts as a turn there while it runs.
+    let host = null;
+    try { host = new URL(String(url)).origin; } catch { host = null; }
+    const on = host ? CHAT_ROLES.map((role) => target(role)).find((t) => t && new URL(t.baseUrl).origin === host) : null;
+    const release = on ? beginTurn(on.machine.id) : () => {};
+    try { return await fetchJsonInner(url, init, timeoutMs); } finally { release(); }
+  }
+  async function fetchJsonInner(url, init, timeoutMs) {
     const r = await machineFetch(url, { ...init, signal: init.signal ? AbortSignal.any([init.signal, AbortSignal.timeout(timeoutMs)]) : AbortSignal.timeout(timeoutMs) });
     let text;
     try { text = await readCapped(r, MODELS_BODY_CAP); } catch { return { ok: false, status: r.status, error: 'response too large' }; }
@@ -335,7 +372,7 @@ function createChatMachines({ machines, health = null, fetchImpl = defaultServic
     return visionProbe(`${t.baseUrl}/v1`, headers, t.model);
   }
 
-  return { target, remoteRoles, effectiveRoles, localRoles, ready, provider, measuredProvider, measurements, visionFor, contextTokens, connectError, listModels, modelsAt, visionProbe, manualTarget, machineModels, propsSource, fetchJson, fetch: machineFetch, label: (role) => ROLE_LABEL[role] || role };
+  return { target, remoteRoles, effectiveRoles, localRoles, ready, provider, measuredProvider, measurements, visionFor, contextTokens, connectError, listModels, modelsAt, visionProbe, manualTarget, machineModels, propsSource, fetchJson, fetch: machineFetch, beginTurn, busy, onTurn, during, label: (role) => ROLE_LABEL[role] || role };
 }
 
 module.exports = { createChatMachines, modelIds, propsFactsOf, NOT_MEASURED_ON_MACHINES, ROLE_LABEL, CHAT_ROLES };

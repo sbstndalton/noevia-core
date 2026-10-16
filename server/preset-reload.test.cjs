@@ -219,3 +219,15 @@ test('#1012 dav-parse.wasm preset_reload: the real Rust check', { skip: skipWasm
   assert.equal(g.verdict(BASE + '[new]\nmodel = /models/n.gguf\n', rows(['loaded-model']), ['loaded-model']).safe, true);
   assert.equal(g.verdict(BASE.replace('8192', '1'), rows(['loaded-model']), ['loaded-model']).safe, false);
 });
+
+// noevia#1863: the text the router runs on is known only while its view matches the last reload.
+test('#1863 routerText is the last reload text while the router has not re-read', () => {
+  const g = createReloadGuard({ check: fakeCheck });
+  assert.equal(g.routerText(rows([])), null, 'unknown before any reload');
+  g.record('[*]\nsleep-idle-seconds = 1800\n', rows([]), '[*]\nsleep-idle-seconds = 1800\n');
+  assert.equal(g.routerText(rows(['loaded-model'], {}, ['loaded-model'])), '[*]\nsleep-idle-seconds = 1800\n', 'loading or sleeping does not change the view');
+  assert.equal(g.routerText(rows([], { other: '[other]\nctx-size = 1\n' })), null, 'a router that re-read on its own is unknown');
+  assert.equal(g.routerText('not rows'), null);
+  g.forget();
+  assert.equal(g.routerText(rows([])), null);
+});
