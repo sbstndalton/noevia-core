@@ -274,6 +274,16 @@ test('chat attachments and the Diary context are created on POST and only read o
   assert.deepEqual(f.sent.pop(), { status: 404, body: { error: 'Diary add-on is disabled' } });
 });
 
+test('#1902: a malformed escape in the chat id is a 400, never a server error, and nothing is created', async () => {
+  const f = fixture({ diary: false });
+  for (const m of ['GET', 'POST']) {
+    await f.call(m, '/api/chats/bad%E0%A4%A/context');
+    assert.deepEqual(f.sent.pop(), { status: 400, body: { error: 'Invalid chat identifier' } }, m);
+  }
+  assert.deepEqual(f.projects, []);
+  assert.equal(f.store.saves, 0);
+});
+
 test('a deleted chat cannot get its attachments project back from a stale tab (#788)', async () => {
   const f = fixture({ diary: false });
   const dir = f.dir;

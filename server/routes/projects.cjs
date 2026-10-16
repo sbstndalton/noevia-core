@@ -174,13 +174,15 @@ function createProjectRoutes({
       // #1264: the front answers both (a GET writes too: getProject's self-heal) while its
       // project-writes slice is confirmed; this copy must not write behind its back.
       if (refuseOwned(rustProjectWrites, json, res)) return true;
-      const id = diaryExtras.chatProjectId(decodeURIComponent(freeContext[1]));
+      // #1902: a malformed escape is the same 400 as any other unusable id, not a URIError 500.
+      const chatId = require('../http.cjs').decodePathPart(freeContext[1]);
+      const id = chatId === null ? null : diaryExtras.chatProjectId(chatId);
       if (!id) return json(res, 400, { error: 'Invalid chat identifier' });
       let project = getProject(id);
       // A deleted chat's attachments project went with it (#788); a stale tab still showing that
       // chat must not create it again, or it would outlive the chat for good. Chat ids that reach
       // here are already in stored form (chatProjectId accepts only [A-Za-z0-9_-]).
-      if (!project && req.method === 'POST' && require('../chat-lists.cjs').readTombstones(currentWorkspace().dir).has(decodeURIComponent(freeContext[1]))) {
+      if (!project && req.method === 'POST' && require('../chat-lists.cjs').readTombstones(currentWorkspace().dir).has(chatId)) {
         return json(res, 410, { error: 'This chat was deleted.' });
       }
       if (!project && req.method === 'POST') {
