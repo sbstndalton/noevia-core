@@ -782,6 +782,8 @@ function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloa
     quarantine,
     sizingBudgetGib,
     reloadPresets,
+    // noevia#1863: the models.ini text the router is known to run on, or null when unknowable.
+    async presetsInRouter(){try{const l=await rawModels();return l.ok&&Array.isArray(l.body?.data)?reloadGuard.routerText(l.body.data):null;}catch{return null;}},
     evidence, recordEvidence, importEvidence,
     calibration: calibrator ? { start: calibrator.start, cancel: calibrator.cancel, status: calibrator.status, recover: calibrator.recover } : null,
     autotune: autotuner ? { start: autotuner.start, resume: autotuner.resume, cancel: autotuner.cancel, status: autotuner.status, setSettings: autotuner.setSettings, recover: autotuner.recover, untuned: autotuner.untuned } : null,

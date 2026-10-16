@@ -2,7 +2,7 @@
 // noevia#1863: the chat-model idle unload time as an admin setting. A fake model manager that
 // keeps the same contract as noevia-rs GET/PUT /api/v1/idle-unload; no engine, no model.
 const test = require('node:test'), assert = require('node:assert/strict');
-const { createIdleUnloadSetting, validSeconds, DEFAULT_SECONDS } = require('./idle-unload-setting.cjs');
+const { createIdleUnloadSetting, validSeconds, globalIdleSeconds, DEFAULT_SECONDS } = require('./idle-unload-setting.cjs');
 
 const ENV = { MODEL_LOADER_URL: 'http://loader:8090/', MODEL_LOADER_TOKEN: 'synthetic-token' };
 
@@ -31,17 +31,26 @@ function fakeLoader({ envSeconds = null, missing = false, down = false } = {}) {
   return { state, fetchJson };
 }
 
+const ini = (seconds) => (seconds ? `[*]\nsleep-idle-seconds = ${seconds}\n\n[chat]\nmodel = c.gguf\n` : '[*]\n\n[chat]\nmodel = c.gguf\n');
+
+/** The router: the text it last read (null: unknowable), refusing a plain reload while `loaded` runs. */
 function setup({ loader = fakeLoader(), loaded = [] } = {}) {
   const audit = [], reloads = [];
-  const reloadPresets = async (o) => { reloads.push(o); return loaded.length ? { ok: false, status: 409, body: { error: 'A model is loaded.', loaded } } : { ok: true, status: 200, body: { reloaded: true } }; };
-  const setting = createIdleUnloadSetting({ env: ENV, fetchJson: loader.fetchJson, reloadPresets, audit: (...a) => audit.push(a) });
-  return { setting, loader, audit, reloads };
+  const router = { text: ini(loader.state.ini), loaded: [...loaded] };
+  const reloadPresets = async (o) => {
+    reloads.push(o);
+    if (router.loaded.length && !o.unload) return { ok: false, status: 409, body: { error: 'A model is loaded.', loaded: [...router.loaded] } };
+    router.loaded = []; router.text = ini(loader.state.ini);
+    return { ok: true, status: 200, body: { reloaded: true } };
+  };
+  const setting = createIdleUnloadSetting({ env: ENV, fetchJson: loader.fetchJson, reloadPresets, presetsInRouter: async () => router.text, audit: (...a) => audit.push(a) });
+  return { setting, loader, audit, reloads, router, reloadPresets };
 }
 
 test('the default is 30 minutes', async () => {
   assert.equal(DEFAULT_SECONDS, 1800);
   const { setting } = setup();
-  assert.deepEqual(await setting.get(), { seconds: 1800, source: 'default', fallbackSeconds: 1800, fallbackSource: 'default', defaultSeconds: 1800, minSeconds: 300, maxSeconds: 86400 });
+  assert.deepEqual(await setting.get(), { seconds: 1800, source: 'default', fallbackSeconds: 1800, fallbackSource: 'default', defaultSeconds: 1800, minSeconds: 300, maxSeconds: 86400, applied: true });
 });
 
 test('the deployment env seeds the value and clearing the setting falls back to it', async () => {
@@ -76,7 +85,37 @@ test('with a model running the new time waits for it instead of unloading it', a
   const out = await setting.save({ seconds: 600 }, 'admin-1');
   assert.deepEqual(out.apply, { state: 'pending', loaded: ['chat-synthetic'] });
   assert.equal(out.seconds, 600);
+  assert.equal(out.applied, false);
   assert.deepEqual(reloads, [{ unload: false }]);
+});
+
+// Review of web#87: a model asleep after its idle time still blocks the reload, so the saved
+// value is usually not live. Every GET says so (it survives a page reload) until a reload lands.
+test('a GET reports whether the router runs on the saved value, across reloads of the page', async () => {
+  const s = setup({ loaded: ['chat-asleep'] });
+  assert.equal((await s.setting.get()).applied, true, 'the router read 1800 at its last reload');
+  await s.setting.save({ seconds: 600 }, 'admin-1');
+  for (let i = 0; i < 2; i++) assert.equal((await s.setting.get()).applied, false, 'still not live on a fresh GET');
+  await s.reloadPresets({ unload: true });
+  assert.equal((await s.setting.get()).applied, true);
+  // Saving the value the router already runs on is applied at once.
+  const again = await s.setting.save({ seconds: 600 }, 'admin-1');
+  assert.equal(again.applied, true);
+  // Unknowable (the router re-read on its own since noevia's last reload): not claimed as applied.
+  s.router.text = null;
+  assert.equal((await s.setting.get()).applied, false);
+  // Never: no key in [*].
+  s.router.text = ini(0); s.loader.state.stored = 0;
+  assert.equal((await s.setting.get()).applied, true);
+});
+
+test('the [*] key is read the way the model manager writes it', () => {
+  assert.equal(globalIdleSeconds(ini(1800)), 1800);
+  assert.equal(globalIdleSeconds(ini(0)), 0);
+  assert.equal(globalIdleSeconds('[chat]\nsleep-idle-seconds = 5\n'), 0, 'a model section is not the global one');
+  assert.equal(globalIdleSeconds('[*]\r\n--sleep-idle-seconds=60\r\n'), 60);
+  assert.equal(globalIdleSeconds('[*]\nsleep-idle-seconds = soon\n'), null);
+  assert.equal(globalIdleSeconds('[*]\n; sleep-idle-seconds = 5\n'), 0);
 });
 
 test('values outside Never or 5 min to 24 h are refused before the model manager is asked', async () => {
