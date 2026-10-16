@@ -310,6 +310,16 @@ function readProjectsFile(file) {
  * workspace calls load() once, refresh(projects) at each request start and save(projects) for
  * saveProjects; the array is updated in place.
  */
+/** The file's stamp when it still holds exactly `text` (what this process just had the store
+ *  write), so the next request start does not take its own save for the other writer's; else null
+ *  (re-read). Node only reads the file here. */
+function stampIfStill(file, text) {
+  try {
+    const fd = fs.openSync(file, 'r');
+    try { const st = fs.fstatSync(fd); return fs.readFileSync(fd, 'utf8') === text ? stampOf(st) : null; } finally { fs.closeSync(fd); }
+  } catch { return null; }
+}
+
 /** projects.json text as Node's atomicJson writes it. */
 const projectsText = (projects) => JSON.stringify({ projects }, null, 2);
 
@@ -414,14 +424,15 @@ function createProjectsFile(file, { atomicJson, warn = console.warn, lock = with
         warn(`[rust-projects] ${file} is not readable as { projects: [...] }; replacing it with this process's view`);
         written = Array.from(localArray);
       } else written = merge(localArray, state.base, disk.projects).result;
-      const done = await remote.client.write(remote.user, 'projects.json', snap.version, projectsText(written));
+      const text = projectsText(written);
+      const done = await remote.client.write(remote.user, 'projects.json', snap.version, text);
       if (done.conflict) continue;
       // `written` is on disk now: take it in as a refresh would, keeping what changed here since.
       const writtenCopy = JSON.parse(projectsText(written)).projects;
       const { result, adopt } = merge(localArray, state.base, writtenCopy);
       apply(localArray, result, adopt);
       rebase(writtenCopy);
-      state.stamp = null; // the next request start re-reads (cheap: nothing differs from the base)
+      state.stamp = stampIfStill(file, text);
       if (afterWrite) afterWrite(Array.from(new Set([...writtenCopy, ...localArray])));
       return;
     }
@@ -557,7 +568,7 @@ function createFreeChatsFile(file, { atomicJson, warn = console.warn, lock = wit
       // Changed here while the write was in flight: those changes over what was written.
       put(workspace, JSON.stringify(now) === localJson || !Array.isArray(now) || !Array.isArray(written) ? written : mergeFreeChats(now, JSON.parse(localJson), written));
       state.base = JSON.stringify(written);
-      state.stamp = null;
+      state.stamp = stampIfStill(file, text);
       return;
     }
     throw busy();

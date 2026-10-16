@@ -304,3 +304,25 @@ test('a streamed answer is not held; with no saves nothing waits', async () => {
   const res = await request(1, (_saves, out) => { out.writeHead(200, { 'Content-Type': 'application/json' }); out.write('{"a"'); out.end(':1}'); });
   assert.deepEqual([res.status, res.body], [200, { a: 1 }]);
 });
+
+test('a request start does not take this process\'s own store save for the other writer\'s; a native write it does', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'store-stamp-'));
+  fs.mkdirSync(path.join(root, 'users', USER), { recursive: true });
+  const store = await fakeStore(root);
+  try {
+    const changed = [];
+    const client = psc.createClient({ port: store.port, token: TOKEN });
+    const wsStore = createWorkspaceStore(root, { id: 'local', label: 'Local', baseUrl: '', apiKey: '' }, null, { rustProjects: true, rustFreeChats: true, projectStore: client, onProjectsChanged: (id) => changed.push(id) });
+    const ws = wsStore.get(USER);
+    ws.projects.push({ id: 'p1', chats: [], instructionSkills: {} });
+    await ws.saveProjects();
+    ws.freeChats.push({ id: 'f1', updatedAt: 1 });
+    await ws.saveFreeChats();
+    wsStore.get(USER);
+    assert.deepEqual(changed, [], 'own saves');
+    await nativeEdit(client, 'projects.json', (v) => ({ projects: [...v.projects, { id: 'rust', chats: [] }] }));
+    wsStore.get(USER);
+    assert.deepEqual(changed, [USER]);
+    assert.deepEqual(ws.projects.map((p) => p.id), ['p1', 'rust']);
+  } finally { await store.close(); }
+});
