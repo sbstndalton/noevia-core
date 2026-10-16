@@ -84,10 +84,13 @@ function createCallers({ wording = 'laya' } = {}) {
   const layer = (purposes) => createDecisions({ backends: { configured: backend }, chains: Object.fromEntries(purposes.map((p) => [p, ['configured']])) });
 
   const routers = {};
+  // #1901: the route labels follow the backend's wording; precheck:false so every case reaches the model (the
+  // simple-ask rule is core's own and is tested in system-one-router.test.cjs, not measured here).
+  const routeBackend = wording === 'kev' ? { ...backend, wording: 'kev' } : backend;
   const router = (code) => (routers[code] ||= require(path.join(SERVER, 'system-one-router.cjs')).createSystemOneRouter({
-    enabled: () => true, env: {}, log: () => {}, fallback: async () => 'smart',
+    enabled: () => true, env: {}, log: () => {}, fallback: async () => 'smart', precheck: false,
     roles: () => ({ fast: 'fast-model', smart: 'smart-model', ...(code ? { code: 'code-model' } : {}) }),
-    getBackend: () => backend, getDeadlineMs: () => 2000,
+    getBackend: () => routeBackend, getDeadlineMs: () => 2000,
   }));
 
   const rm = require(path.join(SERVER, 'routing-modes.cjs'));
