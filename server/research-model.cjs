@@ -39,6 +39,12 @@ function createResearchModel({ autoRoles, lastLoadedModel, chatMachines = null, 
   async function completeOnMachine(remote, messages, { signal, maxTokens }) {
     const ready = await chatMachines.ready(remote);
     if (!ready.ok) throw Object.assign(publicError(ready.error), { code: ready.code || 'machineUnreachable' });
+    // #1880: a research step on the machine counts as a turn there while it runs.
+    const release = typeof chatMachines.beginTurn === 'function' ? chatMachines.beginTurn(remote.machine.id) : () => {};
+    try { return await completeOnMachineNow(remote, messages, { signal, maxTokens }); } finally { release(); }
+  }
+
+  async function completeOnMachineNow(remote, messages, { signal, maxTokens }) {
     let r;
     try {
       r = await chatMachines.fetch(`${remote.baseUrl}/v1/chat/completions`, { method: 'POST',
