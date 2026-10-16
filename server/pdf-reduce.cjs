@@ -27,7 +27,7 @@ async function prepare(name,bytes,options={}){
  if(!bytes.subarray(0,5).equals(Buffer.from('%PDF-')))throw Object.assign(Error('This file is not a PDF.'),{status:400});
  if(!url)throw Object.assign(Error('PDF compression is unavailable. Compress or split this PDF locally and retry.'),{status:503});
  progress('Extracting PDF text and compressing images to fit 25 MB');
- const response=await fetchImpl(url.replace(/\/+$/,'')+'/reduce-pdf',{method:'POST',redirect:'error',headers:{'Content-Type':'application/pdf'},body:bytes,signal:AbortSignal.timeout(180000)});
+ const response=await fetchImpl(url.replace(/\/+$/,'')+'/reduce-pdf',require('./upload-body.cjs').uploadInit(bytes,{method:'POST',redirect:'error',headers:{'Content-Type':'application/pdf'},signal:AbortSignal.timeout(180000)}));
  if(!response.ok)throw Object.assign(Error(response.status===503?'Document processor is busy; retry shortly.':'PDF could not fit 25 MB after compression or text extraction. Split or compress it locally and retry.'),{status:response.status===503?503:422});
  const result=await readCappedJson(response);let output,outputName;
  if(result.kind==='pdf' && typeof result.dataBase64==='string' && result.dataBase64.length<=Math.ceil(OUTPUT_CAP/3)*4){output=Buffer.from(result.dataBase64,'base64');outputName=name.slice(0,-4).slice(0,175)+'.compressed.pdf';if(!output.subarray(0,5).equals(Buffer.from('%PDF-')))throw Error('Invalid reduced PDF');}
