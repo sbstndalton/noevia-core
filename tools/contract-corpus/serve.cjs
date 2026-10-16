@@ -24,7 +24,7 @@ async function main() {
   // M4 (rust-projects.cjs): projects.json shared with the front, the image writes refused here,
   // and the chat-list save too when the front's chat slice is confirmed separately (#1409), and the
   // free-chat save when its slice is.
-  if (process.env.NOEVIA_RUST_PROJECTS === '1') Object.assign(env, { NOEVIA_RUST_PROJECTS: '1', NOEVIA_FRONT: 'rust', NOEVIA_RUST_PROJECTS_CONFIRMED: process.env.NOEVIA_RUST_PROJECTS_CONFIRMED === '1' ? '1' : '', NOEVIA_RUST_PROJECT_CHATS_CONFIRMED: process.env.NOEVIA_RUST_PROJECT_CHATS_CONFIRMED === '1' ? '1' : '', NOEVIA_RUST_FREE_CHATS_CONFIRMED: process.env.NOEVIA_RUST_FREE_CHATS_CONFIRMED === '1' ? '1' : '' });
+  if (process.env.NOEVIA_RUST_PROJECTS === '1') Object.assign(env, { NOEVIA_RUST_PROJECTS: '1', NOEVIA_FRONT: 'rust', NOEVIA_RUST_PROJECTS_CONFIRMED: process.env.NOEVIA_RUST_PROJECTS_CONFIRMED === '1' ? '1' : '', NOEVIA_RUST_PROJECT_CHATS_CONFIRMED: process.env.NOEVIA_RUST_PROJECT_CHATS_CONFIRMED === '1' ? '1' : '', NOEVIA_RUST_FREE_CHATS_CONFIRMED: process.env.NOEVIA_RUST_FREE_CHATS_CONFIRMED === '1' ? '1' : '', NOEVIA_RUST_PROJECT_WRITES: process.env.NOEVIA_RUST_PROJECT_WRITES === '1' ? '1' : '', NOEVIA_RUST_PROJECT_WRITES_CONFIRMED: process.env.NOEVIA_RUST_PROJECT_WRITES_CONFIRMED === '1' ? '1' : '' });
   // M6 reporting refusal proves a clean replay was native, never a silent proxy fallback.
   if (process.env.NOEVIA_RUST_USAGE === '1') Object.assign(env, { NOEVIA_RUST_USAGE: '1', NOEVIA_FRONT: 'rust', NOEVIA_RUST_USAGE_CONFIRMED: process.env.NOEVIA_RUST_USAGE_CONFIRMED === '1' ? '1' : '' });
   // M6 sampling owns one setting; carry the same confirmed refusal through the child boundary.

@@ -100,6 +100,8 @@ const RUST_PROJECTS = require('./rust-projects.cjs').enabledFrom(process.env);
 const RUST_PROJECT_CHATS = RUST_PROJECTS && require('./rust-projects.cjs').chatsEnabledFrom(process.env, () => {});
 // And its free-chat slice (rust-free-chats): free-chats.json shared under its own lock, the save refused here.
 const RUST_FREE_CHATS = RUST_PROJECTS && require('./rust-projects.cjs').freeChatsEnabledFrom(process.env, () => {});
+// sbstndalton/noevia#1264: the project writes ported to the front, on their own confirmed switch.
+const RUST_PROJECT_WRITES = RUST_PROJECTS && require('./rust-projects.cjs').projectWritesEnabledFrom(process.env);
 const authService = createAuth({
   rustAuth,
   dataDir: DATA_DIR,
@@ -1032,7 +1034,7 @@ const projectRoutes = require('./routes/projects.cjs').createProjectRoutes({
   json, readBody, readJson, requestScope, dispatch: (req, res) => handleRequestScoped(req, res), currentWorkspace, authService, storageClient, documents, documentSources, rag, fs, path,
   reasoningEffort, projectAppearance, diaryExtras, PROJECTS, DEFAULT_TOOLBOXES, sanitizeToolboxes, allToolboxes, getProvider, ensureRolesLoaded, servedCatalogue, DEFAULT_PROVIDER_ID, store: projectStore,
   onToolboxesChange: () => permittedToolsCache.clear(),
-  rustProjects: RUST_PROJECTS, rustProjectChats: RUST_PROJECT_CHATS,
+  rustProjects: RUST_PROJECTS, rustProjectChats: RUST_PROJECT_CHATS, rustProjectWrites: RUST_PROJECT_WRITES,
 });
 // The provider registry's routes: list, connect, test and remove (routes/providers.cjs), plus
 // Sign in with ChatGPT (chatgptOAuth, built beside mcpOAuth above) while features.chatgptOAuth is on.

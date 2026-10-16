@@ -62,6 +62,15 @@
 // brain note and attachments project (a whole project delete, with its RAG index and storage
 // sweep), which the front does not do yet.
 //
+// Project writes (sbstndalton/noevia#1264): the rest of Node's projects.json and free-chats.json
+// writers move to the front slice by slice, each behind a second switch, NOEVIA_RUST_PROJECT_WRITES=1
+// (off by default; NOEVIA_RUST_PROJECTS=1 alone never moves them), confirmed by the supervisor only
+// for a front whose --features lists rust-project-writes (NOEVIA_RUST_PROJECT_WRITES_CONFIRMED=1):
+// projectWritesEnabledFrom. PROJECT_WRITE_ROUTES lists them (noevia-rs contracts/http/routes.toml,
+// switch = "NOEVIA_RUST_PROJECT_WRITES"); Node's copies refuse them (refuseOwned) while it is on.
+// Slice 1: a free chat's attachments project, GET and POST /api/chats/{chatId}/context (GET too:
+// getProject's self-heal writes).
+//
 // Removed, with Node's copies of the routes, once Rust owns every projects.json and
 // free-chats.json writer.
 
@@ -86,6 +95,14 @@ const OWNED_ROUTES = Object.freeze(new Set([
   'POST /api/projects/{id}/chats',
   'GET /api/freechats',
   'POST /api/freechats',
+]));
+
+/** The project writes the Rust front answers under NOEVIA_RUST_PROJECT_WRITES (see the header):
+ *  METHOD path-pattern, as OWNED_ROUTES. noevia's deploy/tools/assemble-release.sh refuses a
+ *  release whose front owns a route under that switch missing here. */
+const PROJECT_WRITE_ROUTES = Object.freeze(new Set([
+  'GET /api/chats/{chatId}/context',
+  'POST /api/chats/{chatId}/context',
 ]));
 
 /** Whether the switch is on for this process (see the header). */
@@ -375,6 +392,20 @@ function freeChatsEnabledFrom(env = process.env, warn = console.warn) {
   return enabledFrom(env, warn) && env.NOEVIA_RUST_FREE_CHATS_CONFIRMED === '1';
 }
 
+/** Whether the project-writes slices are the front's (see the header): the projects switch,
+ *  NOEVIA_RUST_PROJECT_WRITES=1 and the supervisor's NOEVIA_RUST_PROJECT_WRITES_CONFIRMED=1. Warns
+ *  when the switch is set without the confirmation (the front then refuses to start, or lacks the
+ *  slice): Node keeps answering, as before. */
+function projectWritesEnabledFrom(env = process.env, warn = console.warn) {
+  if (env.NOEVIA_RUST_PROJECT_WRITES !== '1') return false;
+  if (!enabledFrom(env, warn)) return false;
+  if (env.NOEVIA_RUST_PROJECT_WRITES_CONFIRMED !== '1') {
+    warn('NOEVIA_RUST_PROJECT_WRITES=1 is ignored: the supervisor has not confirmed that the Rust front supports rust-project-writes (NOEVIA_RUST_PROJECT_WRITES_CONFIRMED).');
+    return false;
+  }
+  return true;
+}
+
 // chat-lists.cjs LIST_CAP (required lazily there; equal by test).
 const FREE_LIST_CAP = 1000;
 
@@ -458,7 +489,7 @@ function refuseOwned(enabled, json, res) {
 }
 
 module.exports = {
-  enabledFrom, chatsEnabledFrom, freeChatsEnabledFrom, withFileLock, merge, mergeFields, mergeIdList, createProjectsFile, readProjectsFile, refuseOwned, replaceContents,
+  enabledFrom, chatsEnabledFrom, freeChatsEnabledFrom, projectWritesEnabledFrom, withFileLock, merge, mergeFields, mergeIdList, createProjectsFile, readProjectsFile, refuseOwned, replaceContents,
   createFreeChatsFile, readFreeChatsFile, mergeFreeChats,
-  OWNED_ROUTES, LOCK_SUFFIX, LOCK_WAIT_MS, FLOCK_BUSY_STATUS, FREE_LIST_CAP,
+  OWNED_ROUTES, PROJECT_WRITE_ROUTES, LOCK_SUFFIX, LOCK_WAIT_MS, FLOCK_BUSY_STATUS, FREE_LIST_CAP,
 };
