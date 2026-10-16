@@ -199,3 +199,18 @@ test('a caller that aborts between being granted the turn and sending sends noth
   assert.equal(runs,0,'no exchange after the abort');
   assert.equal(lane.busy,false,'the lane is released at once');
 });
+test('#1751: one transient connect failure is retried once; a status, a second failure or an abort is not',async()=>{
+  const ok={selected:'b',scores:{a:0.4,b:0.6},model:'convaiinnovations/laya'};
+  let calls=0;
+  const flaky=createDecisionEndpoint({env:{COWORK_DECISION_URL:'http://10.9.17.1:8040'},fetchImpl:async()=>{ calls++; if(calls===1) throw new TypeError('fetch failed'); return Response.json(ok); }});
+  assert.equal((await flaky.choice({state:'s',question:'q',options:[{id:'a',label:'A'},{id:'b',label:'B'}]})).selected,'b');
+  assert.equal(calls,2);
+  let down=0;
+  const dead=createDecisionEndpoint({env:{COWORK_DECISION_URL:'http://10.9.18.1:8040'},fetchImpl:async()=>{ down++; throw new TypeError('fetch failed'); }});
+  await assert.rejects(dead.choice({state:'s',question:'q',options:[{id:'a',label:'A'},{id:'b',label:'B'}]}),e=>e.reason==='network');
+  assert.equal(down,2);
+  let busy=0;
+  const refused=createDecisionEndpoint({env:{COWORK_DECISION_URL:'http://10.9.19.1:8040'},fetchImpl:async()=>{ busy++; return new Response('',{status:503}); }});
+  await assert.rejects(refused.choice({state:'s',question:'q',options:[{id:'a',label:'A'},{id:'b',label:'B'}]}),e=>e.reason==='http-503');
+  assert.equal(busy,1);
+});

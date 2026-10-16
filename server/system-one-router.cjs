@@ -12,6 +12,29 @@ function configuration(env = process.env) {
   return parsed.reason ? { reason } : { baseUrl: parsed.baseUrl, reason: null };
 }
 
+// #1639 soak / #1873: route labels per decision-model wording (decision-models.cjs). Laya keeps the wording it was
+// measured with (docs/research/system-one/19-routing-labels.md). With it, Kev sent short creative asks (a 4-line poem,
+// a limerick, a short story) to Smart, because "writing more than a sentence" names them, and Smart then ran at the
+// account-default High effort. Kev's labels name simple short tasks as Fast (synthetic set, 2026-10-16: simple 12/16 ->
+// 14/16 Fast, reasoning 7/8 -> 8/8 Smart).
+const ROUTE_LABELS = Object.freeze({
+  laya: Object.freeze({ fast: 'Greetings, thanks, or a one-line factual answer',
+    smart: 'Explaining, comparing, planning, reasoning or writing more than a sentence' }),
+  kev: Object.freeze({ fast: 'Small talk, a quick fact, or a simple short task: counting, lists, a joke, a short poem or a short story',
+    smart: 'Explaining, comparing, planning, multi-step reasoning or maths, or long careful writing' }),
+});
+// A cheap pre-check before the decision call: a short single-line ask for a plainly simple task (count, list, spell,
+// a joke, a haiku/limerick/short poem, a short story of at most 400 words) goes Fast with no decision call at all.
+// Conservative: anything that also asks to explain, compare, plan, reason or touch code is left to the model.
+const SIMPLE_TASK_RE = /^\s*(please\s+)?(can you\s+|could you\s+)?(count\b|list\b|spell\b|tell me (a|another) (short )?joke\b|(write|give me|make|compose) (me )?(a|an|another)\s+(short\s+|quick\s+|funny\s+|little\s+|tiny\s+|\d{1,2}[- ]line\s+|\d{2,3}[- ]word\s+)*(poem|haiku|limerick|rhyme|joke|story|riddle)\b)/i;
+const NOT_SIMPLE_RE = /\b(explain|why|how|compare|plan|analy[sz]e|reason|prove|derive|step[- ]by[- ]step|in detail|detailed|essay|code|function|script|program|regex|sql|debug|bug)\b|```/i;
+function clearlySimple(message) {
+  const m = String(message || '');
+  if (!m.trim() || m.length > 160 || /\n/.test(m.trim()) || !SIMPLE_TASK_RE.test(m) || NOT_SIMPLE_RE.test(m)) return false;
+  const words = m.match(/\b(\d{2,5})[- ]words?\b/i);
+  return !words || Number(words[1]) <= 400;
+}
+
 function createSystemOneRouter({ enabled, roles, fallback, env = process.env, backend, getBackend = null, getDeadlineMs = null, deadlineMs = 1500,
   log = (entry) => console.info('[system-one] route', JSON.stringify(entry)) }) {
   const config = configuration(env);
@@ -26,16 +49,21 @@ function createSystemOneRouter({ enabled, roles, fallback, env = process.env, ba
   }
   async function classifyWithDetails(message) {
     const active = roles();
-    const options = [{ id: 'fast', label: 'Greetings, thanks, or a one-line factual answer' },
-      { id: 'smart', label: 'Explaining, comparing, planning, reasoning or writing more than a sentence' }];
+    const routing = enabled() ? currentDecisions() : null;
+    const labels = ROUTE_LABELS[routing?.backend?.wording] || ROUTE_LABELS.laya;
+    const options = [{ id: 'fast', label: labels.fast }, { id: 'smart', label: labels.smart }];
     if (active?.code) options.push({ id: 'code', label: 'Anything involving programming code, regex, errors or software' });
     const offered = active?.fast && active?.smart ? options : [];
-    const routing = enabled() ? currentDecisions() : null;
     if (!routing || !offered.length) {
       const role = await fallback(message);
       return { role, routingDecision: { offered, scores: {}, selectedRole: null, effectiveRole: role,
         backend: 'legacy', model: null, calibrated: false, latencyMs: null, status: 'fallback',
         fallbackReason: !enabled() ? 'disabled' : !routing ? 'no-backend' : 'missing-roles', fallbackCause: null } };
+    }
+    if (clearlySimple(message)) {
+      log({ selected: 'fast', options: options.length, margin: null, ms: 0, fellBack: null, cause: null, precheck: true });
+      return { role: 'fast', routingDecision: { offered, scores: {}, selectedRole: 'fast', effectiveRole: 'fast',
+        backend: 'legacy', model: null, calibrated: false, latencyMs: 0, status: 'accepted', fallbackReason: null, fallbackCause: null } };
     }
     const result = await routing.decisions.decide({ kind: 'choice', purpose: 'model.route',
       question: 'Which configured model role should answer this user message?',
@@ -66,4 +94,4 @@ function createSystemOneRouter({ enabled, roles, fallback, env = process.env, ba
     async classify(message) { return (await classifyWithDetails(message)).role; },
   };
 }
-module.exports = { configuration, createSystemOneRouter };
+module.exports = { configuration, createSystemOneRouter, clearlySimple, ROUTE_LABELS };

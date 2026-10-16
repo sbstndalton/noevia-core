@@ -85,6 +85,17 @@ async function exchange(fetchImpl,url,body,signal,headers={'Content-Type':'appli
   } finally { await reader.cancel(); }
   return Buffer.concat(chunks).toString('utf8');
 }
+// #1751: one transient connect failure (a kept-alive socket the service had already closed, a reset while connecting)
+// came back as 'network' ("unreachable") while the service was healthy; three repeats answered in ~0.5 s. Such a
+// failure gets exactly one immediate retry, inside the same lane turn and the caller's deadline. Only 'network' (no
+// response at all) is retried: a status, a bad body or an abort is the answer.
+async function sendOnce(fetchImpl,url,body,holdSignal,headers,callerSignal){
+  try { return await exchange(fetchImpl,url,body,holdSignal,headers); }
+  catch (error) {
+    if(error?.reason!=='network' || holdSignal?.aborted || callerSignal?.aborted) throw error;
+    return exchange(fetchImpl,url,body,holdSignal,headers);
+  }
+}
 // Step supervision's question and options, per decision model (#1639, decision-models.cjs `wording`).
 // 'laya': measured on Laya 2026-09-22 (docs/research/system-one/19-routing-labels.md): the earlier
 // wording paused benign chats and added needless verification rounds (28/38); this one scores 33/38
@@ -132,7 +143,7 @@ function createDecisionEndpoint({ env=process.env, linkLocal=true, fetchImpl=lin
     /** `urgent` (#1437): served before queued calls, for the sensitivity check. */
     async choice({state,question,options},{signal,urgent=false}={}) {
       const body=JSON.stringify(typesafe ? toTypeSafe({state,question,options},profile.servedModel) : {state,question,options});
-      const text=await inTurn(lane,{signal,urgent},(holdSignal)=>exchange(fetchImpl,config.baseUrl+'/v1/decisions',body,holdSignal,headers),holdMaxMs);
+      const text=await inTurn(lane,{signal,urgent},(holdSignal)=>sendOnce(fetchImpl,config.baseUrl+'/v1/decisions',body,holdSignal,headers,signal),holdMaxMs);
       if(!text.trim()) throw failure('empty-response','Decision endpoint returned no decision');
       let result; try { result=JSON.parse(text); } catch { throw failure('parse','Decision response is not JSON'); }
       const ids=options.map(o=>o.id);
