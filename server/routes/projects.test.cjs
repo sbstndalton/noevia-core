@@ -258,39 +258,12 @@ test('a background source job re-enters the router with the caller\'s headers an
   assert.deepEqual(f.sent.pop(), { status: 404, body: { error: 'project not found' } });
 });
 
-test('chat attachments and the Diary context are created on POST and only read on GET', async () => {
+// The chat attachments half (#352 Auto default, #788 tombstone 410, the 400) is the Rust front's
+// now: noevia-rs crates/server-projects tests/chat_context_differential.rs.
+test('the Diary context is refused while the add-on is disabled', async () => {
   const f = fixture({ diary: false });
-  await f.call('GET', '/api/chats/bad/context');
-  assert.deepEqual(f.sent.pop(), { status: 400, body: { error: 'Invalid chat identifier' } });
-  await f.call('GET', '/api/chats/abc/context');
-  assert.deepEqual(f.sent.pop(), { status: 200, body: { project: null } });
-  await f.call('POST', '/api/chats/abc/context');
-  const created = f.sent.pop().body.project;
-  assert.equal(created.id, 'chat-abc');
-  // #352: diaryExtras.newProject() is written for Diary, which really does default to manual —
-  // a standalone chat's own shadow context must not inherit that.
-  assert.equal(created.routing, 'auto', "a standalone chat's context starts on Auto, not Diary's Manual default");
   await f.call('POST', '/api/diary/context');
   assert.deepEqual(f.sent.pop(), { status: 404, body: { error: 'Diary add-on is disabled' } });
-});
-
-test('a deleted chat cannot get its attachments project back from a stale tab (#788)', async () => {
-  const f = fixture({ diary: false });
-  const dir = f.dir;
-  require('../chat-lists.cjs').addTombstone(dir, 'gone');
-  await f.call('POST', '/api/chats/gone/context');
-  assert.deepEqual(f.sent.pop(), { status: 410, body: { error: 'This chat was deleted.' } });
-  assert.deepEqual(f.projects, [], 'nothing was created');
-  await f.call('GET', '/api/chats/gone/context');
-  assert.deepEqual(f.sent.pop(), { status: 200, body: { project: null } }, 'a read still answers like a chat with no attachments');
-  await f.call('POST', '/api/chats/alive/context');
-  assert.equal(f.sent.pop().body.project.id, 'chat-alive', 'any other chat is unaffected');
-  // An existing attachments project is still served for a POST (deletion removes it; nothing
-  // here deletes on read).
-  f.projects.push({ id: 'chat-kept', chats: [] });
-  require('../chat-lists.cjs').addTombstone(dir, 'kept');
-  await f.call('POST', '/api/chats/kept/context');
-  assert.equal(f.sent.pop().body.project.id, 'chat-kept');
 });
 
 test('an explicit routing choice is marked so the #352 migration never reverts it', async () => {
@@ -531,27 +504,10 @@ test('M4: while the Rust front owns it, the chat-list save is refused here befor
   assert.equal(k.sent.at(-1).status, 200);
 });
 
-test('#1264: off, the chat attachments routes are answered here; with the project-writes slice confirmed, both are refused before anything is read or written', async () => {
-  // Off (NOEVIA_RUST_PROJECTS alone, as live today): Node answers and creates.
-  const off = fixture({ projects: [], rustProjects: true, rustProjectChats: true });
-  assert.equal(await off.call('GET', '/api/chats/c1/context'), true);
-  assert.deepEqual(off.sent.at(-1), { status: 200, body: { project: null } });
-  assert.equal(await off.call('POST', '/api/chats/c1/context'), true);
-  assert.equal(off.sent.at(-1).status, 200);
-  assert.equal(off.sent.at(-1).body.project.id, 'chat-c1');
-  assert.equal(off.store.saves, 1);
-  // On: the front owns them; GET too, since getProject's self-heal writes.
-  const on = fixture({ projects: [{ id: 'chat-c2', routing: 'manual' }], rustProjects: true, rustProjectWrites: true });
-  for (const [m, p] of [['GET', '/api/chats/c2/context'], ['POST', '/api/chats/c1/context'], ['POST', '/api/chats/bad%E0%A4%A/context']]) {
-    assert.equal(await on.call(m, p), true, `${m} ${p}`);
-    assert.equal(on.sent.at(-1).status, 503, `${m} ${p}`);
-    assert.equal(on.sent.at(-1).body.code, 'RUST_PROJECTS_OWNED', `${m} ${p}`);
-  }
-  assert.equal(on.store.saves, 0, 'nothing saved');
-  assert.deepEqual(on.projects.map((p) => p.id), ['chat-c2'], 'nothing created');
-  // The other project routes are not this slice's.
-  assert.equal(await on.call('POST', '/api/projects/p1/chats', { chats: [] }), true);
-  assert.notEqual(on.sent.at(-1).body?.code, 'RUST_PROJECTS_OWNED');
+test('#1264: Node no longer answers the chat attachments routes (the Rust front does)', async () => {
+  const f = fixture({ projects: [] });
+  for (const m of ['GET', 'POST']) assert.equal(await f.call(m, '/api/chats/c1/context'), false, m);
+  assert.equal(f.store.saves, 0);
 });
 
 test('#1458: renaming a project moves nothing: its storage folder and every source path stay as they are', async () => {

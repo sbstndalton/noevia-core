@@ -169,31 +169,8 @@ function createProjectRoutes({
       return json(res, 202, { poll: `/api/projects/${encodeURIComponent(projectId)}/source-jobs/${jobId}` });
     }
 
-    const freeContext = /^\/api\/chats\/([^/]+)\/context$/.exec(p);
-    if (freeContext && ['GET', 'POST'].includes(req.method)) {
-      // #1264: the front answers both (a GET writes too: getProject's self-heal) while its
-      // project-writes slice is confirmed; this copy must not write behind its back.
-      if (refuseOwned(rustProjectWrites, json, res)) return true;
-      const id = diaryExtras.chatProjectId(decodeURIComponent(freeContext[1]));
-      if (!id) return json(res, 400, { error: 'Invalid chat identifier' });
-      let project = getProject(id);
-      // A deleted chat's attachments project went with it (#788); a stale tab still showing that
-      // chat must not create it again, or it would outlive the chat for good. Chat ids that reach
-      // here are already in stored form (chatProjectId accepts only [A-Za-z0-9_-]).
-      if (!project && req.method === 'POST' && require('../chat-lists.cjs').readTombstones(currentWorkspace().dir).has(decodeURIComponent(freeContext[1]))) {
-        return json(res, 410, { error: 'This chat was deleted.' });
-      }
-      if (!project && req.method === 'POST') {
-        // diaryExtras.newProject() is written for the Diary project, which really does default
-        // to manual — a standalone chat's shadow context must not inherit that (#352). It starts
-        // on Auto like any other free chat with no explicit choice, until routingChosen (below)
-        // records that a person actually picked one.
-        // #1522: the Automatic mode is stated, not implied by the list (a stored list alone reads as Manual).
-        project = { ...diaryExtras.newProject(), id, name: 'Chat attachments ' + freeContext[1], instructions: '', toolboxes: [...DEFAULT_TOOLBOXES], routing: 'auto', toolsMode: 'auto' };
-        PROJECTS.push(project); saveProjects(PROJECTS);
-      }
-      return json(res, 200, { project });
-    }
+    // GET/POST /api/chats/{chatId}/context (a free chat's attachments project) are the Rust front's
+    // (noevia-rs crates/server-projects context.rs, sbstndalton/noevia#1264); Node's copy is gone.
 
     if (p === '/api/diary/context' && ['GET', 'POST'].includes(req.method)) {
       if (!authService.diaryEnabled(authn.user.id)) return json(res, 404, { error: 'Diary add-on is disabled' });
