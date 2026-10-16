@@ -50,7 +50,10 @@ function sealProviderRow(row, secrets) {
 // `onProjectsChanged(userId)` is called when a request start took in the front's changes (to
 // projects.json or free-chats.json): a write Node used to make itself (and follow with its own
 // nudges, such as the chat vault mirror's) was made by the front instead.
-function createWorkspaceStore(rootDir, defaultProvider, secrets, { rustProjects = false, rustFreeChats = false, onProjectsChanged = () => {} } = {}) {
+// `projectStore` (#1264, project-store-client.cjs createClient): both files are written through the
+// Rust store instead of under flock (needs rustProjects and rustFreeChats). Each workspace gets its
+// own save queue; `pendingStoreWrites()` is a promise for the saves still in flight, or null.
+function createWorkspaceStore(rootDir, defaultProvider, secrets, { rustProjects = false, rustFreeChats = false, projectStore = null, onProjectsChanged = () => {} } = {}) {
   // Per-user workspaces are cached, but shared providers are NEVER baked
   // into the cached object: the shared file is re-read and re-merged on
   // every workspace access. This closes the load-time-merge race where a
@@ -129,13 +132,20 @@ function createWorkspaceStore(rootDir, defaultProvider, secrets, { rustProjects 
     }
 
     const dir = userDir(userId); fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
-    const sharedProjectsFile = rustProjects ? require('./rust-projects.cjs').createProjectsFile(path.join(dir, 'projects.json'), { atomicJson }) : null;
+    const storeQueue = projectStore && rustProjects && rustFreeChats ? require('./project-store-client.cjs').createQueue() : null;
+    const remote = storeQueue ? { client: projectStore, user: userId, queue: storeQueue } : null;
+    const sharedProjectsFile = rustProjects ? require('./rust-projects.cjs').createProjectsFile(path.join(dir, 'projects.json'), { atomicJson, remote }) : null;
     // #1806: a project's sources come back from projects.json as metadata; their text is read from
     // its own file on demand (source-text.cjs). What the other writer's changes bring in is given
     // the same reader.
     const projectsFile = sharedProjectsFile && Object.assign(Object.create(sharedProjectsFile), {
       refresh(list) { const changed = sharedProjectsFile.refresh(list); if (changed) sourceText.attachAll(dir, list); return changed; },
-      save(list, afterWrite) { sharedProjectsFile.save(list, afterWrite); sourceText.attachAll(dir, list); },
+      save(list, afterWrite) {
+        const saved = sharedProjectsFile.save(list, afterWrite);
+        if (saved && typeof saved.then === 'function') return saved.then(() => { sourceText.attachAll(dir, list); });
+        sourceText.attachAll(dir, list);
+        return undefined;
+      },
     });
     // #1806 review: a projects.json that exists but does not parse loads as an empty list. Its
     // sources' text files must survive that: the source-text collection is off for this
@@ -149,7 +159,7 @@ function createWorkspaceStore(rootDir, defaultProvider, secrets, { rustProjects 
     }
     const loaded = projectsFile ? projectsFile.load() : (readJson(path.join(dir, 'projects.json'), { projects: [] }) || {}).projects;
     const projects = Array.isArray(loaded) ? loaded : [];
-    const freeChatsFile = rustFreeChats ? require('./rust-projects.cjs').createFreeChatsFile(path.join(dir, 'free-chats.json'), { atomicJson }) : null;
+    const freeChatsFile = rustFreeChats ? require('./rust-projects.cjs').createFreeChatsFile(path.join(dir, 'free-chats.json'), { atomicJson, remote }) : null;
     const providerFile = path.join(dir, 'providers.json');
     const savedProviders = readJson(providerFile, { providers: [] }).providers || [];
     let needsEncryption = false;
@@ -187,6 +197,8 @@ function createWorkspaceStore(rootDir, defaultProvider, secrets, { rustProjects 
       projectsFile,
       freeChatsFile,
       revoked: false,
+      /** #1264: the project-store saves still in flight (a promise), or null. */
+      pendingStoreWrites() { return storeQueue ? storeQueue.pending() : null; },
       assertActive() {
         if (this.revoked) throw Object.assign(new Error('account no longer exists'), { status: 410 });
       },
@@ -229,8 +241,15 @@ function createWorkspaceStore(rootDir, defaultProvider, secrets, { rustProjects 
           if (loadCorrupt || !Array.isArray(list) || list.length === 0) return;
           try { sourceText.collect(dir, list); } catch (e) { console.warn('[sources] could not remove unused source text:', e.message); }
         };
-        if (projectsFile) projectsFile.save(this.projects, gc);
-        else { atomicJson(path.join(dir, 'projects.json'), { projects: this.projects }); gc(this.projects); }
+        const saved = projectsFile ? projectsFile.save(this.projects, gc) : (atomicJson(path.join(dir, 'projects.json'), { projects: this.projects }), gc(this.projects), undefined);
+        // #1264: through the Rust store the save is async. The #1839 modes stay reverted until it
+        // is written; a failure is logged here and the change, still in memory, goes with the next save.
+        if (saved && typeof saved.then === 'function') {
+          const restore = restoreModes; restoreModes = () => {};
+          const done = saved.finally(restore);
+          done.catch((e) => console.warn('[projects] could not save projects.json through the project store:', e.message));
+          return done;
+        }
         } finally { restoreModes(); }
       },
       saveProviders() {
@@ -295,8 +314,11 @@ function createWorkspaceStore(rootDir, defaultProvider, secrets, { rustProjects 
       },
       saveFreeChats() {
         this.assertActive();
-        if (freeChatsFile) freeChatsFile.save(this);
-        else atomicJson(path.join(dir, 'free-chats.json'), this.freeChats);
+        const saved = freeChatsFile ? freeChatsFile.save(this) : atomicJson(path.join(dir, 'free-chats.json'), this.freeChats);
+        if (saved && typeof saved.then === 'function') {
+          saved.catch((e) => console.warn('[projects] could not save free-chats.json through the project store:', e.message));
+          return saved;
+        }
       },
       savePreferences() { this.assertActive(); atomicJson(path.join(dir, 'preferences.json'), this.preferences); },
       saveAutoRoles() { this.assertActive(); atomicJson(path.join(dir, 'auto-roles.json'), this.autoRoles); },
