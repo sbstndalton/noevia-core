@@ -207,7 +207,13 @@ function createWorkspaceStore(rootDir, defaultProvider, secrets, { rustProjects 
       storeFailed() { return (remote && remote.failed) || null; },
       /** #1917: the live view of this account: this one, or, once this one was dropped after a
        *  failed save, the one read again from disk. For writers that hold a view across awaits. */
-      current() { return cache.get(userId) === this || !remote || !remote.failed ? this : get(userId); },
+      current() {
+        if (cache.get(userId) === this || !remote || !remote.failed) return this;
+        // #1919: never brings back an account removed meanwhile (by Node: get() answers 410; by the
+        // Rust front: its directory is gone, and get() would make it again).
+        if (!fs.existsSync(dir)) throw Object.assign(new Error('account no longer exists'), { status: 410 });
+        return get(userId);
+      },
       /** #1264: a store save this workspace made: reported, and on failure the workspace is
        *  invalidated (see the header). Background writers get the rejection logged; they retry on
        *  their next pass against the re-read files. */

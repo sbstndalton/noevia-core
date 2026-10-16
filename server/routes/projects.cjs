@@ -143,6 +143,13 @@ function createProjectRoutes({
   // #1815: the workspace folder source work is registered under (none when unknown: no registration).
   const sourceWorkDir = () => { try { return (typeof currentWorkspace === 'function' && currentWorkspace()?.dir) || null; } catch { return null; } };
 
+  // #1919: a deferred index removal runs after the save it waited for; by then a source of the same
+  // name may have been uploaded again, and its fresh entries must stay. The names not listed now.
+  const stillGone = (projectId, names) => {
+    const listed = new Set(((getProject(projectId) || {}).files || []).map((f) => f && f.name));
+    return names.filter((name) => !listed.has(name));
+  };
+
   async function handle(req, res, { path: p, authn, url }) {
     // Opt-in asynchronous source processing; the synchronous API remains compatible.
     const sourceJob = p.match(/^\/api\/projects\/([^/]+)\/source-jobs\/([^/]+)$/);
@@ -445,7 +452,7 @@ function createProjectRoutes({
         project.assets = (project.assets || []).filter(a => !a.sourceName || nextNames.has(a.sourceName));
         // #1914: the index entries of removed files go once the list without them is on disk.
         const goneNames = prevFiles.filter((prev) => !nextNames.has(prev.name)).map((prev) => prev.name);
-        if (goneNames.length) dropIndexAfterSave = () => { const userId = currentWorkspace().userId; for (const name of goneNames) rag.deleteProjectFile(id, name, userId); };
+        if (goneNames.length) dropIndexAfterSave = () => { const userId = currentWorkspace().userId; for (const name of stillGone(id, goneNames)) rag.deleteProjectFile(id, name, userId); };
         for (const next of project.files) {
           const prev = prevByName.get(next.name);
           if (!prev || !sourceText.sameText(prev, next)) {
@@ -863,7 +870,7 @@ function createProjectRoutes({
           await whenSaved(() => {
             pruneDocuments(project);
             require('../uploads.cjs').prune(currentWorkspace(), project);
-            rag.deleteProjectFile(id, target, currentWorkspace().userId);
+            for (const name of stillGone(id, [target])) rag.deleteProjectFile(id, name, currentWorkspace().userId);
           });
         } catch (e) { return saveFailureReply(json, res, e, 'could not remove the file from the project; nothing was changed'); }
         saveProjects(PROJECTS);
@@ -1161,7 +1168,7 @@ function createProjectRoutes({
         const nextNames = new Set(project.files.map((f) => f.name));
         // #1914: once the list without them is on disk.
         const goneNames = prev.filter((old) => !nextNames.has(old.name)).map((old) => old.name);
-        if (goneNames.length) { const userId = currentWorkspace().userId; Promise.resolve().then(() => whenSaved(() => { for (const name of goneNames) rag.deleteProjectFile(id, name, userId); })).catch(() => { /* not saved: kept */ }); }
+        if (goneNames.length) { const userId = currentWorkspace().userId; Promise.resolve().then(() => whenSaved(() => { for (const name of stillGone(id, goneNames)) rag.deleteProjectFile(id, name, userId); })).catch(() => { /* not saved: kept */ }); }
         for (const next of project.files) {
           const before = prevByName.get(next.name);
           if (!before || !sourceText.sameText(before, next) || (next.document && ['pending', 'failed', 'unavailable', 'partial'].includes(next.document.indexing))) {
