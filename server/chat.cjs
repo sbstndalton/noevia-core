@@ -1175,6 +1175,16 @@ function createChatHandler({
     // tools, through the on-this-network fetch, with no key and nothing loaded or unloaded on this machine (the provider
     // is not the default one, so every local-engine step below skips it). A machine that is not answering fails the
     // turn, said plainly; it never falls back to another model.
+    // #1880: a turn on a machine is counted there until its response ends, so a measurement never runs beside it.
+    const machineHolds = new Set();
+    const holdMachine = (t) => {
+      const id = t?.machine?.id;
+      if (!id || machineHolds.has(id) || typeof chatMachines?.beginTurn !== 'function') return;
+      machineHolds.add(id);
+      const release = chatMachines.beginTurn(id);
+      res.once('finish', release); res.once('close', release);
+      if (res.writableEnded || res.destroyed) release();
+    };
     let machineTarget = wantsAuto && chatMachines && !routeTarget?.row && provider.id === DEFAULT_PROVIDER_ID && routedRole ? chatMachines.target(routedRole) : null;
     // #1849: a Manual pick of a model a chat role's machine serves (and this machine's catalogue does not list) runs on
     // that machine, under the same rules. The catalogue is read only when some role is on a machine.
@@ -1196,6 +1206,7 @@ function createChatHandler({
       externalProvider = false;
       chatgptProvider = false;
       providerFetch = chatMachines.fetch;
+      holdMachine(machineTarget);
       model = machineTarget.model;
     }
     const automaticLocal = !offBoxTurn({ externalProvider, routeTarget, provider, DEFAULT_PROVIDER_ID });
@@ -1304,6 +1315,7 @@ function createChatHandler({
           chatgptProvider = false;
           providerFetch = chatMachines.fetch;
           machineTarget = to;
+          holdMachine(to);
         } else if (provider.machine) {
           // Back to this machine's engine: the local provider and fetch, as an Automatic turn routed here has.
           provider = getProvider(DEFAULT_PROVIDER_ID);
