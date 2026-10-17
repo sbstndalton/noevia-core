@@ -160,8 +160,8 @@ function createInferenceMachines({ store, audit = () => {}, lookup, embeddingAct
     try { active = embeddingActive(); } catch { active = null; }
     const url = active?.baseUrl || null;
     if (!url) return { machine: LOCAL_ID, port: null, url: null };
-    const local = localEmbeddingUrl();
-    if (local && addressOf(local) === addressOf(url) && portOf(local) === portOf(url)) return { machine: LOCAL_ID, port: null, url };
+    // #1979: a registered machine wins over everything else, so a remote machine whose address the deployment
+    // also names (EMBEDDING_SERVICE_URL) is shown as that machine, not as this one.
     const host = addressOf(url);
     const hit = state.machines.find((m) => m.address.toLowerCase() === host);
     if (hit) return { machine: hit.id, port: portOf(url), url };
@@ -170,6 +170,9 @@ function createInferenceMachines({ store, audit = () => {}, lookup, embeddingAct
       const h = new URL(url).hostname;
       if (!h.includes('.') || h === 'localhost' || /^127\./.test(h) || h === '[::1]') return { machine: LOCAL_ID, port: null, url };
     } catch { /* fall through */ }
+    // Last: an unregistered host the deployment itself names as where embeddings run on this machine.
+    const local = localEmbeddingUrl();
+    if (local && addressOf(local) === host && portOf(local) === portOf(url)) return { machine: LOCAL_ID, port: null, url };
     return { machine: 'other', port: portOf(url), url };
   }
 
@@ -310,7 +313,9 @@ function createInferenceMachines({ store, audit = () => {}, lookup, embeddingAct
       const now = embeddingMachine();
       if (now.machine === (machine ? machine.id : LOCAL_ID) && (!machine || now.port === validPort(body.port))) return view(); // already there
       const baseUrl = machine ? serviceUrl(machine.address, validPort(body.port), '/v1') : localEmbeddingUrl();
-      if (!machine && !baseUrl) throw fail(409, 'noLocalEmbedding', 'This deployment names no embeddings server on this machine, so embeddings cannot move back here from Settings.');
+      // #1979: a deployment address that is a registered machine is that machine, not this one: moving "back" would re-index onto it.
+      const localIsRegistered = !machine && !!baseUrl && state.machines.some((m) => m.address.toLowerCase() === addressOf(baseUrl));
+      if (!machine && (!baseUrl || localIsRegistered)) throw fail(409, 'noLocalEmbedding', 'This deployment names no embeddings server on this machine, so embeddings cannot move back here from Settings.');
       // Not saved here: the re-index (POST /api/embedding set-next, switch, finish) is the one path that moves them.
       throw fail(409, 'reindexRequired', 'Moving embeddings re-indexes projects and the Diary first.', { target: { baseUrl, model: active.model, profile: active.profile } });
     }
