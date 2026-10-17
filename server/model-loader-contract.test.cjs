@@ -30,6 +30,12 @@ function served() {
   assert.match(src, /APIRouter\(prefix="\/api\/v1"\)/);
   const out = new Set();
   for (const m of src.matchAll(/^@router\.(get|post|put|delete|patch)\(\s*"([^"]*)"/gm)) out.add(key(m[1].toUpperCase(), '/api/v1' + m[2]));
+  // #1962: routes the always-native parent serves itself (noevia#1071); the Python app lists them
+  // in NATIVE_OWNED_ROUTES and refuses them, so api.py has no handler for them any more.
+  const main = read('services', 'model-manager', 'app', 'main.py');
+  const owned = main.match(/^NATIVE_OWNED_ROUTES = frozenset\(\{(.*)\}\)$/m);
+  assert.ok(owned, 'NATIVE_OWNED_ROUTES not found in model-manager/app/main.py');
+  for (const m of owned[1].matchAll(/\("([A-Z]+)",\s*"([^"]+)"\)/g)) out.add(key(m[1], m[2]));
   return out;
 }
 
