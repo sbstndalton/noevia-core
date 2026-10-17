@@ -24,7 +24,7 @@ const DOCUMENT_UPLOAD_CAP = 25 * 1024 * 1024;
 function sameSource(a, b) {
   if (a === b) return true;
   if (!a || !b) return false;
-  const meta = (f) => JSON.stringify(Object.keys(f).filter((k) => k !== 'content').sort().map((k) => [k, f[k]]));
+  const meta = (f) => JSON.stringify(Object.keys(f).filter((k) => k !== 'content' && f[k] !== undefined).sort().map((k) => [k, f[k]]));
   return meta(a) === meta(b);
 }
 
@@ -1097,4 +1097,4 @@ function createProjectRoutes({
   };
 }
 
-module.exports = { createProjectRoutes, DOCUMENT_UPLOAD_CAP, IMAGE_UPLOAD_CAP, IMAGE_MIME, get MAX_PROJECT_IMAGES() { return sourceLimits.limits().images; } };
+module.exports = { createProjectRoutes, sameSource, DOCUMENT_UPLOAD_CAP, IMAGE_UPLOAD_CAP, IMAGE_MIME, get MAX_PROJECT_IMAGES() { return sourceLimits.limits().images; } };

@@ -10,7 +10,10 @@
 //   header x-noevia-store-token (else 401); a missing user directory is 410 (never created);
 //   the version is the SHA-256 hex of the file's bytes, '' for a missing file.
 //
-// No file locking (one Node process per data dir in a test). Synthetic data only.
+// `failNext(status, body, { url, times })` makes the next request(s) answer that status and body
+// instead (default: the next /v1/write, once), e.g. 503 { code: 'PROJECTS_BUSY' } as the real store
+// does when its lock times out. No file locking, no 32 MB cap (one Node process per data dir in a
+// test). Synthetic data only.
 const fs = require('node:fs');
 const path = require('node:path');
 const http = require('node:http');
@@ -40,7 +43,7 @@ function valid(file, text) {
 }
 
 /** The request handler over `<dataDir>/users/<user>/<file>`; `writes` lists the files written. */
-function createHandler(dataDir, token, writes = []) {
+function createHandler(dataDir, token, writes = [], failures = []) {
   return (req, res) => {
     const chunks = [];
     req.on('data', (c) => chunks.push(c));
@@ -48,6 +51,8 @@ function createHandler(dataDir, token, writes = []) {
       try {
         if (req.method !== 'POST' || !['/v1/read', '/v1/write'].includes(req.url)) return send(res, 404, { error: 'not found' });
         if (req.headers['x-noevia-store-token'] !== token) return send(res, 401, { error: 'unauthorised' });
+        const planned = failures.find((f) => f.url === req.url && f.times > 0);
+        if (planned) { planned.times -= 1; return send(res, planned.status, planned.body); }
         let body;
         try { body = JSON.parse(Buffer.concat(chunks).toString('utf8')); } catch { return send(res, 400, { error: 'invalid JSON' }); }
         if (!body || typeof body.user !== 'string') return send(res, 400, { error: 'user required' });
@@ -77,9 +82,12 @@ function createHandler(dataDir, token, writes = []) {
 /** Starts the store on 127.0.0.1 (port 0 by default); resolves { port, token, server, writes, close }. */
 async function startProjectStore(dataDir, { port = 0, token = crypto.randomBytes(32).toString('hex') } = {}) {
   const writes = [];
-  const server = http.createServer(createHandler(dataDir, token, writes));
+  const failures = [];
+  const server = http.createServer(createHandler(dataDir, token, writes, failures));
   await new Promise((resolve, reject) => { server.once('error', reject); server.listen(port, '127.0.0.1', resolve); });
-  return { port: server.address().port, token, server, writes, close: () => new Promise((r) => server.close(() => r())) };
+  const failNext = (status, body, { url = '/v1/write', times = 1 } = {}) => { failures.push({ status, body, url, times }); };
+  const clearFailures = () => { failures.length = 0; };
+  return { port: server.address().port, token, server, writes, failNext, clearFailures, close: () => new Promise((r) => server.close(() => r())) };
 }
 
 /** A free loopback port, found synchronously (a child binds port 0 and reports it). */
@@ -100,11 +108,13 @@ function installProjectStore(dataDir, env = process.env) {
   env.NOEVIA_PROJECT_STORE_PORT = String(port);
   env.NOEVIA_PROJECT_STORE_TOKEN = token;
   const writes = [];
-  const server = http.createServer(createHandler(dataDir, token, writes));
+  const failures = [];
+  const server = http.createServer(createHandler(dataDir, token, writes, failures));
+  const failNext = (status, body, { url = '/v1/write', times = 1 } = {}) => { failures.push({ status, body, url, times }); };
   server.on('error', (e) => { console.error(`project store stand-in on ${port}: ${e.message}`); process.exitCode = 1; });
   server.listen(port, '127.0.0.1');
   server.unref();
-  return { port, writes, server };
+  return { port, writes, server, failNext };
 }
 
 module.exports = { startProjectStore, installProjectStore, createHandler, freePortSync };

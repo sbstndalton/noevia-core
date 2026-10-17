@@ -9,7 +9,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const { AsyncLocalStorage } = require('node:async_hooks');
-const { createProjectRoutes, DOCUMENT_UPLOAD_CAP } = require('./projects.cjs');
+const { createProjectRoutes, sameSource, DOCUMENT_UPLOAD_CAP } = require('./projects.cjs');
 const { createProviderRegistry } = require('../providers.cjs');
 
 function fixture({ projects = [], diary = true, catalogue = null, onToolboxesChange, rustProjectWrites = false } = {}) {
@@ -508,4 +508,14 @@ test('#1458: renaming a project moves nothing: its storage folder and every sour
   assert.equal(project.projectFolder, 'noevia projects/proj-1');
   assert.deepEqual(project.sourceFolders, ['noevia projects/proj-1']);
   assert.deepEqual(project.files.map((x) => x.name), ['noevia projects/proj-1/Text/a.md']);
+});
+
+test('sameSource ignores undefined top-level keys, which a store round-trip drops (#1953)', () => {
+  const file = { name: 'notes.txt', size: 12, source: undefined, content: () => 'lazy' };
+  const roundTrip = JSON.parse(JSON.stringify(file));
+  assert.ok(!('source' in roundTrip));
+  assert.equal(sameSource(file, roundTrip), true);
+  assert.equal(sameSource(roundTrip, file), true);
+  assert.equal(sameSource(file, { ...roundTrip, size: 13 }), false);
+  assert.equal(sameSource(file, { ...roundTrip, source: null }), false);
 });
