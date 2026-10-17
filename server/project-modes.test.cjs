@@ -1,4 +1,5 @@
 const test = require('node:test'), assert = require('node:assert/strict');
+const { createStubStore } = require('../tests/server/project-store-stub.cjs');
 const fs = require('node:fs'), os = require('node:os'), path = require('node:path');
 const modes = require('./project-modes.cjs');
 
@@ -36,7 +37,7 @@ test('every project takes chats; only archiving keeps a chat out (#1576, #810)',
 function workspaceWith(projects) {
   const { createWorkspaceStore } = require('./workspace.cjs');
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'noevia-modes-migrate-'));
-  const store = createWorkspaceStore(root, { id: 'default', label: 'Default', baseUrl: 'http://localhost', apiKey: '' }, null);
+  const store = createWorkspaceStore(root, { id: 'default', label: 'Default', baseUrl: 'http://localhost', apiKey: '' }, null, { projectStore: createStubStore(root) });
   const user = '00000000-0000-4000-8000-000000000001';
   const file = path.join(store.userDir(user), 'projects.json');
   fs.mkdirSync(path.dirname(file), { recursive: true });
@@ -46,11 +47,12 @@ function workspaceWith(projects) {
 }
 const backups1576 = (dir) => { const d = path.join(dir, 'migration-backups'); return fs.existsSync(d) ? fs.readdirSync(d).filter((n) => n.startsWith('projects-pre-1576-')) : []; };
 
-test('workspace load migrates a stored Cowork project to Chat, backs up first, keeps its chats and persists it (#1576)', () => {
+test('workspace load migrates a stored Cowork project to Chat, backs up first, keeps its chats and persists it (#1576)', async () => {
   const chats = [{ id: 'task-chat', title: 'Fix the synthetic test', updatedAt: 5, mode: 'cowork' }, { id: 'plain', title: 'Hello', updatedAt: 4 }];
   const w = workspaceWith([{ id: 'old', name: 'Old' }, { id: 'cw', name: 'Synthetic cowork', modes: ['cowork'], chats }, { id: 'code', name: 'Code', modes: ['code'] }]);
   try {
     const ws = w.store.get(w.user);
+    await ws.pendingStoreWrites(); // #1264: the load's save goes through the project store
     assert.deepEqual(ws.projects.map((p) => p.modes), [['chat'], ['chat', 'cowork'], ['chat', 'code']]);
     const saved = JSON.parse(fs.readFileSync(w.file, 'utf8')).projects;
     assert.deepEqual(saved.map((p) => p.modes), [['chat'], ['chat', 'cowork'], ['chat', 'code']]);
@@ -73,25 +75,27 @@ test('an already migrated workspace is not rewritten or backed up again (#1576)'
   } finally { fs.rmSync(w.root, { recursive: true, force: true }); }
 });
 
-test('a failed #1576 backup keeps the migrated modes off the disk, through the #1806 save too, until a backup succeeds (#1839)', () => {
+test('a failed #1576 backup keeps the migrated modes off the disk, through the #1806 save too, until a backup succeeds (#1839)', async () => {
   const sourceText = require('./source-text.cjs');
   const real = sourceText.backupProjectsFile;
   const w = workspaceWith([{ id: 'cw', name: 'Synthetic', modes: ['cowork'], files: [{ id: 'f', name: 'a.txt', content: 'inline text' }] }, { id: 'old', name: 'Old' }]);
   try {
     sourceText.backupProjectsFile = (dir, tag = '1806') => { if (tag === '1576') throw new Error('disk full (synthetic)'); return real(dir, tag); };
     const ws = w.store.get(w.user);
+    // #1264: the load's save goes through the project store; the held modes come back once it is written.
+    await ws.pendingStoreWrites(); await new Promise((r) => setImmediate(r));
     assert.deepEqual(ws.projects.map((p) => p.modes), [['chat', 'cowork'], ['chat']], 'the migration still applies in memory');
     let disk = JSON.parse(fs.readFileSync(w.file, 'utf8')).projects;
     assert.ok(disk[0].files[0].textRef, 'the #1806 save did run');
     assert.deepEqual(disk[0].modes, ['cowork'], 'original modes stay on disk after the load save');
     assert.equal(disk[1].modes, undefined);
     assert.deepEqual(backups1576(w.dir), []);
-    ws.projects[1].name = 'Renamed'; ws.saveProjects();
+    ws.projects[1].name = 'Renamed'; await ws.saveProjects();
     disk = JSON.parse(fs.readFileSync(w.file, 'utf8')).projects;
     assert.equal(disk[1].name, 'Renamed'); assert.deepEqual(disk[0].modes, ['cowork']);
     assert.deepEqual(ws.projects.map((p) => p.modes), [['chat', 'cowork'], ['chat']], 'memory is unchanged by a held save');
     sourceText.backupProjectsFile = real;
-    ws.saveProjects();
+    await ws.saveProjects();
     disk = JSON.parse(fs.readFileSync(w.file, 'utf8')).projects;
     assert.deepEqual(disk.map((p) => p.modes), [['chat', 'cowork'], ['chat']], 'written once a backup exists');
     assert.equal(backups1576(w.dir).length, 1);

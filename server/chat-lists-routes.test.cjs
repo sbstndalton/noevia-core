@@ -10,6 +10,8 @@ const test = require('node:test');
 const testDataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'noevia-chat-lists-route-test-'));
 process.env.DIARY_AUTH_TOKEN = 'test-cowork-token';
 process.env.UI_DATA_DIR = testDataDir;
+// #1071: Node saves projects.json / free-chats.json only through the Rust project store.
+require('../tests/server/project-store-server.cjs').installProjectStore(testDataDir);
 process.env.LEGACY_AUTH_COMPAT = 'true';
 process.env.PUBLIC_ORIGIN = 'http://localhost';
 
@@ -54,9 +56,10 @@ async function request(url, { method = 'GET', headers = {}, body = '' } = {}) {
 
 let cookie = '';
 let csrf = '';
+let userId = '';
 test.before(async () => {
   // Sign-in is the Rust front's (#1071): the account and its session are seeded directly.
-  ({ cookie, csrf } = require('../tests/server/seed-account.cjs').seedAccount(testDataDir, { username: 'admin', displayName: 'Admin', publicOrigin: 'http://localhost' }));
+  ({ cookie, csrf, id: userId } = require('../tests/server/seed-account.cjs').seedAccount(testDataDir, { username: 'admin', displayName: 'Admin', publicOrigin: 'http://localhost' }));
 });
 
 const mutationHeaders = () => ({ origin: 'http://localhost', cookie, 'content-type': 'application/json', 'x-csrf-token': csrf });
@@ -65,33 +68,52 @@ const post = (url, body, headers = mutationHeaders()) => request(url, { method: 
 const realFetch = global.fetch;
 
 const meta = (id, title = id, updatedAt = 1000) => ({ id, title, updatedAt, preview: '' });
-const freeChats = async () => JSON.parse((await request('/api/freechats', { headers: mutationHeaders() })).text).chats.map((c) => c.id).sort();
+// The chat-list and free-chat-list saves are the Rust front's (sbstndalton/noevia#1071; their merge
+// is noevia-rs crates/server-projects): here the front's write is the file as the front writes it,
+// replaced whole, and Node takes it in at the next request start. What Node still does with the
+// lists (a delete, a move, a transcript) runs through its own routes; its view is /api/workspace.
+const userFile = (name) => path.join(testDataDir, 'users', userId, name);
+function frontWrite(file, value) { fs.writeFileSync(`${file}.front`, JSON.stringify(value, null, 2)); fs.renameSync(`${file}.front`, file); }
+async function frontSaveFree(metas) {
+  await request('/api/workspace', { headers: mutationHeaders() }); // the workspace (and its directory) exists
+  let list = [];
+  try { list = JSON.parse(fs.readFileSync(userFile('free-chats.json'), 'utf8')) || []; } catch { /* none yet */ }
+  for (const m of metas) { const i = list.findIndex((c) => c.id === m.id); if (i >= 0) list[i] = { ...list[i], ...m }; else list.unshift(m); }
+  frontWrite(userFile('free-chats.json'), list);
+}
+const workspace = async () => JSON.parse((await request('/api/workspace', { headers: mutationHeaders() })).text);
+const freeChats = async () => (await workspace()).freeChats.map((c) => c.id).sort();
+const freeMeta = async (id) => (await workspace()).freeChats.find((c) => c.id === id);
+const projectChats = async (projectId) => (await workspace()).projects.find((p) => p.id === projectId).chats;
 
-test('saving a stale free-chat list keeps chats another tab created, and never resurrects a deleted one', async () => {
-  assert.equal((await post('/api/freechats', { chats: [meta('c-alpha')] })).status, 200);
-  assert.equal((await post('/api/freechats', { chats: [meta('c-bravo')] })).status, 200, 'a tab that never saw alpha');
+test('Node refuses the list saves the front owns; it follows the front\'s free-chat list and a delete here sticks', async () => {
+  for (const [method, url] of [['GET', '/api/freechats'], ['POST', '/api/freechats'], ['GET', '/api/projects/p1/chats'], ['POST', '/api/projects/p1/chats']]) {
+    const r = await request(url, { method, headers: mutationHeaders(), body: method === 'POST' ? JSON.stringify({ chats: [meta('c-refused')] }) : '' });
+    assert.equal(r.status, 503, `${method} ${url}`);
+    assert.equal(JSON.parse(r.text).code, 'RUST_PROJECTS_OWNED');
+  }
+  await frontSaveFree([meta('c-alpha'), meta('c-bravo')]);
   assert.deepEqual(await freeChats(), ['c-alpha', 'c-bravo']);
-  await post('/api/freechats', { chats: [meta('c-alpha', 'Renamed alpha', 2000)] });
-  const renamed = JSON.parse((await request('/api/freechats', { headers: mutationHeaders() })).text).chats.find((c) => c.id === 'c-alpha');
-  assert.equal(renamed.title, 'Renamed alpha');
+  assert.ok(!(await freeChats()).includes('c-refused'));
   assert.equal((await request('/api/freechats/c-alpha', { method: 'DELETE', headers: mutationHeaders() })).status, 200);
-  await post('/api/freechats', { chats: [meta('c-alpha'), meta('c-bravo')] });
-  assert.deepEqual(await freeChats(), ['c-bravo'], 'a stale list must not bring a deleted chat back');
+  assert.deepEqual(await freeChats(), ['c-bravo']);
+  assert.deepEqual(JSON.parse(fs.readFileSync(userFile('free-chats.json'), 'utf8')).map((c) => c.id), ['c-bravo'], 'saved through the store');
 });
 
-test('project chat lists merge the same way', async () => {
+test('a chat deleted from a project here is gone from the project on disk', async () => {
   const project = JSON.parse((await post('/api/projects', { name: 'Synthetic lists' })).text);
-  await post(`/api/projects/${project.id}/chats`, { chats: [meta('p-one')] });
-  await post(`/api/projects/${project.id}/chats`, { chats: [meta('p-two')] });
-  const ids = async () => JSON.parse((await request(`/api/projects/${project.id}/chats`, { headers: mutationHeaders() })).text).chats.map((c) => c.id).sort();
-  assert.deepEqual(await ids(), ['p-one', 'p-two']);
+  const file = JSON.parse(fs.readFileSync(userFile('projects.json'), 'utf8'));
+  file.projects.find((p) => p.id === project.id).chats = [meta('p-one'), meta('p-two')];
+  frontWrite(userFile('projects.json'), file);
+  assert.deepEqual((await projectChats(project.id)).map((c) => c.id), ['p-one', 'p-two']);
   assert.equal((await request(`/api/projects/${project.id}/chats/p-one`, { method: 'DELETE', headers: mutationHeaders() })).status, 200);
-  await post(`/api/projects/${project.id}/chats`, { chats: [meta('p-one'), meta('p-two')] });
-  assert.deepEqual(await ids(), ['p-two']);
+  assert.deepEqual((await projectChats(project.id)).map((c) => c.id), ['p-two']);
+  const onDisk = JSON.parse(fs.readFileSync(userFile('projects.json'), 'utf8')).projects.find((p) => p.id === project.id).chats.map((c) => c.id);
+  assert.deepEqual(onDisk, ['p-two']);
 });
 
 test('a late history save for a deleted chat does not write the transcript back', async () => {
-  await post('/api/freechats', { chats: [meta('c-deleted-while-streaming')] });
+  await frontSaveFree([meta('c-deleted-while-streaming')]);
   await post('/api/chats/c-deleted-while-streaming/history', { history: [{ role: 'user', content: 'first' }] });
   assert.equal((await request('/api/freechats/c-deleted-while-streaming', { method: 'DELETE', headers: mutationHeaders() })).status, 200);
   const late = await post('/api/chats/c-deleted-while-streaming/history', { history: [{ role: 'user', content: 'first' }, { role: 'assistant', content: 'late reply' }] });
@@ -100,34 +122,18 @@ test('a late history save for a deleted chat does not write the transcript back'
   assert.deepEqual(read, []);
 });
 
-// Chat framing, phase 2 (#738): what the confirm row writes reaches storage, and the move path.
+// Chat framing, phase 2 (#738): the move path.
 const frame = (extra = {}) => ({ projectId: null, kind: 'idea', tags: ['plans'], links: [], confirmed: true, source: 'user', ...extra });
-const freeMeta = async (id) => JSON.parse((await request('/api/freechats', { headers: mutationHeaders() })).text).chats.find((c) => c.id === id);
-
-test('list saves keep a frame and createdAt; frame null clears it and an older tab cannot erase it (#738)', async () => {
-  await post('/api/freechats', { chats: [{ ...meta('c-framed'), createdAt: 500, frame: frame() }] });
-  assert.deepEqual((await freeMeta('c-framed')).frame, frame());
-  assert.equal((await freeMeta('c-framed')).createdAt, 500);
-  await post('/api/freechats', { chats: [{ ...meta('c-framed', 'Older tab'), createdAt: 900 }] });
-  assert.deepEqual((await freeMeta('c-framed')).frame, frame(), 'a meta without a frame keeps the stored one');
-  assert.equal((await freeMeta('c-framed')).createdAt, 500, 'createdAt is set once');
-  await post('/api/freechats', { chats: [{ ...meta('c-framed'), frame: null }] });
-  assert.ok(!(await freeMeta('c-framed')).frame, 'frame: null clears it');
-  const project = JSON.parse((await post('/api/projects', { name: 'Synthetic framed' })).text);
-  await post(`/api/projects/${project.id}/chats`, { chats: [{ ...meta('p-framed'), frame: frame({ projectId: project.id }) }] });
-  const stored = JSON.parse((await request(`/api/projects/${project.id}/chats`, { headers: mutationHeaders() })).text).chats.find((c) => c.id === 'p-framed');
-  assert.deepEqual(stored.frame, frame({ projectId: project.id }));
-});
 
 test('accepting a frame moves the chat into the project with its frame; the transcript stays readable (#738)', async () => {
   const project = JSON.parse((await post('/api/projects', { name: 'Synthetic destination' })).text);
-  await post('/api/freechats', { chats: [meta('c-moving', 'Moving chat')] });
+  await frontSaveFree([meta('c-moving', 'Moving chat')]);
   await post('/api/chats/c-moving/history', { history: [{ role: 'user', content: 'synthetic first message' }] });
   const moved = await post('/api/chats/c-moving/move', { projectId: project.id, frame: frame({ projectId: project.id }) });
   assert.equal(moved.status, 200);
   assert.deepEqual(JSON.parse(moved.text), { ok: true, from: null, projectId: project.id });
   assert.ok(!(await freeMeta('c-moving')), 'gone from the free list');
-  const inProject = JSON.parse((await request(`/api/projects/${project.id}/chats`, { headers: mutationHeaders() })).text).chats.find((c) => c.id === 'c-moving');
+  const inProject = (await projectChats(project.id)).find((c) => c.id === 'c-moving');
   assert.equal(inProject.title, 'Moving chat');
   assert.deepEqual(inProject.frame, frame({ projectId: project.id }));
   const history = JSON.parse((await request('/api/chats/c-moving/history', { headers: mutationHeaders() })).text).history;
@@ -140,7 +146,7 @@ test('accepting a frame moves the chat into the project with its frame; the tran
 });
 
 test('the move refuses unknown, deleted and malformed targets without changing anything (#738)', async () => {
-  await post('/api/freechats', { chats: [meta('c-stays')] });
+  await frontSaveFree([meta('c-stays')]);
   assert.equal((await post('/api/chats/c-stays/move', { projectId: 'no-such-project' })).status, 404);
   assert.ok(await freeMeta('c-stays'), 'still in the free list after a refused move');
   assert.equal((await post('/api/chats/no-such-chat/move', { projectId: null })).status, 404);
@@ -151,30 +157,19 @@ test('the move refuses unknown, deleted and malformed targets without changing a
   assert.equal((await request('/api/chats/c-stays/move', { method: 'POST', headers: { origin: 'http://localhost', 'content-type': 'application/json' }, body: JSON.stringify({ projectId: null }) })).status >= 401, true, 'signed out (no session, no CSRF) is refused');
 });
 
-test('a stale whole-list save never copies a moved chat back into its old list (#755)', async () => {
+test('a moved chat is held by its new list exactly once, both ways (#755)', async () => {
   const project = JSON.parse((await post('/api/projects', { name: 'Synthetic stale target' })).text);
-  const projectIds = async () => JSON.parse((await request(`/api/projects/${project.id}/chats`, { headers: mutationHeaders() })).text).chats.map((c) => c.id);
-  await post('/api/freechats', { chats: [meta('c-stale-f1')] });
+  await frontSaveFree([meta('c-stale-f1')]);
   assert.equal((await post('/api/chats/c-stale-f1/move', { projectId: project.id })).status, 200);
-  const staleFree = await post('/api/freechats', { chats: [meta('c-stale-f1', 'stale tab', 5000), meta('c-stale-other')] });
-  assert.equal(staleFree.status, 200);
-  assert.deepEqual(JSON.parse(staleFree.text), { ok: true, skipped: ['c-stale-f1'] }, 'the stale tab learns its chat lives elsewhere (#765)');
-  assert.deepEqual(JSON.parse((await post('/api/freechats', { chats: [meta('c-stale-other')] })).text), { ok: true }, 'unchanged when nothing is skipped');
-  assert.ok(!(await freeChats()).includes('c-stale-f1'), 'the free list does not get the moved chat back');
-  assert.ok((await freeChats()).includes('c-stale-other'), 'the rest of the stale list still saves');
-  assert.deepEqual((await projectIds()).filter((id) => id === 'c-stale-f1'), ['c-stale-f1'], 'the project holds it exactly once');
-  // Reverse: moved back out to the free list, a stale project-list save must not re-add it.
+  assert.ok(!(await freeChats()).includes('c-stale-f1'), 'the free list does not keep the moved chat');
+  assert.deepEqual((await projectChats(project.id)).map((c) => c.id).filter((id) => id === 'c-stale-f1'), ['c-stale-f1'], 'the project holds it exactly once');
   assert.equal((await post('/api/chats/c-stale-f1/move', { projectId: null })).status, 200);
-  const staleProject = await post(`/api/projects/${project.id}/chats`, { chats: [meta('c-stale-f1', 'stale tab', 6000)] });
-  assert.equal(staleProject.status, 200);
-  assert.deepEqual(JSON.parse(staleProject.text), { ok: true, skipped: ['c-stale-f1'] }, 'the project save reports it too (#765)');
-  assert.deepEqual(JSON.parse((await post(`/api/projects/${project.id}/chats`, { chats: [] })).text), { ok: true });
-  assert.ok(!(await projectIds()).includes('c-stale-f1'), 'the project list does not get it back');
-  assert.ok((await freeChats()).includes('c-stale-f1'), 'still in the free list');
+  assert.ok(!(await projectChats(project.id)).some((c) => c.id === 'c-stale-f1'), 'the project list does not keep it');
+  assert.ok((await freeChats()).includes('c-stale-f1'), 'back in the free list');
 });
 
 test('a move with an invalid frame is refused and keeps the stored frame (#759)', async () => {
-  await post('/api/freechats', { chats: [{ ...meta('c-bad-frame'), frame: frame() }] });
+  await frontSaveFree([{ ...meta('c-bad-frame'), frame: frame() }]);
   const project = JSON.parse((await post('/api/projects', { name: 'Synthetic bad frame' })).text);
   const res = await post('/api/chats/c-bad-frame/move', { projectId: project.id, frame: { kind: 'bogus' } });
   assert.equal(res.status, 400);
@@ -200,7 +195,7 @@ test('the move never puts a chat into an archived project; a once Code-only proj
   const code = JSON.parse((await post('/api/projects', { name: 'Synthetic code only', modes: ['code'] })).text);
   const archived = JSON.parse((await post('/api/projects', { name: 'Synthetic archived' })).text);
   assert.equal((await post(`/api/projects/${archived.id}/config`, { archived: true })).status, 200);
-  await post('/api/freechats', { chats: [meta('c-810')] });
+  await frontSaveFree([meta('c-810')]);
   const refused = await post('/api/chats/c-810/move', { projectId: archived.id, frame: frame({ projectId: archived.id }) });
   assert.equal(refused.status, 404);
   assert.ok(await freeMeta('c-810'), 'still in the free list');

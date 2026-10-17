@@ -3,6 +3,7 @@
 // Synthetic fixtures only.
 
 const assert = require('node:assert/strict');
+const { createStubStore } = require('../tests/server/project-store-stub.cjs');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
@@ -50,11 +51,12 @@ function seed(root, data = legacy()) {
 const onDisk = (file) => JSON.parse(fs.readFileSync(file, 'utf8'));
 const backups = (dir) => (fs.existsSync(path.join(dir, 'migration-backups')) ? fs.readdirSync(path.join(dir, 'migration-backups')).filter((n) => n.startsWith('projects-pre-1806-')) : []);
 
-test('#1806 migration: inline text moves to 0600 per-source files after a byte-exact backup; projects.json keeps metadata and pointers', () => {
+test('#1806 migration: inline text moves to 0600 per-source files after a byte-exact backup; projects.json keeps metadata and pointers', async () => {
   sourceText._cache.clear();
   const root = tmp();
   const { dir, file, bytes } = seed(root);
-  const ws = createWorkspaceStore(root, DEFAULT, null).get(USER);
+  const ws = createWorkspaceStore(root, DEFAULT, null, { projectStore: createStubStore(root) }).get(USER);
+  await ws.pendingStoreWrites(); // the load's save goes through the Rust project store (#1264)
 
   const saved = onDisk(file);
   assert.ok(!fs.readFileSync(file, 'utf8').includes('Alpha beta gamma'), 'no source text left in projects.json');
@@ -83,13 +85,13 @@ test('#1806 migration: inline text moves to 0600 per-source files after a byte-e
   assert.equal(ws.projects[0].files[4].content, undefined);
 });
 
-test('#1806 migration is idempotent, survives an interruption, and rolls back losslessly with the inline tool', () => {
+test('#1806 migration is idempotent, survives an interruption, and rolls back losslessly with the inline tool', async () => {
   sourceText._cache.clear();
   const root = tmp();
   const { dir, file, bytes } = seed(root);
   // Interrupted run: the backup and one text file were written (and a temp file left behind),
   // then the process died before projects.json was replaced.
-  createWorkspaceStore(root, DEFAULT, null).get(USER);
+  await createWorkspaceStore(root, DEFAULT, null, { projectStore: createStubStore(root) }).get(USER).pendingStoreWrites();
   const migrated = fs.readFileSync(file);
   fs.writeFileSync(file, bytes);
   const partial = path.join(dir, 'project-sources', 'proj-b');
@@ -97,14 +99,14 @@ test('#1806 migration is idempotent, survives an interruption, and rolls back lo
   fs.mkdirSync(partial, { recursive: true });
   fs.writeFileSync(path.join(partial, 'x.txt.123.tmp'), 'half');
 
-  createWorkspaceStore(root, DEFAULT, null).get(USER);
+  await createWorkspaceStore(root, DEFAULT, null, { projectStore: createStubStore(root) }).get(USER).pendingStoreWrites();
   assert.deepEqual(fs.readFileSync(file), migrated, 'the rerun reaches the same projects.json');
   assert.deepEqual(fs.readdirSync(partial), [`${sha('bravo synthetic text')}.txt`], 'a stale temp file is removed');
   assert.equal(backups(dir).length, 1, 'the same original is backed up once');
 
   // A third load has nothing to move: no new backup, no rewrite.
   const stamp = fs.statSync(file).mtimeMs;
-  const ws = createWorkspaceStore(root, DEFAULT, null).get(USER);
+  const ws = createWorkspaceStore(root, DEFAULT, null, { projectStore: createStubStore(root) }).get(USER);
   assert.equal(fs.statSync(file).mtimeMs, stamp);
   assert.equal(backups(dir).length, 1);
   assert.equal(ws.projects[0].files[1].content, SKILL);
@@ -114,11 +116,12 @@ test('#1806 migration is idempotent, survives an interruption, and rolls back lo
   assert.deepEqual(onDisk(file), JSON.parse(bytes.toString('utf8')));
 });
 
-test('#1806 saves: new or edited text is written out before projects.json, unused text files are removed, spreads and snapshots still read', () => {
+test('#1806 saves: new or edited text is written out before projects.json, unused text files are removed, spreads and snapshots still read', async () => {
   sourceText._cache.clear();
   const root = tmp();
   const { dir, file } = seed(root);
-  const ws = createWorkspaceStore(root, DEFAULT, null).get(USER);
+  const ws = createWorkspaceStore(root, DEFAULT, null, { projectStore: createStubStore(root) }).get(USER);
+  await ws.pendingStoreWrites();
   const a = ws.projects[0];
 
   const copy = { ...a.files[0] };
@@ -130,7 +133,7 @@ test('#1806 saves: new or edited text is written out before projects.json, unuse
   a.files[0].content = 'edited synthetic text';
   a.files.push({ name: 'new.md', content: 'brand new synthetic text' });
   a.files = a.files.filter((f) => f.name !== 'empty.txt');
-  ws.saveProjects();
+  await ws.saveProjects();
   const saved = onDisk(file).projects[0].files;
   assert.ok(!fs.readFileSync(file, 'utf8').includes('synthetic text'), 'no text in projects.json');
   assert.equal(saved[0].textRef, sha('edited synthetic text'));
@@ -143,7 +146,7 @@ test('#1806 saves: new or edited text is written out before projects.json, unuse
 
   // A project that is deleted loses its text folder on the next save.
   ws.projects.splice(1, 1);
-  ws.saveProjects();
+  await ws.saveProjects();
   assert.ok(!fs.existsSync(path.join(dir, 'project-sources', 'proj-b')));
 });
 
@@ -151,7 +154,7 @@ test('#1806 readers: the chat file injection, skills and coverage get the text o
   sourceText._cache.clear();
   const root = tmp();
   seed(root);
-  const ws = createWorkspaceStore(root, DEFAULT, null).get(USER);
+  const ws = createWorkspaceStore(root, DEFAULT, null, { projectStore: createStubStore(root) }).get(USER);
   const a = ws.projects[0];
 
   // instruction skills: the flag keeps the candidate without a read; the body is the text.
@@ -178,13 +181,14 @@ test('#1806 readers: the chat file injection, skills and coverage get the text o
   assert.deepEqual(coverage.partialSources([a.files.at(-1)], []).map((p) => [p.name, p.length]), [['big.md', 50000]]);
 });
 
-test('#1806 a save of 1000 sources reads no source text and takes under 50 ms; projects.json stays small', () => {
+test('#1806 a save of 1000 sources reads no source text and takes under 50 ms; projects.json stays small', async () => {
   sourceText._cache.clear();
   const root = tmp();
   const filler = 'synthetic source text '.repeat(4600); // ~100k characters each (half the per-source maximum)
   const files = Array.from({ length: 1000 }, (_, i) => ({ name: `folder/sub-${i % 20}/file-${i}.md`, content: `# File ${i}\n${filler}` }));
   const { dir, file } = seed(root, { projects: [{ id: 'proj-big', name: 'Big', modes: ['chat'], files, chats: [] }] });
-  const ws = createWorkspaceStore(root, DEFAULT, null).get(USER);
+  const ws = createWorkspaceStore(root, DEFAULT, null, { projectStore: createStubStore(root) }).get(USER);
+  await ws.pendingStoreWrites();
 
   const reads = [];
   const real = fs.readFileSync;
@@ -199,6 +203,8 @@ test('#1806 a save of 1000 sources reads no source text and takes under 50 ms; p
       times.push(Number(process.hrtime.bigint() - t0) / 1e6);
     }
   } finally { fs.readFileSync = real; }
+  // #1264: what Node does is timed above; the store writes the file after (the last save wins).
+  await ws.pendingStoreWrites();
   times.sort((x, y) => x - y);
   assert.ok(times[3] < 50, `median save ${times[3].toFixed(1)} ms`);
   assert.ok(fs.statSync(file).size < 512 * 1024, `projects.json is ${fs.statSync(file).size} bytes`);
@@ -207,13 +213,12 @@ test('#1806 a save of 1000 sources reads no source text and takes under 50 ms; p
 });
 
 // #1264: with the front sharing projects.json, Node saves through the Rust project store (a stand-in here).
-const { createStubStore } = require('../tests/server/project-store-stub.cjs');
 
 test('#1806 with the Rust front sharing projects.json: the migration saves through the store, and a front write keeps the pointers', async () => {
   sourceText._cache.clear();
   const root = tmp();
   const { file } = seed(root);
-  const store = createWorkspaceStore(root, DEFAULT, null, { rustProjects: true, rustFreeChats: true, projectStore: createStubStore(root) });
+  const store = createWorkspaceStore(root, DEFAULT, null, { projectStore: createStubStore(root) });
   await store.get(USER).pendingStoreWrites();
   const front = onDisk(file);
   assert.equal(front.projects[0].files[0].textRef, sha('# Synthetic notes\n\nAlpha beta gamma.'));
@@ -232,15 +237,16 @@ test('#1806 with the Rust front sharing projects.json: the migration saves throu
   assert.equal(ws.projects[1].files[0].content, 'edited after the front');
 });
 
-test('#1806 the startup sweep migrates only workspaces that still hold inline text', () => {
+test('#1806 the startup sweep migrates only workspaces that still hold inline text', async () => {
   sourceText._cache.clear();
   const root = tmp();
   const { file } = seed(root);
   const clean = '22222222-3333-4444-8555-666666666666';
   fs.mkdirSync(path.join(root, 'users', clean), { recursive: true });
   fs.writeFileSync(path.join(root, 'users', clean, 'projects.json'), JSON.stringify({ projects: [{ id: 'p', name: 'P', files: [] }] }));
-  const store = createWorkspaceStore(root, DEFAULT, null);
+  const store = createWorkspaceStore(root, DEFAULT, null, { projectStore: createStubStore(root) });
   assert.deepEqual(store.migrateSourceText([USER, clean, 'not-a-user-id']), [USER]);
+  await store.get(USER).pendingStoreWrites();
   assert.ok(!fs.readFileSync(file, 'utf8').includes('Alpha beta gamma'));
-  assert.deepEqual(createWorkspaceStore(root, DEFAULT, null).migrateSourceText([USER, clean]), [], 'nothing left to move');
+  assert.deepEqual(createWorkspaceStore(root, DEFAULT, null, { projectStore: createStubStore(root) }).migrateSourceText([USER, clean]), [], 'nothing left to move');
 });

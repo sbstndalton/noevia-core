@@ -6,21 +6,17 @@
 // its chat list (GET and POST /api/projects/{id}/chats); the third the free-chat list (GET and POST
 // /api/freechats; DELETE /api/freechats/{id} stays Node's, see "free-chats.json" below).
 //
-// The switch is NOEVIA_RUST_PROJECTS=1 (exactly) together with NOEVIA_FRONT=rust (M3, Rust-owned
-// sign-in, is permanent since sbstndalton/noevia#1071: the front gates Rust-owned routes itself)
-// and the supervisor's NOEVIA_RUST_PROJECTS_CONFIRMED=1 (set only once the front's --features lists rust-projects).
-// Anything less and the switch is ignored here (a warning is printed) and Node keeps doing
-// everything, as before. Each slice after the first is confirmed on its own, because a front that
-// lists rust-projects may predate it: the chat-list save is refused here only with
-// NOEVIA_RUST_PROJECT_CHATS_CONFIRMED=1 as well (set only once the front's --features lists
-// rust-project-chats; chatsEnabledFrom). Without it a front that answers only the images forwards
-// the chat-list save here, and Node keeps answering it (sbstndalton/noevia#1409). The free-chat
-// list likewise needs NOEVIA_RUST_FREE_CHATS_CONFIRMED=1 (the front lists rust-free-chats;
-// freeChatsEnabledFrom).
+// Permanent since sbstndalton/noevia#1071: the switch NOEVIA_RUST_PROJECTS and the supervisor's
+// confirmations of each slice (NOEVIA_RUST_PROJECTS_CONFIRMED, NOEVIA_RUST_PROJECT_CHATS_CONFIRMED,
+// NOEVIA_RUST_FREE_CHATS_CONFIRMED) are retired and not read. Node never answers the routes in
+// OWNED_ROUTES (refuseOwnedRoute answers 503 RUST_PROJECTS_OWNED before any other mount, whoever
+// asks), its copies of them are gone, and it never writes projects.json or free-chats.json itself:
+// every save goes through the front's project store (project-store-client.cjs), which index.cjs
+// requires at startup. A leftover NOEVIA_RUST_PROJECTS only earns a warning (warnRetired). The web
+// supervisor refuses to start without a front that serves every slice.
 //
-// projects.json cannot have one writer yet: Node's other routes (the chat turn, a chat's move or
-// delete, the config route) still change it. So while the switch is on, both processes write it only under one shared lock and
-// never from a stale copy:
+// Node's other routes (the chat turn, a chat's move or delete, the config route) still change
+// projects.json, but never from a stale copy and never by writing the file themselves:
 //
 //   - Rust is the only process that writes either file (sbstndalton/noevia#1264): Node saves
 //     through the front's internal project store (project-store-client.cjs), a compare-and-swap
@@ -38,14 +34,14 @@
 //     changed on both sides is last-writer-wins. Every request start re-reads the file
 //     when its (ino, size, mtime) changed, refreshing unchanged projects in place, so a handler
 //     holding a project object still sees the current one.
-//   - Node's copies of the Rust-owned write routes answer 503 RUST_PROJECTS_OWNED (refuseOwned),
-//     so a request that reaches Node directly cannot write behind the front's back. The reads stay.
+//   - Node refuses the Rust-owned routes, reads and writes alike, with 503 RUST_PROJECTS_OWNED
+//     (refuseOwnedRoute), so a request that reaches Node directly cannot write behind the front's
+//     back.
 //
 // free-chats.json (the free-chat slice) has the same problem and the same answer: Node's chat turn
 // (the routing flags), a chat's move, a free chat's delete, the retention sweep and an import still
-// write it. While the slice is on, both processes write it only under `free-chats.json.lock` (the
-// same flock and wait). Rust re-reads it under the lock for every save. Node keeps its cached list,
-// re-reads it at each request start when its (ino, size, mtime) changed, and saves under the lock:
+// write it. Rust writes it under its lock and re-reads it for every save. Node keeps its cached list,
+// re-reads it at each request start when its (ino, size, mtime) changed, and saves through the store:
 // when the file still holds what this process last read or wrote, its list as it is; otherwise
 // the chat metas are merged per item against that base (mergeIdList: additions from both sides,
 // removals since the base from either side, a meta both changed merged per field, #1801), newest first
@@ -57,7 +53,7 @@
 //
 // Project writes (sbstndalton/noevia#1264): the rest of Node's projects.json and free-chats.json
 // writers move to the front slice by slice, each behind a second switch, NOEVIA_RUST_PROJECT_WRITES=1
-// (off by default; NOEVIA_RUST_PROJECTS=1 alone never moves them), confirmed by the supervisor only
+// (off by default), confirmed by the supervisor only
 // for a front whose --features lists rust-project-writes (NOEVIA_RUST_PROJECT_WRITES_CONFIRMED=1):
 // projectWritesEnabledFrom. PROJECT_WRITE_ROUTES lists them (noevia-rs contracts/http/routes.toml,
 // switch = "NOEVIA_RUST_PROJECT_WRITES"); Node's copies refuse them (refuseOwned) while it is on.
@@ -70,11 +66,10 @@
 const fs = require('fs');
 
 
-/** The routes a Rust front can answer under the switch: METHOD path-pattern. noevia-rs
- *  contracts/http/routes.toml (switch = "NOEVIA_RUST_PROJECTS") is the other half; noevia's
- *  deploy/tools/assemble-release.sh refuses a release whose front owns a project route missing
- *  here. The chat-list routes are the front's only with chatsEnabledFrom, the free-chat routes
- *  only with freeChatsEnabledFrom. */
+/** The project routes the Rust front always answers and Node always refuses (refuseOwnedRoute):
+ *  METHOD path-pattern. noevia-rs contracts/http/routes.toml (owner = "rust", no switch since
+ *  #1071) is the other half; noevia's deploy/tools/assemble-release.sh refuses a release whose
+ *  front owns a project route missing here. */
 const OWNED_ROUTES = Object.freeze(new Set([
   'POST /api/projects/{id}/assets',
   'GET /api/projects/{id}/assets/{assetId}',
@@ -93,18 +88,36 @@ const PROJECT_WRITE_ROUTES = Object.freeze(new Set([
   'POST /api/chats/{chatId}/context',
 ]));
 
-/** Whether the switch is on for this process (see the header). */
-function enabledFrom(env = process.env, warn = console.warn) {
-  if (env.NOEVIA_RUST_PROJECTS !== '1') return false;
-  if (env.NOEVIA_FRONT !== 'rust') {
-    warn('NOEVIA_RUST_PROJECTS=1 is ignored: the Rust front answers project routes only with NOEVIA_FRONT=rust.');
-    return false;
-  }
-  if (env.NOEVIA_RUST_PROJECTS_CONFIRMED !== '1') {
-    warn('NOEVIA_RUST_PROJECTS=1 is ignored: the supervisor has not confirmed that the Rust front supports rust-projects (NOEVIA_RUST_PROJECTS_CONFIRMED).');
-    return false;
-  }
+// OWNED_ROUTES as Node's own handlers matched them (one path segment per parameter).
+const OWNED_ROUTE_PATTERNS = Object.freeze([
+  [/^\/api\/projects\/[^/]+\/assets$/, ['POST']],
+  [/^\/api\/projects\/[^/]+\/assets\/[^/]+$/, ['GET', 'DELETE']],
+  [/^\/api\/projects\/[^/]+\/chats$/, ['GET', 'POST']],
+  [/^\/api\/freechats$/, ['GET', 'POST']],
+]);
+
+const ROUTE_REFUSAL = Object.freeze({ error: 'This route is served by the Rust front.', code: 'RUST_PROJECTS_OWNED' });
+
+/** Whether `method pathname` (a WHATWG pathname) is one of the Rust front's project routes. */
+function ownedRoute(method, pathname) {
+  const m = String(method || 'GET').toUpperCase();
+  return OWNED_ROUTE_PATTERNS.some(([re, methods]) => re.test(String(pathname)) && methods.includes(m));
+}
+
+/** Refuses a Rust-owned project route (503 RUST_PROJECTS_OWNED), unconditionally; false for
+ *  anything else. index.cjs runs it before every other mount. */
+function refuseOwnedRoute(req, res, pathname, json) {
+  if (!ownedRoute(req.method, pathname)) return false;
+  json(res, 503, ROUTE_REFUSAL);
   return true;
+}
+
+/** The retired switches (see the header): a leftover value is reported, never read for anything. */
+const RETIRED_SWITCHES = Object.freeze(['NOEVIA_RUST_PROJECTS']);
+function warnRetired(env = process.env, warn = console.warn) {
+  const left = RETIRED_SWITCHES.filter((k) => env[k] !== undefined);
+  for (const k of left) warn(`${k} is retired (sbstndalton/noevia#1071) and ignored: the Rust front always serves the project routes; remove it from the environment.`);
+  return left;
 }
 
 function busy() {
@@ -400,27 +413,12 @@ function createProjectsFile(file, { warn = console.warn, remote } = {}) {
   }
 }
 
-/** Whether the chat-list slice is on (see the header): the switch, and the supervisor's
- *  NOEVIA_RUST_PROJECT_CHATS_CONFIRMED=1. Silent when only that is missing: a front that answers
- *  the images alone is a supported pairing, not a misconfiguration. */
-function chatsEnabledFrom(env = process.env, warn = console.warn) {
-  return enabledFrom(env, warn) && env.NOEVIA_RUST_PROJECT_CHATS_CONFIRMED === '1';
-}
-
-/** Whether the free-chat slice is on (see the header): the switch, and the supervisor's
- *  NOEVIA_RUST_FREE_CHATS_CONFIRMED=1. Silent when only that is missing (a front without the
- *  slice is a supported pairing). */
-function freeChatsEnabledFrom(env = process.env, warn = console.warn) {
-  return enabledFrom(env, warn) && env.NOEVIA_RUST_FREE_CHATS_CONFIRMED === '1';
-}
-
-/** Whether the project-writes slices are the front's (see the header): the projects switch,
+/** Whether the project-writes slices are the front's (see the header):
  *  NOEVIA_RUST_PROJECT_WRITES=1 and the supervisor's NOEVIA_RUST_PROJECT_WRITES_CONFIRMED=1. Warns
  *  when the switch is set without the confirmation (the front then refuses to start, or lacks the
  *  slice): Node keeps answering, as before. */
 function projectWritesEnabledFrom(env = process.env, warn = console.warn) {
   if (env.NOEVIA_RUST_PROJECT_WRITES !== '1') return false;
-  if (!enabledFrom(env, warn)) return false;
   if (env.NOEVIA_RUST_PROJECT_WRITES_CONFIRMED !== '1') {
     warn('NOEVIA_RUST_PROJECT_WRITES=1 is ignored: the supervisor has not confirmed that the Rust front supports rust-project-writes (NOEVIA_RUST_PROJECT_WRITES_CONFIRMED).');
     return false;
@@ -530,7 +528,8 @@ function createFreeChatsFile(file, { warn = console.warn, remote } = {}) {
   }
 }
 
-/** For Node's copies of the Rust-owned write routes: true when it answered 503. */
+/** For Node's copies of the switched project writes (PROJECT_WRITE_ROUTES, while
+ *  projectWritesEnabledFrom holds): true when it answered 503. */
 function refuseOwned(enabled, json, res) {
   if (!enabled) return false;
   json(res, 503, { error: 'This route is served by the Rust front while NOEVIA_RUST_PROJECTS is on.', code: 'RUST_PROJECTS_OWNED' });
@@ -538,7 +537,7 @@ function refuseOwned(enabled, json, res) {
 }
 
 module.exports = {
-  enabledFrom, chatsEnabledFrom, freeChatsEnabledFrom, projectWritesEnabledFrom, merge, mergeFields, mergeIdList, createProjectsFile, readProjectsFile, refuseOwned, replaceContents,
+  projectWritesEnabledFrom, ownedRoute, refuseOwnedRoute, warnRetired, RETIRED_SWITCHES, ROUTE_REFUSAL, merge, mergeFields, mergeIdList, createProjectsFile, readProjectsFile, refuseOwned, replaceContents,
   createFreeChatsFile, readFreeChatsFile, mergeFreeChats,
   OWNED_ROUTES, PROJECT_WRITE_ROUTES, FREE_LIST_CAP,
 };

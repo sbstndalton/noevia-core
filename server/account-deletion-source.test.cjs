@@ -7,6 +7,7 @@ const path = require('node:path');
 const { Readable } = require('node:stream');
 const { AsyncLocalStorage } = require('node:async_hooks');
 const { createWorkspaceStore } = require('./workspace.cjs');
+const { createStubStore } = require('../tests/server/project-store-stub.cjs');
 const { createProjectStore } = require('./projects.cjs');
 const { createProjectRoutes } = require('./routes/projects.cjs');
 const documents = require('./documents.cjs');
@@ -23,7 +24,7 @@ const deferred = () => {
 
 function fixture() {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'noevia-account-deletion-source-'));
-  const workspaces = createWorkspaceStore(root, { id: 'default', label: 'Default', apiKey: '' });
+  const workspaces = createWorkspaceStore(root, { id: 'default', label: 'Default', apiKey: '' }, null, { projectStore: createStubStore(root) });
   const workspace = workspaces.get(DELETED_ID);
   workspace.projects = [{ id: 'p1', name: 'Synthetic', files: [], chats: [] }];
   workspace.saveProjects();

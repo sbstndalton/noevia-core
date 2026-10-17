@@ -6,6 +6,7 @@ const os = require('node:os');
 const path = require('node:path');
 const context = require('./chat-context.cjs');
 const { createWorkspaceStore } = require('./workspace.cjs');
+const { createStubStore } = require('../tests/server/project-store-stub.cjs');
 
 const DELETED_ID = 'aaaaaaaa-1111-4111-8111-111111111111';
 const OTHER_ID = 'bbbbbbbb-2222-4222-8222-222222222222';
@@ -22,7 +23,7 @@ const messages = () => Array.from({ length: 12 }, (_, i) => ({ role: i % 2 ? 'as
 
 function fixture() {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'noevia-chat-context-deletion-'));
-  const store = createWorkspaceStore(root, { id: 'default', label: 'Default', apiKey: '' });
+  const store = createWorkspaceStore(root, { id: 'default', label: 'Default', apiKey: '' }, null, { projectStore: createStubStore(root) });
   const workspace = store.get(DELETED_ID);
   const other = store.get(OTHER_ID);
   other.saveProjects();

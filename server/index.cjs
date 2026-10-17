@@ -92,25 +92,19 @@ const secretStore = createSecretStore(DATA_DIR);
 // M3 of the full-Rust migration, permanent since sbstndalton/noevia#1071: the Rust front owns
 // sign-in, the account routes and their tables (rust-auth.cjs); this process only reads them.
 const rustAuth = require('./rust-auth.cjs').createRustAuthGuard();
-// M4: NOEVIA_RUST_PROJECTS=1 shares projects.json with the Rust front, which answers
-// the project image routes (rust-projects.cjs). Off by default.
-const RUST_PROJECTS = require('./rust-projects.cjs').enabledFrom(process.env);
-// Its chat-list slice only with the supervisor's separate confirmation (rust-project-chats).
-const RUST_PROJECT_CHATS = RUST_PROJECTS && require('./rust-projects.cjs').chatsEnabledFrom(process.env, () => {});
-// And its free-chat slice (rust-free-chats): free-chats.json shared under its own lock, the save refused here.
-const RUST_FREE_CHATS = RUST_PROJECTS && require('./rust-projects.cjs').freeChatsEnabledFrom(process.env, () => {});
+// M4, permanent since sbstndalton/noevia#1071 (rust-projects.cjs): the Rust front always serves the
+// project images, the chat lists and the free-chat list, and is the only writer of projects.json
+// and free-chats.json. NOEVIA_RUST_PROJECTS is retired; a leftover value only warns.
+require('./rust-projects.cjs').warnRetired(process.env);
 // sbstndalton/noevia#1264: the project writes ported to the front, on their own confirmed switch.
-const RUST_PROJECT_WRITES = RUST_PROJECTS && require('./rust-projects.cjs').projectWritesEnabledFrom(process.env);
-// sbstndalton/noevia#1264: both files written through the Rust front's internal store, not under flock.
-if (RUST_PROJECTS && !(RUST_FREE_CHATS && require('./project-store-client.cjs').enabledFrom(process.env))) {
-  // #1264: Node no longer locks or writes projects.json itself; with the front sharing it, every
-  // save must go through the front's store.
-  console.error('NOEVIA_RUST_PROJECTS=1 needs the confirmed free-chat slice and the confirmed Rust project store (the web supervisor sets it up): Node writes projects.json only through it.');
+const RUST_PROJECT_WRITES = require('./rust-projects.cjs').projectWritesEnabledFrom(process.env);
+// sbstndalton/noevia#1264: both files are written through the Rust front's internal store, never by
+// Node itself, so without the store (its port and secret, from the web supervisor) nothing starts.
+if (!require('./project-store-client.cjs').enabledFrom(process.env)) {
+  console.error('FATAL: the Rust project store is required (NOEVIA_PROJECT_STORE_PORT and NOEVIA_PROJECT_STORE_TOKEN, set by the web supervisor): Node writes projects.json and free-chats.json only through it (sbstndalton/noevia#1071).');
   process.exit(2);
 }
-const PROJECT_STORE = RUST_FREE_CHATS && require('./project-store-client.cjs').enabledFrom(process.env)
-  ? require('./project-store-client.cjs').clientFromEnv(process.env)
-  : (delete process.env.NOEVIA_PROJECT_STORE_TOKEN, null); // #1916: never kept, used or not
+const PROJECT_STORE = require('./project-store-client.cjs').clientFromEnv(process.env); // #1916: the secret leaves process.env here
 const authService = createAuth({
   rustAuth,
   dataDir: DATA_DIR,
@@ -179,6 +173,8 @@ const importRoutes = require('./routes/import.cjs').createImportRoutes({
       persistedChatIds: () => require('./conversation-import.cjs').persistedChatIds(currentWorkspace().dir),
       addFreeChats: (chats) => { FREE_CHATS.splice(0, FREE_CHATS.length, ...lists.mergeChats(Array.from(FREE_CHATS), chats, lists.readTombstones(currentWorkspace().dir))); saveFreeChats(FREE_CHATS); },
       addProjectChats: (projectId, chats) => saveChats(projectId, chats),
+      // The saves above go through the Rust project store; the import reads the disk after them.
+      whenSaved: () => projectStore.whenSaved(() => {}),
       createProject: (body) => createProject(body),
     };
   },
@@ -207,7 +203,7 @@ const DEFAULT_PROVIDER_CAPABILITIES = require('./providers.cjs').engineCapabilit
 // Set once the chat vault mirror exists (below); until then there is nothing to nudge.
 let projectsChangedElsewhere = () => {};
 const workspaceStore = createWorkspaceStore(DATA_DIR, { id: DEFAULT_PROVIDER_ID, label: DEFAULT_PROVIDER_LABEL, baseUrl: INFERENCE_BASE, apiKey: INFERENCE_KEY, shared: true,
-  ...(DEFAULT_PROVIDER_CAPABILITIES ? { capabilities: DEFAULT_PROVIDER_CAPABILITIES } : {}) }, secretStore, { rustProjects: RUST_PROJECTS, rustFreeChats: RUST_FREE_CHATS, projectStore: PROJECT_STORE,
+  ...(DEFAULT_PROVIDER_CAPABILITIES ? { capabilities: DEFAULT_PROVIDER_CAPABILITIES } : {}) }, secretStore, { projectStore: PROJECT_STORE,
   // #1264: each store save is counted against the request that caused it (holdForStoreSaves).
   onStoreSave: (promise) => { const scope = requestScope.getStore(); if (scope && scope.storeSaves) scope.storeSaves.push(promise); },
   // M4: the front saved a project or free-chat write Node's request would have followed with a
@@ -1043,7 +1039,7 @@ const projectRoutes = require('./routes/projects.cjs').createProjectRoutes({
   json, readBody, readJson, requestScope, dispatch: (req, res) => handleRequestScoped(req, res), currentWorkspace, authService, storageClient, documents, documentSources, rag, fs, path,
   reasoningEffort, projectAppearance, diaryExtras, PROJECTS, DEFAULT_TOOLBOXES, sanitizeToolboxes, allToolboxes, getProvider, ensureRolesLoaded, servedCatalogue, DEFAULT_PROVIDER_ID, store: projectStore,
   onToolboxesChange: () => permittedToolsCache.clear(),
-  rustProjects: RUST_PROJECTS, rustProjectChats: RUST_PROJECT_CHATS, rustProjectWrites: RUST_PROJECT_WRITES,
+  rustProjectWrites: RUST_PROJECT_WRITES,
 });
 // The provider registry's routes: list, connect, test and remove (routes/providers.cjs), plus
 // Sign in with ChatGPT (chatgptOAuth, built beside mcpOAuth above) while features.chatgptOAuth is on.
@@ -1106,7 +1102,6 @@ const approvalRoutes = require('./routes/approvals.cjs').createApprovalRoutes({ 
 const chatListRoutes = require('./routes/chat-lists.cjs').createChatListRoutes({
   json, readBody, currentWorkspace, PROJECTS, FREE_CHATS, diaryExtras, crypto, STORED_HISTORY_BYTES, STORED_HISTORY_CAP,
   chatLists: retentionLists, removeChat: removeRetainedChat, store: projectStore, revokeChatGrant,
-  rustFreeChats: RUST_FREE_CHATS,
 });
 // The routing configuration and the sampling-presets switch are the Rust front's (#1071): these
 // mounts only refuse a bypass. Chat still reads both settings (routing-modes.cjs, chat.cjs).
@@ -1208,6 +1203,8 @@ async function handleRequestScoped(req, res) {
     }
     // Sign-in and the account are the Rust front's (#1071): a request that reaches Node bypassed it.
     if (require('./rust-auth.cjs').refuseOwned(req, res, p, json)) return;
+    // So are the M4 project routes (#1071): Node refuses them whoever asks.
+    if (require('./rust-projects.cjs').refuseOwnedRoute(req, res, p, json)) return;
     if (await diaryRoutes.connector(req, res, { path: p })) return;
     if ((p === '/api/instance' || p === '/.well-known/webauthn') && await webAddressRoutes(req, res, { path: p, authn: null })) return;
     if (await deviceRoutes.open(req, res, { path: p })) return;

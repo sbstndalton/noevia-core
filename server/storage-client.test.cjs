@@ -372,6 +372,8 @@ test('a small text body is read whole and not marked truncated', async (t) => {
 const testDataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cowork-storage-client-test-'));
 process.env.DIARY_AUTH_TOKEN = 'test-cowork-token';
 process.env.UI_DATA_DIR = testDataDir;
+// #1071: Node saves projects.json / free-chats.json only through the Rust project store.
+require('../tests/server/project-store-server.cjs').installProjectStore(testDataDir);
 process.env.LEGACY_AUTH_COMPAT = 'true';
 process.env.PUBLIC_ORIGIN = 'http://localhost';
 
@@ -685,12 +687,8 @@ test('an in-flight sync preserves concurrent uploads and does not restore detach
   } finally { release(); client.listFiles = list; }
 });
 
-test('base64 overhead does not reject images below the advertised 8 MB cap', async () => {
-  const project = await createTestProject('Large image');
-  const response = await request(`/api/projects/${project.id}/assets`, { method: 'POST', headers: mutationHeaders(), body: JSON.stringify({ name: 'large.png', mime: 'image/png', dataBase64: Buffer.alloc(7 * 1024 * 1024).toString('base64') }) });
-  assert.equal(response.status, 200, response.text);
-  assert.equal(JSON.parse(response.text).asset.bytes, 7 * 1024 * 1024);
-});
+// Project image assets (and their 8 MB cap) are the Rust front's routes since
+// sbstndalton/noevia#1071; noevia-rs tests them.
 
 test('folder sync counts other sources against the 60 cap and reports every file it leaves out', async () => {
   // #1806 raised the default to 1000; the counting is the same at any cap.

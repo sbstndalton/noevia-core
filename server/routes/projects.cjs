@@ -17,6 +17,17 @@ const DOCUMENT_UPLOAD_CAP = 25 * 1024 * 1024;
 // ranges. The 25 MB cap above stays for uploads, where it bounds an HTTP body the browser sends. Other
 // types keep the storage client's 25 MB read cap. The read timeout grows with the cap (30 s plus a second
 // per MiB), since a quarter-gigabyte file does not arrive in 30 s.
+
+/** Whether a project source is still the one read before an await: the same object, or (after a
+ *  project-store save took the written copy back in, which replaces file objects) the same
+ *  metadata. `content` is left out: it can be a lazy reader of the source's text file. */
+function sameSource(a, b) {
+  if (a === b) return true;
+  if (!a || !b) return false;
+  const meta = (f) => JSON.stringify(Object.keys(f).filter((k) => k !== 'content').sort().map((k) => [k, f[k]]));
+  return meta(a) === meta(b);
+}
+
 function documentReadOptions(path) {
   if (!/\.pdf$/i.test(String(path || ''))) return undefined;
   const cap = sourceLimits.documentLimits().readBytes;
@@ -65,20 +76,18 @@ const PASS = Symbol('unhandled');
  * @param {string} deps.DEFAULT_PROVIDER_ID
  * @param {object} deps.store   projects.cjs
  * @param {() => void} [deps.onToolboxesChange]  called after a project's toolbox selection changes (clears the permitted-tools cache)
- * @param {boolean} [deps.rustProjects]  M4 (rust-projects.cjs): the Rust front owns the image writes; this copy refuses them
- * @param {boolean} [deps.rustProjectChats]  M4 (rust-projects.cjs chatsEnabledFrom): the front owns the chat-list save too; this copy refuses it
  * @param {boolean} [deps.rustProjectWrites]  #1264 (rust-projects.cjs projectWritesEnabledFrom): the front owns PROJECT_WRITE_ROUTES; this copy refuses them
  */
 function createProjectRoutes({
   json, readBody, readJson, requestScope, dispatch, currentWorkspace, authService, storageClient, documents, documentSources, rag, fs, path,
   reasoningEffort, projectAppearance, diaryExtras, PROJECTS, DEFAULT_TOOLBOXES, sanitizeToolboxes, allToolboxes = () => [{ id: 'core' }], getProvider, ensureRolesLoaded, servedCatalogue, DEFAULT_PROVIDER_ID, store,
-  onToolboxesChange = () => {}, rustProjects = false, rustProjectChats = false, rustProjectWrites = false,
+  onToolboxesChange = () => {}, rustProjectWrites = false,
   storageLatch = require('../storage-latch.cjs').createStorageLatch(),
 }) {
   const { refuseOwned } = require('../rust-projects.cjs');
   const {
     getProject, saveProjects, createProject, deleteProject, whenSaved = (fn) => fn(), pruneDocuments, withSourceLock, ensureProjectFolder, indexSource, ownsFile,
-    loadChats, saveChats, deleteChat,
+    deleteChat,
   } = store;
   // #849: a rejected storage login is its own answer, not "could not create the folder". The
   // wording is the one the refresh toast and the Settings save already use (#770); `code` lets the
@@ -477,55 +486,9 @@ function createProjectRoutes({
       return json(res, 200, { ok: true });
     }
 
-    const projChats = p.match(/^\/api\/projects\/([^/]+)\/chats$/);
-    if (projChats) {
-      // M4: the Rust front saves a project's chat list while NOEVIA_RUST_PROJECTS is on and the
-      // supervisor confirmed that this front has the chat-list slice (rust-project-chats).
-      if (req.method === 'POST' && refuseOwned(rustProjects && rustProjectChats, json, res)) return true;
-      const id = decodeURIComponent(projChats[1]);
-      if (req.method === 'GET') {
-        if (!getProject(id)) return json(res, 404, { error: 'no such project' });
-        return json(res, 200, { chats: loadChats(id) });
-      }
-      if (req.method === 'POST') {
-        const raw = await readBody(req);
-        if (!getProject(id)) return json(res, 404, { error: 'no such project' });
-        let body;
-        try { body = JSON.parse(raw); } catch { return json(res, 400, { error: 'invalid JSON' }); }
-        if (!body || typeof body !== 'object' || !Array.isArray(body.chats)) return json(res, 400, { error: 'chats array required' });
-        // #1406: only the reading of the request is a 400; a busy store (503) or a disk failure is not.
-        try {
-          const skipped = saveChats(
-            id,
-            body.chats
-              .filter((c) => c && typeof c.id === 'string')
-              .slice(0, require('../chat-lists.cjs').LIST_CAP)
-              .map((c) => ({
-                id: c.id.replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 80),
-                title: String(c.title || 'New task').slice(0, 120),
-                updatedAt: typeof c.updatedAt === 'number' ? c.updatedAt : Date.now(),
-                preview: String(c.preview || '').slice(0, 200),
-                pinned: c.pinned === true,
-                archived: c.archived === true,
-                // Chat framing (#737/#738): the frame (null clears it) and the first-saved time; the
-                // merge (chat-lists.cjs) validates the frame and keeps the first createdAt.
-                ...('frame' in c ? { frame: c.frame } : {}),
-                // #778: the per-chat routing flags; the merge keeps them when a save leaves them out.
-                ...(typeof c.forceLocal === 'boolean' ? { forceLocal: c.forceLocal } : {}),
-                ...(typeof c.allowCloud === 'boolean' ? { allowCloud: c.allowCloud } : {}),
-                ...(Number.isFinite(c.createdAt) ? { createdAt: c.createdAt } : {}),
-                // The session's harness (#236); absent means Chat. Only an admin may run Cowork, so a
-                // member's saved 'cowork' is coerced to Chat rather than failing every turn.
-                ...(c.mode === 'cowork' && authn?.user?.role === 'admin' ? { mode: 'cowork' } : {}),
-              })),
-          );
-          // Ids another list holds were not saved here (#765): say so, so the client refreshes.
-          return json(res, 200, Array.isArray(skipped) && skipped.length ? { ok: true, skipped } : { ok: true });
-        } catch (e) {
-          return saveFailureReply(json, res, e, 'could not save the chats; nothing was changed');
-        }
-      }
-    }
+    // GET and POST /api/projects/{id}/chats (a project's chat list) are the Rust front's
+    // (sbstndalton/noevia#1071): index.cjs refuses them before this mount (rust-projects.cjs
+    // refuseOwnedRoute).
 
     // Re-read every attached storage folder and refresh the project's sources
     // from it. Folder-derived files carry `source`; uploaded ones do not, so a
@@ -567,7 +530,7 @@ function createProjectRoutes({
         const previous = uploads.find(f => f.name === name);
         if (previous && body.replace !== true) return sourceExistsReply(res, name);
         const file = await documentSources.ingest(currentWorkspace(), id, name, bytes, previous);
-        if (getProject(id) !== project || project.files.find(f => !f.source && f.name === name) !== previous) return json(res, 409, { error: 'Project changed; retry.' });
+        if (getProject(id) !== project || !sameSource(project.files.find(f => !f.source && f.name === name), previous)) return json(res, 409, { error: 'Project changed; retry.' });
         project.files = [...(project.files || []).filter(f => f.source || f.name !== name), file];
         indexSource(project, file); saveProjects(PROJECTS);
         return json(res, 200, { name, pages: file.document.pages, characters: file.content.length, truncated: file.document.truncated, document: file.document });
@@ -762,7 +725,7 @@ function createProjectRoutes({
           const file = documents.isDocument(rawName)
             ? await documentSources.ingest(currentWorkspace(), id, rawName, bytes, previous)
             : { name: rawName, content: bytes.toString('utf8').slice(0, 200000) };
-          if (getProject(id) !== project || (project.files || []).find(f => !f.source && f.name === rawName) !== previous) return json(res, 409, { error: 'Source changed; retry.' });
+          if (getProject(id) !== project || !sameSource((project.files || []).find(f => !f.source && f.name === rawName), previous)) return json(res, 409, { error: 'Source changed; retry.' });
           project.files = [...(project.files || []).filter(f => f.source || f.name !== rawName), file];
           project.updatedAt = Date.now();
           indexSource(project, file); defaultProjectDocs(project, hadUploads); saveProjects(PROJECTS);
@@ -894,80 +857,9 @@ function createProjectRoutes({
       return res.end(bytes);
     }
 
-    const projAssets = p.match(/^\/api\/projects\/([^/]+)\/assets$/);
-    if (projAssets && req.method === 'POST') {
-      if (refuseOwned(rustProjects, json, res)) return true;
-      const id = decodeURIComponent(projAssets[1]);
-      const project = getProject(id);
-      if (!project) return json(res, 404, { error: 'no such project' });
-      let body;
-      try {
-        // Images do not fit the 1 MB default that text sources live under.
-        body = JSON.parse(await readBody(req, Math.ceil(IMAGE_UPLOAD_CAP / 3) * 4 + 512 * 1024));
-      } catch (e) {
-        if (e && e.status === 413) return json(res, 413, { error: `That image is larger than the ${Math.round(IMAGE_UPLOAD_CAP / (1024 * 1024))} MB limit.` });
-        return json(res, 400, { error: 'invalid JSON' });
-      }
-      const name = String(body.name || '').slice(0, 200);
-      const mime = String(body.mime || '').toLowerCase();
-      if (!IMAGE_MIME.has(mime)) {
-        return json(res, 400, { error: `${mime || 'that file'} is not a supported image (png, jpeg, webp or gif).` });
-      }
-      let bytes;
-      try {
-        bytes = Buffer.from(String(body.dataBase64 || ''), 'base64');
-      } catch {
-        return json(res, 400, { error: 'image data was not valid base64' });
-      }
-      if (!bytes.length) return json(res, 400, { error: 'image data was empty' });
-      if (bytes.length > IMAGE_UPLOAD_CAP) {
-        return json(res, 413, { error: `That image is ${Math.round(bytes.length / 1024)} KB, over the ${Math.round(IMAGE_UPLOAD_CAP / (1024 * 1024))} MB limit.` });
-      }
-      const assets = Array.isArray(project.assets) ? project.assets : [];
-      if (assets.length >= sourceLimits.limits().images) {
-        return json(res, 400, { error: `A project holds at most ${sourceLimits.limits().images} images.` });
-      }
-      const assetId = `img-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
-      currentWorkspace().assertActive?.();
-      const dir = currentWorkspace().assetDir(id);
-      fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
-      fs.writeFileSync(path.join(dir, assetId), bytes, { mode: 0o600 });
-      project.assets = [...assets, { id: assetId, name, mime, bytes: bytes.length }];
-      saveProjects(PROJECTS);
-      return json(res, 200, { asset: { id: assetId, name, mime, bytes: bytes.length } });
-    }
-
-    const projAssetOne = p.match(/^\/api\/projects\/([^/]+)\/assets\/([^/]+)$/);
-    if (projAssetOne) {
-      const id = decodeURIComponent(projAssetOne[1]);
-      const assetId = decodeURIComponent(projAssetOne[2]).replace(/[^a-zA-Z0-9_-]/g, '');
-      const project = getProject(id);
-      if (!project) return json(res, 404, { error: 'no such project' });
-      // A retired image (replaced, but still named by a chat transcript) stays readable (#218).
-      const asset = (project.assets || []).find((a) => a.id === assetId)
-        || (req.method === 'GET' ? (project.retiredAssets || []).find((a) => a.id === assetId) : null);
-      if (!asset) return json(res, 404, { error: 'no such image' });
-      const file = path.join(currentWorkspace().assetDir(id), assetId);
-      if (req.method === 'GET') {
-        let bytes;
-        try { bytes = fs.readFileSync(file); } catch { return json(res, 404, { error: 'image data is missing' }); }
-        res.writeHead(200, {
-          'Content-Type': asset.mime,
-          'Content-Length': bytes.length,
-          'Cache-Control': 'private, max-age=86400',
-          'Content-Security-Policy': "default-src 'none'; sandbox",
-          'X-Content-Type-Options': 'nosniff',
-        });
-        return res.end(bytes);
-      }
-      if (req.method === 'DELETE') {
-        if (refuseOwned(rustProjects, json, res)) return true;
-        project.assets = (project.assets || []).filter((a) => a.id !== assetId);
-        saveProjects(PROJECTS);
-        try { fs.unlinkSync(file); } catch { /* already gone */ }
-        return json(res, 200, { ok: true });
-      }
-    }
+    // A project's images (POST /api/projects/{id}/assets, GET and DELETE .../assets/{assetId}) are
+    // the Rust front's (sbstndalton/noevia#1071): index.cjs refuses them before this mount
+    // (rust-projects.cjs refuseOwnedRoute). Chat reads the stored bytes itself (assetDir).
 
     const projSync = p.match(/^\/api\/projects\/([^/]+)\/sources\/sync$/);
     if (projSync && req.method === 'POST') {

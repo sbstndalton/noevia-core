@@ -16,6 +16,8 @@ const test = require('node:test');
 
 const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'noevia-device-auth-'));
 process.env.UI_DATA_DIR = dataDir;
+// #1071: Node saves projects.json / free-chats.json only through the Rust project store.
+require('../tests/server/project-store-server.cjs').installProjectStore(dataDir);
 process.env.PUBLIC_ORIGIN = 'http://localhost';
 process.env.LEGACY_AUTH_COMPAT = 'false';
 process.env.NOEVIA_FEATURE_NATIVE_CLIENT_AUTH = 'true';
@@ -75,9 +77,13 @@ test.before(async () => {
   const m = seedAccount(dataDir, { username: 'memberqa', displayName: 'Synthetic member', role: 'member' });
   admin = session(a); adminId = a.id;
   member = session(m); memberId = m.id;
-  // Each account gets one free chat so a token's view of "its" workspace is observable.
-  assert.equal((await admin.write('/api/freechats', { chats: [{ id: 'admin-chat', title: 'Admin only' }] })).status, 200);
-  assert.equal((await member.write('/api/freechats', { chats: [{ id: 'member-chat', title: 'Member only' }] })).status, 200);
+  // Each account gets one free chat so a token's view of "its" workspace is observable. The free
+  // chat list is the Rust front's (sbstndalton/noevia#1071), so it is seeded as the front's store
+  // would leave it.
+  for (const [id, chat] of [[adminId, 'admin-chat'], [memberId, 'member-chat']]) {
+    fs.mkdirSync(path.join(dataDir, 'users', id), { recursive: true });
+    fs.writeFileSync(path.join(dataDir, 'users', id, 'free-chats.json'), JSON.stringify([{ id: chat, title: chat }]));
+  }
 });
 
 const deviceFor = (userId, clientName) => seedDeviceToken(dataDir, userId, { clientName });
@@ -104,12 +110,12 @@ test('the device flow is the Rust front\'s: Node refuses every device endpoint, 
 
 test('a device token acts as its own account, as a member, and reads without writing', async () => {
   const tokens = deviceFor(adminId, 'Workspace Mac');
-  const free = await asDevice(tokens.access, '/api/freechats');
+  const free = await asDevice(tokens.access, '/api/workspace');
   assert.equal(free.status, 200);
-  const ids = (free.json.chats || free.json).map((c) => c.id);
+  const ids = free.json.freeChats.map((c) => c.id);
   assert.ok(ids.includes('admin-chat') && !ids.includes('member-chat'), JSON.stringify(ids));
   const memberTokens = deviceFor(memberId, 'Member phone');
-  const memberIds = ((await asDevice(memberTokens.access, '/api/freechats')).json.chats || []).map((c) => c.id);
+  const memberIds = (await asDevice(memberTokens.access, '/api/workspace')).json.freeChats.map((c) => c.id);
   assert.ok(memberIds.includes('member-chat') && !memberIds.includes('admin-chat'), JSON.stringify(memberIds));
   // Role-gated routes outside /api/admin see a member.
   assert.equal((await asDevice(tokens.access, '/api/models/unload', { method: 'POST', body: { name: 'synthetic' } })).status, 403);
@@ -150,7 +156,7 @@ test('bearer tokens cannot carry cookies, and a cookie session cannot borrow a b
   assert.equal(both.json.code, 'ambiguous_credentials');
   // A cookie-authenticated write with a bearer attached is refused before any route runs, so a
   // bearer can never stand in for the CSRF header.
-  const smuggled = await request('/api/freechats', { method: 'POST', body: { chats: [] }, headers: { ...bearer(tokens.access), cookie: admin.cookie, origin: ORIGIN } });
+  const smuggled = await request('/api/workspace/model', { method: 'PUT', body: {}, headers: { ...bearer(tokens.access), cookie: admin.cookie, origin: ORIGIN } });
   assert.equal(smuggled.status, 400);
   // A csrf cookie alone alongside a bearer is refused too.
   assert.equal((await request('/api/workspace', { headers: { ...bearer(tokens.access), cookie: `cowork_csrf=${admin.csrf}` } })).status, 400);

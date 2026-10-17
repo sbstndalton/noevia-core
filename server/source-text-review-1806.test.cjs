@@ -24,14 +24,15 @@ const tmp = () => fs.mkdtempSync(path.join(os.tmpdir(), 'noevia-1806r-'));
 const { createStubStore, remoteFor } = require('../tests/server/project-store-stub.cjs');
 const A = 'alpha synthetic text', B = 'bravo synthetic text';
 
-function seeded(projects = [{ id: 'p1', name: 'P', files: [{ name: 'a.md', content: A }, { name: 'b.md', content: B }], chats: [] }]) {
+async function seeded(projects = [{ id: 'p1', name: 'P', files: [{ name: 'a.md', content: A }, { name: 'b.md', content: B }], chats: [] }]) {
   sourceText._cache.clear();
   sourceText._setGraceMs(0);
   const root = tmp();
   const dir = path.join(root, 'users', USER);
   fs.mkdirSync(dir, { recursive: true });
   fs.writeFileSync(path.join(dir, 'projects.json'), JSON.stringify({ projects }, null, 2));
-  createWorkspaceStore(root, DEFAULT, null).get(USER); // migrates
+  // migrates; the save goes through the Rust project store (#1264)
+  await createWorkspaceStore(root, DEFAULT, null, { projectStore: createStubStore(root) }).get(USER).pendingStoreWrites();
   return { root, dir, file: path.join(dir, 'projects.json'), text: (p, t) => path.join(dir, 'project-sources', p, `${sha(t)}.txt`) };
 }
 const listing = (dir) => {
@@ -41,9 +42,9 @@ const listing = (dir) => {
   return out.sort();
 };
 
-test('review 1: the inline rollback reads every text strictly; a missing or mismatched one aborts before anything is written', () => {
+test('review 1: the inline rollback reads every text strictly; a missing or mismatched one aborts before anything is written', async () => {
   for (const damage of ['missing', 'mismatched', 'empty']) {
-    const { dir, file, text } = seeded();
+    const { dir, file, text } = await seeded();
     if (damage === 'missing') fs.rmSync(text('p1', B));
     else fs.writeFileSync(text('p1', B), damage === 'empty' ? '' : 'not the text');
     const before = fs.readFileSync(file);
@@ -52,21 +53,21 @@ test('review 1: the inline rollback reads every text strictly; a missing or mism
     assert.deepEqual(fs.readFileSync(file), before, `${damage}: projects.json untouched`);
     assert.deepEqual(fs.readdirSync(path.join(dir, 'migration-backups')), backups, `${damage}: no backup written`);
   }
-  const { dir, file } = seeded();
+  const { dir, file } = await seeded();
   assert.equal(sourceText.inlineAll(dir), 2);
   assert.deepEqual(JSON.parse(fs.readFileSync(file, 'utf8')).projects[0].files, [{ name: 'a.md', content: A }, { name: 'b.md', content: B }]);
 });
 
-test('review 2: a source whose text cannot be read keeps its pointer through spreads and documentSources.failed; no empty text is saved', () => {
-  const { root, file, text } = seeded();
+test('review 2: a source whose text cannot be read keeps its pointer through spreads and documentSources.failed; no empty text is saved', async () => {
+  const { root, file, text } = await seeded();
   fs.rmSync(text('p1', B));
   sourceText._cache.clear();
-  const ws = createWorkspaceStore(root, DEFAULT, null).get(USER);
+  const ws = createWorkspaceStore(root, DEFAULT, null, { projectStore: createStubStore(root) }).get(USER);
   const [a, b] = ws.projects[0].files;
   assert.equal(b.content, '', 'a reader sees empty text');
   // routes/projects.cjs folder sync: `previous` kept as a spread, or via documentSources.failed.
   ws.projects[0].files = [{ ...a }, { ...documentSources.failed(b, 'b.md', 'synthetic refresh failure'), source: 'F' }];
-  ws.saveProjects();
+  await ws.saveProjects();
   const saved = JSON.parse(fs.readFileSync(file, 'utf8')).projects[0].files;
   assert.equal(saved[0].textRef, sha(A));
   assert.equal(saved[1].textRef, sha(B), 'the old pointer is kept');
@@ -74,31 +75,31 @@ test('review 2: a source whose text cannot be read keeps its pointer through spr
   // The text comes back (a restore): the kept pointer finds it.
   fs.writeFileSync(text('p1', B), B);
   sourceText._cache.clear();
-  assert.equal(createWorkspaceStore(root, DEFAULT, null).get(USER).projects[0].files[1].content, B);
+  assert.equal(createWorkspaceStore(root, DEFAULT, null, { projectStore: createStubStore(root) }).get(USER).projects[0].files[1].content, B);
 });
 
-test('review 3: after a corrupt projects.json loads as empty, a save leaves every source text in place', () => {
+test('review 3: after a corrupt projects.json loads as empty, a save leaves every source text in place', async () => {
   for (const corrupt of ['{ "projects": [ {"id": "p1",', '{"projects": {"p1": 1}}']) {
-    const { root, dir, file } = seeded();
+    const { root, dir, file } = await seeded();
     const before = listing(path.join(dir, 'project-sources'));
     assert.equal(before.length, 2);
     fs.writeFileSync(file, corrupt);
-    const ws = createWorkspaceStore(root, DEFAULT, null).get(USER);
+    const ws = createWorkspaceStore(root, DEFAULT, null, { projectStore: createStubStore(root) }).get(USER);
     assert.deepEqual(ws.projects, []);
-    ws.saveProjects();
+    await ws.saveProjects();
     ws.projects.push({ id: 'p2', name: 'New', files: [{ name: 'n.md', content: 'new synthetic' }] });
-    ws.saveProjects();
+    await ws.saveProjects();
     assert.deepEqual(listing(path.join(dir, 'project-sources')).filter(([n]) => n.startsWith('p1')), before, corrupt);
   }
   // An empty list from a good file collects nothing either.
-  const { root, dir } = seeded();
-  const ws = createWorkspaceStore(root, DEFAULT, null).get(USER);
+  const { root, dir } = await seeded();
+  const ws = createWorkspaceStore(root, DEFAULT, null, { projectStore: createStubStore(root) }).get(USER);
   ws.projects.splice(0);
-  ws.saveProjects();
+  await ws.saveProjects();
   assert.equal(listing(path.join(dir, 'project-sources')).length, 2);
 });
 
-test('review 4: a text is fsynced before its rename and the folder after; a zero-length or wrong file is rewritten', () => {
+test('review 4: a text is fsynced before its rename and the folder after; a zero-length or wrong file is rewritten', async () => {
   const root = tmp();
   const real = { fsync: fs.fsyncSync, rename: fs.renameSync };
   const events = [];
@@ -134,8 +135,8 @@ test('review 5: the collection runs after the store has written the file, over w
 });
 
 test('review 5: with the Rust front sharing projects.json, a save collects through the store', async () => {
-  const { root, dir, text } = seeded();
-  const ws = createWorkspaceStore(root, DEFAULT, null, { rustProjects: true, rustFreeChats: true, projectStore: createStubStore(root) }).get(USER);
+  const { root, dir, text } = await seeded();
+  const ws = createWorkspaceStore(root, DEFAULT, null, { projectStore: createStubStore(root) }).get(USER);
   await ws.pendingStoreWrites();
   ws.projects[0].files = ws.projects[0].files.slice(0, 1);
   await ws.saveProjects();
@@ -144,24 +145,24 @@ test('review 5: with the Rust front sharing projects.json, a save collects throu
   assert.ok(!fs.existsSync(path.join(dir, 'projects.json.lock')), 'Node takes no flock');
 });
 
-test('review 5: a handler that awaited and puts back a source dropped meanwhile still finds its text (collection grace)', () => {
-  const { root, file, text } = seeded();
+test('review 5: a handler that awaited and puts back a source dropped meanwhile still finds its text (collection grace)', async () => {
+  const { root, file, text } = await seeded();
   sourceText._setGraceMs(sourceText.GRACE_MS);
   try {
-    const ws = createWorkspaceStore(root, DEFAULT, null).get(USER);
+    const ws = createWorkspaceStore(root, DEFAULT, null, { projectStore: createStubStore(root) }).get(USER);
     const held = ws.projects[0].files[1]; // a folder sync's `previous`, held across its awaits
     ws.projects[0].files = ws.projects[0].files.slice(0, 1); // another route drops it and saves
-    ws.saveProjects();
+    await ws.saveProjects();
     assert.ok(fs.existsSync(text('p1', B)), 'kept within the grace');
     ws.projects[0].files.push(held); // the sync finishes with its stale view
-    ws.saveProjects();
+    await ws.saveProjects();
     assert.equal(JSON.parse(fs.readFileSync(file, 'utf8')).projects[0].files[1].textRef, sha(B));
     sourceText._cache.clear();
-    assert.equal(createWorkspaceStore(root, DEFAULT, null).get(USER).projects[0].files[1].content, B);
+    assert.equal(createWorkspaceStore(root, DEFAULT, null, { projectStore: createStubStore(root) }).get(USER).projects[0].files[1].content, B);
     // Unreferenced for longer than the grace, it is removed.
-    const ws2 = createWorkspaceStore(root, DEFAULT, null).get(USER);
+    const ws2 = createWorkspaceStore(root, DEFAULT, null, { projectStore: createStubStore(root) }).get(USER);
     ws2.projects[0].files = ws2.projects[0].files.slice(0, 1);
-    ws2.saveProjects();
+    await ws2.saveProjects();
     sourceText.collect(path.dirname(file), ws2.projects, { now: Date.now() + sourceText.GRACE_MS + 1 });
     assert.ok(!fs.existsSync(text('p1', B)));
   } finally { sourceText._setGraceMs(0); }

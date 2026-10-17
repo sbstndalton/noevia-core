@@ -61,28 +61,28 @@ function withoutFlock(fn) {
   return Promise.resolve().then(fn).finally(() => { process.env.PATH = saved; });
 }
 
-const ON = { NOEVIA_RUST_PROJECTS: '1', NOEVIA_FRONT: 'rust', NOEVIA_RUST_AUTH: '1', NOEVIA_RUST_AUTH_CONFIRMED: '1', NOEVIA_RUST_PROJECTS_CONFIRMED: '1', NOEVIA_RUST_FREE_CHATS_CONFIRMED: '1',
-  NOEVIA_RUST_PROJECT_STORE_CONFIRMED: '1', NOEVIA_PROJECT_STORE_PORT: '19021', NOEVIA_PROJECT_STORE_TOKEN: TOKEN };
+const ON = { NOEVIA_PROJECT_STORE_PORT: '19021', NOEVIA_PROJECT_STORE_TOKEN: TOKEN };
 
-test('the store is permanent: used with its confirmation, both confirmed slices, a port and the secret; the retired switch is never read', () => {
+test('the store is permanent: used with a port and the secret alone; the retired switches and confirmations are never read (#1071)', () => {
   const warned = [];
   const warn = (m) => warned.push(m);
   assert.equal(psc.enabledFrom(ON, warn), true);
-  for (const v of ['0', 'true', '', '1']) assert.equal(psc.enabledFrom({ ...ON, NOEVIA_RUST_PROJECT_STORE: v }, warn), true, v);
+  // Whatever the retired switches and confirmations say, set or not.
+  for (const k of ['NOEVIA_RUST_PROJECT_STORE', 'NOEVIA_RUST_PROJECTS', 'NOEVIA_RUST_PROJECTS_CONFIRMED', 'NOEVIA_RUST_FREE_CHATS_CONFIRMED', 'NOEVIA_RUST_PROJECT_CHATS_CONFIRMED', 'NOEVIA_RUST_PROJECT_STORE_CONFIRMED']) {
+    for (const v of ['0', 'true', '', '1']) assert.equal(psc.enabledFrom({ ...ON, [k]: v }, warn), true, `${k}=${v}`);
+  }
   assert.equal(warned.length, 0);
-  // Projects (or the free-chat slice) off: no store, silently.
-  for (const drop of ['NOEVIA_RUST_FREE_CHATS_CONFIRMED', 'NOEVIA_RUST_PROJECTS_CONFIRMED', 'NOEVIA_RUST_PROJECTS']) {
+  // Without the port or the secret there is no store, and it says so (index.cjs then refuses to start).
+  for (const drop of ['NOEVIA_PROJECT_STORE_PORT', 'NOEVIA_PROJECT_STORE_TOKEN']) {
     const env = { ...ON }; delete env[drop];
     assert.equal(psc.enabledFrom(env, warn), false, drop);
   }
-  assert.equal(warned.length, 0);
-  for (const drop of ['NOEVIA_RUST_PROJECT_STORE_CONFIRMED', 'NOEVIA_PROJECT_STORE_PORT', 'NOEVIA_PROJECT_STORE_TOKEN']) {
-    const env = { ...ON }; delete env[drop];
-    assert.equal(psc.enabledFrom(env, () => {}), false, drop);
-  }
+  assert.equal(warned.length, 2);
+  for (const port of ['0', '65536', 'x', '']) assert.equal(psc.enabledFrom({ ...ON, NOEVIA_PROJECT_STORE_PORT: port }, () => {}), false, port);
   assert.equal(psc.enabledFrom({ ...ON, NOEVIA_PROJECT_STORE_TOKEN: 'short' }, () => {}), false);
   const src = fs.readFileSync(path.join(__dirname, 'project-store-client.cjs'), 'utf8') + fs.readFileSync(path.join(__dirname, 'index.cjs'), 'utf8');
   assert.equal(/env\.NOEVIA_RUST_PROJECT_STORE\b(?!_)/.test(src), false, 'no source reads the retired switch');
+  assert.equal(/NOEVIA_RUST_PROJECT_STORE_CONFIRMED|NOEVIA_RUST_FREE_CHATS_CONFIRMED|NOEVIA_RUST_PROJECTS_CONFIRMED/.test(src), false, 'nor a retired confirmation');
 });
 
 test('no flock path is left: a coordinated file without the store is refused', () => {
@@ -101,7 +101,7 @@ test('on: a whole workspace saves both files only through the store, with no flo
   try {
     await withoutFlock(async () => {
       const client = psc.createClient({ port: store.port, token: TOKEN });
-      const ws = createWorkspaceStore(root, { id: 'local', label: 'Local', baseUrl: '', apiKey: '' }, null, { rustProjects: true, rustFreeChats: true, projectStore: client }).get(USER);
+      const ws = createWorkspaceStore(root, { id: 'local', label: 'Local', baseUrl: '', apiKey: '' }, null, { projectStore: client }).get(USER);
       ws.projects.push({ id: 'p1', name: 'One', chats: [], instructionSkills: {} });
       const a = ws.saveProjects();
       ws.freeChats.push({ id: 'f1', title: 'F', updatedAt: 1 });
@@ -127,7 +127,7 @@ test('concurrency: N Node saves from two workspace views plus native writes lose
   try {
     const client = psc.createClient({ port: store.port, token: TOKEN });
     // Two processes' views of one account (two stores), each with its own cache and queue.
-    const views = [0, 1].map(() => createWorkspaceStore(root, { id: 'local', label: 'Local', baseUrl: '', apiKey: '' }, null, { rustProjects: true, rustFreeChats: true, projectStore: client }).get(USER));
+    const views = [0, 1].map(() => createWorkspaceStore(root, { id: 'local', label: 'Local', baseUrl: '', apiKey: '' }, null, { projectStore: client }).get(USER));
     const saves = [];
     for (let i = 0; i < 12; i += 1) {
       for (const [v, ws] of views.entries()) {
@@ -221,7 +221,7 @@ for (const mode of ['busy', 'conflict', 'down']) {
     try {
       let collect = null;
       const client = psc.createClient({ port: store.port, token: TOKEN, timeoutMs: 2000 });
-      const wsStore = createWorkspaceStore(root, { id: 'local', label: 'Local', baseUrl: '', apiKey: '' }, null, { rustProjects: true, rustFreeChats: true, projectStore: client, onStoreSave: (p) => collect && collect.push(p) });
+      const wsStore = createWorkspaceStore(root, { id: 'local', label: 'Local', baseUrl: '', apiKey: '' }, null, { projectStore: client, onStoreSave: (p) => collect && collect.push(p) });
       const res = await request(store.port, (saves, out) => {
         collect = saves;
         const ws = wsStore.get(USER);
@@ -250,7 +250,7 @@ test('a save queued behind a failed one never writes the failed change later', a
     let fail = true;
     const real = psc.createClient({ port: store.port, token: TOKEN });
     const client = { read: real.read, write: async (...a) => { if (fail) throw psc.busy(); return real.write(...a); } };
-    const ws = createWorkspaceStore(root, { id: 'local', label: 'Local', baseUrl: '', apiKey: '' }, null, { rustProjects: true, rustFreeChats: true, projectStore: client }).get(USER);
+    const ws = createWorkspaceStore(root, { id: 'local', label: 'Local', baseUrl: '', apiKey: '' }, null, { projectStore: client }).get(USER);
     ws.projects.push({ id: 'lost', chats: [], instructionSkills: {} });
     const first = ws.saveProjects();
     const second = ws.saveProjects();
@@ -269,7 +269,7 @@ test('success is unchanged: the held answer goes out as written, after the save'
   try {
     let collect = null;
     const client = psc.createClient({ port: store.port, token: TOKEN });
-    const wsStore = createWorkspaceStore(root, { id: 'local', label: 'Local', baseUrl: '', apiKey: '' }, null, { rustProjects: true, rustFreeChats: true, projectStore: client, onStoreSave: (p) => collect && collect.push(p) });
+    const wsStore = createWorkspaceStore(root, { id: 'local', label: 'Local', baseUrl: '', apiKey: '' }, null, { projectStore: client, onStoreSave: (p) => collect && collect.push(p) });
     const res = await request(store.port, (saves, out) => {
       collect = saves;
       const ws = wsStore.get(USER);
@@ -298,7 +298,7 @@ test('a request start does not take this process\'s own store save for the other
   try {
     const changed = [];
     const client = psc.createClient({ port: store.port, token: TOKEN });
-    const wsStore = createWorkspaceStore(root, { id: 'local', label: 'Local', baseUrl: '', apiKey: '' }, null, { rustProjects: true, rustFreeChats: true, projectStore: client, onProjectsChanged: (id) => changed.push(id) });
+    const wsStore = createWorkspaceStore(root, { id: 'local', label: 'Local', baseUrl: '', apiKey: '' }, null, { projectStore: client, onProjectsChanged: (id) => changed.push(id) });
     const ws = wsStore.get(USER);
     ws.projects.push({ id: 'p1', chats: [], instructionSkills: {} });
     await ws.saveProjects();

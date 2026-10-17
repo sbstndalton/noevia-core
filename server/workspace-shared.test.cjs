@@ -7,6 +7,7 @@ const os = require('node:os');
 const path = require('node:path');
 
 const { createWorkspaceStore } = require('./workspace.cjs');
+const { createStubStore } = require('../tests/server/project-store-stub.cjs');
 const { createSecretStore } = require('./secrets.cjs');
 
 const ADMIN_ID = 'aaaaaaaa-1111-4111-8111-111111111111';
@@ -16,7 +17,7 @@ test('a stale cached workspace cannot erase shared providers when saving private
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cowork-shared-providers-'));
   const sharedFile = path.join(root, 'shared-providers.json');
   const secrets = createSecretStore(root);
-  const store = createWorkspaceStore(root, { id: 'default', label: 'Default', baseUrl: 'http://localhost', apiKey: '' }, secrets);
+  const store = createWorkspaceStore(root, { id: 'default', label: 'Default', baseUrl: 'http://localhost', apiKey: '' }, secrets, { projectStore: createStubStore(root) });
 
   // 1. User B's workspace gets cached BEFORE the shared provider exists.
   const userB = store.get(USER_B_ID);
@@ -49,7 +50,7 @@ test('deleting a shared provider propagates to other users without restart', () 
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cowork-shared-providers-'));
   const sharedFile = path.join(root, 'shared-providers.json');
   const secrets = createSecretStore(root);
-  const store = createWorkspaceStore(root, { id: 'default', label: 'Default', baseUrl: 'http://localhost', apiKey: '' }, secrets);
+  const store = createWorkspaceStore(root, { id: 'default', label: 'Default', baseUrl: 'http://localhost', apiKey: '' }, secrets, { projectStore: createStubStore(root) });
 
   // Cache user B first.
   const userB = store.get(USER_B_ID);
@@ -75,7 +76,7 @@ test('removing a shared provider never writes the padded default row to disk', (
   const sharedFile = path.join(root, 'shared-providers.json');
   const secrets = createSecretStore(root);
   const defaultProvider = { id: 'default', label: 'Default', baseUrl: 'http://localhost', apiKey: 'env-secret' };
-  const store = createWorkspaceStore(root, defaultProvider, secrets);
+  const store = createWorkspaceStore(root, defaultProvider, secrets, { projectStore: createStubStore(root) });
 
   const admin = store.get(ADMIN_ID);
   admin.providers.push({ id: 'shared-z', label: 'Shared Z', baseUrl: 'https://z.test/v1', apiKey: '', shared: true });
@@ -110,7 +111,7 @@ test('loadShared prefers env-derived default values over a stale row left in the
   }));
 
   const defaultProvider = { id: 'default', label: 'Fresh Label', baseUrl: 'http://fresh', apiKey: 'fresh-env-key' };
-  const store = createWorkspaceStore(root, defaultProvider, secrets);
+  const store = createWorkspaceStore(root, defaultProvider, secrets, { projectStore: createStubStore(root) });
 
   const user = store.get(USER_B_ID);
   const seenDefault = user.providers.find((p) => p.id === 'default');
@@ -150,7 +151,7 @@ test('#782: a shared provider key no key opens leaves get() working and flags th
     { id: 'shared-lost', label: 'Lost', baseUrl: 'https://lost.test/v1', apiKey: unreadable, shared: true },
     { id: 'shared-ok', label: 'Fine', baseUrl: 'https://ok.test/v1', apiKey: secrets.encrypt('sk-synthetic-ok'), shared: true },
   ] }));
-  const store = createWorkspaceStore(root, { id: 'default', label: 'Default', baseUrl: 'http://localhost', apiKey: '' }, secrets);
+  const store = createWorkspaceStore(root, { id: 'default', label: 'Default', baseUrl: 'http://localhost', apiKey: '' }, secrets, { projectStore: createStubStore(root) });
 
   const admin = store.get(ADMIN_ID);
   const lost = admin.providers.find((p) => p.id === 'shared-lost');
@@ -189,7 +190,7 @@ test('#782: a private provider key no key opens loads with an empty key and surv
   fs.writeFileSync(path.join(dir, 'providers.json'), JSON.stringify({ providers: [
     { id: 'mine-lost', label: 'Mine', baseUrl: 'https://mine.test/v1', apiKey: unreadable },
   ] }));
-  const store = createWorkspaceStore(root, { id: 'default', label: 'Default', baseUrl: 'http://localhost', apiKey: '' }, secrets);
+  const store = createWorkspaceStore(root, { id: 'default', label: 'Default', baseUrl: 'http://localhost', apiKey: '' }, secrets, { projectStore: createStubStore(root) });
 
   const user = store.get(USER_B_ID);
   const row = user.providers.find((p) => p.id === 'mine-lost');
@@ -209,7 +210,7 @@ test('#785: interleaved shared saves from two admins keep both providers', () =>
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cowork-shared-providers-'));
   const sharedFile = path.join(root, 'shared-providers.json');
   const secrets = createSecretStore(root);
-  const store = createWorkspaceStore(root, { id: 'default', label: 'Default', baseUrl: 'http://localhost', apiKey: '' }, secrets);
+  const store = createWorkspaceStore(root, { id: 'default', label: 'Default', baseUrl: 'http://localhost', apiKey: '' }, secrets, { projectStore: createStubStore(root) });
   const ADMIN_TWO = 'cccccccc-3333-4333-8333-333333333333';
 
   // Both requests merge their views first (as the router does at request start)...

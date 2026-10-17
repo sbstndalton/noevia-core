@@ -8,6 +8,8 @@ const path = require('node:path');
 test('the real HTTP handler marks public readiness and session errors as API v1', async () => {
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'noevia-api-contract-'));
   process.env.UI_DATA_DIR = dataDir;
+  // #1071: Node saves projects.json / free-chats.json only through the Rust project store.
+  require('../tests/server/project-store-server.cjs').installProjectStore(dataDir);
   const originalLog = console.log;
   const originalWarn = console.warn;
   let handleRequest;

@@ -5,6 +5,8 @@ const test = require('node:test');
 // Each test file gets its own data dir so parallel runs never race on the
 // default server/ui-data/secrets.key (EEXIST). Set before any index.cjs require.
 process.env.UI_DATA_DIR = require('node:fs').mkdtempSync(require('node:path').join(require('node:os').tmpdir(), 'cowork-mcpservers-test-'));
+// #1071: Node saves projects.json / free-chats.json only through the Rust project store.
+require('../tests/server/project-store-server.cjs').installProjectStore(process.env.UI_DATA_DIR);
 
 // The parser is the security boundary for credential pass-through, so it is
 // exercised directly (mcp-servers.cjs) with the environment handed in; no server boots.

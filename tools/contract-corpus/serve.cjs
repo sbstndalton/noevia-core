@@ -19,13 +19,15 @@ async function main() {
   const env = serverEnv({ port, dataDir, origin: process.env.PUBLIC_ORIGIN || `http://127.0.0.1:${port}`, mocks });
   // Sign-in and the account are the Rust front's (sbstndalton/noevia#1071): Node always runs
   // read-only for those tables and refuses their routes, so there is no switch to pass through.
-  // M4 (rust-projects.cjs): projects.json shared with the front, the image writes refused here,
-  // and the chat-list save too when the front's chat slice is confirmed separately (#1409), and the
-  // free-chat save when its slice is.
-  if (process.env.NOEVIA_RUST_PROJECTS === '1') Object.assign(env, { NOEVIA_RUST_PROJECTS: '1', NOEVIA_FRONT: 'rust', NOEVIA_RUST_PROJECTS_CONFIRMED: process.env.NOEVIA_RUST_PROJECTS_CONFIRMED === '1' ? '1' : '', NOEVIA_RUST_PROJECT_CHATS_CONFIRMED: process.env.NOEVIA_RUST_PROJECT_CHATS_CONFIRMED === '1' ? '1' : '', NOEVIA_RUST_FREE_CHATS_CONFIRMED: process.env.NOEVIA_RUST_FREE_CHATS_CONFIRMED === '1' ? '1' : '', NOEVIA_RUST_PROJECT_WRITES: process.env.NOEVIA_RUST_PROJECT_WRITES === '1' ? '1' : '', NOEVIA_RUST_PROJECT_WRITES_CONFIRMED: process.env.NOEVIA_RUST_PROJECT_WRITES_CONFIRMED === '1' ? '1' : '' });
-  // #1264: Node's projects.json / free-chats.json saves through the front's internal store
-  // (permanent: passed through whenever the harness hands over a store port).
-  if (process.env.NOEVIA_PROJECT_STORE_PORT) Object.assign(env, { NOEVIA_RUST_PROJECT_STORE_CONFIRMED: process.env.NOEVIA_RUST_PROJECT_STORE_CONFIRMED === '1' ? '1' : '', NOEVIA_PROJECT_STORE_PORT: process.env.NOEVIA_PROJECT_STORE_PORT || '', NOEVIA_PROJECT_STORE_TOKEN: process.env.NOEVIA_PROJECT_STORE_TOKEN || '' });
+  // Node saves projects.json and free-chats.json only through the Rust front's project store and
+  // refuses to start without one (#1264, sbstndalton/noevia#1071): the harness hands over its port
+  // and token. The project image routes and the chat lists are the front's; Node refuses them.
+  if (!process.env.NOEVIA_PROJECT_STORE_PORT || !process.env.NOEVIA_PROJECT_STORE_TOKEN) throw new Error('serve.cjs needs NOEVIA_PROJECT_STORE_PORT and NOEVIA_PROJECT_STORE_TOKEN (the Rust front\'s project store)');
+  Object.assign(env, { NOEVIA_FRONT: 'rust', NOEVIA_PROJECT_STORE_PORT: process.env.NOEVIA_PROJECT_STORE_PORT, NOEVIA_PROJECT_STORE_TOKEN: process.env.NOEVIA_PROJECT_STORE_TOKEN });
+  // net-guard.cjs lets Node reach the store's loopback port, as it does the mocks.
+  env.NOEVIA_CORPUS_ALLOWED_PORTS = `${env.NOEVIA_CORPUS_ALLOWED_PORTS},${Number(process.env.NOEVIA_PROJECT_STORE_PORT)}`;
+  // The project-writes slices stay switched (NOEVIA_RUST_PROJECT_WRITES, with its confirmation).
+  if (process.env.NOEVIA_RUST_PROJECT_WRITES === '1') Object.assign(env, { NOEVIA_RUST_PROJECT_WRITES: '1', NOEVIA_RUST_PROJECT_WRITES_CONFIRMED: process.env.NOEVIA_RUST_PROJECT_WRITES_CONFIRMED === '1' ? '1' : '' });
   // sbstndalton/noevia#1071: usage, sampling/reasoning/routing settings, routing default, stats,
   // export, ChatGPT status and storage reads have no switch any more; Node refuses them always.
   const child = spawn(process.execPath, ['--require', GUARD, SERVER], { env, stdio: ['ignore', 'ignore', 'pipe'] });

@@ -145,6 +145,8 @@ test('M4_ENTRY/complete_original_index', { concurrency: false }, async t => {
     const workspace = path.join(dir, 'users', id);
     fs.mkdirSync(workspace, { recursive: true, mode: 0o700 });
     fs.writeFileSync(path.join(workspace, 'migration.json'), '{"version":1,"source":"synthetic"}', { flag: 'wx', mode: 0o600 });
+    // #1071: Node saves projects.json / free-chats.json only through the Rust project store.
+    require('../tests/server/project-store-server.cjs').installProjectStore(dir);
     const { handleRequest } = require('./index.cjs');
     async function invoke(target, options) {
       const input = request(target, options), output = response();

@@ -13,6 +13,8 @@ const test = require('node:test');
 
 const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'noevia-rust-auth-routes-'));
 process.env.UI_DATA_DIR = dataDir;
+// #1071: Node saves projects.json / free-chats.json only through the Rust project store.
+require('../tests/server/project-store-server.cjs').installProjectStore(dataDir);
 process.env.PUBLIC_ORIGIN = 'http://localhost';
 process.env.LEGACY_AUTH_COMPAT = 'false';
 // The retired switch, explicitly off, and the Node front selector: neither hands sign-in back.

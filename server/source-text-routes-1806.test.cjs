@@ -14,6 +14,8 @@ const test = require('node:test');
 const testDataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'noevia-1806-routes-'));
 process.env.DIARY_AUTH_TOKEN = 'test-cowork-token';
 process.env.UI_DATA_DIR = testDataDir;
+// #1071: Node saves projects.json / free-chats.json only through the Rust project store.
+require('../tests/server/project-store-server.cjs').installProjectStore(testDataDir);
 process.env.LEGACY_AUTH_COMPAT = 'true';
 process.env.PUBLIC_ORIGIN = 'http://localhost';
 process.env.EMBEDDING_BASE_URL = 'http://127.0.0.1:9'; // nothing listens: indexing fails fast, offline

@@ -32,12 +32,11 @@ const SEARCH_MIN_QUERY = 2, SEARCH_MAX_QUERY = 200, SEARCH_MAX_CHATS = 500, SEAR
  * @param {number} deps.STORED_HISTORY_CAP
  * @param {() => { freeChats:object[], projects:object[] }} deps.chatLists   what the retention sweep may delete from
  * @param {(chat:{ projectId?:string, id:string }) => boolean} deps.removeChat
- * @param {object} deps.store   projects.cjs: sanitizeChats, saveFreeChats, deleteFreeChat, readHistory, writeHistory, moveChat
+ * @param {object} deps.store   projects.cjs: sanitizeChats, deleteFreeChat, readHistory, writeHistory, moveChat
  * @param {(userId:string, chatId:string) => boolean} [deps.revokeChatGrant]  approvals.cjs: drops a chat's "Allow for this chat" grant
- * @param {boolean} [deps.rustFreeChats]  M4 (rust-projects.cjs freeChatsEnabledFrom): the Rust front saves the free-chat list; this copy refuses it
  */
-function createChatListRoutes({ json, readBody, currentWorkspace, PROJECTS, FREE_CHATS, diaryExtras, crypto, STORED_HISTORY_BYTES, STORED_HISTORY_CAP, chatLists, removeChat, store, revokeChatGrant = () => false, rustFreeChats = false }) {
-  const { sanitizeChats, saveFreeChats, deleteFreeChat, readHistory, writeHistory, moveChat } = store;
+function createChatListRoutes({ json, readBody, currentWorkspace, PROJECTS, FREE_CHATS, diaryExtras, crypto, STORED_HISTORY_BYTES, STORED_HISTORY_CAP, chatLists, removeChat, store, revokeChatGrant = () => false }) {
+  const { sanitizeChats, deleteFreeChat, readHistory, writeHistory, moveChat } = store;
   // #812: a malformed percent-escape in the URL is the caller's mistake (400), not a server error.
   const decodeChatId = require('../http.cjs').decodePathPart;
   const badChatId = (res) => json(res, 400, { error: 'invalid chat id' });
@@ -138,59 +137,8 @@ function createChatListRoutes({ json, readBody, currentWorkspace, PROJECTS, FREE
       return true;
     }
 
-    // ── Free-chat metas (server-side so they survive browser switches) ──
-    if (p === '/api/freechats') {
-      if (req.method === 'GET') {
-        // #1420: the list is read before the status line goes out, so a broken store is a clean 500.
-        let chats;
-        try { chats = Array.from(FREE_CHATS); } catch { return json(res, 500, { error: 'could not read the free chats' }); }
-        return json(res, 200, { chats });
-      }
-      if (req.method === 'POST') {
-        // M4: the Rust front saves the free-chat list while NOEVIA_RUST_PROJECTS is on and the
-        // supervisor confirmed that this front has the slice (rust-free-chats). The read stays.
-        if (require('../rust-projects.cjs').refuseOwned(rustFreeChats, json, res)) return true;
-        const raw = await readBody(req);
-        let body;
-        try { body = JSON.parse(raw); } catch { return json(res, 400, { error: 'invalid JSON' }); }
-        if (!body || typeof body !== 'object' || !Array.isArray(body.chats)) return json(res, 400, { error: 'chats array required' });
-        // #1419: only the reading of the request is a 400; a lock or disk failure below is 503/500.
-        try {
-          const nextFreeChats = body.chats
-            .filter((c) => c && typeof c.id === 'string')
-            .slice(0, require('../chat-lists.cjs').LIST_CAP)
-            .map((c) => ({
-              id: c.id.replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 80),
-              title: String(c.title || 'New chat').slice(0, 120),
-              updatedAt: typeof c.updatedAt === 'number' ? c.updatedAt : Date.now(),
-              preview: String(c.preview || '').slice(0, 200),
-              pinned: c.pinned === true,
-              archived: c.archived === true,
-              // Chat framing (#737/#738): the frame (null clears it) and the first-saved time; the
-              // merge (chat-lists.cjs) validates the frame and keeps the first createdAt.
-              ...('frame' in c ? { frame: c.frame } : {}),
-              // #778: the per-chat routing flags; the merge keeps them when a save leaves them out.
-              ...(typeof c.forceLocal === 'boolean' ? { forceLocal: c.forceLocal } : {}),
-              ...(typeof c.allowCloud === 'boolean' ? { allowCloud: c.allowCloud } : {}),
-              ...(Number.isFinite(c.createdAt) ? { createdAt: c.createdAt } : {}),
-              // The session's harness (#236); absent means Chat, as for every older chat. Only an
-              // admin may run Cowork, so a member's saved 'cowork' is coerced to Chat rather than
-              // planting a mode that would fail every turn.
-              ...(c.mode === 'cowork' && authn?.user?.role === 'admin' ? { mode: 'cowork' } : {}),
-            }));
-          const lists = require('../chat-lists.cjs');
-          const elsewhere = store.chatIdsElsewhere ? store.chatIdsElsewhere(null) : new Set();
-          FREE_CHATS.splice(0, FREE_CHATS.length, ...lists.mergeChats(Array.from(FREE_CHATS), nextFreeChats, lists.readTombstones(currentWorkspace().dir), elsewhere));
-          saveFreeChats(FREE_CHATS);
-          // Ids a project holds were not saved here (#765): say so, so a stale tab refreshes.
-          const skipped = lists.skippedElsewhere(nextFreeChats, elsewhere);
-          return json(res, 200, skipped.length ? { ok: true, skipped } : { ok: true });
-        } catch (e) {
-          return saveFailureReply(json, res, e, 'could not save the free chats; nothing was changed');
-        }
-      }
-    }
-
+    // GET and POST /api/freechats are the Rust front's (sbstndalton/noevia#1071): index.cjs refuses
+    // them before this mount (rust-projects.cjs refuseOwnedRoute). A free chat's delete stays here.
     const freeDel = p.match(/^\/api\/freechats\/([^/]+)$/);
     if (freeDel && req.method === 'DELETE') {
       const id = decodeChatId(freeDel[1]);

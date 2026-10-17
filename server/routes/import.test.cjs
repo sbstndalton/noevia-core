@@ -1,14 +1,15 @@
 'use strict';
 const test=require('node:test'),assert=require('node:assert/strict'),fs=require('node:fs'),os=require('node:os'),path=require('node:path');
 const {createWorkspaceStore}=require('../workspace.cjs'),{createProjectStore}=require('../projects.cjs'),{createImportRoutes}=require('./import.cjs'),{persistedChatIds}=require('../conversation-import.cjs'),{FORMAT}=require('../chat-export.cjs'),lists=require('../chat-lists.cjs');
+const { createStubStore } = require('../../tests/server/project-store-stub.cjs');
 const uid='aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa';
 const payload={format:FORMAT,chats:[{id:'c-free',title:'Free',history:[{role:'user',content:'Synthetic free'}]},{id:'c-existing',title:'Existing',project:{name:'Existing'},history:[{role:'user',content:'Synthetic existing'}]},{id:'c-new',title:'New',project:{name:'New'},history:[{role:'user',content:'Synthetic new'}]}]};
 function fixture(root,user=uid){
- const w=createWorkspaceStore(root,{id:'default'}).get(user);
+ const w=createWorkspaceStore(root,{id:'default'}, null, { projectStore: createStubStore(root) }).get(user);
  const proxy=field=>new Proxy([],{get(_t,k){const v=w[field][k];return typeof v==='function'?v.bind(w[field]):v;},set(_t,k,v){w[field][k]=v;return true;}});
  const store=createProjectStore({fs,path,currentWorkspace:()=>w,PROJECTS:proxy('projects'),FREE_CHATS:proxy('freeChats'),reasoningEffort:{validEffort:()=>true},projectAppearance:()=>({}),rag:{},storageClient:{isBrowsable:()=>false},documentSources:{},authService:{getStorage:()=>({kind:'local'})},sanitizeToolboxes:x=>x,defaultToolboxes:()=>['core'],PROJECT_ROOT_FOLDER:'projects',createProjectFolder:async()=>'',projectSweep:{}});
  let serial=0;const audited=[],failures={};
- const context=()=>({directory:w.dir,historyPath:id=>w.historyPath(id),persistedChatIds:()=>persistedChatIds(w.dir),projects:()=>w.projects.map(p=>({id:p.id,name:p.name})),existingChatIds:()=>new Set([...w.freeChats,...w.projects.flatMap(p=>p.chats||[])].map(c=>c.id)),tombstones:()=>lists.readTombstones(w.dir),addFreeChats:chats=>store.saveFreeChats(lists.mergeChats(w.freeChats,chats,lists.readTombstones(w.dir))),addProjectChats:(id,chats)=>store.saveChats(id,chats),createProject:body=>store.createProject(body)});
+ const context=()=>({directory:w.dir,historyPath:id=>w.historyPath(id),persistedChatIds:()=>persistedChatIds(w.dir),projects:()=>w.projects.map(p=>({id:p.id,name:p.name})),existingChatIds:()=>new Set([...w.freeChats,...w.projects.flatMap(p=>p.chats||[])].map(c=>c.id)),tombstones:()=>lists.readTombstones(w.dir),addFreeChats:chats=>store.saveFreeChats(lists.mergeChats(w.freeChats,chats,lists.readTombstones(w.dir))),addProjectChats:(id,chats)=>store.saveChats(id,chats),whenSaved:()=>store.whenSaved(()=>{}),createProject:body=>store.createProject(body)});
  const route=createImportRoutes({json:(res,status,body)=>Object.assign(res,{status,body}),readBody:async req=>JSON.stringify(req.data),context,newId:()=>`c-generated-${++serial}`,audit:(...args)=>{if(failures.audit)throw Error('Synthetic audit interruption');audited.push(args);}});
  return {w,store,audited,failures,request:async(data=payload)=>{const res={};await route({method:'POST',data},res,{path:'/api/import/conversations',authn:{user:{id:user}}});return res;}};
 }
