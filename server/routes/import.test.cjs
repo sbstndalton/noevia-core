@@ -1,17 +1,19 @@
 'use strict';
 const test=require('node:test'),assert=require('node:assert/strict'),fs=require('node:fs'),os=require('node:os'),path=require('node:path');
+const psc=require('../project-store-client.cjs'),{startProjectStore}=require('../../tests/server/project-store-server.cjs');
 const {createWorkspaceStore}=require('../workspace.cjs'),{createProjectStore}=require('../projects.cjs'),{createImportRoutes}=require('./import.cjs'),{persistedChatIds}=require('../conversation-import.cjs'),{FORMAT}=require('../chat-export.cjs'),lists=require('../chat-lists.cjs');
 const { createStubStore } = require('../../tests/server/project-store-stub.cjs');
 const uid='aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa';
 const payload={format:FORMAT,chats:[{id:'c-free',title:'Free',history:[{role:'user',content:'Synthetic free'}]},{id:'c-existing',title:'Existing',project:{name:'Existing'},history:[{role:'user',content:'Synthetic existing'}]},{id:'c-new',title:'New',project:{name:'New'},history:[{role:'user',content:'Synthetic new'}]}]};
-function fixture(root,user=uid){
- const w=createWorkspaceStore(root,{id:'default'}, null, { projectStore: createStubStore(root) }).get(user);
+function fixture(root,user=uid,projectStore=createStubStore(root)){
+ const hooks={};
+ const w=createWorkspaceStore(root,{id:'default'}, null, { projectStore }).get(user);
  const proxy=field=>new Proxy([],{get(_t,k){const v=w[field][k];return typeof v==='function'?v.bind(w[field]):v;},set(_t,k,v){w[field][k]=v;return true;}});
  const store=createProjectStore({fs,path,currentWorkspace:()=>w,PROJECTS:proxy('projects'),FREE_CHATS:proxy('freeChats'),reasoningEffort:{validEffort:()=>true},projectAppearance:()=>({}),rag:{},storageClient:{isBrowsable:()=>false},documentSources:{},authService:{getStorage:()=>({kind:'local'})},sanitizeToolboxes:x=>x,defaultToolboxes:()=>['core'],PROJECT_ROOT_FOLDER:'projects',createProjectFolder:async()=>'',projectSweep:{}});
  let serial=0;const audited=[],failures={};
- const context=()=>({directory:w.dir,historyPath:id=>w.historyPath(id),persistedChatIds:()=>persistedChatIds(w.dir),projects:()=>w.projects.map(p=>({id:p.id,name:p.name})),existingChatIds:()=>new Set([...w.freeChats,...w.projects.flatMap(p=>p.chats||[])].map(c=>c.id)),tombstones:()=>lists.readTombstones(w.dir),addFreeChats:chats=>store.saveFreeChats(lists.mergeChats(w.freeChats,chats,lists.readTombstones(w.dir))),addProjectChats:(id,chats)=>store.saveChats(id,chats),whenSaved:()=>store.whenSaved(()=>{}),createProject:body=>store.createProject(body)});
+ const context=()=>({directory:w.dir,historyPath:id=>w.historyPath(id),persistedChatIds:()=>persistedChatIds(w.dir),projects:()=>w.projects.map(p=>({id:p.id,name:p.name})),existingChatIds:()=>new Set([...w.freeChats,...w.projects.flatMap(p=>p.chats||[])].map(c=>c.id)),tombstones:()=>lists.readTombstones(w.dir),addFreeChats:chats=>store.saveFreeChats(lists.mergeChats(w.freeChats,chats,lists.readTombstones(w.dir))),addProjectChats:(id,chats)=>store.saveChats(id,chats),whenSaved:async()=>{await store.whenSaved(()=>{});if(hooks.afterSaved){hooks.afterSaved();await store.whenSaved(()=>{});}},createProject:body=>store.createProject(body)});
  const route=createImportRoutes({json:(res,status,body)=>Object.assign(res,{status,body}),readBody:async req=>JSON.stringify(req.data),context,newId:()=>`c-generated-${++serial}`,audit:(...args)=>{if(failures.audit)throw Error('Synthetic audit interruption');audited.push(args);}});
- return {w,store,audited,failures,request:async(data=payload)=>{const res={};await route({method:'POST',data},res,{path:'/api/import/conversations',authn:{user:{id:user}}});return res;}};
+ return {w,store,hooks,audited,failures,request:async(data=payload)=>{const res={};await route({method:'POST',data},res,{path:'/api/import/conversations',authn:{user:{id:user}}});return res;}};
 }
 function temporary(t){const root=fs.mkdtempSync(path.join(os.tmpdir(),'noevia-import-'));t.after(()=>fs.rmSync(root,{recursive:true,force:true}));return root;}
 function historyIds(w){return fs.readdirSync(w.dir).filter(n=>/^history-c-.*\.json$/.test(n)).map(n=>n.slice(8,-5)).sort();}
@@ -87,4 +89,29 @@ test('unsupported hard links fail before journaling and do not block a later imp
  fs.linkSync=link;
  const retry=await f.request({format:FORMAT,chats:[{id:'c-copy',title:'Copied',history:[{role:'user',content:'Synthetic'}]}]});
  assert.equal(retry.status,200);assert.equal(retry.body.imported,1);assert.equal(f.store.readHistory('c-copy')[0].content,'Synthetic');
+});
+
+test('a chat deleted while the import waits is reported as deleted, not as a full list',async t=>{
+ const f=fixture(temporary(t));await f.store.createProject({name:'Existing',toolboxes:[]});
+ f.hooks.afterSaved=()=>{f.hooks.afterSaved=null;f.store.deleteFreeChat('c-free');};
+ const r=await f.request();assert.equal(r.status,200);
+ assert.equal(r.body.imported,2);
+ const gone=r.body.skipped.filter(s=>s.title==='Free');assert.equal(gone.length,1);assert.match(gone[0].reason,/deleted while import was pending/);
+ assert.ok(!r.body.skipped.some(s=>/list is full/.test(s.reason)));
+ assert.equal(fs.existsSync(f.w.historyPath('c-free')),false);assert.ok(!persistedChatIds(f.w.dir).has('c-free'));
+ assert.deepEqual(fs.readdirSync(path.join(f.w.dir,'conversation-imports')),[]);
+});
+test('an import against a busy project store fails, unlinks nothing and keeps transcript and journal',async t=>{
+ const root=temporary(t);fs.mkdirSync(path.join(root,'users',uid),{recursive:true});
+ const store=await startProjectStore(root);t.after(()=>store.close());
+ const client=psc.createClient({port:store.port,token:store.token});
+ const f=fixture(root,uid,client);await f.store.createProject({name:'Existing',toolboxes:[]});await f.store.whenSaved(()=>{});
+ store.failNext(503,{error:'The project store is busy. Try again shortly.',code:'PROJECTS_BUSY'},{times:20});
+ const failed=await f.request();assert.equal(failed.status,503);assert.match(failed.body.error,/Retry the same file/);assert.equal(f.audited.length,0);
+ assert.equal(persistedChatIds(f.w.dir).size,0);
+ assert.deepEqual(historyIds(f.w),['c-free']);// the free group was published before its list save failed; the rest is still staged
+ const pending=fs.readdirSync(path.join(f.w.dir,'conversation-imports'));assert.equal(pending.length,1);assert.ok(fs.existsSync(path.join(f.w.dir,'conversation-imports',pending[0],'manifest.json')));
+ store.clearFailures();
+ // The store recovers; after a restart a retry of the same file completes it.
+ const ok=await fixture(root,uid,psc.createClient({port:store.port,token:store.token})).request();assert.equal(ok.status,200);assert.equal(ok.body.imported,3);
 });

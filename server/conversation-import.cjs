@@ -106,7 +106,10 @@ async function applyRecord(directory, record, ctx, newId) {
       // rejects here, and the import answers retry, as a failed synchronous save did.
       await ctx.whenSaved();
       const committed = ctx.persistedChatIds();
-      const dropped = active.filter(c => !committed.has(c.id));
+      // A chat deleted in another tab while the save was pending is not "list is full": the final
+      // pass below reports it as deleted (#1953).
+      const deletedNow = ctx.tombstones();
+      const dropped = active.filter(c => !committed.has(c.id) && !deletedNow.has(c.id));
       if (dropped.length) {
         record.capped = [...(record.capped || []), ...dropped.map(c => ({ id: c.id, title: c.title }))]
           .filter((c, index, rows) => rows.findIndex(row => row.id === c.id) === index);
