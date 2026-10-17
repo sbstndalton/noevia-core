@@ -753,6 +753,77 @@ test('#328 a model that fails every probe at its reference settings stops with a
   assert.equal(f.requests.length - before, 3);
 });
 
+test('#1978 a failed run keeps the failing phase and step labels on the job, not the engine text', async t => {
+  const f = fixture(t, { rejectAll: true });
+  await f.manager.autotune.start('synthetic', { confirmPause: true });
+  const j = await finished(f.manager);
+  assert.equal(j.status, 'failed'); assert.equal(j.phase, 'Failed');
+  assert.equal(j.failedPhase, phase(j.models[0], 'kv').label);
+  assert.equal(j.failedStep, phase(j.models[0], 'kv').steps[0].label);
+  // Resume clears them while it runs, and they come back for the new stop.
+  await f.manager.autotune.resume({ confirmPause: true });
+  const again = await finished(f.manager);
+  assert.equal(again.failedPhase, phase(again.models[0], 'kv').label);
+});
+
+test('#1978 a restart-interrupted run keeps the phase it was in', async t => {
+  let stopped = false;
+  const f = fixture(t, { onChat: ({ manager }) => {
+    if (!stopped && manager.autotune.status().body.job?.phase === 'Drafting') { stopped = true; manager.autotune.cancel(); }
+  } });
+  await f.manager.autotune.start('synthetic', { confirmPause: true });
+  const c = await finished(f.manager);
+  assert.equal(c.status, 'cancelled'); assert.equal(c.failedPhase, 'Drafting');
+  const state = JSON.parse(fs.readFileSync(f.stateFile, 'utf8'));
+  const draft = phase(state.job.models[0], 'drafting');
+  state.job.status = 'running'; delete state.job.failedPhase; delete state.job.failedStep;
+  state.job.models[0].status = 'running'; draft.status = 'running'; draft._beforeText = fs.readFileSync(f.ini, 'utf8');
+  fs.writeFileSync(f.stateFile, JSON.stringify(state));
+  const manager = f.restart(); await manager.autotune.recover();
+  const j = manager.autotune.status().body.job;
+  assert.equal(j.status, 'interrupted'); assert.equal(j.failedPhase, 'Drafting');
+});
+
+test('#1978 clear drops a finished job record only: measurements, settings and models.ini stay', async t => {
+  const f = fixture(t, { rejectAll: true });
+  await f.manager.autotune.setSettings('synthetic', { allowQ5Kv: true });
+  await f.manager.autotune.start('synthetic', { confirmPause: true });
+  await finished(f.manager);
+  const before = JSON.parse(fs.readFileSync(f.stateFile, 'utf8'));
+  const ini = fs.readFileSync(f.ini, 'utf8');
+  const r = f.manager.autotune.clear();
+  assert.deepEqual([r.status, r.body], [200, { cleared: true }]);
+  assert.equal(f.manager.autotune.status().body.job, undefined);
+  const after = JSON.parse(fs.readFileSync(f.stateFile, 'utf8'));
+  assert.equal(after.job, undefined);
+  assert.deepEqual(after.history, before.history);
+  assert.deepEqual(after.settings, before.settings);
+  assert.equal(f.manager.autotune.status('synthetic').body.settings.allowQ5Kv, true);
+  assert.equal(fs.readFileSync(f.ini, 'utf8'), ini);
+  assert.equal(f.manager.autotune.clear().status, 409, 'nothing left to clear');
+  assert.equal((await f.manager.autotune.resume({ confirmPause: true })).status, 409);
+});
+
+test('#1978 clear keeps finished measurements in history after a passed run', async t => {
+  const f = fixture(t);
+  await f.manager.autotune.start('synthetic', { confirmPause: true });
+  assert.equal((await finished(f.manager)).status, 'passed');
+  const history = f.manager.autotune.status('synthetic').body.history;
+  assert.ok(history.length > 0);
+  assert.equal(f.manager.autotune.clear().status, 200);
+  assert.deepEqual(f.manager.autotune.status('synthetic').body.history, history);
+});
+
+test('#1978 clear is refused while a run is active, and the run carries on', async t => {
+  let result;
+  const f = fixture(t, { onChat: ({ manager }) => { result ||= manager.autotune.clear(); } });
+  await f.manager.autotune.start('synthetic', { confirmPause: true });
+  assert.equal(f.manager.autotune.clear().status, 409, 'refused while starting');
+  const j = await finished(f.manager);
+  assert.equal(result.status, 409); assert.match(result.body.error, /running/);
+  assert.equal(j.status, 'passed');
+});
+
 test('#328 with sampling to apply, the baseline is measured first at bf16 (#1078) and the KV and drafting keys are put back', async t => {
   const f = fixture(t, { models: ['Qwen3-8B-Instruct'], answerFor: e2b });
   await f.manager.autotune.start('Qwen3-8B-Instruct', { confirmPause: true });

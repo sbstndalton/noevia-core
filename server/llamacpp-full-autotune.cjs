@@ -178,6 +178,18 @@ const sorted = value => Object.fromEntries(Object.entries(value || {}).sort(([a]
 const cancelledError = () => Object.assign(Error('Cancelled'), { cancelled: true });
 const publicJob = job => job && JSON.parse(JSON.stringify(job, (key, value) =>
   key.startsWith('_') || ['originalText', 'lastRevision', 'originalRevision', 'beforeText'].includes(key) ? undefined : value));
+// #1978: the phase/step a run stopped in, by our own labels, kept on the job because j.phase is
+// overwritten with "Failed"/"Cancelled"/"Interrupted". Never an engine message (#1049): only labels.
+function stoppedAt(j) {
+  const stopped = p => ['failed', 'interrupted'].includes(p.status);
+  const item = j.models?.find(m => m.model === j.model && m.phases?.some(stopped)) || j.models?.find(m => m.phases?.some(stopped));
+  const ph = item?.phases.find(p => p.status === 'failed') || item?.phases.find(p => p.status === 'interrupted');
+  delete j.failedPhase; delete j.failedStep;
+  if (!ph || typeof ph.label !== 'string') return;
+  j.failedPhase = ph.label;
+  const st = ph.steps?.find(x => x.status === 'failed') || ph.steps?.find(x => x.status === 'interrupted');
+  if (st && typeof st.label === 'string') j.failedStep = st.label;
+}
 const step = (id, label) => ({ id, label, status: 'pending' });
 function stepsFor(id, kv = kvCandidates()) {
   return id === 'sampling' ? [step('apply', 'Recommended sampling')]
@@ -1424,6 +1436,7 @@ function createFullAutotuner({ request: engineRequest, rawModels: engineRawModel
       if (e.unsafe) j._unsafe = true;
       const item = j.models?.find(m => m.model === j.model && m.status === 'running');
       if (item) { item.status = j.status === 'cancelled' ? 'interrupted' : 'failed'; item.error = e.message; }
+      stoppedAt(j);
     } finally {
       j.finishedAt = now(); j.waiting = false; child = null; idleAbort = null; save();
     }
@@ -1476,6 +1489,17 @@ function createFullAutotuner({ request: engineRequest, rawModels: engineRawModel
     cancelled = true; child?.cancel(); inflight?.abort(); idleAbort?.abort();
     return { ok: true, status: 202, body: publicJob(state.job) };
   }
+  // #1978: drops the finished job record the Recover card shows. History (measurements, evidence),
+  // saved settings and models.ini are not touched. Refused while a run is active or starting, and
+  // while a restored models.ini is still waiting for the model server to re-read it.
+  function clear() {
+    const j = state.job;
+    if (starting || j?.status === 'running') return { ok: false, status: 409, body: { error: 'Auto-tune is running. Cancel it before clearing.' } };
+    if (!j || !['failed', 'cancelled', 'interrupted', 'passed'].includes(j.status)) return { ok: false, status: 409, body: { error: 'There is no finished auto-tune to clear.' } };
+    if (j._reloadPending) return { ok: false, status: 409, body: { error: 'The model server has not re-read the restored settings yet. Try again shortly.' } };
+    delete state.job; save();
+    return { ok: true, status: 200, body: { cleared: true } };
+  }
   async function recover() {
     const j = state.job;
     if (j?._reloadPending) scheduleReload(j);
@@ -1508,7 +1532,7 @@ function createFullAutotuner({ request: engineRequest, rawModels: engineRawModel
       item.status = 'interrupted';
     }
     else if (item) item.status = 'interrupted';
-    j.status = 'interrupted'; j.phase = 'Interrupted'; j.finishedAt = now();
+    j.status = 'interrupted'; j.phase = 'Interrupted'; j.finishedAt = now(); stoppedAt(j);
     j.error = j._unsafe ? 'Restart interrupted tuning; settings could not safely be restored. Inspect models.ini before resuming.'
       : 'Restart interrupted tuning. Completed settings remain saved.';
     save();
@@ -1556,7 +1580,7 @@ function createFullAutotuner({ request: engineRequest, rawModels: engineRawModel
         if (!identity) throw publicFail('A queued model identity could not be read.');
         if (item._identity && item._identity !== hash({ ...identity, profile: undefined })) throw publicFail('A queued model changed since tuning began.');
       }
-      cancelled = false; j.status = 'running'; j.error = undefined; j.finishedAt = undefined;
+      cancelled = false; j.status = 'running'; j.error = undefined; j.finishedAt = undefined; delete j.failedPhase; delete j.failedStep;
       for (const item of j.models) if (item.status !== 'passed') {
         item.status = 'pending'; delete item.error; delete item._foreignYields;
         for (const p of item.phases) if (p.status !== 'passed') {
@@ -1571,6 +1595,6 @@ function createFullAutotuner({ request: engineRequest, rawModels: engineRawModel
     } catch (e) { return { ok: false, status: 409, body: { error: clientMessage(e, 'Auto-tune could not resume.') } }; }
     finally { starting = false; }
   }
-  return { start, resume, cancel, status, setSettings, untuned, recover, flushReload, completion: () => completion };
+  return { start, resume, cancel, clear, status, setSettings, untuned, recover, flushReload, completion: () => completion };
 }
 module.exports = { createFullAutotuner, qualityCheck, qualityFailure, QUALITY, VERSION, newModel, hasHarmonyReasoning, kvCandidates, preferKv, bf16Unsupported, MODES, LONG_PROFILE_REASON };

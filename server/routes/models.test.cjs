@@ -411,6 +411,21 @@ test('resume is admin-only, POST-only and passes renewed pause confirmation', as
   assert.deepEqual(calls, [{ confirmPause: undefined }, { confirmPause: true }]);
 });
 
+test('#1978 clear is admin-only and POST-only, and passes the job store answer through', async () => {
+  let n = 0;
+  const f = fixture({ manager: { autotune: { clear: () => { n++; return { status: 409, body: { error: 'Auto-tune is running. Cancel it before clearing.' } }; } } } });
+  await f.call('POST', '/api/models/autotune/clear', {});
+  assert.equal(f.sent.pop().status, 403);
+  await f.call('POST', '/api/models/autotune/clear', {}, 'member');
+  assert.equal(f.sent.pop().status, 403);
+  await f.call('GET', '/api/models/autotune/clear', undefined, 'admin');
+  assert.equal(f.sent.pop().status, 405);
+  assert.equal(n, 0, 'refused callers never reach the job store');
+  await f.call('POST', '/api/models/autotune/clear', {}, 'admin');
+  assert.equal(f.sent.pop().status, 409);
+  assert.equal(n, 1);
+});
+
 test('#1057 per-model tune settings are admin-only, POST-only, and pass the model and body through', async () => {
   const calls = [];
   const f = fixture({ manager: { autotune: {
