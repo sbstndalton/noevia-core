@@ -12,7 +12,8 @@ const davParseWasm = require('./dav-parse-wasm.cjs');
 const { createModelManager } = require('./model-manager.cjs');
 
 const GIB = 1024 ** 3;
-const meta = { arch: 'qwen35', contextLength: 262144, embeddingLength: 4096, blockCount: 32, headCount: 16, headCountKv: 4, keyLength: 256, valueLength: 256, fullAttentionInterval: 4, hasChatTemplate: true };
+const HYBRID_ARCH = 'qwen35'; // GGUF architecture identifier and metadata-key prefix required by the format reader.
+const meta = { arch: HYBRID_ARCH, contextLength: 262144, embeddingLength: 4096, blockCount: 32, headCount: 16, headCountKv: 4, keyLength: 256, valueLength: 256, fullAttentionInterval: 4, hasChatTemplate: true };
 const SUGGEST = { meta, modelBytes: 5.56 * GIB, mmprojBytes: 0.86 * GIB, budgetGib: 14, current: { 'ubatch-size': '1024' } };
 const FOOT = { meta, modelBytes: 5.56 * GIB, options: { 'ctx-size': '65536', 'cache-type-k': 'q8_0', 'cache-type-v': 'q8_0', 'cache-ram': '1024' }, model: 'm' };
 const INPUTS = { meta, modelBytes: 5.56 * GIB, current: { 'cache-ram': '1024' } };
@@ -133,12 +134,12 @@ function gguf(kv) {
   const val = (type, v) => (type === 4 ? u32(v) : str(v));
   return Buffer.concat([Buffer.from('GGUF'), u32(3), u64(0), u64(Object.keys(kv).length), ...Object.entries(kv).map(([k, [t, v]]) => Buffer.concat([str(k), u32(t), val(t, v)]))]);
 }
-const qwen35 = { 'general.architecture': [8, 'qwen35'], 'qwen35.context_length': [4, 262144], 'qwen35.embedding_length': [4, 4096], 'qwen35.block_count': [4, 32], 'qwen35.attention.head_count': [4, 16], 'qwen35.attention.head_count_kv': [4, 4], 'qwen35.attention.key_length': [4, 256], 'qwen35.attention.value_length': [4, 256], 'qwen35.full_attention_interval': [4, 4], 'tokenizer.chat_template': [8, '{{ messages }}'] };
+const HYBRID_HEADER = { 'general.architecture': [8, 'qwen35'], 'qwen35.context_length': [4, 262144], 'qwen35.embedding_length': [4, 4096], 'qwen35.block_count': [4, 32], 'qwen35.attention.head_count': [4, 16], 'qwen35.attention.head_count_kv': [4, 4], 'qwen35.attention.key_length': [4, 256], 'qwen35.attention.value_length': [4, 256], 'qwen35.full_attention_interval': [4, 4], 'tokenizer.chat_template': [8, '{{ messages }}'] };
 
 function manager(t, budget = 64) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'autoconfig-impl-'));
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
-  fs.writeFileSync(path.join(dir, 'q.gguf'), gguf(qwen35));
+  fs.writeFileSync(path.join(dir, 'q.gguf'), gguf(HYBRID_HEADER));
   const ini = path.join(dir, 'models.ini');
   fs.writeFileSync(ini, 'version = 1\n\n[small]\nmodel = /models/q.gguf\nctx-size = 4096\ncache-ram = 0\n');
   const calls = [], state = { small: 'unloaded' };

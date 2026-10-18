@@ -71,8 +71,6 @@ test('standing on a restricted task: an unreadable command is asked every time, 
   })();
   assert.equal(calls, 2);
   assert.equal(r.asked.length, 3, 'the first asked (no standing yet), the two faults asked despite the standing allow');
-  // The same on the first request without any standing: the fault asks and its approve_all is not remembered.
-  require('./dav-parse-wasm.cjs').codeActionsDecide = real;
 });
 
 test('an announced read whose own stated reading cannot be checked is taken whole: asked with the note, never waved through', { skip: skipWasm }, async () => {

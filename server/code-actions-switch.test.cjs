@@ -149,6 +149,18 @@ test('decide: a refusal, a fault, a bad reply or an input of the wrong shape ask
   }
 });
 
+test('decide keeps malformed grants non-standable while preserving certain workspace denials', () => {
+  const unverified = { ...REPLY, unverified: true, unverifiedWhy: 'test', paths: [] };
+  const asked = ca.decide({ classified: unverified, capabilities: 'network', inWorkspace: true });
+  assert.equal(asked.decision, 'ask');
+  assert.equal(asked.standable, false, 'a non-array grant value cannot establish a standing approval');
+
+  const outsideWrite = { ...REPLY, unverified: true, action: 'edit_file', actions: ['edit_file'], paths: ['/elsewhere/a'] };
+  assert.deepEqual(ca.decide({ classified: outsideWrite, capabilities: 'network', inWorkspace: false }),
+    { decision: 'deny', reason: 'The path is outside this task\u2019s workspace.' },
+    'a certain workspace denial still applies before malformed grants');
+});
+
 test('decide: a network call whose URL host the port cannot read exactly asks, unless the port denies it without the command', () => {
   const network = { ...REPLY, action: 'network', approval: 'capability', command: 'curl https://bücher.example/x', actions: ['network'], standable: true };
   const input = { classified: network, capabilities: [], domains: ['example.com'], inWorkspace: null };
