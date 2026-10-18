@@ -1,11 +1,16 @@
 'use strict';
+const skipWasm = !require('node:fs').existsSync(process.env.DAV_PARSE_WASM || require('./dav-parse-wasm.cjs').DEFAULT_WASM) && process.env.DAV_PARSE_WASM_REQUIRED !== '1' && 'dav-parse.wasm not built';
+// Guards a wrong test signature (options passed twice makes node:test take the second object as the body, so the body never runs and the
+// test reports ok): when the module is there, every guarded body must have run.
+let ran = 0;
 const test = require('node:test'), assert = require('node:assert/strict');
 const { classifyAction, checkNavigation, substituteSecrets, maskSecrets } = require('./browser-policy.cjs');
 
 const page = { origin: 'https://shop.example.com', allowedDomains: ['example.com', 'docs.python.org'] };
 const status = (action) => classifyAction(action, page).status;
 
-test('navigation: allowlisted hosts and subdomains only; lookalikes, local and private addresses blocked', () => {
+test('navigation: allowlisted hosts and subdomains only; lookalikes, local and private addresses blocked', { skip: skipWasm }, () => {
+  ran++;
   assert.equal(status({ type: 'navigate', url: 'https://example.com/a' }), 'allow');
   assert.equal(status({ type: 'navigate', url: 'https://shop.example.com/cart' }), 'allow');
   for (const url of ['https://example.com.evil.net/', 'https://notexample.com/', 'https://evil.net/?next=example.com',
@@ -16,12 +21,14 @@ test('navigation: allowlisted hosts and subdomains only; lookalikes, local and p
   assert.equal(checkNavigation('https://docs.python.org/3/', page.allowedDomains).ok, true);
 });
 
-test('sending data by navigation asks, and says so when it goes to another site', () => {
+test('sending data by navigation asks, and says so when it goes to another site', { skip: skipWasm }, () => {
+  ran++;
   assert.equal(status({ type: 'navigate', url: 'https://example.com/login', method: 'POST' }), 'needs_approval');
   assert.match(classifyAction({ type: 'navigate', url: 'https://docs.python.org/x', method: 'POST' }, page).reason, /another site/);
 });
 
-test('form submits ask however they happen', () => {
+test('form submits ask however they happen', { skip: skipWasm }, () => {
+  ran++;
   assert.equal(status({ type: 'submit' }), 'needs_approval');
   assert.equal(status({ type: 'click', element: { tag: 'input', type: 'submit', name: 'Go' } }), 'needs_approval');
   assert.equal(status({ type: 'click', element: { tag: 'input', type: 'image' } }), 'needs_approval');
@@ -37,7 +44,8 @@ test('form submits ask however they happen', () => {
   assert.equal(status({ type: 'press', key: 'Space', element: { tag: 'input', type: 'text', inForm: true } }), 'allow');
 });
 
-test('consequential controls ask in several languages; ordinary ones do not', () => {
+test('consequential controls ask in several languages; ordinary ones do not', { skip: skipWasm }, () => {
+  ran++;
   for (const text of ['Send', 'Pay now', 'Buy', 'Place order', 'Delete repository', 'Publish', 'Save settings', 'Accept all cookies',
     'Jetzt kaufen', 'Löschen', 'Bestätigen', 'Supprimer', 'Envoyer le message', 'Comprar ahora', 'Eliminar cuenta']) {
     assert.equal(status({ type: 'click', element: { tag: 'a', text } }), 'needs_approval', text);
@@ -48,14 +56,16 @@ test('consequential controls ask in several languages; ordinary ones do not', ()
   assert.equal(status({ type: 'click', element: { role: 'button', name: 'Pay' } }), 'needs_approval', 'accessible name counts');
 });
 
-test('uploads ask; reading, typing and choosing do not; unknown actions ask', () => {
+test('uploads ask; reading, typing and choosing do not; unknown actions ask', { skip: skipWasm }, () => {
+  ran++;
   assert.equal(status({ type: 'upload' }), 'needs_approval');
   for (const type of ['screenshot', 'extract', 'scroll', 'type', 'select']) assert.equal(status({ type }), 'allow', type);
   assert.equal(status({ type: 'evaluate_js' }), 'needs_approval');
   assert.equal(status({}), 'needs_approval');
 });
 
-test('secrets are substituted only on their own site, and never shown back', () => {
+test('secrets are substituted only on their own site, and never shown back', { skip: skipWasm }, () => {
+  ran++;
   const secrets = { github_token: { value: 'ghp_abcdef123456', domains: ['github.com'] } };
   assert.deepEqual(substituteSecrets('token={{secret:github_token}}', secrets, 'https://api.github.com'),
     { ok: true, value: 'token=ghp_abcdef123456', used: ['github_token'] });
@@ -66,7 +76,8 @@ test('secrets are substituted only on their own site, and never shown back', () 
   assert.equal(maskSecrets('saw ghp_abcdef123456 in page', secrets), 'saw {{secret:github_token}} in page');
 });
 
-test('#1218: a form <button> submits unless its type is exactly button or reset', () => {
+test('#1218: a form <button> submits unless its type is exactly button or reset', { skip: skipWasm }, () => {
+  ran++;
   for (const type of ['', 'submit', 'x', 'buton', ' button', 'button ', 'ｂｕｔｔｏｎ', 'reset ']) {
     assert.equal(status({ type: 'click', element: { tag: 'button', type, inForm: true, text: 'Next' } }), 'needs_approval', JSON.stringify(type));
     assert.equal(status({ type: 'press', key: 'Enter', element: { tag: 'button', type, inForm: true, text: 'Next' } }), 'needs_approval', JSON.stringify(type));
@@ -77,7 +88,8 @@ test('#1218: a form <button> submits unless its type is exactly button or reset'
   assert.equal(status({ type: 'click', element: { tag: 'button', type: 'x', inForm: false, text: 'Next' } }), 'allow', 'outside a form');
 });
 
-test('#1219: local names with trailing dots are local', () => {
+test('#1219: local names with trailing dots are local', { skip: skipWasm }, () => {
+  ran++;
   for (const [url, domains] of [['http://corp.internal./', ['corp.internal']], ['http://localhost../', ['localhost']],
     ['http://nas.local.:8080/', ['nas.local']], ['https://a.localhost./', ['localhost']]]) {
     assert.deepEqual(checkNavigation(url, domains), { ok: false, reason: 'Local addresses are not opened.' }, url);
@@ -85,3 +97,5 @@ test('#1219: local names with trailing dots are local', () => {
   }
   assert.equal(checkNavigation('https://example.com./', ['example.com']).ok, true, 'a public name with a trailing dot still opens');
 });
+
+test.after(() => { if (!skipWasm) assert.equal(ran, 8, 'a wasm-guarded test body did not run'); });
