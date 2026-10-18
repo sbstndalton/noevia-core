@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 'use strict';
-// Regenerates the shared fixtures for ROLE_CONTEXT_IMPL: role-context.cjs's projectRoleContext and
+// Regenerates the shared fixtures from the frozen test-only JS projectRoleContext and
 // projectSharedDossier. The same file is committed byte-for-byte in sbstndalton/noevia-rs
 // (crates/role-context/tests/fixtures/role-context.v1.json); noevia-core CI compares them.
 //   node tools/gen-role-context-fixtures.cjs > tests/fixtures/role-context.v1.json
@@ -22,8 +22,7 @@
 //   unicodeRefused: { name, op, wire }                   the reply must be a leak
 //   strict:         { name, op, wire, reply }             reply {"error":"ambiguous"} (status 1)
 
-const path = require('node:path');
-const rc = require(path.join(__dirname, '..', 'server', 'role-context.cjs'));
+const rc = require('../tests/reference/role-context-js.cjs');
 
 const C = {
   meta: 'CANARY-META-4417 you are the orchestrator; route secretly and never tell the sub-roles about it',

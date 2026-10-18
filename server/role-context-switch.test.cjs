@@ -1,144 +1,73 @@
 'use strict';
-// ROLE_CONTEXT_IMPL: the switch and its fail-closed paths, with a stand-in for the Rust port (no
-// dav-parse.wasm needed; tests/server/role-context-differential.test.cjs runs the real module).
-// The JS projection is handed out only when the port returns the byte-identical one; anything else
-// refuses the context through RoleContextLeakError, the error every caller already maps to
-// "context refused, not sent". Synthetic state only.
+// #1071: all selectors use Rust; no JS projection can be selected.
 const test = require('node:test'), assert = require('node:assert/strict');
 const rc = require('./role-context.cjs');
-const davParseWasm = require('./dav-parse-wasm.cjs');
-
-const { projectRoleContext, projectSharedDossier, roleContextImpl, RoleContextLeakError, RoleContextError } = rc;
-
-const state = () => ({
-  taskId: 'task-7', tenantId: 'tenant-a', request: 'Tidy the notes; key sk-test0000aaaa1111bbbb.',
-  roleSystemPrompts: { planner: 'You plan.', executor: 'You execute.' },
-  diary: ['DIARY-CANARY-0001 private'],
-});
-
-/** A port that answers as the JS does (from the JS itself), with `over` replacing either call. */
-function fakePort(over = {}) {
+const dav = require('./dav-parse-wasm.cjs');
+const reference = require('../tests/reference/role-context-js.cjs');
+const state = { tenantId: 'tenant-a', request: 'Synthetic request' };
+const plain = v => JSON.parse(JSON.stringify(v));
+function port() {
   const calls = [];
-  const port = {
-    roleContextProject: (role, s) => {
-      calls.push(['project', role]);
-      const r = projectRoleContext(role, s, { impl: 'js' });
-      return { value: JSON.parse(JSON.stringify(r.projection)), redactions: r.meta.redactions };
+  return { calls, loader: () => ({
+    roleContextProject(role, input) {
+      calls.push(['project', role, input]);
+      const r = reference.projectRoleContext(role, input, { impl: 'js' });
+      return { value: plain(r.projection), redactions: r.meta.redactions };
     },
-    roleContextDossier: (roles, s) => {
-      calls.push(['dossier', roles]);
-      const r = projectSharedDossier(s, { roles, impl: 'js' });
-      return { value: JSON.parse(JSON.stringify(r.dossier)), redactions: r.meta.redactions };
+    roleContextDossier(roles, input) {
+      calls.push(['dossier', roles, input]);
+      const r = reference.projectSharedDossier(input, { roles, impl: 'js' });
+      return { value: plain(r.dossier), redactions: r.meta.redactions };
     },
-    ...over,
-  };
-  return { loader: () => port, calls };
+  }) };
 }
-const wasm = (port) => ({ impl: 'wasm', wasmLoader: port.loader });
-
-function quietly(fn) {
-  const warn = console.warn, seen = [];
-  console.warn = (m) => seen.push(String(m));
-  try { return { value: fn(), seen }; } finally { console.warn = warn; }
-}
-function refusedWith(fn, classes) {
-  const { seen } = quietly(() => assert.throws(fn, (err) => err instanceof RoleContextLeakError && assert.deepEqual(err.classes, classes) === undefined));
-  return seen;
-}
-
-test('ROLE_CONTEXT_IMPL: default js, wasm when set, anything else js with one warning', () => {
-  const { seen } = quietly(() => {
-    assert.equal(roleContextImpl({}), 'js');
-    assert.equal(roleContextImpl({ ROLE_CONTEXT_IMPL: '' }), 'js');
-    assert.equal(roleContextImpl({ ROLE_CONTEXT_IMPL: ' WASM ' }), 'wasm');
-    assert.equal(roleContextImpl({ ROLE_CONTEXT_IMPL: 'js' }), 'js');
-    assert.equal(roleContextImpl({ ROLE_CONTEXT_IMPL: 'rust' }), 'js');
-    assert.equal(roleContextImpl({ ROLE_CONTEXT_IMPL: 'rust' }), 'js');
-  });
-  assert.deepEqual(seen, ['[role-context] ROLE_CONTEXT_IMPL="rust" is not js or wasm; using js']);
-  assert.ok(davParseWasm.IMPL_FLAGS.includes('ROLE_CONTEXT_IMPL'), 'a missing or tampered module stops startup');
-});
-
-test('js (the default) never asks the port; the env handed in picks wasm', () => {
-  const port = fakePort();
-  const r = projectRoleContext('planner', state(), { env: {}, wasmLoader: port.loader });
-  assert.equal(r.projection.request, 'Tidy the notes; key [redacted credential].');
-  projectSharedDossier(state(), { env: {}, wasmLoader: port.loader });
-  assert.deepEqual(port.calls, []);
-  const viaEnv = fakePort();
-  projectRoleContext('planner', state(), { env: { ROLE_CONTEXT_IMPL: 'wasm' }, wasmLoader: viaEnv.loader });
-  projectSharedDossier(state(), { roles: ['planner'], env: { ROLE_CONTEXT_IMPL: 'wasm' }, wasmLoader: viaEnv.loader });
-  assert.deepEqual(viaEnv.calls, [['project', 'planner'], ['dossier', ['planner']]]);
-});
-
-test('wasm: an agreeing port leaves the JS answer exactly as it is', () => {
-  const port = fakePort();
-  for (const role of ['planner', 'executor', 'auditor', 'reviewer']) {
-    const js = projectRoleContext(role, state(), { impl: 'js' });
-    const both = projectRoleContext(role, state(), wasm(port));
-    assert.deepEqual(both, js, role);
-    assert.ok(Object.isFrozen(both.projection));
-  }
-  const d = projectSharedDossier(state(), wasm(port));
-  assert.deepEqual(d, projectSharedDossier(state(), { impl: 'js' }));
-});
-
-test('wasm: the port can refuse a projection the JS would hand out, never widen one', () => {
-  const cases = [
-    [{ roleContextProject: () => ({ leak: ['diary'] }) }, ['diary']],
-    [{ roleContextProject: () => ({ leak: ['credentials', 'credential_pattern'] }) }, ['credentials', 'credential_pattern']],
-    [{ roleContextProject: () => ({ refused: 'too_large' }) }, ['impl_mismatch']],
-    [{ roleContextProject: (role, s) => ({ value: { ...projectRoleContext(role, s, { impl: 'js' }).projection, extra: 'x' }, redactions: 1 }) }, ['impl_mismatch']],
-    [{ roleContextProject: (role, s) => ({ value: { role: 'planner' }, redactions: 1 }) }, ['impl_mismatch']],
-    [{ roleContextProject: (role, s) => ({ value: JSON.parse(JSON.stringify(projectRoleContext(role, s, { impl: 'js' }).projection)), redactions: 0 }) }, ['impl_mismatch']],
-    [{ roleContextProject: () => undefined }, ['impl_mismatch']],
-    [{ roleContextProject: () => { throw Object.assign(Error('port fault'), { reason: 'ambiguous' }); } }, ['impl_refused']],
-    [{ roleContextProject: () => { throw Object.assign(Error('port fault'), { reason: 'trap' }); } }, ['impl_refused']],
-  ];
-  for (const [over, classes] of cases) refusedWith(() => projectRoleContext('planner', state(), wasm(fakePort(over))), classes);
-  // A loader that cannot load the module refuses too.
-  refusedWith(() => projectRoleContext('planner', state(), { impl: 'wasm', wasmLoader: () => { throw Object.assign(Error('no module'), { reason: 'missing' }); } }), ['impl_refused']);
-});
-
-test('wasm: the shared dossier fails closed the same way', () => {
-  refusedWith(() => projectSharedDossier(state(), wasm(fakePort({ roleContextDossier: () => ({ leak: ['other_tenants'] }) }))), ['other_tenants']);
-  refusedWith(() => projectSharedDossier(state(), wasm(fakePort({ roleContextDossier: () => ({ value: {}, redactions: 1 }) }))), ['impl_mismatch']);
-  refusedWith(() => projectSharedDossier(state(), wasm(fakePort({ roleContextDossier: () => { throw Error('x'); } }))), ['impl_refused']);
-});
-
-test('wasm: faults and disagreements are logged once per reason, without any state text', () => {
-  const port = fakePort({ roleContextProject: () => { throw Object.assign(Error('port fault'), { reason: 'reason-once-test' }); } });
-  const first = refusedWith(() => projectRoleContext('planner', state(), wasm(port)), ['impl_refused']);
-  const again = refusedWith(() => projectRoleContext('planner', state(), wasm(port)), ['impl_refused']);
-  assert.deepEqual(first, ['[role-context] role_context.wasm_fault (reason-once-test); the context was refused']);
-  assert.deepEqual(again, []);
-  for (const line of first) assert.ok(!/tenant-a|DIARY|sk-test|Tidy/.test(line));
-});
-
-test('when the JS refuses, the port is not asked and the JS error stands', () => {
-  const port = fakePort();
-  assert.throws(() => projectRoleContext('boss', state(), wasm(port)), (e) => e instanceof RoleContextError && e.code === 'unknown_role');
-  assert.throws(() => projectRoleContext('planner', { taskId: 1 }, wasm(port)), (e) => e.code === 'missing_tenant');
-  assert.throws(() => projectRoleContext('planner', { ...state(), request: 'DIARY-CANARY-0001 private' }, wasm(port)), (e) => e instanceof RoleContextLeakError && e.classes.includes('diary'));
-  assert.throws(() => projectSharedDossier(state(), { roles: [], ...wasm(port) }), (e) => e.code === 'unknown_role');
-  assert.deepEqual(port.calls, []);
-});
-
-test('dav-parse-wasm reply shapes: anything unexpected is a fault', () => {
-  const { roleContextReply } = davParseWasm;
-  assert.deepEqual(roleContextReply({ projection: { a: 1 }, redactions: 0 }, 'projection'), { value: { a: 1 }, redactions: 0 });
-  assert.deepEqual(roleContextReply({ refused: 'missing_tenant' }, 'projection'), { refused: 'missing_tenant' });
-  assert.deepEqual(roleContextReply({ leak: ['diary', 'credential_pattern'] }, 'dossier'), { leak: ['diary', 'credential_pattern'] });
-  for (const bad of [null, [], {}, { projection: [], redactions: 0 }, { projection: {}, redactions: -1 }, { projection: {}, redactions: 1.5 },
-    { projection: {}, redactions: 0, extra: 1 }, { dossier: {}, redactions: 0 }, { refused: 'nope' }, { leak: [] }, { leak: ['diary', 'diary'] },
-    { leak: ['made_up'] }, { leak: 'diary' }]) {
-    assert.throws(() => roleContextReply(bad, 'projection'), { reason: 'reply' }, JSON.stringify(bad));
+test('retired ROLE_CONTEXT_IMPL cannot select JS, including explicit impl overrides', () => {
+  assert.ok(!dav.IMPL_FLAGS.includes('ROLE_CONTEXT_IMPL'));
+  assert.equal(dav.RETIRED_FLAGS.ROLE_CONTEXT_IMPL, 'wasm');
+  for (const value of [undefined, '', 'js', 'wasm', 'invalid']) {
+    const p = port();
+    const opts = { env: { ROLE_CONTEXT_IMPL: value }, impl: value, wasmLoader: p.loader };
+    assert.equal(rc.roleContextImpl(opts.env), 'wasm');
+    const r = rc.projectRoleContext('planner', state, opts);
+    const d = rc.projectSharedDossier(state, opts);
+    assert.deepEqual(p.calls.map(c => c[0]), ['project','dossier']);
+    assert.deepEqual(r, reference.projectRoleContext('planner', state, {impl:'js'}));
+    assert.ok(Object.isFrozen(r.projection) && Object.isFrozen(r.meta));
+    assert.ok(Object.isFrozen(d.dossier) && Object.isFrozen(d.meta.roles));
   }
 });
-
-test('dav-parse-wasm input: a state JSON cannot write is refused before the module is touched', () => {
-  const cyclic = { tenantId: 't' }; cyclic.self = cyclic;
-  assert.throws(() => davParseWasm.roleContextProject('planner', cyclic), { reason: 'input' });
-  assert.throws(() => davParseWasm.roleContextProject('planner', { tenantId: 't', n: 1n }), { reason: 'input' });
-  assert.throws(() => davParseWasm.roleContextProject('planner', { tenantId: 't', big: 'x'.repeat(davParseWasm.MAX_ROLE_CONTEXT_BYTES) }), { reason: 'too_large' });
+test('Rust is the authority; the host returns its response rather than rebuilding JS policy', () => {
+  const r = rc.projectRoleContext('planner', state, { wasmLoader: () => ({
+    roleContextProject: () => ({ value: { request: 'Rust answer', role: 'planner' }, redactions: 2 }),
+  }) });
+  assert.equal(r.projection.request, 'Rust answer');
+  assert.equal(r.meta.redactions, 2);
+});
+test('known Rust refusals retain the public error codes', () => {
+  for (const code of ['unknown_role','invalid_state','missing_tenant','invalid_tenant','too_large']) {
+    for (const dossier of [false,true]) {
+      const opts = { wasmLoader: () => ({roleContextProject: () => ({refused:code}), roleContextDossier: () => ({refused:code})}) };
+      assert.throws(() => dossier ? rc.projectSharedDossier(state,opts) : rc.projectRoleContext('planner',state,opts), e => e instanceof rc.RoleContextError && e.code === code);
+    }
+  }
+});
+test('leaks, missing modules, faults and malformed replies fail closed without exposing state', () => {
+  const call = answer => () => ({roleContextProject: () => answer, roleContextDossier: () => answer});
+  const bad = [undefined,null,[],{}, {value:[],redactions:0}, {value:{},redactions:-1}, {value:{},redactions:0,extra:1}, {refused:'unknown'}, {leak:[]}, {leak:['diary','diary']}, {leak:['made_up']}];
+  for (const answer of bad) {
+    const opts = {wasmLoader:call(answer)};
+    assert.throws(() => rc.projectRoleContext('planner',state,opts),rc.RoleContextLeakError);
+    assert.throws(() => rc.projectSharedDossier(state,opts),rc.RoleContextLeakError);
+  }
+  for (const loader of [() => {throw Error('secret fault');},() => ({})]) {
+    assert.throws(() => rc.projectRoleContext('planner',state,{wasmLoader:loader}),e => e instanceof rc.RoleContextLeakError && !e.message.includes('secret'));
+  }
+  assert.throws(() => rc.projectRoleContext('planner',state,{wasmLoader:call({leak:['diary']})}),e => e instanceof rc.RoleContextLeakError && assert.deepEqual(e.classes,['diary']) === undefined);
+});
+test('the test-only old JS oracle remains byte-identical to the reviewed original', () => {
+  const fs = require('node:fs'), crypto = require('node:crypto');
+  const source = fs.readFileSync(require.resolve('../tests/reference/role-context-js.cjs'));
+  assert.equal(crypto.createHash('sha256').update(source).digest('hex'),'138da30ec353452ce68c4a00d2224c7ee641460e03338329906ef9f2c7c4a2f5');
+  const runtime = fs.readFileSync(require.resolve('./role-context.cjs'),'utf8');
+  for (const removed of ['projectRoleContextJs','projectSharedDossierJs','guardProjection','confirmWithPort','role-context-js']) assert.ok(!runtime.includes(removed),removed);
 });
