@@ -4,7 +4,7 @@
 // Resolution stays inside the requesting project's own files. Synthetic projects only.
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { resolveProjectFile, invalidReason } = require('./project-file-names.cjs');
+const { resolveProjectFile } = require('./project-file-names.cjs');
 const { createToolboxes } = require('./toolboxes.cjs');
 const { createInternalTools } = require('./mcp-internal-tools.cjs');
 
@@ -92,7 +92,7 @@ test('traversal-shaped names are refused before any lookup, in the readers and t
     `${FOLDER}//Text/synthetic-notes.md`, 'synthetic-notes.md\u0000', 'Text/\nsynthetic-notes.md', '', '   ',
   ];
   for (const name of attempts) {
-    assert.ok(invalidReason(name), `accepted ${JSON.stringify(name)}`);
+    assert.equal(resolveProjectFile(fixtures().a, name).code, 'invalid', `accepted ${JSON.stringify(name)}`);
     for (const reader of [read, mcpRead]) {
       const out = await reader(name);
       assert.match(out, /^ERROR: /, `${JSON.stringify(name)} -> ${out}`);
