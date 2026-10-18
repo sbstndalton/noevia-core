@@ -1,7 +1,7 @@
 'use strict';
-// Shared by tools/gen-gguf-meta-fixtures.cjs and tests/server/gguf-meta-differential.test.cjs
-// (here, not in tools/, so the runtime-image job that mounts only tests/ can run the test): the
-// synthetic GGUF builder, the canonical summary text and the fixture byte packing.
+// Shared by the GGUF tests (tests/server/gguf-*.test.cjs and server/gguf-params-1197.test.cjs): the
+// synthetic GGUF builder, the canonical summary text and the fixture byte packing. (The generator
+// tools/gen-gguf-meta-fixtures.cjs went with the JS reader in #1071; the fixtures are frozen.)
 
 // --- canonical summary text ------------------------------------------------------------------
 function encNum(v) {

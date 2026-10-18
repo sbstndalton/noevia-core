@@ -1,0 +1,18 @@
+{
+ "version": 1,
+ "note": "Frozen answers of the former JS reader (removed in #1071) for the pinned real headers fetched by tools/fetch-real-gguf-headers.cjs, keyed by the pinned revision. The architecture and the general.name are replaced by the placeholders <arch> and <name> (no third-party model names are committed); the test masks the same two fields. Read by tests/server/gguf-meta-real-headers.test.cjs. Do not regenerate through the Rust path.",
+ "headers": {
+  "f0b45be0aac41bd6a100a4b5734cad5f67255bfb": {
+   "totalSize": 689814560,
+   "summary": "{\"parameterCount\":999885952,\"arch\":\"<arch>\",\"name\":\"<name>\",\"contextLength\":32768,\"embeddingLength\":1152,\"blockCount\":26,\"headCount\":4,\"headCountKv\":1,\"keyLength\":256,\"valueLength\":256,\"keyLengthSwa\":null,\"valueLengthSwa\":null,\"slidingWindow\":512,\"slidingWindowPattern\":null,\"sharedKvLayers\":null,\"fullAttentionInterval\":null,\"ssmStateSize\":null,\"expertCount\":null,\"nextnPredictLayers\":null,\"hasChatTemplate\":true}"
+  },
+  "fc034cfff751157913579611efad8462ac1be606": {
+   "totalSize": 6375734080,
+   "summary": "{\"parameterCount\":11907350576,\"arch\":\"<arch>\",\"name\":\"<name>\",\"contextLength\":262144,\"embeddingLength\":3840,\"blockCount\":48,\"headCount\":16,\"headCountKv\":[8,8,8,8,8,1,8,8,8,8,8,1,8,8,8,8,8,1,8,8,8,8,8,1,8,8,8,8,8,1,8,8,8,8,8,1,8,8,8,8,8,1,8,8,8,8,8,1],\"keyLength\":512,\"valueLength\":512,\"keyLengthSwa\":256,\"valueLengthSwa\":256,\"slidingWindow\":1024,\"slidingWindowPattern\":[true,true,true,true,true,false,true,true,true,true,true,false,true,true,true,true,true,false,true,true,true,true,true,false,true,true,true,true,true,false,true,true,true,true,true,false,true,true,true,true,true,false,true,true,true,true,true,false],\"sharedKvLayers\":0,\"fullAttentionInterval\":null,\"ssmStateSize\":null,\"expertCount\":null,\"nextnPredictLayers\":null,\"hasChatTemplate\":true}"
+  },
+  "23749fefcc72300e3a2ad315e1317431b06b590a": {
+   "totalSize": 639446688,
+   "summary": "{\"parameterCount\":596049920,\"arch\":\"<arch>\",\"name\":\"<name>\",\"contextLength\":40960,\"embeddingLength\":1024,\"blockCount\":28,\"headCount\":16,\"headCountKv\":8,\"keyLength\":128,\"valueLength\":128,\"keyLengthSwa\":null,\"valueLengthSwa\":null,\"slidingWindow\":null,\"slidingWindowPattern\":null,\"sharedKvLayers\":null,\"fullAttentionInterval\":null,\"ssmStateSize\":null,\"expertCount\":null,\"nextnPredictLayers\":null,\"hasChatTemplate\":true}"
+  }
+ }
+}

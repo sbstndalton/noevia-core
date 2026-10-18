@@ -100,7 +100,7 @@ const round2 = n => Math.round(n * 100) / 100;
 
 /**
  * @param {object} p
- * @param {object} p.meta      gguf-meta summarize() output
+ * @param {object} p.meta      gguf-meta readSummary() output
  * @param {number} p.modelBytes model file size
  * @param {number} [p.mmprojBytes] projector file size when the preset names one
  * @param {number} p.budgetGib  inference memory budget (GPU-addressable, shared)

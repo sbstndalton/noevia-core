@@ -1,16 +1,19 @@
 'use strict';
 
-// GGUF_META_IMPL: tests/fixtures/gguf-meta.v1.json (byte-identical to noevia-rs
-// crates/gguf/tests/fixtures/; CI compares them) holds what gguf-meta.cjs returns for synthetic
-// headers, printed by tools/gen-gguf-meta-fixtures.cjs from the JS itself. Here every row runs
-// through readSummaryWasm (the file I/O here, the parse in dav-parse.wasm's gguf_summary) and must
-// return the same summary or throw the same message; rows nested past 64 must be refused. Then
-// the range reads (skipped bytes never read), the 24 MiB cap, real-size vocabularies, bounded rounds, seeded live JS-vs-wasm mutations, the reply-shape checks and
-// the fail-closed paths. The WebAssembly half needs server/wasm/dav-parse.wasm (or
-// DAV_PARSE_WASM); skipped without it unless DAV_PARSE_WASM_REQUIRED=1.
+// GGUF metadata reader (GGUF_META_IMPL, retired in #1071: always Rust). tests/fixtures/gguf-meta.v1.json
+// (byte-identical to noevia-rs crates/gguf/tests/fixtures/; CI compares them) holds what the
+// former JS reader returned for synthetic headers. It is frozen: the JS reader and its generator are
+// gone, and the file must not be regenerated through the Rust path (that would erase the
+// independent reference). Here every row runs through readSummaryWasm (the file I/O here, the parse
+// in dav-parse.wasm's gguf_summary) and must return the same summary or throw the same message;
+// rows nested past 64 must be refused (the one place the Rust reader is stricter). Then the range
+// reads (skipped bytes never read), the 24 MiB cap, real-size vocabularies, bounded rounds, a
+// frozen seeded corpus of mutated and truncated headers (tests/fixtures/gguf-meta-mutations.v1.json),
+// the reply-shape checks and the fail-closed paths. The WebAssembly half needs
+// server/wasm/dav-parse.wasm (or DAV_PARSE_WASM); skipped without it unless DAV_PARSE_WASM_REQUIRED=1.
 
 const assert = require('node:assert/strict');
-const { execFileSync } = require('node:child_process');
+const crypto = require('node:crypto');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
@@ -18,10 +21,13 @@ const test = require('node:test');
 
 const davParseWasm = require('../../server/dav-parse-wasm.cjs');
 const gguf = require('../../server/gguf-meta.cjs');
-const { readGguf, summarize, readSummary, readSummaryWasm, ggufImpl } = gguf;
+const { readSummary, readSummaryWasm } = gguf;
 
 const FILE = path.join(__dirname, '../fixtures/gguf-meta.v1.json');
-const GENERATOR = path.join(__dirname, '../../tools/gen-gguf-meta-fixtures.cjs');
+const MUTATIONS_FILE = path.join(__dirname, '../fixtures/gguf-meta-mutations.v1.json');
+const MUTATIONS = JSON.parse(fs.readFileSync(MUTATIONS_FILE, 'utf8'));
+// The frozen references are pinned: changing either is a deliberate act that also changes these.
+const PINS = { [FILE]: '3d41ef6b089b244da6640b4f28ba69084425c49e8c89aa9d41ef30c254b2b659', [MUTATIONS_FILE]: 'e58ec0e34a3253c9d387dab9750ae12f204afb9ad119316f0b3f076c70bfa726' };
 const fixtures = JSON.parse(fs.readFileSync(FILE, 'utf8'));
 const wasmFile = process.env.DAV_PARSE_WASM || davParseWasm.DEFAULT_WASM;
 const skipWasm = !fs.existsSync(wasmFile) && process.env.DAV_PARSE_WASM_REQUIRED !== '1' && 'dav-parse.wasm not built';
@@ -32,8 +38,12 @@ test.after(() => fs.rmSync(dir, { recursive: true, force: true }));
 let n = 0;
 const tmp = (buf) => { const f = path.join(dir, `f${n++}.gguf`); fs.writeFileSync(f, buf); return f; };
 
-/** summarize(readGguf(file)) or the message it throws. */
-function js(file) { try { return { summary: summarize(readGguf(file)) }; } catch (e) { return { error: e.message }; } }
+// What a header with no keys summarizes to; the expectations below override single fields.
+const EMPTY = { arch: '', name: '', contextLength: null, embeddingLength: null, blockCount: null, headCount: null, headCountKv: null, keyLength: null, valueLength: null,
+  keyLengthSwa: null, valueLengthSwa: null, slidingWindow: null, slidingWindowPattern: null, sharedKvLayers: null, fullAttentionInterval: null, ssmStateSize: null,
+  expertCount: null, nextnPredictLayers: null, hasChatTemplate: false };
+
+/** The summary readSummaryWasm returns, or the message it throws. */
 function rs(file, opts) { try { return { summary: readSummaryWasm(file, opts) }; } catch (e) { return { error: e.message }; } }
 
 async function withEnv(vars, fn) {
@@ -44,27 +54,31 @@ async function withEnv(vars, fn) {
   }
 }
 
-test('the fixture file is what the generator prints', { skip: !fs.existsSync(GENERATOR) && 'no generator here' }, () => {
-  const out = execFileSync(process.execPath, [GENERATOR], { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024, env: { ...process.env, GGUF_META_IMPL: 'wasm' } });
-  assert.equal(out, fs.readFileSync(FILE, 'utf8'));
-  assert.equal(fixtures.limits.maxArrayKept, gguf.MAX_ARRAY_KEPT);
+test('the fixture file is frozen: its limits are the reader limits and no generator or JS reader remains', () => {
+  assert.equal(fixtures.limits.maxArrayKept, 1024);
+  assert.equal(fixtures.limits.maxStringKept, 256 * 1024);
+  assert.equal(fixtures.version, 1);
+  for (const [file, pin] of Object.entries(PINS)) assert.equal(crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex'), pin, path.basename(file));
+  assert.equal(MUTATIONS.version, 1);
+  for (const gone of ['readGguf', 'summarize', 'ggufImpl', 'MAX_ARRAY_KEPT']) assert.equal(gguf[gone], undefined, gone);
+  assert.deepEqual(Object.keys(gguf).sort(), ['MAX_ROUNDS', 'MAX_SENT_WINDOWS', 'readSummary', 'readSummaryWasm']);
 });
 
-test('every fixture row: the same summary or the same error through the Rust port', { skip: skipWasm }, () => {
+test('every fixture row: the frozen summary or the frozen error through the Rust port', { skip: skipWasm }, () => {
   davParseWasm.reset();
   let same = 0, refused = 0;
   for (const row of fixtures.cases) {
     const file = tmp(gen.unpackBytes(row.bytes));
-    const want = js(file);
-    // The table is the JS today, not only when it was printed.
-    if (want.summary) assert.equal(gen.encodeSummary(want.summary), row.summary, row.name);
-    else assert.equal(want.error, row.error, row.name);
     const got = rs(file);
     if ((row.nest || 0) > 64) {
       assert.deepEqual(got, { error: 'GGUF header could not be checked (depth)' }, row.name);
       refused++;
+    } else if (row.summary !== undefined) {
+      assert.ok(got.summary, `${row.name}: ${got.error}`);
+      assert.equal(gen.encodeSummary(got.summary), row.summary, row.name);
+      same++;
     } else {
-      assert.deepStrictEqual(got, want, row.name);
+      assert.deepEqual(got, { error: row.error }, row.name);
       same++;
     }
   }
@@ -80,26 +94,25 @@ test('ranges: a header is read in doubling steps, skipped bytes never; past 24 M
   const held = (segs) => segs.reduce((n, x) => n + x.bytes.length, 0);
   const spy = { ...davParseWasm, ggufSummary: (size, segs) => { calls.push(held(segs)); return davParseWasm.ggufSummary(size, segs); } };
   const got = readSummaryWasm(three, { wasm: spy });
-  assert.deepStrictEqual(got, summarize(readGguf(three)));
-  assert.equal(got.blockCount, 12);
+  assert.deepStrictEqual(got, { ...EMPTY, arch: 'late', blockCount: 12 });
   assert.ok(calls.length >= 5 && calls.length < 16 && calls[0] === 4096 && calls.at(-1) > 3_000_000, String(calls));
-  // A small cap shows the refusal without a big file; the JS reads it fine.
+  // A small cap shows the refusal without a big file.
   assert.deepEqual(rs(three, { maxWindow: 1024 * 1024 }), { error: 'GGUF header could not be checked (too_large)' });
   // The real cap: 25 MiB of kept strings before the last key.
   const big = Array.from({ length: 125 }, (_, i) => kv(`pad${i}`, STR('q'.repeat(210 * 1024))));
   const seventeen = tmp(build([...big, kv('general.architecture', STR('x'))]));
-  assert.equal(summarize(readGguf(seventeen)).arch, 'x');
+  // Intended: the 24 MiB read cap refuses this header (the former JS reader accepted any size up to 128 MiB).
   assert.deepEqual(rs(seventeen), { error: 'GGUF header could not be checked (too_large)' });
   // Skipped bytes are never read: a 20 MiB skipped array and 40 skipped 300 KiB strings around
   // the keys, ~32 MiB of header in all, cross as a few KiB.
   const longs = Array.from({ length: 40 }, (_, i) => kv(`long${i}`, STR('L'.repeat(300 * 1024))));
   const skipped = tmp(build([kv('v', [T.arr, Buffer.concat([gen.u32(T.u8), gen.u64(20 * 1024 * 1024), Buffer.alloc(20 * 1024 * 1024)])]), ...longs, kv('general.architecture', STR('s')), kv('s.block_count', S(T.u8, 5))]));
   calls.length = 0;
-  assert.deepStrictEqual(readSummaryWasm(skipped, { wasm: spy }), summarize(readGguf(skipped)));
-  assert.equal(js(skipped).summary.blockCount, 5);
+  const SKIPPED = { ...EMPTY, arch: 's', blockCount: 5 };
+  assert.deepStrictEqual(readSummaryWasm(skipped, { wasm: spy }), SKIPPED);
   assert.ok(Math.max(...calls) < 512 * 1024 && fs.statSync(skipped).size > 30 * 1024 * 1024, String(calls));
   // Even with a 1 MiB cap the skipped regions cost nothing.
-  assert.deepStrictEqual(rs(skipped, { maxWindow: 1024 * 1024 }), js(skipped));
+  assert.deepStrictEqual(rs(skipped, { maxWindow: 1024 * 1024 }), { summary: SKIPPED });
   davParseWasm.reset();
 });
 
@@ -110,6 +123,9 @@ test('realistic vocabularies cross in few ranges and rounds', { skip: skipWasm }
   const word = () => 'ab▁cdéfgh'.slice(0, 1 + rnd(8)) + rnd(100000);
   const strArr = (n, f) => [T.arr, Buffer.concat([u32(T.str), u64(n), ...Array.from({ length: n }, () => str(f()))])];
   const numArr = (type, n, w) => [T.arr, Buffer.concat([u32(type), u64(n), Buffer.alloc(n * w, 1)])];
+  // In the order of `shapes` below (the architecture is masked: it is whatever the shape declares).
+  const wants = [{ ...EMPTY, blockCount: 48, contextLength: 131072, hasChatTemplate: true }, { ...EMPTY, blockCount: 28, contextLength: 32768 }];
+  let shapeNo = 0;
   const shapes = {
     gemma_262k: [kv('general.architecture', STR('gemma3')), kv('gemma3.block_count', S(T.u32, 48)), kv('tokenizer.ggml.model', STR('llama')),
       kv('tokenizer.ggml.tokens', strArr(262144, word)), kv('tokenizer.ggml.scores', numArr(T.f32, 262144, 4)), kv('tokenizer.ggml.token_type', numArr(T.i32, 262144, 4)),
@@ -122,7 +138,9 @@ test('realistic vocabularies cross in few ranges and rounds', { skip: skipWasm }
     const file = tmp(build(kvs));
     let rounds = 0, most = 0;
     const spy = { ...davParseWasm, ggufSummary: (size, segs) => { rounds++; most = Math.max(most, segs.length); return davParseWasm.ggufSummary(size, segs); } };
-    assert.deepStrictEqual(readSummaryWasm(file, { wasm: spy }), summarize(readGguf(file)), name);
+    const got = readSummaryWasm(file, { wasm: spy });
+    assert.ok(got.arch, name);
+    assert.deepStrictEqual({ ...got, arch: '' }, wants[shapeNo++], name);
     assert.ok(rounds < 40 && most < 16, `${name}: ${rounds} rounds, ${most} ranges`);
     fs.rmSync(file);
   }
@@ -137,7 +155,6 @@ test('a crafted header cannot make the reads go on: rounds are bounded, the cap 
   let calls = 0;
   const counting = { ...davParseWasm, ggufSummary: (size, segs) => { calls++; return davParseWasm.ggufSummary(size, segs); } };
   assert.deepEqual(rs(many, { wasm: counting }), { error: 'GGUF header could not be checked (too_large)' });
-  assert.equal(js(many).summary.arch, 'm');
   assert.ok(calls < 64, String(calls));
   // Near a small cap the read fills it, so the next request over it fails at once.
   calls = 0;
@@ -160,7 +177,7 @@ test('a crafted header cannot make the reads go on: rounds are bounded, the cap 
   fs.rmSync(big);
 });
 
-test('seeded live differential: mutated and truncated headers agree', { skip: skipWasm }, () => {
+test('seeded corpus: mutated and truncated headers give the frozen answers of the former JS reader', { skip: skipWasm }, () => {
   const { gguf: build, kv, STR, S, ARR, T, str, u32, u64 } = gen;
   const base = build([
     kv('general.architecture', STR('m')), kv('general.name', STR('Mut')),
@@ -170,19 +187,27 @@ test('seeded live differential: mutated and truncated headers agree', { skip: sk
     kv('tokens', [T.arr, Buffer.concat([u32(T.str), u64(1030), ...Array.from({ length: 1030 }, (_, i) => str(`t${i}`))])]),
     kv('tokenizer.chat_template', STR('{{m}}')), kv('m.expert_count', S(T.f32, 3.5)),
   ]);
-  let seed = 1234567;
+  assert.equal(crypto.createHash('sha256').update(base).digest('hex'), MUTATIONS.baseSha256, 'the base header is the one the answers were frozen for');
+  assert.equal(MUTATIONS.rows.length, 400);
+  let seed = MUTATIONS.seed;
   const rnd = (m) => { seed = (Math.imul(seed, 1103515245) + 12345) >>> 0; return seed % m; };
   for (let i = 0; i < 400; i++) {
     const buf = Buffer.from(base);
     for (let k = rnd(5); k > 0; k--) buf[rnd(buf.length)] = rnd(256);
     const file = tmp(rnd(3) === 0 ? buf.subarray(0, rnd(buf.length)) : buf);
-    assert.deepStrictEqual(rs(file), js(file), `iteration ${i}`);
+    const want = MUTATIONS.outcomes[MUTATIONS.rows[i]];
+    const got = rs(file);
+    if (want.summary !== undefined) {
+      assert.ok(got.summary, `iteration ${i}: ${got.error}`);
+      assert.equal(gen.encodeSummary(got.summary), want.summary, `iteration ${i}`);
+    } else assert.deepEqual(got, { error: want.error }, `iteration ${i}`);
+    fs.rmSync(file);
   }
   davParseWasm.reset();
 });
 
 test('reply checks: the summary shape is exact, numbers revive, nothing else passes', () => {
-  const s = summarize({});
+  const s = EMPTY;
   const enc = JSON.parse(gen.encodeSummary(s));
   assert.deepStrictEqual(davParseWasm.ggufSummaryReply(enc), s);
   const tagged = { ...enc, contextLength: { $num: '-0' }, headCountKv: [{ $num: 'NaN' }, { array: true, count: 2000 }, 'x', null, true] };
@@ -223,27 +248,21 @@ test('fails closed: a fault, a bad need or an unknown fail never falls back to t
   assert.throws(() => readSummaryWasm(shrunk, { wasm: lying }), { message: 'Unexpected end of GGUF header' });
 });
 
-test('GGUF_META_IMPL: js by default, wasm when asked, anything else is js with a warning', async (t) => {
-  assert.equal(ggufImpl({}), 'js');
-  assert.equal(ggufImpl({ GGUF_META_IMPL: '' }), 'js');
-  assert.equal(ggufImpl({ GGUF_META_IMPL: ' WASM ' }), 'wasm');
-  const warn = t.mock.method(console, 'warn', () => {});
-  assert.equal(ggufImpl({ GGUF_META_IMPL: 'rust' }), 'js');
-  assert.equal(warn.mock.callCount(), 1);
-  assert.ok(davParseWasm.IMPL_FLAGS.includes('GGUF_META_IMPL'));
-  assert.deepEqual(davParseWasm.wasmFlags({ GGUF_META_IMPL: 'wasm' }), ['GGUF_META_IMPL']);
+test('readSummary is always the Rust reader: no switch value selects a JS path (GGUF_META_IMPL retired, #1071)', async () => {
   const file = tmp(gen.gguf([gen.kv('general.architecture', gen.STR('d'))]));
-  // The default path never touches the module, even a missing one; wasm with a missing one throws.
-  await withEnv({ GGUF_META_IMPL: 'js', DAV_PARSE_WASM: path.join(dir, 'no-such.wasm') }, () => {
-    davParseWasm.reset();
-    assert.equal(readSummary(file).arch, 'd');
-  });
-  await withEnv({ GGUF_META_IMPL: 'wasm', DAV_PARSE_WASM: path.join(dir, 'no-such.wasm') }, () => {
-    davParseWasm.reset();
-    assert.throws(() => readSummary(file), /GGUF header could not be checked/);
-    assert.throws(() => davParseWasm.verifyAtStartup(process.env), /GGUF_META_IMPL set to wasm/);
-  });
+  // A missing module throws whatever the old switch says; before #1071 =js (the default) read the file without it.
+  for (const value of [undefined, '', 'js', 'rust', 'wasm']) {
+    await withEnv({ GGUF_META_IMPL: value ?? '', DAV_PARSE_WASM: path.join(dir, 'no-such.wasm') }, () => {
+      davParseWasm.reset();
+      assert.throws(() => readSummary(file), /GGUF header could not be checked/, String(value));
+      assert.throws(() => davParseWasm.verifyAtStartup(process.env), /dav-parse\.wasm/);
+    });
+  }
   davParseWasm.reset();
+  if (!skipWasm) {
+    await withEnv({ GGUF_META_IMPL: 'js' }, () => assert.deepStrictEqual(readSummary(file), { ...EMPTY, arch: 'd' }));
+    davParseWasm.reset();
+  }
 });
 
 test('a held 20 MiB window asking for jumped 4 KiB ranges stops at the byte budget (#1106)', () => {
