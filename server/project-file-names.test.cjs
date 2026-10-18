@@ -1,4 +1,5 @@
 'use strict';
+const skipWasm = !require('node:fs').existsSync(process.env.DAV_PARSE_WASM || require('./dav-parse-wasm.cjs').DEFAULT_WASM) && process.env.DAV_PARSE_WASM_REQUIRED !== '1' && 'dav-parse.wasm not built';
 // #642: a model can open an uploaded project file by the name it is shown (the storage path) or by
 // its bare name when that is unique, through read_project_file and the Project documents box alike.
 // Resolution stays inside the requesting project's own files. Synthetic projects only.
@@ -53,7 +54,7 @@ function tools() {
   return { a, b, read, mcpRead, internal, written, executeToolCall };
 }
 
-test('an uploaded file resolves by its full stored name and by its bare name, in both readers', async () => {
+test('an uploaded file resolves by its full stored name and by its bare name, in both readers', { skip: skipWasm }, async () => {
   const { read, mcpRead } = tools();
   for (const name of [NOTES, 'synthetic-notes.md', 'Text/synthetic-notes.md', ` synthetic-notes.md `]) {
     for (const reader of [read, mcpRead]) {
@@ -67,7 +68,7 @@ test('an uploaded file resolves by its full stored name and by its bare name, in
   assert.equal(resolveProjectFile(p, 'r\u00e9sum\u00e9.md').file, p.files[0]);
 });
 
-test('a bare name shared by two files is refused with every candidate listed', async () => {
+test('a bare name shared by two files is refused with every candidate listed', { skip: skipWasm }, async () => {
   const { read, mcpRead } = tools();
   for (const reader of [read, mcpRead]) {
     const out = await reader('plan.md');
@@ -83,7 +84,7 @@ test('a bare name shared by two files is refused with every candidate listed', a
   assert.deepEqual(r.candidates, [`${FOLDER}/Text/plan.md`, 'Reference/Other/plan.md']);
 });
 
-test('traversal-shaped names are refused before any lookup, in the readers and the write tools', async () => {
+test('traversal-shaped names are refused before any lookup, in the readers and the write tools', { skip: skipWasm }, async () => {
   const { read, mcpRead, internal, written } = tools();
   const attempts = [
     '../synthetic-notes.md', `${FOLDER}/Text/../Text/synthetic-notes.md`, `${FOLDER}/./Text/synthetic-notes.md`,
@@ -107,7 +108,7 @@ test('traversal-shaped names are refused before any lookup, in the readers and t
   assert.deepEqual(written, [], 'nothing was written');
 });
 
-test("another project's file is not reachable by its full name or its bare name", async () => {
+test("another project's file is not reachable by its full name or its bare name", { skip: skipWasm }, async () => {
   const { a, read, mcpRead } = tools();
   for (const name of ['noevia projects/Other Tenant/Text/secret.md', 'secret.md', 'Text/secret.md']) {
     for (const out of [await read(name), await mcpRead(name)]) {
@@ -121,7 +122,7 @@ test("another project's file is not reachable by its full name or its bare name"
   assert.match(await mcpRead('secret.md', 'proj-b'), /PROJECT-B-SECRET/, 'control: the owner of project B reaches it');
 });
 
-test('unreadable files (#586) resolve by bare name but their contents are never returned', async () => {
+test('unreadable files (#586) resolve by bare name but their contents are never returned', { skip: skipWasm }, async () => {
   const { read, mcpRead } = tools();
   for (const reader of [read, mcpRead]) {
     const stored = await reader('binary.txt');
@@ -132,7 +133,7 @@ test('unreadable files (#586) resolve by bare name but their contents are never 
   }
 });
 
-test('the write tools edit a connected upload in place (#648) and keep refusing other path-named files', async () => {
+test('the write tools edit a connected upload in place (#648) and keep refusing other path-named files', { skip: skipWasm }, async () => {
   const { internal, written, a, read, mcpRead } = tools();
   const ctx = (stored) => ({ userId: 'alice', projectId: a.id, editTarget: require('./project-edit-target.cjs').targetDigest(stored) });
   // A connected upload, by bare name: written as its plain name with the stored path pinned, which
@@ -158,7 +159,7 @@ test('the write tools edit a connected upload in place (#648) and keep refusing 
   await assert.rejects(() => internal.project_create_file.handler({ name: 'synthetic-notes.md', text: 'x' }, ctx(NOTES)), /already exists/);
 });
 
-test('the tool descriptions tell the model to pass the listed name or a unique bare name', async () => {
+test('the tool descriptions tell the model to pass the listed name or a unique bare name', { skip: skipWasm }, async () => {
   const core = require('./toolboxes.cjs').CORE_TOOLS.find((t) => t.function.name === 'read_project_file');
   assert.match(core.function.description, /name as listed/);
   assert.match(core.function.parameters.properties.name.description, /as listed.*if unique/);

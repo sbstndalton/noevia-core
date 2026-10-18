@@ -26,6 +26,7 @@ const davParseWasm = require('../../server/dav-parse-wasm.cjs');
 const pf = require('../../server/project-file-names.cjs');
 
 const FILE = path.join(__dirname, '../fixtures/project-file-names.v1.json');
+const AGREED_BY = { a: 5, f: 241, i: 969, m: 214 }, REFUSED_BY = { a: 4, f: 710, m: 857 };
 const FROZEN = JSON.parse(fs.readFileSync(path.join(__dirname, '../fixtures/project-file-names-resolver.v1.json'), 'utf8'));
 const fixtures = JSON.parse(fs.readFileSync(FILE, 'utf8'));
 const wasmFile = process.env.DAV_PARSE_WASM || davParseWasm.DEFAULT_WASM;
@@ -153,6 +154,8 @@ test('seeded live projects: the port gives the frozen JS answer or refuses, and 
   const pick = (l) => l[Math.floor(rand() * l.length)];
   const name = () => Array.from({ length: 1 + Math.floor(rand() * 3) }, () => pick(SEG)).join('/') + pick(['.md', '']);
   let agreed = 0, refused = 0;
+  const agreedBy = {}, refusedBy = {}; // by the frozen JS answer: f file, a ambiguous, m missing, i invalid
+  const tally = (by, frozen) => { by[frozen[0]] = (by[frozen[0]] || 0) + 1; };
   const short = (r) => (r.file !== undefined ? `f${r.file}` : r.code === 'ambiguous' ? `a${r.candidates.join(',')}` : r.code === 'missing' ? 'm' : 'i');
   for (let n = 0; n < 3000; n++) {
     const names = Array.from({ length: Math.floor(rand() * 6) }, name);
@@ -160,9 +163,10 @@ test('seeded live projects: the port gives the frozen JS answer or refuses, and 
     const files = names.map((nm) => ({ name: nm }));
     const frozen = FROZEN.seeded[n], where = JSON.stringify([names, raw]);
     let port = null;
-    try { port = davParseWasm.projectFileNames(names, raw); } catch (e) { assert.equal(e.reason, 'ambiguous'); refused++; }
+    try { port = davParseWasm.projectFileNames(names, raw); } catch (e) { assert.equal(e.reason, 'ambiguous'); refused++; tally(refusedBy, frozen); }
     if (port) {
       agreed++;
+      tally(agreedBy, frozen);
       assert.equal(short(port), frozen, where);
     }
     const got = quietly(() => pf.resolveProjectFile({ files }, raw));
@@ -170,5 +174,9 @@ test('seeded live projects: the port gives the frozen JS answer or refuses, and 
     else if (port) assert.equal(got.code === 'invalid' ? 'i' : got.code === 'missing' ? 'm' : `a${got.candidates.map((c) => names.indexOf(c)).join(',')}`, frozen, where);
     else assert.equal(got.code, 'unverified', where);
   }
+  // Every frozen answer is accounted for: the port gives it, or refuses and the resolver says 'unverified'.
+  assert.deepEqual(agreedBy, AGREED_BY);
+  assert.deepEqual(refusedBy, REFUSED_BY);
+  assert.equal(agreed + refused, 3000);
   assert.ok(agreed > 1000 && refused > 100, `${agreed} agreed, ${refused} refused`);
 });

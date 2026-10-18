@@ -1,4 +1,5 @@
 'use strict';
+const skipWasm = !require('node:fs').existsSync(process.env.DAV_PARSE_WASM || require('./dav-parse-wasm.cjs').DEFAULT_WASM) && process.env.DAV_PARSE_WASM_REQUIRED !== '1' && 'dav-parse.wasm not built';
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
@@ -11,7 +12,7 @@ test.after(() => fs.rmSync(root, { recursive: true, force: true }));
 const fixture = name => fs.readFileSync(path.join(__dirname, 'fixtures/documents', name));
 const workspace = user => ({ dir: path.join(root, user) });
 
-test('page reads reach the last page beyond the project summary cap and paginate', async () => {
+test('page reads reach the last page beyond the project summary cap and paginate', { skip: skipWasm }, async () => {
   const w = workspace('pages');
   const f = await sources.ingest(w, 'p', 'long.pdf', fixture('long.pdf'));
   assert.equal(f.document.truncated, true);

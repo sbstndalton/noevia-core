@@ -1,3 +1,4 @@
+const skipWasm = !require('node:fs').existsSync(process.env.DAV_PARSE_WASM || require('./dav-parse-wasm.cjs').DEFAULT_WASM) && process.env.DAV_PARSE_WASM_REQUIRED !== '1' && 'dav-parse.wasm not built';
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const mcp = require('./mcp.cjs');
@@ -63,7 +64,7 @@ test('search without an index says so rather than returning nothing', async () =
   assert.match(out, /not available on this deployment/);
 });
 
-test('replace requires the expected number of matches and never writes on a mismatch', async () => {
+test('replace requires the expected number of matches and never writes on a mismatch', { skip: skipWasm }, async () => {
   const { tools, written, project } = harness();
   // "alpha" appears twice; the default expectation is one.
   await assert.rejects(() => tools.project_replace_text.handler({ name: 'notes.md', find: 'alpha', replace: 'A' }, PINNED('notes.md')),
@@ -88,7 +89,7 @@ test('folder-derived and non-text files are refused rather than silently reverte
   assert.deepEqual(written, []);
 });
 
-test('create refuses to clobber, append keeps what is there', async () => {
+test('create refuses to clobber, append keeps what is there', { skip: skipWasm }, async () => {
   const { tools, project } = harness();
   await assert.rejects(() => tools.project_create_file.handler({ name: 'notes.md', text: 'new' }, CTX),
     /already exists/);
@@ -106,7 +107,7 @@ test('a path in a filename cannot escape the project', async () => {
   assert.ok(!project.files.some((f) => f.name.includes('/')), 'no file name may contain a path');
 });
 
-test('a missing file names what the project does have', async () => {
+test('a missing file names what the project does have', { skip: skipWasm }, async () => {
   const { tools } = harness();
   await assert.rejects(() => tools.project_append_file.handler({ name: 'absent.md', text: 'x' }, CTX),
     /Available: notes\.md, synced\.md, scan\.pdf/);
