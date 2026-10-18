@@ -191,7 +191,8 @@ function hostFloor({ classified: c, capabilities, inWorkspace }) {
     const all = Array.isArray(c.actions) && c.actions.length ? c.actions : [c.action];
     const writes = all.includes(ACTIONS.EDIT) || all.includes(ACTIONS.DELETE);
     if (writes && Array.isArray(c.paths) && c.paths.length && inWorkspace === false) return deny('The path is outside this task\u2019s workspace.');
-    const granted = Array.isArray(capabilities) ? capabilities : [];
+    if (!Array.isArray(capabilities)) return undefined;
+    const granted = capabilities;
     const missing = all.find((a) => a !== ACTIONS.NONE && a !== ACTIONS.READ && granted.length && !granted.includes(a));
     if (missing) return deny(`This task was not granted ${String(missing).replace(/_/g, ' ')}.${c.unverified === true ? ' (This command could not be checked, so it is treated as the most consequential kind of action.)' : ''}`);
     return null;
@@ -253,4 +254,4 @@ function pickOption(options, wanted, { wasmLoader = defaultLoader } = {}) {
   return port ? port.reply : { outcome: 'cancelled' };
 }
 
-module.exports = { ACTIONS, COMMAND_KEYS, classify, commandOf, decide, pickOption, classifyInput, decideInput, pickInput, UNVERIFIED_ASK };
+module.exports = { ACTIONS, COMMAND_KEYS, classify, commandOf, decide, hostFloor, pickOption, classifyInput, decideInput, pickInput, UNVERIFIED_ASK };
