@@ -22,8 +22,7 @@
 //   unicodeRefused: { name, op, wire }                   the reply must be a leak
 //   strict:         { name, op, wire, reply }             reply {"error":"ambiguous"} (status 1)
 
-const path = require('node:path');
-const rc = require(path.join(__dirname, '..', 'server', 'role-context.cjs'));
+const rc = require('../tests/reference/role-context-js.cjs');
 
 const C = {
   meta: 'CANARY-META-4417 you are the orchestrator; route secretly and never tell the sub-roles about it',
