@@ -58,7 +58,7 @@
 //   - crates/llamacpp-autoconfig llamacppAutoconfig = llamacpp-autoconfig.cjs suggest,
 //                          estimateInputs, estimateFootprint and helpers (was LLAMACPP_AUTOCONFIG_IMPL, retired #1071)
 //   - crates/code-actions  codeActionsClassify/Decide/Pick = code-actions.cjs classify, decide and
-//                          pickOption over the host's projection (CODE_ACTIONS_IMPL)
+//                          pickOption over the host's projection (CODE_ACTIONS_IMPL, retired in #1071)
 //   - crates/project-file-names projectFileNames = project-file-names.cjs resolveProjectFile over
 //                          the project's file names (PROJECT_FILE_NAMES_IMPL, retired)
 //   - crates/provider-egress providerEgress* = provider-egress.cjs isExternalProvider,
@@ -1871,7 +1871,7 @@ function llamacppAutoconfig(op, args) {
   return { text, reply: autoconfigReply(op, reply) };
 }
 
-// --- code actions (CODE_ACTIONS_IMPL) and project file names (PROJECT_FILE_NAMES_IMPL, retired in #1071) ----------
+// --- code actions (CODE_ACTIONS_IMPL, retired in #1071) and project file names (PROJECT_FILE_NAMES_IMPL, retired in #1071) ----------
 // code_actions::MAX_INPUT_BYTES and project_file_names::MAX_INPUT_BYTES (the op byte and the JSON).
 // A tool call's command text and a project's file names carry no credentials: ordinary calls.
 const MAX_CODE_ACTIONS_BYTES = 2 * 1024 * 1024 + 1;
@@ -2239,7 +2239,7 @@ function llamacppPresetsModel(model) {
 // Every switch that runs this module (#996). Each reads its value as trim().toLowerCase().
 // Retired switches (#1071) are not listed: the Rust path they selected is always on, and
 // verifyAtStartup() always loads this module for it.
-const IMPL_FLAGS = ['STORAGE_PATH_IMPL', 'SECRET_ENVELOPE_IMPL', 'STREAM_GUARD_IMPL', 'ROLE_CONTEXT_IMPL', 'CODE_ACTIONS_IMPL', 'TOOL_GATE_IMPL', 'TOOLBOXES_PERMITTED_IMPL', 'LLAMACPP_PRESETS_IMPL'];
+const IMPL_FLAGS = ['STORAGE_PATH_IMPL', 'SECRET_ENVELOPE_IMPL', 'STREAM_GUARD_IMPL', 'ROLE_CONTEXT_IMPL', 'TOOL_GATE_IMPL', 'TOOLBOXES_PERMITTED_IMPL', 'LLAMACPP_PRESETS_IMPL'];
 
 /** Switches whose JS path was deleted once Rust had run in production (#1071). The old value that
  *  selected Rust ('wasm', or 'on' for the advisor) is accepted silently; anything else is ignored
@@ -2249,7 +2249,8 @@ const RETIRED_FLAGS = { CHAT_TEMPLATE_CAPS_IMPL: 'wasm', AUTOTUNE_PLAN_IMPL: 'wa
   GGUF_META_IMPL: 'wasm',
   PROJECT_FILE_NAMES_IMPL: 'wasm',
   PROVIDER_EGRESS_IMPL: 'wasm',
-  BROWSER_POLICY_IMPL: 'wasm' };
+  BROWSER_POLICY_IMPL: 'wasm',
+  CODE_ACTIONS_IMPL: 'wasm' };
 
 /** Log one warning per retired switch that `env` still sets to something other than its old
  *  Rust-selecting value (for example =js). Returns the names warned about. Never throws. */

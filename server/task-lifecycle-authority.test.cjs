@@ -1,4 +1,8 @@
 'use strict';
+const skipWasm = !require('node:fs').existsSync(process.env.DAV_PARSE_WASM || require('./dav-parse-wasm.cjs').DEFAULT_WASM) && process.env.DAV_PARSE_WASM_REQUIRED !== '1' && 'dav-parse.wasm not built';
+// Guards a wrong test signature (options passed twice makes node:test take the second object as the body, so the body never runs and the
+// test reports ok): when the module is there, every guarded body must have run.
+let ran = 0;
 // #701: lifecycle authority and revisions for Code tasks. `task.stage` / `task.revision` are
 // server-only events that only the holder of the lifecycle capability token can append. These
 // tests prove the token cannot be forged from an ACP session, an approval payload or a job
@@ -34,7 +38,8 @@ const lifecycleKeys = (v) => ['lifecycle', 'revision', 'stages'].filter((k) => O
 const GOLDEN_DERIVED = '{"id":"00000000-0000-4000-8000-000000000701","kind":"code","projectId":"p-synthetic","parentId":null,"capabilities":["read","edit","execute"],"status":"completed","stage":"implementing","steps":[{"id":"harness.config","title":"Pin the harness configuration","status":"completed"}],"artifacts":[],"plan":{"status":"proposed","question":null,"subQuestions":["Find the helper"],"truncated":false},"assistantOutput":{"text":"Done. lifecycle=merged","truncated":false},"checkpoint":{"branch":"noevia/task-synthetic","task":"Rename the widget helper","baseSha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","headSha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","identityHash":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","meta":{"harness":"fake"}},"pendingApproval":null,"uncertain":[],"result":{"summary":"ok","lifecycle":"merged","revision":{"n":3,"headSha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},"stages":[{"stage":"merged"}],"type":"task.stage"},"error":null,"createdAt":1700000000000,"updatedAt":1700000013000,"lifecycle":"verifying","review":{"status":"pending","reviewer":"planner","baseSha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","headSha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","files":1}}';
 const GOLDEN_VIEW = '{"id":"00000000-0000-4000-8000-000000000701","status":"completed","stage":"implementing","error":null,"task":"Rename the widget helper","branch":"noevia/task-synthetic","baseSha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","headSha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","meta":{"harness":"fake"},"identityHash":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","createdAt":1700000000000,"updatedAt":1700000013000,"capabilities":["read","edit","execute"],"steps":[{"id":"harness.config","title":"Pin the harness configuration","status":"completed"}],"plan":{"status":"proposed","question":null,"subQuestions":["Find the helper"],"truncated":false},"assistantOutput":{"text":"Done. lifecycle=merged","truncated":false},"approval":null,"result":{"summary":"ok","lifecycle":"merged","revision":{"n":3,"headSha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},"stages":[{"stage":"merged"}],"type":"task.stage"},"review":{"status":"pending","reviewer":"planner","baseSha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","headSha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","files":1}}';
 
-test('flag off: a journal without lifecycle authority derives and views byte-for-byte as before #701', () => {
+test('flag off: a journal without lifecycle authority derives and views byte-for-byte as before #701', { skip: skipWasm }, () => {
+  ran++;
   const job = derive(fixture.events);
   assert.equal(JSON.stringify(job), GOLDEN_DERIVED);
   assert.equal(JSON.stringify(view(job)), GOLDEN_VIEW);
@@ -46,7 +51,8 @@ test('flag off: a journal without lifecycle authority derives and views byte-for
   }
 });
 
-test('flag off: a real store run with no pipeline never grows lifecycle, revision or stages', async () => {
+test('flag off: a real store run with no pipeline never grows lifecycle, revision or stages', { skip: skipWasm }, async () => {
+  ran++;
   const { jobs } = store();
   const id = codeJob(jobs);
   await jobs.run(id, async (ctx) => { ctx.progress('implementing'); ctx.checkpoint({ branch: 'b', headSha: SHA1 }); return { ok: true }; });
@@ -57,11 +63,13 @@ test('flag off: a real store run with no pipeline never grows lifecycle, revisio
 
 // --- The capability token ------------------------------------------------------------------
 
-test('the authority is claimed once per process: a second claim fails', () => {
+test('the authority is claimed once per process: a second claim fails', { skip: skipWasm }, () => {
+  ran++;
   assert.throws(() => claimLifecycleAuthority(), /already claimed/);
 });
 
-test('append refuses task.stage and task.revision without the exact token', () => {
+test('append refuses task.stage and task.revision without the exact token', { skip: skipWasm }, () => {
+  ran++;
   const { dir, jobs } = store();
   const id = codeJob(jobs);
   const before = fs.readFileSync(path.join(dir, 'jobs', id + '.jsonl'), 'utf8');
@@ -76,7 +84,8 @@ test('append refuses task.stage and task.revision without the exact token', () =
   assert.equal(fs.readFileSync(path.join(dir, 'jobs', id + '.jsonl'), 'utf8'), before, 'nothing was written');
 });
 
-test('forgery: the run context handed to an ACP session cannot write lifecycle events, even given the real token', async () => {
+test('forgery: the run context handed to an ACP session cannot write lifecycle events, even given the real token', { skip: skipWasm }, async () => {
+  ran++;
   const { dir, jobs } = store();
   const id = codeJob(jobs);
   const refused = [];
@@ -101,7 +110,8 @@ function repo() {
   return dir;
 }
 
-test('forgery: an ACP session and the approval cards it raises cannot reach the lifecycle', async () => {
+test('forgery: an ACP session and the approval cards it raises cannot reach the lifecycle', { skip: skipWasm }, async () => {
+  ran++;
   const { createCodeHarness } = require('./code-harness.cjs');
   const { createCodeWorkspaces } = require('./code-workspace.cjs');
   const { ACTIONS } = require('./code-actions.cjs');
@@ -138,7 +148,8 @@ test('forgery: an ACP session and the approval cards it raises cannot reach the 
   assert.deepEqual(lifecycleKeys(view(job)), []);
 });
 
-test('forgery: lifecycle-shaped approval.* data and job results are inert', async () => {
+test('forgery: lifecycle-shaped approval.* data and job results are inert', { skip: skipWasm }, async () => {
+  ran++;
   const { dir, jobs } = store();
   const id = codeJob(jobs);
   const forged = { type: 'task.stage', from: 'planned', to: 'merged', lifecycle: 'merged', revision: { n: 4, headSha: SHA2 }, stages: [{ to: 'merged' }], reportHash: PLAN };
@@ -184,7 +195,8 @@ function pipelineToReviewing(jobs, id) {
   return jobs.append(id, 'task.stage', { from: 'verifying', to: 'reviewing', revision: 1, reason: 'Tests passed', expectedArtifacts: EXPECTED }, AUTHORITY);
 }
 
-test('the pipeline drives planned → implementing → verifying → reviewing, recording the report hash', async () => {
+test('the pipeline drives planned → implementing → verifying → reviewing, recording the report hash', { skip: skipWasm }, async () => {
+  ran++;
   const { jobs } = store();
   const id = codeJob(jobs);
   let reviewing, expectedHash;
@@ -213,7 +225,8 @@ test('the pipeline drives planned → implementing → verifying → reviewing, 
   assert.ok(v.stages.every((s) => typeof s.at === 'number'));
 });
 
-test('changes requested loops back to implementing at the next revision', () => {
+test('changes requested loops back to implementing at the next revision', { skip: skipWasm }, () => {
+  ran++;
   const { jobs } = store();
   const id = codeJob(jobs);
   pipelineToReviewing(jobs, id);
@@ -230,7 +243,8 @@ test('changes requested loops back to implementing at the next revision', () => 
   assert.equal(job.revision.headSha, SHA2);
 });
 
-test('the token proves who writes, not that the move is sound: every unsound move is refused and nothing is written', () => {
+test('the token proves who writes, not that the move is sound: every unsound move is refused and nothing is written', { skip: skipWasm }, () => {
+  ran++;
   const { dir, jobs } = store();
   const id = codeJob(jobs);
   jobs.append(id, 'task.stage', { from: 'planned', to: 'implementing', revision: 0 }, AUTHORITY);
@@ -256,7 +270,8 @@ test('the token proves who writes, not that the move is sound: every unsound mov
   assert.equal(fs.readFileSync(path.join(dir, 'jobs', id + '.jsonl'), 'utf8'), before);
 });
 
-test('reviewing needs the journal itself to be complete: missing tests, checkpoint or artifact each refuse it', () => {
+test('reviewing needs the journal itself to be complete: missing tests, checkpoint or artifact each refuse it', { skip: skipWasm }, () => {
+  ran++;
   const cases = [
     [{ tests: false }, EXPECTED, 'tests-run'],
     [{ checkpoint: false }, EXPECTED, 'checkpoint-head-recorded'],
@@ -283,7 +298,8 @@ test('reviewing needs the journal itself to be complete: missing tests, checkpoi
   assert.throws(() => jobs.append(id, 'task.stage', { from: 'implementing', to: 'reviewing', revision: 0, expectedArtifacts: EXPECTED }, AUTHORITY), /no-unresolved-uncertainty/);
 });
 
-test('merged is reachable only from reviewing', () => {
+test('merged is reachable only from reviewing', { skip: skipWasm }, () => {
+  ran++;
   for (const path of [['implementing'], ['implementing', 'verifying'], ['implementing', 'blocked', 'implementing']]) {
     const { jobs } = store();
     const id = codeJob(jobs);
@@ -301,7 +317,8 @@ test('merged is reachable only from reviewing', () => {
   assert.equal(jobs.get(id).lifecycle, 'merged');
 });
 
-test('lifecycle events are rebuilt from known fields, bounded, and belong to Code jobs only', () => {
+test('lifecycle events are rebuilt from known fields, bounded, and belong to Code jobs only', { skip: skipWasm }, () => {
+  ran++;
   const { dir, jobs } = store();
   const id = codeJob(jobs);
   const e = jobs.append(id, 'task.stage', { from: 'planned', to: 'implementing', revision: 0, reason: `line\nbreak\u0000${'x'.repeat(400)}`, lifecycle: 'merged', stages: ['merged'], extra: 1 }, AUTHORITY);
@@ -320,7 +337,8 @@ test('lifecycle events are rebuilt from known fields, bounded, and belong to Cod
 
 // --- Replay after restart -------------------------------------------------------------------
 
-test('replay after restart: the same journal derives the same lifecycle, revision and stages', () => {
+test('replay after restart: the same journal derives the same lifecycle, revision and stages', { skip: skipWasm }, () => {
+  ran++;
   const { dir, jobs } = store();
   const id = codeJob(jobs);
   pipelineToReviewing(jobs, id);
@@ -337,7 +355,8 @@ test('replay after restart: the same journal derives the same lifecycle, revisio
   assert.equal(lifecycle.deriveLifecycle(events), 'reviewing');
 });
 
-test('replay after restart: an unfinished authoritative task is interrupted into blocked; a merged one stays merged', async () => {
+test('replay after restart: an unfinished authoritative task is interrupted into blocked; a merged one stays merged', { skip: skipWasm }, async () => {
+  ran++;
   const { dir, jobs } = store();
   const open = codeJob(jobs);
   pipelineToReviewing(jobs, open);
@@ -358,7 +377,8 @@ test('replay after restart: an unfinished authoritative task is interrupted into
   release(); await running.catch(() => {});
 });
 
-test('replay of a tampered journal never throws: an illegal or unproven jump yields a null lifecycle', () => {
+test('replay of a tampered journal never throws: an illegal or unproven jump yields a null lifecycle', { skip: skipWasm }, () => {
+  ran++;
   const { dir, jobs } = store();
   const id = codeJob(jobs);
   jobs.append(id, 'task.stage', { from: 'planned', to: 'implementing', revision: 0 }, AUTHORITY);
@@ -388,7 +408,8 @@ test('replay of a tampered journal never throws: an illegal or unproven jump yie
   }
 });
 
-test('step(): task.stage folds through transition() and only with authority are implicit moves ignored', () => {
+test('step(): task.stage folds through transition() and only with authority are implicit moves ignored', { skip: skipWasm }, () => {
+  ran++;
   const ev = (type, data = {}) => ({ type, data });
   assert.equal(lifecycle.step('planned', ev('job.started')), 'implementing');
   assert.equal(lifecycle.step('planned', ev('job.started'), { authoritative: true }), 'planned');
@@ -403,7 +424,8 @@ test('step(): task.stage folds through transition() and only with authority are 
   assert.equal(lifecycle.isAuthoritative(fixture.events), false);
 });
 
-test('reportHash is stable across key order and changes with any check', () => {
+test('reportHash is stable across key order and changes with any check', { skip: skipWasm }, () => {
+  ran++;
   const a = passing('x');
   const b = { overall: 'pass', checks: a.checks.map((c) => ({ evidence: {}, detail: c.detail, status: c.status, name: c.name })), jobId: 'x' };
   assert.equal(reportHash(a), reportHash(b));
@@ -424,7 +446,8 @@ test('reportHash is stable across key order and changes with any check', () => {
 // #705: a move into reviewing is judged on the CURRENT round's evidence — the steps and artifacts
 // since the task last entered implementing. A failed test run of an earlier revision does not hold
 // a later one back, and a passing one does not vouch for it either.
-test('reviewing is judged on the current revision: earlier failures do not block, earlier passes do not count', () => {
+test('reviewing is judged on the current revision: earlier failures do not block, earlier passes do not count', { skip: skipWasm }, () => {
+  ran++;
   const failFirst = () => {
     const { jobs } = store();
     const id = codeJob(jobs);
@@ -459,7 +482,8 @@ test('reviewing is judged on the current revision: earlier failures do not block
   }
 });
 
-test('flag off: a non-pipeline journal with a repeated step id derives exactly as before (#705 review)', () => {
+test('flag off: a non-pipeline journal with a repeated step id derives exactly as before (#705 review)', { skip: skipWasm }, () => {
+  ran++;
   const { jobs } = store();
   const id = codeJob(jobs);
   jobs.append(id, 'step.started', { id: 'harness.config', title: 'Pin' });
@@ -470,3 +494,5 @@ test('flag off: a non-pipeline journal with a repeated step id derives exactly a
   assert.deepEqual(jobs.get(id).steps.map((s) => s.status), ['failed', 'running']);
   assert.equal('stages' in jobs.get(id), false);
 });
+
+test.after(() => { if (!skipWasm) assert.equal(ran, 20, 'a wasm-guarded test body did not run'); });
