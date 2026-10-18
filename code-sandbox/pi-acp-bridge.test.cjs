@@ -140,17 +140,16 @@ test('pi is spawned detached and killed via its process group, with a SIGKILL fa
   }
 });
 
-test('an outside-the-workspace read from the gate goes to noevia as an ask that cannot stand (#113)', () => {
+test('an outside-the-workspace read from the gate is flagged for noevia, which asks and cannot stand behind it (#113)', () => {
+  // What noevia does with the flag (an ask that cannot stand) is tested where code-actions lives, in apps/web
+  // server/pi-acp-bridge.test.cjs: this job builds no dav-parse.wasm, which code-actions needs since #1071.
   const { toolCallFor } = require('./pi-acp-bridge.cjs');
-  const { classify, decide } = require('../../apps/web/server/code-actions.cjs');
   const inside = toolCallFor({ toolCallId: 'a', toolName: 'read', input: { path: 'src/a.ts' } });
   assert.equal(inside.kind, 'read');
-  assert.equal(decide({ classified: classify(inside) }).decision, 'allow');
+  assert.equal(inside.rawInput.noeviaOutsideWorkspace, undefined);
   const outside = toolCallFor({ toolCallId: 'b', toolName: 'read', input: { path: '/etc/passwd' }, outsideWorkspace: true });
   assert.equal(outside.kind, 'other');
-  const c = classify(outside);
-  assert.equal(decide({ classified: c }).decision, 'ask');
-  assert.equal(c.standable, false);
+  assert.equal(outside.rawInput.noeviaOutsideWorkspace, true);
 });
 
 test('toolCallFor: a tool named after an Object.prototype property gets kind other, never a prototype value (#1000)', () => {

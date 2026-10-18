@@ -1,4 +1,8 @@
 'use strict';
+const skipWasm = !require('node:fs').existsSync(process.env.DAV_PARSE_WASM || require('./dav-parse-wasm.cjs').DEFAULT_WASM) && process.env.DAV_PARSE_WASM_REQUIRED !== '1' && 'dav-parse.wasm not built';
+// Guards a wrong test signature (options passed twice makes node:test take the second object as the body, so the body never runs and the
+// test reports ok): when the module is there, every guarded body must have run.
+let ran = 0;
 // noevia's pi bridge lives in services/code-sandbox; tested here, end to end through noevia's own
 // ACP client, against a fake `pi --mode rpc` that speaks pi's documented event shapes.
 const test = require('node:test'), assert = require('node:assert/strict');
@@ -10,7 +14,8 @@ const { classify, ACTIONS } = require('./code-actions.cjs');
 const BRIDGE = require.resolve('../../../services/code-sandbox/pi-acp-bridge.cjs');
 const FAKE_PI = require.resolve('./fixtures/fake-pi-rpc.cjs');
 
-test('an allowed pi command reaches noevia as a classifiable permission request and runs', async (t) => {
+test('an allowed pi command reaches noevia as a classifiable permission request and runs', { skip: skipWasm }, async (t) => {
+  ran++;
   const r = await runWithShim(t, (p) => ({ outcome: 'selected', optionId: p.options.find((o) => o.kind === 'allow_once').optionId }));
   const outcome = await r.agent.prompt('clean the build folder');
   assert.equal(outcome.stopReason, 'end_turn');
@@ -30,7 +35,21 @@ test('an allowed pi command reaches noevia as a classifiable permission request 
     ['PRIVATE_REASONING', 'HIDDEN_TOOL_REASONING'], 'reasoning is a separate protocol update');
 });
 
-test('declining, cancelling or an odd answer never lets the command run', async (t) => {
+test('an outside-the-workspace read from the gate goes to noevia as an ask that cannot stand (#113)', { skip: skipWasm }, () => {
+  ran++;
+  const { decide } = require('./code-actions.cjs');
+  const inside = toolCallFor({ toolCallId: 'a', toolName: 'read', input: { path: 'src/a.ts' } });
+  assert.equal(inside.kind, 'read');
+  assert.equal(decide({ classified: classify(inside) }).decision, 'allow');
+  const outside = toolCallFor({ toolCallId: 'b', toolName: 'read', input: { path: '/etc/passwd' }, outsideWorkspace: true });
+  assert.equal(outside.kind, 'other');
+  const c = classify(outside);
+  assert.equal(decide({ classified: c }).decision, 'ask');
+  assert.equal(c.standable, false);
+});
+
+test('declining, cancelling or an odd answer never lets the command run', { skip: skipWasm }, async (t) => {
+  ran++;
   for (const answer of [
     (p) => ({ outcome: 'selected', optionId: p.options.find((o) => o.kind === 'reject_once').optionId }),
     () => ({ outcome: 'cancelled' }),
@@ -43,7 +62,8 @@ test('declining, cancelling or an odd answer never lets the command run', async 
   }
 });
 
-test('tool mapping: edits carry their path, unknown tools are "other" (gated like a command)', () => {
+test('tool mapping: edits carry their path, unknown tools are "other" (gated like a command)', { skip: skipWasm }, () => {
+  ran++;
   assert.deepEqual(toolCallFor({ toolCallId: 'x', toolName: 'write', input: { path: 'src/a.js', content: 'y' } }).locations, [{ path: 'src/a.js' }]);
   assert.equal(toolCallFor({ toolName: 'edit', input: { path: 'a' } }).kind, 'edit');
   assert.equal(toolCallFor({ toolName: 'read', input: { path: 'a' } }).kind, 'read');
@@ -69,7 +89,8 @@ async function runWithShim(t, answer, command) {
   return { agent, asked, updates, log: () => (fs.existsSync(logFile) ? fs.readFileSync(logFile, 'utf8').trim() : '') };
 }
 
-test('other dialogs and confirms without noevia’s payload are refused without asking', async () => {
+test('other dialogs and confirms without noevia’s payload are refused without asking', { skip: skipWasm }, async () => {
+  ran++;
   const { PassThrough } = require('node:stream'), { EventEmitter } = require('node:events');
   const { createBridge } = require('../../../services/code-sandbox/pi-acp-bridge.cjs');
   const input = new PassThrough(), output = new PassThrough(), toPi = [];
@@ -92,7 +113,8 @@ test('other dialogs and confirms without noevia’s payload are refused without 
   assert.ok(!sent.some((m) => m.method === 'session/request_permission'), 'nothing reached the user as a question');
 });
 
-test('pi starts offline with no discovered resources, persistence or project trust', () => {
+test('pi starts offline with no discovered resources, persistence or project trust', { skip: skipWasm }, () => {
+  ran++;
   assert.deepEqual(piArgsFor({ HOME: '/workspaces/.harness-home/task-1' }), [
     '--mode', 'rpc', '--offline', '--no-session', '--no-approve', '--no-context-files', '--no-extensions',
     '--extension', '/workspaces/.harness-home/task-1/.pi/agent/extensions/noevia-gate.js',
@@ -102,3 +124,5 @@ test('pi starts offline with no discovered resources, persistence or project tru
   assert.throws(() => piArgsFor({}), /private HOME/);
   assert.throws(() => piArgsFor({ HOME: 'relative' }), /private HOME/);
 });
+
+test.after(() => { if (!skipWasm) assert.equal(ran, 6, 'a wasm-guarded test body did not run'); });

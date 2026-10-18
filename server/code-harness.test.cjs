@@ -1,4 +1,10 @@
+const skipWasm = !require('node:fs').existsSync(process.env.DAV_PARSE_WASM || require('./dav-parse-wasm.cjs').DEFAULT_WASM) && process.env.DAV_PARSE_WASM_REQUIRED !== '1' && 'dav-parse.wasm not built';
+// Guards a wrong test signature (options passed twice makes node:test take the second object as the body, so the body never runs and the
+// test reports ok): when the module is there, every guarded body must have run.
+let ran = 0;
 const test = require('node:test'), assert = require('node:assert/strict');
+const withoutReason = (o) => { const { _meta, ...rest } = o || {}; return rest; };
+const reasonOf = (o) => o?._meta?.noevia?.reason;
 const fs = require('node:fs'), os = require('node:os'), path = require('node:path');
 const { execFileSync } = require('node:child_process');
 const { createCodeHarness } = require('./code-harness.cjs');
@@ -8,6 +14,84 @@ const { ACTIONS } = require('./code-actions.cjs');
 
 const temps = [];
 const temp = (p) => { const d = fs.mkdtempSync(path.join(os.tmpdir(), p)); temps.push(d); return d; };
+test('a command the checker cannot read is put to a person with the command and why it could not be checked, and an approval of it cannot stand', { skip: skipWasm }, async () => {
+  ran++;
+  const huge = `echo ${'x'.repeat(2 * 1024 * 1024)}`;
+  let first, second;
+  const r = await run({ answers: ['approve_all', 'approve'], script: async (h) => {
+    first = await h.requestPermission({ toolCall: { kind: 'execute', rawInput: { command: huge } }, options: OPTIONS });
+    second = await h.requestPermission({ toolCall: { kind: 'execute', rawInput: { command: huge } }, options: OPTIONS });
+  } });
+  assert.equal(r.asked.length, 2, 'asked both times: "allow for this task" never stands behind it');
+  assert.equal(r.asked[0].command, huge.trim());
+  assert.match(r.asked[0].reason, /could not be checked \(too large or complex to check\), so a person has to approve it/);
+  assert.deepEqual([first, second].map(withoutReason), [{ outcome: 'selected', optionId: 'y' }, { outcome: 'selected', optionId: 'y' }]);
+});
+
+test('an unreadable command in a task that was not granted the riskiest class is refused and the agent is told which permission is missing; a fully granted task is asked', { skip: skipWasm }, async () => {
+  ran++;
+  const huge = `echo ${'x'.repeat(2 * 1024 * 1024)}`;
+  let denied, asked;
+  const refused = await run({ capabilities: [ACTIONS.EDIT, ACTIONS.EXECUTE], answers: ['approve'], script: async (h) => {
+    denied = await h.requestPermission({ toolCall: { kind: 'execute', rawInput: { command: huge } }, options: OPTIONS });
+  } });
+  assert.equal(refused.asked.length, 0, 'nobody is asked to approve what the task was not granted');
+  assert.deepEqual(withoutReason(denied), { outcome: 'selected', optionId: 'n' });
+  assert.match(reasonOf(denied), /^This task was not granted external account\./);
+  const granted = await run({ capabilities: [ACTIONS.EDIT, ACTIONS.EXECUTE, ACTIONS.EXTERNAL], answers: ['approve_all'], script: async (h) => {
+    asked = await h.requestPermission({ toolCall: { kind: 'execute', rawInput: { command: huge } }, options: OPTIONS });
+  } });
+  assert.equal(granted.asked.length, 1);
+  assert.match(granted.asked[0].reason, /workspace limits could not be checked/);
+  assert.deepEqual(withoutReason(asked), { outcome: 'selected', optionId: 'y' });
+});
+
+test('standing on a restricted task: an unreadable command is asked every time, a decide fault is asked every time, and neither answer stands', { skip: skipWasm }, async () => {
+  ran++;
+  const huge = `echo ${'x'.repeat(2 * 1024 * 1024)}`;
+  // A restricted task granted everything an unreadable command is treated as.
+  const full = [ACTIONS.EDIT, ACTIONS.EXECUTE, ACTIONS.EXTERNAL];
+  const unreadable = await run({ capabilities: full, answers: ['approve_all', 'approve_all', 'approve'], script: async (h) => {
+    for (let i = 0; i < 3; i++) await h.requestPermission({ toolCall: { kind: 'execute', rawInput: { command: huge } }, options: OPTIONS });
+  } });
+  assert.equal(unreadable.asked.length, 3, '"allow for this task" never stands behind an unreadable command');
+  // A standing allow for an edit, then the checker cannot decide: asked, and the answer does not stand either.
+  const real = require('./dav-parse-wasm.cjs').codeActionsDecide;
+  let calls = 0;
+  const r = await (async () => {
+    try {
+      return await run({ capabilities: [ACTIONS.EDIT], answers: ['approve_all', 'approve_all', 'approve'], script: async (h, cwd) => {
+        const edit = { toolCall: { kind: 'edit', locations: [{ path: path.join(cwd, 'a.txt') }] }, options: OPTIONS };
+        await h.requestPermission(edit); // a standing allow for edit_file arises from the first answer
+        require('./dav-parse-wasm.cjs').codeActionsDecide = () => { calls++; throw new (require('./dav-parse-wasm.cjs').DavParseError)('trap', 'trap'); };
+        await h.requestPermission(edit); // the decide fault: asked, though a standing allow exists
+        await h.requestPermission(edit); // and the second answer did not stand either
+      } });
+    } finally { require('./dav-parse-wasm.cjs').codeActionsDecide = real; }
+  })();
+  assert.equal(calls, 2);
+  assert.equal(r.asked.length, 3, 'the first asked (no standing yet), the two faults asked despite the standing allow');
+  // The same on the first request without any standing: the fault asks and its approve_all is not remembered.
+  require('./dav-parse-wasm.cjs').codeActionsDecide = real;
+});
+
+test('an announced read whose own stated reading cannot be checked is taken whole: asked with the note, never waved through', { skip: skipWasm }, async () => {
+  ran++;
+  const dpw = require('./dav-parse-wasm.cjs');
+  const real = dpw.codeActionsClassify;
+  try {
+    // The stated bare request (no kind, no input) cannot be classified; the announced call alone is a plain read.
+    dpw.codeActionsClassify = (projection) => { if (projection.kind === null) throw new dpw.DavParseError('trap', 'trap'); return real(projection); };
+    const r = await run({ capabilities: [ACTIONS.READ, ACTIONS.EXECUTE, ACTIONS.EXTERNAL], answers: ['approve_all', 'approve'], script: async (h) => {
+      h.sessionUpdate({ sessionUpdate: 'tool_call', toolCallId: 'c1', kind: 'read', rawInput: { command: 'cat a' } });
+      await h.requestPermission({ toolCall: { toolCallId: 'c1', kind: null }, options: OPTIONS });
+      await h.requestPermission({ toolCall: { toolCallId: 'c1', kind: null }, options: OPTIONS });
+    } });
+    assert.equal(r.asked.length, 2, 'asked both times: no standing approval arises from an unverified reading');
+    assert.match(r.asked[0].reason, /could not be checked/);
+  } finally { dpw.codeActionsClassify = real; }
+});
+
 test.after(() => { for (const d of temps) fs.rmSync(d, { recursive: true, force: true }); });
 
 function repo() {
@@ -57,7 +141,8 @@ async function run({ script, answers = [], capabilities = [], domains = [], egre
 
 const editCall = (file) => ({ toolCall: { kind: 'edit', title: 'Edit ' + file, locations: [{ path: file }], rawInput: { path: file } }, options: OPTIONS });
 
-test('an edit inside the workspace asks, and the card carries the full arguments', async () => {
+test('an edit inside the workspace asks, and the card carries the full arguments', { skip: skipWasm }, async () => {
+  ran++;
   let picked;
   const r = await run({
     answers: ['approve'],
@@ -70,7 +155,8 @@ test('an edit inside the workspace asks, and the card carries the full arguments
   assert.deepEqual(picked, { outcome: 'selected', optionId: 'y' });
 });
 
-test('a permission request naming only its call id is judged by the call the harness announced', async () => {
+test('a permission request naming only its call id is judged by the call the harness announced', { skip: skipWasm }, async () => {
+  ran++;
   // DeepSeek Harness, measured 2026-09-23: `tool_call` carries the command, and the permission
   // request that follows carries nothing but `toolCallId` (an ACP ToolCallUpdate).
   const r = await run({
@@ -87,7 +173,8 @@ test('a permission request naming only its call id is judged by the call the har
   assert.deepEqual(r.asked[0].arguments, { command: 'rm -rf build', description: 'clean' });
 });
 
-test('fields the permission request states win over what was announced, and finished calls are forgotten', async () => {
+test('fields the permission request states win over what was announced, and finished calls are forgotten', { skip: skipWasm }, async () => {
+  ran++;
   const r = await run({
     answers: ['approve', 'approve'],
     script: async (h) => {
@@ -104,7 +191,8 @@ test('fields the permission request states win over what was announced, and fini
   assert.equal(r.asked[1].arguments, null);
 });
 
-test('an announced read, search or think kind never lets a bare permission request through unasked', async () => {
+test('an announced read, search or think kind never lets a bare permission request through unasked', { skip: skipWasm }, async () => {
+  ran++;
   for (const kind of ['read', 'search', 'think']) {
     for (const stated of [{ toolCallId: 'c1' }, { toolCallId: 'c1', kind: null }]) {
       const r = await run({
@@ -120,31 +208,38 @@ test('an announced read, search or think kind never lets a bare permission reque
   }
 });
 
-test('declining means the harness is told no, not told nothing', async () => {
+test('declining means the harness is told no, not told nothing', { skip: skipWasm }, async () => {
+  ran++;
   let picked;
   await run({ answers: ['deny'], script: async (h, cwd) => { picked = await h.requestPermission(editCall(path.join(cwd, 'a.txt'))); } });
-  assert.deepEqual(picked, { outcome: 'selected', optionId: 'n' });
+  assert.deepEqual(withoutReason(picked), { outcome: 'selected', optionId: 'n' });
+  assert.equal(reasonOf(picked), 'The person declined this action.', 'the agent\'s model is told why');
 });
 
-test('a timeout or an abort is a refusal, never an allow', async () => {
+test('a timeout or an abort is a refusal, never an allow', { skip: skipWasm }, async () => {
+  ran++;
   for (const answer of ['timeout', 'aborted', undefined]) {
     let picked;
     await run({ answers: [answer], script: async (h, cwd) => { picked = await h.requestPermission(editCall(path.join(cwd, 'a.txt'))); } });
-    assert.deepEqual(picked, { outcome: 'selected', optionId: 'n' }, String(answer));
+    assert.deepEqual(withoutReason(picked), { outcome: 'selected', optionId: 'n' }, String(answer));
+    assert.match(reasonOf(picked), answer === 'timeout' ? /Nobody answered/ : answer === 'aborted' ? /stopped before/ : /declined/, String(answer));
   }
 });
 
-test('an edit outside the workspace is refused without asking anyone', async () => {
+test('an edit outside the workspace is refused without asking anyone', { skip: skipWasm }, async () => {
+  ran++;
   let picked;
   const r = await run({ script: async (h) => { picked = await h.requestPermission(editCall('/etc/passwd')); } });
   assert.equal(r.asked.length, 0, 'nobody is asked to approve what is not allowed at all');
-  assert.deepEqual(picked, { outcome: 'selected', optionId: 'n' });
+  assert.deepEqual(withoutReason(picked), { outcome: 'selected', optionId: 'n' });
+  assert.match(reasonOf(picked), /outside this task/, 'the model is told the path is outside the workspace');
   const decided = events(r).find((e) => e.type === 'approval.decided');
   assert.equal(decided.data.automatic, true);
   assert.match(decided.data.reason, /outside/i);
 });
 
-test('"allow for this task" covers the same class only, and never a delete or a push', async () => {
+test('"allow for this task" covers the same class only, and never a delete or a push', { skip: skipWasm }, async () => {
+  ran++;
   const del = (file) => ({ toolCall: { kind: 'delete', title: 'rm', locations: [{ path: file }], rawInput: { path: file } }, options: OPTIONS });
   const push = { toolCall: { kind: 'execute', title: 'push', rawInput: { command: 'git push' } }, options: OPTIONS };
   const r = await run({
@@ -163,7 +258,8 @@ test('"allow for this task" covers the same class only, and never a delete or a 
     [ACTIONS.EDIT, ACTIONS.DELETE, ACTIONS.DELETE, ACTIONS.GIT_PUSH, ACTIONS.GIT_PUSH]);
 });
 
-test('a standing execute allow does not cover hidden pushes, deletes or run-time commands', async () => {
+test('a standing execute allow does not cover hidden pushes, deletes or run-time commands', { skip: skipWasm }, async () => {
+  ran++;
   const cmd = (command) => ({ toolCall: { kind: 'execute', title: 'bash', rawInput: { command } }, options: OPTIONS });
   const r = await run({
     capabilities: [ACTIONS.EXECUTE, ACTIONS.DELETE, ACTIONS.GIT_PUSH],
@@ -182,7 +278,8 @@ test('a standing execute allow does not cover hidden pushes, deletes or run-time
     ACTIONS.EXECUTE, ACTIONS.EXECUTE]);
 });
 
-test('a standing allow does not leak into another task', async () => {
+test('a standing allow does not leak into another task', { skip: skipWasm }, async () => {
+  ran++;
   const first = await run({ capabilities: [ACTIONS.EDIT], answers: ['approve_all'],
     script: async (h, cwd) => { await h.requestPermission(editCall(path.join(cwd, 'a.txt'))); } });
   assert.equal(first.asked.length, 1);
@@ -191,7 +288,8 @@ test('a standing allow does not leak into another task', async () => {
   assert.equal(second.asked.length, 1, 'the next task is asked from scratch');
 });
 
-test('reads and thoughts cost nobody an approval', async () => {
+test('reads and thoughts cost nobody an approval', { skip: skipWasm }, async () => {
+  ran++;
   const r = await run({
     script: async (h, cwd) => {
       await h.requestPermission({ toolCall: { kind: 'read', locations: [{ path: path.join(cwd, 'a.txt') }] }, options: OPTIONS });
@@ -202,7 +300,8 @@ test('reads and thoughts cost nobody an approval', async () => {
   assert.equal(r.asked.length, 0);
 });
 
-test('a class the task was never granted is refused, even if the human would have said yes', async () => {
+test('a class the task was never granted is refused, even if the human would have said yes', { skip: skipWasm }, async () => {
+  ran++;
   let picked;
   const r = await run({
     capabilities: [ACTIONS.EDIT],
@@ -210,10 +309,12 @@ test('a class the task was never granted is refused, even if the human would hav
     script: async (h) => { picked = await h.requestPermission({ toolCall: { kind: 'execute', rawInput: { command: 'git push' } }, options: OPTIONS }); },
   });
   assert.equal(r.asked.length, 0);
-  assert.deepEqual(picked, { outcome: 'selected', optionId: 'n' });
+  assert.deepEqual(withoutReason(picked), { outcome: 'selected', optionId: 'n' });
+  assert.match(reasonOf(picked), /was not granted git push/, 'the model is told which class was never granted');
 });
 
-test('the write path is checked again at write time, not only at approval time', async () => {
+test('the write path is checked again at write time, not only at approval time', { skip: skipWasm }, async () => {
+  ran++;
   const r = await run({
     capabilities: [ACTIONS.EDIT], answers: ['approve'],
     script: async (h, cwd) => {
@@ -230,7 +331,8 @@ test('the write path is checked again at write time, not only at approval time',
   assert.ok(events(r).some((e) => e.type === 'tool.completed' && e.data.name === 'write_file'));
 });
 
-test('a read is served from the worktree, and a line window is honoured', async () => {
+test('a read is served from the worktree, and a line window is honoured', { skip: skipWasm }, async () => {
+  ran++;
   await run({
     script: async (h, cwd) => {
       fs.writeFileSync(path.join(cwd, 'many.txt'), 'one\ntwo\nthree\nfour');
@@ -241,7 +343,8 @@ test('a read is served from the worktree, and a line window is honoured', async 
   });
 });
 
-test('the workspace is released and the egress grant revoked however the task ends', async () => {
+test('the workspace is released and the egress grant revoked however the task ends', { skip: skipWasm }, async () => {
+  ran++;
   const revoked = [], granted = [];
   const egress = { grant: ({ taskId, domains }) => { granted.push({ taskId, domains }); return { token: 'secret-token' }; },
     revoke: (taskId) => { revoked.push(taskId); return 1; } };
@@ -261,7 +364,8 @@ test('the workspace is released and the egress grant revoked however the task en
   assert.ok(revoked.includes(boom.taskId));
 });
 
-test('no egress grant without both the capability and named domains', async () => {
+test('no egress grant without both the capability and named domains', { skip: skipWasm }, async () => {
+  ran++;
   const granted = [];
   const egress = { grant: (g) => { granted.push(g); return { token: 't' }; }, revoke: () => 0 };
   await run({ capabilities: [ACTIONS.NETWORK], domains: [], egress, script: async () => {} });
@@ -269,7 +373,8 @@ test('no egress grant without both the capability and named domains', async () =
   assert.deepEqual(granted, [], 'a task gets the network only when it was granted one and told where');
 });
 
-test('the job records what happened, and the proxy token never reaches the record', async () => {
+test('the job records what happened, and the proxy token never reaches the record', { skip: skipWasm }, async () => {
+  ran++;
   const egress = { grant: () => ({ token: 'super-secret-token' }), revoke: () => 1 };
   const r = await run({
     capabilities: [ACTIONS.EDIT, ACTIONS.NETWORK], domains: ['a.test'], egress, answers: ['approve'],
@@ -291,7 +396,8 @@ test('the job records what happened, and the proxy token never reaches the recor
 const rawLog = (r) => fs.readFileSync(path.join(r.dir, 'jobs', r.taskId + '.jsonl'), 'utf8');
 const events = (r) => rawLog(r).split('\n').filter(Boolean).map((l) => JSON.parse(l));
 
-test('ACP plan updates retain the latest bounded report without inventing entry progress', async () => {
+test('ACP plan updates retain the latest bounded report without inventing entry progress', { skip: skipWasm }, async () => {
+  ran++;
   const first = Array.from({ length: 25 }, (_, i) => ({ content: i === 0 ? '😀'.repeat(80) : `Step ${i}`,
     status: i === 0 ? 'completed' : 'pending', priority: 'high' }));
   const r = await run({ script: async (h) => {
@@ -307,7 +413,8 @@ test('ACP plan updates retain the latest bounded report without inventing entry 
   assert.deepEqual(r.job.plan, { status: 'proposed', question: null, subQuestions: ['<script>text only</script>'], truncated: false });
 });
 
-test('assistant output retains visible chunks across tool rounds without thoughts or tool data', async () => {
+test('assistant output retains visible chunks across tool rounds without thoughts or tool data', { skip: skipWasm }, async () => {
+  ran++;
   const r = await run({ script: async (h) => {
     h.sessionUpdate({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'First. ' } });
     h.sessionUpdate({ sessionUpdate: 'agent_thought_chunk', content: { type: 'text', text: 'PRIVATE_REASONING' } });
@@ -327,7 +434,8 @@ test('assistant output retains visible chunks across tool rounds without thought
   assert.ok(rows.some((e) => e.type === 'tool.completed' && e.data.content === 'TOOL_OUTPUT'), 'tool summary remains separately journaled');
 });
 
-test('tiny chunks, split emoji and repeated tool rounds stay bounded at 32 KiB and 64 output events', async () => {
+test('tiny chunks, split emoji and repeated tool rounds stay bounded at 32 KiB and 64 output events', { skip: skipWasm }, async () => {
+  ran++;
   const r = await run({ script: async (h) => {
     h.sessionUpdate({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: '\uD83D' } });
     h.sessionUpdate({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: '\uDE00' } });
@@ -350,7 +458,8 @@ test('tiny chunks, split emoji and repeated tool rounds stay bounded at 32 KiB a
   assert.ok(events(r).filter((e) => e.type === 'progress').length < 10, 'chunk progress is coalesced');
 });
 
-test('pending assistant output flushes before a prompt failure', async () => {
+test('pending assistant output flushes before a prompt failure', { skip: skipWasm }, async () => {
+  ran++;
   const r = await run({ script: async (h) => {
     h.sessionUpdate({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'Partial explanation' } });
     throw Error('synthetic failure');
@@ -361,7 +470,8 @@ test('pending assistant output flushes before a prompt failure', async () => {
   assert.ok(rows.indexOf('assistant.output') < rows.indexOf('job.failed'));
 });
 
-test('graceful cancellation flushes pending output before the cancelled event', async () => {
+test('graceful cancellation flushes pending output before the cancelled event', { skip: skipWasm }, async () => {
+  ran++;
   let streamed = false;
   const r = await run({
     script: async (h, _cwd, signal) => {
@@ -381,7 +491,8 @@ test('graceful cancellation flushes pending output before the cancelled event', 
   assert.ok(types.indexOf('assistant.output') < types.indexOf('job.cancelled'));
 });
 
-test('a finished task records what the harness reported, and what it did not', async () => {
+test('a finished task records what the harness reported, and what it did not', { skip: skipWasm }, async () => {
+  ran++;
   const r = await run({
     script: async (h) => {
       h.sessionUpdate({ sessionUpdate: 'tool_call', toolCallId: '1', kind: 'execute', title: 'npm test' });
@@ -405,7 +516,8 @@ test('a finished task records what the harness reported, and what it did not', a
   assert.match(r.job.result.identityHash, /^[0-9a-f]{64}$/);
 });
 
-test('checkpoints carry the base commit and the head commit the agent actually left, not just the branch', async () => {
+test('checkpoints carry the base commit and the head commit the agent actually left, not just the branch', { skip: skipWasm }, async () => {
+  ran++;
   let observedBase;
   const r = await run({
     script: async (h, cwd) => {
@@ -423,7 +535,8 @@ test('checkpoints carry the base commit and the head commit the agent actually l
   assert.equal(r.workspaces.headSha(r.taskId), null);
 });
 
-test('a task on a repository with no commits yet checkpoints base and head as null, not a thrown error', async () => {
+test('a task on a repository with no commits yet checkpoints base and head as null, not a thrown error', { skip: skipWasm }, async () => {
+  ran++;
   const dir = temp('noevia-hjobs-');
   const jobs = createJobs({ dir });
   const workspaces = createCodeWorkspaces({ dir, epoch: 'test' });
@@ -445,7 +558,8 @@ test('a task on a repository with no commits yet checkpoints base and head as nu
   assert.equal(job.checkpoint.headSha, null);
 });
 
-test('the recorded head matches the branch in the SOURCE repository even after an uncommitted edit, not a pre-release snapshot (clone mode)', async () => {
+test('the recorded head matches the branch in the SOURCE repository even after an uncommitted edit, not a pre-release snapshot (clone mode)', { skip: skipWasm }, async () => {
+  ran++;
   // Clone mode is what a sandboxed harness runs under (CODE_HARNESS_USER set in production, see
   // `mode` in code-workspace.cjs): only release() auto-commits whatever the agent left
   // uncommitted, and only after that auto-commit is headSha's answer actually final.
@@ -474,7 +588,8 @@ test('the recorded head matches the branch in the SOURCE repository even after a
   assert.notEqual(job.checkpoint.headSha, job.checkpoint.baseSha, 'the release-time auto-commit moved the branch past base');
 });
 
-test('a throw from the corrected, post-release checkpoint is caught and logged, never masking the job’s real outcome', async () => {
+test('a throw from the corrected, post-release checkpoint is caught and logged, never masking the job’s real outcome', { skip: skipWasm }, async () => {
+  ran++;
   const dir = temp('noevia-hjobs-');
   const realJobs = createJobs({ dir });
   const workspaces = createCodeWorkspaces({ dir, epoch: 'test' });
@@ -511,7 +626,8 @@ test('a throw from the corrected, post-release checkpoint is caught and logged, 
     'the failure is logged, not swallowed silently');
 });
 
-test('a silent harness produces an honest record rather than zeroes', async () => {
+test('a silent harness produces an honest record rather than zeroes', { skip: skipWasm }, async () => {
+  ran++;
   const r = await run({ script: async () => {} });
   const meta = r.job.result.meta;
   assert.equal(meta.usage, null);
@@ -522,13 +638,15 @@ test('a silent harness produces an honest record rather than zeroes', async () =
   assert.match(r.job.result.identityHash, /^[0-9a-f]{64}$/);
 });
 
-test('the identity separates a sandboxed run from one spawned beside noevia', async () => {
+test('the identity separates a sandboxed run from one spawned beside noevia', { skip: skipWasm }, async () => {
+  ran++;
   const a = await run({ script: async () => {}, agent: { name: 'opencode', version: '1.18.31' } });
   const b = await run({ script: async () => {}, agent: { name: 'opencode', version: '1.18.31' }, sandboxKind: 'sandbox' });
   assert.notEqual(a.job.result.identityHash, b.job.result.identityHash);
 });
 
-test('a failure before the harness starts still gives back the workspace and the network', async () => {
+test('a failure before the harness starts still gives back the workspace and the network', { skip: skipWasm }, async () => {
+  ran++;
   // Writing the first checkpoint touches the disk, so it can fail for ordinary reasons: a full
   // volume, a read-only mount. Before the fix that write sat outside the try/finally, and when
   // it threw the egress token stayed valid and the branch stayed claimed for good.
@@ -560,7 +678,8 @@ test('a failure before the harness starts still gives back the workspace and the
   assert.ok(workspaces.claim({ taskId: '00000000-0000-4000-8000-000000000002', repoPath: held.repo, branch: held.branch }));
 });
 
-test('a run that cannot even record its start still gives back the workspace and the network', async () => {
+test('a run that cannot even record its start still gives back the workspace and the network', { skip: skipWasm }, async () => {
+  ran++;
   // jobs.run appends `job.started` before the work and outside its try: a full disk there used
   // to skip the work's finally entirely, leaving the proxy token valid and the branch claimed.
   const dir = temp('noevia-hjobs-');
@@ -584,7 +703,8 @@ test('a run that cannot even record its start still gives back the workspace and
   assert.equal(workspaces.get(started.taskId).status, 'released');
 });
 
-test('the real jobs.run failing to append job.started triggers the same cleanup', async () => {
+test('the real jobs.run failing to append job.started triggers the same cleanup', { skip: skipWasm }, async () => {
+  ran++;
   const dir = temp('noevia-hjobs-');
   const jobs = createJobs({ dir });
   const workspaces = createCodeWorkspaces({ dir, epoch: 'test' });
@@ -607,7 +727,8 @@ test('the real jobs.run failing to append job.started triggers the same cleanup'
   assert.equal(workspaces.get(started.taskId).status, 'released');
 });
 
-test('usage is taken from the harness’s own usage_update, where the real one puts it', async () => {
+test('usage is taken from the harness’s own usage_update, where the real one puts it', { skip: skipWasm }, async () => {
+  ran++;
   const r = await run({
     script: async (h) => {
       h.sessionUpdate({ sessionUpdate: 'available_commands_update', commands: ['build'] });
@@ -624,7 +745,8 @@ test('usage is taken from the harness’s own usage_update, where the real one p
   assert.equal(r.job.result.meta.messageChunks, 1);
 });
 
-test('a granted task reaches the proxy by its endpoint and the engine directly', async () => {
+test('a granted task reaches the proxy by its endpoint and the engine directly', { skip: skipWasm }, async () => {
+  ran++;
   const egress = { endpoint: 'egress:8040', grant: () => ({ token: 'tok' }), revoke: () => 1 };
   const r = await run({ capabilities: [ACTIONS.NETWORK], domains: ['pypi.org'], egress, script: async () => {} });
   assert.equal(r.connected.proxy.url, 'http://task:tok@egress:8040');
@@ -634,7 +756,8 @@ test('a granted task reaches the proxy by its endpoint and the engine directly',
   assert.equal(offline.connected.proxy, null);
 });
 
-test('shared project context reaches the agent ahead of the task, never the task label', async () => {
+test('shared project context reaches the agent ahead of the task, never the task label', { skip: skipWasm }, async () => {
+  ran++;
   const sent = [];
   const r = await run({ context: 'Context shared from the "Lab" project', sent, script: async () => {} });
   assert.equal(sent[0], 'Context shared from the "Lab" project\n\nTask:\nfix the bug');
@@ -644,7 +767,8 @@ test('shared project context reaches the agent ahead of the task, never the task
   assert.equal(plain[0], 'fix the bug');
 });
 
-test("a networked task's result says which hosts it reached and which were refused", async () => {
+test("a networked task's result says which hosts it reached and which were refused", { skip: skipWasm }, async () => {
+  ran++;
   const forgotten = [];
   const egress = { grant: () => ({ token: 't' }), revoke: () => 1,
     activity: (taskId, { forget = false } = {}) => { if (forget) forgotten.push(taskId);
@@ -658,7 +782,8 @@ test("a networked task's result says which hosts it reached and which were refus
   assert.equal('network' in offline.job.result, false);
 });
 
-test('relative fs paths resolve inside the worktree, never against the web process cwd', async () => {
+test('relative fs paths resolve inside the worktree, never against the web process cwd', { skip: skipWasm }, async () => {
+  ran++;
   const outside = temp('noevia-houtside-');
   fs.writeFileSync(path.join(outside, 'secret.txt'), 'synthetic secret');
   const before = fs.existsSync(path.join(process.cwd(), 'noevia-escape-probe.txt'));
@@ -682,7 +807,8 @@ test('relative fs paths resolve inside the worktree, never against the web proce
 });
 
 // ---- #181: a symlink as the final component is never followed, dangling or not ----
-test('a symlinked final component is refused for reads and writes; ordinary writes still land inside', async () => {
+test('a symlinked final component is refused for reads and writes; ordinary writes still land inside', { skip: skipWasm }, async () => {
+  ran++;
   const outside = temp('noevia-symout-');
   const target = path.join(outside, 'authorized_keys'); // absent: the link dangles
   fs.writeFileSync(path.join(outside, 'present.txt'), 'synthetic secret');
@@ -707,7 +833,8 @@ test('a symlinked final component is refused for reads and writes; ordinary writ
   assert.equal(r.job.status, 'completed', r.job.error);
 });
 
-test('defaultFiles refuses a link swapped in after the containment check (O_NOFOLLOW)', () => {
+test('defaultFiles refuses a link swapped in after the containment check (O_NOFOLLOW)', { skip: skipWasm }, () => {
+  ran++;
   const { defaultFiles } = require('./code-harness.cjs');
   const root = temp('noevia-race-'), outside = temp('noevia-race-out-');
   const victim = path.join(outside, 'v.txt');
@@ -725,7 +852,8 @@ test('defaultFiles refuses a link swapped in after the containment check (O_NOFO
   assert.equal(fs.readFileSync(path.join(root, 'new', 'deep', 'ok.txt'), 'utf8'), 'ok');
 });
 
-test('defaultFiles refuses a hard-linked file, and leaves the other name untouched (#223)', () => {
+test('defaultFiles refuses a hard-linked file, and leaves the other name untouched (#223)', { skip: skipWasm }, () => {
+  ran++;
   const { defaultFiles } = require('./code-harness.cjs');
   const root = temp('noevia-hl-'), outside = temp('noevia-hl-out-');
   const victim = path.join(outside, 'secret.txt');
@@ -738,7 +866,8 @@ test('defaultFiles refuses a hard-linked file, and leaves the other name untouch
   assert.equal(defaultFiles.read(path.join(root, 'plain.txt'), 100, root), 'fine');
 });
 
-test('a middle directory swapped after open is caught by comparing dev/ino (#223)', () => {
+test('a middle directory swapped after open is caught by comparing dev/ino (#223)', { skip: skipWasm }, () => {
+  ran++;
   const { verifyOpened } = require('./code-harness.cjs');
   const root = temp('noevia-swap-'), outside = temp('noevia-swap-out-');
   fs.mkdirSync(path.join(root, 'sub'));
@@ -759,7 +888,8 @@ test('a middle directory swapped after open is caught by comparing dev/ino (#223
   } finally { fs.closeSync(fd); }
 });
 
-test('a redirect under a standing execute allow still meets the edit containment check (#225)', async () => {
+test('a redirect under a standing execute allow still meets the edit containment check (#225)', { skip: skipWasm }, async () => {
+  ran++;
   const cmd = (command) => ({ toolCall: { kind: 'execute', title: 'bash', rawInput: { command } }, options: OPTIONS });
   const picked = [];
   const r = await run({
@@ -775,3 +905,5 @@ test('a redirect under a standing execute allow still meets the edit containment
   assert.deepEqual(r.asked.map((a) => a.command), ['make build', ': > ~/.bashrc']);
   assert.deepEqual(picked.map((p) => p.optionId), ['y', 'n', 'n', 'y']);
 });
+
+test.after(() => { if (!skipWasm) assert.equal(ran, 46, 'a wasm-guarded test body did not run'); });
