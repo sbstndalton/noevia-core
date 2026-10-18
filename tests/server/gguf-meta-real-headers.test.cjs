@@ -5,7 +5,8 @@
 // Gemma 3 / Gemma 4 (262k vocab) and Qwen3 (151k vocab, merges) GGUFs are fetched by
 // tools/fetch-real-gguf-headers.cjs into tests/fixtures/real-gguf-headers/ (gitignored). Each
 // becomes a sparse file of the real total size (only the head holds bytes; the reader never goes
-// past the key/value block), then the Rust path must return exactly the JS summary, inside the
+// past the key/value block), then the Rust path must return exactly the summary the former JS reader
+// gave (frozen in tests/fixtures/gguf-real-headers.expected.v1.json), inside the
 // budget with margin. Skipped without the fixtures or dav-parse.wasm unless
 // REAL_GGUF_HEADERS_REQUIRED=1 / DAV_PARSE_WASM_REQUIRED=1.
 
@@ -17,7 +18,10 @@ const test = require('node:test');
 
 const davParseWasm = require('../../server/dav-parse-wasm.cjs');
 const gguf = require('../../server/gguf-meta.cjs');
-const { readGguf, summarize, readSummaryWasm, MAX_ROUNDS, MAX_SENT_WINDOWS } = gguf;
+const { readSummaryWasm, MAX_ROUNDS, MAX_SENT_WINDOWS } = gguf;
+const gen = require('./gguf-fixture-lib.cjs');
+const EXPECTED = JSON.parse(fs.readFileSync(path.join(__dirname, '../fixtures/gguf-real-headers.expected.v1.json'), 'utf8'));
+const skipNoWasm = !fs.existsSync(process.env.DAV_PARSE_WASM || davParseWasm.DEFAULT_WASM) && process.env.DAV_PARSE_WASM_REQUIRED !== '1' && 'dav-parse.wasm not built';
 
 const DIR = path.join(__dirname, '../fixtures/real-gguf-headers');
 const manifestFile = path.join(DIR, 'manifest.json');
@@ -29,16 +33,15 @@ const manifest = have ? JSON.parse(fs.readFileSync(manifestFile, 'utf8')) : [];
 
 // #1195, always run (no fetched fixtures needed): a header that ends past the bytes given is refused
 // by the reader, so a head-only parse proves the key/value block ends inside the head.
-test('a key/value block that runs past the bytes given is refused, not read as zeros', () => {
-  const gen = require('./gguf-fixture-lib.cjs');
+test('a key/value block that runs past the bytes given is refused, not read as zeros', { skip: skipNoWasm }, () => {
   const buf = gen.gguf([gen.arch('llama'), gen.kv('llama.block_count', gen.S(gen.T.u32, 4))]);
   const dir2 = fs.mkdtempSync(path.join(os.tmpdir(), 'gguf-bound-'));
   try {
     const whole = path.join(dir2, 'whole.gguf'), cut = path.join(dir2, 'cut.gguf');
     fs.writeFileSync(whole, buf);
-    assert.deepStrictEqual(summarize(readGguf(whole)).blockCount, 4);
+    assert.deepStrictEqual(readSummaryWasm(whole).blockCount, 4);
     fs.writeFileSync(cut, buf.subarray(0, buf.length - 3));
-    assert.throws(() => readGguf(cut), /Unexpected end of GGUF header/);
+    assert.throws(() => readSummaryWasm(cut), /Unexpected end of GGUF header/);
   } finally { fs.rmSync(dir2, { recursive: true, force: true }); }
 });
 
@@ -63,16 +66,21 @@ test('every manifest entry matches its pinned source', { skip: !have && 'real GG
 });
 
 for (const entry of manifest) {
-  test(`${entry.name}: the real header is not refused by the byte budget and equals the JS summary`, { skip }, (t) => {
+  test(`${entry.name}: the real header is not refused by the byte budget and equals the frozen summary`, { skip }, (t) => {
     const file = path.join(dir, `${entry.name}.gguf`);
     fs.writeFileSync(file, fs.readFileSync(path.join(DIR, `${entry.name}.head`)));
     fs.truncateSync(file, entry.totalSize); // sparse: the size the module sees is the real one
-    const want = summarize(readGguf(file));
+    const frozen = EXPECTED.headers[entry.name];
+    assert.ok(frozen, `${entry.name} has a frozen summary`);
+    assert.equal(frozen.revision, entry.revision);
+    assert.equal(frozen.totalSize, entry.totalSize);
+    const want = readSummaryWasm(file);
+    assert.equal(gen.encodeSummary(want), frozen.summary, 'the frozen summary of the former JS reader');
     // #1195: the key/value block must end inside the head bytes. Parsing the head alone (no sparse zeros
     // after it) must give the same summary; a header longer than the head fails to parse here.
     const headOnly = path.join(dir, `${entry.name}.head.gguf`);
     fs.writeFileSync(headOnly, fs.readFileSync(path.join(DIR, `${entry.name}.head`)));
-    assert.deepStrictEqual(summarize(readGguf(headOnly)), want, 'the key/value block ends within the head bytes');
+    assert.deepStrictEqual(readSummaryWasm(headOnly), want, 'the key/value block ends within the head bytes');
     let rounds = 0, sent = 0, widest = 0;
     const spy = { ...davParseWasm, ggufSummary: (size, segs) => {
       rounds++;
@@ -97,7 +105,6 @@ for (const entry of manifest) {
 // to a ~20 MiB metadata block, near the 24 MiB window cap and about twice the largest real header
 // above. It must still be summarised, and stay inside the budget.
 test('a synthetic ~20 MiB large-vocabulary header stays inside the byte budget', { skip: !fs.existsSync(wasmFile) && process.env.DAV_PARSE_WASM_REQUIRED !== '1' && 'dav-parse.wasm not built' }, (t) => {
-  const gen = require('./gguf-fixture-lib.cjs');
   const { gguf: build, kv, STR, S, T, str, u32, u64 } = gen;
   const n = 262144;
   const tok = (i) => str(`▁tok${i}`.padEnd(40, 'x')); // ~48 bytes each: 12.5 MiB of tokens
@@ -113,7 +120,8 @@ test('a synthetic ~20 MiB large-vocabulary header stays inside the byte budget',
   assert.ok(size > 18 * 1048576 && size < 22 * 1048576, String(size));
   let sent = 0;
   const spy = { ...davParseWasm, ggufSummary: (s, segs) => { sent += segs.reduce((a, x) => a + x.bytes.length, 0); return davParseWasm.ggufSummary(s, segs); } };
-  assert.deepStrictEqual(readSummaryWasm(file, { wasm: spy }), summarize(readGguf(file)));
+  assert.deepStrictEqual(readSummaryWasm(file, { wasm: spy }), { arch: 'gemma4', name: '', contextLength: 131072, embeddingLength: null, blockCount: 48, headCount: null, headCountKv: null, keyLength: null, valueLength: null,
+    keyLengthSwa: null, valueLengthSwa: null, slidingWindow: null, slidingWindowPattern: null, sharedKvLayers: null, fullAttentionInterval: null, ssmStateSize: null, expertCount: null, nextnPredictLayers: null, hasChatTemplate: true });
   const budget = MAX_SENT_WINDOWS * davParseWasm.MAX_GGUF_WINDOW_BYTES;
   t.diagnostic(`synthetic ${(size / 1048576).toFixed(1)} MiB header: sent ${(sent / 1048576).toFixed(1)} MiB of ${(budget / 1048576).toFixed(0)} MiB`);
   console.log(`[budget] synthetic ${(size / 1048576).toFixed(1)} MiB: sent ${(sent / 1048576).toFixed(1)}/${(budget / 1048576).toFixed(0)} MiB`);

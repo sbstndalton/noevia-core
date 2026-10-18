@@ -152,24 +152,24 @@ function manager(t, budget = 64) {
   return { m, calls, ini };
 }
 
+// The sizing port alone is made unusable (it faults like a trapped module). Pointing DAV_PARSE_WASM at
+// nothing would also stop the GGUF reader, which is Rust-only since #1071 (see the next-but-one test),
+// so the metadata read would refuse the request before the sizing confirmation ran.
 function withUnusableModule(t) {
-  const saved = { impl: process.env.LLAMACPP_AUTOCONFIG_IMPL, file: process.env.DAV_PARSE_WASM };
+  const saved = { impl: process.env.LLAMACPP_AUTOCONFIG_IMPL, fn: davParseWasm.llamacppAutoconfig };
   process.env.LLAMACPP_AUTOCONFIG_IMPL = 'js'; // retired: changes nothing
-  process.env.DAV_PARSE_WASM = path.join(os.tmpdir(), 'no-such-dav-parse.wasm');
-  davParseWasm.reset();
+  davParseWasm.llamacppAutoconfig = () => { throw new davParseWasm.DavParseError('dav-parse module is missing', 'missing'); };
   const warn = console.warn; console.warn = () => {};
   t.after(() => {
     console.warn = warn;
-    for (const [k, v] of [['LLAMACPP_AUTOCONFIG_IMPL', saved.impl], ['DAV_PARSE_WASM', saved.file]]) { if (v === undefined) delete process.env[k]; else process.env[k] = v; }
-    davParseWasm.reset();
+    davParseWasm.llamacppAutoconfig = saved.fn;
+    if (saved.impl === undefined) delete process.env.LLAMACPP_AUTOCONFIG_IMPL; else process.env.LLAMACPP_AUTOCONFIG_IMPL = saved.impl;
   });
 }
 
-test('manager: the small model loads with the real module; with no usable module the load is refused, not waved through', async (t) => {
-  if (fs.existsSync(process.env.DAV_PARSE_WASM || davParseWasm.DEFAULT_WASM)) {
-    const real = manager(t);
-    assert.equal((await real.m.load('small')).ok, true);
-  }
+test('manager: the small model loads with the real module; with an unusable sizing port the load is refused, not waved through', async (t) => {
+  const real = manager(t);
+  assert.equal((await real.m.load('small')).ok, true);
   withUnusableModule(t);
   const { m, calls } = manager(t);
   const r = await m.load('small');
@@ -178,7 +178,7 @@ test('manager: the small model loads with the real module; with no usable module
   assert.ok(!calls.includes('POST /models/load'), calls.join('\n'));
 });
 
-test('manager: with no usable module a preset save is refused, the panel is a 503 and no settings are suggested', async (t) => {
+test('manager: with an unusable sizing port a preset save is refused, the panel is a 503 and no settings are suggested', async (t) => {
   withUnusableModule(t);
   const { m, ini } = manager(t);
   const before = fs.readFileSync(ini, 'utf8');
@@ -195,4 +195,21 @@ test('manager: with no usable module a preset save is refused, the panel is a 50
   // The Models page shows no estimate rather than a wrong one.
   const est = await m.inferenceEstimates();
   assert.equal(est.body.models[0].estimate, null); assert.equal(est.body.models[0].fits, null);
+});
+
+test('manager: with no dav-parse.wasm at all the GGUF read refuses (Rust-only since #1071): no suggestion, no panel, no estimate, and the preset is untouched', async (t) => {
+  const saved = process.env.DAV_PARSE_WASM;
+  process.env.DAV_PARSE_WASM = path.join(os.tmpdir(), 'no-such-dav-parse.wasm');
+  davParseWasm.reset();
+  t.after(() => { if (saved === undefined) delete process.env.DAV_PARSE_WASM; else process.env.DAV_PARSE_WASM = saved; davParseWasm.reset(); });
+  const { m, ini } = manager(t);
+  const before = fs.readFileSync(ini, 'utf8');
+  const suggested = await m.suggestPreset('small');
+  assert.equal(suggested.status, 422);
+  assert.match(suggested.body.error, /^Could not read model metadata: GGUF header could not be checked \(missing\)/);
+  assert.equal((await m.estimateMemory('small')).status, 422);
+  // Unreadable metadata means no estimate (the runtime watchdog covers what cannot be estimated), never a made-up one.
+  const est = await m.inferenceEstimates();
+  assert.equal(est.body.models[0].estimate, null); assert.equal(est.body.models[0].fits, null);
+  assert.equal(fs.readFileSync(ini, 'utf8'), before);
 });

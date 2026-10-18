@@ -1,6 +1,6 @@
 'use strict';
 const test=require('node:test'),assert=require('node:assert/strict'),fs=require('node:fs'),os=require('node:os'),path=require('node:path');
-const {readGguf,summarize}=require('./gguf-meta.cjs');
+const {readSummaryWasm}=require('./gguf-meta.cjs');
 const {suggest,kvCacheBytes,parseMemoryLimit,CTX_CANDIDATES}=require('./llamacpp-autoconfig.cjs');
 const {createModelManager}=require('./model-manager.cjs');
 
@@ -21,6 +21,8 @@ function gguf(kv){
   }
 }
 const qwen35={'general.architecture':[8,'qwen35'],'qwen35.context_length':[4,262144],'qwen35.embedding_length':[4,4096],'qwen35.block_count':[4,32],'qwen35.attention.head_count':[4,16],'qwen35.attention.head_count_kv':[4,4],'qwen35.attention.key_length':[4,256],'qwen35.attention.value_length':[4,256],'qwen35.full_attention_interval':[4,4],'qwen35.ssm.state_size':[4,128],'tokenizer.chat_template':[8,'{{ messages }}']};
+// The summary of the synthetic qwen35 header, as the Rust reader returns it (the tests pass this as the meta).
+const qwen35Meta=t=>readSummaryWasm(write(t,'qwen35.gguf',gguf(qwen35)).file);
 function write(t,name,buf){const dir=fs.mkdtempSync(path.join(os.tmpdir(),'autoconfig-'));t.after(()=>fs.rmSync(dir,{recursive:true,force:true}));const file=path.join(dir,name);fs.writeFileSync(file,buf);return {dir,file};}
 
 test('GGUF header reader keeps per-layer arrays and skips vocabularies across buffer refills',t=>{
@@ -28,16 +30,15 @@ test('GGUF header reader keeps per-layer arrays and skips vocabularies across bu
   // ~2 MiB of token strings forces the reader past its first 1 MiB chunk via skips.
   const tokens=Array.from({length:40000},(_,i)=>'token-'+String(i).padStart(40,'x'));
   const {file}=write(t,'m.gguf',gguf({'general.architecture':[8,'gemma4'],'tokenizer.ggml.tokens':[9,[8,tokens]],'gemma4.attention.sliding_window_pattern':[9,[7,pattern]],'gemma4.block_count':[4,42],'tokenizer.chat_template':[8,'x']}));
-  const kv=readGguf(file),m=summarize(kv);
-  assert.deepEqual(kv['tokenizer.ggml.tokens'],{array:true,count:40000});
+  const m=readSummaryWasm(file);
   assert.deepEqual(m.slidingWindowPattern,pattern);
   assert.equal(m.blockCount,42);assert.equal(m.hasChatTemplate,true);
   const bad=write(t,'bad.gguf',Buffer.from('NOPE'));
-  assert.throws(()=>readGguf(bad.file),/Not a GGUF/);
+  assert.throws(()=>readSummaryWasm(bad.file),/Not a GGUF/);
 });
 
-test('KV sizing follows hybrid, sliding-window and plain attention layouts',()=>{
-  const hybrid=summarize(Object.fromEntries(Object.entries(qwen35).map(([k,[,v]])=>[k,v])));
+test('KV sizing follows hybrid, sliding-window and plain attention layouts',(t)=>{
+  const hybrid=qwen35Meta(t);
   // 8 of 32 layers hold KV: 8 * 4 heads * 512 dims * 1.0625 bytes * ctx, plus 24 SSM states.
   assert.equal(kvCacheBytes(hybrid,262144),8*4*512*1.0625*262144+24*4*1024*1024);
   const plain={blockCount:10,headCount:8,headCountKv:2,embeddingLength:1024};
@@ -48,8 +49,8 @@ test('KV sizing follows hybrid, sliding-window and plain attention layouts',()=>
   assert.equal(kvCacheBytes({blockCount:0},4096),0);
 });
 
-test('suggestion picks the largest fitting context and adds projector and MTP settings',()=>{
-  const meta=summarize(Object.fromEntries(Object.entries(qwen35).map(([k,[,v]])=>[k,v])));
+test('suggestion picks the largest fitting context and adds projector and MTP settings',(t)=>{
+  const meta=qwen35Meta(t);
   const gib=1024**3;
   // #697: rows include the 1 GiB prompt-cache cap, so 14 GiB now stops one rung below native
   // and 15 GiB is what holds the full 262144 context with its cache.
@@ -116,10 +117,10 @@ test('the context ladder matches the Python planner exactly', () => {
   assert.deepEqual(CTX_CANDIDATES, [...CTX_CANDIDATES].sort((a, b) => a - b), 'and ascending');
 });
 
-test('a native context off the calibrated ladder is snapped down, never suggested raw', () => {
+test('a native context off the calibrated ladder is snapped down, never suggested raw', (t)=> {
   const gib = 1024 ** 3;
   // 100000 sits strictly between the qualified 98304 and 106496 rungs.
-  const meta = { ...summarize(Object.fromEntries(Object.entries(qwen35).map(([k, [, v]]) => [k, v]))), contextLength: 100000 };
+  const meta = { ...qwen35Meta(t), contextLength: 100000 };
   const r = suggest({ meta, modelBytes: 5.56 * gib, budgetGib: 200 });
   assert.equal(r.values['ctx-size'], '98304');
   assert.ok(CTX_CANDIDATES.includes(Number(r.values['ctx-size'])));
@@ -127,11 +128,11 @@ test('a native context off the calibrated ladder is snapped down, never suggeste
   assert.ok(!r.rows.some((row) => row.ctx === 100000), 'the raw native value itself is never a candidate');
 });
 
-test('a native context below the smallest qualified candidate is a clear error, not a false out-of-budget one', () => {
+test('a native context below the smallest qualified candidate is a clear error, not a false out-of-budget one', (t)=> {
   const gib = 1024 ** 3;
   // An old model whose native context (2048) sits below CTX_CANDIDATES[0] (4096): there is
   // nothing calibrator-verified to offer, so this must not fall through to "needs more memory".
-  const meta = { ...summarize(Object.fromEntries(Object.entries(qwen35).map(([k, [, v]]) => [k, v]))), contextLength: 2048 };
+  const meta = { ...qwen35Meta(t), contextLength: 2048 };
   const r = suggest({ meta, modelBytes: 5.56 * gib, budgetGib: 200 });
   assert.match(r.error, /native context \(2048\) is below the smallest supported context size \(4096\)/);
   assert.equal(r.values, undefined);
@@ -140,7 +141,7 @@ test('a native context below the smallest qualified candidate is a clear error, 
 
 test('estimate inputs are read-only facts: q8 KV rows, pinned projector memory, current settings (#204)',async t=>{
   const {estimateInputs}=require('./llamacpp-autoconfig.cjs');
-  const meta=summarize(Object.fromEntries(Object.entries(qwen35).map(([k,[,v]])=>[k,v])));
+  const meta=qwen35Meta(t);
   const gib=1024**3;
   const plain=estimateInputs({meta,modelBytes:5.5*gib,current:{'ctx-size':'16384','cache-type-k':'q8_0'}});
   assert.equal(plain.chat,true);assert.equal(plain.sizeable,true);assert.equal(plain.modelGib,5.5);assert.equal(plain.pinnedGib,0);
