@@ -1,4 +1,8 @@
 'use strict';
+const skipWasm = !require('node:fs').existsSync(process.env.DAV_PARSE_WASM || require('./dav-parse-wasm.cjs').DEFAULT_WASM) && process.env.DAV_PARSE_WASM_REQUIRED !== '1' && 'dav-parse.wasm not built';
+// Guards a wrong test signature (options passed twice makes node:test take the second object as the body, so the body never runs and the
+// test reports ok): when the module is there, every guarded body must have run.
+let ran = 0;
 
 // #1522 (where a new project starts) and #1550 (where an Automatic turn goes when its routed model
 // cannot take tools). Pure functions over synthetic model names; no model is loaded or run.
@@ -101,7 +105,9 @@ test('gateSaysToolNeeded: a rule or the decision service picking a tool counts; 
 // #1550: what an Automatic turn adds for its message. Pure, over synthetic box records.
 const { automaticBoxesFor, automaticAdditions, orderWithAdditions, wantsWeb, MAX_ADDED, createAutomaticToolsReady } = require('./tools-mode.cjs');
 
-test('automaticBoxesFor: current-information and search questions need Web search', () => {
+test('automaticBoxesFor: current-information and search questions need Web search', { skip: skipWasm }, () => {
+
+  ran++;
   for (const message of [
     'What are the latest stable versions of Rust and Node LTS? Cite sources.',
     "What's the weather in Oslo today?",
@@ -121,7 +127,9 @@ test('automaticBoxesFor: bare "current", "online", "recent" and "today\'s" do no
   ]) assert.ok(!automaticBoxesFor(message).includes('web-search'), message);
 });
 
-test('automaticBoxesFor: a URL is fetched only from a short one-line message, never from a pasted email', () => {
+test('automaticBoxesFor: a URL is fetched only from a short one-line message, never from a pasted email', { skip: skipWasm }, () => {
+
+  ran++;
   assert.deepEqual(automaticBoxesFor('Summarise https://example.com/synthetic-page'), ['web-search']);
   const email = 'Hi Sam,\nplease find the synthetic invoice at https://example.com/invoice/123 before Friday.\nThanks,\nAlex';
   assert.deepEqual(automaticBoxesFor(email), []);
@@ -240,3 +248,5 @@ test('#1646: isPrivateDataBox is an allow-list: only core, web and offline-refer
   for (const id of ['nextcloud-files', 'nextcloud-mail', 'project-docs', 'gdrive', 'diary', 'a-box-added-later', '', undefined]) assert.equal(tm.isPrivateDataBox(id), true, String(id));
   assert.ok(tm.PRIVATE_CORE_TOOLS.has('read_project_file') && !tm.PRIVATE_CORE_TOOLS.has('get_current_time'));
 });
+
+test.after(() => { if (!skipWasm) assert.equal(ran, 2, 'a wasm-guarded test body did not run'); });

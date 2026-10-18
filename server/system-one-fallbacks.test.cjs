@@ -13,7 +13,7 @@ const fs = require('node:fs'), os = require('node:os'), path = require('node:pat
 const { createDecisionSettings, SERVICE_LIMITS } = require('./decision-settings.cjs');
 const { createDecisions, causeOf, CAUSE_RE } = require('./decision/index.cjs');
 const { createFeatures } = require('./features.cjs');
-const { createToolGate, shapeOptions } = require('./tool-gate.cjs');
+const { createToolGate, offeredProjection, boxesProjection, DEFAULT_BOXES } = require('./tool-gate.cjs');
 const { createStepSupervision } = require('./step-supervision.cjs');
 const { createSystemOneRouter } = require('./system-one-router.cjs');
 const { createDecisionLog, summarize } = require('./decision-log.cjs');
@@ -128,7 +128,7 @@ test('an id the service would refuse is mapped there and back', async () => {
 
 test('without backend limits (llama-logit readout) the options are unchanged', () => {
   const tools = Array.from({ length: 30 }, (_, i) => tool(`synthetic_reader_${i}`, 'x'.repeat(300)));
-  const { options, trimmed } = shapeOptions(tools, null);
+  const { options, trimmed } = require('./dav-parse-wasm.cjs').toolGateOptions(offeredProjection(new Map(tools.map((t) => [t.function.name, t])), () => true), null, null, null, boxesProjection(DEFAULT_BOXES));
   assert.equal(options.length, 25);
   assert.equal(trimmed, 6);
   assert.equal(options[0].label, `synthetic_reader_0: ${'x'.repeat(160)}`);

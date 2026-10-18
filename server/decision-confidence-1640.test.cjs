@@ -5,6 +5,10 @@
 // real shape ({selected, scores, model, calibrated:false}; noevia-services laya/server.py). Synthetic
 // text only; no model, no Diary, nothing leaves 127.0.0.1.
 const test = require('node:test');
+const skipWasm = !require('node:fs').existsSync(process.env.DAV_PARSE_WASM || require('./dav-parse-wasm.cjs').DEFAULT_WASM) && process.env.DAV_PARSE_WASM_REQUIRED !== '1' && 'dav-parse.wasm not built';
+// Guards a wrong test signature (options passed twice makes node:test take the second object as the body, so the body never runs and the
+// test reports ok): when the module is there, every guarded body must have run.
+let ran = 0;
 const assert = require('node:assert/strict');
 const http = require('node:http');
 const rm = require('./routing-modes.cjs');
@@ -171,15 +175,15 @@ test('#1640: the decision layer bound needs a finite number: null or a numeric s
 const TIME_TOOL = { type: 'function', function: { name: 'core_time', description: 'Current time', parameters: { type: 'object', properties: {} } } };
 const pick = (selected, share) => (body) => laya(selected, Object.fromEntries(body.options.map((o) => [o.id, o.id === selected ? share : (1 - share) / (body.options.length - 1)])));
 
-for (const impl of ['js', 'wasm']) {
-  test(`#1640: the tool gate through the decision service agrees on the share (TOOL_GATE_IMPL=${impl})`, async (t) => {
-    const env = impl === 'wasm' ? { TOOL_GATE_IMPL: 'wasm' } : {};
+{
+  test('#1640: the tool gate through the decision service agrees on the share', { skip: skipWasm }, async (t) => {
+    ran++;
     const run = async (reply) => {
       const svc = await fakeService(t, reply);
       const s = stack(svc.url);
       const logs = [];
       const gate = createToolGate({ enabled: () => true, decide: s.decisions.decide, isWriteTool: () => false, limits: () => s.backend.limits,
-        log: (e) => logs.push(e), env, warn: () => {} });
+        log: (e) => logs.push(e), warn: () => {} });
       return { r: await gate.evaluate('How long until the synthetic meeting?', [TIME_TOOL]), logs, s };
     };
     const sure = await run(pick('core_time', 0.97));
@@ -213,3 +217,5 @@ test('#1640: step supervision through the decision service bounds a read-only es
   assert.equal(weak.logs.at(-1).fellBack, 'weak-escalate');
   assert.equal((await run({ continue: 0.97, verify: 0.02, escalate: 0.01 })).d.action, 'continue');
 });
+
+test.after(() => { if (!skipWasm) assert.equal(ran, 1, 'a wasm-guarded test body did not run'); });
