@@ -1,4 +1,8 @@
 'use strict';
+const skipWasm = !require('node:fs').existsSync(process.env.DAV_PARSE_WASM || require('./dav-parse-wasm.cjs').DEFAULT_WASM) && process.env.DAV_PARSE_WASM_REQUIRED !== '1' && 'dav-parse.wasm not built';
+// Guards a wrong test signature (options passed twice makes node:test take the second object as the body, so the body never runs and the
+// test reports ok): when the module is there, every guarded body must have run.
+let ran = 0;
 // #237: the per-turn view of permitted tools. Synthetic boxes only.
 const test = require('node:test');
 const assert = require('node:assert/strict');
@@ -26,7 +30,8 @@ function input(overrides = {}) {
 }
 const byId = (boxes) => Object.fromEntries(boxes.map((b) => [b.id, b]));
 
-test('reads are allowed, writes and Ask reads need approval, and the project selection is marked active', () => {
+test('reads are allowed, writes and Ask reads need approval, and the project selection is marked active', { skip: skipWasm }, () => {
+  ran++;
   const boxes = byId(computePermittedTools(input()));
   assert.equal(boxes.core.tools[0].permission, 'allowed');
   assert.equal(boxes.core.active, true);
@@ -37,14 +42,16 @@ test('reads are allowed, writes and Ask reads need approval, and the project sel
   assert.equal(boxes['nextcloud-notes'].active, false, 'available but not selected: offered for a turn, not on by default');
 });
 
-test('a blocked tool is unavailable with a reason, and a tool policy is read for this account only', () => {
+test('a blocked tool is unavailable with a reason, and a tool policy is read for this account only', { skip: skipWasm }, () => {
+  ran++;
   const seen = [];
   const boxes = byId(computePermittedTools(input({ policyMode: (u, name) => { seen.push(u); return name === 'get_current_time' ? 'block' : 'allow'; } })));
   assert.deepEqual(boxes.core.tools[0], { name: 'get_current_time', description: '', write: false, permission: 'unavailable', reason: 'Blocked in your tool permissions.', reasonCode: 'blocked' });
   assert.ok(seen.every((u) => u === 'u-member'));
 });
 
-test('an unconnected connector, a signed-out OAuth service, and a disabled Diary are unavailable with reasons', () => {
+test('an unconnected connector, a signed-out OAuth service, and a disabled Diary are unavailable with reasons', { skip: skipWasm }, () => {
+  ran++;
   const boxes = byId(computePermittedTools(input({ accountReady: () => false, diaryEnabled: false })));
   assert.equal(boxes.gdrive.state, 'unavailable');
   assert.match(boxes.gdrive.reason, /Connect/);
@@ -56,12 +63,14 @@ test('an unconnected connector, a signed-out OAuth service, and a disabled Diary
   assert.equal(connected.gdrive.active, true, 'a connected account box is on for every chat');
 });
 
-test('configured but undiscovered services are listed as unavailable and never offered', () => {
+test('configured but undiscovered services are listed as unavailable and never offered', { skip: skipWasm }, () => {
+  ran++;
   const boxes = byId(computePermittedTools(input()));
   assert.deepEqual([boxes['nextcloud-calendar'].state, boxes['nextcloud-calendar'].tools.length], ['unavailable', 0]);
 });
 
-test('the coding harness: Cowork-only, admin-only, harness on, project and repository required', () => {
+test('the coding harness: Cowork-only, admin-only, harness on, project and repository required', { skip: skipWasm }, () => {
+  ran++;
   const code = (o) => byId(computePermittedTools(input(o))).code;
   assert.match(code({}).reason, /Cowork/);
   assert.match(code({ mode: 'cowork' }).reason, /administrators/, 'a member never gets code tools');
@@ -74,7 +83,8 @@ test('the coding harness: Cowork-only, admin-only, harness on, project and repos
   assert.deepEqual(on.tools.map((t) => t.permission), ['allowed', 'needs-approval', 'needs-approval']);
 });
 
-test('selectedToolboxIds (#354): the shared union chat.cjs, this catalogue and the picker must all agree on', () => {
+test('selectedToolboxIds (#354): the shared union chat.cjs, this catalogue and the picker must all agree on', { skip: skipWasm }, () => {
+  ran++;
   const connectorBoxes = new Set(['gdrive']);
   // A connector id can end up stored on an older/hand-edited project even though
   // sanitizeToolboxes normally strips it; the union still strips it from the base list and adds
@@ -95,7 +105,8 @@ test('selectedToolboxIds (#354): the shared union chat.cjs, this catalogue and t
   );
 });
 
-test('a free chat (no project) uses the default selection', () => {
+test('a free chat (no project) uses the default selection', { skip: skipWasm }, () => {
+  ran++;
   const boxes = byId(computePermittedTools(input({ project: null })));
   assert.equal(boxes.core.active, true);
   assert.equal(boxes['web-search'].active, false);
@@ -113,7 +124,8 @@ test('the TTL cache expires and evicts', () => {
   assert.equal(cache.get('c'), 3);
 });
 
-test('#1006: Tools Automatic uses the default set; Manual (or no mode) the project list', () => {
+test('#1006: Tools Automatic uses the default set; Manual (or no mode) the project list', { skip: skipWasm }, () => {
+  ran++;
   const { projectToolboxIds, selectedToolboxIds } = require('./toolboxes-permitted.cjs');
   const defaults = ['core'];
   assert.deepEqual(projectToolboxIds({ toolsMode: 'auto', toolboxes: ['core', 'web', 'storage'] }, defaults), ['core']);
@@ -124,7 +136,8 @@ test('#1006: Tools Automatic uses the default set; Manual (or no mode) the proje
   assert.deepEqual(selectedToolboxIds({ project: { toolsMode: 'auto', toolboxes: ['web'] }, defaultToolboxes: defaults, connectorBoxes: new Set(['gdrive']), connected: ['gdrive'] }), ['core', 'gdrive']);
 });
 
-test('#1006 review: an Automatic project keeps the Project documents box its first upload added', () => {
+test('#1006 review: an Automatic project keeps the Project documents box its first upload added', { skip: skipWasm }, () => {
+  ran++;
   const { projectToolboxIds } = require('./toolboxes-permitted.cjs');
   const { applyProjectDocsDefault, BOX } = require('./project-docs-default.cjs');
   const project = { id: 'proj-syn', toolsMode: 'auto', files: [{ name: 'synthetic.txt', content: 'x' }] };
@@ -133,3 +146,5 @@ test('#1006 review: an Automatic project keeps the Project documents box its fir
   assert.deepEqual(projectToolboxIds({ toolsMode: 'auto', toolboxes: ['core', BOX] }, ['core']), ['core'], 'only when the upload default added it');
   assert.deepEqual(projectToolboxIds({ toolsMode: 'auto', toolboxes: ['web'], docsToolboxDefaulted: true }, ['core']), ['core']);
 });
+
+test.after(() => { if (!skipWasm) assert.equal(ran, 9, 'a wasm-guarded test body did not run'); });

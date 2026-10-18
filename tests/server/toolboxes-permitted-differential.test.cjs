@@ -1,16 +1,27 @@
 'use strict';
 
-// TOOLBOXES_PERMITTED_IMPL: tests/fixtures/toolboxes-permitted.v1.json (byte-identical to
-// noevia-rs crates/toolboxes-permitted/tests/fixtures/; CI compares them) holds
-// toolboxes-permitted.cjs's answers, printed by tools/gen-toolboxes-permitted-fixtures.cjs from the
-// JS itself (synthetic rows only). Here every row runs through dav-parse.wasm's toolboxes_permitted,
-// and a seeded property checks that the switched functions never carry, offer or permit more than
-// the JS (and, the port agreeing, return exactly the JS answer). Only ids are compared, never
-// folded, so nothing depends on ICU. The WebAssembly half needs server/wasm/dav-parse.wasm (or
+// Permitted tools (TOOLBOXES_PERMITTED_IMPL, retired in #1071: always Rust).
+// tests/fixtures/toolboxes-permitted.v1.json (byte-identical to noevia-rs
+// crates/toolboxes-permitted/tests/fixtures/; CI compares them) holds the port's exact replies for synthetic
+// rows, first printed from the former JS rules (the port is never stricter than the JS there, so no row is
+// `strict`). tests/fixtures/toolboxes-permitted-js.v1.json freezes what the old toolboxes-permitted.cjs
+// answered for 2500 seeded synthetic inputs (odd project shapes, boxes with odd tools, manifests, callbacks
+// answering with odd values): the project ids, the selected ids and the per-turn catalogue, each as the JS alone
+// (`js`) and as the live composition (`live`, TOOLBOXES_PERMITTED_IMPL=wasm: the JS carried only as far as the
+// port agreed, which is what ran). Both files are frozen and sha256-pinned: the JS rules and their generator are
+// gone, and neither may be regenerated through the Rust path (that would erase the independent reference).
+// Provenance (also in the frozen file's `note`): frozen from noevia-core at 1ef1ecf with the dav-parse.wasm that
+// server/dav-parse.lock pins present.
+// What must hold, and is counted below: for every frozen input the functions give exactly what the live
+// composition gave (so nothing is carried, offered or permitted that live refused), which is the JS answer or,
+// where the port could not answer (a projection it cannot carry, a fault), no ids and every box and tool
+// unavailable ('unchecked'); never more than the JS alone. The one difference: a carried id that is not a
+// string (live kept it from the JS list; it matches no box) is no longer in the list. Only ids are compared,
+// never folded, so nothing depends on ICU. The WebAssembly half needs server/wasm/dav-parse.wasm (or
 // DAV_PARSE_WASM); skipped without it unless DAV_PARSE_WASM_REQUIRED=1.
 
 const assert = require('node:assert/strict');
-const { execFileSync } = require('node:child_process');
+const crypto = require('node:crypto');
 const fs = require('node:fs');
 const path = require('node:path');
 const test = require('node:test');
@@ -19,26 +30,27 @@ const davParseWasm = require('../../server/dav-parse-wasm.cjs');
 const tp = require('../../server/toolboxes-permitted.cjs');
 
 const FILE = path.join(__dirname, '../fixtures/toolboxes-permitted.v1.json');
-const GENERATOR = path.join(__dirname, '../../tools/gen-toolboxes-permitted-fixtures.cjs');
+const FROZEN_FILE = path.join(__dirname, '../fixtures/toolboxes-permitted-js.v1.json');
+// The frozen references are pinned: changing either is a deliberate act that also changes these.
+const PINS = { [FILE]: '2f3937d5a5876d79d288969476fb224e79dab4d2fba8cfb4a7272ed2801bd737', [FROZEN_FILE]: '1aff93ac23e096837f167433a569b6193521656aba35f7702fdddcaeed6f685e' };
 const fixtures = JSON.parse(fs.readFileSync(FILE, 'utf8'));
+const FROZEN = JSON.parse(fs.readFileSync(FROZEN_FILE, 'utf8'));
 const wasmFile = process.env.DAV_PARSE_WASM || davParseWasm.DEFAULT_WASM;
 const skipWasm = !fs.existsSync(wasmFile) && process.env.DAV_PARSE_WASM_REQUIRED !== '1' && 'dav-parse.wasm not built';
-const WASM = { env: { TOOLBOXES_PERMITTED_IMPL: 'wasm' } };
-const RANK = { allowed: 0, 'needs-approval': 1, unavailable: 2 };
+// Guards a wrong test signature (options passed twice makes node:test take the second object as the body, so the
+// body never runs and the test reports ok): when the module is there, every guarded body must have run.
+let ran = 0;
+test.after(() => { if (!skipWasm) assert.equal(ran, 2, 'a wasm-guarded test body did not run'); });
 
-function mulberry32(seed) {
-  return () => {
-    seed = (seed + 0x6d2b79f5) | 0;
-    let t = Math.imul(seed ^ (seed >>> 15), 1 | seed);
-    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
-    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
-  };
-}
+const sha = (v) => crypto.createHash('sha256').update(Buffer.isBuffer(v) ? v : JSON.stringify(v)).digest('hex');
 function quietly(fn) {
-  const warn = console.warn, seen = [];
-  console.warn = (m) => seen.push(String(m));
-  try { return { value: fn(), seen }; } finally { console.warn = warn; }
+  const warn = console.warn;
+  console.warn = () => {};
+  try { return fn(); } finally { console.warn = warn; }
 }
+// The frozen hashes are of the key-sorted JSON.
+const canon = (v) => (Array.isArray(v) ? `[${v.map(canon).join(',')}]` : v && typeof v === 'object' ? `{${Object.keys(v).sort().map((k) => `${JSON.stringify(k)}:${canon(v[k])}`).join(',')}}` : JSON.stringify(v === undefined ? null : v));
+const H = (v) => crypto.createHash('sha256').update(canon(v)).digest('hex').slice(0, 16);
 
 const CALLS = {
   1: (a) => davParseWasm.toolboxesProjectIds(...a),
@@ -46,54 +58,67 @@ const CALLS = {
   3: ([i]) => davParseWasm.toolboxesPermitted(i),
 };
 
-test('the fixture file is what the generator prints', { skip: !fs.existsSync(GENERATOR) && 'no generator here' }, () => {
-  const out = execFileSync(process.execPath, [GENERATOR], { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024, stdio: ['ignore', 'pipe', 'ignore'] });
-  assert.equal(out, fs.readFileSync(FILE, 'utf8'));
+// What the freeze script made of a case: the callbacks are data, a description LONG stands for 300 characters.
+const expand = (b) => ({ ...b, tools: b.tools && b.tools.map((t) => (t && t.function && t.function.description === 'LONG' ? { ...t, function: { ...t.function, description: 'd'.repeat(300) } } : t)) });
+const toInput = (c) => ({
+  user: c.user, project: c.project, mode: c.mode, boxes: c.boxes.map(expand), manifest: c.manifest, defaultToolboxes: c.defaultToolboxes,
+  connectorBoxes: new Set(c.connectorBoxes), connected: c.connected, oauthServerIds: new Set(c.oauthServerIds),
+  accountReady: (_u, id) => c.ready[id], policyMode: (_u, t) => c.policy[t], isWriteTool: (n) => c.write[n],
+  diaryEnabled: c.diaryEnabled, harnessEnabled: c.harnessEnabled, repositories: c.repositories,
+});
+
+test('the shared fixture and the frozen JS answers are the pinned files', () => {
+  for (const [file, pin] of Object.entries(PINS)) assert.equal(sha(fs.readFileSync(file)), pin, path.basename(file));
+  assert.equal(FROZEN.cases.length, 2500);
+  assert.match(FROZEN.note, /freeze script \(sha256 [0-9a-f]{64}\)/);
+  assert.match(FROZEN.note, /dav-parse\.wasm that server\/dav-parse\.lock pins \(sha256 [0-9a-f]{64}\)/);
+  assert.ok(fixtures.rows.length >= 1500);
 });
 
 test('fixture rows: the exact reply', { skip: skipWasm }, () => {
-  assert.ok(fixtures.rows.length >= 1500);
+  ran++;
   for (const [i, row] of fixtures.rows.entries()) {
     assert.deepEqual(CALLS[row.op](JSON.parse(row.wire)), JSON.parse(row.want), `row ${i}`);
     assert.equal(row.strict, undefined, 'the port is never stricter here');
   }
 });
 
-test('property: the switched functions never carry, offer or permit more than the JS', { skip: skipWasm }, () => {
-  const rand = mulberry32(0x7b0c);
-  const pick = (l) => l[Math.floor(rand() * l.length)];
-  const IDS = ['core', 'web', 'diary', 'gmail', 'notion', 'sso', 'project-docs', 'other'];
-  const some = () => IDS.filter(() => rand() < 0.35);
-  const project = () => pick([null, { toolboxes: some() }, { toolsMode: 'auto', docsToolboxDefaulted: rand() < 0.5, toolboxes: some() }, { toolsMode: 'manual' },
-    { toolboxes: [...some(), 3, null] }, 'odd']);
-  const tool = (n) => ({ type: 'function', function: { name: n, description: 'synthetic' } });
-  for (let n = 0; n < 600; n++) {
-    const p = project(), defaults = some(), connectorBoxes = new Set(pick([[], ['gmail', 'notion']])), connected = pick([[], ['gmail'], ['notion', 'gmail']]);
-    const js1 = tp.projectToolboxIdsJs(p, defaults);
-    const sw1 = quietly(() => tp.projectToolboxIds(p, defaults, WASM)).value;
-    assert.ok(sw1.every((id) => js1.includes(id)));
-    if (js1.every((id) => typeof id === 'string')) assert.deepEqual(sw1, js1, 'agreement returns the JS list');
-    const sel = { project: p, defaultToolboxes: defaults, connectorBoxes, connected };
-    const js2 = tp.selectedToolboxIdsJs(sel);
-    assert.deepEqual(quietly(() => tp.selectedToolboxIds(sel, WASM)).value.filter((id) => !js2.includes(id)), []);
-    const policy = new Map();
-    const input = {
-      user: { id: 'u-synthetic', role: pick(['admin', 'member']) }, project: p, mode: pick(['chat', 'cowork']),
-      boxes: IDS.filter(() => rand() < 0.5).map((id) => ({ id, label: id, tools: ['read', 'write_x', 'list', 'send'].filter(() => rand() < 0.5).map(tool) })),
-      manifest: pick([[], [{ id: 'down' }, { id: 'diary' }, null]]), defaultToolboxes: defaults, connectorBoxes, connected,
-      oauthServerIds: new Set(pick([[], ['sso']])), accountReady: () => rand() < 0.5,
-      policyMode: (_u, t) => { if (!policy.has(t)) policy.set(t, pick(['allow', 'ask', 'block'])); return policy.get(t); },
-      isWriteTool: (name) => name.startsWith('write') || name === 'send', diaryEnabled: rand() < 0.5, harnessEnabled: rand() < 0.5, repositories: pick([[], ['r']]),
-    };
-    // The same readiness for both runs.
-    const ready = rand() < 0.5;
-    input.accountReady = () => ready;
-    const js = tp.computePermittedToolsJs(input);
-    const sw = quietly(() => tp.computePermittedTools(input, WASM)).value;
-    assert.deepEqual(sw, js, 'the port agrees with the JS on every synthetic catalogue');
-    for (const [k, b] of sw.entries()) {
-      assert.ok(b.state === 'unavailable' || js[k].state === 'available');
-      for (const [t, x] of b.tools.entries()) assert.ok(RANK[x.permission] >= RANK[js[k].tools[t].permission]);
+test('frozen inputs: the functions give what the live composition gave, and never more than the JS alone', { skip: skipWasm }, () => {
+  ran++;
+  const count = { total: 0, projectSame: 0, selectedSame: 0, selectedFault: 0, selectedNonString: 0, catSameAsJs: 0, catFault: 0, catBoxes: 0, tools: 0 };
+  const strings = (l) => l.filter((id) => typeof id === 'string');
+  for (const { i, in: c, project, selected, catalogue } of FROZEN.cases) {
+    const label = `case ${i}`;
+    // Project ids: live is the JS list when the port agrees (here always); non-string entries match no box and are not carried.
+    const p = quietly(() => tp.projectToolboxIds(c.project, c.defaultToolboxes));
+    assert.deepEqual(p, strings(project.live), label);
+    assert.deepEqual(p, strings(project.js), label);
+    count.projectSame++;
+    // Selected ids: live is the JS list, or none when the port could not carry the request.
+    const input = toInput(c);
+    const s = quietly(() => tp.selectedToolboxIds({ project: input.project, defaultToolboxes: input.defaultToolboxes, connectorBoxes: input.connectorBoxes, connected: input.connected }));
+    assert.deepEqual(s, strings(selected.live), label);
+    if (selected.live.length !== selected.js.length) { count.selectedFault++; assert.deepEqual(selected.live, [], label); assert.deepEqual(s, [], label); } else count.selectedSame++;
+    for (const id of s) assert.ok(selected.js.includes(id), `${label}: ${id} was carried by the JS alone`);
+    if (selected.live.some((id) => typeof id !== 'string')) count.selectedNonString++;
+    // The catalogue.
+    const out = quietly(() => tp.computePermittedTools(toInput(c)));
+    assert.equal(H(out), catalogue.live, label);
+    count.total++;
+    count.catBoxes += out.length;
+    for (const b of out) count.tools += b.tools.length;
+    if (catalogue.live === catalogue.js) count.catSameAsJs++;
+    else {
+      // Where live differs from the JS alone it showed everything unchecked; so does the function now.
+      assert.equal(catalogue.faulted, true, label);
+      count.catFault++;
+      for (const b of out) {
+        assert.equal(b.state, 'unavailable', label);
+        assert.equal(b.reasonCode, 'unchecked', label);
+        assert.equal(b.active, false, label);
+        for (const t of b.tools) assert.deepEqual([t.permission, t.reasonCode], ['unavailable', 'unchecked'], label);
+      }
     }
   }
+  assert.deepEqual(count, { total: 2500, projectSame: 2500, selectedSame: 2099, selectedFault: 401, selectedNonString: 523, catSameAsJs: 1646, catFault: 854, catBoxes: 18508, tools: 35226 });
 });

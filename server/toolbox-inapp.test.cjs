@@ -1,4 +1,8 @@
 'use strict';
+const skipWasm = !require('node:fs').existsSync(process.env.DAV_PARSE_WASM || require('./dav-parse-wasm.cjs').DEFAULT_WASM) && process.env.DAV_PARSE_WASM_REQUIRED !== '1' && 'dav-parse.wasm not built';
+// Guards a wrong test signature (options passed twice makes node:test take the second object as the body, so the body never runs and the
+// test reports ok): when the module is there, every guarded body must have run.
+let ran = 0;
 // #615 (round 9): the composer tools menu is fed by /api/toolboxes/permitted, which left out the
 // `inApp` flag /api/toolboxes carried, so every MCP-backed in-app box stayed English. The flag now
 // comes from one helper; this asserts that EVERY server path that hands toolboxes to the client
@@ -56,7 +60,8 @@ test('GET /api/toolboxes/permitted (the composer tools menu) flags every in-app 
   }
 });
 
-test('a configured-but-undiscovered manifest box is still flagged in-app', async () => {
+test('a configured-but-undiscovered manifest box is still flagged in-app', { skip: skipWasm }, async () => {
+  ran++;
   const manifest = [{ id: 'nextcloud-calendar', label: 'Calendar', description: 'Calendar' }];
   const res = await get(makeRoutes({ boxes: [], manifest }), '/api/toolboxes/permitted?mode=chat');
   const row = res.body.boxes.find((b) => b.id === 'nextcloud-calendar');
@@ -74,7 +79,8 @@ test('every path agrees with the one helper, and a third party box is never in-a
   assert.equal(isInAppBox(null), false);
 });
 
-test('reasons carry a code the client can word from its catalogue, with the English text as fallback', () => {
+test('reasons carry a code the client can word from its catalogue, with the English text as fallback', { skip: skipWasm }, () => {
+  ran++;
   const rows = computePermittedTools({
     user: { id: 'u', role: 'member' }, project: null, mode: 'chat', boxes: [], manifest: [], defaultToolboxes: [], connectorBoxes: new Set(), connected: [],
     oauthServerIds: new Set(), accountReady: () => true, policyMode: () => 'allow', isWriteTool: () => false, diaryEnabled: true, harnessEnabled: true, repositories: [],
@@ -84,3 +90,5 @@ test('reasons carry a code the client can word from its catalogue, with the Engl
   assert.match(code.reason, /Cowork/);
   for (const tool of code.tools) assert.equal(tool.reasonCode, 'codeNeedsCowork');
 });
+
+test.after(() => { if (!skipWasm) assert.equal(ran, 2, 'a wasm-guarded test body did not run'); });

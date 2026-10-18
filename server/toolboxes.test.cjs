@@ -1,5 +1,8 @@
 'use strict';
 const skipWasm = !require('node:fs').existsSync(process.env.DAV_PARSE_WASM || require('./dav-parse-wasm.cjs').DEFAULT_WASM) && process.env.DAV_PARSE_WASM_REQUIRED !== '1' && 'dav-parse.wasm not built';
+// Guards a wrong test signature (options passed twice makes node:test take the second object as the body, so the body never runs and the
+// test reports ok): when the module is there, every guarded body must have run.
+let permittedRan = 0;
 // createToolboxes with everything injected: no server boot, no data dir, no MCP.
 // toolbox.test.cjs and tool-permissions.test.cjs still exercise the same code
 // through index.cjs, so this file covers the seams that only the factory exposes:
@@ -42,7 +45,8 @@ test('MCP boxes join the built-ins through the injected accessor, and the offer 
   assert.deepEqual(t.sanitizeToolboxes(['core', 'nc-notes', 'nc-notes', 7]), ['nc-notes']);
 });
 
-test('resolveTools sends MCP tools within the cap and budget, first box first', () => {
+test('resolveTools sends MCP tools within the cap and budget, first box first', { skip: skipWasm }, () => {
+  permittedRan++;
   const t = build({ mcpBoxes: [box('a', [tool('a_1'), tool('a_2')]), box('b', [tool('b_1')])] });
   const r = t.resolveTools({ toolboxes: ['b', 'a'] }, 'model-9b');
   assert.deepEqual(r.boxes, ['b', 'a']);
@@ -94,7 +98,8 @@ test('toolboxSummaries lists a connector only for the account that actually conn
   assert.equal(t.toolboxSummaries(t.connectedBoxes({ id: 'other' })).some((b) => b.id === 'gdrive'), false, "another account's summaries still omit it");
 });
 
-test('Drive stays resolvable per connected account when the operator offer list omits it', () => {
+test('Drive stays resolvable per connected account when the operator offer list omits it', { skip: skipWasm }, () => {
+  permittedRan++;
   const names = ['drive_search_files', 'drive_read_file', 'drive_get_metadata', 'drive_list_recent', 'drive_create_file', 'drive_update_file', 'drive_trash_file'];
   const reads = names.slice(0, 4);
   const drive = { box: box('gdrive', names.map(tool), reads), names: new Set(names), connected: (u) => u.id === 'linked', execute: async () => '' };
@@ -187,3 +192,5 @@ test('toolboxSummaries marks the boxes shipped with noevia, so the client may wo
   assert.equal(byId.diary.inApp, true, 'an MCP-backed box curated in the manifest');
   assert.equal(byId['third-party'].inApp, false, 'a box a third party defined keeps its own name');
 });
+
+test.after(() => { if (!skipWasm) assert.equal(permittedRan, 2, 'a wasm-guarded test body did not run'); });

@@ -1,4 +1,8 @@
 'use strict';
+const skipWasm = !require('node:fs').existsSync(process.env.DAV_PARSE_WASM || require('./dav-parse-wasm.cjs').DEFAULT_WASM) && process.env.DAV_PARSE_WASM_REQUIRED !== '1' && 'dav-parse.wasm not built';
+// Guards a wrong test signature (options passed twice makes node:test take the second object as the body, so the body never runs and the
+// test reports ok): when the module is there, every guarded body must have run.
+let ran = 0;
 // #865: a tool call is routed by (server, name), never by name alone. Two synthetic MCP servers
 // offer the same tool name; whichever box offered the tool to the model is the server the call
 // reaches, with that server's credential. A bare name two servers offer is refused, not guessed.
@@ -77,7 +81,8 @@ async function setup({ withDirectory = true, withInternal = false } = {}) {
   return { wiring, toolboxes, mcp, asUser, callAs };
 }
 
-test('enabling only the directory box routes a shared tool name to the directory server, with its own credential', async () => {
+test('enabling only the directory box routes a shared tool name to the directory server, with its own credential', { skip: skipWasm }, async () => {
+  ran++;
   const s = await setup();
   const { resolved, text } = await s.callAs(['dir'], 'search_files');
   assert.equal(resolved.tools.find((t) => t.function.name === 'search_files').function.description, 'directory search', 'the model is shown the directory tool');
@@ -89,7 +94,8 @@ test('enabling only the directory box routes a shared tool name to the directory
   assert.ok(!JSON.stringify(s.mcp.calls).includes('Basic'), 'the Nextcloud password never leaves for the other server');
 });
 
-test('the operator box keeps its own server for the same name, and the first selected box wins a clash', async () => {
+test('the operator box keeps its own server for the same name, and the first selected box wins a clash', { skip: skipWasm }, async () => {
+  ran++;
   const s = await setup();
   const nc = await s.callAs(['nc-files'], 'search_files');
   assert.equal(nc.text, `${NC_URL}:search_files`);
@@ -120,7 +126,8 @@ test('a route to a server that does not offer the name is refused, not redirecte
   assert.equal(s.mcp.calls.length, 0);
 });
 
-test('operator-only deployments are unchanged: same tools offered byte for byte, bare calls still run', async () => {
+test('operator-only deployments are unchanged: same tools offered byte for byte, bare calls still run', { skip: skipWasm }, async () => {
+  ran++;
   const s = await setup({ withDirectory: false });
   const { resolved, text } = await s.callAs(['nc-files'], 'search_files');
   assert.equal(JSON.stringify(resolved.tools), JSON.stringify(s.wiring.state.boxes[0].tools), 'no field is added to what the model sees');
@@ -241,3 +248,5 @@ test('#891: a fixed caller never falls back to a directory server when no operat
   // Chat tool calls keep name routing: a directory-only tool still runs there.
   assert.equal(await s.asUser(() => s.wiring.executeMcpToolCall('dir_only', {})), `${DIR_URL}:dir_only`);
 });
+
+test.after(() => { if (!skipWasm) assert.equal(ran, 3, 'a wasm-guarded test body did not run'); });

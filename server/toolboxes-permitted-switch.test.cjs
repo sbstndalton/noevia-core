@@ -1,22 +1,22 @@
 'use strict';
-// TOOLBOXES_PERMITTED_IMPL: the switch and its strict paths, with a stand-in for the Rust port (no
-// dav-parse.wasm needed; tests/server/toolboxes-permitted-differential.test.cjs runs the real
-// module). The port can only offer less: a box id is carried only if both carry it, a box is
-// available or active only if both say so, a tool's permission is the stricter one; a fault or a
-// reply of another shape carries no box and shows everything unavailable. The callbacks are
-// recorded during the JS run, never called twice. Synthetic accounts and boxes only.
+// The permitted-tools view applies the Rust port's answer (TOOLBOXES_PERMITTED_IMPL, retired in #1071), tested with a
+// stand-in for the port (no dav-parse.wasm needed; tests/server/toolboxes-permitted-differential.test.cjs runs the real
+// module). What is checked here is the host's side of the contract and its floor: the callbacks are called once each and
+// what they said is what the port is sent; the port decides which ids are carried and each box and tool; a fault, a
+// refusal or a reply of another shape carries no id and shows every box and tool unavailable ('unchecked'); and under the
+// port the account's own limits stay (a blocked tool is never more than unavailable, a write or an Ask tool is never
+// allowed, a box that needs a connection, a sign-in or the Diary add-on is not available unless the port says so too).
+// Synthetic accounts and boxes only.
 const test = require('node:test'), assert = require('node:assert/strict');
 const tp = require('./toolboxes-permitted.cjs');
 const davParseWasm = require('./dav-parse-wasm.cjs');
 
-const WASM = { TOOLBOXES_PERMITTED_IMPL: 'wasm' };
 const fault = () => { throw new davParseWasm.DavParseError('dav-parse module failed', 'trap'); };
 function fakePort(answers = {}) {
   const calls = [];
   const fnOf = (name) => (...args) => { calls.push([name, args]); return (answers[name] || fault)(...args); };
   return { calls, loader: () => ({ toolboxesProjectIds: fnOf('project'), toolboxesSelectedIds: fnOf('selected'), toolboxesPermitted: fnOf('permitted') }) };
 }
-const wasm = (port) => ({ env: WASM, wasmLoader: port.loader });
 function quietly(fn) {
   const warn = console.warn, seen = [];
   console.warn = (m) => seen.push(String(m));
@@ -24,133 +24,159 @@ function quietly(fn) {
 }
 const tool = (name) => ({ type: 'function', function: { name, description: `${name} (synthetic)` } });
 function input(over = {}) {
-  const counts = { ready: 0, write: 0, policy: 0 };
+  const counts = { ready: [], write: [], policy: [] };
   return {
     counts,
     input: {
       user: { id: 'u1', role: 'admin' }, project: { id: 'p1', toolboxes: ['core', 'web'] }, mode: 'cowork',
-      boxes: [{ id: 'core', label: 'Core', tools: [tool('read_file'), tool('write_file')] }, { id: 'web', label: 'Web', tools: [tool('web_search')] },
+      boxes: [{ id: 'core', label: 'Core', source: 'builtin', tools: [tool('read_file'), tool('write_file')] }, { id: 'web', label: 'Web', tools: [tool('web_search')] },
         { id: 'sso', label: 'SSO', tools: [tool('sso_read')] }],
       manifest: [{ id: 'down' }], defaultToolboxes: ['core'], connectorBoxes: new Set(['gmail']), connected: [], oauthServerIds: new Set(['sso']),
-      accountReady: () => { counts.ready++; return true; }, isWriteTool: (n) => { counts.write++; return n === 'write_file'; },
-      policyMode: (_u, t) => { counts.policy++; return t === 'web_search' ? 'ask' : 'allow'; },
+      accountReady: (_u, id) => { counts.ready.push(id); return true; }, isWriteTool: (n) => { counts.write.push(n); return n === 'write_file'; },
+      policyMode: (_u, t) => { counts.policy.push(t); return t === 'web_search' ? 'ask' : 'allow'; },
       diaryEnabled: true, harnessEnabled: true, repositories: ['r1'], ...over,
     },
   };
 }
-const asPort = (boxes) => ({ boxes: boxes.map((b) => ({ id: typeof b.id === 'string' ? b.id : null, state: b.state, reasonCode: b.reasonCode, active: b.active,
-  tools: b.tools.map((t) => ({ permission: t.permission, reasonCode: t.reasonCode })) })) });
+const T = (permission, reasonCode = null) => ({ permission, reasonCode });
+const OPEN = { available: { state: 'available', reasonCode: null } };
+/** The port's answer for input(): core, web, sso, the manifest's down, the coding harness. */
+function reply(over = {}) {
+  return { boxes: [
+    { id: 'core', ...OPEN.available, active: true, tools: [T('allowed'), T('needs-approval')] },
+    { id: 'web', ...OPEN.available, active: true, tools: [T('needs-approval')] },
+    { id: 'sso', ...OPEN.available, active: false, tools: [T('allowed')] },
+    { id: 'down', state: 'unavailable', reasonCode: 'notConnected', active: false, tools: [] },
+    { id: 'code', ...OPEN.available, active: true, tools: [T('allowed'), T('needs-approval'), T('needs-approval')] },
+  ].map((b, i) => (over[i] ? { ...b, ...over[i] } : b)) };
+}
+const byId = (boxes) => Object.fromEntries(boxes.map((b) => [b.id, b]));
 
-test('TOOLBOXES_PERMITTED_IMPL: default js, wasm when set, anything else js with one warning', () => {
-  const { seen } = quietly(() => {
-    assert.equal(tp.toolboxesPermittedImpl({}), 'js');
-    assert.equal(tp.toolboxesPermittedImpl({ TOOLBOXES_PERMITTED_IMPL: ' Wasm' }), 'wasm');
-    assert.equal(tp.toolboxesPermittedImpl({ TOOLBOXES_PERMITTED_IMPL: 'yes' }), 'js');
-    assert.equal(tp.toolboxesPermittedImpl({ TOOLBOXES_PERMITTED_IMPL: 'yes' }), 'js');
+test('the port\'s answer is the catalogue; the callbacks are called once each, in order, and the port is sent what they said', () => {
+  const port = fakePort({ permitted: () => reply() });
+  const { input: i, counts } = input();
+  const out = tp.computePermittedTools(i, { wasmLoader: port.loader });
+  assert.deepEqual(counts, { ready: ['sso'], write: ['read_file', 'write_file', 'web_search', 'sso_read'], policy: ['read_file', 'write_file', 'web_search', 'sso_read'] });
+  const boxes = byId(out);
+  assert.deepEqual(out.map((b) => b.id), ['core', 'web', 'sso', 'down', 'code']);
+  assert.deepEqual(boxes.core.tools.map((t) => [t.name, t.write, t.permission, t.reason, t.reasonCode]), [['read_file', false, 'allowed', null, null], ['write_file', true, 'needs-approval', null, null]]);
+  assert.equal(boxes.core.inApp, true);
+  assert.equal(boxes.core.active, true);
+  assert.equal(boxes.sso.active, false);
+  assert.deepEqual([boxes.down.state, boxes.down.reasonCode, boxes.down.reason, boxes.down.inApp], ['unavailable', 'notConnected', tp.REASONS.notConnected, true]);
+  assert.deepEqual([boxes.code.state, boxes.code.reason, boxes.code.tools.map((t) => t.permission)], ['available', null, ['allowed', 'needs-approval', 'needs-approval']]);
+  assert.equal(boxes.web.tools[0].description, 'web_search (synthetic)');
+  const [, [sent]] = port.calls[0];
+  assert.deepEqual(sent.boxes, [{ id: 'core', ready: null, tools: [{ write: false, policy: 'other' }, { write: true, policy: 'other' }] },
+    { id: 'web', ready: null, tools: [{ write: false, policy: 'ask' }] }, { id: 'sso', ready: true, tools: [{ write: false, policy: 'other' }] }]);
+  assert.deepEqual([sent.isAdmin, sent.cowork, sent.hasRepositories, sent.manifest], [true, true, true, [{ id: 'down' }]]);
+  assert.equal(port.calls.length, 1);
+});
+
+test('the port can make an answer stricter: an unavailable box with its reason, a blocked tool, an unknown code is unchecked', () => {
+  const port = fakePort({ permitted: () => reply({ 1: { state: 'unavailable', reasonCode: 'signIn', active: false, tools: [T('unavailable', 'signIn')] },
+    0: { tools: [T('unavailable', 'blocked'), T('needs-approval')] }, 2: { state: 'unavailable', reasonCode: 'no-such-code', tools: [T('unavailable', 'no-such-code')] },
+    4: { state: 'unavailable', reasonCode: 'codeOff', active: false, tools: [T('unavailable', 'codeOff'), T('unavailable', 'codeOff'), T('unavailable', 'codeOff')] } }) });
+  const boxes = byId(tp.computePermittedTools(input().input, { wasmLoader: port.loader }));
+  assert.deepEqual([boxes.web.state, boxes.web.reasonCode, boxes.web.reason, boxes.web.active, boxes.web.tools[0].permission, boxes.web.tools[0].reason], ['unavailable', 'signIn', tp.REASONS.signIn, false, 'unavailable', tp.REASONS.signIn]);
+  assert.deepEqual([boxes.core.tools[0].permission, boxes.core.tools[0].reason, boxes.core.tools[0].reasonCode], ['unavailable', tp.REASONS.blocked, 'blocked']);
+  assert.deepEqual([boxes.sso.reasonCode, boxes.sso.reason, boxes.sso.tools[0].reasonCode], ['unchecked', tp.REASONS.unchecked, 'unchecked']);
+  assert.deepEqual([boxes.code.state, boxes.code.reason, boxes.code.tools.map((t) => t.reasonCode)], ['unavailable', tp.REASONS.codeOff, ['codeOff', 'codeOff', 'codeOff']]);
+});
+
+test('the floor: the limits of the account hold even if the port says allowed and available', () => {
+  const answer = { boxes: [
+    { id: 'core', ...OPEN.available, active: true, tools: [T('allowed'), T('allowed')] },
+    { id: 'web', ...OPEN.available, active: true, tools: [T('allowed')] },
+    { id: 'sso', ...OPEN.available, active: true, tools: [T('allowed')] },
+    { id: 'diary', ...OPEN.available, active: true, tools: [T('allowed')] },
+    { id: 'code', ...OPEN.available, active: true, tools: [T('allowed'), T('allowed'), T('allowed')] },
+  ] };
+  const policy = { read_file: 'block', web_search: 'ask' };
+  const { input: i } = input({
+    boxes: [{ id: 'core', tools: [tool('read_file'), tool('write_file')] }, { id: 'web', tools: [tool('web_search')] }, { id: 'sso', tools: [tool('sso_read')] },
+      { id: 'diary', tools: [tool('diary_read')] }],
+    manifest: [], diaryEnabled: false, accountReady: () => false, policyMode: (_u, t) => policy[t] || 'allow',
   });
-  assert.equal(seen.length, 1);
-  assert.match(seen[0], /TOOLBOXES_PERMITTED_IMPL="yes" is not js or wasm; using js/);
-  assert.ok(davParseWasm.IMPL_FLAGS.includes('TOOLBOXES_PERMITTED_IMPL'));
+  const boxes = byId(tp.computePermittedTools(i, { wasmLoader: fakePort({ permitted: () => answer }).loader }));
+  assert.deepEqual(boxes.core.tools.map((t) => [t.permission, t.reasonCode]), [['unavailable', 'blocked'], ['needs-approval', null]], 'Block; a write is never allowed');
+  assert.deepEqual([boxes.web.tools[0].permission, boxes.web.tools[0].reasonCode], ['needs-approval', null], 'Ask');
+  assert.deepEqual([boxes.sso.state, boxes.sso.reasonCode, boxes.sso.active, boxes.sso.tools[0].permission, boxes.sso.tools[0].reasonCode], ['unavailable', 'signIn', false, 'unavailable', 'signIn'], 'not signed in');
+  assert.deepEqual([boxes.diary.state, boxes.diary.reasonCode, boxes.diary.tools[0].permission], ['unavailable', 'diaryOff', 'unavailable'], 'the Diary add-on is off');
 });
 
-test('under js the port is never asked, and the two-argument callers read process.env', () => {
-  const port = fakePort();
-  const opts = { env: {}, wasmLoader: port.loader };
-  assert.deepEqual(tp.projectToolboxIds({ toolboxes: ['a'] }, ['core'], opts), ['a']);
-  assert.deepEqual(tp.selectedToolboxIds({ project: null, defaultToolboxes: ['core'], connectorBoxes: new Set(), connected: ['gmail'] }, opts), ['core', 'gmail']);
-  tp.computePermittedTools(input().input, opts);
-  assert.deepEqual(port.calls, []);
-  const saved = process.env.TOOLBOXES_PERMITTED_IMPL;
-  try {
-    delete process.env.TOOLBOXES_PERMITTED_IMPL;
-    assert.deepEqual(tp.projectToolboxIds(null, ['core']), ['core']);
-  } finally { if (saved === undefined) delete process.env.TOOLBOXES_PERMITTED_IMPL; else process.env.TOOLBOXES_PERMITTED_IMPL = saved; }
+test('the floor: a box that needs a connection is unavailable unless the port says so too', () => {
+  const answer = { boxes: [{ id: 'gmail', ...OPEN.available, active: true, tools: [T('allowed')] }, { id: 'code', ...OPEN.available, active: true, tools: [T('allowed'), T('needs-approval'), T('needs-approval')] }] };
+  const { input: i } = input({ boxes: [{ id: 'gmail', tools: [tool('mail_read')] }], manifest: [], oauthServerIds: new Set(), connectorBoxes: new Set(['gmail']), connected: [] });
+  const boxes = byId(tp.computePermittedTools(i, { wasmLoader: fakePort({ permitted: () => answer }).loader }));
+  assert.deepEqual([boxes.gmail.state, boxes.gmail.reasonCode, boxes.gmail.reason, boxes.gmail.active, boxes.gmail.tools[0].permission], ['unavailable', 'connect', tp.REASONS.connect, false, 'unavailable']);
 });
 
-test('carried ids: the JS list when the port agrees, only the shared string ids otherwise, none on a fault', () => {
-  const project = { toolboxes: ['core', 'web', 7, 'notes'] };
-  let port = fakePort({ project: () => ({ ids: ['core', 'web', null, 'notes'] }) });
-  const js = tp.projectToolboxIdsJs(project, ['core']);
-  assert.equal(tp.projectToolboxIds(project, ['core'], wasm(port)), js, 'the JS list itself');
-  assert.deepEqual(port.calls[0][1], [{ auto: false, docsDefaulted: false, toolboxes: ['core', 'web', null, 'notes'] }, ['core'], 'project-docs']);
-  port = fakePort({ project: () => ({ ids: ['core', 'extra'] }) });
-  assert.deepEqual(quietly(() => tp.projectToolboxIds(project, ['core'], wasm(port))).value, ['core']);
-  port = fakePort();
-  assert.deepEqual(quietly(() => tp.projectToolboxIds(project, ['core'], wasm(port))).value, []);
-  // selectedToolboxIds: a connector the port does not carry is dropped; a fault carries nothing.
-  const sel = { project: null, defaultToolboxes: ['core', 'gmail'], connectorBoxes: new Set(['gmail']), connected: ['gmail'] };
-  port = fakePort({ selected: () => ({ ids: ['core'] }) });
-  assert.deepEqual(quietly(() => tp.selectedToolboxIds(sel, wasm(port))).value, ['core']);
-  port = fakePort({ selected: () => ({ ids: ['core', 'gmail', 'gmail'] }) });
-  assert.deepEqual(quietly(() => tp.selectedToolboxIds(sel, wasm(port))).value, ['core', 'gmail']);
-  port = fakePort({ selected: () => ({ ids: ['gmail'] }) });
-  const { value, seen } = quietly(() => tp.selectedToolboxIds(sel, wasm(port)));
-  assert.deepEqual(value, ['gmail']);
-  assert.ok(seen.every((l) => !l.includes('core')), 'warnings (once per reason) carry no ids');
-  port = fakePort();
-  assert.deepEqual(quietly(() => tp.selectedToolboxIds(sel, wasm(port))).value, []);
-});
-
-test('catalogue: agreement returns the JS answer; callbacks are not called twice', () => {
-  const plain = input();
-  const js = tp.computePermittedToolsJs(plain.input);
-  const once = { ...plain.counts };
-  const w = input();
-  const port = fakePort({ permitted: (proj) => {
-    assert.deepEqual(proj.boxes, [{ id: 'core', ready: null, tools: [{ write: false, policy: 'other' }, { write: true, policy: 'other' }] },
-      { id: 'web', ready: null, tools: [{ write: false, policy: 'ask' }] }, { id: 'sso', ready: true, tools: [{ write: false, policy: 'other' }] }]);
-    return asPort(js);
-  } });
-  assert.deepEqual(tp.computePermittedTools(w.input, wasm(port)), js);
-  assert.deepEqual(w.counts, once);
-});
-
-test('catalogue: the stricter of the two for each box and tool, with the port reason', () => {
-  const { input: i } = input();
-  const js = tp.computePermittedToolsJs(i);
-  const answer = asPort(js);
-  answer.boxes[0].tools[0] = { permission: 'unavailable', reasonCode: 'blocked' }; // stricter tool
-  answer.boxes[1] = { ...answer.boxes[1], state: 'unavailable', reasonCode: 'signIn', active: false,
-    tools: [{ permission: 'unavailable', reasonCode: 'signIn' }] }; // stricter box
-  answer.boxes[2].tools[0] = { permission: 'allowed', reasonCode: null }; // not more permissive
-  answer.boxes[3] = { ...answer.boxes[3], state: 'available', reasonCode: null }; // 'down' is unavailable: stays
-  answer.boxes[4].tools[1] = { permission: 'needs-approval', reasonCode: 'weird' };
-  const port = fakePort({ permitted: () => answer });
-  const out = quietly(() => tp.computePermittedTools(i, wasm(port))).value;
-  assert.equal(out[0].tools[0].permission, 'unavailable');
-  assert.equal(out[0].tools[0].reason, tp.REASONS.blocked);
-  assert.equal(out[1].state, 'unavailable');
-  assert.equal(out[1].reasonCode, 'signIn');
-  assert.equal(out[1].active, false);
-  assert.equal(out[1].tools[0].permission, 'unavailable');
-  assert.deepEqual(out[2], js[2]);
-  assert.deepEqual(out[3], js[3]);
-  assert.deepEqual(out[4], js[4]);
-  const RANK = { allowed: 0, 'needs-approval': 1, unavailable: 2 };
-  for (const [k, b] of out.entries()) {
-    assert.ok(b.state === 'unavailable' || js[k].state === 'available');
-    assert.ok(!b.active || js[k].active);
-    for (const [n, t] of b.tools.entries()) assert.ok(RANK[t.permission] >= RANK[js[k].tools[n].permission]);
-  }
-});
-
-test('catalogue: a fault or another shape shows everything unavailable', () => {
-  const { input: i } = input();
-  const js = tp.computePermittedToolsJs(i);
-  const shapes = [() => { throw new davParseWasm.DavParseError('x', 'trap'); }, () => ({ boxes: asPort(js).boxes.slice(1) }),
-    () => { const a = asPort(js); a.boxes[0].tools.pop(); return a; }, () => { const a = asPort(js); a.boxes[0].id = 'other'; return a; }];
-  for (const answer of shapes) {
-    const out = quietly(() => tp.computePermittedTools(i, wasm(fakePort({ permitted: answer })))).value;
-    assert.equal(out.length, js.length);
+test('a fault, a refusal or a reply of another shape: every box and tool unavailable (unchecked), the callbacks still called once', () => {
+  const answers = [undefined, () => { throw new TypeError('unexpected'); }, () => reply({ 0: { id: 'other' } }), () => ({ boxes: reply().boxes.slice(1) }),
+    () => reply({ 0: { tools: [T('allowed')] } }), () => ({ boxes: [] })];
+  for (const permitted of answers) {
+    const port = fakePort(permitted ? { permitted } : {});
+    const { input: i, counts } = input();
+    const { value: out, seen } = quietly(() => tp.computePermittedTools(i, { wasmLoader: port.loader }));
+    assert.equal(counts.write.length, 4);
+    assert.deepEqual(out.map((b) => b.id), ['core', 'web', 'sso', 'down', 'code']);
     for (const b of out) {
-      assert.equal(b.state, 'unavailable');
-      assert.equal(b.active, false);
-      assert.equal(b.reasonCode, 'unchecked');
-      assert.ok(b.tools.every((t) => t.permission === 'unavailable' && t.reasonCode === 'unchecked'));
+      assert.deepEqual([b.state, b.reasonCode, b.reason, b.active], ['unavailable', 'unchecked', tp.REASONS.unchecked, false], b.id);
+      for (const t of b.tools) assert.deepEqual([t.permission, t.reasonCode], ['unavailable', 'unchecked']);
     }
+    assert.equal(out[0].tools[0].name, 'read_file');
+    assert.ok(seen.every((l) => !l.includes('read_file') && !l.includes('u1')), 'warnings carry no input');
   }
-  // A box id that is not a string cannot be projected: a fault too.
-  const odd = input({ boxes: [{ id: 5, tools: [] }] }).input;
-  const out = quietly(() => tp.computePermittedTools(odd, wasm(fakePort({ permitted: () => ({ boxes: [] }) })))).value;
-  assert.ok(out.every((b) => b.state === 'unavailable'));
+  // A box whose id is not a string cannot be sent: unchecked as well.
+  const odd = input({ boxes: [{ id: 7, label: 'odd', tools: [tool('x')] }], manifest: [] });
+  const out = quietly(() => tp.computePermittedTools(odd.input, { wasmLoader: fakePort({ permitted: () => reply() }).loader })).value;
+  assert.deepEqual(out.map((b) => b.reasonCode), ['unchecked', 'unchecked']);
+});
+
+test('callbacks that throw are not hidden: the error reaches the caller, as before', () => {
+  const { input: i } = input({ policyMode: () => { throw Error('policy store down'); } });
+  assert.throws(() => tp.computePermittedTools(i, { wasmLoader: fakePort({ permitted: () => reply() }).loader }), /policy store down/);
+});
+
+test('carried ids are the port\'s string ids; a fault or a list that cannot be sent carries none', () => {
+  const port = fakePort({ project: () => ({ ids: ['core', null, 'web'] }), selected: () => ({ ids: ['core', 'gmail', null] }) });
+  assert.deepEqual(tp.projectToolboxIds({ toolboxes: ['core', 7, 'web'] }, ['core'], { wasmLoader: port.loader }), ['core', 'web']);
+  assert.deepEqual(port.calls[0][1].slice(0, 2), [{ auto: false, docsDefaulted: false, toolboxes: ['core', null, 'web'] }, ['core']]);
+  const sel = { project: null, defaultToolboxes: ['core'], connectorBoxes: new Set(['gmail']), connected: ['gmail'] };
+  assert.deepEqual(tp.selectedToolboxIds(sel, { wasmLoader: port.loader }), ['core', 'gmail']);
+  assert.deepEqual(port.calls[1][1].slice(3), [['gmail'], ['gmail']]);
+  const { value } = quietly(() => [tp.projectToolboxIds({}, ['core'], { wasmLoader: fakePort().loader }), tp.selectedToolboxIds(sel, { wasmLoader: fakePort().loader }),
+    tp.projectToolboxIds({}, 'core', { wasmLoader: port.loader }), tp.selectedToolboxIds({ ...sel, connectorBoxes: new Set([7]) }, { wasmLoader: port.loader }),
+    tp.selectedToolboxIds({ ...sel, connected: 'gmail' }, { wasmLoader: port.loader })]);
+  assert.deepEqual(value, [[], [], [], [], []]);
+});
+
+test('every fault is counted, logged at the 1st, 10th, 100th and 1000th time, without input, and bounded', () => {
+  const lines = [];
+  const warn = console.warn;
+  console.warn = (m) => lines.push(String(m));
+  try {
+    const port = fakePort({ project: () => { throw new davParseWasm.DavParseError('x', 'count-test'); } });
+    for (let i = 0; i < 1100; i++) tp.projectToolboxIds({ toolboxes: ['secret-box'] }, ['core'], { wasmLoader: port.loader });
+    for (let i = 0; i < 300; i++) tp.projectToolboxIds({}, ['core'], { wasmLoader: fakePort({ project: () => { throw new davParseWasm.DavParseError('x', `bound-${i}`); } }).loader });
+  } finally { console.warn = warn; }
+  const counted = lines.filter((l) => l.includes('count-test'));
+  assert.deepEqual(counted.map((l) => l.match(/\((\d+) times so far\)/)?.[1] ?? '1'), ['1', '10', '100', '1000']);
+  assert.ok(counted.every((l) => /^\[toolboxes-permitted\] toolboxes_permitted\.wasm_fault \(count-test\); nothing was carried or permitted/.test(l) && !l.includes('secret-box')));
+  assert.ok(lines.length < 260, 'a flood of distinct reasons stays bounded');
+});
+
+test('retired: the switch and the JS rules are gone', () => {
+  assert.equal(davParseWasm.RETIRED_FLAGS.TOOLBOXES_PERMITTED_IMPL, 'wasm');
+  assert.ok(!davParseWasm.IMPL_FLAGS.includes('TOOLBOXES_PERMITTED_IMPL'));
+  for (const name of ['toolboxesPermittedImpl', 'computePermittedToolsJs', 'projectToolboxIdsJs', 'selectedToolboxIdsJs', 'mergeBox']) assert.equal(tp[name], undefined, name);
+});
+
+test('projections: what the port reads of the request', () => {
+  assert.equal(tp.projectProjection(null), null);
+  assert.deepEqual(tp.projectProjection({ toolsMode: 'auto', docsToolboxDefaulted: true, toolboxes: ['a', 3] }), { auto: true, docsDefaulted: true, toolboxes: ['a', null] });
+  assert.deepEqual(tp.projectProjection({ toolsMode: 'AUTO', docsToolboxDefaulted: 'yes' }), { auto: false, docsDefaulted: false, toolboxes: null });
+  assert.deepEqual(tp.idsProjection(['a', undefined, 5]), ['a', null, null]);
+  assert.throws(() => tp.idsProjection('a'), /not a list/);
 });
