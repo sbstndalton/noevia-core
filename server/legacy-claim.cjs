@@ -47,12 +47,34 @@ function previousOwner(root, started) {
   }
   return null;
 }
+function readRegularBounded(file, maxBytes) {
+  let fd = null;
+  try {
+    const flags = fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0) |
+      (fs.constants.O_NONBLOCK || 0) | (fs.constants.O_NOCTTY || 0);
+    fd = fs.openSync(file, flags);
+    const opened = fs.fstatSync(fd);
+    if (!opened.isFile() || opened.size > maxBytes) return null;
+    const bytes = Buffer.alloc(maxBytes + 1);
+    let length = 0;
+    while (length < bytes.length) {
+      const count = fs.readSync(fd, bytes, length, bytes.length - length, null);
+      if (count === 0) break;
+      length += count;
+    }
+    if (length > maxBytes) return null;
+    return bytes.subarray(0, length);
+  } catch { return null; }
+  finally { if (fd !== null) fs.closeSync(fd); }
+}
 function ownerRecord(root) {
   const file = path.join(root, 'legacy-owner.json'), s = lstat(file);
   if (!s) return null;
   if (!s.isFile() || s.isSymbolicLink()) return { malformed: true };
+  const bytes = readRegularBounded(file, 4096);
+  if (!bytes) return { malformed: true };
   try {
-    const v = JSON.parse(fs.readFileSync(file, 'utf8'));
+    const v = JSON.parse(bytes.toString('utf8'));
     return v && typeof v === 'object' ? v : { malformed: true };
   } catch { return { malformed: true }; }
 }
@@ -112,8 +134,10 @@ function copyTree(root, rel, dest, started, budget) {
   if (!stat.isFile()) throw unavailable('Legacy workspace contains a link or special file.');
   let input = null, output = null;
   try {
-    input = fs.openSync(source, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0));
-    if (!fs.fstatSync(input).isFile()) throw unavailable('Legacy workspace changed during migration.');
+    input = fs.openSync(source, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0) |
+      (fs.constants.O_NONBLOCK || 0) | (fs.constants.O_NOCTTY || 0));
+    const opened = fs.fstatSync(input);
+    if (!opened.isFile() || opened.size !== stat.size) throw unavailable('Legacy workspace changed during migration.');
     output = fs.openSync(dest, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | (fs.constants.O_NOFOLLOW || 0), 0o600);
     const buffer = Buffer.allocUnsafe(64 * 1024);
     while (true) {
