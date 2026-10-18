@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 'use strict';
-// Regenerates the shared fixtures for ROLE_CONTEXT_IMPL: role-context.cjs's projectRoleContext and
+// Regenerates the shared fixtures from the frozen test-only JS projectRoleContext and
 // projectSharedDossier. The same file is committed byte-for-byte in sbstndalton/noevia-rs
 // (crates/role-context/tests/fixtures/role-context.v1.json); noevia-core CI compares them.
 //   node tools/gen-role-context-fixtures.cjs > tests/fixtures/role-context.v1.json
