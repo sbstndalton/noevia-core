@@ -18,7 +18,8 @@ const path = require('node:path');
 const test = require('node:test');
 
 const davParseWasm = require('../../server/dav-parse-wasm.cjs');
-const presets = require('../../server/llamacpp-presets.cjs');
+const runtime = require('../../server/llamacpp-presets.cjs');
+const presets = require('../reference/llamacpp-presets-js.cjs');
 
 const FILE = path.join(__dirname, '../fixtures/llamacpp-presets.v1.json');
 const GENERATOR = path.join(__dirname, '../../tools/gen-llamacpp-presets-fixtures.cjs');
@@ -49,7 +50,7 @@ const CALLS = {
 };
 
 test('the fixture file is what the generator prints', { skip: !fs.existsSync(GENERATOR) && 'no generator here' }, () => {
-  const out = execFileSync(process.execPath, [GENERATOR], { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024, stdio: ['ignore', 'pipe', 'ignore'] });
+  const out = execFileSync(process.execPath, [GENERATOR], { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024, env: {...process.env,DAV_PARSE_WASM:path.join(__dirname,'no-generator-module.wasm')}, stdio: ['ignore', 'pipe', 'ignore'] });
   assert.equal(out, fs.readFileSync(FILE, 'utf8'));
 });
 
@@ -118,7 +119,7 @@ test('property: the switched prepare() never writes what the JS refuses, and wri
   const file = path.join(dir, 'models.ini');
   fs.writeFileSync(file, '[*]\nbatch-size = 2048\n\n[synthetic]\nmodel = /models/synthetic.gguf\nub = 512\n');
   const js = presets.createPresetStore(file, { cacheRam: LIMITS, env: {} });
-  const sw = presets.createPresetStore(file, { cacheRam: LIMITS, env: { LLAMACPP_PRESETS_IMPL: 'wasm' } });
+  const sw = runtime.createPresetStore(file, { cacheRam: LIMITS, env: { LLAMACPP_PRESETS_IMPL: 'wasm' } });
   const rand = mulberry32(0x9e3779b9);
   const names = Object.keys(presets.fields);
   const VALUES = ['', '64', '512', '4096', '8192', '9000', '0x40', '1e3', ' 64', '0.5', '2.000', '2.001', 'auto', 'q8_0', '-1', '99999999', '00032', ' 256', '5\n'];
