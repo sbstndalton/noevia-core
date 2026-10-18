@@ -10,6 +10,10 @@ const editTargets = require('./project-edit-target.cjs');
 const { readCappedText, readCappedJson, discardBody } = require('./http.cjs');
 // A provider's error body is only shown as a short message; a summary reply is a few KB of JSON.
 // Both are capped so a provider streaming an endless body cannot be buffered whole (#903).
+// No tool call has arguments anywhere near this size: past it the call is not run, for any provider (the
+// egress rules refuse to read more than about 8 MiB, and nothing downstream should buffer an unbounded model output).
+const MAX_TOOL_ARGS_UNITS = 8 * 1024 * 1024;
+const TOOL_ARGS_TOO_LARGE = (name) => `ERROR: ${name} was not run: its arguments were larger than 8 MiB, which is not a real tool call. Nothing was changed.`;
 const PROVIDER_ERROR_BODY_CAP = 64 * 1024;
 const SUMMARY_REPLY_CAP = 4 * 1024 * 1024;
 // The one non-streaming fallback reply of a round (#918).
@@ -2064,7 +2068,10 @@ function createChatHandler({
                   const slot = toolCalls.get(i) || { id: tc.id || `call-${i}`, name: '', args: '' };
                   if (tc.id) slot.id = tc.id;
                   if (tc.function?.name) slot.name += tc.function.name;
-                  if (tc.function?.arguments) slot.args += tc.function.arguments;
+                  if (tc.function?.arguments && !slot.tooLarge) {
+                    if (slot.args.length + String(tc.function.arguments).length > MAX_TOOL_ARGS_UNITS) { slot.tooLarge = true; slot.args = ''; }
+                    else slot.args += tc.function.arguments;
+                  }
                   toolCalls.set(i, slot);
                   // Emit the accumulated slot, keyed by index — not the raw
                   // fragment. A single call arrives in many deltas (name once,
@@ -2123,8 +2130,9 @@ function createChatHandler({
           if (Array.isArray(msg?.tool_calls)) {
             for (const tc of msg.tool_calls) {
               const index = toolCalls.size;
-              toolCalls.set(index, { id: tc.id || `call-${index}`, name: tc.function?.name || '', args: tc.function?.arguments || '' });
-              send({ type: 'tool', index: toolOffset + index, name: tc.function?.name || '', args: require('./search-query.cjs').cleanSearchArgs(tc.function?.name || '', tc.function?.arguments || '') });
+              const tooLarge = String(tc.function?.arguments || '').length > MAX_TOOL_ARGS_UNITS;
+              toolCalls.set(index, { id: tc.id || `call-${index}`, name: tc.function?.name || '', args: tooLarge ? '' : tc.function?.arguments || '', ...(tooLarge ? { tooLarge: true } : {}) });
+              send({ type: 'tool', index: toolOffset + index, name: tc.function?.name || '', args: tooLarge ? '' : require('./search-query.cjs').cleanSearchArgs(tc.function?.name || '', tc.function?.arguments || '') });
             }
           }
           reportRoundUsage(full.body?.usage, full.body?.timings);
@@ -2176,7 +2184,7 @@ function createChatHandler({
       // user instead of dangling.
       if (toolCalls.size > 0) {
         // #1523: a search query is the question, not the request wrapper around it.
-        for (const tc of toolCalls.values()) tc.args = require('./search-query.cjs').cleanSearchArgs(tc.name, tc.args);
+        for (const tc of toolCalls.values()) tc.args = tc.tooLarge ? '{}' : require('./search-query.cjs').cleanSearchArgs(tc.name, tc.args);
         if (roundContent.trim()) { send({ type: 'preamble', text: roundContent }); roundHasContent = false; }
         const assistantMsg = { role: 'assistant', content: null, tool_calls: [...toolCalls.entries()].map(([i, tc]) => ({ id: tc.id, type: 'function', function: { name: tc.name, arguments: tc.args } })) };
         roundMessages = [...roundMessages, assistantMsg];
@@ -2221,6 +2229,11 @@ function createChatHandler({
               result = `ERROR: ${tc.name} was not run because an earlier write in this reply was declined. Nothing was changed.`;
               notRunResults.add(result);
               return result;
+            }
+            // An oversized call (its arguments were dropped while streaming) never runs, for any provider.
+            if (tc.tooLarge) {
+              authService.audit('tool.denied', userId, userId, { tool: tc.name, reason: 'arguments-too-large' });
+              return TOOL_ARGS_TOO_LARGE(tc.name);
             }
             // The account's tool policy (Settings → Connectors). Writes are always at least `ask`.
             const refusedForEgress = egressToolRefusal(chatUser?.id || userId, tc.name, tc.args);
