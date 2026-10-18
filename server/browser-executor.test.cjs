@@ -1,4 +1,8 @@
 'use strict';
+const skipWasm = !require('node:fs').existsSync(process.env.DAV_PARSE_WASM || require('./dav-parse-wasm.cjs').DEFAULT_WASM) && process.env.DAV_PARSE_WASM_REQUIRED !== '1' && 'dav-parse.wasm not built';
+// Guards a wrong test signature (options passed twice makes node:test take the second object as the body, so the body never runs and the
+// test reports ok): when the module is there, every guarded body must have run.
+let ran = 0;
 // The executor's decisions with a scripted stand-in for Playwright: no browser, no network.
 // The real-Chromium suite is qa/browser-executor.cjs.
 const test = require('node:test'), assert = require('node:assert/strict');
@@ -79,7 +83,8 @@ async function session({ dom, answers = [], secrets = {}, open = {}, failOn, onA
 const submitButton = { tag: 'button', type: '', role: '', name: 'Show details', text: 'Show details', value: '', inForm: true, formMethod: 'post' };
 const textField = { tag: 'input', type: 'text', name: 'Note', text: '', value: '', inForm: true, formMethod: 'post' };
 
-test('a session is refused without allowed domains, a downloads directory or an egress grant', async () => {
+test('a session is refused without allowed domains, a downloads directory or an egress grant', { skip: skipWasm }, async () => {
+  ran++;
   const executor = createBrowserExecutor({ launch: async () => fakeBrowser().browser, askApproval: async () => 'deny' });
   const base = { jobId: 'j', allowedDomains: ['shop.example.test'], downloadsDir: temp(), proxy: { server: 'http://egress:1' } };
   await assert.rejects(executor.open({ ...base, allowedDomains: [] }), (e) => e.status === 400);
@@ -91,13 +96,15 @@ test('a session is refused without allowed domains, a downloads directory or an 
   assert.ok(await direct.open({ ...base, proxy: null }));
 });
 
-test('each session is a fresh context behind its own proxy grant', async () => {
+test('each session is a fresh context behind its own proxy grant', { skip: skipWasm }, async () => {
+  ran++;
   const s = await session();
   assert.deepEqual(s.options().proxy, { server: 'http://egress:8040', username: 'task', password: 'token' });
   assert.equal(s.options().serviceWorkers, 'block');
 });
 
-test('the element is judged as it is, not as the model describes it', async () => {
+test('the element is judged as it is, not as the model describes it', { skip: skipWasm }, async () => {
+  ran++;
   const s = await session({ dom: { '#b': submitButton } });
   const r = await s.act({ type: 'click', selector: '#b', text: 'harmless, just shows details', safe: true });
   assert.equal(s.cards.length, 1, 'asked');
@@ -107,7 +114,8 @@ test('the element is judged as it is, not as the model describes it', async () =
   assert.deepEqual(s.effects, [], 'declined: nothing clicked');
 });
 
-test('Allow once performs the action; a timeout or failure to answer does not', async () => {
+test('Allow once performs the action; a timeout or failure to answer does not', { skip: skipWasm }, async () => {
+  ran++;
   const yes = await session({ dom: { '#b': submitButton }, answers: ['approve'] });
   assert.equal((await yes.act({ type: 'click', selector: '#b' })).status, 'done');
   assert.deepEqual(yes.effects, [['click', '#b']]);
@@ -118,7 +126,8 @@ test('Allow once performs the action; a timeout or failure to answer does not', 
   }
 });
 
-test('each action disposes its element handle after approved, declined and policy-blocked outcomes', async () => {
+test('each action disposes its element handle after approved, declined and policy-blocked outcomes', { skip: skipWasm }, async () => {
+  ran++;
   const approved = await session({ dom: { '#b': submitButton }, answers: ['approve'] });
   assert.equal((await approved.act({ type: 'click', selector: '#b' })).status, 'done');
   assert.deepEqual(approved.disposals, ['#b']);
@@ -132,7 +141,8 @@ test('each action disposes its element handle after approved, declined and polic
   assert.deepEqual(blocked.disposals, ['#f']);
 });
 
-test('a secret is typed only on its own site, and never appears in a result, card or log', async () => {
+test('a secret is typed only on its own site, and never appears in a result, card or log', { skip: skipWasm }, async () => {
+  ran++;
   const secrets = { shop: { value: SECRET, domains: ['shop.example.test'] }, bank: { value: 'bank-9981-x', domains: ['bank.example.test'] } };
   const s = await session({ dom: { '#f': textField, '#b': submitButton }, secrets, answers: ['approve'] });
   assert.equal((await s.act({ type: 'type', selector: '#f', text: 'pw {{secret:shop}}' })).status, 'done');
@@ -152,7 +162,8 @@ test('a secret is typed only on its own site, and never appears in a result, car
   assert.ok(!everything.includes(SECRET) && !everything.includes('bank-9981-x'));
 });
 
-test('approval is invalidated when the exact target is replaced before dispatch', async () => {
+test('approval is invalidated when the exact target is replaced before dispatch', { skip: skipWasm }, async () => {
+  ran++;
   const dom = { '#b': submitButton };
   const s = await session({ dom, answers: ['approve'], onApproval: async () => {
     dom['#b'] = { ...submitButton, name: 'Replacement', text: 'Replacement' };
@@ -163,7 +174,8 @@ test('approval is invalidated when the exact target is replaced before dispatch'
   assert.deepEqual(s.effects, [], 'the replacement target is never clicked');
 });
 
-test('approval is invalidated when the page origin changes before dispatch', async () => {
+test('approval is invalidated when the page origin changes before dispatch', { skip: skipWasm }, async () => {
+  ran++;
   const s = await session({ dom: { '#b': submitButton }, answers: ['approve'], onApproval: async (_card, fake) => {
     fake.setUrl('https://partner.example.test/account');
   } });
@@ -174,7 +186,8 @@ test('approval is invalidated when the page origin changes before dispatch', asy
   assert.deepEqual(s.effects, [], 'nothing is clicked on the changed page');
 });
 
-test('only files given to the task upload, and only after asking', async () => {
+test('only files given to the task upload, and only after asking', { skip: skipWasm }, async () => {
+  ran++;
   const dir = temp(), given = path.join(dir, 'given.txt'), other = path.join(dir, 'other.txt');
   fs.writeFileSync(given, 'x'); fs.writeFileSync(other, 'y');
   const fileInput = { tag: 'input', type: 'file', inForm: true };
@@ -186,7 +199,8 @@ test('only files given to the task upload, and only after asking', async () => {
   assert.deepEqual(s.effects, [['upload', '#u', fs.realpathSync(given)]]);
 });
 
-test('navigation off the allowed list is blocked before anything happens', async () => {
+test('navigation off the allowed list is blocked before anything happens', { skip: skipWasm }, async () => {
+  ran++;
   const s = await session();
   for (const url of ['https://evil.test/', 'http://10.0.0.1/', 'javascript:alert(1)', 'https://shop.example.test.evil.test/']) {
     assert.equal((await s.act({ type: 'navigate', url })).status, 'blocked', url);
@@ -195,13 +209,15 @@ test('navigation off the allowed list is blocked before anything happens', async
   assert.equal((await s.act({ type: 'navigate', url: ORIGIN + '/next' })).status, 'done');
 });
 
-test('an action that fails after it was dispatched is uncertain, not failed', async () => {
+test('an action that fails after it was dispatched is uncertain, not failed', { skip: skipWasm }, async () => {
+  ran++;
   const s = await session({ dom: { '#b': submitButton }, answers: ['approve'], failOn: 'click' });
   const r = await s.act({ type: 'click', selector: '#b' });
   assert.equal(r.status, 'uncertain');
 });
 
-test('unknown actions, missing elements and closed sessions do nothing', async () => {
+test('unknown actions, missing elements and closed sessions do nothing', { skip: skipWasm }, async () => {
+  ran++;
   const s = await session();
   assert.equal((await s.act({ type: 'teleport' })).status, 'blocked');
   assert.equal((await s.act({ type: 'click', selector: '#missing' })).status, 'blocked');
@@ -210,7 +226,8 @@ test('unknown actions, missing elements and closed sessions do nothing', async (
   assert.deepEqual(s.effects, []);
 });
 
-test('two downloads at once keep both files, each under its own number', async () => {
+test('two downloads at once keep both files, each under its own number', { skip: skipWasm }, async () => {
+  ran++;
   const s = await session();
   const saved = [];
   const download = (name, delay) => ({ suggestedFilename: () => name, url: () => ORIGIN + '/' + name,
@@ -223,7 +240,8 @@ test('two downloads at once keep both files, each under its own number', async (
   assert.deepEqual(s.executor.state(s.id).downloads.map((d) => path.basename(d.path)).sort(), ['1-r.csv', '2-r.csv']);
 });
 
-test('#1218: describeInPage reports a button’s DOM type (its real state), other elements’ attribute', () => {
+test('#1218: describeInPage reports a button’s DOM type (its real state), other elements’ attribute', { skip: skipWasm }, () => {
+  ran++;
   const { describeInPage } = require('./browser-executor.cjs');
   const node = (tagName, attrs, type) => ({ tagName, type, closest: () => null, labels: [], form: { getAttribute: () => 'post', action: 'https://example.com/f' },
     getAttribute: (k) => (k in attrs ? attrs[k] : null), innerText: 'Next' });
@@ -239,3 +257,5 @@ test('#1218: describeInPage reports a button’s DOM type (its real state), othe
     globalThis.location = saved;
   }
 });
+
+test.after(() => { if (!skipWasm) assert.equal(ran, 14, 'a wasm-guarded test body did not run'); });
