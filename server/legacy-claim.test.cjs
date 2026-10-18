@@ -71,22 +71,22 @@ test('legacy helper requires an explicit absolute executable and accepts only fi
   assert.throws(() => claimLegacyRoot(root, owner), (error) => error.status === 503);
 
   const claimed = executableFor(t, 'test "$1" = "--claim-legacy-root"\ntest "$2" = "' + root + '"\ntest "$3" = "' + owner + '"\nprintf "CLAIMED\\n"\n');
-  useHelper(t, claimed);
+  process.env.NOEVIA_LEGACY_CLAIM_BIN = claimed;
   assert.equal(claimLegacyRoot(root, owner), true);
 
   const skipped = executableFor(t, 'printf "SKIPPED\\n"\n');
-  useHelper(t, skipped);
+  process.env.NOEVIA_LEGACY_CLAIM_BIN = skipped;
   assert.equal(claimLegacyRoot(root, owner), false);
 
   const malformed = executableFor(t, 'printf "sensitive child output"\n');
-  useHelper(t, malformed);
+  process.env.NOEVIA_LEGACY_CLAIM_BIN = malformed;
   assert.throws(() => claimLegacyRoot(root, owner), (error) =>
     error.status === 503 && !error.message.includes('sensitive child output'));
 });
 
 test('helper timeout is bounded and becomes a generic unavailable response', (t) => {
   const root = rootFor(t);
-  const helper = executableFor(t, 'sleep 10\nprintf "CLAIMED\\n"\n');
+  const helper = executableFor(t, 'exec sleep 10\n');
   useHelper(t, helper);
   const started = Date.now();
   assert.throws(() => claimLegacyRoot(root, owner), (error) => error.status === 503);

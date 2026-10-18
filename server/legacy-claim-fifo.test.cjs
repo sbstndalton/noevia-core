@@ -25,7 +25,8 @@ test('Node wrapper reaches native authority for FIFO owner and source markers wi
     assert.equal(result.status, 0, result.stderr);
     process.env.NOEVIA_LEGACY_CLAIM_BIN = helper;
     const started = Date.now();
-    assert.throws(() => claimLegacyRoot(root, owner), (error) => error.status === 503);
+    if (kind === 'owner') assert.equal(claimLegacyRoot(root, owner), false);
+    else assert.throws(() => claimLegacyRoot(root, owner), (error) => error.status === 503);
     assert.ok(Date.now() - started < 7000);
   }
 });
