@@ -3,6 +3,7 @@
 const fs = require('fs');
 const path = require('path');
 const sourceText = require('./source-text.cjs');
+const legacyClaim = require('./legacy-claim.cjs');
 
 function readJson(file, fallback) {
   try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch { return fallback; }
@@ -95,38 +96,16 @@ function createWorkspaceStore(rootDir, defaultProvider, secrets, { projectStore 
   }
 
   function claimLegacy(userId) {
-    const target = userDir(userId);
-    const hasLegacy = fs.existsSync(path.join(rootDir, 'projects.json')) || fs.existsSync(path.join(rootDir, 'providers.json')) || fs.readdirSync(rootDir).some(name => /^history-.*\.json$/.test(name));
-    if (!hasLegacy) return false;
-    // Legacy files remain for recovery. They are not a template for every
-    // later administrator: claiming twice copies another tenant's data and
-    // credentials and can mark the new account as the diary's legacy owner.
-    const ownerFile = path.join(rootDir, 'legacy-owner.json');
-    if (!fs.existsSync(ownerFile)) {
-      const previous = fs.existsSync(usersDir) && fs.readdirSync(usersDir).find(id =>
-        /^[0-9a-f-]{36}$/i.test(id) && fs.existsSync(path.join(usersDir, id, 'migration.json')));
-      const ownerId = previous || userId;
-      try { fs.writeFileSync(ownerFile, JSON.stringify({ userId: ownerId }), { mode: 0o600, flag: 'wx' }); }
-      catch (err) { if (err.code !== 'EEXIST') throw err; }
-    }
-    if (readJson(ownerFile, {}).userId !== userId || fs.existsSync(target)) return false;
-    const backup = path.join(rootDir, 'migration-backups', `legacy-${Date.now()}`);
-    fs.mkdirSync(target, { recursive: true, mode: 0o700 });
-    fs.mkdirSync(backup, { recursive: true, mode: 0o700 });
-    const names = fs.readdirSync(rootDir).filter(name =>
-      /^(projects|providers|free-chats|auto-roles)\.json$/.test(name) || /^history-.*\.json$/.test(name) || name === 'rag');
-    for (const name of names) {
-      const source = path.join(rootDir, name);
-      fs.cpSync(source, path.join(backup, name), { recursive: true, errorOnExist: true });
-      fs.cpSync(source, path.join(target, name), { recursive: true, errorOnExist: true });
-    }
-    atomicJson(path.join(target, 'migration.json'), { version: 1, source: 'legacy-root', backup, migratedAt: Date.now() });
-    return true;
+    return legacyClaim.claimLegacyRoot(rootDir, userId);
   }
 
-  function get(userId, { claim = false } = {}) {
+  function get(userId, { claim = false, claimTransaction = null } = {}) {
     if (removed.has(userId)) throw Object.assign(new Error('account no longer exists'), { status: 410 });
-    if (claim) claimLegacy(userId);
+    if (claim && legacyClaim.needsClaim(rootDir, userId)) {
+      const runClaim = () => claimLegacy(userId);
+      if (claimTransaction) claimTransaction(runClaim);
+      else runClaim();
+    }
     const cached = cache.get(userId);
     if (cached) {
       cached.providers = mergeProviders(cached.privateProviders);

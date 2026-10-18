@@ -136,6 +136,26 @@ jobs:
           rustup target add wasm32-unknown-unknown --toolchain 1.99.0
           "$RUNNER_TEMP/rs/tools/build-dav-parse-wasm.sh" "$PWD/server/wasm/dav-parse.wasm"
           echo "$DAV_PARSE_WASM_SHA256  server/wasm/dav-parse.wasm" | sha256sum -c -
+      # #205: qualify the actual filesystem helper, not a second JS migration algorithm.
+      # Immutable companion source input (rs225), not a release or dav-parse pin.
+      - name: Build the reviewed native legacy claim helper
+        env:
+          CARGO_BUILD_JOBS: '2'
+        run: |
+          set -euo pipefail
+          helper_ref=93ccb24740c3f05d8f2861d9a356c657ba13851c
+          helper_sha256=05abdc23f65d4d7533db235138cc7ed2cb1f89c87d28a5dcf41338796c0cb5c1
+          curl -fsSL "https://codeload.github.com/sbstndalton/noevia-rs/tar.gz/$helper_ref" -o "$RUNNER_TEMP/claim-rs.tgz"
+          echo "$helper_sha256  $RUNNER_TEMP/claim-rs.tgz" | sha256sum -c -
+          mkdir "$RUNNER_TEMP/claim-rs"
+          tar -xzf "$RUNNER_TEMP/claim-rs.tgz" --strip-components=1 -C "$RUNNER_TEMP/claim-rs"
+          CARGO_TARGET_DIR="$RUNNER_TEMP/claim-target" cargo build --locked \
+            --manifest-path "$RUNNER_TEMP/claim-rs/Cargo.toml" -p noevia-server --bin noevia-server
+          helper="$RUNNER_TEMP/claim-target/debug/noevia-server"
+          helper_features="$("$helper" --features)"
+          grep -qx legacy-root-claim <<<"$helper_features"
+          sha256sum "$helper"
+          printf 'NOEVIA_LEGACY_CLAIM_BIN=%s\nNOEVIA_LEGACY_CLAIM_REQUIRED=1\n' "$helper" >> "$GITHUB_ENV"
       - run: npm run test:server
         env:
           DAV_PARSE_WASM_REQUIRED: '1'
