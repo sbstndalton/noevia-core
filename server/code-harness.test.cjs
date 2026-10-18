@@ -28,6 +28,24 @@ test('a command the checker cannot read is put to a person with the command and 
   assert.deepEqual([first, second].map(withoutReason), [{ outcome: 'selected', optionId: 'y' }, { outcome: 'selected', optionId: 'y' }]);
 });
 
+test('an unreadable command in a task that was not granted the riskiest class is refused and the agent is told which permission is missing; a fully granted task is asked', { skip: skipWasm }, async () => {
+  ran++;
+  const huge = `echo ${'x'.repeat(2 * 1024 * 1024)}`;
+  let denied, asked;
+  const refused = await run({ capabilities: [ACTIONS.EDIT, ACTIONS.EXECUTE], answers: ['approve'], script: async (h) => {
+    denied = await h.requestPermission({ toolCall: { kind: 'execute', rawInput: { command: huge } }, options: OPTIONS });
+  } });
+  assert.equal(refused.asked.length, 0, 'nobody is asked to approve what the task was not granted');
+  assert.deepEqual(withoutReason(denied), { outcome: 'selected', optionId: 'n' });
+  assert.match(reasonOf(denied), /could not be checked, so it is treated as the most consequential kind of action \(external account\), which this task was not granted/);
+  const granted = await run({ capabilities: [ACTIONS.EDIT, ACTIONS.EXTERNAL], answers: ['approve_all'], script: async (h) => {
+    asked = await h.requestPermission({ toolCall: { kind: 'execute', rawInput: { command: huge } }, options: OPTIONS });
+  } });
+  assert.equal(granted.asked.length, 1);
+  assert.match(granted.asked[0].reason, /workspace limits could not be checked/);
+  assert.deepEqual(withoutReason(asked), { outcome: 'selected', optionId: 'y' });
+});
+
 test.after(() => { for (const d of temps) fs.rmSync(d, { recursive: true, force: true }); });
 
 function repo() {
@@ -842,4 +860,4 @@ test('a redirect under a standing execute allow still meets the edit containment
   assert.deepEqual(picked.map((p) => p.optionId), ['y', 'n', 'n', 'y']);
 });
 
-test.after(() => { if (!skipWasm) assert.equal(ran, 43, 'a wasm-guarded test body did not run'); });
+test.after(() => { if (!skipWasm) assert.equal(ran, 44, 'a wasm-guarded test body did not run'); });

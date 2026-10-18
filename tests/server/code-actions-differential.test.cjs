@@ -214,5 +214,11 @@ test('find -exec chains: the port gives the JS answer (by hash); oversized comma
     const d = ca.decide({ classified: now, capabilities: [], domains: [], inWorkspace: null });
     assert.equal(d.decision, 'ask', 'a person decides; the card shows the command and why it could not be checked');
     assert.match(d.reason, /could not be checked \(too large or complex to check\)/);
+    assert.match(d.reason, /workspace limits could not be checked/);
+    // Treated as the riskiest class: a task not granted it is denied, one granted it is asked.
+    const restricted = ca.decide({ classified: now, capabilities: ['edit_file', 'execute_command'], domains: [], inWorkspace: null });
+    assert.equal(restricted.decision, 'deny');
+    assert.match(restricted.reason, /which this task was not granted/);
+    assert.equal(ca.decide({ classified: now, capabilities: ['edit_file', 'external_account'], domains: [], inWorkspace: null }).decision, 'ask');
   });
 });

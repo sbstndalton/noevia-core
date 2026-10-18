@@ -17,15 +17,22 @@
 // deleted. This module sends the crate only what each function reads (classifyInput, decideInput,
 // pickInput) and applies its answer alone. When the crate refuses, faults or replies badly (logged
 // once per reason, command-text free) the result is the strict one:
-//   - classify returns an unverified classification: the most consequential class, approval
-//     'always', unreadable, simple and standable false, `unverified: true`, and why it could not be
-//     checked. decide() puts it to a person ('ask', the reason names why) without asking the crate, so
-//     no allow and no standing approval can come of it; the card shows the command text;
-//   - decide asks a person too when it cannot get an answer (a fault, a bad reply). When the crate
-//     refused a network call whose URL host it cannot read exactly (outside its plain-ASCII,
-//     non-IP-shorthand subset), it is asked again without the command, which still denies what the
-//     workspace and the granted classes forbid; whatever it does not deny is put to a person, never
-//     allowed. This is what the wasm composition did before #1071 (the JS answer stricter by the port);
+//   - classify returns an unverified classification: an unreadable command is treated as the riskiest
+//     kind, the most consequential class (external_account), approval 'always', unreadable, simple and
+//     standable false, `unverified: true`, why it could not be checked, and only the paths the call
+//     stated itself (its command's paths are unknown);
+//   - decide treats that class like any other, without asking the crate: a task whose grants do not
+//     include external_account is denied, naming the missing permission (the live behaviour for a
+//     class the task was not granted); a path known to be outside the workspace is denied; otherwise
+//     the call goes to a person ('ask'), never allowed and never standing, and the reason says why it
+//     could not be checked and that its workspace limits could not be checked either (its paths are
+//     unknown) or that it reaches outside the workspace. A command that cannot be checked is never
+//     denied for being unreadable alone: with the grant it always becomes an approval card;
+//   - decide asks a person too when it cannot get an answer for a classified call (a fault, a bad reply;
+//     live kept a JS deny, if there was one, which nothing here can recompute). When the crate refused a
+//     network call whose URL host it cannot read exactly (outside its plain-ASCII, non-IP-shorthand
+//     subset), it is asked again without the command; whatever it does not deny is put to a person, never
+//     allowed;
 //   - pickOption answers { outcome: 'cancelled' } (a refusal).
 // Faults are logged (command-text free) on the first occurrence of each reason and again at the 10th,
 // 100th, 1000th and so on, so a persistent runtime fault is not silent.
@@ -116,10 +123,13 @@ const whyOf = (fault) => WHY[fault] || 'the checker did not answer';
 
 /** What a call the crate could not classify is treated as: the most consequential class, never allowed or stood behind. */
 function unverifiedClassification(call, fault) {
-  let command = '';
+  let command = '', paths = [], outsideWorkspace = false;
   try { command = commandOf(call?.rawInput); } catch { command = ''; }
-  return { action: ACTIONS.EXTERNAL, approval: 'always', command, paths: [], readable: false, actions: [ACTIONS.EXTERNAL], simple: false, standable: false,
-    unverified: true, unverifiedWhy: whyOf(fault) };
+  // Only the paths the call states itself: the paths a command would name or write are unknown.
+  try { paths = [...new Set((Array.isArray(call?.locations) ? call.locations : []).map((l) => (l && typeof l.path === 'string' ? l.path : null)).filter(Boolean))]; } catch { paths = []; }
+  try { outsideWorkspace = !!call?.rawInput && typeof call.rawInput === 'object' && call.rawInput.noeviaOutsideWorkspace === true; } catch { outsideWorkspace = false; }
+  return { action: ACTIONS.EXTERNAL, approval: 'always', command, paths, readable: false, actions: [ACTIONS.EXTERNAL], simple: false, standable: false,
+    unverified: true, unverifiedWhy: whyOf(fault), ...(outsideWorkspace ? { outsideWorkspace: true } : {}) };
 }
 
 /**
@@ -148,23 +158,37 @@ function decideInput({ classified: c, capabilities = [], domains = [], inWorkspa
 }
 
 const UNVERIFIED_ASK = 'This action could not be verified, so a person has to approve it.';
-const unverifiedAsk = (why) => `This action could not be checked (${why}), so a person has to approve it.`;
+const unverifiedAsk = (c) => {
+  const where = c.outsideWorkspace === true ? ' It reaches outside the task\u2019s workspace.'
+    : ' The paths its command would touch are unknown, so the task\u2019s workspace limits could not be checked either.';
+  return `This action could not be checked (${String(c.unverifiedWhy || whyOf())}), so a person has to approve it.${where}`;
+};
+const UNVERIFIED_NOT_GRANTED = 'This command could not be checked, so it is treated as the most consequential kind of action (external account), which this task was not granted.';
+/** An unverified classification is decided as the class it is treated as: the grants, then the workspace, then a person. */
+function decideUnverified({ classified: c, capabilities = [], inWorkspace = null }) {
+  if (Array.isArray(capabilities) && capabilities.length && !capabilities.includes(ACTIONS.EXTERNAL)) return { decision: 'deny', reason: UNVERIFIED_NOT_GRANTED };
+  if (inWorkspace === false && Array.isArray(c.paths) && c.paths.length) return { decision: 'deny', reason: 'The path is outside this task\u2019s workspace.' };
+  return { decision: 'ask', reason: unverifiedAsk(c) };
+}
 
 /**
  * What noevia does with one classified call, by the Rust port: `allow` is only ever reached by a read, a no-op, or a
  * network call to a domain the job was granted when it was created; an edit or delete outside the workspace root, or a
- * class the job was never granted, is `deny`; everything else asks. An unverified classification, a refusal or a fault
- * asks a person (see the header), as the wasm composition did before #1071. Option: `wasmLoader` (tests).
+ * class the job was never granted, is `deny`; everything else asks. An unverified classification is decided as the
+ * most consequential class with unknown paths (see the header): denied without the grant, otherwise a person is asked.
+ * A refusal or a fault on a classified call asks a person. Option: `wasmLoader` (tests).
  * @param {{classified: ReturnType<typeof classify>, capabilities?: string[], domains?: string[], inWorkspace?: boolean|null}} input
  * @returns {{decision: 'allow'|'ask'|'deny', reason: string}}
  */
 function decide(input = {}, { wasmLoader = defaultLoader } = {}) {
-  if (input?.classified?.unverified === true) return { decision: 'ask', reason: unverifiedAsk(String(input.classified.unverifiedWhy || whyOf())) };
+  if (input?.classified?.unverified === true) return decideUnverified(input);
   const { port, fault } = askPort('decide', () => wasmLoader().codeActionsDecide(...decideInput(input)));
   if (port) return port.reply;
   if (fault === 'ambiguous' && input.classified.approval === 'capability') {
     // The crate could not read a URL host exactly. What it denies without the command (the workspace, the granted
-    // classes) stays denied; anything else is put to a person, never allowed.
+    // classes) stays denied; anything else is put to a person, never allowed. In practice this branch is defence:
+    // the crate decides those denials before it reads a host, so a refusal here means none applied and the second
+    // answer is an ask. It is kept so a change in the crate's order cannot turn a deny into an ask unnoticed.
     const [classified, capabilities, domains, inWorkspace] = decideInput(input);
     const again = askPort('decide.again', () => wasmLoader().codeActionsDecide({ ...classified, command: '' }, capabilities, domains, inWorkspace));
     if (again.port) return again.port.reply.decision === 'deny' ? again.port.reply : { decision: 'ask', reason: UNVERIFIED_ASK };
