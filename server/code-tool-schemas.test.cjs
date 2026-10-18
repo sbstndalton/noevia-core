@@ -1,4 +1,8 @@
 'use strict';
+const skipWasm = !require('node:fs').existsSync(process.env.DAV_PARSE_WASM || require('./dav-parse-wasm.cjs').DEFAULT_WASM) && process.env.DAV_PARSE_WASM_REQUIRED !== '1' && 'dav-parse.wasm not built';
+// Guards a wrong test signature (options passed twice makes node:test take the second object as the body, so the body never runs and the
+// test reports ok): when the module is there, every guarded body must have run.
+let ran = 0;
 // The Executor guard (#704): per-action schemas at the ACP boundary, the structured violation the
 // agent gets back, the three-strike block, and that nothing changes with the flag off.
 // Synthetic repositories and a scripted agent only; no model, no network.
@@ -34,7 +38,8 @@ const ROOT = '/work/tree';
 
 // ── The schemas, on their own ────────────────────────────────────────────────────────────────
 
-test('well-formed calls from the harnesses noevia runs pass every schema', () => {
+test('well-formed calls from the harnesses noevia runs pass every schema', { skip: skipWasm }, () => {
+  ran++;
   const ok = [
     // OpenCode, measured in experiments/acp-spike (removed in #846; git history at cc1bc4a9): an edit names `filepath` + `diff` and a location.
     { toolCallId: 'c1', kind: 'edit', title: `${ROOT}/median.js`, locations: [{ path: `${ROOT}/median.js` }], rawInput: { filepath: `${ROOT}/median.js`, diff: '@@' } },
@@ -53,7 +58,8 @@ test('well-formed calls from the harnesses noevia runs pass every schema', () =>
   for (const call of ok) assert.equal(checkToolCall(call), null, JSON.stringify(call).slice(0, 80));
 });
 
-test('each malformed call names the argument that is wrong, with a hint for its kind', () => {
+test('each malformed call names the argument that is wrong, with a hint for its kind', { skip: skipWasm }, () => {
+  ran++;
   const bad = [
     [{ kind: 'execute', rawInput: {} }, '$.rawInput.command', /Missing command/],
     [{ kind: 'execute' }, '$.rawInput.command', /Missing command/],
@@ -84,7 +90,8 @@ test('each malformed call names the argument that is wrong, with a hint for its 
   assert.ok(ACP_KINDS.includes('switch_mode') && ACP_KINDS.length === 10);
 });
 
-test('where a call points is never a strike: reads, writes, commands and fetches anywhere pass the shape check', () => {
+test('where a call points is never a strike: reads, writes, commands and fetches anywhere pass the shape check', { skip: skipWasm }, () => {
+  ran++;
   // The policy behind the guard owns these: decide() refuses a write/move/delete outside the
   // workspace, a read or command elsewhere goes to the card (#113), and fs/* is checked on use.
   const elsewhere = [
@@ -100,7 +107,8 @@ test('where a call points is never a strike: reads, writes, commands and fetches
   assert.equal(checkFsCall('fs/write_text_file', { path: '../escape.txt', content: 'x' }), null);
 });
 
-test('fs/read_text_file and fs/write_text_file params have their own schemas', () => {
+test('fs/read_text_file and fs/write_text_file params have their own schemas', { skip: skipWasm }, () => {
+  ran++;
   const opts = { maxBytes: 16 };
   assert.equal(checkFsCall('fs/read_text_file', { sessionId: 's', path: `${ROOT}/a.txt`, line: 2, limit: 1 }, opts), null);
   assert.equal(checkFsCall('fs/write_text_file', { sessionId: 's', path: 'b.txt', content: 'hello' }, opts), null);
@@ -125,7 +133,8 @@ test('fs/read_text_file and fs/write_text_file params have their own schemas', (
   }
 });
 
-test('the guard counts shape violations, gives each its structured correction, and blocks at the limit', () => {
+test('the guard counts shape violations, gives each its structured correction, and blocks at the limit', { skip: skipWasm }, () => {
+  ran++;
   const events = [], logs = [];
   let halted = 0;
   const guard = createExecutorGuard({ event: (type, data) => events.push({ type, data }), log: (e) => logs.push(e), onBlocked: () => halted++ });
@@ -168,7 +177,8 @@ test('the guard counts shape violations, gives each its structured correction, a
   assert.ok(logs.every((e) => !('content' in e)), 'the log never carries file content');
 });
 
-test('the deployment flag is off until installed, and off whenever its check misbehaves', () => {
+test('the deployment flag is off until installed, and off whenever its check misbehaves', { skip: skipWasm }, () => {
+  ran++;
   assert.equal(executorGuardFlag.enabled(), false);
   try {
     useExecutorGuard(() => true); assert.equal(executorGuardFlag.enabled(), true);
@@ -215,7 +225,8 @@ async function run({ guard, script, answers = [], capabilities = [] }) {
 }
 const attempt = async (fn) => { try { return { value: await fn() }; } catch (error) { return { error }; } };
 
-test('bad then corrected arguments: the bad call gets the reject outcome with its violation, the corrected one reaches the approval card', async () => {
+test('bad then corrected arguments: the bad call gets the reject outcome with its violation, the corrected one reaches the approval card', { skip: skipWasm }, async () => {
+  ran++;
   const outcomes = [];
   const r = await run({
     guard: ON, answers: ['approve'],
@@ -238,7 +249,8 @@ test('bad then corrected arguments: the bad call gets the reject outcome with it
   assert.ok(r.logs.some((e) => e.event === 'code.guard_violation' && e.count === 1));
 });
 
-test('the guard never approves: a well-formed write still asks, and Decline and a timeout still refuse', async () => {
+test('the guard never approves: a well-formed write still asks, and Decline and a timeout still refuse', { skip: skipWasm }, async () => {
+  ran++;
   const picks = [];
   const r = await run({
     guard: ON, answers: ['deny', 'timeout', 'approve_all'],
@@ -255,7 +267,8 @@ test('the guard never approves: a well-formed write still asks, and Decline and 
   assert.equal(r.job.result.violations, 0);
 });
 
-test('malformed fs calls are refused by the guard; good ones run; one outside the worktree is refused as before, without a strike', async () => {
+test('malformed fs calls are refused by the guard; good ones run; one outside the worktree is refused as before, without a strike', { skip: skipWasm }, async () => {
+  ran++;
   const out = [];
   const r = await run({
     guard: ON,
@@ -279,7 +292,8 @@ test('malformed fs calls are refused by the guard; good ones run; one outside th
   assert.equal(r.job.result.violations, 1, 'only the malformed call was a strike');
 });
 
-test('pointing outside the workspace is never a strike: the out-of-workspace read still reaches the card (#113), an outside write is refused as before', async () => {
+test('pointing outside the workspace is never a strike: the out-of-workspace read still reaches the card (#113), an outside write is refused as before', { skip: skipWasm }, async () => {
+  ran++;
   const picks = [];
   const r = await run({
     guard: ON, answers: ['approve', 'approve', 'approve'],
@@ -300,7 +314,8 @@ test('pointing outside the workspace is never a strike: the out-of-workspace rea
   assert.equal(r.job.result.violations, 0);
 });
 
-test('a malformed call answered with the reject outcome never runs its tool', async () => {
+test('a malformed call answered with the reject outcome never runs its tool', { skip: skipWasm }, async () => {
+  ran++;
   // A scripted agent that does what a harness does: runs the edit only when allowed.
   const r = await run({
     guard: ON, answers: ['approve'],
@@ -316,7 +331,8 @@ test('a malformed call answered with the reject outcome never runs its tool', as
   assert.equal(r.job.result.denied, 1);
 });
 
-test('three violations stop the task as blocked: the agent is halted and no card is ever shown', async () => {
+test('three violations stop the task as blocked: the agent is halted and no card is ever shown', { skip: skipWasm }, async () => {
+  ran++;
   const out = [];
   const r = await run({
     guard: ON, answers: ['approve', 'approve'],
@@ -345,7 +361,8 @@ test('three violations stop the task as blocked: the agent is halted and no card
   assert.equal(step.status, 'failed');
 });
 
-test('a blocked task stays blocked even when the agent ignores the stop and finishes its turn', async () => {
+test('a blocked task stays blocked even when the agent ignores the stop and finishes its turn', { skip: skipWasm }, async () => {
+  ran++;
   const r = await run({
     guard: ON,
     script: async (h) => {
@@ -358,7 +375,8 @@ test('a blocked task stays blocked even when the agent ignores the stop and fini
   assert.equal(r.job.result.blocked, true);
 });
 
-test('flag off: the same malformed calls take exactly the path they took before', async () => {
+test('flag off: the same malformed calls take exactly the path they took before', { skip: skipWasm }, async () => {
+  ran++;
   const out = [];
   const r = await run({
     guard: OFF, answers: ['deny', 'deny', 'deny'],
@@ -379,7 +397,8 @@ test('flag off: the same malformed calls take exactly the path they took before'
   assert.equal(r.job.steps.some((s) => s.id === 'executor.guard'), false);
 });
 
-test('the deployment default is off: a harness built without a guard runs unguarded', async () => {
+test('the deployment default is off: a harness built without a guard runs unguarded', { skip: skipWasm }, async () => {
+  ran++;
   const r = await run({
     guard: undefined, answers: ['deny'],
     script: async (h) => { await h.requestPermission({ toolCall: { kind: 'execute', rawInput: {} }, options: OPTIONS }); },
@@ -413,7 +432,8 @@ async function runAcp({ guard, steps, answers = [] }) {
   return { job, asked, seen: prompt?.seen || null };
 }
 
-test('over ACP: the violation reaches the agent as the reject outcome with the violation in _meta, and the corrected call is approved', async () => {
+test('over ACP: the violation reaches the agent as the reject outcome with the violation in _meta, and the corrected call is approved', { skip: skipWasm }, async () => {
+  ran++;
   const r = await runAcp({
     guard: ON, answers: ['approve'],
     steps: (cwd) => [
@@ -435,7 +455,8 @@ test('over ACP: the violation reaches the agent as the reject outcome with the v
   assert.equal(r.asked.length, 1);
 });
 
-test('over ACP: after the third violation the agent subprocess is stopped and the task is blocked', async () => {
+test('over ACP: after the third violation the agent subprocess is stopped and the task is blocked', { skip: skipWasm }, async () => {
+  ran++;
   const r = await runAcp({
     guard: ON,
     steps: () => [
@@ -450,3 +471,5 @@ test('over ACP: after the third violation the agent subprocess is stopped and th
   assert.equal(r.job.result.blocked, true);
   assert.equal(r.asked.length, 0);
 });
+
+test.after(() => { if (!skipWasm) assert.equal(ran, 17, 'a wasm-guarded test body did not run'); });

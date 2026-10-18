@@ -1,4 +1,8 @@
 'use strict';
+const skipWasm = !require('node:fs').existsSync(process.env.DAV_PARSE_WASM || require('./dav-parse-wasm.cjs').DEFAULT_WASM) && process.env.DAV_PARSE_WASM_REQUIRED !== '1' && 'dav-parse.wasm not built';
+// Guards a wrong test signature (options passed twice makes node:test take the second object as the body, so the body never runs and the
+// test reports ok): when the module is there, every guarded body must have run.
+let ran = 0;
 const test = require('node:test'), assert = require('node:assert/strict');
 const fs = require('node:fs'), os = require('node:os'), path = require('node:path');
 const { execFileSync } = require('node:child_process');
@@ -23,7 +27,8 @@ const settle = async (service, ws, id) => {
   return service.get(ws, project, id);
 };
 
-test('only repositories the operator registered are offered, and only real ones', () => {
+test('only repositories the operator registered are offered, and only real ones', { skip: skipWasm }, () => {
+  ran++;
   const good = repo();
   const notGit = temp('noevia-plain-');
   const parsed = parseRepos(`noevia|${good},plain|${notGit},relative|not/absolute,broken|/does/not/exist,dupe|${good},noevia|${good}`);
@@ -44,7 +49,8 @@ function service(extra = {}) {
   return { svc, ws, repoPath };
 }
 
-test('a task cannot name a path the operator did not register', async () => {
+test('a task cannot name a path the operator did not register', { skip: skipWasm }, async () => {
+  ran++;
   const { svc, ws } = service();
   await assert.rejects(() => svc.start(ws, project, { repository: '/etc', prompt: 'x' }), /registered/);
   await assert.rejects(() => svc.start(ws, project, { repository: '../../etc', prompt: 'x' }), /registered/);
@@ -53,7 +59,8 @@ test('a task cannot name a path the operator did not register', async () => {
   await assert.rejects(() => svc.start(ws, project, { repository: 'noevia', prompt: 'x'.repeat(8001) }), /too long/);
 });
 
-test('capabilities and domains are filtered to what noevia will grant at all', async () => {
+test('capabilities and domains are filtered to what noevia will grant at all', { skip: skipWasm }, async () => {
+  ran++;
   const { svc, ws } = service();
   const started = await svc.start(ws, project, { repository: 'noevia', prompt: 'fix',
     capabilities: ['edit_file', 'open_browser', 'external_account', 'not_a_thing'],
@@ -64,7 +71,8 @@ test('capabilities and domains are filtered to what noevia will grant at all', a
   await settle(svc, ws, started.taskId);
 });
 
-test('one task at a time per project', async () => {
+test('one task at a time per project', { skip: skipWasm }, async () => {
+  ran++;
   let release;
   const { svc, ws } = service({ connect: async () => ({ prompt: () => new Promise((r) => { release = () => r({ stopReason: 'end_turn' }); }) }) });
   const first = await svc.start(ws, project, { repository: 'noevia', prompt: 'one' });
@@ -77,7 +85,8 @@ test('one task at a time per project', async () => {
   await settle(svc, ws, second.taskId);
 });
 
-test('active task summary scans once, respects project scope and caps the returned list', async () => {
+test('active task summary scans once, respects project scope and caps the returned list', { skip: skipWasm }, async () => {
+  ran++;
   const releases = [];
   const { svc, ws } = service({ connect: async () => ({ prompt: () => new Promise((resolve) => { releases.push(() => resolve({ stopReason: 'end_turn' })); }) }) });
   const otherProject = { id: 'p2' };
@@ -95,7 +104,8 @@ test('active task summary scans once, respects project scope and caps the return
   releases.forEach((release) => release());
 });
 
-test('a task from another project is not found, rather than forbidden', async () => {
+test('a task from another project is not found, rather than forbidden', { skip: skipWasm }, async () => {
+  ran++;
   const { svc, ws } = service();
   const started = await svc.start(ws, project, { repository: 'noevia', prompt: 'fix' });
   await settle(svc, ws, started.taskId);
@@ -103,7 +113,8 @@ test('a task from another project is not found, rather than forbidden', async ()
   assert.throws(() => svc.get(ws, project, '00000000-0000-4000-8000-000000000000'), /Task not found/);
 });
 
-test('assistant output and reported plan are visible only to their owning project and tenant workspace', async () => {
+test('assistant output and reported plan are visible only to their owning project and tenant workspace', { skip: skipWasm }, async () => {
+  ran++;
   let number = 0;
   const { svc, ws } = service({ connect: async ({ handlers }) => ({ prompt: async () => {
     handlers.sessionUpdate({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: `Visible task ${++number}` } });
@@ -128,7 +139,8 @@ test('assistant output and reported plan are visible only to their owning projec
   assert.throws(() => svc.get(otherTenant, project, first.taskId), /Task not found/);
 });
 
-test('an approval reaches the waiting task, and an unknown decision is refused', async () => {
+test('an approval reaches the waiting task, and an unknown decision is refused', { skip: skipWasm }, async () => {
+  ran++;
   let ask;
   const { svc, ws } = service({
     connect: async ({ handlers }) => ({ prompt: async () => {
@@ -149,7 +161,8 @@ test('an approval reaches the waiting task, and an unknown decision is refused',
   await settle(svc, ws, started.taskId);
 });
 
-test('an unanswered approval times out as a refusal', async () => {
+test('an unanswered approval times out as a refusal', { skip: skipWasm }, async () => {
+  ran++;
   let ask;
   const { svc, ws } = service({
     timeoutMs: 20,
@@ -163,7 +176,8 @@ test('an unanswered approval times out as a refusal', async () => {
   assert.deepEqual(await ask, { outcome: 'selected', optionId: 'n' });
 });
 
-test('cancelling refuses whatever was waiting, so no card can be answered afterwards', async () => {
+test('cancelling refuses whatever was waiting, so no card can be answered afterwards', { skip: skipWasm }, async () => {
+  ran++;
   let ask;
   const { svc, ws } = service({
     timeoutMs: 60000,
@@ -181,7 +195,8 @@ test('cancelling refuses whatever was waiting, so no card can be answered afterw
   assert.throws(() => svc.decide(ws, project, started.taskId, 'approve', seen), /no longer waiting/);
 });
 
-test('the listed task carries no host path and no repository location', async () => {
+test('the listed task carries no host path and no repository location', { skip: skipWasm }, async () => {
+  ran++;
   const { svc, ws, repoPath } = service();
   const started = await svc.start(ws, project, { repository: 'noevia', prompt: 'fix' });
   await settle(svc, ws, started.taskId);
@@ -190,7 +205,8 @@ test('the listed task carries no host path and no repository location', async ()
   assert.deepEqual(svc.repositories(), [{ id: 'noevia' }], 'the browser learns the name, never the path');
 });
 
-test('a completed task carries the commit it forked from and the commit it left at, not just the branch', async () => {
+test('a completed task carries the commit it forked from and the commit it left at, not just the branch', { skip: skipWasm }, async () => {
+  ran++;
   const { svc, ws, repoPath } = service({
     connect: async ({ cwd }) => ({ prompt: async () => {
       fs.writeFileSync(path.join(cwd, 'b.txt'), 'b');
@@ -209,7 +225,8 @@ test('a completed task carries the commit it forked from and the commit it left 
   assert.equal(JSON.stringify(done).includes(repoPath), false, 'still no host path leaks through');
 });
 
-test('two tasks waiting at once each get their own answer', async () => {
+test('two tasks waiting at once each get their own answer', { skip: skipWasm }, async () => {
+  ran++;
   // Same workspace, different projects: both wait, and answering one must not touch the other.
   const asks = {};
   const dir = temp('noevia-sws-');
@@ -239,7 +256,8 @@ test('two tasks waiting at once each get their own answer', async () => {
   assert.deepEqual(await asks.b, { outcome: 'selected', optionId: 'n' });
 });
 
-test('a harness or preparation mode noevia does not offer is refused at the server', async () => {
+test('a harness or preparation mode noevia does not offer is refused at the server', { skip: skipWasm }, async () => {
+  ran++;
   const { svc, ws } = service();
   assert.deepEqual(svc.harnesses(), [{ id: 'opencode', label: 'OpenCode', version: null }]);
   await assert.rejects(() => svc.start(ws, project, { repository: 'noevia', prompt: 'x', harness: 'claude-code' }),
@@ -253,7 +271,8 @@ test('a harness or preparation mode noevia does not offer is refused at the serv
     /outbound allowlist/);
 });
 
-test('prompt preparation offers Direct and nothing that lacks evidence', async () => {
+test('prompt preparation offers Direct and nothing that lacks evidence', { skip: skipWasm }, async () => {
+  ran++;
   const { svc, ws } = service();
   const modes = svc.promptPreparation();
   assert.deepEqual(modes.filter((m) => m.available).map((m) => m.id), ['direct']);
@@ -266,7 +285,8 @@ test('prompt preparation offers Direct and nothing that lacks evidence', async (
   await settle(svc, ws, started.taskId);
 });
 
-test('the deployment names its harness, and whether it is sandboxed', () => {
+test('the deployment names its harness, and whether it is sandboxed', { skip: skipWasm }, () => {
+  ran++;
   const { defaultHarnesses } = require('./code-service.cjs');
   assert.deepEqual(defaultHarnesses({ CODE_HARNESS_NAME: 'claude-code', CODE_HARNESS_VERSION: '2.0' }),
     [{ id: 'claude-code', label: 'Claude Code', version: '2.0' }]);
@@ -278,7 +298,8 @@ test('the deployment names its harness, and whether it is sandboxed', () => {
   assert.equal(sandboxed.sandboxed(), true);
 });
 
-test('the harness user is read only in the form that can be acted on', () => {
+test('the harness user is read only in the form that can be acted on', { skip: skipWasm }, () => {
+  ran++;
   const { parseUser } = require('./code-service.cjs');
   assert.deepEqual(parseUser('1000:1000'), { uid: 1000, gid: 1000 });
   assert.deepEqual(parseUser(' 65534:65534 '), { uid: 65534, gid: 65534 });
@@ -287,7 +308,8 @@ test('the harness user is read only in the form that can be acted on', () => {
   }
 });
 
-test('without the egress proxy, network and installs are never granted, and the server says so', async () => {
+test('without the egress proxy, network and installs are never granted, and the server says so', { skip: skipWasm }, async () => {
+  ran++;
   // They used to be recorded as granted and then quietly not happen: the proxy is the only way
   // a task gets any network, so with no proxy there is nothing to grant.
   const { svc, ws } = service();
@@ -303,7 +325,8 @@ test('without the egress proxy, network and installs are never granted, and the 
   assert.deepEqual(online.capabilities, ['read_repository', 'network']);
 });
 
-test('an answer names the card it was for: an expired approval is a 409, and the next one is untouched', async () => {
+test('an answer names the card it was for: an expired approval is a 409, and the next one is untouched', { skip: skipWasm }, async () => {
+  ran++;
   const asks = [];
   let release;
   const { svc, ws } = service({
@@ -342,7 +365,8 @@ test('an answer names the card it was for: an expired approval is a 409, and the
   await settle(svc, ws, started.taskId);
 });
 
-test('an answer for an id that was never a real approval gets the generic message, not "expired"', async () => {
+test('an answer for an id that was never a real approval gets the generic message, not "expired"', { skip: skipWasm }, async () => {
+  ran++;
   const { svc, ws } = service({ connect: async () => ({ prompt: async () => ({ stopReason: 'end_turn' }) }) });
   const started = await svc.start(ws, project, { repository: 'noevia', prompt: 'x', capabilities: ['edit_file'] });
   await settle(svc, ws, started.taskId);
@@ -351,7 +375,8 @@ test('an answer for an id that was never a real approval gets the generic messag
     'a bogus id that was never a timed-out card gets the plain message');
 });
 
-test('cancelling refuses EVERY approval the task has waiting, not just the first', async () => {
+test('cancelling refuses EVERY approval the task has waiting, not just the first', { skip: skipWasm }, async () => {
+  ran++;
   const asks = [];
   const { svc, ws } = service({
     timeoutMs: 60000,
@@ -369,7 +394,8 @@ test('cancelling refuses EVERY approval the task has waiting, not just the first
   assert.equal(svc.get(ws, project, started.taskId).approval, null);
 });
 
-test('a task that fails with an approval waiting refuses it rather than leaving the card live', async () => {
+test('a task that fails with an approval waiting refuses it rather than leaving the card live', { skip: skipWasm }, async () => {
+  ran++;
   let ask;
   const { svc, ws } = service({
     timeoutMs: 60000,
@@ -391,7 +417,8 @@ const { createMaintenanceGate } = require('./inference-maintenance.cjs');
 const { INFERENCE_PAUSED } = require('./code-service.cjs');
 const gated = (gate, extra = {}, tuning = () => gate.held()) => service({ inference: { enter: () => gate.enter(), paused: tuning }, ...extra });
 
-test('#1062 a running coding task holds the inference lease: auto-tune waits for it, then gets the gate', async () => {
+test('#1062 a running coding task holds the inference lease: auto-tune waits for it, then gets the gate', { skip: skipWasm }, async () => {
+  ran++;
   const gate = createMaintenanceGate();
   let release;
   const { svc, ws } = gated(gate, { connect: async () => ({ prompt: () => new Promise((r) => { release = () => r({ stopReason: 'end_turn' }); }) }) });
@@ -406,7 +433,8 @@ test('#1062 a running coding task holds the inference lease: auto-tune waits for
   releaseGate();
 });
 
-test('#1062 no coding task starts while auto-tune holds the gate, and nothing is left claimed', async () => {
+test('#1062 no coding task starts while auto-tune holds the gate, and nothing is left claimed', { skip: skipWasm }, async () => {
+  ran++;
   const gate = createMaintenanceGate();
   let connects = 0;
   const { svc, ws } = gated(gate, { connect: async () => { connects++; return { prompt: async () => ({ stopReason: 'end_turn' }) }; } });
@@ -419,13 +447,15 @@ test('#1062 no coding task starts while auto-tune holds the gate, and nothing is
   assert.equal((await settle(svc, ws, started.taskId)).status, 'completed');
 });
 
-test('#1062 a tune that is active between models (gate briefly free) still refuses new tasks', async () => {
+test('#1062 a tune that is active between models (gate briefly free) still refuses new tasks', { skip: skipWasm }, async () => {
+  ran++;
   const gate = createMaintenanceGate();
   const { svc, ws } = gated(gate, {}, () => true);
   await assert.rejects(() => svc.start(ws, project, { repository: 'noevia', prompt: 'fix' }), (e) => e.status === 503);
 });
 
-test('#1062 a task that loses the race to auto-tune fails with the pause message and leaks no lease', async () => {
+test('#1062 a task that loses the race to auto-tune fails with the pause message and leaks no lease', { skip: skipWasm }, async () => {
+  ran++;
   const gate = createMaintenanceGate();
   let releaseGate = null;
   // paused() says no, then the tune takes the gate before the run begins.
@@ -442,7 +472,8 @@ test('#1062 a task that loses the race to auto-tune fails with the pause message
   assert.equal((await settle(svc, ws, again.taskId)).status, 'completed');
 });
 
-test('#1069 a lease refused at run time releases the claimed worktree and network grant', async () => {
+test('#1069 a lease refused at run time releases the claimed worktree and network grant', { skip: skipWasm }, async () => {
+  ran++;
   const gate = createMaintenanceGate();
   const released = [];
   let refuse = true;
@@ -458,7 +489,8 @@ test('#1069 a lease refused at run time releases the claimed worktree and networ
   gate.hold('idle')();
 });
 
-test('#1062 the lease is given back when a task fails or is cancelled', async () => {
+test('#1062 the lease is given back when a task fails or is cancelled', { skip: skipWasm }, async () => {
+  ran++;
   const gate = createMaintenanceGate();
   const failing = gated(gate, { connect: async () => { throw Object.assign(Error('The coding sandbox refused the connection.'), { publicMessage: 'The coding sandbox refused the connection.' }); } });
   const a = await failing.svc.start(failing.ws, project, { repository: 'noevia', prompt: 'fix' });
@@ -473,3 +505,5 @@ test('#1062 the lease is given back when a task fails or is cancelled', async ()
   assert.equal((await settle(hanging.svc, hanging.ws, b.taskId)).status, 'cancelled');
   gate.hold('after cancel')();
 });
+
+test.after(() => { if (!skipWasm) assert.equal(ran, 28, 'a wasm-guarded test body did not run'); });
