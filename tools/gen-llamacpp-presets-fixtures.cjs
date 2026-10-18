@@ -16,8 +16,7 @@
 // list (the differential test checks every UTF-16 code unit against the runtime's own), and every
 // other pattern is ASCII. All values are synthetic; random combinations use a seeded mulberry32.
 
-const path = require('node:path');
-const p = require(path.join(__dirname, '..', 'server', 'llamacpp-presets.cjs'));
+const p = require('../tests/reference/llamacpp-presets-js.cjs');
 
 function mulberry32(seed) {
   return () => {

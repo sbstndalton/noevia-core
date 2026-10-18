@@ -1,7 +1,7 @@
 'use strict';
 const test = require('node:test'), assert = require('node:assert/strict');
 const { familyOf, hasHarmonyReasoning, quirksOf, resolveSamplingRecommendation, toIniOptions, FAMILIES } = require('./sampling-recommendation.cjs');
-const { fields } = require('./llamacpp-presets.cjs');
+const { optionValue } = require('./llamacpp-presets.cjs');
 
 test('family matching is table driven, and specific families win over the base architecture', () => {
   const cases = { 'gpt-oss-20b': 'gpt-oss', 'unsloth/gpt_oss:20b': 'gpt-oss', 'DeepSeek-R1-Distill-Qwen-7B': 'deepseek-r1',
@@ -19,7 +19,7 @@ test('every family value converts to a models.ini key the preset store accepts',
   for (const family of FAMILIES) {
     const options = toIniOptions(family.values);
     assert.ok(Object.keys(options).length > 0, family.id);
-    for (const [key, value] of Object.entries(options)) assert.ok(fields[key].valid(value), family.id + ' ' + key + '=' + value);
+    for (const [key, value] of Object.entries(options)) assert.equal(optionValue(key,value,{hardMaxMib:1048576}),value, family.id + ' ' + key + '=' + value);
   }
 });
 

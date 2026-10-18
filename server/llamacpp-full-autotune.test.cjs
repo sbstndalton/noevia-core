@@ -2146,19 +2146,21 @@ test('#1133: a sizing failure during KV planning is logged, not silently treated
   assert.ok(!lines.some(text => /synthetic sizing failure/.test(text)), 'the raw error text must not reach the job log');
 });
 
-test('noevia#1133: the KV ceilings are planned with the JS estimate, so the Rust confirmation (even with no usable module) cannot remove them', async t => {
+test('noevia#1133: unavailable planning and confirmation operations cannot remove independent KV ceilings', async t => {
   const davParseWasm = require('./dav-parse-wasm.cjs');
-  const saved = { impl: process.env.LLAMACPP_AUTOCONFIG_IMPL, file: process.env.DAV_PARSE_WASM };
-  process.env.LLAMACPP_AUTOCONFIG_IMPL = 'js'; // retired: changes nothing
-  process.env.DAV_PARSE_WASM = require('node:path').join(require('node:os').tmpdir(), 'no-such-dav-parse.wasm');
-  davParseWasm.reset();
-  t.after(() => {
-    for (const [k, v] of [['LLAMACPP_AUTOCONFIG_IMPL', saved.impl], ['DAV_PARSE_WASM', saved.file]]) { if (v === undefined) delete process.env[k]; else process.env[k] = v; }
-    davParseWasm.reset();
-  });
+  // #203: required preset policy still uses the actual pinned module. Isolate the
+  // advisory autoconfig operation, whose fault must not suppress the planning estimate.
+  const saved = { confirmation:davParseWasm.llamacppAutoconfig, planner:davParseWasm.autotunePlan };
+  let confirmationCalls = 0, plannerCalls = 0;
+  davParseWasm.llamacppAutoconfig = () => { confirmationCalls++; throw new Error('synthetic confirmation fault'); };
+  davParseWasm.autotunePlan = () => { plannerCalls++; throw new Error('synthetic planner fault'); };
+  t.after(() => { davParseWasm.llamacppAutoconfig = saved.confirmation; davParseWasm.autotunePlan = saved.planner; });
   const f = fixture(t, { autotuneExtra: { planFacts: async () => DENSE_64K, budgetGib: () => 6 } });
   await f.manager.autotune.start('synthetic', { confirmPause: true });
   const j = await finished(f.manager), kv = phase(j.models[0], 'kv');
+  assert.ok(plannerCalls > 0, 'the real caller must exercise the unavailable planner');
+  assert.equal(confirmationCalls, 0, 'independent ceilings must not call the unavailable confirmation');
+  assert.ok(kv, JSON.stringify({status:j.status,error:j.error,phases:j.models[0].phases.map(p=>p.id)}));
   assert.deepEqual(kv.value.candidates.map(c => [c.kv, c.ceiling]), [['bf16', 12288], ['q8_0', 24576]]);
   assert.equal(kv.value.kv, 'q8_0');
 });

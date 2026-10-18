@@ -1,9 +1,9 @@
 'use strict';
 
-// ROLE_CONTEXT_IMPL: tests/fixtures/role-context.v1.json (byte-identical to noevia-rs
+// Rust-only role context: tests/fixtures/role-context.v1.json (byte-identical to noevia-rs
 // crates/role-context/tests/fixtures/; CI compares them) holds role-context.cjs's projections,
 // dossiers, refusals and leak verdicts as the exact replies the Rust port must give, printed by
-// tools/gen-role-context-fixtures.cjs from the JS itself (synthetic states, ASCII only there). Here
+// tools/gen-role-context-fixtures.cjs from the frozen test-only JS oracle (synthetic states, ASCII only there). Here
 // every row runs through dav-parse.wasm's role_context and through the switched projectRoleContext /
 // projectSharedDossier; then seeded live states, including non-ASCII text whose treatment follows
 // this runtime's ICU: the port agrees with this runtime's JS or refuses, and the switched function
@@ -17,7 +17,8 @@ const path = require('node:path');
 const test = require('node:test');
 
 const davParseWasm = require('../../server/dav-parse-wasm.cjs');
-const rc = require('../../server/role-context.cjs');
+const runtime = require('../../server/role-context.cjs');
+const reference = require('../reference/role-context-js.cjs');
 
 const FILE = path.join(__dirname, '../fixtures/role-context.v1.json');
 const GENERATOR = path.join(__dirname, '../../tools/gen-role-context-fixtures.cjs');
@@ -39,6 +40,7 @@ function portReply(op, a, state) {
 
 /** The JS's answer, run directly (`impl`) as the same reply text. */
 function jsReply(op, a, state, impl = JS) {
+  const rc = impl === JS ? reference : runtime;
   try {
     if (op === 1) { const r = rc.projectRoleContext(a, state, impl); return JSON.stringify({ projection: r.projection, redactions: r.meta.redactions }); }
     const r = rc.projectSharedDossier(state, { roles: a, ...impl });
@@ -51,7 +53,7 @@ function jsReply(op, a, state, impl = JS) {
 }
 
 test('the fixture file is what the generator prints', { skip: !fs.existsSync(GENERATOR) && 'no generator here' }, () => {
-  const out = execFileSync(process.execPath, [GENERATOR], { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
+  const out = execFileSync(process.execPath, [GENERATOR], { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024, env: { ...process.env, DAV_PARSE_WASM: path.join(__dirname, 'no-generator-module.wasm'), ROLE_CONTEXT_IMPL: 'js' } });
   assert.equal(out, fs.readFileSync(FILE, 'utf8'));
 });
 

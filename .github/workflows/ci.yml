@@ -337,9 +337,9 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           repository: sbstndalton/noevia
-          # #1290 immutable key-only acceptance input; not a release pin.
-          # Twice-fetched archive SHA256 d969984ab011b3ed45279f7d21e3a2925ad2f4fb663a3e88cb3db294c549451c.
-          ref: 8937698739754e7c6cee8067b885c5a3be4f2802
+          # #2069 immutable image recipe retains preserved differential reference inputs.
+          # Twice-fetched archive SHA256 8f2d96f8361a6581bbc9c394904b57c3479aec8f49290ae844fa84eb54d88383.
+          ref: e03b90332634e32655e64da0a62af0c09dbf29d7
           path: ws
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
