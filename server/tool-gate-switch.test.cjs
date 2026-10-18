@@ -25,9 +25,9 @@ function fakePort(answers = {}) {
   const fnOf = (name) => (...args) => { calls.push([name, args]); return (answers[name] || fault)(...args); };
   return { calls, loader: () => ({ toolGateRule: fnOf('rule'), toolGateOptions: fnOf('options'), toolGateAnswer: fnOf('answer'), toolGateQueries: fnOf('queries') }) };
 }
-function gate({ port, decide = async () => ({ selected: 'project_search', confidence: 0.9 }), limits = null, wording, tools } = {}) {
+function gate({ port, decide = async () => ({ selected: 'project_search', confidence: 0.9 }), limits = null, wording, tools, boxes } = {}) {
   const logs = [], decided = [];
-  const g = tg.createToolGate({ enabled: () => true, isWriteTool, now: () => NOW, wasmLoader: port?.loader, limits, wording, unavailable: () => null,
+  const g = tg.createToolGate({ enabled: () => true, isWriteTool, now: () => NOW, wasmLoader: port?.loader, limits, wording, boxes, unavailable: () => null,
     decide: async (r) => { decided.push(r); return decide(r); }, log: (e) => logs.push(e), warn: () => {} });
   return { g, logs, decided, tools };
 }
@@ -101,6 +101,53 @@ test('a decision the host would not force is a fault of the port: a tool not off
     assert.equal(out2.decision, 'none', JSON.stringify(decision));
     assert.equal(second.logs.at(-1).reason, 'impl-fault');
   }
+});
+
+test('prefetch requires every declared key as an own argument, in either stage; require does not need arguments', async () => {
+  for (const stage of ['rule', 'answer']) {
+    for (const args of [{}, { other: 'qa' }, Object.create({ url: 'https://example.com/qa' })]) {
+      const decision = { tool: 'web_fetch', mode: 'prefetch', args };
+      const port = fakePort(stage === 'rule' ? { rule: () => ({ rule: 'url', decision }) }
+        : { rule: NO_RULE, options: OPTIONS, answer: () => ({ decision }) });
+      const { g, logs, decided } = gate({ port });
+      const out = (await quietly(() => g.evaluate('qa', TOOLS))).value;
+      assert.equal(out.decision, 'none');
+      assert.equal(logs.at(-1).reason, 'impl-fault');
+      assert.equal(decided.length, stage === 'rule' ? 0 : 1);
+    }
+  }
+  // Presence, not truthiness, is this host floor; schema/value validation remains at the tool boundary.
+  for (const value of ['', false, 0, null]) {
+    const decision = { tool: 'web_fetch', mode: 'prefetch', args: { url: value } };
+    const { g } = gate({ port: fakePort({ rule: () => ({ rule: 'url', decision }) }) });
+    assert.deepEqual((await g.evaluate('qa', TOOLS)).decision, decision);
+  }
+});
+
+test('Stage 2 search prefetch is refused by the host, while Stage 1 and require retain their behavior', async () => {
+  const decision = { tool: 'tavily_search', mode: 'prefetch', args: { query: 'qa' } };
+  const first = gate({ port: fakePort({ rule: () => ({ rule: 'search', decision }) }) });
+  assert.deepEqual((await first.g.evaluate('qa', TOOLS)).decision, decision);
+  const second = gate({ port: fakePort({ rule: NO_RULE, options: OPTIONS, answer: () => ({ decision }) }) });
+  assert.equal((await quietly(() => second.g.evaluate('qa', TOOLS))).value.decision, 'none');
+  assert.equal(second.logs.at(-1).reason, 'impl-fault');
+  const required = { tool: 'tavily_search', mode: 'require' };
+  const third = gate({ port: fakePort({ rule: NO_RULE, options: OPTIONS, answer: () => ({ decision: required }) }) });
+  assert.deepEqual((await third.g.evaluate('qa', TOOLS)).decision, required);
+  // Caller-provided kinds follow first matching non-drive order, just as the crate does.
+  const fourth = gate({ boxes: { url: ['tavily_search'], search: ['tavily_search'] },
+    port: fakePort({ rule: NO_RULE, options: OPTIONS, answer: () => ({ decision }) }) });
+  assert.deepEqual((await fourth.g.evaluate('qa', TOOLS)).decision, decision);
+});
+
+test('a search suitability fault warns about the query, without claiming a tool was forced', async () => {
+  const { value, seen } = await quietly(() => tg.prefetchableSearch('qa private message', () => {
+    throw new davParseWasm.DavParseError('qa fault', 'suitability-warning');
+  }));
+  assert.equal(value, false);
+  assert.equal(seen.length, 1);
+  assert.match(seen[0], /the message was not used as a search query/);
+  assert.doesNotMatch(seen[0], /no tool was forced|qa private message/);
 });
 
 test('Stage 2: the options are the port\'s, sent as the service\'s options; a fault or no option fitting asks nobody', async () => {

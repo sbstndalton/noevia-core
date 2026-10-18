@@ -17,14 +17,15 @@
 // policy mode and each sign-in box's readiness, each asked once, in the order the crate reads
 // them), asks it, and builds the answer: the crate says which box ids are carried, whether each box
 // is available or active, and each tool's permission; this file adds only the presentation (labels,
-// descriptions, the reason text for a reason code).
+// descriptions, the reason text for a reason code), and retains the host limits below.
 //
 // The floor, for a boundary that decides which tools a turn may offer: a fault, a refusal, a reply
 // of another shape than the request carries no box id and shows every box and tool unavailable
 // (reasonCode 'unchecked'), as before. Under the crate the host keeps the account's own limits: a
 // tool the account set to Block is never more than unavailable, a write or an Ask tool is never
-// allowed, and a box that needs a connection, a sign-in or the Diary add-on is unavailable unless
-// the crate says so too; the crate can only make the answer stricter than these. Warnings are
+// allowed, and a box missing its connection, sign-in or Diary add-on stays unavailable even if
+// the crate says it is available. Configured but undiscovered boxes also stay notConnected.
+// The crate can only make the answer stricter than these host limits. Warnings are
 // logged once, and again at the 10th, 100th, 1000th and so on, per event and reason, and carry no
 // input.
 
@@ -212,7 +213,8 @@ function computePermittedTools(input, { wasmLoader = defaultLoader } = {}) {
     const tools = l.tools.map((t, k) => {
       const q = p.tools[k];
       if (l.code) {
-        return { name: t.name, description: t.description, write: t.write, permission: q.permission, reason: q.reasonCode ? reasonFor(q.reasonCode)[0] : null, reasonCode: q.reasonCode };
+        const [codeReason, codeReasonCode] = q.reasonCode ? reasonFor(q.reasonCode) : [null, null];
+        return { name: t.name, description: t.description, write: t.write, permission: q.permission, reason: codeReason, reasonCode: codeReasonCode };
       }
       let permission = q.permission;
       let [tReason, tReasonCode] = q.reasonCode === 'blocked' ? [REASONS.blocked, 'blocked'] : q.reasonCode ? reasonFor(q.reasonCode) : [null, null];

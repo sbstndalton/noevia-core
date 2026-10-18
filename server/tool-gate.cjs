@@ -86,8 +86,19 @@ function createToolGate({ enabled, decide, boxes = DEFAULT_BOXES, isWriteTool, l
   function confined(decision, offered, what) {
     const ok = !!decision && typeof decision === 'object' && typeof decision.tool === 'string' && offered.has(decision.tool) && readOnly(decision.tool)
       && (decision.mode === 'require' || (decision.mode === 'prefetch' && !!decision.args && typeof decision.args === 'object' && !Array.isArray(decision.args)));
-    if (!ok) portWarn('tool_gate.bad_decision', what);
-    return ok;
+    if (!ok) { portWarn('tool_gate.bad_decision', what); return false; }
+    if (decision.mode === 'prefetch') {
+      const tool = offered.get(decision.tool);
+      const requiredPresent = Array.from(requiredOf(tool)).every((key) => typeof key !== 'symbol' && Object.hasOwn(decision.args, String(key)));
+      // Stage 2 may require a search, but must never send the message as a search query itself.
+      // Use the same first matching kind as the crate, including caller-provided box order.
+      const kind = Object.keys(boxes).find((key) => key !== 'drive' && (boxes[key] || []).includes(decision.tool));
+      if (!requiredPresent || (what === 'answer' && kind === 'search')) {
+        portWarn('tool_gate.bad_decision', what);
+        return false;
+      }
+    }
+    return true;
   }
 
   async function readout(message, offered, bias) {
@@ -227,7 +238,8 @@ function portWarn(event, reason) {
   if (!seenPort.has(key) && seenPort.size >= 200) return; // bounded
   const n = (seenPort.get(key) || 0) + 1;
   seenPort.set(key, n);
-  if (n === 1 || (n >= 10 && /^10*$/.test(String(n)))) console.warn(`[tool-gate] ${event} (${reason}); no tool was forced${n > 1 ? ` (${n} times so far)` : ''}`);
+  const outcome = event === 'tool_gate.prefetchable_fault' ? 'the message was not used as a search query' : 'no tool was forced';
+  if (n === 1 || (n >= 10 && /^10*$/.test(String(n)))) console.warn(`[tool-gate] ${event} (${reason}); ${outcome}${n > 1 ? ` (${n} times so far)` : ''}`);
 }
 
 /** Whether the message is short, one line and plain enough to send to a search service as the query (the crate's reading:
