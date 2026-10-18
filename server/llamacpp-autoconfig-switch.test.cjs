@@ -1,4 +1,5 @@
 'use strict';
+const skipWasm = !require('node:fs').existsSync(process.env.DAV_PARSE_WASM || require('./dav-parse-wasm.cjs').DEFAULT_WASM) && process.env.DAV_PARSE_WASM_REQUIRED !== '1' && 'dav-parse.wasm not built';
 // LLAMACPP_AUTOCONFIG_IMPL (retired in #1071: the port always confirms the JS): every path where the Rust port
 // refuses, faults or disagrees, with stand-in ports (no WebAssembly needed). The JS answer is
 // returned only when the port agrees byte for byte or the JS answer is the conservative one;
@@ -167,7 +168,7 @@ function withUnusableModule(t) {
   });
 }
 
-test('manager: the small model loads with the real module; with an unusable sizing port the load is refused, not waved through', async (t) => {
+test('manager: the small model loads with the real module; with an unusable sizing port the load is refused, not waved through', { skip: skipWasm }, async (t) => {
   const real = manager(t);
   assert.equal((await real.m.load('small')).ok, true);
   withUnusableModule(t);
@@ -178,7 +179,7 @@ test('manager: the small model loads with the real module; with an unusable sizi
   assert.ok(!calls.includes('POST /models/load'), calls.join('\n'));
 });
 
-test('manager: with an unusable sizing port a preset save is refused, the panel is a 503 and no settings are suggested', async (t) => {
+test('manager: with an unusable sizing port a preset save is refused, the panel is a 503 and no settings are suggested', { skip: skipWasm }, async (t) => {
   withUnusableModule(t);
   const { m, ini } = manager(t);
   const before = fs.readFileSync(ini, 'utf8');
@@ -197,7 +198,7 @@ test('manager: with an unusable sizing port a preset save is refused, the panel 
   assert.equal(est.body.models[0].estimate, null); assert.equal(est.body.models[0].fits, null);
 });
 
-test('manager: with no dav-parse.wasm at all the GGUF read refuses (Rust-only since #1071): no suggestion, no panel, no estimate, and the preset is untouched', async (t) => {
+test('manager: with no dav-parse.wasm at all the GGUF read refuses (Rust-only since #1071): no suggestion, no panel, no estimate, and the preset is untouched', { skip: skipWasm }, async (t) => {
   const saved = process.env.DAV_PARSE_WASM;
   process.env.DAV_PARSE_WASM = path.join(os.tmpdir(), 'no-such-dav-parse.wasm');
   davParseWasm.reset();

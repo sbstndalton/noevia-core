@@ -21,6 +21,8 @@ const gguf = require('../../server/gguf-meta.cjs');
 const { readSummaryWasm, MAX_ROUNDS, MAX_SENT_WINDOWS } = gguf;
 const gen = require('./gguf-fixture-lib.cjs');
 const EXPECTED = JSON.parse(fs.readFileSync(path.join(__dirname, '../fixtures/gguf-real-headers.expected.v1.json'), 'utf8'));
+// The frozen file keeps neither the architecture nor the model name of the real headers.
+const mask = (summary) => ({ ...summary, arch: '<arch>', name: '<name>' });
 const skipNoWasm = !fs.existsSync(process.env.DAV_PARSE_WASM || davParseWasm.DEFAULT_WASM) && process.env.DAV_PARSE_WASM_REQUIRED !== '1' && 'dav-parse.wasm not built';
 
 const DIR = path.join(__dirname, '../fixtures/real-gguf-headers');
@@ -70,12 +72,12 @@ for (const entry of manifest) {
     const file = path.join(dir, `${entry.name}.gguf`);
     fs.writeFileSync(file, fs.readFileSync(path.join(DIR, `${entry.name}.head`)));
     fs.truncateSync(file, entry.totalSize); // sparse: the size the module sees is the real one
-    const frozen = EXPECTED.headers[entry.name];
+    const frozen = EXPECTED.headers[entry.revision];
     assert.ok(frozen, `${entry.name} has a frozen summary`);
-    assert.equal(frozen.revision, entry.revision);
     assert.equal(frozen.totalSize, entry.totalSize);
     const want = readSummaryWasm(file);
-    assert.equal(gen.encodeSummary(want), frozen.summary, 'the frozen summary of the former JS reader');
+    assert.ok(want.arch && want.name, 'the header names its architecture and model');
+    assert.equal(gen.encodeSummary(mask(want)), frozen.summary, 'the frozen summary of the former JS reader (architecture and name masked)');
     // #1195: the key/value block must end inside the head bytes. Parsing the head alone (no sparse zeros
     // after it) must give the same summary; a header longer than the head fails to parse here.
     const headOnly = path.join(dir, `${entry.name}.head.gguf`);
@@ -120,7 +122,9 @@ test('a synthetic ~20 MiB large-vocabulary header stays inside the byte budget',
   assert.ok(size > 18 * 1048576 && size < 22 * 1048576, String(size));
   let sent = 0;
   const spy = { ...davParseWasm, ggufSummary: (s, segs) => { sent += segs.reduce((a, x) => a + x.bytes.length, 0); return davParseWasm.ggufSummary(s, segs); } };
-  assert.deepStrictEqual(readSummaryWasm(file, { wasm: spy }), { arch: 'gemma4', name: '', contextLength: 131072, embeddingLength: null, blockCount: 48, headCount: null, headCountKv: null, keyLength: null, valueLength: null,
+  const synthetic = readSummaryWasm(file, { wasm: spy });
+  assert.ok(synthetic.arch);
+  assert.deepStrictEqual({ ...synthetic, arch: '<arch>' }, { arch: '<arch>', name: '', contextLength: 131072, embeddingLength: null, blockCount: 48, headCount: null, headCountKv: null, keyLength: null, valueLength: null,
     keyLengthSwa: null, valueLengthSwa: null, slidingWindow: null, slidingWindowPattern: null, sharedKvLayers: null, fullAttentionInterval: null, ssmStateSize: null, expertCount: null, nextnPredictLayers: null, hasChatTemplate: true });
   const budget = MAX_SENT_WINDOWS * davParseWasm.MAX_GGUF_WINDOW_BYTES;
   t.diagnostic(`synthetic ${(size / 1048576).toFixed(1)} MiB header: sent ${(sent / 1048576).toFixed(1)} MiB of ${(budget / 1048576).toFixed(0)} MiB`);

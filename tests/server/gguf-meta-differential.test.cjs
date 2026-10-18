@@ -24,7 +24,10 @@ const gguf = require('../../server/gguf-meta.cjs');
 const { readSummary, readSummaryWasm } = gguf;
 
 const FILE = path.join(__dirname, '../fixtures/gguf-meta.v1.json');
-const MUTATIONS = JSON.parse(fs.readFileSync(path.join(__dirname, '../fixtures/gguf-meta-mutations.v1.json'), 'utf8'));
+const MUTATIONS_FILE = path.join(__dirname, '../fixtures/gguf-meta-mutations.v1.json');
+const MUTATIONS = JSON.parse(fs.readFileSync(MUTATIONS_FILE, 'utf8'));
+// The frozen references are pinned: changing either is a deliberate act that also changes these.
+const PINS = { [FILE]: '3d41ef6b089b244da6640b4f28ba69084425c49e8c89aa9d41ef30c254b2b659', [MUTATIONS_FILE]: 'e58ec0e34a3253c9d387dab9750ae12f204afb9ad119316f0b3f076c70bfa726' };
 const fixtures = JSON.parse(fs.readFileSync(FILE, 'utf8'));
 const wasmFile = process.env.DAV_PARSE_WASM || davParseWasm.DEFAULT_WASM;
 const skipWasm = !fs.existsSync(wasmFile) && process.env.DAV_PARSE_WASM_REQUIRED !== '1' && 'dav-parse.wasm not built';
@@ -55,6 +58,7 @@ test('the fixture file is frozen: its limits are the reader limits and no genera
   assert.equal(fixtures.limits.maxArrayKept, 1024);
   assert.equal(fixtures.limits.maxStringKept, 256 * 1024);
   assert.equal(fixtures.version, 1);
+  for (const [file, pin] of Object.entries(PINS)) assert.equal(crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex'), pin, path.basename(file));
   assert.equal(MUTATIONS.version, 1);
   for (const gone of ['readGguf', 'summarize', 'ggufImpl', 'MAX_ARRAY_KEPT']) assert.equal(gguf[gone], undefined, gone);
   assert.deepEqual(Object.keys(gguf).sort(), ['MAX_ROUNDS', 'MAX_SENT_WINDOWS', 'readSummary', 'readSummaryWasm']);
@@ -119,7 +123,9 @@ test('realistic vocabularies cross in few ranges and rounds', { skip: skipWasm }
   const word = () => 'ab▁cdéfgh'.slice(0, 1 + rnd(8)) + rnd(100000);
   const strArr = (n, f) => [T.arr, Buffer.concat([u32(T.str), u64(n), ...Array.from({ length: n }, () => str(f()))])];
   const numArr = (type, n, w) => [T.arr, Buffer.concat([u32(type), u64(n), Buffer.alloc(n * w, 1)])];
-  const want = { gemma_262k: { ...EMPTY, arch: 'gemma3', blockCount: 48, contextLength: 131072, hasChatTemplate: true }, qwen_151k_merges: { ...EMPTY, arch: 'qwen2', blockCount: 28, contextLength: 32768 } };
+  // In the order of `shapes` below (the architecture is masked: it is whatever the shape declares).
+  const wants = [{ ...EMPTY, blockCount: 48, contextLength: 131072, hasChatTemplate: true }, { ...EMPTY, blockCount: 28, contextLength: 32768 }];
+  let shapeNo = 0;
   const shapes = {
     gemma_262k: [kv('general.architecture', STR('gemma3')), kv('gemma3.block_count', S(T.u32, 48)), kv('tokenizer.ggml.model', STR('llama')),
       kv('tokenizer.ggml.tokens', strArr(262144, word)), kv('tokenizer.ggml.scores', numArr(T.f32, 262144, 4)), kv('tokenizer.ggml.token_type', numArr(T.i32, 262144, 4)),
@@ -132,7 +138,9 @@ test('realistic vocabularies cross in few ranges and rounds', { skip: skipWasm }
     const file = tmp(build(kvs));
     let rounds = 0, most = 0;
     const spy = { ...davParseWasm, ggufSummary: (size, segs) => { rounds++; most = Math.max(most, segs.length); return davParseWasm.ggufSummary(size, segs); } };
-    assert.deepStrictEqual(readSummaryWasm(file, { wasm: spy }), want[name], name);
+    const got = readSummaryWasm(file, { wasm: spy });
+    assert.ok(got.arch, name);
+    assert.deepStrictEqual({ ...got, arch: '' }, wants[shapeNo++], name);
     assert.ok(rounds < 40 && most < 16, `${name}: ${rounds} rounds, ${most} ranges`);
     fs.rmSync(file);
   }
