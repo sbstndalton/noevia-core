@@ -3,6 +3,8 @@ const skipWasm = !require('node:fs').existsSync(process.env.DAV_PARSE_WASM || re
 // test reports ok): when the module is there, every guarded body must have run.
 let ran = 0;
 const test = require('node:test'), assert = require('node:assert/strict');
+const withoutReason = (o) => { const { _meta, ...rest } = o || {}; return rest; };
+const reasonOf = (o) => o?._meta?.noevia?.reason;
 const fs = require('node:fs'), os = require('node:os'), path = require('node:path');
 const { execFileSync } = require('node:child_process');
 const { createCodeHarness } = require('./code-harness.cjs');
@@ -12,6 +14,20 @@ const { ACTIONS } = require('./code-actions.cjs');
 
 const temps = [];
 const temp = (p) => { const d = fs.mkdtempSync(path.join(os.tmpdir(), p)); temps.push(d); return d; };
+test('a command the checker cannot read is put to a person with the command and why it could not be checked, and an approval of it cannot stand', { skip: skipWasm }, async () => {
+  ran++;
+  const huge = `echo ${'x'.repeat(2 * 1024 * 1024)}`;
+  let first, second;
+  const r = await run({ answers: ['approve_all', 'approve'], script: async (h) => {
+    first = await h.requestPermission({ toolCall: { kind: 'execute', rawInput: { command: huge } }, options: OPTIONS });
+    second = await h.requestPermission({ toolCall: { kind: 'execute', rawInput: { command: huge } }, options: OPTIONS });
+  } });
+  assert.equal(r.asked.length, 2, 'asked both times: "allow for this task" never stands behind it');
+  assert.equal(r.asked[0].command, huge.trim());
+  assert.match(r.asked[0].reason, /could not be checked \(too large or complex to check\), so a person has to approve it/);
+  assert.deepEqual([first, second].map(withoutReason), [{ outcome: 'selected', optionId: 'y' }, { outcome: 'selected', optionId: 'y' }]);
+});
+
 test.after(() => { for (const d of temps) fs.rmSync(d, { recursive: true, force: true }); });
 
 function repo() {
@@ -132,7 +148,8 @@ test('declining means the harness is told no, not told nothing', { skip: skipWas
   ran++;
   let picked;
   await run({ answers: ['deny'], script: async (h, cwd) => { picked = await h.requestPermission(editCall(path.join(cwd, 'a.txt'))); } });
-  assert.deepEqual(picked, { outcome: 'selected', optionId: 'n' });
+  assert.deepEqual(withoutReason(picked), { outcome: 'selected', optionId: 'n' });
+  assert.equal(reasonOf(picked), 'The person declined this action.', 'the agent\'s model is told why');
 });
 
 test('a timeout or an abort is a refusal, never an allow', { skip: skipWasm }, async () => {
@@ -140,7 +157,8 @@ test('a timeout or an abort is a refusal, never an allow', { skip: skipWasm }, a
   for (const answer of ['timeout', 'aborted', undefined]) {
     let picked;
     await run({ answers: [answer], script: async (h, cwd) => { picked = await h.requestPermission(editCall(path.join(cwd, 'a.txt'))); } });
-    assert.deepEqual(picked, { outcome: 'selected', optionId: 'n' }, String(answer));
+    assert.deepEqual(withoutReason(picked), { outcome: 'selected', optionId: 'n' }, String(answer));
+    assert.match(reasonOf(picked), answer === 'timeout' ? /Nobody answered/ : answer === 'aborted' ? /stopped before/ : /declined/, String(answer));
   }
 });
 
@@ -149,7 +167,8 @@ test('an edit outside the workspace is refused without asking anyone', { skip: s
   let picked;
   const r = await run({ script: async (h) => { picked = await h.requestPermission(editCall('/etc/passwd')); } });
   assert.equal(r.asked.length, 0, 'nobody is asked to approve what is not allowed at all');
-  assert.deepEqual(picked, { outcome: 'selected', optionId: 'n' });
+  assert.deepEqual(withoutReason(picked), { outcome: 'selected', optionId: 'n' });
+  assert.match(reasonOf(picked), /outside this task/, 'the model is told the path is outside the workspace');
   const decided = events(r).find((e) => e.type === 'approval.decided');
   assert.equal(decided.data.automatic, true);
   assert.match(decided.data.reason, /outside/i);
@@ -226,7 +245,8 @@ test('a class the task was never granted is refused, even if the human would hav
     script: async (h) => { picked = await h.requestPermission({ toolCall: { kind: 'execute', rawInput: { command: 'git push' } }, options: OPTIONS }); },
   });
   assert.equal(r.asked.length, 0);
-  assert.deepEqual(picked, { outcome: 'selected', optionId: 'n' });
+  assert.deepEqual(withoutReason(picked), { outcome: 'selected', optionId: 'n' });
+  assert.match(reasonOf(picked), /was not granted git push/, 'the model is told which class was never granted');
 });
 
 test('the write path is checked again at write time, not only at approval time', { skip: skipWasm }, async () => {
@@ -822,4 +842,4 @@ test('a redirect under a standing execute allow still meets the edit containment
   assert.deepEqual(picked.map((p) => p.optionId), ['y', 'n', 'n', 'y']);
 });
 
-test.after(() => { if (!skipWasm) assert.equal(ran, 42, 'a wasm-guarded test body did not run'); });
+test.after(() => { if (!skipWasm) assert.equal(ran, 43, 'a wasm-guarded test body did not run'); });

@@ -4,6 +4,8 @@ const skipWasm = !require('node:fs').existsSync(process.env.DAV_PARSE_WASM || re
 // test reports ok): when the module is there, every guarded body must have run.
 let ran = 0;
 const test = require('node:test'), assert = require('node:assert/strict');
+const withoutReason = (o) => { const { _meta, ...rest } = o || {}; return rest; };
+const reasonOf = (o) => o?._meta?.noevia?.reason;
 const fs = require('node:fs'), os = require('node:os'), path = require('node:path');
 const { execFileSync } = require('node:child_process');
 const { createCodeService, parseRepos, GRANTABLE } = require('./code-service.cjs');
@@ -173,7 +175,7 @@ test('an unanswered approval times out as a refusal', { skip: skipWasm }, async 
   });
   const started = await svc.start(ws, project, { repository: 'noevia', prompt: 'fix', capabilities: ['edit_file'] });
   await settle(svc, ws, started.taskId);
-  assert.deepEqual(await ask, { outcome: 'selected', optionId: 'n' });
+  assert.deepEqual(withoutReason(await ask), { outcome: 'selected', optionId: 'n' });
 });
 
 test('cancelling refuses whatever was waiting, so no card can be answered afterwards', { skip: skipWasm }, async () => {
@@ -190,7 +192,7 @@ test('cancelling refuses whatever was waiting, so no card can be answered afterw
   for (let i = 0; i < 200 && !svc.get(ws, project, started.taskId)?.approval; i++) await new Promise((r) => setTimeout(r, 5));
   const seen = svc.get(ws, project, started.taskId).approval.id;
   svc.cancel(ws, project, started.taskId);
-  assert.deepEqual(await ask, { outcome: 'selected', optionId: 'n' }, 'the harness is told no, not left hanging');
+  assert.deepEqual(withoutReason(await ask), { outcome: 'selected', optionId: 'n' }, 'the harness is told no, not left hanging');
   assert.equal(svc.get(ws, project, started.taskId).approval, null);
   assert.throws(() => svc.decide(ws, project, started.taskId, 'approve', seen), /no longer waiting/);
 });
@@ -253,7 +255,7 @@ test('two tasks waiting at once each get their own answer', { skip: skipWasm }, 
   assert.deepEqual(await asks.a, { outcome: 'selected', optionId: 'y' });
   assert.ok(svc.get(ws, two, b.taskId).approval, 'the other task is still waiting for its own answer');
   svc.decide(ws, two, b.taskId, 'deny', svc.get(ws, two, b.taskId).approval.id);
-  assert.deepEqual(await asks.b, { outcome: 'selected', optionId: 'n' });
+  assert.deepEqual(withoutReason(await asks.b), { outcome: 'selected', optionId: 'n' });
 });
 
 test('a harness or preparation mode noevia does not offer is refused at the server', { skip: skipWasm }, async () => {
@@ -348,7 +350,7 @@ test('an answer names the card it was for: an expired approval is a 409, and the
   const alive = setInterval(() => {}, 10);
   let firstAnswer;
   try { firstAnswer = await asks[0]; } finally { clearInterval(alive); }
-  assert.deepEqual(firstAnswer, { outcome: 'selected', optionId: 'n' }, 'the first timed out as a refusal');
+  assert.deepEqual(withoutReason(firstAnswer), { outcome: 'selected', optionId: 'n' }, 'the first timed out as a refusal');
   let second = null;
   for (let i = 0; i < 200 && !(second = svc.get(ws, project, started.taskId)?.approval); i++) await new Promise((r) => setTimeout(r, 2));
   assert.equal(second.title, 'second');
@@ -390,7 +392,7 @@ test('cancelling refuses EVERY approval the task has waiting, not just the first
   for (let i = 0; i < 200 && asks.length < 2; i++) await new Promise((r) => setTimeout(r, 5));
   await new Promise((r) => setTimeout(r, 10));
   svc.cancel(ws, project, started.taskId);
-  assert.deepEqual(await Promise.all(asks), [{ outcome: 'selected', optionId: 'n' }, { outcome: 'selected', optionId: 'n' }]);
+  assert.deepEqual((await Promise.all(asks)).map(withoutReason), [{ outcome: 'selected', optionId: 'n' }, { outcome: 'selected', optionId: 'n' }]);
   assert.equal(svc.get(ws, project, started.taskId).approval, null);
 });
 
@@ -406,7 +408,7 @@ test('a task that fails with an approval waiting refuses it rather than leaving 
   });
   const started = await svc.start(ws, project, { repository: 'noevia', prompt: 'fix', capabilities: ['edit_file'] });
   await settle(svc, ws, started.taskId);
-  assert.deepEqual(await ask, { outcome: 'selected', optionId: 'n' });
+  assert.deepEqual(withoutReason(await ask), { outcome: 'selected', optionId: 'n' });
   assert.equal(svc.get(ws, project, started.taskId).approval, null);
 });
 

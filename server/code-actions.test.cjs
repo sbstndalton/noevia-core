@@ -121,7 +121,7 @@ test('hostsOf stays linear on a long http:// run and still reads every host (noe
   const task = { domains: ['ok.test'] };
   // 256Ki units of `http://` in one word: the old per-match re-scan of the word was quadratic
   // (about 3 s here; the budget is far above the linear cost and far below the quadratic one). That much reading work is past the
-  // Rust crate's bound (noevia#1212), so the call is unverified and refused (before #1071 the JS read it and asked).
+  // Rust crate's bound (noevia#1212), so the call is unverified: never allowed or stood behind, and put to a person with the note.
   const long = 'http://'.repeat(Math.ceil((256 * 1024) / 7)).slice(0, 256 * 1024);
   const t = process.hrtime.bigint();
   const c = exec(`curl ${long}`);
@@ -129,7 +129,9 @@ test('hostsOf stays linear on a long http:// run and still reads every host (noe
   const ms = Number(process.hrtime.bigint() - t) / 1e6;
   assert.ok(ms < 500, `hostsOf took ${ms.toFixed(0)} ms`);
   assert.equal(c.unverified, true);
-  assert.equal(d.decision, 'deny');
+  assert.equal(c.standable, false);
+  assert.equal(d.decision, 'ask');
+  assert.match(d.reason, /could not be checked \(too large or complex to check\)/);
   // Within the bound it is read, linearly, and asks.
   const run = 'http://'.repeat(Math.ceil((32 * 1024) / 7)).slice(0, 32 * 1024);
   const t2 = process.hrtime.bigint();

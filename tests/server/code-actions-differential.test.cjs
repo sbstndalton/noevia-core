@@ -13,8 +13,9 @@
 // composition was the JS answer made stricter by the port; with the JS gone the port decides alone, so what must hold,
 // and is counted below, is that nothing is weaker than the frozen JS answer (a class less consequential, an approval
 // weaker, a standing approval or a plain-network reading the JS withheld, a decision that allows what the JS asked
-// about or refused), that the answers the port gives are the JS ones byte for byte, and that what the port refuses is
-// refused here (classify: the unverified classification; decide: deny; pickOption: cancel). The WebAssembly half needs
+// about), that the answers the port gives are the JS ones byte for byte, and that what the port refuses is put strictly here
+// (classify: the unverified classification, never allowed or stood behind; decide: ask a person, as the wasm composition did;
+// pickOption: cancel). The WebAssembly half needs
 // server/wasm/dav-parse.wasm (or DAV_PARSE_WASM); skipped without it unless DAV_PARSE_WASM_REQUIRED=1.
 
 const assert = require('node:assert/strict');
@@ -29,7 +30,7 @@ const ca = require('../../server/code-actions.cjs');
 const FILE = path.join(__dirname, '../fixtures/code-actions.v1.json');
 const FROZEN_FILE = path.join(__dirname, '../fixtures/code-actions-js.v1.json');
 // The frozen references are pinned: changing either is a deliberate act that also changes these.
-const PINS = { [FILE]: 'af97068f9869d21f0888d5893311e7e4993fbb5450810e2e7ac9b3387c453edf', [FROZEN_FILE]: '4a1e9717af53ee5b38619c597d954a7a2356de9e1f3ab867ecb0fb637a82080d' };
+const PINS = { [FILE]: 'af97068f9869d21f0888d5893311e7e4993fbb5450810e2e7ac9b3387c453edf', [FROZEN_FILE]: '826f9e5aed83ef1e4b5e301c07c3e84ae4059752f84b42791ac0f6c6899e0ec0' };
 const FROZEN = JSON.parse(fs.readFileSync(FROZEN_FILE, 'utf8'));
 const fixtures = JSON.parse(fs.readFileSync(FILE, 'utf8'));
 const wasmFile = process.env.DAV_PARSE_WASM || davParseWasm.DEFAULT_WASM;
@@ -83,7 +84,7 @@ test('the fixture files are frozen and pinned, line up, and no JS classifier, sw
   assert.equal(FROZEN.version, 1);
   assert.equal(FROZEN.seeded.classify.length, 2000);
   assert.equal(FROZEN.seeded.decide.length, 12000);
-  assert.deepEqual(Object.keys(ca).sort(), ['ACTIONS', 'COMMAND_KEYS', 'UNVERIFIED_ASK', 'UNVERIFIED_DENY', 'classify', 'classifyInput', 'commandOf', 'decide', 'decideInput', 'pickInput', 'pickOption']);
+  assert.deepEqual(Object.keys(ca).sort(), ['ACTIONS', 'COMMAND_KEYS', 'UNVERIFIED_ASK', 'classify', 'classifyInput', 'commandOf', 'decide', 'decideInput', 'pickInput', 'pickOption']);
   assert.ok(!fs.existsSync(path.join(__dirname, '../../tools/gen-code-actions-fixtures.cjs')));
 });
 
@@ -184,6 +185,8 @@ test('seeded live calls: classification is the JS one; no decision is weaker tha
   assert.deepEqual(seen, {"ask same decision, other words":2635,"allow same":2139,"ask same":6960,"allow->ask":266});
 });
 
+// The chain pins are sha256 of the former JS answer. They are meant to be re-pinned deliberately: if the crate's reading of these
+// commands is ever supposed to change, change the hash in a reviewed commit that says why, never to make a failing run pass.
 test('find -exec chains: the port gives the JS answer (by hash); oversized commands are refused, and the call is unverified, never weaker', { skip: skipWasm }, () => {
   ran++;
   const call = (command) => ({ kind: 'execute', rawInput: { command }, locations: [] });
@@ -207,6 +210,9 @@ test('find -exec chains: the port gives the JS answer (by hash); oversized comma
     assert.deepEqual(weakerClassification(js, now), []);
     assert.equal(now.unverified, true);
     assert.equal(now.command, trimmed, 'the command text is kept for the card');
-    assert.equal(ca.decide({ classified: now, capabilities: [], domains: [], inWorkspace: null }).decision, 'deny');
+    assert.equal(now.standable, false);
+    const d = ca.decide({ classified: now, capabilities: [], domains: [], inWorkspace: null });
+    assert.equal(d.decision, 'ask', 'a person decides; the card shows the command and why it could not be checked');
+    assert.match(d.reason, /could not be checked \(too large or complex to check\)/);
   });
 });

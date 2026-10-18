@@ -2,8 +2,9 @@
 // Code actions are always the Rust port (CODE_ACTIONS_IMPL retired, #1071). This file pins how the functions code-harness.cjs
 // calls use the port's answers, with a stand-in for the port (no dav-parse.wasm needed; tests/server/code-actions-differential.test.cjs
 // runs the real module against the frozen JS answers). The port decides alone. A refusal, a fault or a bad reply is the strict
-// result: classify gives the unverified classification, decide denies (a network call whose URL host the port cannot read exactly
-// asks, unless the port denies it without the command), pickOption cancels. Synthetic calls only.
+// result, which is what the wasm composition did before #1071: classify gives the unverified classification (never allowed, never
+// stood behind), decide asks a person (a network call whose URL host the port cannot read exactly is asked again without the
+// command and stays denied if the port denies it then), pickOption cancels. Synthetic calls only.
 const test = require('node:test'), assert = require('node:assert/strict');
 const ca = require('./code-actions.cjs');
 const davParseWasm = require('./dav-parse-wasm.cjs');
@@ -26,7 +27,7 @@ function quietly(fn) {
 }
 
 test('the module exports what code-harness and its tests use, and the projections: no JS classifier, switch or word list remains', () => {
-  assert.deepEqual(Object.keys(ca).sort(), ['ACTIONS', 'COMMAND_KEYS', 'UNVERIFIED_ASK', 'UNVERIFIED_DENY', 'classify', 'classifyInput', 'commandOf', 'decide', 'decideInput', 'pickInput', 'pickOption']);
+  assert.deepEqual(Object.keys(ca).sort(), ['ACTIONS', 'COMMAND_KEYS', 'UNVERIFIED_ASK', 'classify', 'classifyInput', 'commandOf', 'decide', 'decideInput', 'pickInput', 'pickOption']);
 });
 
 test('the retired switch changes nothing: the port is asked whatever CODE_ACTIONS_IMPL says', () => {
@@ -52,10 +53,12 @@ test('classify: the port\'s classification is the answer, and it is sent only wh
 
 test('classify: a refusal, a fault or a bad reply is the unverified classification, with the command kept for the card', () => {
   const call = { kind: 'execute', rawInput: { cmd: '  curl https://example.com/x  ' } };
-  for (const answer of [refuse('too_large'), refuse('trap'), () => { throw new TypeError('bad'); }]) {
+  const cases = [[refuse('too_large'), 'too large or complex to check'], [refuse('input'), 'its arguments have a form that cannot be checked'],
+    [refuse('trap'), 'the checker did not answer'], [() => { throw new TypeError('bad'); }, 'the checker did not answer']];
+  for (const [answer, why] of cases) {
     const { value: c, seen } = quietly(() => ca.classify(call, fakePort({ classify: answer })));
     assert.deepEqual(c, { action: 'external_account', approval: 'always', command: 'curl https://example.com/x', paths: [], readable: false,
-      actions: ['external_account'], simple: false, standable: false, unverified: true });
+      actions: ['external_account'], simple: false, standable: false, unverified: true, unverifiedWhy: why });
     assert.ok(seen.every((m) => !m.includes('example.com')), 'logged without the command');
   }
   // A call that cannot even be projected is unverified too, not a throw.
@@ -73,22 +76,23 @@ test('decide: the port\'s decision is the answer, and it is sent only what decid
   assert.deepEqual([capabilities, domains, inWorkspace], [['execute_command'], ['example.com'], true]);
 });
 
-test('decide: an unverified classification is denied without asking the port', () => {
+test('decide: an unverified classification asks a person, saying why, without asking the port; it cannot be stood behind', () => {
   const port = fakePort({ decide: reply({ decision: 'allow', reason: 'Read-only.' }) });
-  const unverified = ca.classify(CALL, fakePort());
+  const unverified = quietly(() => ca.classify(CALL, fakePort({ classify: refuse('too_large') }))).value;
   assert.equal(unverified.unverified, true);
-  assert.deepEqual(ca.decide({ classified: unverified, capabilities: [], domains: [], inWorkspace: true }, port), { decision: 'deny', reason: ca.UNVERIFIED_DENY });
+  assert.equal(unverified.standable, false);
+  assert.deepEqual(ca.decide({ classified: unverified, capabilities: [], domains: [], inWorkspace: true }, port),
+    { decision: 'ask', reason: 'This action could not be checked (too large or complex to check), so a person has to approve it.' });
   assert.deepEqual(port.calls, []);
 });
 
-test('decide: a refusal, a fault, a bad reply or an input of the wrong shape is denied', () => {
+test('decide: a refusal, a fault, a bad reply or an input of the wrong shape asks a person (never allows)', () => {
   const input = { classified: REPLY, capabilities: [], domains: [], inWorkspace: null };
   for (const answer of [refuse('trap'), refuse('too_large'), refuse('ambiguous'), () => { throw new TypeError('bad'); }]) {
-    // approval 'always': even an ambiguous refusal is a refusal here (only a network call can be asked about)
-    assert.deepEqual(quietly(() => ca.decide(input, fakePort({ decide: answer }))).value, { decision: 'deny', reason: ca.UNVERIFIED_DENY });
+    assert.deepEqual(quietly(() => ca.decide(input, fakePort({ decide: answer }))).value, { decision: 'ask', reason: ca.UNVERIFIED_ASK });
   }
   for (const bad of [undefined, {}, { classified: {} }, { classified: { ...REPLY, paths: 'x' } }, { classified: REPLY, inWorkspace: 'yes' }]) {
-    assert.deepEqual(quietly(() => ca.decide(bad, fakePort({ decide: reply({ decision: 'allow', reason: '' }) }))).value, { decision: 'deny', reason: ca.UNVERIFIED_DENY }, JSON.stringify(bad));
+    assert.deepEqual(quietly(() => ca.decide(bad, fakePort({ decide: reply({ decision: 'allow', reason: '' }) }))).value, { decision: 'ask', reason: ca.UNVERIFIED_ASK }, JSON.stringify(bad));
   }
 });
 
@@ -104,8 +108,8 @@ test('decide: a network call whose URL host the port cannot read exactly asks, u
   // What the port denies without the command stays denied, with its words.
   const denied = quietly(() => ca.decide(input, fakePort(answers(reply({ decision: 'deny', reason: 'This task was not granted network.' }))))).value;
   assert.deepEqual(denied, { decision: 'deny', reason: 'This task was not granted network.' });
-  // The second ask is refused too: denied.
-  assert.equal(quietly(() => ca.decide(input, fakePort(answers(refuse('trap'))))).value.decision, 'deny');
+  // The second ask is refused too: a person is asked.
+  assert.equal(quietly(() => ca.decide(input, fakePort(answers(refuse('trap'))))).value.decision, 'ask');
   // And the second ask carries no command text.
   const port = fakePort(answers(reply({ decision: 'ask', reason: '' })));
   quietly(() => ca.decide(input, port));
@@ -138,7 +142,7 @@ test('process.env with a missing module: nothing is allowed, selected or classif
       });
       assert.equal(value.c.unverified, true);
       assert.equal(value.c.approval, 'always');
-      assert.equal(value.d.decision, 'deny');
+      assert.equal(value.d.decision, 'ask');
       assert.deepEqual(value.p, { outcome: 'cancelled' });
     }
   } finally {
@@ -146,4 +150,15 @@ test('process.env with a missing module: nothing is allowed, selected or classif
     if (saved.file === undefined) delete process.env.DAV_PARSE_WASM; else process.env.DAV_PARSE_WASM = saved.file;
     davParseWasm.reset();
   }
+});
+
+test('a persistent fault is logged on its first occurrence and again at the 10th, 100th and 1000th, never with the command', () => {
+  const call = { kind: 'execute', rawInput: { command: 'ls secret-synthetic-path' } };
+  const { seen } = quietly(() => { for (let i = 0; i < 1000; i++) ca.classify(call, fakePort({ classify: refuse('persistent_fault_test') })); });
+  assert.equal(seen.length, 4, seen.join('\n'));
+  assert.match(seen[0], /persistent_fault_test\); the call was handled as unverified$/);
+  assert.match(seen[1], /\(10 times so far\)$/);
+  assert.match(seen[2], /\(100 times so far\)$/);
+  assert.match(seen[3], /\(1000 times so far\)$/);
+  assert.ok(seen.every((m) => !m.includes('secret-synthetic-path')));
 });

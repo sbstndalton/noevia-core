@@ -18,13 +18,17 @@
 // pickInput) and applies its answer alone. When the crate refuses, faults or replies badly (logged
 // once per reason, command-text free) the result is the strict one:
 //   - classify returns an unverified classification: the most consequential class, approval
-//     'always', unreadable, simple and standable false, `unverified: true`. decide() refuses it
-//     without asking the crate, so no card, no standing approval and no allow can come of it;
-//   - decide refuses ('deny'), except when the crate refused a network call whose URL host it cannot
-//     read exactly (outside its plain-ASCII, non-IP-shorthand subset): then the crate is asked again
-//     without the command, which still denies what the workspace and the granted classes forbid, and
-//     whatever it does not deny is put to a person ('ask'), never allowed;
+//     'always', unreadable, simple and standable false, `unverified: true`, and why it could not be
+//     checked. decide() puts it to a person ('ask', the reason names why) without asking the crate, so
+//     no allow and no standing approval can come of it; the card shows the command text;
+//   - decide asks a person too when it cannot get an answer (a fault, a bad reply). When the crate
+//     refused a network call whose URL host it cannot read exactly (outside its plain-ASCII,
+//     non-IP-shorthand subset), it is asked again without the command, which still denies what the
+//     workspace and the granted classes forbid; whatever it does not deny is put to a person, never
+//     allowed. This is what the wasm composition did before #1071 (the JS answer stricter by the port);
 //   - pickOption answers { outcome: 'cancelled' } (a refusal).
+// Faults are logged (command-text free) on the first occurrence of each reason and again at the 10th,
+// 100th, 1000th and so on, so a persistent runtime fault is not silent.
 // Stricter than the former JS (the crate docs): a command array element that is not a string,
 // boolean, null or safe integer; in the network branch of decide, a URL host outside the
 // plain-ASCII, non-IP-shorthand subset; more than 256 Ki-units of reading work (noevia#1212: every
@@ -61,12 +65,13 @@ function commandOf(rawInput) {
 
 const defaultLoader = () => require('./dav-parse-wasm.cjs');
 
-const warnedPort = new Set();
+const seenPort = new Map();
 function portWarn(event, reason) {
   const key = `${event}:${reason}`;
-  if (warnedPort.has(key)) return;
-  warnedPort.add(key);
-  console.warn(`[code-actions] ${event} (${reason}); the call was handled as unverified`);
+  if (!seenPort.has(key) && seenPort.size >= 200) return; // bounded
+  const n = (seenPort.get(key) || 0) + 1;
+  seenPort.set(key, n);
+  if (n === 1 || (n >= 10 && /^10*$/.test(String(n)))) console.warn(`[code-actions] ${event} (${reason}); the call was handled as unverified${n > 1 ? ` (${n} times so far)` : ''}`);
 }
 
 /** `{ port }` with the crate's `{ text, reply }`, or `{ fault }` with the reason after a refusal or fault (logged). */
@@ -105,11 +110,16 @@ function classifyInput(call) {
 }
 
 
+/** Why the crate could not check a call, in words for the approval card. */
+const WHY = { too_large: 'too large or complex to check', input: 'its arguments have a form that cannot be checked', ambiguous: 'it names a host that cannot be read exactly' };
+const whyOf = (fault) => WHY[fault] || 'the checker did not answer';
+
 /** What a call the crate could not classify is treated as: the most consequential class, never allowed or stood behind. */
-function unverifiedClassification(call) {
+function unverifiedClassification(call, fault) {
   let command = '';
   try { command = commandOf(call?.rawInput); } catch { command = ''; }
-  return { action: ACTIONS.EXTERNAL, approval: 'always', command, paths: [], readable: false, actions: [ACTIONS.EXTERNAL], simple: false, standable: false, unverified: true };
+  return { action: ACTIONS.EXTERNAL, approval: 'always', command, paths: [], readable: false, actions: [ACTIONS.EXTERNAL], simple: false, standable: false,
+    unverified: true, unverifiedWhy: whyOf(fault) };
 }
 
 /**
@@ -119,8 +129,8 @@ function unverifiedClassification(call) {
  *            actions: string[], simple: boolean, standable: boolean, unverified?: true}}
  */
 function classify(call = {}, { wasmLoader = defaultLoader } = {}) {
-  const { port } = askPort('classify', () => wasmLoader().codeActionsClassify(classifyInput(call)));
-  return port ? port.reply : unverifiedClassification(call);
+  const { port, fault } = askPort('classify', () => wasmLoader().codeActionsClassify(classifyInput(call)));
+  return port ? port.reply : unverifiedClassification(call, fault);
 }
 
 const isStrings = (a) => Array.isArray(a) && a.every((x) => typeof x === 'string');
@@ -138,18 +148,18 @@ function decideInput({ classified: c, capabilities = [], domains = [], inWorkspa
 }
 
 const UNVERIFIED_ASK = 'This action could not be verified, so a person has to approve it.';
-const UNVERIFIED_DENY = 'This action could not be verified, so it was refused.';
+const unverifiedAsk = (why) => `This action could not be checked (${why}), so a person has to approve it.`;
 
 /**
  * What noevia does with one classified call, by the Rust port: `allow` is only ever reached by a read, a no-op, or a
  * network call to a domain the job was granted when it was created; an edit or delete outside the workspace root, or a
  * class the job was never granted, is `deny`; everything else asks. An unverified classification, a refusal or a fault
- * is `deny` (see the header for the one network case that asks). Option: `wasmLoader` (tests).
+ * asks a person (see the header), as the wasm composition did before #1071. Option: `wasmLoader` (tests).
  * @param {{classified: ReturnType<typeof classify>, capabilities?: string[], domains?: string[], inWorkspace?: boolean|null}} input
  * @returns {{decision: 'allow'|'ask'|'deny', reason: string}}
  */
 function decide(input = {}, { wasmLoader = defaultLoader } = {}) {
-  if (input?.classified?.unverified === true) return { decision: 'deny', reason: UNVERIFIED_DENY };
+  if (input?.classified?.unverified === true) return { decision: 'ask', reason: unverifiedAsk(String(input.classified.unverifiedWhy || whyOf())) };
   const { port, fault } = askPort('decide', () => wasmLoader().codeActionsDecide(...decideInput(input)));
   if (port) return port.reply;
   if (fault === 'ambiguous' && input.classified.approval === 'capability') {
@@ -159,7 +169,7 @@ function decide(input = {}, { wasmLoader = defaultLoader } = {}) {
     const again = askPort('decide.again', () => wasmLoader().codeActionsDecide({ ...classified, command: '' }, capabilities, domains, inWorkspace));
     if (again.port) return again.port.reply.decision === 'deny' ? again.port.reply : { decision: 'ask', reason: UNVERIFIED_ASK };
   }
-  return { decision: 'deny', reason: UNVERIFIED_DENY };
+  return { decision: 'ask', reason: UNVERIFIED_ASK };
 }
 
 /** What pickOption() reads of the offered options. */
@@ -179,4 +189,4 @@ function pickOption(options, wanted, { wasmLoader = defaultLoader } = {}) {
   return port ? port.reply : { outcome: 'cancelled' };
 }
 
-module.exports = { ACTIONS, COMMAND_KEYS, classify, commandOf, decide, pickOption, classifyInput, decideInput, pickInput, UNVERIFIED_ASK, UNVERIFIED_DENY };
+module.exports = { ACTIONS, COMMAND_KEYS, classify, commandOf, decide, pickOption, classifyInput, decideInput, pickInput, UNVERIFIED_ASK };

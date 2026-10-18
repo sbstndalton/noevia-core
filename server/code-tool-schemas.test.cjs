@@ -7,6 +7,8 @@ let ran = 0;
 // agent gets back, the three-strike block, and that nothing changes with the flag off.
 // Synthetic repositories and a scripted agent only; no model, no network.
 const test = require('node:test'), assert = require('node:assert/strict');
+const withoutReason = (o) => { const { _meta, ...rest } = o || {}; return rest; };
+const reasonOf = (o) => o?._meta?.noevia?.reason;
 const fs = require('node:fs'), os = require('node:os'), path = require('node:path');
 const { execFileSync } = require('node:child_process');
 const { createCodeHarness } = require('./code-harness.cjs');
@@ -309,7 +311,7 @@ test('pointing outside the workspace is never a strike: the out-of-workspace rea
   assert.equal(r.asked.length, 3, 'the outside read, the command and the good edit each reached the card');
   assert.equal(r.asked[0].paths[0], '/usr/share/dict/words');
   assert.deepEqual(picks.map((p) => p.optionId), ['y', 'y', 'n', 'n', 'n', 'y']);
-  assert.ok(picks.every((p) => !p._meta), 'policy refusals carry no guard violation');
+  assert.ok(picks.every((p) => !p._meta?.noevia?.violation), 'policy refusals carry no guard violation (only their plain reason)');
   assert.equal(r.job.status, 'completed', 'three outside writes did not block the task');
   assert.equal(r.job.result.violations, 0);
 });

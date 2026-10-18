@@ -443,7 +443,8 @@ function createCodeHarness({ jobs, workspaces, egress = null, askApproval, now =
         counts.denied++;
         record({ event: 'code.refused', action: classified.action, reason: verdict.reason });
         ctx.event('approval.decided', { decision: 'denied', action: classified.action, reason: verdict.reason, automatic: true });
-        return pickOption(options, 'reject_once');
+        // The reason (outside the workspace, a class the task was not granted) goes to the agent's model so it can adjust.
+        return rejectOutcome(pickOption(options, 'reject_once'), verdict.reason);
       }
       if (verdict.decision === 'allow') {
         counts.allowed++;
@@ -454,7 +455,7 @@ function createCodeHarness({ jobs, workspaces, egress = null, askApproval, now =
       // real effect is built at run time (`sh -c`, `eval`, `xargs`, `$VAR`) never rides one either.
       const standing = classified.standable === false ? undefined : blanket.get(classified.action);
       if (standing === 'allow') { counts.allowed++; return pickOption(options, 'allow_once'); }
-      if (standing === 'deny') { counts.refused++; return pickOption(options, 'reject_once'); }
+      if (standing === 'deny') { counts.refused++; return rejectOutcome(pickOption(options, 'reject_once'), 'The person refused this kind of action for this task.'); }
 
       const request = {
         taskId, action: classified.action, title: toolCall.title || '', kind: toolCall.kind || '',
@@ -474,8 +475,11 @@ function createCodeHarness({ jobs, workspaces, egress = null, askApproval, now =
         return pickOption(options, 'allow_once');
       }
       counts.refused++;
-      // A timeout or an abort is a refusal, never an allow.
-      return pickOption(options, 'reject_once');
+      // A timeout or an abort is a refusal, never an allow. The model is told which it was.
+      const why = answer === 'timeout' ? 'Nobody answered the approval request in time, so the action was not run.'
+        : answer === 'aborted' ? 'The task was stopped before this action was approved, so it was not run.'
+          : 'The person declined this action.';
+      return rejectOutcome(pickOption(options, 'reject_once'), why);
     }
 
     /**

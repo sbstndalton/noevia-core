@@ -268,6 +268,8 @@ function violationText(violation) {
  * Decline sends), with the violation in `_meta` for a bridge that can pass it on (pi, #704).
  */
 function rejectOutcome(selected, violation) {
+  // A plain string is the reason itself (a refusal on workspace or capability grounds, a person's Decline): the agent's model reads it.
+  if (typeof violation === 'string') return { ...selected, _meta: { noevia: { reason: violation } } };
   return { ...selected, _meta: { noevia: { reason: violationText(violation), violation } } };
 }
 

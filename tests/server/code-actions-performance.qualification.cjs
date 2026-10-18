@@ -17,7 +17,8 @@ test('find -exec chains: linear, the same answer as the former JS (frozen, by ha
     process.stderr.write(`qualification_case=chain:${n}\n`);
     const c = call(`find .${' -exec find .'.repeat(n)} -print${' \\;'.repeat(n)}`);
     const [r, ms] = timed(() => davParseWasm.codeActionsClassify(ca.classifyInput(c)).text);
-    // The JS classifier is gone (#1071): its answer is frozen in tests/fixtures/code-actions-js.v1.json, by sha256.
+    // The JS classifier is gone (#1071): its answer is frozen in tests/fixtures/code-actions-js.v1.json, by sha256. The hashes are meant
+    // to be re-pinned deliberately, in a reviewed commit that says why the crate's reading of these commands changed.
     const frozen = JSON.parse(fs.readFileSync(path.join(__dirname, '../fixtures/code-actions-js.v1.json'), 'utf8')).chains[k];
     assert.equal(crypto.createHash('sha256').update(r).digest('hex'), frozen, `${n}`);
     // Identical thresholds, isolated from concurrent suite workers (#1279).
