@@ -34,8 +34,8 @@
 //   - crates/stream-guard  streamGuardNew/Feed/End/Check, streamGuardCorrection = stream-guard.cjs's
 //                          IncrementalValidator and buildCorrectionRequest; the validator state is
 //                          bytes held here between calls, nothing stays in the module (STREAM_GUARD_IMPL, #516/#704)
-//   - crates/gguf (node)   ggufSummary = gguf-meta.cjs summarize(readGguf(file)) over the byte
-//                          ranges the caller has read; file I/O stays in the JS (GGUF_META_IMPL)
+//   - crates/gguf (node)   ggufSummary = the summary of a GGUF header over the byte
+//                          ranges the caller has read; file I/O stays in gguf-meta.cjs (GGUF_META_IMPL, retired)
 //   - crates/policy-leaves authTokens = auth-tokens.cjs resolveAuthTokens (#294, a secret call);
 //                          toolPolicyMode/toolPolicySet = tool-policy.cjs's decision and set()
 //                          checks, the database stays in the JS (was POLICY_LEAVES_IMPL, retired #1071)
@@ -1180,7 +1180,7 @@ function s3Region(value) {
   return region;
 }
 
-// --- gguf-meta (GGUF_META_IMPL) ---------------------------------------------------------------
+// --- gguf-meta (GGUF_META_IMPL, retired in #1071: always on) ---------------------------------------------------------------
 // gguf::node::MAX_WINDOW_BYTES / MAX_SEGMENTS: the file bytes one call takes, in how many ranges.
 const MAX_GGUF_WINDOW_BYTES = 24 * 1024 * 1024;
 const MAX_GGUF_SEGMENTS = 512;
@@ -1207,8 +1207,7 @@ function ggufValue(v, depth = 0) {
 }
 /** Check a summary reply's shape and revive its numbers (exported for tests). */
 function ggufSummaryReply(s) {
-  // #1708: parameterCount (#1197) is present exactly when the JS summary has one, and comes first as
-  // there. Refusing it made every real header (all have tensors) unreadable on the Rust path.
+  // #1708: parameterCount (#1197) is present exactly when the summary has one, and comes first. Refusing it made every real header (all have tensors) unreadable on the Rust path.
   const counted = !!s && typeof s === 'object' && Object.hasOwn(s, 'parameterCount');
   if (!exactKeys(s, counted ? ['parameterCount', ...GGUF_SUMMARY_KEYS] : GGUF_SUMMARY_KEYS)) throw new DavParseError('gguf summary has unexpected keys', 'reply');
   if (typeof s.arch !== 'string' || typeof s.name !== 'string' || typeof s.hasChatTemplate !== 'boolean') throw new DavParseError('gguf summary has unexpected types', 'reply');
@@ -1231,10 +1230,10 @@ function ggufSummaryReply(s) {
   return out;
 }
 
-/** gguf-meta.cjs summarize(readGguf(file)) over `segments` ([{ off, bytes }], sorted, disjoint,
+/** The summary of a GGUF header (what gguf-meta.cjs's former JS reader returned) over `segments` ([{ off, bytes }], sorted, disjoint,
  *  non-empty byte ranges of a file of `size` bytes). Returns `{ summary }`, `{ need: { at, end } }`
  *  (read the file from `at` to at least `end`, as one range, and ask again) or `{ fail, value? }`
- *  (the error the JS throws). A refusal or a bad reply throws. */
+ *  (the error message gguf-meta.cjs throws). A refusal or a bad reply throws. */
 function ggufSummary(size, segments) {
   if (!Number.isSafeInteger(size) || size < 0 || !Array.isArray(segments)) throw new DavParseError('gguf input has the wrong type', 'input');
   if (segments.length > MAX_GGUF_SEGMENTS) throw new DavParseError('gguf input has too many ranges', 'too_large');
@@ -2240,13 +2239,14 @@ function llamacppPresetsModel(model) {
 // Every switch that runs this module (#996). Each reads its value as trim().toLowerCase().
 // Retired switches (#1071) are not listed: the Rust path they selected is always on, and
 // verifyAtStartup() always loads this module for it.
-const IMPL_FLAGS = ['STORAGE_PATH_IMPL', 'SECRET_ENVELOPE_IMPL', 'STREAM_GUARD_IMPL', 'GGUF_META_IMPL', 'ROLE_CONTEXT_IMPL', 'CODE_ACTIONS_IMPL', 'PROVIDER_EGRESS_IMPL', 'BROWSER_POLICY_IMPL', 'TOOL_GATE_IMPL', 'TOOLBOXES_PERMITTED_IMPL', 'LLAMACPP_PRESETS_IMPL'];
+const IMPL_FLAGS = ['STORAGE_PATH_IMPL', 'SECRET_ENVELOPE_IMPL', 'STREAM_GUARD_IMPL', 'ROLE_CONTEXT_IMPL', 'CODE_ACTIONS_IMPL', 'PROVIDER_EGRESS_IMPL', 'BROWSER_POLICY_IMPL', 'TOOL_GATE_IMPL', 'TOOLBOXES_PERMITTED_IMPL', 'LLAMACPP_PRESETS_IMPL'];
 
 /** Switches whose JS path was deleted once Rust had run in production (#1071). The old value that
  *  selected Rust ('wasm', or 'on' for the advisor) is accepted silently; anything else is ignored
  *  with one warning, because Rust is always used. */
 const RETIRED_FLAGS = { CHAT_TEMPLATE_CAPS_IMPL: 'wasm', AUTOTUNE_PLAN_IMPL: 'wasm', PRESET_RELOAD_IMPL: 'wasm', LAYA_LOAD_ADVISOR: 'on', DAV_PARSE_IMPL: 'wasm', S3_PARSE_IMPL: 'wasm', MCP_FRAME_IMPL: 'wasm', UPLOAD_SNIFF_IMPL: 'wasm', S3_SIGN_IMPL: 'wasm', PROMPT_FRAMING_IMPL: 'wasm', SSRF_IMPL: 'wasm',
   POLICY_LEAVES_IMPL: 'wasm', CODE_REVIEW_VERDICT_IMPL: 'wasm', TOOL_EXCHANGE_IMPL: 'wasm', DECISION_IMPL: 'wasm', COMPLETENESS_REPORT_IMPL: 'wasm', TASK_LIFECYCLE_IMPL: 'wasm', MCP_SERVERS_IMPL: 'wasm', CODE_NET_GUARD_IMPL: 'wasm', LLAMACPP_AUTOCONFIG_IMPL: 'wasm',
+  GGUF_META_IMPL: 'wasm',
   PROJECT_FILE_NAMES_IMPL: 'wasm' };
 
 /** Log one warning per retired switch that `env` still sets to something other than its old

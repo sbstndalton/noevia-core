@@ -1,4 +1,5 @@
 'use strict';
+const skipWasm = !require('node:fs').existsSync(process.env.DAV_PARSE_WASM || require('./dav-parse-wasm.cjs').DEFAULT_WASM) && process.env.DAV_PARSE_WASM_REQUIRED !== '1' && 'dav-parse.wasm not built';
 // #697: one model at a time within an inference memory budget. Synthetic GGUF headers, a fake
 // router and fake sysfs only; no model is ever loaded and no real engine is contacted.
 const test = require('node:test'), assert = require('node:assert/strict'), fs = require('node:fs'), os = require('node:os'), path = require('node:path');
@@ -204,7 +205,7 @@ test('a model that fits loads normally, and raising the budget lets the large on
   assert.equal((await manager.load('big')).ok, true);
 });
 
-test('an unbounded prompt cache is refused under any budget', async t => {
+test('an unbounded prompt cache is refused under any budget', { skip: skipWasm }, async t => {
   const { manager } = fixture(t, { section: '\n[open]\nmodel = /models/q.gguf\nctx-size = 4096\ncache-ram = -1\n', budget: 64, state: { open: 'unloaded' } });
   const r = await manager.load('open');
   assert.equal(r.status, 409); assert.match(r.body.error, /unbounded prompt cache/);
