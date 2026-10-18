@@ -1,4 +1,9 @@
 'use strict';
+// Needs dav-parse.wasm: provider egress is Rust-only since #1071. Skipped without it unless DAV_PARSE_WASM_REQUIRED=1.
+if (!require('node:fs').existsSync(process.env.DAV_PARSE_WASM || require('./dav-parse-wasm.cjs').DEFAULT_WASM) && process.env.DAV_PARSE_WASM_REQUIRED !== '1') {
+  require('node:test').test('needs dav-parse.wasm (not built)', { skip: 'dav-parse.wasm not built' }, () => {});
+  return;
+}
 // sbstndalton/noevia#1787: on the local gemma route the "high" effort is sent as a best-effort hint. The hint said
 // "Think through this step by step before answering.", and a model whose real thinking already goes to
 // reasoning_content (the thinking panel) then also wrote its working into the reply: a "Reasoning:" heading,

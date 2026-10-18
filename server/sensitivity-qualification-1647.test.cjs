@@ -1,4 +1,9 @@
 'use strict';
+// Needs dav-parse.wasm: provider egress is Rust-only since #1071. Skipped without it unless DAV_PARSE_WASM_REQUIRED=1.
+if (!require('node:fs').existsSync(process.env.DAV_PARSE_WASM || require('./dav-parse-wasm.cjs').DEFAULT_WASM) && process.env.DAV_PARSE_WASM_REQUIRED !== '1') {
+  require('node:test').test('needs dav-parse.wasm (not built)', { skip: 'dav-parse.wasm not built' }, () => {});
+  return;
+}
 // #1647: in Hybrid routing a "not sensitive" verdict may clear a turn for a cloud provider only when
 // the decision model that gave it is on the qualified list for the sensitivity decision, matched by
 // the identity the service reports (model id AND content revision), with its evidence at the bar.

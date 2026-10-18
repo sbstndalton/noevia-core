@@ -1,4 +1,9 @@
 'use strict';
+// Needs dav-parse.wasm: provider egress is Rust-only since #1071. Skipped without it unless DAV_PARSE_WASM_REQUIRED=1.
+if (!require('node:fs').existsSync(process.env.DAV_PARSE_WASM || require('./dav-parse-wasm.cjs').DEFAULT_WASM) && process.env.DAV_PARSE_WASM_REQUIRED !== '1') {
+  require('node:test').test('needs dav-parse.wasm (not built)', { skip: 'dav-parse.wasm not built' }, () => {});
+  return;
+}
 // #1520 / #1521 end to end: the system text the provider receives carries the connector and Web search
 // note for the message, and an ordinary message's system text gets no route note. Synthetic provider; no network.
 const test = require('node:test'), assert = require('node:assert/strict');

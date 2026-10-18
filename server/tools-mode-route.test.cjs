@@ -1,4 +1,9 @@
 'use strict';
+// Needs dav-parse.wasm: provider egress is Rust-only since #1071. Skipped without it unless DAV_PARSE_WASM_REQUIRED=1.
+if (!require('node:fs').existsSync(process.env.DAV_PARSE_WASM || require('./dav-parse-wasm.cjs').DEFAULT_WASM) && process.env.DAV_PARSE_WASM_REQUIRED !== '1') {
+  require('node:test').test('needs dav-parse.wasm (not built)', { skip: 'dav-parse.wasm not built' }, () => {});
+  return;
+}
 
 // #1550 end to end through the chat handler. In Automatic tools mode, a turn that the tool gate says needs a
 // tool, routed to a model whose chat template cannot take tools, goes to the first tool-capable role model with

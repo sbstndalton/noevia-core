@@ -1,4 +1,9 @@
 'use strict';
+// Needs dav-parse.wasm: provider egress is Rust-only since #1071. Skipped without it unless DAV_PARSE_WASM_REQUIRED=1.
+if (!require('node:fs').existsSync(process.env.DAV_PARSE_WASM || require('./dav-parse-wasm.cjs').DEFAULT_WASM) && process.env.DAV_PARSE_WASM_REQUIRED !== '1') {
+  require('node:test').test('needs dav-parse.wasm (not built)', { skip: 'dav-parse.wasm not built' }, () => {});
+  return;
+}
 // #1605 (after #1588): a source's file name is not ours to trust. The stored-only list and the image-source
 // notes put names into the system text; a quote or a newline in a name must not start a line of its own there.
 // Synthetic hostile names, provider and files; no network.

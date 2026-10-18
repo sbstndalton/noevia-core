@@ -1,4 +1,9 @@
 'use strict';
+// Needs dav-parse.wasm: provider egress is Rust-only since #1071. Skipped without it unless DAV_PARSE_WASM_REQUIRED=1.
+if (!require('node:fs').existsSync(process.env.DAV_PARSE_WASM || require('./dav-parse-wasm.cjs').DEFAULT_WASM) && process.env.DAV_PARSE_WASM_REQUIRED !== '1') {
+  require('node:test').test('needs dav-parse.wasm (not built)', { skip: 'dav-parse.wasm not built' }, () => {});
+  return;
+}
 // sbstndalton/noevia#1786: a generic request ("a three-day packing checklist") on a chat with Google Drive
 // connected. The tool gate answered "none", but the answering model was still offered the Drive tools with
 // nothing telling it they were not wanted, read a QA tag in the message as a file reference, searched Drive

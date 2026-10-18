@@ -1,4 +1,9 @@
 'use strict';
+// Needs dav-parse.wasm: provider egress is Rust-only since #1071. Skipped without it unless DAV_PARSE_WASM_REQUIRED=1.
+if (!require('node:fs').existsSync(process.env.DAV_PARSE_WASM || require('./dav-parse-wasm.cjs').DEFAULT_WASM) && process.env.DAV_PARSE_WASM_REQUIRED !== '1') {
+  require('node:test').test('needs dav-parse.wasm (not built)', { skip: 'dav-parse.wasm not built' }, () => {});
+  return;
+}
 // sbstndalton/noevia#1785: a chat kept its first message as its title for good ("QA-1015-T1 Say hello in one short
 // sentence." after 15 turns about trains). After the first reply of a local chat, the model that answered is asked
 // for a short title (thinking off), the client gets a `title` event, and the title is saved over the derived one only.

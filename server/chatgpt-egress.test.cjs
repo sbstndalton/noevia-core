@@ -1,4 +1,9 @@
 'use strict';
+// Needs dav-parse.wasm: provider egress is Rust-only since #1071. Skipped without it unless DAV_PARSE_WASM_REQUIRED=1.
+if (!require('node:fs').existsSync(process.env.DAV_PARSE_WASM || require('./dav-parse-wasm.cjs').DEFAULT_WASM) && process.env.DAV_PARSE_WASM_REQUIRED !== '1') {
+  require('node:test').test('needs dav-parse.wasm (not built)', { skip: 'dav-parse.wasm not built' }, () => {});
+  return;
+}
 // The chat loop on a Sign in with ChatGPT provider (#447), end to end through createChatHandler
 // with the real adapter and a fake OpenAI (*.fixture.invalid). Proves the external-provider rules
 // in provider-egress.cjs: flag off refuses, the OAuth bearer (not an apiKey) is on the wire, Diary

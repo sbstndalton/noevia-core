@@ -1,4 +1,9 @@
 'use strict';
+// Needs dav-parse.wasm: provider egress is Rust-only since #1071. Skipped without it unless DAV_PARSE_WASM_REQUIRED=1.
+if (!require('node:fs').existsSync(process.env.DAV_PARSE_WASM || require('./dav-parse-wasm.cjs').DEFAULT_WASM) && process.env.DAV_PARSE_WASM_REQUIRED !== '1') {
+  require('node:test').test('needs dav-parse.wasm (not built)', { skip: 'dav-parse.wasm not built' }, () => {});
+  return;
+}
 // #682: why System-One decisions fall back. The tool gate sent requests the private decision
 // service refuses (more than 8 options, labels over 120 characters, an option-head token budget),
 // so 157 of 158 decisions fell back as "no-backend-answered" in ~2 ms; supervision errors had no

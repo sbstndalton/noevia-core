@@ -1,4 +1,9 @@
 'use strict';
+// Needs dav-parse.wasm: provider egress is Rust-only since #1071. Skipped without it unless DAV_PARSE_WASM_REQUIRED=1.
+if (!require('node:fs').existsSync(process.env.DAV_PARSE_WASM || require('../dav-parse-wasm.cjs').DEFAULT_WASM) && process.env.DAV_PARSE_WASM_REQUIRED !== '1') {
+  require('node:test').test('needs dav-parse.wasm (not built)', { skip: 'dav-parse.wasm not built' }, () => {});
+  return;
+}
 // PUT /api/providers/:id (#535): editing a provider in place. A fake registry covers the policy
 // (who may edit which row, key kept vs replaced, the origin guard, contextTokens bounds); the last
 // tests run the real workspace store so the edit is proven on disk, key encrypted, across a reload.

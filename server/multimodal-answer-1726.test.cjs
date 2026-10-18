@@ -1,4 +1,9 @@
 'use strict';
+// Needs dav-parse.wasm: provider egress is Rust-only since #1071. Skipped without it unless DAV_PARSE_WASM_REQUIRED=1.
+if (!require('node:fs').existsSync(process.env.DAV_PARSE_WASM || require('./dav-parse-wasm.cjs').DEFAULT_WASM) && process.env.DAV_PARSE_WASM_REQUIRED !== '1') {
+  require('node:test').test('needs dav-parse.wasm (not built)', { skip: 'dav-parse.wasm not built' }, () => {});
+  return;
+}
 // #1726: what the chat model gets for a retrieved image. A model that can see gets the image; one that
 // cannot gets the image's own text, else a caption made once by the Vision role model, else its name
 // (said plainly); a cloud route gets nothing derived from it. Flag off: exactly the pre-#1726 path.
