@@ -1,4 +1,5 @@
 'use strict';
+const skipWasm = !require('node:fs').existsSync(process.env.DAV_PARSE_WASM || require('./dav-parse-wasm.cjs').DEFAULT_WASM) && process.env.DAV_PARSE_WASM_REQUIRED !== '1' && 'dav-parse.wasm not built';
 // createToolboxes with everything injected: no server boot, no data dir, no MCP.
 // toolbox.test.cjs and tool-permissions.test.cjs still exercise the same code
 // through index.cjs, so this file covers the seams that only the factory exposes:
@@ -133,7 +134,7 @@ test('#1603: get_current_time also returns the computed calendar facts for the z
   assert.match(await tools.executeToolCall(null, 'get_current_time', '{}'), /\| Calendar facts, computed by the server .*ISO week \d+ of \d{4}/);
 });
 
-test('the executor runs built-ins itself and hands MCP tools on with the project in scope', async () => {
+test('the executor runs built-ins itself and hands MCP tools on with the project in scope', { skip: skipWasm }, async () => {
   const t = build({ mcpBoxes: [box('nc', [tool('nc_notes_search_notes')])] });
   assert.match(await t.executeToolCall(null, 'get_current_time', '{}'), /^Current time: .* \| ISO: /);
   assert.match(await t.executeToolCall(null, 'get_current_time', '{"timezone":"Europe/Berlin"}'), /\(Europe\/Berlin\)/);

@@ -1,0 +1,5224 @@
+{
+ "version": 1,
+ "note": "Frozen answers of the former JS resolver (project-file-names.cjs resolveProjectFileJs, removed in #1071) for the rows of project-file-names.v1.json (same order; file = index into the names) and for the seeded projects of tests/server/project-file-names-differential.test.cjs (f<i> = file i, a<i,j> = ambiguous, m = missing, i = invalid). Do not regenerate through the Rust path.",
+ "rows": [
+  {
+   "file": 2
+  },
+  {
+   "file": 1
+  },
+  {
+   "file": 0
+  },
+  {
+   "file": 0
+  },
+  {
+   "file": 0
+  },
+  {
+   "code": "ambiguous",
+   "error": "\"SKILL.md\" matches more than one project file: Skills/writing/SKILL.md, Skills/review/SKILL.md. Pass the full name exactly as listed.",
+   "candidates": [
+    "Skills/writing/SKILL.md",
+    "Skills/review/SKILL.md"
+   ]
+  },
+  {
+   "file": 4
+  },
+  {
+   "file": 6
+  },
+  {
+   "code": "missing",
+   "error": "no project file named \"txt\". Available: noevia projects/Alpha/Text/notes.md, noevia projects/Alpha/Text/plan.md, notes.md, Docs/notes.md, Skills/writing/SKILL.md, Skills/review/SKILL.md, a.txt, x/a.txt.bak, deep/er/still/file.md, 日本語.md, Русский/файл.txt, café.md, 한국어.txt, カタカナ.md, dup.md, dup.md"
+  },
+  {
+   "file": 8
+  },
+  {
+   "file": 8
+  },
+  {
+   "file": 8
+  },
+  {
+   "file": 9
+  },
+  {
+   "file": 10
+  },
+  {
+   "file": 11
+  },
+  {
+   "file": 12
+  },
+  {
+   "file": 13
+  },
+  {
+   "file": 14
+  },
+  {
+   "code": "missing",
+   "error": "no project file named \"missing.md\". Available: noevia projects/Alpha/Text/notes.md, noevia projects/Alpha/Text/plan.md, notes.md, Docs/notes.md, Skills/writing/SKILL.md, Skills/review/SKILL.md, a.txt, x/a.txt.bak, deep/er/still/file.md, 日本語.md, Русский/файл.txt, café.md, 한국어.txt, カタカナ.md, dup.md, dup.md"
+  },
+  {
+   "code": "missing",
+   "error": "no project file named \"NOTES.MD\". Available: noevia projects/Alpha/Text/notes.md, noevia projects/Alpha/Text/plan.md, notes.md, Docs/notes.md, Skills/writing/SKILL.md, Skills/review/SKILL.md, a.txt, x/a.txt.bak, deep/er/still/file.md, 日本語.md, Русский/файл.txt, café.md, 한국어.txt, カタカナ.md, dup.md, dup.md"
+  },
+  {
+   "file": 2
+  },
+  {
+   "file": 2
+  },
+  {
+   "file": 2
+  },
+  {
+   "code": "invalid",
+   "error": "\"\" is not a usable project file name: a file name is required. Use a name exactly as listed."
+  },
+  {
+   "code": "invalid",
+   "error": "\"   \" is not a usable project file name: a file name is required. Use a name exactly as listed."
+  },
+  {
+   "code": "invalid",
+   "error": "\"../notes.md\" is not a usable project file name: a file name cannot contain empty, \".\" or \"..\" parts. Use a name exactly as listed."
+  },
+  {
+   "code": "invalid",
+   "error": "\"./notes.md\" is not a usable project file name: a file name cannot contain empty, \".\" or \"..\" parts. Use a name exactly as listed."
+  },
+  {
+   "code": "invalid",
+   "error": "\"Text/../notes.md\" is not a usable project file name: a file name cannot contain empty, \".\" or \"..\" parts. Use a name exactly as listed."
+  },
+  {
+   "code": "invalid",
+   "error": "\"Text//notes.md\" is not a usable project file name: a file name cannot contain empty, \".\" or \"..\" parts. Use a name exactly as listed."
+  },
+  {
+   "code": "invalid",
+   "error": "\"notes.md/\" is not a usable project file name: a file name cannot contain empty, \".\" or \"..\" parts. Use a name exactly as listed."
+  },
+  {
+   "code": "invalid",
+   "error": "\"/notes.md\" is not a usable project file name: a file name cannot be an absolute path. Use a name exactly as listed."
+  },
+  {
+   "code": "invalid",
+   "error": "\"C:/notes.md\" is not a usable project file name: a file name cannot be an absolute path. Use a name exactly as listed."
+  },
+  {
+   "code": "invalid",
+   "error": "\"c:/x\" is not a usable project file name: a file name cannot be an absolute path. Use a name exactly as listed."
+  },
+  {
+   "code": "missing",
+   "error": "no project file named \"C:notes.md\". Available: noevia projects/Alpha/Text/notes.md, noevia projects/Alpha/Text/plan.md, notes.md, Docs/notes.md, Skills/writing/SKILL.md, Skills/review/SKILL.md, a.txt, x/a.txt.bak, deep/er/still/file.md, 日本語.md, Русский/файл.txt, café.md, 한국어.txt, カタカナ.md, dup.md, dup.md"
+  },
+  {
+   "code": "invalid",
+   "error": "\"Text\\\\notes.md\" is not a usable project file name: a file name cannot contain backslashes. Use a name exactly as listed."
+  },
+  {
+   "code": "invalid",
+   "error": "\"notes\\u0000.md\" is not a usable project file name: a file name cannot contain control characters. Use a name exactly as listed."
+  },
+  {
+   "code": "invalid",
+   "error": "\"notes\\u001f.md\" is not a usable project file name: a file name cannot contain control characters. Use a name exactly as listed."
+  },
+  {
+   "code": "invalid",
+   "error": "\"notes.md\" is not a usable project file name: a file name cannot contain control characters. Use a name exactly as listed."
+  },
+  {
+   "code": "invalid",
+   "error": "\"%2e%2e/notes.md\" is not a usable project file name: a file name cannot contain encoded dots or separators. Use a name exactly as listed."
+  },
+  {
+   "code": "invalid",
+   "error": "\"%2Fetc\" is not a usable project file name: a file name cannot contain encoded dots or separators. Use a name exactly as listed."
+  },
+  {
+   "code": "invalid",
+   "error": "\"%5c\" is not a usable project file name: a file name cannot contain encoded dots or separators. Use a name exactly as listed."
+  },
+  {
+   "code": "invalid",
+   "error": "\"%00\" is not a usable project file name: a file name cannot contain encoded dots or separators. Use a name exactly as listed."
+  },
+  {
+   "code": "missing",
+   "error": "no project file named \"%2\". Available: noevia projects/Alpha/Text/notes.md, noevia projects/Alpha/Text/plan.md, notes.md, Docs/notes.md, Skills/writing/SKILL.md, Skills/review/SKILL.md, a.txt, x/a.txt.bak, deep/er/still/file.md, 日本語.md, Русский/файл.txt, café.md, 한국어.txt, カタカナ.md, dup.md, dup.md"
+  },
+  {
+   "code": "missing",
+   "error": "no project file named \"%41notes.md\". Available: noevia projects/Alpha/Text/notes.md, noevia projects/Alpha/Text/plan.md, notes.md, Docs/notes.md, Skills/writing/SKILL.md, Skills/review/SKILL.md, a.txt, x/a.txt.bak, deep/er/still/file.md, 日本語.md, Русский/файл.txt, café.md, 한국어.txt, カタカナ.md, dup.md, dup.md"
+  },
+  {
+   "code": "invalid",
+   "error": "\"..\" is not a usable project file name: a file name cannot contain empty, \".\" or \"..\" parts. Use a name exactly as listed."
+  },
+  {
+   "code": "invalid",
+   "error": "\".\" is not a usable project file name: a file name cannot contain empty, \".\" or \"..\" parts. Use a name exactly as listed."
+  },
+  {
+   "code": "invalid",
+   "error": "\"a/./b\" is not a usable project file name: a file name cannot contain empty, \".\" or \"..\" parts. Use a name exactly as listed."
+  },
+  {
+   "code": "missing",
+   "error": "no project file named \"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\". Available: noevia projects/Alpha/Text/notes.md, noevia projects/Alpha/Text/plan.md, notes.md, Docs/notes.md, Skills/writing/SKILL.md, Skills/review/SKILL.md, a.txt, x/a.txt.bak, deep/er/still/file.md, 日本語.md, Русский/файл.txt, café.md, 한국어.txt, カタカナ.md, dup.md, dup.md"
+  },
+  {
+   "code": "invalid",
+   "error": "\"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\" is not a usable project file name: that file name is too long. Use a name exactly as listed."
+  },
+  {
+   "code": "missing",
+   "error": "no project file named \" yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy\". Available: noevia projects/Alpha/Text/notes.md, noevia projects/Alpha/Text/plan.md, notes.md, Docs/notes.md, Skills/writing/SKILL.md, Skills/review/SKILL.md, a.txt, x/a.txt.bak, deep/er/still/file.md, 日本語.md, Русский/файл.txt, café.md, 한국어.txt, カタカナ.md, dup.md, dup.md"
+  },
+  {
+   "code": "invalid",
+   "error": "\"5\" is not a usable project file name: a file name is required. Use a name exactly as listed."
+  },
+  {
+   "code": "invalid",
+   "error": "\"\" is not a usable project file name: a file name is required. Use a name exactly as listed."
+  },
+  {
+   "code": "invalid",
+   "error": "\"\" is not a usable project file name: a file name is required. Use a name exactly as listed."
+  },
+  {
+   "code": "invalid",
+   "error": "\"true\" is not a usable project file name: a file name is required. Use a name exactly as listed."
+  },
+  {
+   "code": "invalid",
+   "error": "\"notes.md\" is not a usable project file name: a file name is required. Use a name exactly as listed."
+  },
+  {
+   "code": "invalid",
+   "error": "\"[object Object]\" is not a usable project file name: a file name is required. Use a name exactly as listed."
+  },
+  {
+   "file": 11
+  },
+  {
+   "code": "missing",
+   "error": "no project file named \"Café.md\". Available: noevia projects/Alpha/Text/notes.md, noevia projects/Alpha/Text/plan.md, notes.md, Docs/notes.md, Skills/writing/SKILL.md, Skills/review/SKILL.md, a.txt, x/a.txt.bak, deep/er/still/file.md, 日本語.md, Русский/файл.txt, café.md, 한국어.txt, カタカナ.md, dup.md, dup.md"
+  },
+  {
+   "code": "missing",
+   "error": "no project file named \"néè.md\". Available: noevia projects/Alpha/Text/notes.md, noevia projects/Alpha/Text/plan.md, notes.md, Docs/notes.md, Skills/writing/SKILL.md, Skills/review/SKILL.md, a.txt, x/a.txt.bak, deep/er/still/file.md, 日本語.md, Русский/файл.txt, café.md, 한국어.txt, カタカナ.md, dup.md, dup.md"
+  },
+  {
+   "code": "missing",
+   "error": "no project file named \"Text/café.md\". Available: noevia projects/Alpha/Text/notes.md, noevia projects/Alpha/Text/plan.md, notes.md, Docs/notes.md, Skills/writing/SKILL.md, Skills/review/SKILL.md, a.txt, x/a.txt.bak, deep/er/still/file.md, 日本語.md, Русский/файл.txt, café.md, 한국어.txt, カタカナ.md, dup.md, dup.md"
+  },
+  {
+   "code": "missing",
+   "error": "no project file named \"cafè.md\". Available: noevia projects/Alpha/Text/notes.md, noevia projects/Alpha/Text/plan.md, notes.md, Docs/notes.md, Skills/writing/SKILL.md, Skills/review/SKILL.md, a.txt, x/a.txt.bak, deep/er/still/file.md, 日本語.md, Русский/файл.txt, café.md, 한국어.txt, カタカナ.md, dup.md, dup.md"
+  },
+  {
+   "code": "missing",
+   "error": "no project file named \"notes.md́\". Available: noevia projects/Alpha/Text/notes.md, noevia projects/Alpha/Text/plan.md, notes.md, Docs/notes.md, Skills/writing/SKILL.md, Skills/review/SKILL.md, a.txt, x/a.txt.bak, deep/er/still/file.md, 日本語.md, Русский/файл.txt, café.md, 한국어.txt, カタカナ.md, dup.md, dup.md"
+  },
+  {
+   "code": "missing",
+   "error": "no project file named \"α.md\". Available: noevia projects/Alpha/Text/notes.md, noevia projects/Alpha/Text/plan.md, notes.md, Docs/notes.md, Skills/writing/SKILL.md, Skills/review/SKILL.md, a.txt, x/a.txt.bak, deep/er/still/file.md, 日本語.md, Русский/файл.txt, café.md, 한국어.txt, カタカナ.md, dup.md, dup.md"
+  },
+  {
+   "code": "missing",
+   "error": "no project file named \"א.md\". Available: noevia projects/Alpha/Text/notes.md, noevia projects/Alpha/Text/plan.md, notes.md, Docs/notes.md, Skills/writing/SKILL.md, Skills/review/SKILL.md, a.txt, x/a.txt.bak, deep/er/still/file.md, 日本語.md, Русский/файл.txt, café.md, 한국어.txt, カタカナ.md, dup.md, dup.md"
+  },
+  {
+   "code": "missing",
+   "error": "no project file named \"\\ud800.md\". Available: noevia projects/Alpha/Text/notes.md, noevia projects/Alpha/Text/plan.md, notes.md, Docs/notes.md, Skills/writing/SKILL.md, Skills/review/SKILL.md, a.txt, x/a.txt.bak, deep/er/still/file.md, 日本語.md, Русский/файл.txt, café.md, 한국어.txt, カタカナ.md, dup.md, dup.md"
+  },
+  {
+   "code": "missing",
+   "error": "no project file named \"cafǘ.md\". Available: noevia projects/Alpha/Text/notes.md, noevia projects/Alpha/Text/plan.md, notes.md, Docs/notes.md, Skills/writing/SKILL.md, Skills/review/SKILL.md, a.txt, x/a.txt.bak, deep/er/still/file.md, 日本語.md, Русский/файл.txt, café.md, 한국어.txt, カタカナ.md, dup.md, dup.md"
+  },
+  {
+   "code": "missing",
+   "error": "no project file named \"café́.md\". Available: noevia projects/Alpha/Text/notes.md, noevia projects/Alpha/Text/plan.md, notes.md, Docs/notes.md, Skills/writing/SKILL.md, Skills/review/SKILL.md, a.txt, x/a.txt.bak, deep/er/still/file.md, 日本語.md, Русский/файл.txt, café.md, 한국어.txt, カタカナ.md, dup.md, dup.md"
+  },
+  {
+   "code": "missing",
+   "error": "no project file named \"caféα.md\". Available: noevia projects/Alpha/Text/notes.md, noevia projects/Alpha/Text/plan.md, notes.md, Docs/notes.md, Skills/writing/SKILL.md, Skills/review/SKILL.md, a.txt, x/a.txt.bak, deep/er/still/file.md, 日本語.md, Русский/файл.txt, café.md, 한국어.txt, カタカナ.md, dup.md, dup.md"
+  },
+  {
+   "code": "missing",
+   "error": "no project file named \"caq́.md\". Available: noevia projects/Alpha/Text/notes.md, noevia projects/Alpha/Text/plan.md, notes.md, Docs/notes.md, Skills/writing/SKILL.md, Skills/review/SKILL.md, a.txt, x/a.txt.bak, deep/er/still/file.md, 日本語.md, Русский/файл.txt, café.md, 한국어.txt, カタカナ.md, dup.md, dup.md"
+  },
+  {
+   "code": "missing",
+   "error": "no project file named \"́notes.md\". Available: noevia projects/Alpha/Text/notes.md, noevia projects/Alpha/Text/plan.md, notes.md, Docs/notes.md, Skills/writing/SKILL.md, Skills/review/SKILL.md, a.txt, x/a.txt.bak, deep/er/still/file.md, 日本語.md, Русский/файл.txt, café.md, 한국어.txt, カタカナ.md, dup.md, dup.md"
+  },
+  {
+   "code": "missing",
+   "error": "no project file named \"cafẹ́.md\". Available: noevia projects/Alpha/Text/notes.md, noevia projects/Alpha/Text/plan.md, notes.md, Docs/notes.md, Skills/writing/SKILL.md, Skills/review/SKILL.md, a.txt, x/a.txt.bak, deep/er/still/file.md, 日本語.md, Русский/файл.txt, café.md, 한국어.txt, カタカナ.md, dup.md, dup.md"
+  },
+  {
+   "code": "missing",
+   "error": "no project file named \"notes.md\". Available: (none attached)"
+  },
+  {
+   "code": "missing",
+   "error": "no project file named \"plan.md\". Available: (none attached)"
+  },
+  {
+   "code": "missing",
+   "error": "no project file named \"Text/notes.md\". Available: (none attached)"
+  },
+  {
+   "code": "missing",
+   "error": "no project file named \"Alpha/Text/notes.md\". Available: (none attached)"
+  },
+  {
+   "code": "missing",
+   "error": "no project file named \"noevia projects/Alpha/Text/notes.md\". Available: (none attached)"
+  },
+  {
+   "code": "missing",
+   "error": "no project file named \"SKILL.md\". Available: (none attached)"
+  },
+  {
+   "code": "missing",
+   "error": "no project file named \"writing/SKILL.md\". Available: (none attached)"
+  },
+  {
+   "code": "missing",
+   "error": "no project file named \"a.txt\". Available: (none attached)"
+  },
+  {
+   "code": "missing",
+   "error": "no project file named \"txt\". Available: (none attached)"
+  },
+  {
+   "code": "missing",
+   "error": "no project file named \"file.md\". Available: (none attached)"
+  },
+  {
+   "code": "missing",
+   "error": "no project file named \"still/file.md\". Available: (none attached)"
+  },
+  {
+   "code": "missing",
+   "error": "no project file named \"er/still/file.md\". Available: (none attached)"
+  },
+  {
+   "code": "missing",
+   "error": "no project file named \"日本語.md\". Available: (none attached)"
+  },
+  {
+   "code": "missing",
+   "error": "no project file named \"файл.txt\". Available: (none attached)"
+  },
+  {
+   "code": "missing",
+   "error": "no project file named \"café.md\". Available: (none attached)"
+  },
+  {
+   "code": "missing",
+   "error": "no project file named \"한국어.txt\". Available: (none attached)"
+  },
+  {
+   "code": "missing",
+   "error": "no project file named \"カタカナ.md\". Available: (none attached)"
+  },
+  {
+   "code": "missing",
+   "error": "no project file named \"dup.md\". Available: (none attached)"
+  },
+  {
+   "code": "missing",
+   "error": "no project file named \"missing.md\". Available: (none attached)"
+  },
+  {
+   "code": "missing",
+   "error": "no project file named \"NOTES.MD\". Available: (none attached)"
+  },
+  {
+   "code": "missing",
+   "error": "no project file named \" notes.md \". Available: (none attached)"
+  },
+  {
+   "code": "missing",
+   "error": "no project file named \"\\tnotes.md\\n\". Available: (none attached)"
+  },
+  {
+   "code": "missing",
+   "error": "no project file named \" notes.md　\". Available: (none attached)"
+  },
+  {
+   "code": "invalid",
+   "error": "\"\" is not a usable project file name: a file name is required. Use a name exactly as listed."
+  },
+  {
+   "code": "invalid",
+   "error": "\"   \" is not a usable project file name: a file name is required. Use a name exactly as listed."
+  },
+  {
+   "file": 1
+  },
+  {
+   "file": 0
+  },
+  {
+   "code": "ambiguous",
+   "error": "\"a.md\" matches more than one project file: x/a.md, x/a.md. Pass the full name exactly as listed.",
+   "candidates": [
+    "x/a.md",
+    "x/a.md"
+   ]
+  },
+  {
+   "file": 2
+  },
+  {
+   "file": 1
+  },
+  {
+   "file": 1
+  },
+  {
+   "file": 0
+  },
+  {
+   "code": "missing",
+   "error": "no project file named \"A.md\". Available: a.md"
+  },
+  {
+   "file": 0
+  },
+  {
+   "file": 0
+  },
+  {
+   "file": 1
+  },
+  {
+   "file": 0
+  },
+  {
+   "file": 1
+  },
+  {
+   "code": "missing",
+   "error": "no project file named \"Ａ/P.pdf\". Available: -/noevia projects/v1.2.MD, b.md, —.txt, é/noevia projects/P"
+  },
+  {
+   "file": 2
+  },
+  {
+   "code": "missing",
+   "error": "no project file named \"a/é/b.pdf\". Available: Text.MD"
+  },
+  {
+   "file": 3
+  },
+  {
+   "code": "missing",
+   "error": "no project file named \"_.md\". Available: notes/Skills/файл, é/-/notes.pdf"
+  },
+  {
+   "file": 2
+  },
+  {
+   "file": 5
+  },
+  {
+   "file": 0
+  },
+  {
+   "file": 2
+  },
+  {
+   "file": 1
+  },
+  {
+   "code": "invalid",
+   "error": "\"C:/a.md\" is not a usable project file name: a file name cannot be an absolute path. Use a name exactly as listed."
+  },
+  {
+   "code": "missing",
+   "error": "no project file named \"b/café\". Available: _/notes.md, é/файл/a.txt, файл.md, a/notes/日本.pdf"
+  },
+  {
+   "code": "invalid",
+   "error": "\"C:/日本.MD\" is not a usable project file name: a file name cannot be an absolute path. Use a name exactly as listed."
+  },
+  {
+   "file": 1
+  },
+  {
+   "file": 0
+  },
+  {
+   "code": "invalid",
+   "error": "\" ./-.MD\\t\" is not a usable project file name: a file name cannot contain empty, \".\" or \"..\" parts. Use a name exactly as listed."
+  },
+  {
+   "file": 1
+  },
+  {
+   "file": 3
+  },
+  {
+   "file": 1
+  },
+  {
+   "file": 2
+  },
+  {
+   "code": "invalid",
+   "error": "\"./b.txt\" is not a usable project file name: a file name cannot contain empty, \".\" or \"..\" parts. Use a name exactly as listed."
+  },
+  {
+   "code": "missing",
+   "error": "no project file named \"файл.MD\". Available: Skills/é.md"
+  },
+  {
+   "code": "missing",
+   "error": "no project file named \"😀/P/v1.2\". Available: Skills/x y.pdf, файл/P.txt, P/日本.pdf, é.txt, a"
+  },
+  {
+   "file": 0
+  },
+  {
+   "file": 0
+  },
+  {
+   "code": "missing",
+   "error": "no project file named \"_.pdf\". Available: P/notes/—"
+  },
+  {
+   "code": "missing",
+   "error": "no project file named \"Text/—.MD\". Available: 😀/файл/αβ.md"
+  },
+  {
+   "code": "invalid",
+   "error": "\"./Text.pdf\" is not a usable project file name: a file name cannot contain empty, \".\" or \"..\" parts. Use a name exactly as listed."
+  },
+  {
+   "file": 2
+  },
+  {
+   "file": 0
+  },
+  {
+   "code": "missing",
+   "error": "no project file named \"_/a/αβ.MD\". Available: notes, b.pdf, Skills.pdf, v1.2/한/é, P/café.pdf, Text/Ａ/αβ.pdf"
+  },
+  {
+   "code": "missing",
+   "error": "no project file named \"😀\". Available: —.txt, _, файл/_/v1.2.pdf, _/café/αβ.md, —/—/Skills, b/-, _"
+  },
+  {
+   "file": 1
+  },
+  {
+   "file": 0
+  },
+  {
+   "code": "invalid",
+   "error": "\"./файл/x y.pdf\" is not a usable project file name: a file name cannot contain empty, \".\" or \"..\" parts. Use a name exactly as listed."
+  },
+  {
+   "code": "missing",
+   "error": "no project file named \"é/x y.MD\". Available: P.pdf, файл/v1.2/x y"
+  },
+  {
+   "file": 1
+  },
+  {
+   "code": "invalid",
+   "error": "\"/x/b.MD\" is not a usable project file name: a file name cannot be an absolute path. Use a name exactly as listed."
+  },
+  {
+   "code": "missing",
+   "error": "no project file named \"b/файл\". Available: (none attached)"
+  },
+  {
+   "file": 1
+  },
+  {
+   "file": 0
+  },
+  {
+   "file": 0
+  },
+  {
+   "file": 1
+  },
+  {
+   "file": 4
+  },
+  {
+   "file": 0
+  },
+  {
+   "file": 1
+  },
+  {
+   "file": 2
+  },
+  {
+   "file": 0
+  },
+  {
+   "code": "invalid",
+   "error": "\"%2e/P.pdf\" is not a usable project file name: a file name cannot contain encoded dots or separators. Use a name exactly as listed."
+  },
+  {
+   "file": 0
+  },
+  {
+   "file": 5
+  },
+  {
+   "code": "invalid",
+   "error": "\"C:/한/-/😀.txt\" is not a usable project file name: a file name cannot be an absolute path. Use a name exactly as listed."
+  },
+  {
+   "code": "missing",
+   "error": "no project file named \"P.md\". Available: a.pdf, notes/Skills/-.md, café/v1.2.pdf, é/noevia projects.pdf, b/v1.2.txt, 😀/x y.txt"
+  },
+  {
+   "code": "invalid",
+   "error": "\"/x/_/café/a\" is not a usable project file name: a file name cannot be an absolute path. Use a name exactly as listed."
+  },
+  {
+   "file": 2
+  },
+  {
+   "file": 0
+  },
+  {
+   "code": "missing",
+   "error": "no project file named \"noevia projects.pdf\". Available: Skills.pdf, 한/日本/한, v1.2.txt, _/😀/é.pdf, P/noevia projects.md, café.pdf, é/é/Skills/-.pdf"
+  },
+  {
+   "file": 7
+  },
+  {
+   "code": "missing",
+   "error": "no project file named \"αβ/x y/-.md\". Available: b/日本.txt, _"
+  },
+  {
+   "code": "invalid",
+   "error": "\"%2e/日本/P/Skills.txt\" is not a usable project file name: a file name cannot contain encoded dots or separators. Use a name exactly as listed."
+  },
+  {
+   "file": 1
+  },
+  {
+   "code": "invalid",
+   "error": "\"../😀.md\" is not a usable project file name: a file name cannot contain empty, \".\" or \"..\" parts. Use a name exactly as listed."
+  },
+  {
+   "file": 3
+  },
+  {
+   "file": 4
+  },
+  {
+   "file": 3
+  },
+  {
+   "code": "invalid",
+   "error": "\"/x/Ａ/😀/αβ\" is not a usable project file name: a file name cannot be an absolute path. Use a name exactly as listed."
+  },
+  {
+   "code": "missing",
+   "error": "no project file named \"noevia projects.txt\". Available: 😀.txt, —/_.MD, b.md, 😀/a/P.txt, x y/한, é/한.txt"
+  },
+  {
+   "file": 2
+  },
+  {
+   "code": "invalid",
+   "error": "\"../x y/한.md\" is not a usable project file name: a file name cannot contain empty, \".\" or \"..\" parts. Use a name exactly as listed."
+  },
+  {
+   "code": "missing",
+   "error": "no project file named \"日本/_\". Available: a/файл/x y.MD, P/😀/—.pdf, Text.md, café/😀/x y, Ａ.txt, 한/v1.2/한.txt, é/Text.txt"
+  },
+  {
+   "code": "missing",
+   "error": "no project file named \"Skills/日本.md\". Available: (none attached)"
+  },
+  {
+   "file": 4
+  },
+  {
+   "file": 0
+  },
+  {
+   "file": 1
+  },
+  {
+   "code": "invalid",
+   "error": "\" /日本/noevia projects\\t\" is not a usable project file name: a file name cannot be an absolute path. Use a name exactly as listed."
+  },
+  {
+   "file": 0
+  },
+  {
+   "code": "missing",
+   "error": "no project file named \"日本/Ａ.MD\". Available: P/файл.MD, b.md"
+  },
+  {
+   "file": 0
+  },
+  {
+   "code": "invalid",
+   "error": "\"./é/a.md\" is not a usable project file name: a file name cannot contain empty, \".\" or \"..\" parts. Use a name exactly as listed."
+  },
+  {
+   "file": 2
+  },
+  {
+   "file": 0
+  },
+  {
+   "file": 2
+  },
+  {
+   "file": 0
+  },
+  {
+   "code": "missing",
+   "error": "no project file named \"😀/日本.md\". Available: a/notes.md, v1.2.pdf, é/b/-.txt"
+  },
+  {
+   "file": 1
+  },
+  {
+   "code": "invalid",
+   "error": "\"../файл/x y/-\" is not a usable project file name: a file name cannot contain empty, \".\" or \"..\" parts. Use a name exactly as listed."
+  },
+  {
+   "code": "missing",
+   "error": "no project file named \" é/日本/P.txt\\t\". Available: 😀"
+  },
+  {
+   "code": "invalid",
+   "error": "\"%2e/_/café/a.txt\" is not a usable project file name: a file name cannot contain encoded dots or separators. Use a name exactly as listed."
+  },
+  {
+   "code": "missing",
+   "error": "no project file named \" Ａ/файл/日本.MD\\t\". Available: b, notes.pdf, café/a.md, a"
+  },
+  {
+   "file": 4
+  },
+  {
+   "code": "invalid",
+   "error": "\"../noevia projects/-.txt\" is not a usable project file name: a file name cannot contain empty, \".\" or \"..\" parts. Use a name exactly as listed."
+  },
+  {
+   "file": 2
+  },
+  {
+   "code": "invalid",
+   "error": "\"/x/v1.2.pdf\" is not a usable project file name: a file name cannot be an absolute path. Use a name exactly as listed."
+  },
+  {
+   "code": "missing",
+   "error": "no project file named \" файл/noevia projects\\t\". Available: a/v1.2.MD, notes/한.txt, P/noevia projects.md, notes/—/😀.md, notes/é"
+  },
+  {
+   "file": 1
+  },
+  {
+   "file": 3
+  },
+  {
+   "code": "missing",
+   "error": "no project file named \"a/café/v1.2\". Available: (none attached)"
+  },
+  {
+   "file": 1
+  },
+  {
+   "file": 4
+  },
+  {
+   "file": 3
+  },
+  {
+   "file": 3
+  },
+  {
+   "code": "missing",
+   "error": "no project file named \"😀/é.md\". Available: é.MD"
+  },
+  {
+   "file": 4
+  },
+  {
+   "file": 2
+  },
+  {
+   "file": 2
+  },
+  {
+   "file": 1
+  },
+  {
+   "file": 2
+  },
+  {
+   "file": 0
+  },
+  {
+   "file": 4
+  },
+  {
+   "file": 2
+  },
+  {
+   "file": 2
+  },
+  {
+   "file": 1
+  },
+  {
+   "code": "missing",
+   "error": "no project file named \"한/—.MD\". Available: a/Skills/αβ.MD, b/Text/-, —/a.pdf, café/notes/b.md, a, _, notes/Ａ.pdf"
+  },
+  {
+   "file": 1
+  },
+  {
+   "code": "invalid",
+   "error": "\"C:/日本/файл/😀.pdf\" is not a usable project file name: a file name cannot be an absolute path. Use a name exactly as listed."
+  },
+  {
+   "code": "missing",
+   "error": "no project file named \"Skills/café\". Available: _, _/Text/—.pdf, v1.2"
+  },
+  {
+   "file": 0
+  },
+  {
+   "code": "invalid",
+   "error": "\"%2e/файл.MD\" is not a usable project file name: a file name cannot contain encoded dots or separators. Use a name exactly as listed."
+  },
+  {
+   "code": "missing",
+   "error": "no project file named \"notes/b\". Available: Skills/café.md, _/😀/😀.pdf, P/Ａ/-.pdf, 😀/Skills.pdf, x y.MD, P/😀.MD, Text/😀"
+  },
+  {
+   "file": 3
+  },
+  {
+   "file": 0
+  },
+  {
+   "code": "missing",
+   "error": "no project file named \"a.md\". Available: x y.txt, noevia projects.pdf, x y/Ａ/notes.pdf"
+  },
+  {
+   "file": 1
+  },
+  {
+   "code": "invalid",
+   "error": "\"/x/notes/—/Skills.txt\" is not a usable project file name: a file name cannot be an absolute path. Use a name exactly as listed."
+  },
+  {
+   "code": "invalid",
+   "error": "\"../файл.pdf\" is not a usable project file name: a file name cannot contain empty, \".\" or \"..\" parts. Use a name exactly as listed."
+  },
+  {
+   "code": "missing",
+   "error": "no project file named \"Text/한/한.MD\". Available: a, файл/noevia projects/—.txt, -/noevia projects.txt"
+  },
+  {
+   "file": 1
+  },
+  {
+   "file": 0
+  },
+  {
+   "code": "invalid",
+   "error": "\"/x y.md\" is not a usable project file name: a file name cannot be an absolute path. Use a name exactly as listed."
+  },
+  {
+   "file": 0
+  },
+  {
+   "file": 0
+  },
+  {
+   "file": 2
+  },
+  {
+   "file": 5
+  },
+  {
+   "file": 4
+  },
+  {
+   "file": 4
+  },
+  {
+   "file": 2
+  },
+  {
+   "file": 2
+  },
+  {
+   "code": "invalid",
+   "error": "\"%2e/😀\" is not a usable project file name: a file name cannot contain encoded dots or separators. Use a name exactly as listed."
+  },
+  {
+   "file": 1
+  },
+  {
+   "code": "missing",
+   "error": "no project file named \"日本/файл/—.pdf\". Available: a/😀"
+  },
+  {
+   "file": 0
+  },
+  {
+   "code": "invalid",
+   "error": "\"../v1.2/Skills/Ａ\" is not a usable project file name: a file name cannot contain empty, \".\" or \"..\" parts. Use a name exactly as listed."
+  },
+  {
+   "file": 3
+  },
+  {
+   "file": 1
+  },
+  {
+   "code": "invalid",
+   "error": "\"./—.txt\" is not a usable project file name: a file name cannot contain empty, \".\" or \"..\" parts. Use a name exactly as listed."
+  },
+  {
+   "file": 4
+  },
+  {
+   "code": "invalid",
+   "error": "\"%2e/αβ/_.pdf\" is not a usable project file name: a file name cannot contain encoded dots or separators. Use a name exactly as listed."
+  },
+  {
+   "code": "invalid",
+   "error": "\"%2e/日本/한/v1.2.txt\" is not a usable project file name: a file name cannot contain encoded dots or separators. Use a name exactly as listed."
+  },
+  {
+   "file": 2
+  },
+  {
+   "file": 0
+  },
+  {
+   "file": 3
+  },
+  {
+   "file": 0
+  },
+  {
+   "code": "missing",
+   "error": "no project file named \" _.MD\\t\". Available: (none attached)"
+  },
+  {
+   "code": "invalid",
+   "error": "\"C:/v1.2/a/notes\" is not a usable project file name: a file name cannot be an absolute path. Use a name exactly as listed."
+  },
+  {
+   "file": 5
+  },
+  {
+   "code": "invalid",
+   "error": "\"../a.md\" is not a usable project file name: a file name cannot contain empty, \".\" or \"..\" parts. Use a name exactly as listed."
+  },
+  {
+   "code": "invalid",
+   "error": "\" /-/a.md\\t\" is not a usable project file name: a file name cannot be an absolute path. Use a name exactly as listed."
+  },
+  {
+   "file": 0
+  },
+  {
+   "code": "missing",
+   "error": "no project file named \" 한/Skills.md\\t\". Available: b.md, Skills/日本/noevia projects.md, —"
+  },
+  {
+   "code": "missing",
+   "error": "no project file named \"_/한\". Available: (none attached)"
+  },
+  {
+   "file": 0
+  },
+  {
+   "code": "invalid",
+   "error": "\"../P/v1.2.md\" is not a usable project file name: a file name cannot contain empty, \".\" or \"..\" parts. Use a name exactly as listed."
+  },
+  {
+   "file": 1
+  },
+  {
+   "code": "missing",
+   "error": "no project file named \" Skills/한.MD\\t\". Available: -/a/a.md, 日本.pdf, 日本.md, a/b/_.MD, Text.pdf, café/noevia projects/한.MD"
+  },
+  {
+   "code": "missing",
+   "error": "no project file named \"Skills/한.txt\". Available: b/noevia projects/αβ.txt, notes/b/файл.pdf, é/v1.2.txt"
+  },
+  {
+   "code": "missing",
+   "error": "no project file named \"αβ/αβ/é.pdf\". Available: x y/Text.txt"
+  },
+  {
+   "file": 2
+  },
+  {
+   "file": 1
+  },
+  {
+   "file": 3
+  },
+  {
+   "code": "missing",
+   "error": "no project file named \" noevia projects/b.txt\\t\". Available: Ａ/😀/Ａ.txt, a/v1.2/Ａ, αβ"
+  },
+  {
+   "code": "missing",
+   "error": "no project file named \"café/notes/notes.txt\". Available: é/x y/_, Skills.txt, P.MD, Skills/x y/Skills.pdf"
+  },
+  {
+   "file": 0
+  },
+  {
+   "code": "missing",
+   "error": "no project file named \" noevia projects/é/é.md\\t\". Available: 日本, b.md, Ａ.md, —/noevia projects/Ａ"
+  },
+  {
+   "file": 0
+  },
+  {
+   "file": 3
+  },
+  {
+   "code": "missing",
+   "error": "no project file named \"x y/_/файл.txt\". Available: é/Ａ.txt, αβ/notes.MD, —.pdf"
+  },
+  {
+   "code": "invalid",
+   "error": "\"./x y/-/Ａ.md\" is not a usable project file name: a file name cannot contain empty, \".\" or \"..\" parts. Use a name exactly as listed."
+  },
+  {
+   "file": 6
+  },
+  {
+   "code": "missing",
+   "error": "no project file named \"Text\". Available: café/Text/-.md, 日本.pdf, файл.MD, café/P/v1.2, -.md, notes.pdf"
+  },
+  {
+   "code": "missing",
+   "error": "no project file named \"Ａ/файл/日本.txt\". Available: b/v1.2/日本.pdf, P.MD, Skills.MD, P/😀/—.MD, é/é/x y.MD"
+  },
+  {
+   "code": "invalid",
+   "error": "\"%2e/Ａ/_/😀.md\" is not a usable project file name: a file name cannot contain encoded dots or separators. Use a name exactly as listed."
+  },
+  {
+   "file": 0
+  },
+  {
+   "file": 0
+  },
+  {
+   "file": 5
+  },
+  {
+   "file": 4
+  },
+  {
+   "file": 1
+  },
+  {
+   "file": 0
+  },
+  {
+   "code": "invalid",
+   "error": "\"%2e/Skills/файл\" is not a usable project file name: a file name cannot contain encoded dots or separators. Use a name exactly as listed."
+  },
+  {
+   "file": 0
+  },
+  {
+   "code": "invalid",
+   "error": "\"%2e/b/b\" is not a usable project file name: a file name cannot contain encoded dots or separators. Use a name exactly as listed."
+  },
+  {
+   "code": "missing",
+   "error": "no project file named \"b/αβ/_.txt\". Available: 日本/café/P.md, файл/a, P.md, b/v1.2.md"
+  },
+  {
+   "code": "missing",
+   "error": "no project file named \"-.pdf\". Available: notes.txt, αβ.pdf, Ａ/—/v1.2.txt, 한.pdf, Text, noevia projects.txt"
+  },
+  {
+   "file": 1
+  },
+  {
+   "code": "missing",
+   "error": "no project file named \"v1.2.pdf\". Available: P/b.txt"
+  },
+  {
+   "code": "missing",
+   "error": "no project file named \"한/a.md\". Available: v1.2.pdf, αβ.md, αβ/café.md, Ａ/café/café.pdf, файл/café/notes.MD, Ａ.MD"
+  },
+  {
+   "file": 2
+  },
+  {
+   "file": 0
+  },
+  {
+   "file": 6
+  },
+  {
+   "file": 0
+  },
+  {
+   "file": 4
+  },
+  {
+   "file": 0
+  },
+  {
+   "code": "invalid",
+   "error": "\"/x/Ａ/日本/файл.MD\" is not a usable project file name: a file name cannot be an absolute path. Use a name exactly as listed."
+  },
+  {
+   "file": 1
+  },
+  {
+   "code": "invalid",
+   "error": "\"../noevia projects/b/é.md\" is not a usable project file name: a file name cannot contain empty, \".\" or \"..\" parts. Use a name exactly as listed."
+  },
+  {
+   "file": 0
+  },
+  {
+   "file": 2
+  },
+  {
+   "file": 0
+  },
+  {
+   "code": "invalid",
+   "error": "\"../файл/-.md\" is not a usable project file name: a file name cannot contain empty, \".\" or \"..\" parts. Use a name exactly as listed."
+  },
+  {
+   "code": "missing",
+   "error": "no project file named \"é/Text/Ａ.txt\". Available: noevia projects/αβ.pdf, Skills/v1.2.pdf, café.txt, 😀/noevia projects.MD"
+  },
+  {
+   "file": 2
+  },
+  {
+   "code": "invalid",
+   "error": "\"/файл/файл/notes.MD\" is not a usable project file name: a file name cannot be an absolute path. Use a name exactly as listed."
+  },
+  {
+   "code": "missing",
+   "error": "no project file named \"notes/_/_\". Available: x y/notes.txt, 한.md, noevia projects/😀/b.txt, —.txt, -/x y/b.pdf, Text.md"
+  },
+  {
+   "file": 1
+  },
+  {
+   "file": 2
+  },
+  {
+   "code": "missing",
+   "error": "no project file named \"한/_/Skills.MD\". Available: 😀.MD, Ａ/Ａ/😀.pdf"
+  },
+  {
+   "code": "invalid",
+   "error": "\"./notes/a/αβ\" is not a usable project file name: a file name cannot contain empty, \".\" or \"..\" parts. Use a name exactly as listed."
+  },
+  {
+   "file": 2
+  },
+  {
+   "code": "missing",
+   "error": "no project file named \"a/αβ/v1.2.MD\". Available: (none attached)"
+  },
+  {
+   "file": 0
+  },
+  {
+   "code": "invalid",
+   "error": "\"/x/notes/café.MD\" is not a usable project file name: a file name cannot be an absolute path. Use a name exactly as listed."
+  },
+  {
+   "code": "missing",
+   "error": "no project file named \"-/日本.MD\". Available: Text, -.txt"
+  },
+  {
+   "code": "missing",
+   "error": "no project file named \"файл/файл.pdf\". Available: x y/файл.txt, v1.2/한.pdf, 한/_.md, -.MD"
+  },
+  {
+   "file": 5
+  },
+  {
+   "code": "missing",
+   "error": "no project file named \"한/v1.2/café.md\". Available: café/αβ/Skills.md, -.txt, αβ/b.pdf, x y/noevia projects.md"
+  },
+  {
+   "code": "missing",
+   "error": "no project file named \"Text/b.MD\". Available: -/a/日本, P/—.pdf, é/Text.md"
+  },
+  {
+   "file": 4
+  },
+  {
+   "file": 2
+  },
+  {
+   "code": "missing",
+   "error": "no project file named \"Ａ/Ａ/Skills\". Available: v1.2/P.pdf, é/P.MD"
+  },
+  {
+   "file": 4
+  },
+  {
+   "code": "missing",
+   "error": "no project file named \" -\\t\". Available: é/Ａ/Text/P.md"
+  },
+  {
+   "file": 1
+  },
+  {
+   "file": 0
+  },
+  {
+   "code": "missing",
+   "error": "no project file named \"é/_/Text.pdf\". Available: café/Ａ.MD, notes/v1.2/noevia projects.MD"
+  },
+  {
+   "file": 0
+  },
+  {
+   "code": "missing",
+   "error": "no project file named \"한.md\". Available: é/b/b/_"
+  },
+  {
+   "file": 0
+  },
+  {
+   "file": 1
+  },
+  {
+   "code": "invalid",
+   "error": "\"/x/한/한\" is not a usable project file name: a file name cannot be an absolute path. Use a name exactly as listed."
+  },
+  {
+   "code": "missing",
+   "error": "no project file named \"日本.txt\". Available: noevia projects/Ａ.pdf, v1.2/Ａ/_.md, 한/Ａ/日本.pdf, —.md, é/αβ.txt, Ａ.txt, _/x y/한.md"
+  },
+  {
+   "file": 0
+  },
+  {
+   "file": 0
+  },
+  {
+   "code": "missing",
+   "error": "no project file named \"-/Ａ/αβ.md\". Available: Text/a/日本.MD"
+  },
+  {
+   "file": 2
+  },
+  {
+   "code": "invalid",
+   "error": "\"/αβ/Text/😀.pdf\" is not a usable project file name: a file name cannot be an absolute path. Use a name exactly as listed."
+  },
+  {
+   "file": 0
+  },
+  {
+   "file": 3
+  },
+  {
+   "file": 0
+  },
+  {
+   "code": "missing",
+   "error": "no project file named \"x y/notes.md\". Available: b.txt, Skills/_.md, v1.2/notes/v1.2.MD, 日本.MD, —/café/b.MD, noevia projects.pdf"
+  },
+  {
+   "code": "invalid",
+   "error": "\"%2e/Ａ/v1.2/-.MD\" is not a usable project file name: a file name cannot contain encoded dots or separators. Use a name exactly as listed."
+  },
+  {
+   "file": 0
+  },
+  {
+   "file": 6
+  },
+  {
+   "file": 2
+  },
+  {
+   "file": 0
+  },
+  {
+   "file": 1
+  },
+  {
+   "file": 5
+  },
+  {
+   "code": "invalid",
+   "error": "\"C:/café/αβ\" is not a usable project file name: a file name cannot be an absolute path. Use a name exactly as listed."
+  },
+  {
+   "code": "missing",
+   "error": "no project file named \"файл\". Available: P/—.pdf, notes.MD, notes.md, noevia projects.md"
+  },
+  {
+   "code": "invalid",
+   "error": "\"/한/😀/—.md\" is not a usable project file name: a file name cannot be an absolute path. Use a name exactly as listed."
+  },
+  {
+   "file": 3
+  },
+  {
+   "code": "missing",
+   "error": "no project file named \"-/Ａ.txt\". Available: —.MD, Text/-, P, 😀/файл.txt, é/日本/v1.2.md, x y/a.md, a/é/noevia projects.pdf"
+  },
+  {
+   "file": 0
+  },
+  {
+   "file": 3
+  },
+  {
+   "code": "invalid",
+   "error": "\"../é/Ａ/x y.pdf\" is not a usable project file name: a file name cannot contain empty, \".\" or \"..\" parts. Use a name exactly as listed."
+  },
+  {
+   "file": 0
+  },
+  {
+   "code": "invalid",
+   "error": "\"./αβ.md\" is not a usable project file name: a file name cannot contain empty, \".\" or \"..\" parts. Use a name exactly as listed."
+  },
+  {
+   "code": "missing",
+   "error": "no project file named \"한.pdf\". Available: é/Ａ.md, 한/notes/файл, 日本/—/x y.md, —.md"
+  },
+  {
+   "code": "missing",
+   "error": "no project file named \"x y/a.md\". Available: café/b.md, αβ, αβ.pdf, -/-/café, _/b.md, 😀/_/αβ.txt, —/é/αβ.md"
+  },
+  {
+   "file": 3
+  },
+  {
+   "file": 1
+  },
+  {
+   "file": 1
+  },
+  {
+   "file": 4
+  },
+  {
+   "file": 5
+  },
+  {
+   "code": "invalid",
+   "error": "\"/x/한/-/—\" is not a usable project file name: a file name cannot be an absolute path. Use a name exactly as listed."
+  },
+  {
+   "file": 1
+  },
+  {
+   "file": 0
+  },
+  {
+   "file": 3
+  },
+  {
+   "code": "invalid",
+   "error": "\"../b/P/_\" is not a usable project file name: a file name cannot contain empty, \".\" or \"..\" parts. Use a name exactly as listed."
+  },
+  {
+   "file": 2
+  },
+  {
+   "code": "invalid",
+   "error": "\" /_/файл\\t\" is not a usable project file name: a file name cannot be an absolute path. Use a name exactly as listed."
+  },
+  {
+   "file": 0
+  },
+  {
+   "file": 4
+  },
+  {
+   "code": "invalid",
+   "error": "\"/Ａ/café.MD\" is not a usable project file name: a file name cannot be an absolute path. Use a name exactly as listed."
+  },
+  {
+   "file": 1
+  },
+  {
+   "code": "missing",
+   "error": "no project file named \"a.MD\". Available: Skills, 한/한.pdf, notes/한/v1.2.txt, файл/Skills.md, αβ/x y.md, 😀/é.MD"
+  },
+  {
+   "file": 0
+  },
+  {
+   "file": 0
+  },
+  {
+   "code": "invalid",
+   "error": "\"./v1.2/_.md\" is not a usable project file name: a file name cannot contain empty, \".\" or \"..\" parts. Use a name exactly as listed."
+  },
+  {
+   "code": "invalid",
+   "error": "\"../P/日本/noevia projects\" is not a usable project file name: a file name cannot contain empty, \".\" or \"..\" parts. Use a name exactly as listed."
+  },
+  {
+   "file": 5
+  },
+  {
+   "code": "invalid",
+   "error": "\"C:/é.md\" is not a usable project file name: a file name cannot be an absolute path. Use a name exactly as listed."
+  },
+  {
+   "file": 0
+  },
+  {
+   "file": 2
+  },
+  {
+   "file": 1
+  },
+  {
+   "code": "missing",
+   "error": "no project file named \"Skills/—/日本.pdf\". Available: é/x y.MD, 😀/😀.txt, é/v1.2.pdf, -/—/αβ.MD"
+  },
+  {
+   "file": 4
+  },
+  {
+   "code": "missing",
+   "error": "no project file named \"noevia projects/_/é\". Available: é/x y/日本/Text"
+  },
+  {
+   "file": 5
+  },
+  {
+   "file": 0
+  },
+  {
+   "code": "invalid",
+   "error": "\"/файл/Skills.md\" is not a usable project file name: a file name cannot be an absolute path. Use a name exactly as listed."
+  },
+  {
+   "file": 0
+  },
+  {
+   "code": "missing",
+   "error": "no project file named \"P/файл/P\". Available: -/Skills/—.pdf, a/café.MD, b/한/x y.md, Skills/한.txt, P/x y/файл.pdf, -/Text/a.pdf"
+  },
+  {
+   "code": "missing",
+   "error": "no project file named \"_/b.MD\". Available: x y.md, a/b/_.pdf, Skills/αβ/😀.pdf, 日本/—.txt"
+  },
+  {
+   "file": 2
+  },
+  {
+   "code": "missing",
+   "error": "no project file named \"Text/v1.2.MD\". Available: x y/—/é.MD, x y/αβ/Ａ"
+  },
+  {
+   "file": 2
+  },
+  {
+   "code": "invalid",
+   "error": "\"/x/a/é/é.pdf\" is not a usable project file name: a file name cannot be an absolute path. Use a name exactly as listed."
+  },
+  {
+   "file": 2
+  },
+  {
+   "file": 0
+  },
+  {
+   "file": 4
+  },
+  {
+   "file": 3
+  },
+  {
+   "file": 1
+  },
+  {
+   "file": 0
+  },
+  {
+   "code": "missing",
+   "error": "no project file named \"Skills.md\". Available: notes/😀/😀.pdf"
+  },
+  {
+   "code": "invalid",
+   "error": "\"/x/b.txt\" is not a usable project file name: a file name cannot be an absolute path. Use a name exactly as listed."
+  },
+  {
+   "file": 1
+  },
+  {
+   "code": "missing",
+   "error": "no project file named \"αβ\". Available: P/한/Skills.txt, v1.2/😀, 😀.md"
+  },
+  {
+   "file": 1
+  },
+  {
+   "file": 1
+  },
+  {
+   "code": "missing",
+   "error": "no project file named \" _/한/日本.txt\\t\". Available: é/Text/Ａ/한.md"
+  },
+  {
+   "file": 0
+  },
+  {
+   "file": 2
+  },
+  {
+   "file": 2
+  },
+  {
+   "code": "missing",
+   "error": "no project file named \"Ａ.md\". Available: notes.md, Skills/Text.MD, 😀, 日本/Ａ/😀.txt, Skills/Ａ, Skills/café, 한.MD"
+  },
+  {
+   "code": "missing",
+   "error": "no project file named \"é.MD\". Available: v1.2/—/café.pdf, 한/café/αβ, 한/—.txt"
+  },
+  {
+   "file": 0
+  },
+  {
+   "code": "missing",
+   "error": "no project file named \"a.md\". Available: _/한.MD, b/😀/noevia projects.txt, café/Text/é.MD, -/Skills.pdf, Ａ/Text/notes.MD, é/Ａ/noevia projects.md"
+  },
+  {
+   "file": 3
+  },
+  {
+   "code": "invalid",
+   "error": "\"C:/한/Text.pdf\" is not a usable project file name: a file name cannot be an absolute path. Use a name exactly as listed."
+  },
+  {
+   "code": "missing",
+   "error": "no project file named \"한/café.txt\". Available: Skills.pdf, 😀/notes/файл.pdf, _/café/Text.pdf, b.pdf"
+  },
+  {
+   "file": 5
+  },
+  {
+   "code": "missing",
+   "error": "no project file named \"P/b/αβ.MD\". Available: notes/b/a.MD, Skills/Text.md, —.pdf, x y/b.MD, café, notes.MD"
+  },
+  {
+   "code": "missing",
+   "error": "no project file named \"notes/b.txt\". Available: notes.MD"
+  },
+  {
+   "file": 2
+  },
+  {
+   "code": "invalid",
+   "error": "\"/v1.2/x y/αβ.md\" is not a usable project file name: a file name cannot be an absolute path. Use a name exactly as listed."
+  },
+  {
+   "file": 0
+  },
+  {
+   "file": 4
+  },
+  {
+   "file": 2
+  },
+  {
+   "code": "invalid",
+   "error": "\"./Text/_.md\" is not a usable project file name: a file name cannot contain empty, \".\" or \"..\" parts. Use a name exactly as listed."
+  },
+  {
+   "file": 1
+  },
+  {
+   "code": "missing",
+   "error": "no project file named \"noevia projects.MD\". Available: файл.md, _/é, 😀.MD, noevia projects.pdf, Text/P.pdf, -/αβ/notes.pdf, 日本/noevia projects.pdf"
+  },
+  {
+   "file": 2
+  },
+  {
+   "file": 2
+  },
+  {
+   "file": 1
+  },
+  {
+   "file": 4
+  },
+  {
+   "file": 4
+  },
+  {
+   "file": 1
+  },
+  {
+   "file": 0
+  },
+  {
+   "file": 6
+  },
+  {
+   "file": 3
+  },
+  {
+   "file": 0
+  },
+  {
+   "file": 3
+  },
+  {
+   "file": 2
+  },
+  {
+   "file": 3
+  },
+  {
+   "file": 1
+  },
+  {
+   "file": 4
+  },
+  {
+   "file": 2
+  },
+  {
+   "file": 1
+  },
+  {
+   "file": 0
+  },
+  {
+   "file": 3
+  },
+  {
+   "code": "invalid",
+   "error": "\"%2e/_\" is not a usable project file name: a file name cannot contain encoded dots or separators. Use a name exactly as listed."
+  },
+  {
+   "file": 2
+  },
+  {
+   "code": "invalid",
+   "error": "\"/Skills.md\" is not a usable project file name: a file name cannot be an absolute path. Use a name exactly as listed."
+  },
+  {
+   "file": 1
+  },
+  {
+   "file": 1
+  },
+  {
+   "file": 0
+  },
+  {
+   "file": 2
+  },
+  {
+   "file": 3
+  },
+  {
+   "file": 1
+  },
+  {
+   "file": 1
+  },
+  {
+   "file": 3
+  },
+  {
+   "code": "invalid",
+   "error": "\"/x/_.txt\" is not a usable project file name: a file name cannot be an absolute path. Use a name exactly as listed."
+  },
+  {
+   "file": 0
+  },
+  {
+   "file": 0
+  },
+  {
+   "file": 2
+  },
+  {
+   "code": "invalid",
+   "error": "\"%2e/Ａ/Skills/a.pdf\" is not a usable project file name: a file name cannot contain encoded dots or separators. Use a name exactly as listed."
+  },
+  {
+   "file": 6
+  },
+  {
+   "code": "missing",
+   "error": "no project file named \"файл/αβ/Ａ.txt\". Available: (none attached)"
+  },
+  {
+   "file": 0
+  },
+  {
+   "file": 5
+  },
+  {
+   "file": 2
+  },
+  {
+   "code": "invalid",
+   "error": "\"C:/αβ/v1.2\" is not a usable project file name: a file name cannot be an absolute path. Use a name exactly as listed."
+  },
+  {
+   "code": "invalid",
+   "error": "\"/x/café/—/日本.md\" is not a usable project file name: a file name cannot be an absolute path. Use a name exactly as listed."
+  },
+  {
+   "file": 5
+  },
+  {
+   "code": "invalid",
+   "error": "\"%2e/-.pdf\" is not a usable project file name: a file name cannot contain encoded dots or separators. Use a name exactly as listed."
+  },
+  {
+   "file": 1
+  },
+  {
+   "file": 4
+  },
+  {
+   "code": "missing",
+   "error": "no project file named \"x y/한.txt\". Available: x y/—/-, é/—/P.MD"
+  },
+  {
+   "file": 1
+  },
+  {
+   "code": "missing",
+   "error": "no project file named \"_.MD\". Available: (none attached)"
+  },
+  {
+   "file": 1
+  },
+  {
+   "code": "missing",
+   "error": "no project file named \" Text/—\\t\". Available: x y/Skills.txt, x y/-.txt, Text/v1.2.md, 한.md"
+  },
+  {
+   "file": 2
+  },
+  {
+   "file": 0
+  },
+  {
+   "file": 6
+  },
+  {
+   "file": 0
+  },
+  {
+   "code": "missing",
+   "error": "no project file named \"Text.MD\". Available: Ａ/x y.md, Text.pdf, -.pdf, a.txt, -.md, -/日本/Skills, é/P.md"
+  },
+  {
+   "file": 1
+  },
+  {
+   "file": 4
+  },
+  {
+   "file": 2
+  },
+  {
+   "code": "invalid",
+   "error": "\"../αβ/café.pdf\" is not a usable project file name: a file name cannot contain empty, \".\" or \"..\" parts. Use a name exactly as listed."
+  },
+  {
+   "file": 1
+  },
+  {
+   "file": 1
+  },
+  {
+   "file": 0
+  },
+  {
+   "code": "ambiguous",
+   "error": "\"notes.md\" matches more than one project file: α/x/notes.md, y/notes.md. Pass the full name exactly as listed.",
+   "candidates": [
+    "α/x/notes.md",
+    "y/notes.md"
+   ]
+  },
+  {
+   "file": 0
+  },
+  {
+   "file": 1
+  },
+  {
+   "file": 1
+  },
+  {
+   "file": 0
+  },
+  {
+   "file": 3
+  },
+  {
+   "file": 1
+  },
+  {
+   "code": "ambiguous",
+   "error": "\"🤖.md\" matches more than one project file: x/🤖.md, y/🤖.md. Pass the full name exactly as listed.",
+   "candidates": [
+    "x/🤖.md",
+    "y/🤖.md"
+   ]
+  },
+  {
+   "file": 0
+  },
+  {
+   "file": 0
+  },
+  {
+   "file": 0
+  },
+  {
+   "file": 0
+  },
+  {
+   "code": "ambiguous",
+   "error": "\"Café.md\" matches more than one project file: x/Café.md, y/Café.md. Pass the full name exactly as listed.",
+   "candidates": [
+    "x/Café.md",
+    "y/Café.md"
+   ]
+  },
+  {
+   "file": 1
+  },
+  {
+   "file": 0
+  },
+  {
+   "file": 0
+  },
+  {
+   "file": 0
+  },
+  {
+   "file": 0
+  },
+  {
+   "file": 0
+  },
+  {
+   "file": 0
+  },
+  {
+   "code": "ambiguous",
+   "error": "\"日本/😀/v1.2.pdf\" matches more than one project file: café/日本/😀/v1.2.pdf, café/日本/😀/v1.2.pdf, noevia projects/日本/😀/v1.2.pdf. Pass the full name exactly as listed.",
+   "candidates": [
+    "café/日本/😀/v1.2.pdf",
+    "café/日本/😀/v1.2.pdf",
+    "noevia projects/日本/😀/v1.2.pdf"
+   ]
+  },
+  {
+   "code": "ambiguous",
+   "error": "\"notes/Text/b.MD\" matches more than one project file: —/notes/Text/b.MD, Text/notes/Text/b.MD, Ａ/notes/Text/b.MD. Pass the full name exactly as listed.",
+   "candidates": [
+    "—/notes/Text/b.MD",
+    "Text/notes/Text/b.MD",
+    "Ａ/notes/Text/b.MD"
+   ]
+  },
+  {
+   "code": "ambiguous",
+   "error": "\"Ａ/Skills/Text.pdf\" matches more than one project file: Ａ/Ａ/Skills/Text.pdf, noevia projects/Ａ/Skills/Text.pdf, noevia projects/Ａ/Skills/Text.pdf, v1.2/Ａ/Skills/Text.pdf. Pass the full name exactly as listed.",
+   "candidates": [
+    "Ａ/Ａ/Skills/Text.pdf",
+    "noevia projects/Ａ/Skills/Text.pdf",
+    "noevia projects/Ａ/Skills/Text.pdf",
+    "v1.2/Ａ/Skills/Text.pdf"
+   ]
+  },
+  {
+   "code": "ambiguous",
+   "error": "\"😀.txt\" matches more than one project file: -/😀.txt, Skills/😀.txt, noevia projects/😀.txt, x y/😀.txt. Pass the full name exactly as listed.",
+   "candidates": [
+    "-/😀.txt",
+    "Skills/😀.txt",
+    "noevia projects/😀.txt",
+    "x y/😀.txt"
+   ]
+  },
+  {
+   "code": "ambiguous",
+   "error": "\"Ａ/b/—.MD\" matches more than one project file: αβ/Ａ/b/—.MD, Ａ/Ａ/b/—.MD, 日本/Ａ/b/—.MD, _/Ａ/b/—.MD. Pass the full name exactly as listed.",
+   "candidates": [
+    "αβ/Ａ/b/—.MD",
+    "Ａ/Ａ/b/—.MD",
+    "日本/Ａ/b/—.MD",
+    "_/Ａ/b/—.MD"
+   ]
+  },
+  {
+   "code": "ambiguous",
+   "error": "\"b/a\" matches more than one project file: Ａ/b/a, notes/b/a, notes/b/a. Pass the full name exactly as listed.",
+   "candidates": [
+    "Ａ/b/a",
+    "notes/b/a",
+    "notes/b/a"
+   ]
+  },
+  {
+   "code": "ambiguous",
+   "error": "\"Skills/日本/P.MD\" matches more than one project file: P/Skills/日本/P.MD, 😀/Skills/日本/P.MD, v1.2/Skills/日本/P.MD, é/Skills/日本/P.MD. Pass the full name exactly as listed.",
+   "candidates": [
+    "P/Skills/日本/P.MD",
+    "😀/Skills/日本/P.MD",
+    "v1.2/Skills/日本/P.MD",
+    "é/Skills/日本/P.MD"
+   ]
+  },
+  {
+   "code": "ambiguous",
+   "error": "\"😀\" matches more than one project file: 한/😀, a/😀, —/😀, notes/😀. Pass the full name exactly as listed.",
+   "candidates": [
+    "한/😀",
+    "a/😀",
+    "—/😀",
+    "notes/😀"
+   ]
+  },
+  {
+   "code": "ambiguous",
+   "error": "\"αβ/日本/b.pdf\" matches more than one project file: Skills/αβ/日本/b.pdf, café/αβ/日本/b.pdf, Text/αβ/日本/b.pdf, -/αβ/日本/b.pdf. Pass the full name exactly as listed.",
+   "candidates": [
+    "Skills/αβ/日本/b.pdf",
+    "café/αβ/日本/b.pdf",
+    "Text/αβ/日本/b.pdf",
+    "-/αβ/日本/b.pdf"
+   ]
+  },
+  {
+   "code": "ambiguous",
+   "error": "\"_/—/日本.md\" matches more than one project file: noevia projects/_/—/日本.md, 😀/_/—/日本.md. Pass the full name exactly as listed.",
+   "candidates": [
+    "noevia projects/_/—/日本.md",
+    "😀/_/—/日本.md"
+   ]
+  },
+  {
+   "code": "ambiguous",
+   "error": "\"Skills.MD\" matches more than one project file: 한/Skills.MD, P/Skills.MD, Skills/Skills.MD. Pass the full name exactly as listed.",
+   "candidates": [
+    "한/Skills.MD",
+    "P/Skills.MD",
+    "Skills/Skills.MD"
+   ]
+  },
+  {
+   "code": "ambiguous",
+   "error": "\"αβ/файл/Ａ.txt\" matches more than one project file: Skills/αβ/файл/Ａ.txt, _/αβ/файл/Ａ.txt, 😀/αβ/файл/Ａ.txt, P/αβ/файл/Ａ.txt. Pass the full name exactly as listed.",
+   "candidates": [
+    "Skills/αβ/файл/Ａ.txt",
+    "_/αβ/файл/Ａ.txt",
+    "😀/αβ/файл/Ａ.txt",
+    "P/αβ/файл/Ａ.txt"
+   ]
+  },
+  {
+   "code": "ambiguous",
+   "error": "\"-/-.pdf\" matches more than one project file: 한/-/-.pdf, noevia projects/-/-.pdf, Skills/-/-.pdf. Pass the full name exactly as listed.",
+   "candidates": [
+    "한/-/-.pdf",
+    "noevia projects/-/-.pdf",
+    "Skills/-/-.pdf"
+   ]
+  },
+  {
+   "code": "ambiguous",
+   "error": "\"x y/Skills/файл\" matches more than one project file: noevia projects/x y/Skills/файл, 日本/x y/Skills/файл, _/x y/Skills/файл, café/x y/Skills/файл. Pass the full name exactly as listed.",
+   "candidates": [
+    "noevia projects/x y/Skills/файл",
+    "日本/x y/Skills/файл",
+    "_/x y/Skills/файл",
+    "café/x y/Skills/файл"
+   ]
+  },
+  {
+   "code": "ambiguous",
+   "error": "\"b.md\" matches more than one project file: 日本/b.md, -/b.md, Skills/b.md. Pass the full name exactly as listed.",
+   "candidates": [
+    "日本/b.md",
+    "-/b.md",
+    "Skills/b.md"
+   ]
+  },
+  {
+   "code": "ambiguous",
+   "error": "\"_.MD\" matches more than one project file: Skills/_.MD, -/_.MD. Pass the full name exactly as listed.",
+   "candidates": [
+    "Skills/_.MD",
+    "-/_.MD"
+   ]
+  },
+  {
+   "code": "ambiguous",
+   "error": "\"noevia projects/-/notes\" matches more than one project file: v1.2/noevia projects/-/notes, notes/noevia projects/-/notes, αβ/noevia projects/-/notes, Text/noevia projects/-/notes. Pass the full name exactly as listed.",
+   "candidates": [
+    "v1.2/noevia projects/-/notes",
+    "notes/noevia projects/-/notes",
+    "αβ/noevia projects/-/notes",
+    "Text/noevia projects/-/notes"
+   ]
+  },
+  {
+   "code": "ambiguous",
+   "error": "\"-/файл.txt\" matches more than one project file: 日本/-/файл.txt, αβ/-/файл.txt. Pass the full name exactly as listed.",
+   "candidates": [
+    "日本/-/файл.txt",
+    "αβ/-/файл.txt"
+   ]
+  },
+  {
+   "code": "ambiguous",
+   "error": "\"b/файл/noevia projects.pdf\" matches more than one project file: Text/b/файл/noevia projects.pdf, noevia projects/b/файл/noevia projects.pdf, Ａ/b/файл/noevia projects.pdf. Pass the full name exactly as listed.",
+   "candidates": [
+    "Text/b/файл/noevia projects.pdf",
+    "noevia projects/b/файл/noevia projects.pdf",
+    "Ａ/b/файл/noevia projects.pdf"
+   ]
+  },
+  {
+   "code": "ambiguous",
+   "error": "\"αβ/한/한.md\" matches more than one project file: v1.2/αβ/한/한.md, 😀/αβ/한/한.md, Ａ/αβ/한/한.md. Pass the full name exactly as listed.",
+   "candidates": [
+    "v1.2/αβ/한/한.md",
+    "😀/αβ/한/한.md",
+    "Ａ/αβ/한/한.md"
+   ]
+  },
+  {
+   "code": "ambiguous",
+   "error": "\"v1.2.txt\" matches more than one project file: v1.2/v1.2.txt, café/v1.2.txt, a/v1.2.txt, 日本/v1.2.txt. Pass the full name exactly as listed.",
+   "candidates": [
+    "v1.2/v1.2.txt",
+    "café/v1.2.txt",
+    "a/v1.2.txt",
+    "日本/v1.2.txt"
+   ]
+  },
+  {
+   "code": "ambiguous",
+   "error": "\"noevia projects/v1.2/файл.pdf\" matches more than one project file: Ａ/noevia projects/v1.2/файл.pdf, 한/noevia projects/v1.2/файл.pdf. Pass the full name exactly as listed.",
+   "candidates": [
+    "Ａ/noevia projects/v1.2/файл.pdf",
+    "한/noevia projects/v1.2/файл.pdf"
+   ]
+  },
+  {
+   "code": "ambiguous",
+   "error": "\"noevia projects/a.txt\" matches more than one project file: a/noevia projects/a.txt, b/noevia projects/a.txt, 한/noevia projects/a.txt. Pass the full name exactly as listed.",
+   "candidates": [
+    "a/noevia projects/a.txt",
+    "b/noevia projects/a.txt",
+    "한/noevia projects/a.txt"
+   ]
+  },
+  {
+   "code": "ambiguous",
+   "error": "\"_\" matches more than one project file: b/_, Ａ/_, 한/_. Pass the full name exactly as listed.",
+   "candidates": [
+    "b/_",
+    "Ａ/_",
+    "한/_"
+   ]
+  },
+  {
+   "code": "ambiguous",
+   "error": "\"notes\" matches more than one project file: noevia projects/notes, -/notes, файл/notes, αβ/notes. Pass the full name exactly as listed.",
+   "candidates": [
+    "noevia projects/notes",
+    "-/notes",
+    "файл/notes",
+    "αβ/notes"
+   ]
+  },
+  {
+   "code": "ambiguous",
+   "error": "\"—/é.pdf\" matches more than one project file: 😀/—/é.pdf, —/—/é.pdf, Skills/—/é.pdf. Pass the full name exactly as listed.",
+   "candidates": [
+    "😀/—/é.pdf",
+    "—/—/é.pdf",
+    "Skills/—/é.pdf"
+   ]
+  },
+  {
+   "code": "ambiguous",
+   "error": "\"Text/noevia projects.md\" matches more than one project file: v1.2/Text/noevia projects.md, 日本/Text/noevia projects.md, é/Text/noevia projects.md. Pass the full name exactly as listed.",
+   "candidates": [
+    "v1.2/Text/noevia projects.md",
+    "日本/Text/noevia projects.md",
+    "é/Text/noevia projects.md"
+   ]
+  },
+  {
+   "code": "ambiguous",
+   "error": "\"noevia projects/Text.md\" matches more than one project file: _/noevia projects/Text.md, -/noevia projects/Text.md, v1.2/noevia projects/Text.md, b/noevia projects/Text.md. Pass the full name exactly as listed.",
+   "candidates": [
+    "_/noevia projects/Text.md",
+    "-/noevia projects/Text.md",
+    "v1.2/noevia projects/Text.md",
+    "b/noevia projects/Text.md"
+   ]
+  },
+  {
+   "code": "ambiguous",
+   "error": "\"a/-.txt\" matches more than one project file: 😀/a/-.txt, αβ/a/-.txt, é/a/-.txt. Pass the full name exactly as listed.",
+   "candidates": [
+    "😀/a/-.txt",
+    "αβ/a/-.txt",
+    "é/a/-.txt"
+   ]
+  },
+  {
+   "code": "ambiguous",
+   "error": "\"b/café.txt\" matches more than one project file: _/b/café.txt, é/b/café.txt, café/b/café.txt. Pass the full name exactly as listed.",
+   "candidates": [
+    "_/b/café.txt",
+    "é/b/café.txt",
+    "café/b/café.txt"
+   ]
+  },
+  {
+   "code": "ambiguous",
+   "error": "\"Text.pdf\" matches more than one project file: b/Text.pdf, _/Text.pdf, 日本/Text.pdf, 😀/Text.pdf. Pass the full name exactly as listed.",
+   "candidates": [
+    "b/Text.pdf",
+    "_/Text.pdf",
+    "日本/Text.pdf",
+    "😀/Text.pdf"
+   ]
+  },
+  {
+   "code": "ambiguous",
+   "error": "\"é.md\" matches more than one project file: _/é.md, файл/é.md. Pass the full name exactly as listed.",
+   "candidates": [
+    "_/é.md",
+    "файл/é.md"
+   ]
+  },
+  {
+   "code": "ambiguous",
+   "error": "\"файл\" matches more than one project file: файл/файл, αβ/файл. Pass the full name exactly as listed.",
+   "candidates": [
+    "файл/файл",
+    "αβ/файл"
+   ]
+  },
+  {
+   "code": "ambiguous",
+   "error": "\"—.txt\" matches more than one project file: 한/—.txt, Ａ/—.txt. Pass the full name exactly as listed.",
+   "candidates": [
+    "한/—.txt",
+    "Ａ/—.txt"
+   ]
+  },
+  {
+   "code": "ambiguous",
+   "error": "\"notes/αβ/b.txt\" matches more than one project file: 😀/notes/αβ/b.txt, b/notes/αβ/b.txt. Pass the full name exactly as listed.",
+   "candidates": [
+    "😀/notes/αβ/b.txt",
+    "b/notes/αβ/b.txt"
+   ]
+  },
+  {
+   "code": "ambiguous",
+   "error": "\"a.pdf\" matches more than one project file: v1.2/a.pdf, файл/a.pdf. Pass the full name exactly as listed.",
+   "candidates": [
+    "v1.2/a.pdf",
+    "файл/a.pdf"
+   ]
+  },
+  {
+   "code": "ambiguous",
+   "error": "\"é/notes/P.MD\" matches more than one project file: _/é/notes/P.MD, -/é/notes/P.MD. Pass the full name exactly as listed.",
+   "candidates": [
+    "_/é/notes/P.MD",
+    "-/é/notes/P.MD"
+   ]
+  },
+  {
+   "code": "ambiguous",
+   "error": "\"x y/notes.txt\" matches more than one project file: αβ/x y/notes.txt, Ａ/x y/notes.txt. Pass the full name exactly as listed.",
+   "candidates": [
+    "αβ/x y/notes.txt",
+    "Ａ/x y/notes.txt"
+   ]
+  },
+  {
+   "code": "ambiguous",
+   "error": "\"a.pdf\" matches more than one project file: Skills/a.pdf, a/a.pdf. Pass the full name exactly as listed.",
+   "candidates": [
+    "Skills/a.pdf",
+    "a/a.pdf"
+   ]
+  },
+  {
+   "code": "ambiguous",
+   "error": "\"é.md\" matches more than one project file: v1.2/é.md, —/é.md. Pass the full name exactly as listed.",
+   "candidates": [
+    "v1.2/é.md",
+    "—/é.md"
+   ]
+  }
+ ],
+ "seeded": [
+  "f0",
+  "m",
+  "m",
+  "m",
+  "i",
+  "i",
+  "f0",
+  "m",
+  "m",
+  "i",
+  "m",
+  "m",
+  "i",
+  "i",
+  "f4",
+  "f3",
+  "m",
+  "m",
+  "i",
+  "f1",
+  "f2",
+  "m",
+  "f0",
+  "m",
+  "m",
+  "i",
+  "i",
+  "f0",
+  "i",
+  "f0",
+  "i",
+  "f0",
+  "i",
+  "f0",
+  "i",
+  "m",
+  "f0",
+  "m",
+  "m",
+  "m",
+  "i",
+  "m",
+  "m",
+  "i",
+  "i",
+  "i",
+  "f1",
+  "m",
+  "f1",
+  "f4",
+  "i",
+  "m",
+  "f2",
+  "i",
+  "m",
+  "i",
+  "m",
+  "f2",
+  "m",
+  "m",
+  "m",
+  "i",
+  "i",
+  "m",
+  "f0",
+  "f0",
+  "m",
+  "f3",
+  "f0",
+  "i",
+  "m",
+  "m",
+  "f0",
+  "i",
+  "i",
+  "m",
+  "i",
+  "f0",
+  "i",
+  "i",
+  "f2",
+  "m",
+  "m",
+  "i",
+  "i",
+  "m",
+  "m",
+  "m",
+  "m",
+  "m",
+  "m",
+  "m",
+  "f2",
+  "f1",
+  "i",
+  "f2",
+  "m",
+  "m",
+  "f3",
+  "i",
+  "f0",
+  "m",
+  "f0",
+  "m",
+  "m",
+  "m",
+  "i",
+  "f1",
+  "f0",
+  "f2",
+  "f0",
+  "f0",
+  "i",
+  "m",
+  "i",
+  "m",
+  "m",
+  "f0",
+  "i",
+  "m",
+  "f0",
+  "f0",
+  "i",
+  "m",
+  "m",
+  "i",
+  "i",
+  "f1",
+  "f4",
+  "i",
+  "f1",
+  "f1",
+  "f2",
+  "m",
+  "i",
+  "m",
+  "i",
+  "f1",
+  "m",
+  "m",
+  "m",
+  "m",
+  "m",
+  "m",
+  "m",
+  "m",
+  "m",
+  "i",
+  "i",
+  "m",
+  "m",
+  "i",
+  "f4",
+  "i",
+  "m",
+  "i",
+  "m",
+  "f0",
+  "i",
+  "i",
+  "m",
+  "f1",
+  "i",
+  "m",
+  "i",
+  "i",
+  "m",
+  "i",
+  "f0",
+  "m",
+  "i",
+  "m",
+  "m",
+  "m",
+  "i",
+  "m",
+  "f0",
+  "m",
+  "m",
+  "f0",
+  "f1",
+  "i",
+  "f0",
+  "m",
+  "m",
+  "m",
+  "i",
+  "m",
+  "m",
+  "f2",
+  "m",
+  "f2",
+  "m",
+  "m",
+  "i",
+  "f4",
+  "m",
+  "f1",
+  "i",
+  "f0",
+  "f0",
+  "m",
+  "f0",
+  "i",
+  "f0",
+  "f0",
+  "f1",
+  "f3",
+  "i",
+  "f0",
+  "i",
+  "i",
+  "i",
+  "f4",
+  "m",
+  "f1",
+  "m",
+  "i",
+  "i",
+  "i",
+  "i",
+  "m",
+  "i",
+  "f0",
+  "f0",
+  "m",
+  "i",
+  "m",
+  "i",
+  "f1",
+  "m",
+  "m",
+  "f0",
+  "i",
+  "i",
+  "i",
+  "f0",
+  "i",
+  "m",
+  "i",
+  "m",
+  "f0",
+  "i",
+  "i",
+  "i",
+  "m",
+  "m",
+  "i",
+  "f0",
+  "a1,3",
+  "m",
+  "f1",
+  "f1",
+  "m",
+  "m",
+  "i",
+  "f0",
+  "f0",
+  "m",
+  "m",
+  "f1",
+  "f0",
+  "i",
+  "i",
+  "m",
+  "f0",
+  "m",
+  "f2",
+  "f0",
+  "i",
+  "i",
+  "f3",
+  "f0",
+  "f0",
+  "m",
+  "i",
+  "m",
+  "i",
+  "i",
+  "m",
+  "m",
+  "f0",
+  "f1",
+  "f0",
+  "f0",
+  "m",
+  "m",
+  "f0",
+  "f0",
+  "f0",
+  "i",
+  "i",
+  "i",
+  "i",
+  "f2",
+  "m",
+  "i",
+  "f1",
+  "i",
+  "f4",
+  "f1",
+  "m",
+  "m",
+  "i",
+  "m",
+  "f1",
+  "i",
+  "i",
+  "m",
+  "i",
+  "m",
+  "m",
+  "f1",
+  "m",
+  "i",
+  "f1",
+  "m",
+  "f1",
+  "m",
+  "i",
+  "m",
+  "i",
+  "f1",
+  "m",
+  "m",
+  "i",
+  "i",
+  "f1",
+  "m",
+  "m",
+  "f1",
+  "f0",
+  "i",
+  "f0",
+  "m",
+  "m",
+  "f0",
+  "f0",
+  "i",
+  "i",
+  "m",
+  "i",
+  "m",
+  "m",
+  "m",
+  "m",
+  "i",
+  "f2",
+  "i",
+  "i",
+  "f0",
+  "m",
+  "i",
+  "f0",
+  "f0",
+  "f0",
+  "m",
+  "m",
+  "m",
+  "f0",
+  "m",
+  "i",
+  "m",
+  "i",
+  "m",
+  "f1",
+  "i",
+  "i",
+  "f0",
+  "m",
+  "i",
+  "i",
+  "m",
+  "i",
+  "m",
+  "m",
+  "f0",
+  "m",
+  "i",
+  "m",
+  "f1",
+  "f0",
+  "f1",
+  "i",
+  "m",
+  "f0",
+  "f0",
+  "f3",
+  "m",
+  "f0",
+  "f0",
+  "f0",
+  "m",
+  "m",
+  "m",
+  "f0",
+  "m",
+  "m",
+  "m",
+  "f1",
+  "f1",
+  "m",
+  "m",
+  "f2",
+  "i",
+  "f2",
+  "i",
+  "f1",
+  "f0",
+  "f0",
+  "i",
+  "i",
+  "m",
+  "m",
+  "i",
+  "i",
+  "f1",
+  "m",
+  "i",
+  "m",
+  "f0",
+  "f0",
+  "m",
+  "f2",
+  "m",
+  "m",
+  "f1",
+  "m",
+  "f1",
+  "f0",
+  "m",
+  "f0",
+  "m",
+  "f0",
+  "i",
+  "f0",
+  "m",
+  "i",
+  "f3",
+  "m",
+  "i",
+  "i",
+  "i",
+  "m",
+  "f0",
+  "m",
+  "i",
+  "f1",
+  "i",
+  "m",
+  "i",
+  "m",
+  "m",
+  "m",
+  "m",
+  "i",
+  "f0",
+  "i",
+  "m",
+  "i",
+  "f0",
+  "f2",
+  "m",
+  "f1",
+  "m",
+  "m",
+  "m",
+  "m",
+  "m",
+  "i",
+  "m",
+  "i",
+  "i",
+  "m",
+  "m",
+  "m",
+  "i",
+  "f0",
+  "i",
+  "f0",
+  "m",
+  "i",
+  "i",
+  "f2",
+  "i",
+  "f0",
+  "m",
+  "m",
+  "i",
+  "m",
+  "m",
+  "f0",
+  "i",
+  "m",
+  "f2",
+  "f0",
+  "m",
+  "m",
+  "i",
+  "m",
+  "i",
+  "f1",
+  "m",
+  "m",
+  "m",
+  "i",
+  "f1",
+  "i",
+  "f2",
+  "f1",
+  "i",
+  "f0",
+  "f2",
+  "f0",
+  "f2",
+  "f1",
+  "f0",
+  "f1",
+  "f2",
+  "f2",
+  "m",
+  "f3",
+  "f0",
+  "f1",
+  "f3",
+  "f0",
+  "i",
+  "i",
+  "i",
+  "m",
+  "m",
+  "i",
+  "f0",
+  "m",
+  "f2",
+  "m",
+  "f0",
+  "f1",
+  "f4",
+  "i",
+  "m",
+  "m",
+  "i",
+  "m",
+  "i",
+  "i",
+  "i",
+  "m",
+  "f0",
+  "f0",
+  "m",
+  "i",
+  "f1",
+  "m",
+  "f4",
+  "i",
+  "i",
+  "i",
+  "f0",
+  "m",
+  "i",
+  "m",
+  "i",
+  "m",
+  "m",
+  "f0",
+  "f3",
+  "m",
+  "i",
+  "i",
+  "i",
+  "i",
+  "f0",
+  "i",
+  "i",
+  "f0",
+  "m",
+  "m",
+  "i",
+  "f0",
+  "i",
+  "i",
+  "m",
+  "m",
+  "m",
+  "m",
+  "f0",
+  "m",
+  "m",
+  "i",
+  "m",
+  "m",
+  "m",
+  "m",
+  "f1",
+  "f2",
+  "i",
+  "f4",
+  "m",
+  "f1",
+  "m",
+  "m",
+  "f1",
+  "f2",
+  "f1",
+  "i",
+  "f0",
+  "m",
+  "m",
+  "f0",
+  "m",
+  "f0",
+  "m",
+  "f1",
+  "f2",
+  "f3",
+  "m",
+  "i",
+  "f4",
+  "i",
+  "m",
+  "f1",
+  "m",
+  "f1",
+  "i",
+  "i",
+  "f0",
+  "m",
+  "f1",
+  "f1",
+  "i",
+  "m",
+  "i",
+  "i",
+  "m",
+  "m",
+  "f2",
+  "f2",
+  "f0",
+  "m",
+  "i",
+  "f0",
+  "i",
+  "i",
+  "f1",
+  "f2",
+  "m",
+  "m",
+  "m",
+  "m",
+  "f0",
+  "f1",
+  "f1",
+  "f1",
+  "m",
+  "f1",
+  "i",
+  "m",
+  "m",
+  "m",
+  "f0",
+  "i",
+  "m",
+  "m",
+  "i",
+  "i",
+  "m",
+  "m",
+  "f0",
+  "m",
+  "m",
+  "i",
+  "i",
+  "m",
+  "f0",
+  "f0",
+  "f2",
+  "f0",
+  "f0",
+  "i",
+  "i",
+  "m",
+  "i",
+  "m",
+  "m",
+  "m",
+  "f1",
+  "m",
+  "f1",
+  "f3",
+  "i",
+  "i",
+  "m",
+  "f0",
+  "f3",
+  "i",
+  "f1",
+  "i",
+  "m",
+  "f3",
+  "i",
+  "f0",
+  "i",
+  "i",
+  "f0",
+  "m",
+  "i",
+  "i",
+  "m",
+  "m",
+  "f1",
+  "m",
+  "i",
+  "f0",
+  "m",
+  "m",
+  "m",
+  "f0",
+  "f1",
+  "i",
+  "i",
+  "m",
+  "i",
+  "i",
+  "m",
+  "m",
+  "i",
+  "f1",
+  "f1",
+  "i",
+  "f2",
+  "f1",
+  "i",
+  "m",
+  "m",
+  "m",
+  "f1",
+  "i",
+  "f1",
+  "f0",
+  "f2",
+  "i",
+  "i",
+  "f0",
+  "i",
+  "m",
+  "i",
+  "f0",
+  "i",
+  "m",
+  "m",
+  "m",
+  "i",
+  "f0",
+  "i",
+  "i",
+  "m",
+  "f0",
+  "m",
+  "f0",
+  "i",
+  "f3",
+  "f0",
+  "m",
+  "i",
+  "m",
+  "m",
+  "i",
+  "i",
+  "m",
+  "f0",
+  "m",
+  "m",
+  "i",
+  "f2",
+  "f4",
+  "i",
+  "m",
+  "f1",
+  "m",
+  "i",
+  "f0",
+  "m",
+  "i",
+  "m",
+  "f2",
+  "i",
+  "i",
+  "f0",
+  "m",
+  "m",
+  "f0",
+  "m",
+  "m",
+  "i",
+  "m",
+  "f0",
+  "f4",
+  "f2",
+  "i",
+  "i",
+  "f3",
+  "m",
+  "i",
+  "m",
+  "i",
+  "i",
+  "f3",
+  "m",
+  "f3",
+  "f0",
+  "i",
+  "m",
+  "i",
+  "i",
+  "i",
+  "m",
+  "i",
+  "m",
+  "m",
+  "f0",
+  "f0",
+  "m",
+  "f0",
+  "f1",
+  "m",
+  "i",
+  "m",
+  "i",
+  "m",
+  "i",
+  "i",
+  "f0",
+  "i",
+  "f2",
+  "f0",
+  "m",
+  "f0",
+  "i",
+  "m",
+  "i",
+  "i",
+  "i",
+  "i",
+  "f3",
+  "i",
+  "m",
+  "f0",
+  "m",
+  "i",
+  "f0",
+  "f0",
+  "f0",
+  "m",
+  "i",
+  "m",
+  "f4",
+  "m",
+  "m",
+  "f4",
+  "m",
+  "f0",
+  "i",
+  "i",
+  "m",
+  "f0",
+  "m",
+  "m",
+  "i",
+  "m",
+  "i",
+  "i",
+  "i",
+  "i",
+  "f0",
+  "i",
+  "m",
+  "i",
+  "m",
+  "i",
+  "m",
+  "i",
+  "m",
+  "m",
+  "m",
+  "m",
+  "m",
+  "i",
+  "m",
+  "m",
+  "m",
+  "f0",
+  "i",
+  "i",
+  "f0",
+  "m",
+  "i",
+  "i",
+  "i",
+  "m",
+  "m",
+  "f0",
+  "f1",
+  "m",
+  "m",
+  "i",
+  "f0",
+  "f1",
+  "m",
+  "m",
+  "i",
+  "i",
+  "f2",
+  "m",
+  "f0",
+  "i",
+  "i",
+  "f2",
+  "m",
+  "i",
+  "m",
+  "m",
+  "f3",
+  "i",
+  "f0",
+  "f0",
+  "i",
+  "i",
+  "m",
+  "m",
+  "m",
+  "m",
+  "i",
+  "f1",
+  "f0",
+  "i",
+  "f2",
+  "i",
+  "i",
+  "m",
+  "m",
+  "i",
+  "i",
+  "m",
+  "m",
+  "f1",
+  "i",
+  "i",
+  "i",
+  "i",
+  "i",
+  "f0",
+  "i",
+  "i",
+  "i",
+  "i",
+  "f4",
+  "f0",
+  "m",
+  "i",
+  "i",
+  "m",
+  "m",
+  "i",
+  "m",
+  "m",
+  "m",
+  "f0",
+  "i",
+  "i",
+  "m",
+  "i",
+  "i",
+  "m",
+  "i",
+  "f0",
+  "m",
+  "f0",
+  "f1",
+  "f0",
+  "i",
+  "f0",
+  "f2",
+  "f0",
+  "m",
+  "i",
+  "i",
+  "f4",
+  "i",
+  "m",
+  "f1",
+  "f1",
+  "i",
+  "f3",
+  "i",
+  "f3",
+  "m",
+  "f3",
+  "f3",
+  "i",
+  "i",
+  "m",
+  "m",
+  "m",
+  "m",
+  "m",
+  "m",
+  "m",
+  "m",
+  "f0",
+  "f0",
+  "m",
+  "m",
+  "f4",
+  "i",
+  "f0",
+  "f1",
+  "i",
+  "m",
+  "i",
+  "i",
+  "m",
+  "m",
+  "f0",
+  "f1",
+  "i",
+  "m",
+  "i",
+  "f4",
+  "i",
+  "i",
+  "i",
+  "f0",
+  "m",
+  "i",
+  "m",
+  "m",
+  "i",
+  "f4",
+  "f0",
+  "m",
+  "m",
+  "m",
+  "i",
+  "f3",
+  "i",
+  "m",
+  "i",
+  "m",
+  "m",
+  "i",
+  "i",
+  "f0",
+  "m",
+  "f0",
+  "m",
+  "f0",
+  "i",
+  "i",
+  "i",
+  "f4",
+  "i",
+  "f4",
+  "m",
+  "m",
+  "f0",
+  "f0",
+  "m",
+  "f0",
+  "i",
+  "i",
+  "m",
+  "i",
+  "f0",
+  "m",
+  "i",
+  "m",
+  "m",
+  "m",
+  "m",
+  "i",
+  "f2",
+  "m",
+  "f0",
+  "i",
+  "i",
+  "m",
+  "f0",
+  "m",
+  "m",
+  "m",
+  "i",
+  "m",
+  "m",
+  "f2",
+  "i",
+  "i",
+  "f0",
+  "f1",
+  "i",
+  "m",
+  "m",
+  "m",
+  "m",
+  "f3",
+  "f0",
+  "m",
+  "f3",
+  "f0",
+  "m",
+  "a0,1",
+  "m",
+  "i",
+  "i",
+  "i",
+  "m",
+  "i",
+  "i",
+  "f1",
+  "f0",
+  "m",
+  "i",
+  "i",
+  "f0",
+  "i",
+  "m",
+  "f4",
+  "m",
+  "i",
+  "i",
+  "i",
+  "i",
+  "i",
+  "f0",
+  "f1",
+  "m",
+  "f0",
+  "m",
+  "f1",
+  "f3",
+  "m",
+  "i",
+  "m",
+  "f1",
+  "m",
+  "f2",
+  "m",
+  "f0",
+  "i",
+  "f3",
+  "f0",
+  "m",
+  "m",
+  "f2",
+  "f0",
+  "i",
+  "i",
+  "m",
+  "i",
+  "f1",
+  "i",
+  "f0",
+  "f2",
+  "i",
+  "f3",
+  "m",
+  "f3",
+  "f0",
+  "i",
+  "m",
+  "f0",
+  "f4",
+  "f1",
+  "m",
+  "f1",
+  "f1",
+  "i",
+  "i",
+  "f1",
+  "f0",
+  "f2",
+  "f1",
+  "m",
+  "f2",
+  "i",
+  "i",
+  "f1",
+  "f3",
+  "m",
+  "f0",
+  "m",
+  "f0",
+  "f0",
+  "m",
+  "f2",
+  "i",
+  "m",
+  "i",
+  "f0",
+  "i",
+  "m",
+  "f1",
+  "f0",
+  "f1",
+  "m",
+  "i",
+  "m",
+  "i",
+  "m",
+  "i",
+  "m",
+  "m",
+  "f0",
+  "f0",
+  "m",
+  "i",
+  "m",
+  "m",
+  "m",
+  "i",
+  "i",
+  "m",
+  "i",
+  "f0",
+  "i",
+  "i",
+  "f0",
+  "m",
+  "i",
+  "f0",
+  "i",
+  "m",
+  "i",
+  "f0",
+  "m",
+  "i",
+  "i",
+  "m",
+  "m",
+  "m",
+  "m",
+  "m",
+  "i",
+  "m",
+  "f0",
+  "f1",
+  "m",
+  "m",
+  "i",
+  "f0",
+  "m",
+  "m",
+  "f0",
+  "f1",
+  "i",
+  "f3",
+  "m",
+  "i",
+  "i",
+  "f0",
+  "f0",
+  "m",
+  "m",
+  "f0",
+  "f0",
+  "f2",
+  "m",
+  "f1",
+  "i",
+  "i",
+  "f2",
+  "m",
+  "m",
+  "m",
+  "i",
+  "m",
+  "f1",
+  "f0",
+  "m",
+  "f0",
+  "m",
+  "m",
+  "i",
+  "m",
+  "f1",
+  "i",
+  "i",
+  "f0",
+  "m",
+  "f2",
+  "m",
+  "m",
+  "f0",
+  "i",
+  "m",
+  "f0",
+  "i",
+  "m",
+  "m",
+  "f0",
+  "f0",
+  "i",
+  "f1",
+  "i",
+  "m",
+  "f0",
+  "f1",
+  "m",
+  "f3",
+  "m",
+  "m",
+  "i",
+  "f0",
+  "i",
+  "f2",
+  "i",
+  "i",
+  "m",
+  "m",
+  "f0",
+  "i",
+  "i",
+  "i",
+  "i",
+  "m",
+  "i",
+  "f0",
+  "m",
+  "m",
+  "m",
+  "f0",
+  "i",
+  "i",
+  "m",
+  "m",
+  "f0",
+  "i",
+  "m",
+  "m",
+  "m",
+  "m",
+  "i",
+  "i",
+  "i",
+  "f1",
+  "f0",
+  "i",
+  "f1",
+  "m",
+  "f1",
+  "m",
+  "f0",
+  "m",
+  "i",
+  "f1",
+  "f0",
+  "i",
+  "m",
+  "f0",
+  "f3",
+  "i",
+  "f0",
+  "m",
+  "m",
+  "i",
+  "i",
+  "i",
+  "m",
+  "f1",
+  "m",
+  "f0",
+  "m",
+  "m",
+  "f0",
+  "i",
+  "m",
+  "i",
+  "i",
+  "m",
+  "m",
+  "m",
+  "i",
+  "m",
+  "i",
+  "i",
+  "m",
+  "f0",
+  "i",
+  "f0",
+  "m",
+  "i",
+  "m",
+  "i",
+  "i",
+  "i",
+  "m",
+  "i",
+  "i",
+  "i",
+  "i",
+  "i",
+  "i",
+  "m",
+  "i",
+  "i",
+  "m",
+  "f3",
+  "m",
+  "m",
+  "m",
+  "m",
+  "m",
+  "m",
+  "m",
+  "i",
+  "m",
+  "f3",
+  "i",
+  "i",
+  "i",
+  "i",
+  "m",
+  "i",
+  "m",
+  "f0",
+  "i",
+  "i",
+  "i",
+  "m",
+  "f2",
+  "f1",
+  "i",
+  "m",
+  "m",
+  "i",
+  "m",
+  "m",
+  "i",
+  "f0",
+  "i",
+  "i",
+  "m",
+  "i",
+  "f1",
+  "m",
+  "i",
+  "f1",
+  "m",
+  "m",
+  "f0",
+  "m",
+  "m",
+  "m",
+  "i",
+  "f2",
+  "i",
+  "i",
+  "f0",
+  "i",
+  "f1",
+  "f0",
+  "i",
+  "f0",
+  "f3",
+  "f0",
+  "i",
+  "i",
+  "i",
+  "i",
+  "m",
+  "f0",
+  "f0",
+  "f1",
+  "f0",
+  "m",
+  "i",
+  "m",
+  "i",
+  "m",
+  "f2",
+  "m",
+  "i",
+  "i",
+  "m",
+  "m",
+  "f0",
+  "m",
+  "m",
+  "f2",
+  "m",
+  "f0",
+  "m",
+  "i",
+  "f0",
+  "f4",
+  "f0",
+  "m",
+  "i",
+  "f0",
+  "m",
+  "i",
+  "f0",
+  "i",
+  "f0",
+  "m",
+  "m",
+  "i",
+  "f0",
+  "i",
+  "f0",
+  "f2",
+  "f1",
+  "i",
+  "i",
+  "i",
+  "f1",
+  "i",
+  "f0",
+  "i",
+  "i",
+  "f1",
+  "i",
+  "f0",
+  "f2",
+  "m",
+  "m",
+  "i",
+  "f1",
+  "f2",
+  "i",
+  "i",
+  "m",
+  "f0",
+  "m",
+  "m",
+  "f0",
+  "m",
+  "f4",
+  "i",
+  "i",
+  "i",
+  "m",
+  "m",
+  "f1",
+  "f0",
+  "f0",
+  "i",
+  "f0",
+  "i",
+  "m",
+  "f4",
+  "m",
+  "f0",
+  "m",
+  "i",
+  "f2",
+  "f1",
+  "f2",
+  "i",
+  "a0,1",
+  "m",
+  "m",
+  "i",
+  "m",
+  "m",
+  "m",
+  "m",
+  "i",
+  "i",
+  "i",
+  "m",
+  "i",
+  "m",
+  "m",
+  "f4",
+  "f3",
+  "i",
+  "f0",
+  "m",
+  "m",
+  "i",
+  "f3",
+  "m",
+  "m",
+  "i",
+  "m",
+  "f2",
+  "f1",
+  "m",
+  "m",
+  "m",
+  "f2",
+  "m",
+  "m",
+  "m",
+  "f0",
+  "i",
+  "i",
+  "m",
+  "m",
+  "i",
+  "m",
+  "m",
+  "m",
+  "f2",
+  "i",
+  "m",
+  "i",
+  "f1",
+  "f4",
+  "f2",
+  "i",
+  "i",
+  "m",
+  "f0",
+  "i",
+  "f0",
+  "i",
+  "f0",
+  "i",
+  "m",
+  "f1",
+  "i",
+  "f0",
+  "m",
+  "i",
+  "f0",
+  "f0",
+  "i",
+  "m",
+  "m",
+  "m",
+  "f0",
+  "f4",
+  "i",
+  "m",
+  "f1",
+  "m",
+  "m",
+  "f2",
+  "f0",
+  "f0",
+  "i",
+  "i",
+  "f0",
+  "m",
+  "f4",
+  "f1",
+  "m",
+  "m",
+  "m",
+  "f0",
+  "f1",
+  "i",
+  "i",
+  "f0",
+  "i",
+  "i",
+  "m",
+  "m",
+  "i",
+  "m",
+  "m",
+  "m",
+  "f1",
+  "m",
+  "f0",
+  "m",
+  "i",
+  "m",
+  "i",
+  "m",
+  "i",
+  "m",
+  "m",
+  "m",
+  "i",
+  "i",
+  "f1",
+  "f3",
+  "i",
+  "m",
+  "f2",
+  "i",
+  "a1,3",
+  "i",
+  "f1",
+  "f1",
+  "m",
+  "f1",
+  "m",
+  "i",
+  "f0",
+  "i",
+  "m",
+  "f0",
+  "f1",
+  "m",
+  "m",
+  "i",
+  "f1",
+  "m",
+  "i",
+  "f0",
+  "f3",
+  "i",
+  "m",
+  "m",
+  "f4",
+  "f1",
+  "m",
+  "i",
+  "m",
+  "i",
+  "i",
+  "m",
+  "f0",
+  "m",
+  "i",
+  "f0",
+  "f0",
+  "f1",
+  "i",
+  "i",
+  "m",
+  "f1",
+  "a0,2",
+  "m",
+  "i",
+  "m",
+  "i",
+  "f2",
+  "m",
+  "f0",
+  "f3",
+  "m",
+  "i",
+  "i",
+  "f0",
+  "i",
+  "m",
+  "m",
+  "f0",
+  "f1",
+  "m",
+  "f0",
+  "f1",
+  "i",
+  "f0",
+  "m",
+  "m",
+  "f0",
+  "i",
+  "i",
+  "i",
+  "i",
+  "f1",
+  "m",
+  "i",
+  "i",
+  "f0",
+  "m",
+  "m",
+  "f1",
+  "i",
+  "f1",
+  "m",
+  "m",
+  "i",
+  "m",
+  "m",
+  "i",
+  "m",
+  "f1",
+  "f2",
+  "i",
+  "i",
+  "f3",
+  "f2",
+  "m",
+  "f1",
+  "f0",
+  "i",
+  "i",
+  "i",
+  "m",
+  "i",
+  "m",
+  "m",
+  "m",
+  "m",
+  "i",
+  "m",
+  "i",
+  "i",
+  "i",
+  "f1",
+  "i",
+  "m",
+  "m",
+  "f0",
+  "m",
+  "i",
+  "f0",
+  "f1",
+  "m",
+  "i",
+  "m",
+  "i",
+  "m",
+  "m",
+  "i",
+  "m",
+  "i",
+  "f3",
+  "f0",
+  "m",
+  "m",
+  "i",
+  "f0",
+  "m",
+  "i",
+  "f2",
+  "m",
+  "i",
+  "f3",
+  "m",
+  "m",
+  "m",
+  "i",
+  "f2",
+  "m",
+  "f0",
+  "i",
+  "i",
+  "m",
+  "f0",
+  "i",
+  "i",
+  "m",
+  "i",
+  "f0",
+  "m",
+  "f2",
+  "i",
+  "m",
+  "m",
+  "m",
+  "m",
+  "i",
+  "i",
+  "i",
+  "f0",
+  "f0",
+  "i",
+  "i",
+  "m",
+  "i",
+  "m",
+  "f0",
+  "m",
+  "m",
+  "m",
+  "f4",
+  "i",
+  "i",
+  "i",
+  "m",
+  "i",
+  "i",
+  "i",
+  "f2",
+  "f4",
+  "f1",
+  "i",
+  "f0",
+  "m",
+  "m",
+  "m",
+  "f2",
+  "i",
+  "m",
+  "f3",
+  "m",
+  "m",
+  "i",
+  "i",
+  "m",
+  "i",
+  "i",
+  "f2",
+  "f0",
+  "m",
+  "m",
+  "m",
+  "m",
+  "f0",
+  "i",
+  "f0",
+  "i",
+  "a0,1",
+  "i",
+  "m",
+  "i",
+  "i",
+  "f1",
+  "m",
+  "f1",
+  "m",
+  "f1",
+  "m",
+  "f2",
+  "f4",
+  "f0",
+  "f0",
+  "i",
+  "i",
+  "m",
+  "f0",
+  "m",
+  "i",
+  "f0",
+  "i",
+  "m",
+  "m",
+  "m",
+  "i",
+  "i",
+  "i",
+  "m",
+  "m",
+  "f4",
+  "i",
+  "i",
+  "i",
+  "f2",
+  "f1",
+  "m",
+  "i",
+  "i",
+  "m",
+  "m",
+  "f2",
+  "m",
+  "f0",
+  "m",
+  "f1",
+  "i",
+  "i",
+  "m",
+  "f0",
+  "i",
+  "m",
+  "i",
+  "i",
+  "m",
+  "m",
+  "i",
+  "f0",
+  "m",
+  "f4",
+  "i",
+  "m",
+  "i",
+  "a2,3",
+  "i",
+  "m",
+  "m",
+  "m",
+  "m",
+  "m",
+  "i",
+  "m",
+  "m",
+  "i",
+  "i",
+  "m",
+  "m",
+  "i",
+  "f1",
+  "f2",
+  "m",
+  "f1",
+  "i",
+  "i",
+  "i",
+  "m",
+  "f1",
+  "m",
+  "i",
+  "m",
+  "f0",
+  "m",
+  "m",
+  "i",
+  "i",
+  "a0,1",
+  "i",
+  "m",
+  "i",
+  "i",
+  "m",
+  "f3",
+  "i",
+  "m",
+  "f1",
+  "m",
+  "m",
+  "f0",
+  "i",
+  "i",
+  "m",
+  "f0",
+  "m",
+  "m",
+  "i",
+  "f1",
+  "f0",
+  "f4",
+  "f2",
+  "i",
+  "f1",
+  "i",
+  "i",
+  "m",
+  "i",
+  "f0",
+  "f2",
+  "f2",
+  "f4",
+  "i",
+  "f3",
+  "f0",
+  "m",
+  "i",
+  "f0",
+  "m",
+  "f1",
+  "m",
+  "m",
+  "f0",
+  "m",
+  "i",
+  "f0",
+  "m",
+  "i",
+  "f2",
+  "m",
+  "i",
+  "m",
+  "m",
+  "f0",
+  "m",
+  "i",
+  "i",
+  "i",
+  "f0",
+  "m",
+  "f0",
+  "i",
+  "f0",
+  "f0",
+  "m",
+  "i",
+  "f2",
+  "m",
+  "i",
+  "m",
+  "f2",
+  "m",
+  "i",
+  "i",
+  "f0",
+  "m",
+  "f3",
+  "i",
+  "i",
+  "m",
+  "f1",
+  "i",
+  "m",
+  "f1",
+  "i",
+  "m",
+  "m",
+  "i",
+  "i",
+  "m",
+  "i",
+  "i",
+  "f0",
+  "m",
+  "m",
+  "a0,1",
+  "i",
+  "i",
+  "f2",
+  "f1",
+  "i",
+  "m",
+  "f4",
+  "i",
+  "i",
+  "i",
+  "m",
+  "m",
+  "m",
+  "i",
+  "m",
+  "m",
+  "m",
+  "f0",
+  "f0",
+  "i",
+  "f0",
+  "m",
+  "m",
+  "m",
+  "f0",
+  "m",
+  "i",
+  "m",
+  "m",
+  "m",
+  "m",
+  "i",
+  "i",
+  "m",
+  "m",
+  "m",
+  "f2",
+  "i",
+  "i",
+  "m",
+  "m",
+  "m",
+  "m",
+  "f3",
+  "f0",
+  "i",
+  "m",
+  "f0",
+  "m",
+  "m",
+  "i",
+  "m",
+  "m",
+  "f0",
+  "f0",
+  "i",
+  "m",
+  "f0",
+  "f1",
+  "f3",
+  "f0",
+  "m",
+  "m",
+  "m",
+  "m",
+  "f0",
+  "i",
+  "m",
+  "i",
+  "i",
+  "i",
+  "m",
+  "f0",
+  "f0",
+  "f4",
+  "f1",
+  "i",
+  "i",
+  "f0",
+  "i",
+  "m",
+  "m",
+  "m",
+  "m",
+  "m",
+  "f0",
+  "i",
+  "f1",
+  "m",
+  "f2",
+  "m",
+  "m",
+  "i",
+  "m",
+  "f0",
+  "m",
+  "f0",
+  "m",
+  "i",
+  "f0",
+  "i",
+  "m",
+  "f0",
+  "m",
+  "i",
+  "m",
+  "i",
+  "i",
+  "f3",
+  "m",
+  "m",
+  "m",
+  "i",
+  "m",
+  "f0",
+  "i",
+  "m",
+  "f4",
+  "m",
+  "m",
+  "i",
+  "i",
+  "m",
+  "m",
+  "m",
+  "f0",
+  "i",
+  "f0",
+  "i",
+  "m",
+  "m",
+  "m",
+  "i",
+  "i",
+  "f0",
+  "m",
+  "f0",
+  "i",
+  "i",
+  "i",
+  "m",
+  "i",
+  "m",
+  "i",
+  "f0",
+  "i",
+  "m",
+  "m",
+  "m",
+  "i",
+  "f1",
+  "i",
+  "i",
+  "m",
+  "m",
+  "i",
+  "m",
+  "i",
+  "f0",
+  "i",
+  "f0",
+  "m",
+  "i",
+  "m",
+  "f0",
+  "i",
+  "f1",
+  "m",
+  "f2",
+  "i",
+  "m",
+  "m",
+  "m",
+  "m",
+  "m",
+  "i",
+  "i",
+  "m",
+  "f0",
+  "m",
+  "i",
+  "f0",
+  "f1",
+  "i",
+  "f1",
+  "i",
+  "f1",
+  "i",
+  "f3",
+  "f1",
+  "i",
+  "i",
+  "m",
+  "i",
+  "f4",
+  "f0",
+  "m",
+  "f1",
+  "m",
+  "m",
+  "m",
+  "m",
+  "m",
+  "i",
+  "i",
+  "f0",
+  "i",
+  "m",
+  "i",
+  "m",
+  "f0",
+  "f1",
+  "i",
+  "f0",
+  "f2",
+  "m",
+  "i",
+  "i",
+  "m",
+  "i",
+  "f0",
+  "m",
+  "m",
+  "m",
+  "m",
+  "i",
+  "f1",
+  "f1",
+  "f0",
+  "f1",
+  "f0",
+  "i",
+  "f4",
+  "m",
+  "i",
+  "f1",
+  "i",
+  "f0",
+  "f3",
+  "i",
+  "i",
+  "m",
+  "i",
+  "i",
+  "f2",
+  "f1",
+  "m",
+  "f0",
+  "i",
+  "f0",
+  "f1",
+  "i",
+  "i",
+  "f0",
+  "m",
+  "i",
+  "m",
+  "f1",
+  "f2",
+  "m",
+  "f1",
+  "f0",
+  "m",
+  "m",
+  "f0",
+  "f0",
+  "f1",
+  "f0",
+  "m",
+  "m",
+  "f0",
+  "i",
+  "m",
+  "i",
+  "m",
+  "m",
+  "i",
+  "f0",
+  "f0",
+  "m",
+  "f0",
+  "m",
+  "f0",
+  "i",
+  "m",
+  "f0",
+  "f1",
+  "i",
+  "m",
+  "m",
+  "i",
+  "f0",
+  "i",
+  "f0",
+  "i",
+  "f0",
+  "m",
+  "m",
+  "f2",
+  "f3",
+  "i",
+  "i",
+  "i",
+  "m",
+  "i",
+  "m",
+  "i",
+  "i",
+  "f0",
+  "f0",
+  "f0",
+  "m",
+  "f1",
+  "m",
+  "f0",
+  "i",
+  "m",
+  "i",
+  "m",
+  "i",
+  "i",
+  "i",
+  "i",
+  "f0",
+  "f0",
+  "f1",
+  "i",
+  "i",
+  "f1",
+  "m",
+  "f0",
+  "i",
+  "i",
+  "m",
+  "m",
+  "m",
+  "m",
+  "m",
+  "f4",
+  "f0",
+  "m",
+  "m",
+  "m",
+  "f0",
+  "f0",
+  "m",
+  "m",
+  "m",
+  "f1",
+  "f0",
+  "i",
+  "f0",
+  "f0",
+  "i",
+  "f1",
+  "i",
+  "f3",
+  "m",
+  "i",
+  "i",
+  "f1",
+  "f2",
+  "m",
+  "m",
+  "m",
+  "i",
+  "m",
+  "i",
+  "i",
+  "m",
+  "i",
+  "i",
+  "m",
+  "i",
+  "i",
+  "m",
+  "i",
+  "m",
+  "f0",
+  "m",
+  "f0",
+  "i",
+  "f0",
+  "i",
+  "f1",
+  "i",
+  "i",
+  "i",
+  "i",
+  "m",
+  "m",
+  "i",
+  "m",
+  "i",
+  "f1",
+  "m",
+  "f0",
+  "i",
+  "i",
+  "i",
+  "f0",
+  "i",
+  "m",
+  "m",
+  "m",
+  "m",
+  "i",
+  "i",
+  "i",
+  "i",
+  "f1",
+  "m",
+  "i",
+  "m",
+  "m",
+  "f1",
+  "f1",
+  "m",
+  "f0",
+  "i",
+  "m",
+  "f2",
+  "i",
+  "m",
+  "i",
+  "f0",
+  "m",
+  "m",
+  "i",
+  "i",
+  "f0",
+  "i",
+  "f0",
+  "m",
+  "i",
+  "i",
+  "i",
+  "f0",
+  "m",
+  "i",
+  "f1",
+  "m",
+  "i",
+  "i",
+  "f0",
+  "m",
+  "m",
+  "i",
+  "f1",
+  "i",
+  "f0",
+  "f1",
+  "i",
+  "f2",
+  "i",
+  "i",
+  "m",
+  "m",
+  "i",
+  "m",
+  "m",
+  "f1",
+  "f3",
+  "i",
+  "i",
+  "f4",
+  "i",
+  "f2",
+  "m",
+  "m",
+  "f2",
+  "m",
+  "m",
+  "m",
+  "f4",
+  "i",
+  "f0",
+  "f1",
+  "i",
+  "i",
+  "i",
+  "m",
+  "i",
+  "m",
+  "m",
+  "m",
+  "f1",
+  "f0",
+  "m",
+  "f1",
+  "f0",
+  "f0",
+  "f0",
+  "m",
+  "i",
+  "m",
+  "i",
+  "i",
+  "f0",
+  "m",
+  "f1",
+  "f0",
+  "i",
+  "m",
+  "i",
+  "i",
+  "i",
+  "i",
+  "m",
+  "f2",
+  "i",
+  "i",
+  "i",
+  "i",
+  "f0",
+  "m",
+  "f0",
+  "m",
+  "f0",
+  "i",
+  "i",
+  "m",
+  "m",
+  "m",
+  "m",
+  "f0",
+  "i",
+  "f3",
+  "m",
+  "m",
+  "f1",
+  "i",
+  "i",
+  "f2",
+  "i",
+  "m",
+  "f0",
+  "i",
+  "i",
+  "f2",
+  "m",
+  "f2",
+  "f3",
+  "i",
+  "m",
+  "i",
+  "f0",
+  "f1",
+  "f4",
+  "i",
+  "m",
+  "i",
+  "f1",
+  "f2",
+  "m",
+  "f0",
+  "m",
+  "m",
+  "i",
+  "m",
+  "i",
+  "m",
+  "f0",
+  "f0",
+  "f1",
+  "i",
+  "m",
+  "m",
+  "m",
+  "m",
+  "f0",
+  "f1",
+  "i",
+  "i",
+  "f0",
+  "i",
+  "f0",
+  "i",
+  "m",
+  "i",
+  "m",
+  "m",
+  "i",
+  "i",
+  "i",
+  "m",
+  "f1",
+  "f4",
+  "i",
+  "i",
+  "f2",
+  "m",
+  "f0",
+  "f0",
+  "f1",
+  "m",
+  "f1",
+  "i",
+  "i",
+  "m",
+  "f2",
+  "i",
+  "i",
+  "m",
+  "f0",
+  "f0",
+  "m",
+  "m",
+  "i",
+  "i",
+  "f2",
+  "m",
+  "i",
+  "f1",
+  "i",
+  "m",
+  "i",
+  "f0",
+  "m",
+  "m",
+  "m",
+  "i",
+  "f0",
+  "f1",
+  "i",
+  "m",
+  "i",
+  "m",
+  "m",
+  "m",
+  "m",
+  "m",
+  "i",
+  "m",
+  "m",
+  "m",
+  "f1",
+  "m",
+  "f0",
+  "f1",
+  "f3",
+  "m",
+  "i",
+  "i",
+  "i",
+  "i",
+  "m",
+  "i",
+  "m",
+  "f2",
+  "f3",
+  "f0",
+  "f1",
+  "m",
+  "m",
+  "f0",
+  "f1",
+  "i",
+  "f0",
+  "i",
+  "f0",
+  "f3",
+  "f0",
+  "m",
+  "f0",
+  "m",
+  "m",
+  "m",
+  "m",
+  "i",
+  "f1",
+  "m",
+  "f3",
+  "f0",
+  "m",
+  "f1",
+  "m",
+  "i",
+  "f1",
+  "m",
+  "m",
+  "m",
+  "f1",
+  "f0",
+  "i",
+  "i",
+  "f0",
+  "m",
+  "i",
+  "i",
+  "i",
+  "f0",
+  "f1",
+  "f2",
+  "f0",
+  "m",
+  "i",
+  "m",
+  "f0",
+  "i",
+  "i",
+  "i",
+  "f0",
+  "i",
+  "f2",
+  "f3",
+  "f1",
+  "m",
+  "m",
+  "m",
+  "f2",
+  "f1",
+  "i",
+  "i",
+  "i",
+  "m",
+  "i",
+  "i",
+  "f0",
+  "i",
+  "f2",
+  "i",
+  "f1",
+  "m",
+  "f0",
+  "m",
+  "f4",
+  "i",
+  "f1",
+  "m",
+  "i",
+  "m",
+  "f3",
+  "f1",
+  "f0",
+  "i",
+  "i",
+  "f3",
+  "i",
+  "f1",
+  "f0",
+  "f0",
+  "m",
+  "f2",
+  "m",
+  "f1",
+  "m",
+  "f0",
+  "i",
+  "f4",
+  "m",
+  "i",
+  "i",
+  "i",
+  "i",
+  "f3",
+  "m",
+  "f1",
+  "m",
+  "f2",
+  "m",
+  "m",
+  "i",
+  "m",
+  "i",
+  "f1",
+  "f1",
+  "f0",
+  "m",
+  "m",
+  "m",
+  "i",
+  "i",
+  "i",
+  "m",
+  "i",
+  "i",
+  "f1",
+  "m",
+  "i",
+  "f0",
+  "i",
+  "m",
+  "m",
+  "i",
+  "f2",
+  "m",
+  "f1",
+  "i",
+  "m",
+  "m",
+  "f0",
+  "f0",
+  "i",
+  "m",
+  "m",
+  "m",
+  "i",
+  "f0",
+  "m",
+  "i",
+  "f1",
+  "f1",
+  "f0",
+  "f0",
+  "f2",
+  "i",
+  "i",
+  "f1",
+  "m",
+  "i",
+  "m",
+  "m",
+  "f0",
+  "i",
+  "f0",
+  "f0",
+  "m",
+  "m",
+  "f1",
+  "f1",
+  "m",
+  "m",
+  "m",
+  "f1",
+  "m",
+  "m",
+  "i",
+  "m",
+  "i",
+  "i",
+  "m",
+  "f4",
+  "f1",
+  "m",
+  "f0",
+  "i",
+  "f0",
+  "m",
+  "i",
+  "i",
+  "m",
+  "m",
+  "i",
+  "f0",
+  "i",
+  "i",
+  "i",
+  "i",
+  "i",
+  "i",
+  "i",
+  "i",
+  "f2",
+  "i",
+  "m",
+  "f0",
+  "i",
+  "m",
+  "m",
+  "m",
+  "f3",
+  "i",
+  "i",
+  "f0",
+  "i",
+  "i",
+  "i",
+  "f3",
+  "i",
+  "m",
+  "m",
+  "m",
+  "m",
+  "m",
+  "f0",
+  "m",
+  "m",
+  "f0",
+  "m",
+  "f0",
+  "m",
+  "f0",
+  "f1",
+  "m",
+  "m",
+  "f1",
+  "i",
+  "m",
+  "i",
+  "i",
+  "m",
+  "i",
+  "f0",
+  "i",
+  "m",
+  "f2",
+  "f1",
+  "m",
+  "m",
+  "i",
+  "i",
+  "i",
+  "f0",
+  "i",
+  "f3"
+ ]
+}
