@@ -27,8 +27,8 @@
 // task lifecycle reads a failed job as `blocked`). #701 later records that as a formal
 // `task.stage` transition; this module does not depend on it.
 //
-// STREAM_GUARD_IMPL=wasm (default js; stream-guard.cjs) runs the validator and the correction
-// request through the Rust port, read on each check. Same violations. It fails closed: when the
+// Validation and correction projection always use Rust; STREAM_GUARD_IMPL is retired.
+// The public caller contract is unchanged. It fails closed: when the
 // module cannot answer, the call is refused as unchecked (UNCHECKED, counted like any other
 // violation), never let through.
 const { checkTextWasm, buildCorrectionRequestWasm } = require('./stream-guard.cjs');
@@ -109,7 +109,7 @@ const HINTS = Object.freeze({
   'fs/write_text_file': 'Send { path, content } with a plain non-empty path and the whole file as a string.',
 });
 
-/** What a call is refused with when the Rust port cannot check it (STREAM_GUARD_IMPL=wasm). */
+/** The fixed refusal when the Rust port cannot check a call. */
 const UNCHECKED = Object.freeze({ message: 'Arguments could not be checked.', path: '$' });
 
 const isObject = (value) => value !== null && typeof value === 'object' && !Array.isArray(value);
@@ -225,7 +225,7 @@ function checkFsCall(method, params, { maxBytes = Infinity } = {}) {
  * The structured violation the agent receives: the Laya correction shape (`buildCorrectionRequest`,
  * only the violation, no restated schema), plus which tool, how many strikes, and how to fix it.
  */
-/** The correction request a violation carries. Under wasm a module failure (or a path over
+/** The correction request a violation carries. A module failure (or a path over
  *  dav-parse-wasm.cjs MAX_CORRECTION_UNITS) gives the fixed UNCHECKED request. */
 function correctionFor(found) {
   try {
