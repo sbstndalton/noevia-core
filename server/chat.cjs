@@ -2194,12 +2194,13 @@ function createChatHandler({
       if (toolCalls.size > 0) {
         // #1523: a search query is the question, not the request wrapper around it.
         for (const tc of toolCalls.values()) tc.args = tc.tooLarge ? '{}' : require('./search-query.cjs').cleanSearchArgs(tc.name, tc.args);
-        // An id this server made up (the provider sent none, or one over the cap) must not equal another call's id in the
-        // same message: the results are matched back to their calls by id.
+        // Every call in a message needs a unique id: preserve the first real occurrence,
+        // and substitute missing, oversized or repeated ids without taking any real id.
         {
           const used = new Set([...toolCalls.values()].filter((c) => !c.idMade).map((c) => c.id));
+          const seen = new Set();
           for (const [i, c] of toolCalls) {
-            if (!c.idMade) continue;
+            if (!c.idMade && !seen.has(c.id)) { seen.add(c.id); continue; }
             let id = `call-${i}`;
             for (let k = 2; used.has(id); k++) id = `call-${i}-${k}`;
             used.add(id);
