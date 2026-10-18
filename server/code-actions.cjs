@@ -18,21 +18,23 @@
 // pickInput) and applies its answer alone. When the crate refuses, faults or replies badly (logged
 // once per reason, command-text free) the result is the strict one:
 //   - classify returns an unverified classification: an unreadable command is treated as the riskiest
-//     kind, the most consequential class (external_account), approval 'always', unreadable, simple and
-//     standable false, `unverified: true`, why it could not be checked, and only the paths the call
-//     stated itself (its command's paths are unknown);
-//   - decide treats that class like any other, without asking the crate: a task whose grants do not
-//     include external_account is denied, naming the missing permission (the live behaviour for a
-//     class the task was not granted); a path known to be outside the workspace is denied; otherwise
-//     the call goes to a person ('ask'), never allowed and never standing, and the reason says why it
-//     could not be checked and that its workspace limits could not be checked either (its paths are
-//     unknown) or that it reaches outside the workspace. A command that cannot be checked is never
-//     denied for being unreadable alone: with the grant it always becomes an approval card;
-//   - decide asks a person too when it cannot get an answer for a classified call (a fault, a bad reply;
-//     live kept a JS deny, if there was one, which nothing here can recompute). When the crate refused a
-//     network call whose URL host it cannot read exactly (outside its plain-ASCII, non-IP-shorthand
-//     subset), it is asked again without the command; whatever it does not deny is put to a person, never
-//     allowed;
+//     kind, the most consequential class (external_account) together with execute_command (and the
+//     kind's own class), approval 'always', unreadable, simple and standable false, `unverified: true`,
+//     why it could not be checked, and only the paths the call stated itself (its command's paths are
+//     unknown);
+//   - decide treats that class like any other, in live's order and without asking the crate: a stated
+//     path known to be outside the workspace is denied; a task whose grants do not include one of its
+//     classes is denied, naming the first missing one; otherwise the call goes to a person ('ask'),
+//     never allowed and never standing, and the reason says why it could not be checked and that its
+//     workspace limits could not be checked either (its paths are unknown) or that it reaches outside
+//     the workspace. A command that cannot be checked is never denied for being unreadable alone: with
+//     the grants it always becomes an approval card;
+//   - decide, when the crate cannot answer for a classified call (a fault, a bad reply, a refused
+//     network host), first applies the crate's two deny rules itself (`hostFloor`: an edit or delete with
+//     paths outside the workspace; a restricted task missing a class), then asks a person. That ask is
+//     marked `standable: false`, and the harness lets no standing approval cover it or arise from it. If
+//     the floor itself cannot be computed it asks, not standable. The network case is also asked again
+//     without the command (defence, see decide()); whatever is not denied is put to a person, never allowed;
 //   - pickOption answers { outcome: 'cancelled' } (a refusal).
 // Faults are logged (command-text free) on the first occurrence of each reason and again at the 10th,
 // 100th, 1000th and so on, so a persistent runtime fault is not silent.
@@ -121,14 +123,28 @@ function classifyInput(call) {
 const WHY = { too_large: 'too large or complex to check', input: 'its arguments have a form that cannot be checked', ambiguous: 'it names a host that cannot be read exactly' };
 const whyOf = (fault) => WHY[fault] || 'the checker did not answer';
 
-/** What a call the crate could not classify is treated as: the most consequential class, never allowed or stood behind. */
+// How the ACP `kind` maps to a class (spec §3 table); the crate keeps the same table. Only used to name the classes an
+// unreadable call is treated as.
+const KIND_CLASS = Object.freeze({
+  read: ACTIONS.READ, search: ACTIONS.READ, edit: ACTIONS.EDIT, move: ACTIONS.EDIT, delete: ACTIONS.DELETE,
+  fetch: ACTIONS.NETWORK, execute: ACTIONS.EXECUTE, think: ACTIONS.NONE, other: ACTIONS.EXECUTE,
+});
+
+/** What a call the crate could not classify is treated as: the riskiest kind, never allowed or stood behind. */
 function unverifiedClassification(call, fault) {
-  let command = '', paths = [], outsideWorkspace = false;
+  let command = '', paths = [], outsideWorkspace = false, kind = '';
   try { command = commandOf(call?.rawInput); } catch { command = ''; }
   // Only the paths the call states itself: the paths a command would name or write are unknown.
   try { paths = [...new Set((Array.isArray(call?.locations) ? call.locations : []).map((l) => (l && typeof l.path === 'string' ? l.path : null)).filter(Boolean))]; } catch { paths = []; }
   try { outsideWorkspace = !!call?.rawInput && typeof call.rawInput === 'object' && call.rawInput.noeviaOutsideWorkspace === true; } catch { outsideWorkspace = false; }
-  return { action: ACTIONS.EXTERNAL, approval: 'always', command, paths, readable: false, actions: [ACTIONS.EXTERNAL], simple: false, standable: false,
+  try { kind = typeof call?.kind === 'string' ? call.kind : ''; } catch { kind = ''; }
+  const kindClass = Object.prototype.hasOwnProperty.call(KIND_CLASS, kind) ? KIND_CLASS[kind] : ACTIONS.EXECUTE;
+  // The classes it is treated as, all of which the task must have been granted: the riskiest, a command's (when it is or has one)
+  // and the kind's own.
+  const actions = [ACTIONS.EXTERNAL];
+  if (kind === 'execute' || command) actions.push(ACTIONS.EXECUTE);
+  if (!actions.includes(kindClass)) actions.push(kindClass);
+  return { action: ACTIONS.EXTERNAL, approval: 'always', command, paths, readable: false, actions, simple: false, standable: false,
     unverified: true, unverifiedWhy: whyOf(fault), ...(outsideWorkspace ? { outsideWorkspace: true } : {}) };
 }
 
@@ -163,20 +179,40 @@ const unverifiedAsk = (c) => {
     : ' The paths its command would touch are unknown, so the task\u2019s workspace limits could not be checked either.';
   return `This action could not be checked (${String(c.unverifiedWhy || whyOf())}), so a person has to approve it.${where}`;
 };
-const UNVERIFIED_NOT_GRANTED = 'This command could not be checked, so it is treated as the most consequential kind of action (external account), which this task was not granted.';
-/** An unverified classification is decided as the class it is treated as: the grants, then the workspace, then a person. */
-function decideUnverified({ classified: c, capabilities = [], inWorkspace = null }) {
-  if (Array.isArray(capabilities) && capabilities.length && !capabilities.includes(ACTIONS.EXTERNAL)) return { decision: 'deny', reason: UNVERIFIED_NOT_GRANTED };
-  if (inWorkspace === false && Array.isArray(c.paths) && c.paths.length) return { decision: 'deny', reason: 'The path is outside this task\u2019s workspace.' };
-  return { decision: 'ask', reason: unverifiedAsk(c) };
+const deny = (reason) => ({ decision: 'deny', reason });
+/**
+ * The crate's two deny rules, applied here when the crate cannot answer (and to an unverified classification), in live's
+ * order: an edit or delete with paths and `inWorkspace === false` is outside the workspace; a restricted task (a non-empty
+ * list of granted classes) missing a class other than none or read was not granted it. Returns a deny, null (neither rule
+ * applies) or undefined (it cannot be computed: the caller asks, not standable).
+ */
+function hostFloor({ classified: c, capabilities, inWorkspace }) {
+  try {
+    const all = Array.isArray(c.actions) && c.actions.length ? c.actions : [c.action];
+    const writes = all.includes(ACTIONS.EDIT) || all.includes(ACTIONS.DELETE);
+    if (writes && Array.isArray(c.paths) && c.paths.length && inWorkspace === false) return deny('The path is outside this task\u2019s workspace.');
+    const granted = Array.isArray(capabilities) ? capabilities : [];
+    const missing = all.find((a) => a !== ACTIONS.NONE && a !== ACTIONS.READ && granted.length && !granted.includes(a));
+    if (missing) return deny(`This task was not granted ${String(missing).replace(/_/g, ' ')}.${c.unverified === true ? ' (This command could not be checked, so it is treated as the most consequential kind of action.)' : ''}`);
+    return null;
+  } catch { return undefined; }
+}
+/** A person is asked, and no standing approval covers it or arises from it. */
+const askNotStandable = (reason) => ({ decision: 'ask', reason, standable: false });
+/** An unverified classification is decided as the class it is treated as: the floor, then a person. */
+function decideUnverified(input) {
+  const floor = hostFloor(input);
+  if (floor) return floor;
+  return askNotStandable(unverifiedAsk(input.classified));
 }
 
 /**
  * What noevia does with one classified call, by the Rust port: `allow` is only ever reached by a read, a no-op, or a
  * network call to a domain the job was granted when it was created; an edit or delete outside the workspace root, or a
  * class the job was never granted, is `deny`; everything else asks. An unverified classification is decided as the
- * most consequential class with unknown paths (see the header): denied without the grant, otherwise a person is asked.
- * A refusal or a fault on a classified call asks a person. Option: `wasmLoader` (tests).
+ * most consequential class with unknown paths (see the header): denied by the floor, otherwise a person is asked, not
+ * standable. A refusal or a fault on a classified call applies the floor, then asks a person, not standable.
+ * Option: `wasmLoader` (tests).
  * @param {{classified: ReturnType<typeof classify>, capabilities?: string[], domains?: string[], inWorkspace?: boolean|null}} input
  * @returns {{decision: 'allow'|'ask'|'deny', reason: string}}
  */
@@ -184,16 +220,20 @@ function decide(input = {}, { wasmLoader = defaultLoader } = {}) {
   if (input?.classified?.unverified === true) return decideUnverified(input);
   const { port, fault } = askPort('decide', () => wasmLoader().codeActionsDecide(...decideInput(input)));
   if (port) return port.reply;
-  if (fault === 'ambiguous' && input.classified.approval === 'capability') {
-    // The crate could not read a URL host exactly. What it denies without the command (the workspace, the granted
-    // classes) stays denied; anything else is put to a person, never allowed. In practice this branch is defence:
-    // the crate decides those denials before it reads a host, so a refusal here means none applied and the second
-    // answer is an ask. It is kept so a change in the crate's order cannot turn a deny into an ask unnoticed.
+  // The crate could not answer. Its two deny rules do not depend on the command, so they are applied here, whatever the cause.
+  const floor = hostFloor(input);
+  if (floor) return floor;
+  if (fault === 'ambiguous' && floor === null && input.classified.approval === 'capability') {
+    // The crate could not read a URL host exactly. Asked again without the command, it still decides the workspace and
+    // the granted classes: a deny stays a deny, anything else is put to a person, never allowed. In practice this branch
+    // is defence: the floor above and the crate both decide those denials before a host is read, so a refusal here means
+    // none applied and the second answer is an ask. It is kept so a change in the crate's order cannot turn a deny into
+    // an ask unnoticed.
     const [classified, capabilities, domains, inWorkspace] = decideInput(input);
     const again = askPort('decide.again', () => wasmLoader().codeActionsDecide({ ...classified, command: '' }, capabilities, domains, inWorkspace));
-    if (again.port) return again.port.reply.decision === 'deny' ? again.port.reply : { decision: 'ask', reason: UNVERIFIED_ASK };
+    if (again.port && again.port.reply.decision === 'deny') return again.port.reply;
   }
-  return { decision: 'ask', reason: UNVERIFIED_ASK };
+  return askNotStandable(UNVERIFIED_ASK);
 }
 
 /** What pickOption() reads of the offered options. */

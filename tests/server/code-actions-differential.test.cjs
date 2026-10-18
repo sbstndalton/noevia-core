@@ -218,7 +218,10 @@ test('find -exec chains: the port gives the JS answer (by hash); oversized comma
     // Treated as the riskiest class: a task not granted it is denied, one granted it is asked.
     const restricted = ca.decide({ classified: now, capabilities: ['edit_file', 'execute_command'], domains: [], inWorkspace: null });
     assert.equal(restricted.decision, 'deny');
-    assert.match(restricted.reason, /which this task was not granted/);
-    assert.equal(ca.decide({ classified: now, capabilities: ['edit_file', 'external_account'], domains: [], inWorkspace: null }).decision, 'ask');
+    assert.match(restricted.reason, /^This task was not granted external account\./);
+    assert.equal(ca.decide({ classified: now, capabilities: ['edit_file', 'external_account'], domains: [], inWorkspace: null }).decision, 'deny', 'granted external_account but not execute_command');
+    const granted = ca.decide({ classified: now, capabilities: ['edit_file', 'execute_command', 'external_account'], domains: [], inWorkspace: null });
+    assert.equal(granted.decision, 'ask');
+    assert.equal(granted.standable, false);
   });
 });

@@ -37,13 +37,59 @@ test('an unreadable command in a task that was not granted the riskiest class is
   } });
   assert.equal(refused.asked.length, 0, 'nobody is asked to approve what the task was not granted');
   assert.deepEqual(withoutReason(denied), { outcome: 'selected', optionId: 'n' });
-  assert.match(reasonOf(denied), /could not be checked, so it is treated as the most consequential kind of action \(external account\), which this task was not granted/);
-  const granted = await run({ capabilities: [ACTIONS.EDIT, ACTIONS.EXTERNAL], answers: ['approve_all'], script: async (h) => {
+  assert.match(reasonOf(denied), /^This task was not granted external account\./);
+  const granted = await run({ capabilities: [ACTIONS.EDIT, ACTIONS.EXECUTE, ACTIONS.EXTERNAL], answers: ['approve_all'], script: async (h) => {
     asked = await h.requestPermission({ toolCall: { kind: 'execute', rawInput: { command: huge } }, options: OPTIONS });
   } });
   assert.equal(granted.asked.length, 1);
   assert.match(granted.asked[0].reason, /workspace limits could not be checked/);
   assert.deepEqual(withoutReason(asked), { outcome: 'selected', optionId: 'y' });
+});
+
+test('standing on a restricted task: an unreadable command is asked every time, a decide fault is asked every time, and neither answer stands', { skip: skipWasm }, async () => {
+  ran++;
+  const huge = `echo ${'x'.repeat(2 * 1024 * 1024)}`;
+  // A restricted task granted everything an unreadable command is treated as.
+  const full = [ACTIONS.EDIT, ACTIONS.EXECUTE, ACTIONS.EXTERNAL];
+  const unreadable = await run({ capabilities: full, answers: ['approve_all', 'approve_all', 'approve'], script: async (h) => {
+    for (let i = 0; i < 3; i++) await h.requestPermission({ toolCall: { kind: 'execute', rawInput: { command: huge } }, options: OPTIONS });
+  } });
+  assert.equal(unreadable.asked.length, 3, '"allow for this task" never stands behind an unreadable command');
+  // A standing allow for an edit, then the checker cannot decide: asked, and the answer does not stand either.
+  const real = require('./dav-parse-wasm.cjs').codeActionsDecide;
+  let calls = 0;
+  const r = await (async () => {
+    try {
+      return await run({ capabilities: [ACTIONS.EDIT], answers: ['approve_all', 'approve_all', 'approve'], script: async (h, cwd) => {
+        const edit = { toolCall: { kind: 'edit', locations: [{ path: path.join(cwd, 'a.txt') }] }, options: OPTIONS };
+        await h.requestPermission(edit); // a standing allow for edit_file arises from the first answer
+        require('./dav-parse-wasm.cjs').codeActionsDecide = () => { calls++; throw new (require('./dav-parse-wasm.cjs').DavParseError)('trap', 'trap'); };
+        await h.requestPermission(edit); // the decide fault: asked, though a standing allow exists
+        await h.requestPermission(edit); // and the second answer did not stand either
+      } });
+    } finally { require('./dav-parse-wasm.cjs').codeActionsDecide = real; }
+  })();
+  assert.equal(calls, 2);
+  assert.equal(r.asked.length, 3, 'the first asked (no standing yet), the two faults asked despite the standing allow');
+  // The same on the first request without any standing: the fault asks and its approve_all is not remembered.
+  require('./dav-parse-wasm.cjs').codeActionsDecide = real;
+});
+
+test('an announced read whose own stated reading cannot be checked is taken whole: asked with the note, never waved through', { skip: skipWasm }, async () => {
+  ran++;
+  const dpw = require('./dav-parse-wasm.cjs');
+  const real = dpw.codeActionsClassify;
+  try {
+    // The stated bare request (no kind, no input) cannot be classified; the announced call alone is a plain read.
+    dpw.codeActionsClassify = (projection) => { if (projection.kind === null) throw new dpw.DavParseError('trap', 'trap'); return real(projection); };
+    const r = await run({ capabilities: [ACTIONS.READ, ACTIONS.EXECUTE, ACTIONS.EXTERNAL], answers: ['approve_all', 'approve'], script: async (h) => {
+      h.sessionUpdate({ sessionUpdate: 'tool_call', toolCallId: 'c1', kind: 'read', rawInput: { command: 'cat a' } });
+      await h.requestPermission({ toolCall: { toolCallId: 'c1', kind: null }, options: OPTIONS });
+      await h.requestPermission({ toolCall: { toolCallId: 'c1', kind: null }, options: OPTIONS });
+    } });
+    assert.equal(r.asked.length, 2, 'asked both times: no standing approval arises from an unverified reading');
+    assert.match(r.asked[0].reason, /could not be checked/);
+  } finally { dpw.codeActionsClassify = real; }
 });
 
 test.after(() => { for (const d of temps) fs.rmSync(d, { recursive: true, force: true }); });
@@ -860,4 +906,4 @@ test('a redirect under a standing execute allow still meets the edit containment
   assert.deepEqual(picked.map((p) => p.optionId), ['y', 'n', 'n', 'y']);
 });
 
-test.after(() => { if (!skipWasm) assert.equal(ran, 44, 'a wasm-guarded test body did not run'); });
+test.after(() => { if (!skipWasm) assert.equal(ran, 46, 'a wasm-guarded test body did not run'); });

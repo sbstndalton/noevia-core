@@ -2,9 +2,9 @@
 // Code actions are always the Rust port (CODE_ACTIONS_IMPL retired, #1071). This file pins how the functions code-harness.cjs
 // calls use the port's answers, with a stand-in for the port (no dav-parse.wasm needed; tests/server/code-actions-differential.test.cjs
 // runs the real module against the frozen JS answers). The port decides alone. A refusal, a fault or a bad reply is the strict
-// result, which is what the wasm composition did before #1071: classify gives the unverified classification (never allowed, never
-// stood behind), decide asks a person (a network call whose URL host the port cannot read exactly is asked again without the
-// command and stays denied if the port denies it then), pickOption cancels. Synthetic calls only.
+// result, which is what the wasm composition did before #1071: classify gives the unverified classification (the riskiest kind, never
+// allowed, never stood behind), decide applies the crate's two deny rules itself (the floor) and then asks a person with no standing
+// approval, pickOption cancels. Synthetic calls only.
 const test = require('node:test'), assert = require('node:assert/strict');
 const ca = require('./code-actions.cjs');
 const davParseWasm = require('./dav-parse-wasm.cjs');
@@ -58,7 +58,7 @@ test('classify: a refusal, a fault or a bad reply is the unverified classificati
   for (const [answer, why] of cases) {
     const { value: c, seen } = quietly(() => ca.classify(call, fakePort({ classify: answer })));
     assert.deepEqual(c, { action: 'external_account', approval: 'always', command: 'curl https://example.com/x', paths: [], readable: false,
-      actions: ['external_account'], simple: false, standable: false, unverified: true, unverifiedWhy: why });
+      actions: ['external_account', 'execute_command'], simple: false, standable: false, unverified: true, unverifiedWhy: why });
     assert.ok(seen.every((m) => !m.includes('example.com')), 'logged without the command');
   }
   // A call that cannot even be projected is unverified too, not a throw.
@@ -79,38 +79,51 @@ test('decide: the port\'s decision is the answer, and it is sent only what decid
 const UNREADABLE = (call = CALL) => quietly(() => ca.classify(call, fakePort({ classify: refuse('too_large') }))).value;
 const NOTE = 'This action could not be checked (too large or complex to check), so a person has to approve it. The paths its command would touch are unknown, so the task\u2019s workspace limits could not be checked either.';
 
-test('decide: an unverified command is treated as the riskiest kind with unknown paths; with the grant (or no restriction) a person is asked, saying why, and it cannot stand', () => {
+test('decide: an unverified command is treated as the riskiest kind with unknown paths; with the grants (or no restriction) a person is asked, saying why, not standable', () => {
   const port = fakePort({ decide: reply({ decision: 'allow', reason: 'Read-only.' }) });
   const unverified = UNREADABLE();
   assert.equal(unverified.unverified, true);
   assert.equal(unverified.action, 'external_account');
+  assert.deepEqual(unverified.actions, ['external_account', 'execute_command']);
   assert.equal(unverified.standable, false);
-  // No restriction on the task, and a task granted that class: asked, never allowed.
-  for (const capabilities of [[], ['edit_file', 'external_account']]) {
-    assert.deepEqual(ca.decide({ classified: unverified, capabilities, domains: [], inWorkspace: null }, port), { decision: 'ask', reason: NOTE });
+  // No restriction on the task, and a task granted every class it is treated as: asked, never allowed.
+  for (const capabilities of [[], ['edit_file', 'execute_command', 'external_account']]) {
+    assert.deepEqual(ca.decide({ classified: unverified, capabilities, domains: [], inWorkspace: null }, port), { decision: 'ask', reason: NOTE, standable: false });
   }
   assert.deepEqual(port.calls, []);
 });
 
-test('decide: an unverified command in a task that was not granted the riskiest class is denied, naming the missing permission', () => {
+test('decide: an unverified command in a task that was not granted a class it is treated as is denied, naming the first missing class', () => {
   const port = fakePort({ decide: reply({ decision: 'allow', reason: 'x' }) });
-  for (const capabilities of [['edit_file'], ['edit_file', 'execute_command', 'network', 'delete', 'git_push']]) {
+  for (const capabilities of [['edit_file'], ['edit_file', 'network', 'delete', 'git_push', 'execute_command']]) {
     const d = ca.decide({ classified: UNREADABLE(), capabilities, domains: ['example.com'], inWorkspace: null }, port);
     assert.equal(d.decision, 'deny');
-    assert.match(d.reason, /could not be checked, so it is treated as the most consequential kind of action \(external account\), which this task was not granted/);
+    assert.match(d.reason, /^This task was not granted external account\. \(This command could not be checked, so it is treated as the most consequential kind of action\.\)$/);
   }
+  // Granted external_account but not execute_command: the unverified execute call is denied, naming execute command.
+  const d = ca.decide({ classified: UNREADABLE(), capabilities: ['edit_file', 'external_account'], domains: [], inWorkspace: null }, port);
+  assert.equal(d.decision, 'deny');
+  assert.match(d.reason, /^This task was not granted execute command\./);
   assert.deepEqual(port.calls, []);
 });
 
-test('decide: an unverified command and the workspace: a stated path known to be outside is denied; unknown paths ask and say so', () => {
-  const withPath = { ...CALL, locations: [{ path: '/elsewhere/a' }] };
-  const c = UNREADABLE(withPath);
+test('decide: an unverified call and the workspace, in live\u2019s order: a stated path outside is denied for a write kind, before the grants; unknown paths ask and say so', () => {
+  const edit = { kind: 'edit', rawInput: { path: 'x' }, locations: [{ path: '/elsewhere/a' }] };
+  const c = UNREADABLE(edit);
   assert.deepEqual(c.paths, ['/elsewhere/a']);
-  assert.deepEqual(ca.decide({ classified: c, capabilities: [], domains: [], inWorkspace: false }), { decision: 'deny', reason: 'The path is outside this task\u2019s workspace.' });
-  assert.deepEqual(ca.decide({ classified: c, capabilities: ['external_account'], domains: [], inWorkspace: true }), { decision: 'ask', reason: NOTE });
-  // No stated path: the harness cannot place it (inWorkspace null), so a person is asked with the workspace note.
+  assert.deepEqual(c.actions, ['external_account', 'edit_file']);
+  const WS = { decision: 'deny', reason: 'The path is outside this task\u2019s workspace.' };
+  // Granted everything it is treated as, and a restricted task missing something: the workspace answers first.
+  assert.deepEqual(ca.decide({ classified: c, capabilities: ['edit_file', 'external_account'], domains: [], inWorkspace: false }), WS);
+  assert.deepEqual(ca.decide({ classified: c, capabilities: ['network'], domains: [], inWorkspace: false }), WS);
+  // Inside (or unknown), the grants decide, then a person is asked.
+  assert.equal(ca.decide({ classified: c, capabilities: ['network'], domains: [], inWorkspace: true }).decision, 'deny');
+  assert.deepEqual(ca.decide({ classified: c, capabilities: ['edit_file', 'external_account'], domains: [], inWorkspace: true }), { decision: 'ask', reason: NOTE, standable: false });
+  // An unverified command (execute kind) with a stated outside path is not a write: asked, with the workspace note.
+  const cmd = UNREADABLE({ ...CALL, locations: [{ path: '/elsewhere/a' }] });
+  assert.equal(ca.decide({ classified: cmd, capabilities: ['execute_command', 'external_account'], domains: [], inWorkspace: false }).decision, 'ask');
+  // No stated path: nothing to be outside of.
   assert.match(ca.decide({ classified: UNREADABLE(), capabilities: [], domains: [], inWorkspace: null }).reason, /workspace limits could not be checked/);
-  // inWorkspace false with no stated path to be outside of is not a denial.
   assert.equal(ca.decide({ classified: UNREADABLE({ kind: 'execute', rawInput: { command: 'ls' } }), capabilities: [], domains: [], inWorkspace: false }).decision, 'ask');
 });
 
@@ -119,8 +132,9 @@ test('decide: noeviaOutsideWorkspace on an unverified command: asked (not standa
   const c = UNREADABLE(flagged);
   assert.equal(c.outsideWorkspace, true);
   assert.equal(c.standable, false);
-  const d = ca.decide({ classified: c, capabilities: ['external_account'], domains: [], inWorkspace: null });
+  const d = ca.decide({ classified: c, capabilities: ['external_account', 'execute_command'], domains: [], inWorkspace: null });
   assert.equal(d.decision, 'ask');
+  assert.equal(d.standable, false);
   assert.match(d.reason, /It reaches outside the task\u2019s workspace\./);
   assert.equal(ca.decide({ classified: c, capabilities: ['edit_file'], domains: [], inWorkspace: null }).decision, 'deny');
 });
@@ -128,10 +142,10 @@ test('decide: noeviaOutsideWorkspace on an unverified command: asked (not standa
 test('decide: a refusal, a fault, a bad reply or an input of the wrong shape asks a person (never allows)', () => {
   const input = { classified: REPLY, capabilities: [], domains: [], inWorkspace: null };
   for (const answer of [refuse('trap'), refuse('too_large'), refuse('ambiguous'), () => { throw new TypeError('bad'); }]) {
-    assert.deepEqual(quietly(() => ca.decide(input, fakePort({ decide: answer }))).value, { decision: 'ask', reason: ca.UNVERIFIED_ASK });
+    assert.deepEqual(quietly(() => ca.decide(input, fakePort({ decide: answer }))).value, { decision: 'ask', reason: ca.UNVERIFIED_ASK, standable: false });
   }
   for (const bad of [undefined, {}, { classified: {} }, { classified: { ...REPLY, paths: 'x' } }, { classified: REPLY, inWorkspace: 'yes' }]) {
-    assert.deepEqual(quietly(() => ca.decide(bad, fakePort({ decide: reply({ decision: 'allow', reason: '' }) }))).value, { decision: 'ask', reason: ca.UNVERIFIED_ASK }, JSON.stringify(bad));
+    assert.deepEqual(quietly(() => ca.decide(bad, fakePort({ decide: reply({ decision: 'allow', reason: '' }) }))).value, { decision: 'ask', reason: ca.UNVERIFIED_ASK, standable: false }, JSON.stringify(bad));
   }
 });
 
@@ -141,7 +155,7 @@ test('decide: a network call whose URL host the port cannot read exactly asks, u
   // The first ask is refused as ambiguous; the second (no command) is answered.
   const answers = (second) => { let n = 0; return { decide: (...a) => { if (n++ === 0) throw new davParseWasm.DavParseError('refused', 'ambiguous'); return second(...a); } }; };
   const ask = quietly(() => ca.decide(input, fakePort(answers(reply({ decision: 'ask', reason: 'Network request.' }))))).value;
-  assert.deepEqual(ask, { decision: 'ask', reason: ca.UNVERIFIED_ASK });
+  assert.deepEqual(ask, { decision: 'ask', reason: ca.UNVERIFIED_ASK, standable: false });
   // Never allowed, even if the second answer would allow.
   assert.equal(quietly(() => ca.decide(input, fakePort(answers(reply({ decision: 'allow', reason: 'x' }))))).value.decision, 'ask');
   // What the port denies without the command stays denied, with its words.
@@ -200,4 +214,31 @@ test('a persistent fault is logged on its first occurrence and again at the 10th
   assert.match(seen[2], /\(100 times so far\)$/);
   assert.match(seen[3], /\(1000 times so far\)$/);
   assert.ok(seen.every((m) => !m.includes('secret-synthetic-path')));
+});
+
+test('decide, when the crate cannot answer: the floor (the crate\u2019s two deny rules) is applied on the host before a person is asked, and the ask cannot stand', () => {
+  const edit = { ...REPLY, action: 'edit_file', command: '', paths: ['/elsewhere/a'], actions: ['edit_file'] };
+  const exec = { ...REPLY, action: 'execute_command', actions: ['execute_command'], paths: [] };
+  const dead = (c) => ({ decide: refuse(c) });
+  for (const cause of ['trap', 'too_large', 'ambiguous', 'reply', 'input']) {
+    // 1. an edit or delete with paths outside the workspace
+    assert.deepEqual(quietly(() => ca.decide({ classified: edit, capabilities: [], domains: [], inWorkspace: false }, fakePort(dead(cause)))).value,
+      { decision: 'deny', reason: 'The path is outside this task\u2019s workspace.' }, cause);
+    // 2. a restricted task missing the class (the first missing one is named); none and read never need a grant
+    assert.deepEqual(quietly(() => ca.decide({ classified: { ...exec, actions: ['read_repository', 'none', 'network', 'execute_command'] }, capabilities: ['execute_command'], domains: [], inWorkspace: null }, fakePort(dead(cause)))).value,
+      { decision: 'deny', reason: 'This task was not granted network.' }, cause);
+    // neither rule applies: asked, and not standable
+    assert.deepEqual(quietly(() => ca.decide({ classified: exec, capabilities: ['execute_command'], domains: [], inWorkspace: null }, fakePort(dead(cause)))).value,
+      { decision: 'ask', reason: ca.UNVERIFIED_ASK, standable: false }, cause);
+  }
+  // Order, as live: the workspace before the grants; paths outside but an inside answer or no paths: no workspace denial.
+  assert.equal(quietly(() => ca.decide({ classified: edit, capabilities: ['network'], domains: [], inWorkspace: false }, fakePort(dead('trap')))).value.reason, 'The path is outside this task\u2019s workspace.');
+  assert.equal(quietly(() => ca.decide({ classified: { ...edit, paths: [] }, capabilities: [], domains: [], inWorkspace: false }, fakePort(dead('trap')))).value.decision, 'ask');
+  assert.equal(quietly(() => ca.decide({ classified: edit, capabilities: [], domains: [], inWorkspace: true }, fakePort(dead('trap')))).value.decision, 'ask');
+});
+
+test('decide, when the floor itself cannot be computed: a person is asked, not standable', () => {
+  const classified = { ...REPLY, get actions() { throw Error('no'); } };
+  assert.deepEqual(quietly(() => ca.decide({ classified, capabilities: ['edit_file'], domains: [], inWorkspace: false }, fakePort({ decide: refuse('trap') }))).value,
+    { decision: 'ask', reason: ca.UNVERIFIED_ASK, standable: false });
 });
