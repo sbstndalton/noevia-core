@@ -123,14 +123,14 @@ test('realistic vocabularies cross in few ranges and rounds', { skip: skipWasm }
   const word = () => 'ab▁cdéfgh'.slice(0, 1 + rnd(8)) + rnd(100000);
   const strArr = (n, f) => [T.arr, Buffer.concat([u32(T.str), u64(n), ...Array.from({ length: n }, () => str(f()))])];
   const numArr = (type, n, w) => [T.arr, Buffer.concat([u32(type), u64(n), Buffer.alloc(n * w, 1)])];
-  // In the order of `shapes` below (the architecture is masked: it is whatever the shape declares).
+  // Architecture names, metadata-key prefixes and tokenizer enum values below are GGUF format values required by the reader; only the shape labels are fixture names.
   const wants = [{ ...EMPTY, blockCount: 48, contextLength: 131072, hasChatTemplate: true }, { ...EMPTY, blockCount: 28, contextLength: 32768 }];
   let shapeNo = 0;
   const shapes = {
-    gemma_262k: [kv('general.architecture', STR('gemma3')), kv('gemma3.block_count', S(T.u32, 48)), kv('tokenizer.ggml.model', STR('llama')),
+    large_vocabulary: [kv('general.architecture', STR('gemma3')), kv('gemma3.block_count', S(T.u32, 48)), kv('tokenizer.ggml.model', STR('llama')),
       kv('tokenizer.ggml.tokens', strArr(262144, word)), kv('tokenizer.ggml.scores', numArr(T.f32, 262144, 4)), kv('tokenizer.ggml.token_type', numArr(T.i32, 262144, 4)),
       kv('tokenizer.chat_template', STR('{{ x }}'.repeat(2000))), kv('gemma3.context_length', S(T.u32, 131072))],
-    qwen_151k_merges: [kv('general.architecture', STR('qwen2')), kv('qwen2.block_count', S(T.u32, 28)),
+    merge_vocabulary: [kv('general.architecture', STR('qwen2')), kv('qwen2.block_count', S(T.u32, 28)),
       kv('tokenizer.ggml.tokens', strArr(151936, word)), kv('tokenizer.ggml.token_type', numArr(T.i32, 151936, 4)),
       kv('tokenizer.ggml.merges', strArr(151387, () => `${word()} ${word()}`)), kv('qwen2.context_length', S(T.u32, 32768))],
   };

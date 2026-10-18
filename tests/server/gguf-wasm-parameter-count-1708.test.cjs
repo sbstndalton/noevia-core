@@ -15,9 +15,11 @@ const EMPTY = { arch: '', name: '', contextLength: null, embeddingLength: null, 
   keyLengthSwa: null, valueLengthSwa: null, slidingWindow: null, slidingWindowPattern: null, sharedKvLayers: null, fullAttentionInterval: null, ssmStateSize: null,
   expertCount: null, nextnPredictLayers: null, hasChatTemplate: false };
 // The architecture is masked to '' below: the header declares it, this test is about the counts.
+// This is a GGUF architecture discriminator and metadata-key prefix, not a fixture label.
+const GGUF_ARCH = 'llama';
 const BASE_SUMMARY = { ...EMPTY, blockCount: 1, contextLength: 8192 };
 const masked = (summary) => ({ ...summary, arch: '' });
-const BASE = [arch('llama'), kv('llama.block_count', S(4, 1)), kv('llama.context_length', S(4, 8192))];
+const BASE = [arch(GGUF_ARCH), kv(GGUF_ARCH + '.block_count', S(4, 1)), kv(GGUF_ARCH + '.context_length', S(4, 8192))];
 const info = (name, dims, type = 0) => Buffer.concat([str(name), u32(dims.length), ...dims.map((d) => u64(d)), u32(type), u64(0)]);
 const build = (kvs, infos = []) => Buffer.concat([gguf(kvs, { tensors: infos.length }), ...infos]);
 const TENSORS = [info('token_embd.weight', [4096, 32000]), info('output_norm.weight', [4096])];
@@ -49,7 +51,7 @@ test('#1708 no tensors still means no parameterCount key on the Rust path', { sk
 
 test('#1708 the glue still refuses a summary with a stray key or a bad parameterCount', { skip }, () => {
   const reply = davParseWasm.ggufSummaryReply;
-  const ok = { arch: 'llama', name: '', contextLength: 8192, embeddingLength: null, blockCount: 1, headCount: null, headCountKv: null, keyLength: null, valueLength: null, keyLengthSwa: null, valueLengthSwa: null, slidingWindow: null, slidingWindowPattern: null, sharedKvLayers: null, fullAttentionInterval: null, ssmStateSize: null, expertCount: null, nextnPredictLayers: null, hasChatTemplate: false };
+  const ok = { arch: GGUF_ARCH, name: '', contextLength: 8192, embeddingLength: null, blockCount: 1, headCount: null, headCountKv: null, keyLength: null, valueLength: null, keyLengthSwa: null, valueLengthSwa: null, slidingWindow: null, slidingWindowPattern: null, sharedKvLayers: null, fullAttentionInterval: null, ssmStateSize: null, expertCount: null, nextnPredictLayers: null, hasChatTemplate: false };
   assert.deepStrictEqual(reply({ parameterCount: 12, ...ok }), { parameterCount: 12, ...ok });
   assert.deepStrictEqual(reply(ok), ok);
   assert.throws(() => reply({ ...ok, stray: 1 }), /unexpected keys/);
