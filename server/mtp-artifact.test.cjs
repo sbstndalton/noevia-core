@@ -1,5 +1,6 @@
 'use strict';
 const test=require('node:test'),assert=require('node:assert/strict');
+// qwen35 and its metadata prefix are GGUF format values required by the reader, not fixture labels.
 const {inspect,validate,check,prefix,LIMIT}=require('./mtp-artifact.cjs');
 const u32=n=>{const b=Buffer.alloc(4);b.writeUInt32LE(n);return b;},u64=n=>{const b=Buffer.alloc(8);b.writeBigUInt64LE(BigInt(n));return b;},str=s=>Buffer.concat([u64(Buffer.byteLength(s)),Buffer.from(s)]);
 function gguf(names=[],layers=0,split=1){return Buffer.concat([Buffer.from('GGUF'),u32(3),u64(names.length),u64(3),str('general.architecture'),u32(8),str('qwen35'),str('qwen35.nextn_predict_layers'),u32(4),u32(layers),str('split.count'),u32(4),u32(split),...names.flatMap(n=>[str(n),u32(1),u64(2),u32(0),u64(0)])]);}

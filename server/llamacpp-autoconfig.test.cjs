@@ -21,9 +21,10 @@ function gguf(kv){
     throw Error('type');
   }
 }
-const qwen35={'general.architecture':[8,'qwen35'],'qwen35.context_length':[4,262144],'qwen35.embedding_length':[4,4096],'qwen35.block_count':[4,32],'qwen35.attention.head_count':[4,16],'qwen35.attention.head_count_kv':[4,4],'qwen35.attention.key_length':[4,256],'qwen35.attention.value_length':[4,256],'qwen35.full_attention_interval':[4,4],'qwen35.ssm.state_size':[4,128],'tokenizer.chat_template':[8,'{{ messages }}']};
+const HYBRID_ARCH='qwen35'; // GGUF architecture identifier and metadata-key prefix required by the format reader.
+const HYBRID_HEADER={'general.architecture':[8,'qwen35'],'qwen35.context_length':[4,262144],'qwen35.embedding_length':[4,4096],'qwen35.block_count':[4,32],'qwen35.attention.head_count':[4,16],'qwen35.attention.head_count_kv':[4,4],'qwen35.attention.key_length':[4,256],'qwen35.attention.value_length':[4,256],'qwen35.full_attention_interval':[4,4],'qwen35.ssm.state_size':[4,128],'tokenizer.chat_template':[8,'{{ messages }}']};
 // The summary of the synthetic hybrid-layout header, as the Rust reader returns it (the tests pass this as the meta).
-const hybridMeta=t=>readSummaryWasm(write(t,'hybrid.gguf',gguf(qwen35)).file);
+const hybridMeta=t=>readSummaryWasm(write(t,'hybrid.gguf',gguf(HYBRID_HEADER)).file);
 function write(t,name,buf){const dir=fs.mkdtempSync(path.join(os.tmpdir(),'autoconfig-'));t.after(()=>fs.rmSync(dir,{recursive:true,force:true}));const file=path.join(dir,name);fs.writeFileSync(file,buf);return {dir,file};}
 
 test('GGUF header reader keeps per-layer arrays and skips vocabularies across buffer refills', { skip: skipWasm }, t=>{
@@ -75,15 +76,15 @@ test('suggestion picks the largest fitting context and adds projector and MTP se
 
 test('manager suggestion reads only files inside the read-only model mount and never writes presets',async t=>{
   const models=write(t,'x',Buffer.alloc(0)).dir;
-  fs.writeFileSync(path.join(models,'q.gguf'),gguf(qwen35));
-  const outside=write(t,'secret.gguf',gguf(qwen35));
+  fs.writeFileSync(path.join(models,'q.gguf'),gguf(HYBRID_HEADER));
+  const outside=write(t,'secret.gguf',gguf(HYBRID_HEADER));
   const ini=path.join(models,'models.ini');
   fs.writeFileSync(ini,`version = 1\n[good]\nmodel = /models/q.gguf\nc = 4096\n[escape]\nmodel = /models/../${path.relative(path.dirname(models),outside.file)}\n[foreign]\nmodel = ${outside.file}\n[missing-projector]\nmodel = /models/q.gguf\nmmproj = /models/none.gguf\n`);
   const before=fs.readFileSync(ini,'utf8');
   const make=autoconfig=>createModelManager({kind:'llamacpp',baseUrl:'http://synthetic',presetPath:ini,fetchJson:async()=>{throw Error('no router call expected');},autoconfig});
   const manager=make({modelsPath:models,budgetGib:14});
   const good=await manager.suggestPreset('good');
-  assert.equal(good.status,200);assert.equal(good.body.arch,'qwen35');assert.ok(Number(good.body.values['ctx-size'])>=4096);
+  assert.equal(good.status,200);assert.equal(good.body.arch,HYBRID_ARCH);assert.ok(Number(good.body.values['ctx-size'])>=4096);
   for(const name of ['escape','foreign','missing-projector'])assert.equal((await manager.suggestPreset(name)).status,404,name);
   assert.equal((await manager.suggestPreset('absent')).status,404);
   assert.equal((await make({budgetGib:14}).suggestPreset('good')).status,501);
@@ -157,7 +158,7 @@ test('estimate inputs are read-only facts: q8 KV rows, pinned projector memory, 
   assert.equal(embed.chat,false);assert.equal(embed.sizeable,false);assert.deepEqual(embed.rows,[]);
   // The manager reads only the mounted file and never writes the preset file.
   const models=write(t,'x',Buffer.alloc(0)).dir;
-  fs.writeFileSync(path.join(models,'q.gguf'),gguf(qwen35));
+  fs.writeFileSync(path.join(models,'q.gguf'),gguf(HYBRID_HEADER));
   const ini=path.join(models,'models.ini');
   fs.writeFileSync(ini,'version = 1\n[good]\nmodel = /models/q.gguf\nc = 8192\n');
   const before=fs.readFileSync(ini,'utf8');

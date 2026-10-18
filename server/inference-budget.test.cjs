@@ -23,8 +23,9 @@ function gguf(kv) {
   const val = (type, v) => type === 4 ? u32(v) : type === 8 ? str(v) : (() => { throw Error('type'); })();
   return Buffer.concat([Buffer.from('GGUF'), u32(3), u64(0), u64(Object.keys(kv).length), ...Object.entries(kv).map(([k, [t, v]]) => Buffer.concat([str(k), u32(t), val(t, v)]))]);
 }
-const qwen35 = { 'general.architecture': [8, 'qwen35'], 'qwen35.context_length': [4, 262144], 'qwen35.embedding_length': [4, 4096], 'qwen35.block_count': [4, 32], 'qwen35.attention.head_count': [4, 16], 'qwen35.attention.head_count_kv': [4, 4], 'qwen35.attention.key_length': [4, 256], 'qwen35.attention.value_length': [4, 256], 'qwen35.full_attention_interval': [4, 4], 'qwen35.ssm.state_size': [4, 128], 'tokenizer.chat_template': [8, '{{ messages }}'] };
-const qwenMeta = { arch: 'qwen35', contextLength: 262144, embeddingLength: 4096, blockCount: 32, headCount: 16, headCountKv: 4, keyLength: 256, valueLength: 256, fullAttentionInterval: 4, hasChatTemplate: true };
+const HYBRID_ARCH = 'qwen35'; // GGUF architecture identifier and metadata-key prefix required by the format reader.
+const HYBRID_HEADER = { 'general.architecture': [8, 'qwen35'], 'qwen35.context_length': [4, 262144], 'qwen35.embedding_length': [4, 4096], 'qwen35.block_count': [4, 32], 'qwen35.attention.head_count': [4, 16], 'qwen35.attention.head_count_kv': [4, 4], 'qwen35.attention.key_length': [4, 256], 'qwen35.attention.value_length': [4, 256], 'qwen35.full_attention_interval': [4, 4], 'qwen35.ssm.state_size': [4, 128], 'tokenizer.chat_template': [8, '{{ messages }}'] };
+const hybridMeta = { arch: HYBRID_ARCH, contextLength: 262144, embeddingLength: 4096, blockCount: 32, headCount: 16, headCountKv: 4, keyLength: 256, valueLength: 256, fullAttentionInterval: 4, hasChatTemplate: true };
 
 function tmp(t) { const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'budget-697-')); t.after(() => fs.rmSync(dir, { recursive: true, force: true })); return dir; }
 
@@ -78,7 +79,7 @@ test('cache-ram limits default to a 1024 MiB cap and a 2048 MiB hard maximum', (
 
 test('#723: embedding and reranking presets carry no prompt cache in the estimate or in writes', t => {
   const bert = { arch: 'nomic-bert', contextLength: 2048, embeddingLength: 768, blockCount: 12, headCount: 12, headCountKv: 12 };
-  const chat = estimateFootprint({ meta: qwenMeta, modelBytes: 5 * GIB, options: { 'ctx-size': '4096' } });
+  const chat = estimateFootprint({ meta: hybridMeta, modelBytes: 5 * GIB, options: { 'ctx-size': '4096' } });
   assert.equal(chat.cacheRamGib, 8, 'chat sections unchanged: a missing cache-ram is the 8 GiB default');
   for (const [model, bytes, options] of [['nomic-embed-text-v1', 0.14 * GIB, {}], ['qwen3-reranker-0.6b-q8_0', 0.6 * GIB, {}], ['x', 0.6 * GIB, { reranking: 'true' }], ['y', 0.14 * GIB, { embedding: 'true', 'cache-ram': '4096' }]]) {
     const est = estimateFootprint({ meta: bert, modelBytes: bytes, options, model });
@@ -125,28 +126,28 @@ test('a bounded global cache-ram is inherited rather than repeated in the sectio
 // ── The estimate ─────────────────────────────────────────────────────────────
 
 test('the footprint is (weights + KV at the preset context and cache types + projector + runtime) x 1.05 + cache-ram', () => {
-  const kvQ8 = kvCacheBytes(qwenMeta, 32768) / GIB;
-  const q8 = estimateFootprint({ meta: qwenMeta, modelBytes: 5 * GIB, options: { 'ctx-size': '32768', 'cache-type-k': 'q8_0', 'cache-type-v': 'q8_0', 'cache-ram': '1024' } });
+  const kvQ8 = kvCacheBytes(hybridMeta, 32768) / GIB;
+  const q8 = estimateFootprint({ meta: hybridMeta, modelBytes: 5 * GIB, options: { 'ctx-size': '32768', 'cache-type-k': 'q8_0', 'cache-type-v': 'q8_0', 'cache-ram': '1024' } });
   assert.equal(q8.ctx, 32768); assert.equal(q8.kvGib, Math.round(kvQ8 * 100) / 100); assert.equal(q8.cacheRamGib, 1);
   assert.equal(q8.totalGib, Math.round(((5 + kvQ8 + 1) * 1.05 + 1) * 100) / 100);
   // f16 (llama.cpp's default) holds 2 bytes per element against q8_0's 1.0625.
-  const f16 = estimateFootprint({ meta: qwenMeta, modelBytes: 5 * GIB, options: { 'ctx-size': '32768', 'cache-ram': '1024' } });
+  const f16 = estimateFootprint({ meta: hybridMeta, modelBytes: 5 * GIB, options: { 'ctx-size': '32768', 'cache-ram': '1024' } });
   assert.ok(Math.abs(f16.kvGib - kvQ8 * 2 / 1.0625) < 0.01);
   // No cache-ram line: llama-server's 8 GiB default is what it would hold.
-  assert.equal(estimateFootprint({ meta: qwenMeta, modelBytes: 5 * GIB, options: { 'ctx-size': '4096' } }).cacheRamGib, 8);
-  const unbounded = estimateFootprint({ meta: qwenMeta, modelBytes: 5 * GIB, options: { 'cache-ram': '-1' } });
+  assert.equal(estimateFootprint({ meta: hybridMeta, modelBytes: 5 * GIB, options: { 'ctx-size': '4096' } }).cacheRamGib, 8);
+  const unbounded = estimateFootprint({ meta: hybridMeta, modelBytes: 5 * GIB, options: { 'cache-ram': '-1' } });
   assert.equal(unbounded.cacheRamUnbounded, true); assert.equal(unbounded.totalGib, null);
   // No ctx-size: the model's trained context, which is what the engine would allocate.
-  assert.equal(estimateFootprint({ meta: qwenMeta, modelBytes: GIB, options: {} }).ctx, 262144);
-  const vision = estimateFootprint({ meta: qwenMeta, modelBytes: 5 * GIB, mmprojBytes: GIB, options: { 'ctx-size': '4096', 'cache-ram': '0' } });
+  assert.equal(estimateFootprint({ meta: hybridMeta, modelBytes: GIB, options: {} }).ctx, 262144);
+  const vision = estimateFootprint({ meta: hybridMeta, modelBytes: 5 * GIB, mmprojBytes: GIB, options: { 'ctx-size': '4096', 'cache-ram': '0' } });
   assert.ok(vision.extraGib > 1 + 1 + 0.5 - 0.01, 'projector weights and vision scratch count');
 });
 
 test('autoconfig never suggests settings whose estimate, prompt cache included, exceeds the budget', () => {
   for (const budgetGib of [4, 8, 10, 12, 20]) {
-    const r = suggest({ meta: qwenMeta, modelBytes: 5 * GIB, budgetGib, cacheRamMaxMib: 1024 });
+    const r = suggest({ meta: hybridMeta, modelBytes: 5 * GIB, budgetGib, cacheRamMaxMib: 1024 });
     if (r.error) { assert.match(r.error, /more than the \d+ GiB budget/, `${budgetGib}: ${r.error}`); continue; }
-    const est = estimateFootprint({ meta: qwenMeta, modelBytes: 5 * GIB, options: r.values });
+    const est = estimateFootprint({ meta: hybridMeta, modelBytes: 5 * GIB, options: r.values });
     assert.ok(est.totalGib <= budgetGib, `${budgetGib} GiB: suggested ${r.values['ctx-size']} costs ${est.totalGib}`);
     assert.ok(Number(r.values['cache-ram']) <= 1024);
   }
@@ -156,7 +157,7 @@ test('autoconfig never suggests settings whose estimate, prompt cache included, 
 
 function fixture(t, { section, budget = 2, state = { big: 'unloaded', small: 'unloaded', chat: 'loaded' } }) {
   const dir = tmp(t);
-  fs.writeFileSync(path.join(dir, 'q.gguf'), gguf(qwen35));
+  fs.writeFileSync(path.join(dir, 'q.gguf'), gguf(HYBRID_HEADER));
   const ini = path.join(dir, 'models.ini');
   fs.writeFileSync(ini, `version = 1\n\n[big]\nmodel = /models/q.gguf\nctx-size = 262144\ncache-type-k = q8_0\ncache-type-v = q8_0\ncache-ram = 1024\n\n[small]\nmodel = /models/q.gguf\nctx-size = 4096\ncache-ram = 0\n\n[chat]\nmodel = /models/q.gguf\nctx-size = 4096\ncache-ram = 0\n${section || ''}`);
   const calls = [];
@@ -230,7 +231,7 @@ test('the Models page gets each model\'s estimate against the budget, read-only'
 test('autoconfig sizes against the inference budget, lowered only by an explicit autoconfig figure', async t => {
   const { manager } = fixture(t, { budget: 12 });
   assert.equal(manager.sizingBudgetGib(), 12);
-  const dir = tmp(t); fs.writeFileSync(path.join(dir, 'q.gguf'), gguf(qwen35)); fs.writeFileSync(path.join(dir, 'models.ini'), 'version = 1\n\n[m]\nmodel = /models/q.gguf\n');
+  const dir = tmp(t); fs.writeFileSync(path.join(dir, 'q.gguf'), gguf(HYBRID_HEADER)); fs.writeFileSync(path.join(dir, 'models.ini'), 'version = 1\n\n[m]\nmodel = /models/q.gguf\n');
   const make = (autoconfig, budget) => createModelManager({ kind: 'llamacpp', baseUrl: 'http://synthetic', presetPath: path.join(dir, 'models.ini'), autoconfig: { modelsPath: dir, ...autoconfig }, inferenceBudget: { budgetGib: () => budget }, fetchJson: async () => ({ ok: true, status: 200, body: { data: [] } }) });
   // The container memory limit (budgetGib fallback) does not count GTT: the inference budget wins.
   assert.equal(make({ budgetGib: 14 }, 20).sizingBudgetGib(), 20);
@@ -436,7 +437,7 @@ test('a model the watchdog unloaded stays refused until its preset or the budget
 
 test('a preset change releases a quarantined model', async t => {
   const dir = tmp(t);
-  fs.writeFileSync(path.join(dir, 'q.gguf'), gguf(qwen35));
+  fs.writeFileSync(path.join(dir, 'q.gguf'), gguf(HYBRID_HEADER));
   const file = path.join(dir, 'models.ini');
   fs.writeFileSync(file, 'version = 1\n\n[small]\nmodel = /models/q.gguf\nctx-size = 4096\ncache-ram = 0\n');
   const state = { small: 'unloaded' };
@@ -451,7 +452,7 @@ test('a preset change releases a quarantined model', async t => {
 
 test('saving a preset whose estimate exceeds the budget is refused and nothing is written', async t => {
   const dir = tmp(t);
-  fs.writeFileSync(path.join(dir, 'q.gguf'), gguf(qwen35));
+  fs.writeFileSync(path.join(dir, 'q.gguf'), gguf(HYBRID_HEADER));
   const file = path.join(dir, 'models.ini');
   fs.writeFileSync(file, 'version = 1\n\n[m]\nmodel = /models/q.gguf\nctx-size = 4096\ncache-ram = 0\n');
   const before = fs.readFileSync(file, 'utf8');
