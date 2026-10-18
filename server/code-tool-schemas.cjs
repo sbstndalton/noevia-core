@@ -31,7 +31,7 @@
 // request through the Rust port, read on each check. Same violations. It fails closed: when the
 // module cannot answer, the call is refused as unchecked (UNCHECKED, counted like any other
 // violation), never let through.
-const { createValidator, buildCorrectionRequest, streamGuardImpl, checkTextWasm, buildCorrectionRequestWasm } = require('./stream-guard.cjs');
+const { checkTextWasm, buildCorrectionRequestWasm } = require('./stream-guard.cjs');
 const { classify, COMMAND_KEYS } = require('./code-actions.cjs');
 
 const MAX_VIOLATIONS = 3;
@@ -121,12 +121,7 @@ function validate(schema, value) {
   try { text = JSON.stringify(value); } catch { return { message: 'Arguments are not valid JSON.', path: '$' }; }
   if (text === undefined) return { message: 'Arguments are missing.', path: '$' };
   let violation;
-  if (streamGuardImpl() === 'wasm') {
-    try { violation = checkTextWasm(schema, text); } catch { return { ...UNCHECKED }; }
-  } else {
-    const validator = createValidator(schema);
-    violation = validator.feed(text) || validator.end();
-  }
+  try { violation = checkTextWasm(schema, text); } catch { return { ...UNCHECKED }; }
   return violation ? { message: violation.message, path: violation.path || '$' } : null;
 }
 
@@ -233,11 +228,10 @@ function checkFsCall(method, params, { maxBytes = Infinity } = {}) {
 /** The correction request a violation carries. Under wasm a module failure (or a path over
  *  dav-parse-wasm.cjs MAX_CORRECTION_UNITS) gives the fixed UNCHECKED request. */
 function correctionFor(found) {
-  if (streamGuardImpl() !== 'wasm') return buildCorrectionRequest({ message: clip(found.message), path: found.path || null });
   try {
     return buildCorrectionRequestWasm({ message: String(found.message ?? ''), path: found.path || null }, MESSAGE_MAX);
   } catch {
-    return buildCorrectionRequest(UNCHECKED);
+    return { type: 'schema_violation_correction', violation: { ...UNCHECKED } };
   }
 }
 

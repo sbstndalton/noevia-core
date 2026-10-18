@@ -29,7 +29,7 @@ const path = require('node:path');
 
 delete process.env.STREAM_GUARD_IMPL;
 const server = path.join(__dirname, '..', 'server');
-const { createValidator, buildCorrectionRequest } = require(path.join(server, 'stream-guard.cjs'));
+const { createValidator, buildCorrectionRequest } = require('../tests/reference/stream-guard-js.cjs');
 const { toolCallSchema, FS_SCHEMAS, ACP_KINDS } = require(path.join(server, 'code-tool-schemas.cjs'));
 
 // --- deterministic PRNG (mulberry32) ---------------------------------------------------------

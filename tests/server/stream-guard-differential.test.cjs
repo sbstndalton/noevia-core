@@ -17,7 +17,9 @@ const test = require('node:test');
 
 const davParseWasm = require('../../server/dav-parse-wasm.cjs');
 const guard = require('../../server/stream-guard.cjs');
+const reference = require('../reference/stream-guard-js.cjs');
 const tools = require('../../server/code-tool-schemas.cjs');
+const referenceTools = require('../reference/stream-guard-caller.cjs');
 
 const FILE = path.join(__dirname, '../fixtures/stream-guard.v1.json');
 const fixtures = JSON.parse(fs.readFileSync(FILE, 'utf8'));
@@ -126,7 +128,7 @@ test('live: JS and wasm validators agree on seeded texts, any split, every calle
     for (const c of cuts) { chunks.push(t.slice(prev, c)); prev = c; }
     chunks.push(t.slice(prev));
     const options = rnd() < 0.2 ? { maxDepth: Math.floor(rnd() * 4), maxBytes: Math.floor(rnd() * 80) } : undefined;
-    const js = feedAll(guard.createValidator(schema, options), chunks);
+    const js = feedAll(reference.createValidator(schema, options), chunks);
     const wasm = feedAll(guard.createValidatorWasm(schema, options), chunks);
     assert.deepEqual(wasm, js, JSON.stringify({ i, chunks, options }));
     if (js.v) refused += 1;
@@ -154,8 +156,8 @@ test('a chunk over the cap is decided without crossing, as the JS decides it', {
   davParseWasm.reset();
   const huge = 'x'.repeat(davParseWasm.MAX_GUARD_BYTES + 1);
   for (const options of [undefined, { maxBytes: 5 }]) {
-    assert.deepEqual(plainV(guard.createValidatorWasm({}, options).feed(huge)), plainV(guard.createValidator({}, options).feed(huge)));
-    assert.deepEqual(plainV(guard.checkTextWasm({}, huge, options)), plainV(guard.createValidator({}, options).feed(huge)));
+    assert.deepEqual(plainV(guard.createValidatorWasm({}, options).feed(huge)), plainV(reference.createValidator({}, options).feed(huge)));
+    assert.deepEqual(plainV(guard.checkTextWasm({}, huge, options)), plainV(reference.createValidator({}, options).feed(huge)));
   }
   // An earlier violation still wins.
   const v = guard.createValidatorWasm({});
@@ -263,9 +265,9 @@ const FS = [
   ['fs/write_text_file', { path: '/w/a', content: 3 }], ['fs/write_text_file', { path: '/w/a' }], ['fs/read_text_file', null],
 ];
 
-function guardRun() {
+function guardRun(toolModule = tools) {
   const events = [];
-  const g = tools.createExecutorGuard({ event: (type, data) => events.push([type, data]), limit: 50, maxBytes: 4 });
+  const g = toolModule.createExecutorGuard({ event: (type, data) => events.push([type, data]), limit: 50, maxBytes: 4 });
   const out = [];
   for (const c of CALLS) out.push(g.permission(c, 'read'));
   for (const [m, p] of FS) out.push(m === 'fs/read_text_file' ? g.readTextFile(p) : g.writeTextFile(p));
@@ -274,7 +276,7 @@ function guardRun() {
 
 test('the Executor guard gives the same refusals, texts and journal under STREAM_GUARD_IMPL=wasm', { skip: skipWasm }, async () => {
   davParseWasm.reset();
-  const js = await withEnv({ STREAM_GUARD_IMPL: 'js' }, guardRun);
+  const js = await withEnv({ STREAM_GUARD_IMPL: 'js' }, () => guardRun(referenceTools));
   const wasm = await withEnv({ STREAM_GUARD_IMPL: 'wasm' }, guardRun);
   assert.equal(wasm, js);
   assert.ok(JSON.parse(js).n >= 15);
@@ -292,7 +294,7 @@ test('STREAM_GUARD_IMPL=wasm fails closed without a usable module: every call re
       const g = tools.createExecutorGuard({ limit: 3 });
       const v = g.permission(ok);
       assert.ok(v && v.violation.message === 'Arguments could not be checked.' && v.count === 1);
-      assert.throws(() => davParseWasm.verifyAtStartup({ STREAM_GUARD_IMPL: 'wasm', DAV_PARSE_WASM: missing }), (e) => e.flags.includes('STREAM_GUARD_IMPL') && e.reason === 'missing');
+      assert.throws(() => davParseWasm.verifyAtStartup({ STREAM_GUARD_IMPL: 'wasm', DAV_PARSE_WASM: missing }), (e) => !e.flags.includes('STREAM_GUARD_IMPL') && e.reason === 'missing');
     });
   } finally { davParseWasm.reset(); }
 });
@@ -306,7 +308,7 @@ test('a path over MAX_CORRECTION_UNITS: refused by the loader, answered with the
     assert.deepEqual(tools.correctionFor(found), { type: 'schema_violation_correction', violation: { message: 'Arguments could not be checked.', path: '$' } });
     // Within the cap it is the JS's answer.
     const small = { message: 'x'.repeat(400), path: '$.a' };
-    const js = await withEnv({ STREAM_GUARD_IMPL: 'js' }, () => tools.correctionFor(small));
+    const js = await withEnv({ STREAM_GUARD_IMPL: 'js' }, () => referenceTools.correctionFor(small));
     assert.deepEqual(tools.correctionFor(small), js);
   });
 });
@@ -322,20 +324,24 @@ test('a module that misanswers is refused, not believed', { skip: skipWasm }, as
   });
 });
 
-test('STREAM_GUARD_IMPL: js by default, wasm when asked, anything else is js with a warning; js never loads the module', async (t) => {
-  assert.equal(guard.streamGuardImpl({}), 'js');
-  assert.equal(guard.streamGuardImpl({ STREAM_GUARD_IMPL: '' }), 'js');
-  assert.equal(guard.streamGuardImpl({ STREAM_GUARD_IMPL: ' WASM ' }), 'wasm');
-  const warn = t.mock.method(console, 'warn', () => {});
-  assert.equal(guard.streamGuardImpl({ STREAM_GUARD_IMPL: 'rust' }), 'js');
-  assert.equal(guard.streamGuardImpl({ STREAM_GUARD_IMPL: 'rust' }), 'js');
-  assert.equal(warn.mock.callCount(), 1);
-  assert.ok(davParseWasm.IMPL_FLAGS.includes('STREAM_GUARD_IMPL'));
-  assert.deepEqual(davParseWasm.wasmFlags({ STREAM_GUARD_IMPL: 'wasm' }), ['STREAM_GUARD_IMPL']);
-  await withEnv({ STREAM_GUARD_IMPL: 'js', DAV_PARSE_WASM: path.join(__dirname, 'no-such.wasm') }, async () => {
+test('retired STREAM_GUARD_IMPL always selects Rust and cannot bypass a missing module', async () => {
+  for (const value of [undefined, '', 'js', 'wasm', 'rust']) assert.equal(guard.streamGuardImpl({STREAM_GUARD_IMPL:value}),'wasm');
+  assert.ok(!davParseWasm.IMPL_FLAGS.includes('STREAM_GUARD_IMPL'));
+  assert.equal(davParseWasm.RETIRED_FLAGS.STREAM_GUARD_IMPL,'wasm');
+  assert.deepEqual(davParseWasm.wasmFlags({STREAM_GUARD_IMPL:'wasm'}),[]);
+  await withEnv({STREAM_GUARD_IMPL:'js',DAV_PARSE_WASM:path.join(__dirname,'no-such.wasm')},async () => {
     davParseWasm.reset();
-    assert.equal(tools.checkToolCall({ toolCallId: 'c1', kind: 'execute', rawInput: { command: 'ls' } }), null);
-    assert.equal(tools.checkToolCall({ kind: 'read', toolCallId: 3 }).message, 'Type mismatch at $.toolCallId: expected string, got number');
+    assert.throws(() => guard.createValidator({}),{reason:'missing'});
+    assert.throws(() => guard.buildCorrectionRequest({message:'synthetic',path:'$'}),{reason:'missing'});
+    assert.ok(tools.checkToolCall({toolCallId:'c1',kind:'execute',rawInput:{command:'ls'}}),'a missing module refuses instead of selecting JS');
   });
   davParseWasm.reset();
+});
+test('the archived JS parser is checksum-bound and unreachable from production source', () => {
+  const crypto = require('node:crypto');
+  assert.equal(crypto.createHash('sha256').update(fs.readFileSync(require.resolve('../reference/stream-guard-js.cjs'))).digest('hex'),'50ec91594176125b9f5467fb3efcf6ce9a6ab623a470fe6baa4690712671c8ec');
+  const source=fs.readFileSync(require.resolve('../../server/stream-guard.cjs'),'utf8');
+  assert.ok(!source.includes('class IncrementalValidator'));
+  assert.ok(!source.includes('stream-guard-js'));
+  assert.equal(crypto.createHash('sha256').update(fs.readFileSync(require.resolve('../reference/stream-guard-caller.cjs'))).digest('hex'),'39f8cc28acd5b2df86b10b30eba9c22b39fa5f05c965f3285ee9b3f2ea6324d5');
 });
