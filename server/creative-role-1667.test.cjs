@@ -1,4 +1,9 @@
 'use strict';
+// Needs dav-parse.wasm: provider egress is Rust-only since #1071. Skipped without it unless DAV_PARSE_WASM_REQUIRED=1.
+if (!require('node:fs').existsSync(process.env.DAV_PARSE_WASM || require('./dav-parse-wasm.cjs').DEFAULT_WASM) && process.env.DAV_PARSE_WASM_REQUIRED !== '1') {
+  require('node:test').test('needs dav-parse.wasm (not built)', { skip: 'dav-parse.wasm not built' }, () => {});
+  return;
+}
 // sbstndalton/noevia#1667: the Creative chat role. Owner decision (2026-10-15): prompts the sampling classifier already
 // marks creative (sampling-presets.cjs) go to a Creative role, with creative sampling. Unassigned, the router's pick
 // stands with creative sampling (the behaviour before #1667). Explicit model picks (a project's or the user's own) win.

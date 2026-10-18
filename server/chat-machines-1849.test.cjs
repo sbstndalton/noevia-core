@@ -1,4 +1,9 @@
 'use strict';
+// Needs dav-parse.wasm: provider egress is Rust-only since #1071. Skipped without it unless DAV_PARSE_WASM_REQUIRED=1.
+if (!require('node:fs').existsSync(process.env.DAV_PARSE_WASM || require('./dav-parse-wasm.cjs').DEFAULT_WASM) && process.env.DAV_PARSE_WASM_REQUIRED !== '1') {
+  require('node:test').test('needs dav-parse.wasm (not built)', { skip: 'dav-parse.wasm not built' }, () => {});
+  return;
+}
 // sbstndalton/noevia#1849 and #1850, follow-ups to #1840 (chat roles on Inference machines). Each consumer that
 // follows a role to its machine is driven against a fake llama-server on loopback: a Manual pick of a model a
 // machine serves, the auto-router classifier (Fast on a machine) and Deep Research (Smart on a machine). Same rules

@@ -1,4 +1,9 @@
 'use strict';
+// Needs dav-parse.wasm: provider egress is Rust-only since #1071. Skipped without it unless DAV_PARSE_WASM_REQUIRED=1.
+if (!require('node:fs').existsSync(process.env.DAV_PARSE_WASM || require('./dav-parse-wasm.cjs').DEFAULT_WASM) && process.env.DAV_PARSE_WASM_REQUIRED !== '1') {
+  require('node:test').test('needs dav-parse.wasm (not built)', { skip: 'dav-parse.wasm not built' }, () => {});
+  return;
+}
 // sbstndalton/noevia#1854, a follow-up to #1840/#1849/#1850 (chat roles on Inference machines).
 //  1. #1550 tool-capable move: an Automatic turn the tool gate says needs a tool, routed to a role whose model cannot
 //     take tools, moves to a tool-capable role whether either role is here or on a machine. A role on a machine is a

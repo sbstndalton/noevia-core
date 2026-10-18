@@ -1,4 +1,9 @@
 'use strict';
+// Needs dav-parse.wasm: provider egress is Rust-only since #1071. Skipped without it unless DAV_PARSE_WASM_REQUIRED=1.
+if (!require('node:fs').existsSync(process.env.DAV_PARSE_WASM || require('./dav-parse-wasm.cjs').DEFAULT_WASM) && process.env.DAV_PARSE_WASM_REQUIRED !== '1') {
+  require('node:test').test('needs dav-parse.wasm (not built)', { skip: 'dav-parse.wasm not built' }, () => {});
+  return;
+}
 // sbstndalton/noevia#1788 (after #1475): "Say hello in one short sentence." was routed Fast by the decision service,
 // but the account's default effort (High) was applied anyway: the gemma reply got the High hint and the 8,192-token
 // thinking cap, showed "Effort: high", and thought for about 19 s before "Hello there.". The #1475 fix capped

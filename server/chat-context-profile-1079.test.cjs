@@ -1,4 +1,9 @@
 'use strict';
+// Needs dav-parse.wasm: provider egress is Rust-only since #1071. Skipped without it unless DAV_PARSE_WASM_REQUIRED=1.
+if (!require('node:fs').existsSync(process.env.DAV_PARSE_WASM || require('./dav-parse-wasm.cjs').DEFAULT_WASM) && process.env.DAV_PARSE_WASM_REQUIRED !== '1') {
+  require('node:test').test('needs dav-parse.wasm (not built)', { skip: 'dav-parse.wasm not built' }, () => {});
+  return;
+}
 // #1079: a chat or project with Context: High is served by its model's `<model>-long` profile; Low
 // (the default) by the model itself. Roles and the stored pick keep naming the model. Synthetic
 // fixtures; no network. The pick is Rust's (dav-parse.wasm long_profile); here the fixture

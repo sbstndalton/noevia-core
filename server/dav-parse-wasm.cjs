@@ -63,7 +63,7 @@
 //                          the project's file names (PROJECT_FILE_NAMES_IMPL)
 //   - crates/provider-egress providerEgress* = provider-egress.cjs isExternalProvider,
 //                          isTrialTermsHost, egressRefusal, stripPrivateToolboxes, toolRefusal,
-//                          canonicalPath and diaryFolderFor over the host's projections (PROVIDER_EGRESS_IMPL)
+//                          canonicalPath and diaryFolderFor over the host's projections (PROVIDER_EGRESS_IMPL, retired in #1071)
 //   - crates/browser-policy browserPolicy* = browser-policy.cjs classifyAction, checkNavigation,
 //                          the decision of substituteSecrets (names and domains, never a value)
 //                          and the label fold over the host's projections (BROWSER_POLICY_IMPL)
@@ -1951,7 +1951,7 @@ function projectFileNames(names, raw) {
   return badReply('project file names');
 }
 
-// --- provider egress (PROVIDER_EGRESS_IMPL) ------------------------------------------------------
+// --- provider egress (PROVIDER_EGRESS_IMPL, retired in #1071) ------------------------------------------------------
 // provider_egress::MAX_INPUT_BYTES (the op byte and the JSON). The host sends its projections of a
 // provider row ({kind, external, baseUrl, label}), a storage connection ({kind, corpusRoot,
 // baseUrl}: no credentials) and a tool call's name and arguments. Every reply is checked for shape;
@@ -2239,14 +2239,15 @@ function llamacppPresetsModel(model) {
 // Every switch that runs this module (#996). Each reads its value as trim().toLowerCase().
 // Retired switches (#1071) are not listed: the Rust path they selected is always on, and
 // verifyAtStartup() always loads this module for it.
-const IMPL_FLAGS = ['STORAGE_PATH_IMPL', 'SECRET_ENVELOPE_IMPL', 'STREAM_GUARD_IMPL', 'ROLE_CONTEXT_IMPL', 'CODE_ACTIONS_IMPL', 'PROJECT_FILE_NAMES_IMPL', 'PROVIDER_EGRESS_IMPL', 'BROWSER_POLICY_IMPL', 'TOOL_GATE_IMPL', 'TOOLBOXES_PERMITTED_IMPL', 'LLAMACPP_PRESETS_IMPL'];
+const IMPL_FLAGS = ['STORAGE_PATH_IMPL', 'SECRET_ENVELOPE_IMPL', 'STREAM_GUARD_IMPL', 'ROLE_CONTEXT_IMPL', 'CODE_ACTIONS_IMPL', 'PROJECT_FILE_NAMES_IMPL', 'BROWSER_POLICY_IMPL', 'TOOL_GATE_IMPL', 'TOOLBOXES_PERMITTED_IMPL', 'LLAMACPP_PRESETS_IMPL'];
 
 /** Switches whose JS path was deleted once Rust had run in production (#1071). The old value that
  *  selected Rust ('wasm', or 'on' for the advisor) is accepted silently; anything else is ignored
  *  with one warning, because Rust is always used. */
 const RETIRED_FLAGS = { CHAT_TEMPLATE_CAPS_IMPL: 'wasm', AUTOTUNE_PLAN_IMPL: 'wasm', PRESET_RELOAD_IMPL: 'wasm', LAYA_LOAD_ADVISOR: 'on', DAV_PARSE_IMPL: 'wasm', S3_PARSE_IMPL: 'wasm', MCP_FRAME_IMPL: 'wasm', UPLOAD_SNIFF_IMPL: 'wasm', S3_SIGN_IMPL: 'wasm', PROMPT_FRAMING_IMPL: 'wasm', SSRF_IMPL: 'wasm',
   POLICY_LEAVES_IMPL: 'wasm', CODE_REVIEW_VERDICT_IMPL: 'wasm', TOOL_EXCHANGE_IMPL: 'wasm', DECISION_IMPL: 'wasm', COMPLETENESS_REPORT_IMPL: 'wasm', TASK_LIFECYCLE_IMPL: 'wasm', MCP_SERVERS_IMPL: 'wasm', CODE_NET_GUARD_IMPL: 'wasm', LLAMACPP_AUTOCONFIG_IMPL: 'wasm',
-  GGUF_META_IMPL: 'wasm' };
+  GGUF_META_IMPL: 'wasm',
+  PROVIDER_EGRESS_IMPL: 'wasm' };
 
 /** Log one warning per retired switch that `env` still sets to something other than its old
  *  Rust-selecting value (for example =js). Returns the names warned about. Never throws. */

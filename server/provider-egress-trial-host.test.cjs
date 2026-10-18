@@ -1,4 +1,9 @@
 'use strict';
+// Needs dav-parse.wasm: provider egress is Rust-only since #1071. Skipped without it unless DAV_PARSE_WASM_REQUIRED=1.
+if (!require('node:fs').existsSync(process.env.DAV_PARSE_WASM || require('./dav-parse-wasm.cjs').DEFAULT_WASM) && process.env.DAV_PARSE_WASM_REQUIRED !== '1') {
+  require('node:test').test('needs dav-parse.wasm (not built)', { skip: 'dav-parse.wasm not built' }, () => {});
+  return;
+}
 // A custom OpenAI-compatible provider pointed at build.nvidia.com's free API is external by URL:
 // NVIDIA's API Trial Terms forbid personal or confidential data and log traffic, so the #447
 // rules (no Diary text, no private toolboxes) apply without any flag on the row. Synthetic data only.
