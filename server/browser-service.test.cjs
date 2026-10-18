@@ -1,4 +1,8 @@
 'use strict';
+const skipWasm = !require('node:fs').existsSync(process.env.DAV_PARSE_WASM || require('./dav-parse-wasm.cjs').DEFAULT_WASM) && process.env.DAV_PARSE_WASM_REQUIRED !== '1' && 'dav-parse.wasm not built';
+// Guards a wrong test signature (options passed twice makes node:test take the second object as the body, so the body never runs and the
+// test reports ok): when the module is there, every guarded body must have run.
+let ran = 0;
 const test = require('node:test'), assert = require('node:assert/strict');
 const fs = require('node:fs'), os = require('node:os'), path = require('node:path');
 const { createBrowserService } = require('./browser-service.cjs');
@@ -49,13 +53,15 @@ function service(extra = {}) {
   return { svc, workspace, fake };
 }
 
-test('a task needs at least one domain, and only reachable ones', async () => {
+test('a task needs at least one domain, and only reachable ones', { skip: skipWasm }, async () => {
+  ran++;
   const { svc, workspace } = service();
   await assert.rejects(() => svc.start(workspace, project, { domains: [] }), /at least one domain/);
   await assert.rejects(() => svc.start(workspace, project, { domains: ['not a domain', '../evil'] }), /at least one domain/);
 });
 
-test('one task at a time per project, running through queued, running, finished', async () => {
+test('one task at a time per project, running through queued, running, finished', { skip: skipWasm }, async () => {
+  ran++;
   const { svc, workspace } = service();
   const started = await svc.start(workspace, project, { domains: ['shop.example.test'] });
   assert.ok(started.taskId);
@@ -74,7 +80,8 @@ test('one task at a time per project, running through queued, running, finished'
   svc.finish(workspace, project, second.taskId, null);
 });
 
-test('a read action runs without an approval card; a consequential one asks, and the answer decides it', async () => {
+test('a read action runs without an approval card; a consequential one asks, and the answer decides it', { skip: skipWasm }, async () => {
+  ran++;
   const { svc, workspace, fake } = service();
   const started = await svc.start(workspace, project, { domains: ['shop.example.test'] });
   const extracted = await svc.act(workspace, project, started.taskId, { type: 'extract' });
@@ -97,7 +104,8 @@ test('a read action runs without an approval card; a consequential one asks, and
   svc.finish(workspace, project, started.taskId, null);
 });
 
-test('a declined approval blocks the action, and never auto-approves', async () => {
+test('a declined approval blocks the action, and never auto-approves', { skip: skipWasm }, async () => {
+  ran++;
   const { svc, workspace, fake } = service();
   const started = await svc.start(workspace, project, { domains: ['shop.example.test'] });
   const actPromise = svc.act(workspace, project, started.taskId, { type: 'click', selector: '#go' });
@@ -110,7 +118,8 @@ test('a declined approval blocks the action, and never auto-approves', async () 
   svc.finish(workspace, project, started.taskId, null);
 });
 
-test('an approval that gets no answer times out as a refusal, never a silent approve', async () => {
+test('an approval that gets no answer times out as a refusal, never a silent approve', { skip: skipWasm }, async () => {
+  ran++;
   const { svc, workspace, fake } = service();
   const started = await svc.start(workspace, project, { domains: ['shop.example.test'] });
   const result = await svc.act(workspace, project, started.taskId, { type: 'click', selector: '#go' });
@@ -119,14 +128,16 @@ test('an approval that gets no answer times out as a refusal, never a silent app
   svc.finish(workspace, project, started.taskId, null);
 });
 
-test('an unanswered approval is refused, an approval-answer for the wrong id is refused, and stale answers are refused', async () => {
+test('an unanswered approval is refused, an approval-answer for the wrong id is refused, and stale answers are refused', { skip: skipWasm }, async () => {
+  ran++;
   const { svc, workspace } = service();
   const started = await svc.start(workspace, project, { domains: ['shop.example.test'] });
   assert.throws(() => svc.decide(workspace, project, started.taskId, 'approve', 'not-a-real-id'), /no longer waiting/);
   svc.finish(workspace, project, started.taskId, null);
 });
 
-test('cancel aborts the task, closes the session, revokes egress, and refuses any card still waiting', async () => {
+test('cancel aborts the task, closes the session, revokes egress, and refuses any card still waiting', { skip: skipWasm }, async () => {
+  ran++;
   const { svc, workspace } = service();
   const started = await svc.start(workspace, project, { domains: ['shop.example.test'] });
   const actPromise = svc.act(workspace, project, started.taskId, { type: 'click', selector: '#go' });
@@ -139,7 +150,8 @@ test('cancel aborts the task, closes the session, revokes egress, and refuses an
   await assert.rejects(() => svc.act(workspace, project, started.taskId, { type: 'extract' }), /not running/);
 });
 
-test('a task idle too long times out (failed), not left running forever', async () => {
+test('a task idle too long times out (failed), not left running forever', { skip: skipWasm }, async () => {
+  ran++;
   const { svc, workspace } = service();
   const started = await svc.start(workspace, project, { domains: ['shop.example.test'] });
   await new Promise((r) => setTimeout(r, 260));
@@ -148,7 +160,8 @@ test('a task idle too long times out (failed), not left running forever', async 
   assert.match(task.error, /timed out/);
 });
 
-test('recovery after a restart marks a running task interrupted, never silently resumed', async () => {
+test('recovery after a restart marks a running task interrupted, never silently resumed', { skip: skipWasm }, async () => {
+  ran++;
   const workspace = { dir: temp('noevia-browser-recover-') };
   const egress = { endpoint: 'egress:8040', grant: ({ taskId }) => ({ token: `tok-${taskId}` }), revoke: () => {} };
   const fake1 = fakeBrowser();
@@ -169,7 +182,8 @@ test('recovery after a restart marks a running task interrupted, never silently 
   await new Promise((r) => setTimeout(r, 80));
 });
 
-test('a task from another project is not found, rather than forbidden — tenant scoping', async () => {
+test('a task from another project is not found, rather than forbidden — tenant scoping', { skip: skipWasm }, async () => {
+  ran++;
   const { svc, workspace } = service();
   const started = await svc.start(workspace, project, { domains: ['shop.example.test'] });
   assert.throws(() => svc.get(workspace, { id: 'other-project' }, started.taskId), /Task not found/);
@@ -178,14 +192,16 @@ test('a task from another project is not found, rather than forbidden — tenant
   svc.finish(workspace, project, started.taskId, null);
 });
 
-test('a browser that fails to open never leaves a phantom running task', async () => {
+test('a browser that fails to open never leaves a phantom running task', { skip: skipWasm }, async () => {
+  ran++;
   const workspace = { dir: temp('noevia-browser-openfail-') };
   const egress = { endpoint: 'egress:8040', grant: ({ taskId }) => ({ token: `tok-${taskId}` }), revoke: () => {} };
   const svc = createBrowserService({ launch: async () => { throw Error('no browser on this host'); }, egress, timeoutMs: 60 });
   await assert.rejects(() => svc.start(workspace, project, { domains: ['shop.example.test'] }), /could not open/);
 });
 
-test('a cancel that lands before the approval card exists is not left waiting the full timeout', async () => {
+test('a cancel that lands before the approval card exists is not left waiting the full timeout', { skip: skipWasm }, async () => {
+  ran++;
   // timeoutMs is generous here on purpose: if the fix regresses and the card is not wired to
   // the job's own abort signal, this test would only pass by accident, after the full wait.
   let releaseGate; const gate = new Promise((r) => { releaseGate = r; });
@@ -208,7 +224,8 @@ test('a cancel that lands before the approval card exists is not left waiting th
   assert.equal(svc.get(workspace, project, started.taskId).status, 'cancelled');
 });
 
-test('start refuses up front without egress, never leaving a phantom queued job behind', async () => {
+test('start refuses up front without egress, never leaving a phantom queued job behind', { skip: skipWasm }, async () => {
+  ran++;
   const workspace = { dir: temp('noevia-browser-noegress-') };
   const fake = fakeBrowser();
   const svc = createBrowserService({ launch: async () => fake.browser, egress: null, timeoutMs: 60 });
@@ -218,7 +235,8 @@ test('start refuses up front without egress, never leaving a phantom queued job 
   await assert.rejects(() => svc.start(workspace, project, { domains: ['shop.example.test'] }), (e) => e.status === 503);
 });
 
-test('a grant that throws leaves the job cancelled, not stuck queued and blocking every later start', async () => {
+test('a grant that throws leaves the job cancelled, not stuck queued and blocking every later start', { skip: skipWasm }, async () => {
+  ran++;
   const workspace = { dir: temp('noevia-browser-grantfail-') };
   const fake = fakeBrowser();
   const egress = { endpoint: 'egress:8040', grant: () => { throw Object.assign(Error('no capacity'), { publicMessage: 'The egress proxy refused this task.' }); }, revoke: () => {} };
@@ -231,7 +249,8 @@ test('a grant that throws leaves the job cancelled, not stuck queued and blockin
   svc2.finish(workspace, project, started.taskId, null);
 });
 
-test('an action still queued behind finish() is rejected, not left hanging forever', async () => {
+test('an action still queued behind finish() is rejected, not left hanging forever', { skip: skipWasm }, async () => {
+  ran++;
   const { svc, workspace } = service({ idleTimeoutMs: 60000 });
   const started = await svc.start(workspace, project, { domains: ['shop.example.test'] });
   // Both calls enqueue synchronously (act()'s Promise executor runs before any await yields),
@@ -245,7 +264,8 @@ test('an action still queued behind finish() is rejected, not left hanging forev
   assert.equal(svc.get(workspace, project, started.taskId).status, 'completed');
 });
 
-test('finish() refuses a result over the size limit, and records nothing', async () => {
+test('finish() refuses a result over the size limit, and records nothing', { skip: skipWasm }, async () => {
+  ran++;
   const { svc, workspace } = service();
   const started = await svc.start(workspace, project, { domains: ['shop.example.test'] });
   const big = { text: 'x'.repeat(70 * 1024) };
@@ -253,3 +273,5 @@ test('finish() refuses a result over the size limit, and records nothing', async
   assert.equal(svc.get(workspace, project, started.taskId).status, 'running', 'still running: the oversized result never reached the job');
   svc.finish(workspace, project, started.taskId, { ok: true });
 });
+
+test.after(() => { if (!skipWasm) assert.equal(ran, 16, 'a wasm-guarded test body did not run'); });
