@@ -254,4 +254,4 @@ function pickOption(options, wanted, { wasmLoader = defaultLoader } = {}) {
   return port ? port.reply : { outcome: 'cancelled' };
 }
 
-module.exports = { ACTIONS, COMMAND_KEYS, classify, commandOf, decide, hostFloor, pickOption, classifyInput, decideInput, pickInput, UNVERIFIED_ASK };
+module.exports = { ACTIONS, COMMAND_KEYS, classify, commandOf, decide, pickOption, classifyInput, decideInput, pickInput, UNVERIFIED_ASK };
