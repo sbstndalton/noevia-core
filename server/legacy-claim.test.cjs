@@ -10,7 +10,7 @@ const { createAuth } = require('./auth.cjs');
 const { seedAccount } = require('../tests/server/seed-account.cjs');
 const { createWorkspaceStore } = require('./workspace.cjs');
 const { createStubStore } = require('../tests/server/project-store-stub.cjs');
-const { claimLegacyRoot, MAX_BYTES, MAX_ENTRIES, MAX_DEPTH } = require('./legacy-claim.cjs');
+const { claimLegacyRoot, hasLegacy, needsClaim, MAX_ENTRIES } = require('./legacy-claim.cjs');
 
 const owner = '11111111-1111-4111-8111-111111111111';
 const other = '22222222-2222-4222-8222-222222222222';
@@ -19,102 +19,94 @@ function rootFor(t) {
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
   return root;
 }
-function mode(file) { return fs.statSync(file).mode & 0o777; }
-
-test('copies the original claim set to a private backup and target with a recoverable marker', (t) => {
+function executableFor(t, body) {
   const root = rootFor(t);
-  fs.writeFileSync(path.join(root, 'projects.json'), '{"projects":[{"id":"old"}]}');
-  fs.writeFileSync(path.join(root, 'providers.json'), '{"providers":[{"apiKey":"secret"}]}');
-  fs.writeFileSync(path.join(root, 'free-chats.json'), '[{"id":"free"}]');
-  fs.writeFileSync(path.join(root, 'auto-roles.json'), '{"x":true}');
-  fs.writeFileSync(path.join(root, 'history-chat.json'), '{"messages":[]}');
-  fs.mkdirSync(path.join(root, 'rag'));
-  fs.writeFileSync(path.join(root, 'rag', 'index.bin'), Buffer.from([0, 1, 2, 255]));
+  const file = path.join(root, 'claim-helper');
+  fs.writeFileSync(file, '#!/bin/sh\nset -eu\n' + body, { mode: 0o700 });
+  fs.chmodSync(file, 0o700);
+  return file;
+}
+function useHelper(t, file) {
+  const previous = process.env.NOEVIA_LEGACY_CLAIM_BIN;
+  process.env.NOEVIA_LEGACY_CLAIM_BIN = file;
+  t.after(() => {
+    if (previous === undefined) delete process.env.NOEVIA_LEGACY_CLAIM_BIN;
+    else process.env.NOEVIA_LEGACY_CLAIM_BIN = previous;
+  });
+}
 
-  assert.equal(claimLegacyRoot(root, owner), true);
-  const target = path.join(root, 'users', owner);
-  const marker = JSON.parse(fs.readFileSync(path.join(target, 'migration.json'), 'utf8'));
-  assert.equal(marker.version, 1);
-  assert.equal(marker.source, 'legacy-root');
-  assert.equal(JSON.parse(fs.readFileSync(path.join(target, 'projects.json'), 'utf8')).projects[0].id, 'old');
-  assert.deepEqual(fs.readFileSync(path.join(target, 'rag', 'index.bin')), Buffer.from([0, 1, 2, 255]));
-  assert.equal(fs.readFileSync(path.join(marker.backup, 'providers.json'), 'utf8'), fs.readFileSync(path.join(root, 'providers.json'), 'utf8'));
-  assert.equal(JSON.parse(fs.readFileSync(path.join(root, 'legacy-owner.json'), 'utf8')).userId, owner);
-  assert.equal(fs.existsSync(path.join(root, 'projects.json')), true, 'source remains for recovery');
-  assert.equal(mode(target), 0o700);
-  assert.equal(mode(marker.backup), 0o700);
-  assert.equal(mode(path.join(target, 'providers.json')), 0o600);
+test('bounded legacy hint recognizes known triggers and treats overflow as maybe', (t) => {
+  const root = rootFor(t);
+  assert.equal(hasLegacy(root), false);
+  assert.equal(needsClaim(root, owner), false);
+  fs.writeFileSync(path.join(root, 'history-chat.json'), '{}');
+  assert.equal(hasLegacy(root), true);
+  fs.rmSync(path.join(root, 'history-chat.json'));
+  for (let i = 0; i <= MAX_ENTRIES; i++) fs.writeFileSync(path.join(root, 'noise-' + i), '');
+  assert.equal(hasLegacy(root), true, 'overflow must defer to native bounded authority');
 });
 
-test('preserves trigger asymmetry and prevents later admins from claiming retained data', (t) => {
+test('bounded hint suppresses only a complete same-owner target or known other owner', (t) => {
   const root = rootFor(t);
-  fs.writeFileSync(path.join(root, 'free-chats.json'), '[]');
-  fs.writeFileSync(path.join(root, 'auto-roles.json'), '{}');
-  fs.mkdirSync(path.join(root, 'rag'));
-  assert.equal(claimLegacyRoot(root, owner), false);
-  assert.equal(fs.existsSync(path.join(root, 'legacy-owner.json')), false);
-
-  fs.writeFileSync(path.join(root, 'projects.json'), '{"projects":[]}');
-  assert.equal(claimLegacyRoot(root, owner), true);
-  fs.rmSync(path.join(root, 'users', owner), { recursive: true });
-  assert.equal(claimLegacyRoot(root, other), false);
-  assert.equal(fs.existsSync(path.join(root, 'users', other)), false);
-  assert.equal(JSON.parse(fs.readFileSync(path.join(root, 'legacy-owner.json'), 'utf8')).userId, owner);
-});
-
-test('recovers the prior migration owner when legacy-owner.json is absent', (t) => {
-  const root = rootFor(t);
-  fs.writeFileSync(path.join(root, 'projects.json'), '{"projects":[]}');
+  fs.writeFileSync(path.join(root, 'projects.json'), '{}');
+  assert.equal(needsClaim(root, owner), true);
+  fs.writeFileSync(path.join(root, 'legacy-owner.json'), JSON.stringify({ userId: other }));
+  assert.equal(needsClaim(root, owner), false);
+  fs.writeFileSync(path.join(root, 'legacy-owner.json'), JSON.stringify({ userId: owner }));
   fs.mkdirSync(path.join(root, 'users', owner), { recursive: true });
-  fs.writeFileSync(path.join(root, 'users', owner, 'migration.json'), '{}');
-  assert.equal(claimLegacyRoot(root, other), false);
-  assert.equal(JSON.parse(fs.readFileSync(path.join(root, 'legacy-owner.json'), 'utf8')).userId, owner);
-  assert.equal(fs.existsSync(path.join(root, 'users', other)), false);
+  assert.equal(needsClaim(root, owner), false);
+  fs.rmSync(path.join(root, 'users', owner), { recursive: true });
+  fs.symlinkSync(root, path.join(root, 'users', owner));
+  assert.equal(needsClaim(root, owner), true, 'linked target must reach native refusal path');
 });
 
-test('fails closed on malformed ownership markers, symlinks, oversized or over-deep trees', (t) => {
-  const malformed = rootFor(t);
-  fs.writeFileSync(path.join(malformed, 'projects.json'), '{}');
-  fs.writeFileSync(path.join(malformed, 'legacy-owner.json'), '{');
-  assert.equal(claimLegacyRoot(malformed, owner), false);
-  assert.equal(fs.existsSync(path.join(malformed, 'users', owner)), false);
-
-  const linked = rootFor(t);
-  fs.writeFileSync(path.join(linked, 'projects.json'), '{}');
-  const outside = path.join(linked, 'outside.json');
-  fs.writeFileSync(outside, 'private');
-  fs.symlinkSync(outside, path.join(linked, 'history-link.json'));
-  assert.throws(() => claimLegacyRoot(linked, owner), (e) => e.status === 503);
-  assert.equal(fs.existsSync(path.join(linked, 'users', owner)), false);
-  assert.equal(fs.existsSync(path.join(linked, 'migration-backups')), false);
-
-  const large = rootFor(t);
-  fs.writeFileSync(path.join(large, 'projects.json'), '{}');
-  fs.writeFileSync(path.join(large, 'providers.json'), Buffer.alloc(MAX_BYTES + 1));
-  assert.throws(() => claimLegacyRoot(large, owner), (e) => e.status === 503 && /size limit/.test(e.message));
-  assert.equal(fs.existsSync(path.join(large, 'users', owner)), false);
-  assert.equal(fs.existsSync(path.join(large, 'migration-backups')), false);
-  assert.equal(fs.existsSync(path.join(large, 'legacy-owner.json')), false);
-
-  const deep = rootFor(t);
-  fs.writeFileSync(path.join(deep, 'projects.json'), '{}');
-  let current = path.join(deep, 'rag');
-  fs.mkdirSync(current);
-  for (let i = 0; i < MAX_DEPTH + 1; i++) { current = path.join(current, 'd'); fs.mkdirSync(current); }
-  assert.throws(() => claimLegacyRoot(deep, owner), (e) => e.status === 503 && /depth limit/.test(e.message));
-  assert.equal(fs.existsSync(path.join(deep, 'users', owner)), false);
-
-  const many = rootFor(t);
-  fs.writeFileSync(path.join(many, 'projects.json'), '{}');
-  fs.mkdirSync(path.join(many, 'rag'));
-  for (let i = 0; i < MAX_ENTRIES; i++) fs.writeFileSync(path.join(many, 'rag', String(i)), '');
-  assert.throws(() => claimLegacyRoot(many, owner), (e) => e.status === 503 && /entry limit/.test(e.message));
-  assert.equal(fs.existsSync(path.join(many, 'users', owner)), false);
-});
-
-
-test('workspace claim runs inside the same real auth database transaction', (t) => {
+test('legacy helper requires an explicit absolute executable and accepts only fixed replies', (t) => {
   const root = rootFor(t);
+  fs.writeFileSync(path.join(root, 'projects.json'), '{}');
+  const previous = process.env.NOEVIA_LEGACY_CLAIM_BIN;
+  delete process.env.NOEVIA_LEGACY_CLAIM_BIN;
+  t.after(() => { if (previous !== undefined) process.env.NOEVIA_LEGACY_CLAIM_BIN = previous; });
+  assert.throws(() => claimLegacyRoot(root, owner), (error) => error.status === 503);
+  process.env.NOEVIA_LEGACY_CLAIM_BIN = 'claim-helper';
+  assert.throws(() => claimLegacyRoot(root, owner), (error) => error.status === 503);
+
+  const claimed = executableFor(t, 'test "$1" = "--claim-legacy-root"\ntest "$2" = "' + root + '"\ntest "$3" = "' + owner + '"\nprintf "CLAIMED\\n"\n');
+  useHelper(t, claimed);
+  assert.equal(claimLegacyRoot(root, owner), true);
+
+  const skipped = executableFor(t, 'printf "SKIPPED\\n"\n');
+  useHelper(t, skipped);
+  assert.equal(claimLegacyRoot(root, owner), false);
+
+  const malformed = executableFor(t, 'printf "sensitive child output"\n');
+  useHelper(t, malformed);
+  assert.throws(() => claimLegacyRoot(root, owner), (error) =>
+    error.status === 503 && !error.message.includes('sensitive child output'));
+});
+
+test('helper timeout is bounded and becomes a generic unavailable response', (t) => {
+  const root = rootFor(t);
+  const helper = executableFor(t, 'sleep 10\nprintf "CLAIMED\\n"\n');
+  useHelper(t, helper);
+  const started = Date.now();
+  assert.throws(() => claimLegacyRoot(root, owner), (error) => error.status === 503);
+  assert.ok(Date.now() - started < 9200, 'wrapper timeout covers both bounded legacy scans, root lock, claim work and slop');
+});
+
+test('nonlegacy workspace get takes the fast path without a configured child' , (t) => {
+  const root = rootFor(t);
+  const previous = process.env.NOEVIA_LEGACY_CLAIM_BIN;
+  delete process.env.NOEVIA_LEGACY_CLAIM_BIN;
+  t.after(() => { if (previous !== undefined) process.env.NOEVIA_LEGACY_CLAIM_BIN = previous; });
+  const store = createWorkspaceStore(root, { id: 'default', label: 'Default', apiKey: '' }, null, { projectStore: createStubStore(root) });
+  assert.doesNotThrow(() => store.get(owner, { claim: true }));
+});
+
+test('workspace claim runs inside the same fresh admin auth database transaction', (t) => {
+  const root = rootFor(t);
+  const helper = executableFor(t,
+    'test "$1" = "--claim-legacy-root"\nmkdir -p "$2/users/$3"\nprintf "{\\"userId\\":\\"%s\\"}" "$3" > "$2/legacy-owner.json"\nprintf "CLAIMED\\n"\n');
+  useHelper(t, helper);
   const auth = createAuth({ dataDir: root, publicOrigin: 'https://cowork.example.test' });
   t.after(() => auth.db.close());
   const admin = seedAccount(root, { username: 'claim-admin' });
@@ -134,17 +126,44 @@ test('workspace claim runs inside the same real auth database transaction', (t) 
     }).immediate(),
   });
   assert.equal(transactionCalls, 1);
-  assert.equal(fs.existsSync(path.join(workspace.dir, 'migration.json')), true);
+  assert.equal(fs.existsSync(path.join(root, 'legacy-owner.json')), true);
   const laterWorkspace = store.get(admin.id, {
     claim: true,
-    claimTransaction: () => { transactionCalls++; throw new Error('already-claimed get must not enter a write transaction'); },
+    claimTransaction: () => { transactionCalls++; throw new Error('settled get must not enter a write transaction'); },
   });
   assert.equal(laterWorkspace, workspace);
   assert.equal(transactionCalls, 1);
 });
 
+test('actual Rust claim helper is called by Node while the auth write transaction is held', {
+  skip: process.env.NOEVIA_LEGACY_CLAIM_REQUIRED !== '1' &&
+    (!process.env.NOEVIA_LEGACY_CLAIM_BIN || !path.isAbsolute(process.env.NOEVIA_LEGACY_CLAIM_BIN)),
+}, (t) => {
+  const root = rootFor(t);
+  fs.writeFileSync(path.join(root, 'projects.json'), '{"projects":[]}');
+  const auth = createAuth({ dataDir: root, publicOrigin: 'https://cowork.example.test' });
+  t.after(() => auth.db.close());
+  const admin = seedAccount(root, { username: 'native-claim-admin' });
+  const request = { headers: { cookie: admin.cookie }, socket: { remoteAddress: '127.0.0.1' } };
+  const store = createWorkspaceStore(root, { id: 'default', label: 'Default', apiKey: '' }, null, { projectStore: createStubStore(root) });
+  const workspace = store.get(admin.id, {
+    claim: true,
+    claimTransaction: (claim) => auth.db.transaction(() => {
+      assert.equal(auth.db.inTransaction, true);
+      const live = auth.authenticate(request);
+      assert.equal(live.user.id, admin.id);
+      assert.equal(live.user.role, 'admin');
+      return claim();
+    }).immediate(),
+  });
+  assert.equal(fs.existsSync(path.join(workspace.dir, 'migration.json')), true);
+  assert.deepEqual(fs.readFileSync(path.join(workspace.dir, 'projects.json')), Buffer.from('{"projects":[]}'));
+});
+
 test('a separate process deleting the account first prevents a Node legacy claim', async (t) => {
   const root = rootFor(t);
+  const helper = executableFor(t, 'printf "unexpected claim" >&2\nexit 9\n');
+  useHelper(t, helper);
   const auth = createAuth({ dataDir: root, publicOrigin: 'https://cowork.example.test' });
   t.after(() => auth.db.close());
   const admin = seedAccount(root, { username: 'claim-target' });
@@ -171,7 +190,7 @@ test('a separate process deleting the account first prevents a Node legacy claim
     let output = '';
     child.stdout.on('data', (chunk) => {
       output += chunk;
-      if (output.includes('LOCKED\n')) resolve();
+      if (output.includes('LOCKED')) resolve();
     });
     child.once('error', reject);
   });
