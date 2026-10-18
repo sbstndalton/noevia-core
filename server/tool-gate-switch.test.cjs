@@ -1,10 +1,11 @@
 'use strict';
-// TOOL_GATE_IMPL: the switch and its strict paths, with a stand-in for the Rust port (no
-// dav-parse.wasm needed; tests/server/tool-gate-differential.test.cjs runs the real module). The
-// port can only make the gate force less: prefetch only when both prefetch the same arguments,
-// require when one requires, and 'none' (the gate off) for a different tool, a rule or answer only
-// one side sees, different Stage 2 options, a fault or a bad reply; after a rule or option
-// mismatch the decision service is not asked. Synthetic messages and tools only.
+// The tool gate applies the Rust port's answer alone (TOOL_GATE_IMPL, retired in #1071), tested with a stand-in
+// for the port (no dav-parse.wasm needed; tests/server/tool-gate-differential.test.cjs runs the real module).
+// What is checked here is the host's side of the contract, the floor under the port: what the gate sends it,
+// that a rule or a Stage 2 answer it gives is applied as given, and that nothing it cannot answer, answers
+// badly or names a tool this request does not offer read-only is ever forced: 'none' (the gate off), reason
+// impl-fault, the decision service not asked after a fault in the rules or in the options, a counted warning
+// that carries no input. Synthetic messages and tools only.
 const test = require('node:test'), assert = require('node:assert/strict');
 const tg = require('./tool-gate.cjs');
 const davParseWasm = require('./dav-parse-wasm.cjs');
@@ -15,187 +16,201 @@ const TOOLS = [fn('web_fetch', { url: { type: 'string' } }, ['url']), fn('tavily
 const isWriteTool = (n) => n === 'write_file';
 const NOW = Date.UTC(2026, 8, 15, 12);
 const fault = () => { throw new davParseWasm.DavParseError('dav-parse module failed', 'trap'); };
+const NO_RULE = () => ({ rule: null });
+const OPTIONS = () => ({ trimmed: 1, options: [{ id: 'project_search', label: 'search the project' }, { id: 'none', label: 'No tool: answer directly' }] });
 
 /** A stand-in port: each toolGate* call is recorded and answered by `answers[name]` (default: a fault). */
 function fakePort(answers = {}) {
   const calls = [];
   const fnOf = (name) => (...args) => { calls.push([name, args]); return (answers[name] || fault)(...args); };
-  return { calls, loader: () => ({ toolGateRule: fnOf('rule'), toolGateOptions: fnOf('options'), toolGateAnswer: fnOf('answer') }) };
+  return { calls, loader: () => ({ toolGateRule: fnOf('rule'), toolGateOptions: fnOf('options'), toolGateAnswer: fnOf('answer'), toolGateQueries: fnOf('queries') }) };
 }
-function gate({ port, env = { TOOL_GATE_IMPL: 'wasm' }, decide = async () => ({ selected: 'project_search', confidence: 0.9 }), limits = null } = {}) {
+function gate({ port, decide = async () => ({ selected: 'project_search', confidence: 0.9 }), limits = null, wording, tools } = {}) {
   const logs = [], decided = [];
-  const g = tg.createToolGate({ enabled: () => true, isWriteTool, now: () => NOW, env, wasmLoader: port?.loader, limits, unavailable: () => null,
+  const g = tg.createToolGate({ enabled: () => true, isWriteTool, now: () => NOW, wasmLoader: port?.loader, limits, wording, unavailable: () => null,
     decide: async (r) => { decided.push(r); return decide(r); }, log: (e) => logs.push(e), warn: () => {} });
-  return { g, logs, decided };
+  return { g, logs, decided, tools };
 }
 function quietly(fn) {
   const warn = console.warn, seen = [];
   console.warn = (m) => seen.push(String(m));
   return Promise.resolve().then(fn).then((value) => ({ value, seen })).finally(() => { console.warn = warn; });
 }
-const sameRule = (message) => () => {
-  const offered = new Map(TOOLS.map((t) => [t.function.name, t]));
-  const js = tg.ruleDecisionWith(message, offered, { boxes: tg.DEFAULT_BOXES, readOnly: (n) => !isWriteTool(n), now: () => NOW });
-  return js ? { rule: js.rule, decision: js.decision.mode === 'prefetch' ? { tool: js.decision.tool, mode: 'prefetch', args: js.decision.args } : js.decision } : { rule: null };
-};
+const URL_RULE = () => ({ rule: 'url', decision: { tool: 'web_fetch', mode: 'prefetch', args: { url: 'https://example.com/a' } } });
 
-test('TOOL_GATE_IMPL: default js, wasm when set, anything else js with one warning', async () => {
-  const { seen } = await quietly(() => {
-    assert.equal(tg.toolGateImpl({}), 'js');
-    assert.equal(tg.toolGateImpl({ TOOL_GATE_IMPL: '' }), 'js');
-    assert.equal(tg.toolGateImpl({ TOOL_GATE_IMPL: ' WASM ' }), 'wasm');
-    assert.equal(tg.toolGateImpl({ TOOL_GATE_IMPL: 'Js' }), 'js');
-    assert.equal(tg.toolGateImpl({ TOOL_GATE_IMPL: 'rust' }), 'js');
-    assert.equal(tg.toolGateImpl({ TOOL_GATE_IMPL: 'rust' }), 'js');
-  });
-  assert.equal(seen.length, 1);
-  assert.match(seen[0], /TOOL_GATE_IMPL="rust" is not js or wasm; using js/);
-  assert.ok(davParseWasm.IMPL_FLAGS.includes('TOOL_GATE_IMPL'), 'a missing or tampered module stops startup');
+test('TOOL_GATE_IMPL is retired: it is listed as retired, not as a switch, and the JS path and the comparison are gone', () => {
+  assert.equal(davParseWasm.RETIRED_FLAGS.TOOL_GATE_IMPL, 'wasm');
+  assert.ok(!davParseWasm.IMPL_FLAGS.includes('TOOL_GATE_IMPL'));
+  assert.equal(tg.toolGateImpl, undefined);
+  assert.equal(tg.stricterDecision, undefined);
+  assert.equal(tg.shapeOptions, undefined);
 });
 
-test('under js (the default, and an unknown value) the port is never asked', async () => {
-  const port = fakePort();
-  for (const env of [{}, { TOOL_GATE_IMPL: 'on' }]) {
-    const { g } = gate({ port, env });
-    await quietly(async () => {
-      assert.equal((await g.evaluate('open https://example.com/a', TOOLS)).decision.mode, 'prefetch');
-      assert.equal((await g.evaluate('hello there', TOOLS)).decision.tool, 'project_search');
-    });
-  }
-  assert.deepEqual(port.calls, []);
-});
-
-test('agreement: the JS decision stands, and the port saw projections, not tool objects', async () => {
-  const port = fakePort({ rule: sameRule('open https://example.com/a') });
-  const { g, logs } = gate({ port });
-  const out = await g.evaluate('open https://example.com/a', TOOLS);
-  assert.deepEqual(out.decision, { tool: 'web_fetch', args: { url: 'https://example.com/a' }, mode: 'prefetch' });
-  assert.equal(logs.at(-1).reason, undefined);
-  const [, [message, tools, now, boxes]] = port.calls[0];
-  assert.equal(message, 'open https://example.com/a');
-  assert.equal(now, NOW);
-  assert.deepEqual(tools[0], { name: 'web_fetch', readOnly: true, description: 'web_fetch (synthetic)', own: ['url'], truthy: ['url'], anyProps: true, required: ['url'] });
-  assert.equal(tools[4].readOnly, false);
-  assert.deepEqual(boxes[0], ['url', tg.DEFAULT_BOXES.url]);
-});
-
-test('a prefetch the port only requires, or prefetches with other arguments, is required', async () => {
-  for (const decision of [{ tool: 'web_fetch', mode: 'require' }, { tool: 'web_fetch', mode: 'prefetch', args: { url: 'https://example.com/b' } }]) {
+test('the port\'s rule decision is the answer, applied as given, and it saw projections, not tool objects', async () => {
+  for (const decision of [{ tool: 'web_fetch', mode: 'prefetch', args: { url: 'https://example.com/a' } }, { tool: 'web_fetch', mode: 'require' }]) {
     const port = fakePort({ rule: () => ({ rule: 'url', decision }) });
-    const { g, logs } = gate({ port });
-    const { value: out, seen } = await quietly(() => g.evaluate('open https://example.com/a', TOOLS));
-    assert.deepEqual(out.decision, { tool: 'web_fetch', mode: 'require' });
+    const { g, logs, decided } = gate({ port });
+    const out = await g.evaluate('open https://example.com/a', TOOLS);
+    assert.deepEqual(out.decision, decision);
     assert.equal(out.source, 'rule');
-    assert.equal(logs.at(-1).reason, 'impl-stricter');
-    assert.ok(seen.every((l) => !l.includes('example.com')), 'warnings carry no input');
-  }
-});
-
-test('a JS require stays required when the port would prefetch', async () => {
-  // The diary tool needs a month and the message names none: the JS requires it.
-  const port = fakePort({ rule: () => ({ rule: 'diary', decision: { tool: 'diary_read_month', mode: 'prefetch', args: { month: '2026-09' } } }) });
-  const { g } = gate({ port });
-  const out = await g.evaluate('what is in my diary', TOOLS);
-  assert.deepEqual(out.decision, { tool: 'diary_read_month', mode: 'require' });
-});
-
-test('a different tool, a rule only one side sees, a fault or a bad reply: none, and the service is not asked', async () => {
-  const cases = [
-    [{ rule: () => ({ rule: 'url', decision: { tool: 'tavily_search', mode: 'require' } }) }, 'open https://example.com/a', 'impl-mismatch'],
-    [{ rule: () => ({ rule: 'search', decision: { tool: 'web_fetch', mode: 'require' } }) }, 'open https://example.com/a', 'impl-mismatch'],
-    [{ rule: () => ({ rule: null }) }, 'open https://example.com/a', 'impl-mismatch'],
-    [{ rule: () => ({ rule: 'search', decision: { tool: 'tavily_search', mode: 'require' } }) }, 'hello there', 'impl-mismatch'],
-    [{}, 'open https://example.com/a', 'impl-fault'],
-    [{ rule: () => { throw new davParseWasm.DavParseError('bad', 'reply'); } }, 'hello there', 'impl-fault'],
-  ];
-  for (const [answers, message, reason] of cases) {
-    const port = fakePort(answers);
-    const { g, logs, decided } = gate({ port });
-    const { value: out } = await quietly(() => g.evaluate(message, TOOLS));
-    assert.equal(out.decision, 'none', message);
-    assert.equal(logs.at(-1).reason, reason);
-    assert.deepEqual(decided, [], 'no decision service call after a rule mismatch or fault');
-  }
-});
-
-test('Stage 2: options must match exactly, or the service is not asked', async () => {
-  const shaped = (offered) => tg.readoutOptions(offered, { boxes: tg.DEFAULT_BOXES, readOnly: (n) => !isWriteTool(n), bias: null, limits: null }).shape();
-  const offered = new Map(TOOLS.map((t) => [t.function.name, t]));
-  const good = shaped(offered);
-  const variants = [{ ...good, trimmed: good.trimmed + 1 }, { ...good, options: good.options.slice(1) },
-    { ...good, options: good.options.map((o, i) => (i === 0 ? { ...o, label: `${o.label}!` } : o)) }];
-  for (const v of variants) {
-    const port = fakePort({ rule: () => ({ rule: null }), options: () => v });
-    const { g, logs, decided } = gate({ port });
-    const { value: out } = await quietly(() => g.evaluate('hello there', TOOLS));
-    assert.equal(out.decision, 'none');
-    assert.equal(logs.at(-1).reason, 'impl-mismatch');
+    assert.deepEqual(logs.at(-1), { event: 'decision', source: 'rule', tool: 'web_fetch', mode: decision.mode, confidence: null, offered: 5, ms: logs.at(-1).ms, rule: 'url' });
     assert.deepEqual(decided, []);
+    const [, [message, tools, now, boxes]] = port.calls[0];
+    assert.equal(message, 'open https://example.com/a');
+    assert.equal(now, NOW);
+    assert.deepEqual(tools[0], { name: 'web_fetch', readOnly: true, description: 'web_fetch (synthetic)', own: ['url'], truthy: ['url'], anyProps: true, required: ['url'] });
+    assert.equal(tools[4].readOnly, false);
+    assert.deepEqual(boxes[0], ['url', tg.DEFAULT_BOXES.url]);
   }
-  const port = fakePort({ rule: () => ({ rule: null }) }); // options faults
-  const { g, logs, decided } = gate({ port });
-  await quietly(() => g.evaluate('hello there', TOOLS));
-  assert.equal(logs.at(-1).reason, 'impl-fault');
-  assert.deepEqual(decided, []);
 });
 
-test('Stage 2: the answer stands when both read it the same; a stricter port requires; anything else is none', async () => {
-  const offered = new Map(TOOLS.map((t) => [t.function.name, t]));
-  const options = () => tg.readoutOptions(offered, { boxes: tg.DEFAULT_BOXES, readOnly: (n) => !isWriteTool(n), bias: null, limits: null }).shape();
-  const run = async (answer, decide, message = 'hello there') => {
-    const port = fakePort({ rule: () => ({ rule: null }), options, answer });
+test('a fault, a refusal or a bad reply in the rules: nothing is forced, the service is not asked, the warning carries no input', async () => {
+  const bad = [fault, () => { throw new davParseWasm.DavParseError('bad', 'reply'); }, () => { throw new TypeError('unexpected'); }, undefined];
+  for (const rule of bad) {
+    const port = fakePort(rule ? { rule } : {});
+    const { g, logs, decided } = gate({ port });
+    const { value: out, seen } = await quietly(() => g.evaluate('open https://example.com/secret-path', TOOLS));
+    assert.equal(out.decision, 'none');
+    assert.equal(out.source, 'none');
+    assert.equal(logs.at(-1).reason, 'impl-fault');
+    assert.equal(logs.at(-1).rule, undefined);
+    assert.deepEqual(decided, []);
+    assert.ok(seen.every((l) => !l.includes('secret-path') && !l.includes('example.com')), 'warnings carry no input');
+  }
+  // A loader that fails (module missing): the same.
+  const { g } = gate({ port: { loader: () => { throw new davParseWasm.DavParseError('module not found', 'load'); } } });
+  assert.equal((await quietly(() => g.evaluate('open https://example.com/a', TOOLS))).value.decision, 'none');
+});
+
+test('a decision the host would not force is a fault of the port: a tool not offered, a write tool, a bad mode or arguments', async () => {
+  const decisions = [
+    { tool: 'not_offered', mode: 'require' }, { tool: 'write_file', mode: 'require' }, { tool: 'write_file', mode: 'prefetch', args: { path: 'x' } },
+    { tool: 'web_fetch', mode: 'run' }, { tool: 'web_fetch', mode: 'prefetch' }, { tool: 'web_fetch', mode: 'prefetch', args: ['x'] }, { tool: 7, mode: 'require' }, null, undefined, 'web_fetch',
+  ];
+  for (const decision of decisions) {
+    const port = fakePort({ rule: () => ({ rule: 'url', decision }) });
+    const { g, logs, decided } = gate({ port });
+    const out = (await quietly(() => g.evaluate('open https://example.com/a', TOOLS))).value;
+    assert.equal(out.decision, 'none', JSON.stringify(decision));
+    assert.equal(logs.at(-1).reason, 'impl-fault');
+    assert.deepEqual(decided, []);
+    // And the same in Stage 2.
+    const port2 = fakePort({ rule: NO_RULE, options: OPTIONS, answer: () => ({ decision }) });
+    const second = gate({ port: port2 });
+    const out2 = (await quietly(() => second.g.evaluate('hello there', TOOLS))).value;
+    assert.equal(out2.decision, 'none', JSON.stringify(decision));
+    assert.equal(second.logs.at(-1).reason, 'impl-fault');
+  }
+});
+
+test('Stage 2: the options are the port\'s, sent as the service\'s options; a fault or no option fitting asks nobody', async () => {
+  const port = fakePort({ rule: NO_RULE, options: OPTIONS, answer: () => ({ reason: 'none' }) });
+  const { g, logs, decided } = gate({ port, limits: { maxOptions: 8, maxLabelChars: 120, maxChoiceChars: 360 }, wording: 'kev' });
+  await g.evaluate('hello there', TOOLS, { prefer: ['search'], hint: 'The user framed this chat as a lookup.' });
+  assert.equal(decided.length, 1);
+  assert.deepEqual(decided[0].options, OPTIONS().options);
+  assert.equal(decided[0].question, `${tg.KEV_QUESTION} The user framed this chat as a lookup.`);
+  assert.deepEqual(logs.at(-1).options, 2);
+  assert.deepEqual(logs.at(-1).trimmed, 1);
+  const [, [tools, prefer, hint, limits]] = port.calls.find(([n]) => n === 'options');
+  assert.equal(tools.length, 5);
+  assert.deepEqual([prefer, hint], [['search'], 'The user framed this chat as a lookup.']);
+  assert.deepEqual(limits, { maxOptions: 8, maxLabelChars: 120, maxChoiceChars: 320 }, 'the choice budget lowered by the Kev question');
+  // A fault in the options: nothing forced, nobody asked.
+  const f = gate({ port: fakePort({ rule: NO_RULE }) });
+  const out = (await quietly(() => f.g.evaluate('hello there', TOOLS))).value;
+  assert.equal(out.decision, 'none');
+  assert.equal(f.logs.at(-1).reason, 'impl-fault');
+  assert.deepEqual(f.decided, []);
+  // No option fits.
+  const none = gate({ port: fakePort({ rule: NO_RULE, options: () => ({ trimmed: 4, options: [] }) }) });
+  assert.equal((await none.g.evaluate('hello there', TOOLS)).decision, 'none');
+  assert.equal(none.logs.at(-1).reason, 'no-options-fit');
+  assert.deepEqual(none.decided, []);
+  // Only write tools offered: the port is not even asked.
+  const writes = fakePort({ rule: NO_RULE });
+  const w = gate({ port: writes });
+  assert.equal((await w.g.evaluate('hello there', [TOOLS[4]])).decision, 'none');
+  assert.equal(w.logs.at(-1).reason, 'no-read-tools');
+  assert.equal(writes.calls.some(([n]) => n === 'options'), false);
+});
+
+test('Stage 2: the port reads the answer; its decision is applied, its refusals are none, a fault is none', async () => {
+  const today = { type: 'function', function: { name: 'diary_read_today', parameters: { properties: {} } } };
+  const run = async (answer, decide = async () => ({ selected: 'project_search', confidence: 0.9 }), tools = TOOLS) => {
+    const port = fakePort({ rule: NO_RULE, options: OPTIONS, answer });
     const { g, logs } = gate({ port, decide });
-    const { value } = await quietly(() => g.evaluate(message, TOOLS));
-    return { out: value, log: logs.at(-1), port };
+    const out = (await quietly(() => g.evaluate('hello there', tools))).value;
+    return { out, log: logs.at(-1), port };
   };
-  // project_search is a drive tool: always required.
   let r = await run(() => ({ decision: { tool: 'project_search', mode: 'require' } }));
   assert.deepEqual(r.out.decision, { tool: 'project_search', mode: 'require' });
   assert.equal(r.out.source, 'decision');
+  assert.equal(r.out.confidence, 0.9);
   const [, args] = r.port.calls.find(([n]) => n === 'answer');
   assert.deepEqual(args.slice(4), ['project_search', null, null, 0.9, 0.6]);
-  // A diary tool that needs no month, chosen by the service: prefetched ({}) by the JS.
-  const decide = async () => ({ selected: 'diary_read_today', confidence: 0.95 });
-  const today = { type: 'function', function: { name: 'diary_read_today', parameters: { properties: {} } } };
-  const runToday = async (answer) => {
-    const port = fakePort({ rule: () => ({ rule: null }), options: () => tg.readoutOptions(new Map([...TOOLS, today].map((t) => [t.function.name, t])),
-      { boxes: tg.DEFAULT_BOXES, readOnly: (n) => !isWriteTool(n), bias: null, limits: null }).shape(), answer });
-    const { g } = gate({ port, decide });
-    return (await quietly(() => g.evaluate('hello there', [...TOOLS, today]))).value;
-  };
-  assert.deepEqual((await runToday(() => ({ decision: { tool: 'diary_read_today', mode: 'prefetch', args: {} } }))).decision,
-    { tool: 'diary_read_today', args: {}, mode: 'prefetch' });
-  assert.deepEqual((await runToday(() => ({ decision: { tool: 'diary_read_today', mode: 'require' } }))).decision, { tool: 'diary_read_today', mode: 'require' });
-  assert.equal((await runToday(() => ({ reason: 'not-offered' }))).decision, 'none');
-  r = await run(() => ({ decision: { tool: 'tavily_search', mode: 'require' } }));
+  // Prefetch with the port's arguments.
+  r = await run(() => ({ decision: { tool: 'diary_read_today', mode: 'prefetch', args: {} } }), async () => ({ selected: 'diary_read_today', confidence: 0.95 }), [...TOOLS, today]);
+  assert.deepEqual(r.out.decision, { tool: 'diary_read_today', mode: 'prefetch', args: {} });
+  // The reasons the port gives: none forced, the confidence still reported as the service gave it.
+  r = await run(() => ({ reason: 'low-confidence' }), async () => ({ selected: 'project_search', scores: { project_search: 0.4 } }));
   assert.equal(r.out.decision, 'none');
-  assert.equal(r.log.reason, 'impl-mismatch');
-  r = await run(() => ({ reason: 'low-confidence' }));
+  assert.equal(r.log.reason, 'low-confidence');
+  assert.equal(r.out.confidence, 0.4);
+  r = await run(() => ({ reason: 'not-offered' }), async () => ({ selected: 'other', confidence: 0.99 }));
   assert.equal(r.out.decision, 'none');
+  assert.equal(r.log.reason, 'not-offered');
+  assert.equal(r.out.confidence, undefined);
+  r = await run(() => ({ reason: 'none' }), async () => ({ selected: 'none', scores: { none: 0.8 } }));
+  assert.equal(r.out.decision, 'none');
+  assert.equal(r.log.reason, 'none');
+  assert.equal(r.out.confidence, 0.8);
+  // A fault, or the service falling back: nothing forced.
   r = await run(fault);
   assert.equal(r.out.decision, 'none');
   assert.equal(r.log.reason, 'impl-fault');
-  // The JS gives no decision: the port cannot add one.
-  r = await run(() => ({ decision: { tool: 'project_search', mode: 'require' } }), async () => ({ selected: 'none', confidence: 0.99 }));
+  assert.equal(r.log.options, 2);
+  r = await run(() => ({ decision: { tool: 'project_search', mode: 'require' } }), async () => ({ source: 'fallback', metadata: { fellBack: 'timeout' } }));
   assert.equal(r.out.decision, 'none');
-  assert.equal(r.log.reason, 'none');
+  assert.equal(r.log.reason, 'timeout');
+  assert.equal(r.port.calls.some(([n]) => n === 'answer'), false, 'the port is asked to read only an answer that exists');
 });
 
-test('stricterDecision never forces more than either side', () => {
-  const p = (tool, args) => ({ tool, mode: 'prefetch', args }), q = (tool) => ({ tool, mode: 'require' });
-  const RANK = { require: 1, prefetch: 2 };
-  const cases = [[p('a', { url: 'x' }), p('a', { url: 'x' })], [p('a', { url: 'x' }), p('a', { url: 'y' })], [p('a', {}), q('a')], [q('a'), p('a', {})],
-    [q('a'), q('a')], [p('a', {}), p('b', {})], [q('a'), q('b')], [p('a', {}), null], [null, q('a')]];
-  for (const [js, port] of cases) {
-    const m = tg.stricterDecision(js, port);
-    if (!js || !port || js.tool !== port.tool) { assert.equal(m, undefined); continue; }
-    assert.equal(m.tool, js.tool);
-    assert.ok(RANK[m.mode] <= RANK[js.mode] && RANK[m.mode] <= RANK[port.mode]);
-    if (m.mode === 'prefetch') assert.deepEqual(m.args, js.args);
-  }
+test('every fault is counted, logged at the 1st, 10th, 100th and 1000th time, and bounded', async () => {
+  const lines = [];
+  const warn = console.warn;
+  console.warn = (m) => lines.push(String(m));
+  try {
+    const { g } = gate({ port: fakePort({ rule: () => { throw new davParseWasm.DavParseError('x', 'count-test'); } }) });
+    for (let i = 0; i < 1100; i++) await g.evaluate('open https://example.com/a', TOOLS);
+  } finally { console.warn = warn; }
+  assert.deepEqual(lines.map((l) => l.match(/\((\d+) times so far\)/)?.[1] ?? '1'), ['1', '10', '100', '1000']);
+  assert.ok(lines.every((l) => /^\[tool-gate\] tool_gate\.wasm_fault \(count-test\); no tool was forced/.test(l) && !l.includes('example.com')));
+  // A flood of distinct reasons stays bounded.
+  console.warn = () => {};
+  try {
+    for (let i = 0; i < 300; i++) {
+      const { g } = gate({ port: fakePort({ rule: () => { throw new davParseWasm.DavParseError('x', `bound-${i}`); } }) });
+      await g.evaluate('hello', TOOLS);
+    }
+  } finally { console.warn = warn; }
 });
 
-test('projections: what the rules read, as the JS reads it', () => {
+test('prefetchableSearch asks the port; when it cannot answer the message is not prefetchable (the stricter answer)', async () => {
+  const yes = fakePort({ queries: (messages) => ({ queries: messages, prefetchable: messages.map(() => true) }) });
+  assert.equal(tg.prefetchableSearch('latest news', yes.loader), true);
+  assert.deepEqual(yes.calls[0][1], [['latest news']]);
+  assert.equal(tg.prefetchableSearch(undefined, yes.loader), true);
+  assert.deepEqual(yes.calls[1][1], [['']]);
+  const no = fakePort({ queries: () => ({ queries: [''], prefetchable: [false] }) });
+  assert.equal(tg.prefetchableSearch('latest news', no.loader), false);
+  const { value, seen } = await quietly(() => [tg.prefetchableSearch('latest news secret', fakePort({ queries: fault }).loader),
+    tg.prefetchableSearch('latest news', fakePort({ queries: () => ({ prefetchable: 'yes' }) }).loader), tg.prefetchableSearch('x', () => { throw Error('no module'); })]);
+  assert.deepEqual(value, [false, false, false]);
+  assert.ok(seen.every((l) => !l.includes('secret')));
+});
+
+test('projections: what the port reads of the request', () => {
   const odd = { type: 'function', function: { name: 'x', parameters: { properties: { url: 0, urls: {}, month: null }, required: ['url', 7, Symbol('s')] } } };
   const sym = tg.toolProjection(odd, () => true);
   assert.deepEqual(sym, { name: 'x', readOnly: true, description: '', own: ['urls', 'url', 'month'], truthy: ['urls'], anyProps: true, required: ['url', '7', null] });
@@ -205,4 +220,21 @@ test('projections: what the rules read, as the JS reads it', () => {
   assert.equal(tg.limitsProjection({ maxOptions: '8' }), null);
   assert.deepEqual(tg.limitsProjection({ maxOptions: 8, maxLabelChars: 'x', maxChoiceChars: 0 }), { maxOptions: 8, maxLabelChars: 120, maxChoiceChars: 'Infinity' });
   assert.deepEqual([NaN, -Infinity, 2].map(tg.numberProjection), ['NaN', '-Infinity', 2]);
+});
+
+test('boxes that cannot be projected, or a clock that is not a number: nothing is forced', async () => {
+  const run = async (opts) => {
+    const logs = [];
+    const port = fakePort({ rule: URL_RULE });
+    const g = tg.createToolGate({ enabled: () => true, isWriteTool, wasmLoader: port.loader, unavailable: () => null, decide: async () => ({}), log: (e) => logs.push(e), warn: () => {}, ...opts });
+    return { out: (await quietly(() => g.evaluate('open https://example.com/a', TOOLS))).value, logs };
+  };
+  let r = await run({ boxes: { url: 'web_fetch' }, now: () => NOW });
+  assert.equal(r.out.decision, 'none');
+  assert.equal(r.logs.at(-1).reason, 'impl-fault');
+  r = await run({ now: () => 'noon' });
+  assert.equal(r.out.decision, 'none');
+  assert.equal(r.logs.at(-1).reason, 'impl-fault');
+  r = await run({ now: () => NaN });
+  assert.equal(r.out.decision.mode, 'prefetch', 'a clock that is NaN is sent as null, as before');
 });
