@@ -10,10 +10,12 @@ const editTargets = require('./project-edit-target.cjs');
 const { readCappedText, readCappedJson, discardBody } = require('./http.cjs');
 // A provider's error body is only shown as a short message; a summary reply is a few KB of JSON.
 // Both are capped so a provider streaming an endless body cannot be buffered whole (#903).
-// No tool call has arguments anywhere near this size: past it the call is not run, for any provider (the
-// egress rules refuse to read more than about 8 MiB, and nothing downstream should buffer an unbounded model output).
+// No tool call has a name, an id or arguments anywhere near this size: past it the call is not run, for any
+// provider (the egress rules refuse to read more than about 8 MiB, and nothing downstream should buffer an
+// unbounded model output). It counts UTF-16 code units, hence "characters" in the message.
 const MAX_TOOL_ARGS_UNITS = 8 * 1024 * 1024;
-const TOOL_ARGS_TOO_LARGE = (name) => `ERROR: ${name} was not run: its arguments were larger than 8 MiB, which is not a real tool call. Nothing was changed.`;
+const shownToolName = (name) => String(name || '').slice(0, 64);
+const TOOL_ARGS_TOO_LARGE = (name) => `ERROR: ${shownToolName(name)} was not run: its name, id or arguments were larger than about 8 million characters, which is not a real tool call. Nothing was changed.`;
 const PROVIDER_ERROR_BODY_CAP = 64 * 1024;
 const SUMMARY_REPLY_CAP = 4 * 1024 * 1024;
 // The one non-streaming fallback reply of a round (#918).
@@ -2065,9 +2067,15 @@ function createChatHandler({
                 sawAnything = true;
                 for (const tc of delta.tool_calls) {
                   const i = typeof tc.index === 'number' ? tc.index : 0;
-                  const slot = toolCalls.get(i) || { id: tc.id || `call-${i}`, name: '', args: '' };
-                  if (tc.id) slot.id = tc.id;
-                  if (tc.function?.name) slot.name += tc.function.name;
+                  const slot = toolCalls.get(i) || { id: `call-${i}`, idMade: true, name: '', args: '' };
+                  if (tc.id) {
+                    if (String(tc.id).length > MAX_TOOL_ARGS_UNITS) { slot.tooLarge = true; slot.args = ''; }
+                    else { slot.id = tc.id; slot.idMade = false; }
+                  }
+                  if (tc.function?.name && !slot.nameCut) {
+                    if (slot.name.length + String(tc.function.name).length > MAX_TOOL_ARGS_UNITS) { slot.tooLarge = true; slot.nameCut = true; slot.args = ''; slot.name = shownToolName(slot.name); }
+                    else slot.name += tc.function.name;
+                  }
                   if (tc.function?.arguments && !slot.tooLarge) {
                     if (slot.args.length + String(tc.function.arguments).length > MAX_TOOL_ARGS_UNITS) { slot.tooLarge = true; slot.args = ''; }
                     else slot.args += tc.function.arguments;
@@ -2130,9 +2138,10 @@ function createChatHandler({
           if (Array.isArray(msg?.tool_calls)) {
             for (const tc of msg.tool_calls) {
               const index = toolCalls.size;
-              const tooLarge = String(tc.function?.arguments || '').length > MAX_TOOL_ARGS_UNITS;
-              toolCalls.set(index, { id: tc.id || `call-${index}`, name: tc.function?.name || '', args: tooLarge ? '' : tc.function?.arguments || '', ...(tooLarge ? { tooLarge: true } : {}) });
-              send({ type: 'tool', index: toolOffset + index, name: tc.function?.name || '', args: tooLarge ? '' : require('./search-query.cjs').cleanSearchArgs(tc.function?.name || '', tc.function?.arguments || '') });
+              const tooLarge = [tc.id, tc.function?.name, tc.function?.arguments].some((v) => String(v || '').length > MAX_TOOL_ARGS_UNITS);
+              const callName = tooLarge ? shownToolName(tc.function?.name) : tc.function?.name || '';
+              toolCalls.set(index, { id: tooLarge || !tc.id ? `call-${index}` : tc.id, idMade: tooLarge || !tc.id, name: callName, args: tooLarge ? '' : tc.function?.arguments || '', ...(tooLarge ? { tooLarge: true } : {}) });
+              send({ type: 'tool', index: toolOffset + index, name: callName, args: tooLarge ? '' : require('./search-query.cjs').cleanSearchArgs(tc.function?.name || '', tc.function?.arguments || '') });
             }
           }
           reportRoundUsage(full.body?.usage, full.body?.timings);
@@ -2185,12 +2194,24 @@ function createChatHandler({
       if (toolCalls.size > 0) {
         // #1523: a search query is the question, not the request wrapper around it.
         for (const tc of toolCalls.values()) tc.args = tc.tooLarge ? '{}' : require('./search-query.cjs').cleanSearchArgs(tc.name, tc.args);
+        // An id this server made up (the provider sent none, or one over the cap) must not equal another call's id in the
+        // same message: the results are matched back to their calls by id.
+        {
+          const used = new Set([...toolCalls.values()].filter((c) => !c.idMade).map((c) => c.id));
+          for (const [i, c] of toolCalls) {
+            if (!c.idMade) continue;
+            let id = `call-${i}`;
+            for (let k = 2; used.has(id); k++) id = `call-${i}-${k}`;
+            used.add(id);
+            c.id = id;
+          }
+        }
         if (roundContent.trim()) { send({ type: 'preamble', text: roundContent }); roundHasContent = false; }
         const assistantMsg = { role: 'assistant', content: null, tool_calls: [...toolCalls.entries()].map(([i, tc]) => ({ id: tc.id, type: 'function', function: { name: tc.name, arguments: tc.args } })) };
         roundMessages = [...roundMessages, assistantMsg];
         for (const [toolIndex, tc] of toolCalls) {
           if (chatSignal.signal.aborted) break;
-          if (tc.name === 'more_tools' && routing.narrowed) {
+          if (tc.name === 'more_tools' && routing.narrowed && !tc.tooLarge) {
             let reply = 'All of this project\'s tools are already available.';
             if (!widened) {
               widened = true;
