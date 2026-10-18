@@ -8,6 +8,11 @@
 // seeded calls below, for every UTF-16 code unit as a key or a method, and for the large-input cases.
 // Both files are frozen and sha256-pinned: the JS rules and their generator are gone, and neither may be
 // regenerated through the Rust path (that would erase the independent reference).
+// Provenance and one caveat (also in the frozen file's `note`): the "JS" answers were frozen from noevia-core at
+// e70151f with the dav-parse.wasm that server/dav-parse.lock pins. For IP literals they come from ssrf.cjs
+// isPrivateIp, which is itself the ssrf-policy crate, so comparing them with the browser-policy crate is circular;
+// the independent reference for IP address classification is the ssrf-policy crate's own frozen fixtures
+// (tests/fixtures/ssrf.v1.json, #795), not this file.
 // Here every row runs through dav-parse.wasm's browser_policy and through the functions browser-executor.cjs
 // calls. The old composition never let an action out that the JS held back, and let the port only add; with
 // the JS gone the port decides alone, so what must hold, and is counted below, is that no frozen JS answer is
@@ -32,7 +37,7 @@ const bp = require('../../server/browser-policy.cjs');
 const FILE = path.join(__dirname, '../fixtures/browser-policy.v1.json');
 const FROZEN_FILE = path.join(__dirname, '../fixtures/browser-policy-js.v1.json');
 // The frozen references are pinned: changing either is a deliberate act that also changes these.
-const PINS = { [FILE]: 'c42a8ac82d8876faaebf661c81c277506964abc1e4befeec9a0005559626f1d7', [FROZEN_FILE]: 'a4ceeb5e51a5dd027abf6ce3e84d7a9fabbfe956459b26a6070be0b0122dc1a6' };
+const PINS = { [FILE]: 'c42a8ac82d8876faaebf661c81c277506964abc1e4befeec9a0005559626f1d7', [FROZEN_FILE]: '262f8793f4972ed361c486402bc14eabaf09e62d4aa9c727d550659174dfc03a' };
 const FROZEN = JSON.parse(fs.readFileSync(FROZEN_FILE, 'utf8'));
 const fixtures = JSON.parse(fs.readFileSync(FILE, 'utf8'));
 const wasmFile = process.env.DAV_PARSE_WASM || davParseWasm.DEFAULT_WASM;
