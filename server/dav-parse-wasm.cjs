@@ -60,7 +60,7 @@
 //   - crates/code-actions  codeActionsClassify/Decide/Pick = code-actions.cjs classify, decide and
 //                          pickOption over the host's projection (CODE_ACTIONS_IMPL)
 //   - crates/project-file-names projectFileNames = project-file-names.cjs resolveProjectFile over
-//                          the project's file names (PROJECT_FILE_NAMES_IMPL)
+//                          the project's file names (PROJECT_FILE_NAMES_IMPL, retired)
 //   - crates/provider-egress providerEgress* = provider-egress.cjs isExternalProvider,
 //                          isTrialTermsHost, egressRefusal, stripPrivateToolboxes, toolRefusal,
 //                          canonicalPath and diaryFolderFor over the host's projections (PROVIDER_EGRESS_IMPL)
@@ -1871,7 +1871,7 @@ function llamacppAutoconfig(op, args) {
   return { text, reply: autoconfigReply(op, reply) };
 }
 
-// --- code actions (CODE_ACTIONS_IMPL) and project file names (PROJECT_FILE_NAMES_IMPL) ----------
+// --- code actions (CODE_ACTIONS_IMPL) and project file names (PROJECT_FILE_NAMES_IMPL, retired in #1071) ----------
 // code_actions::MAX_INPUT_BYTES and project_file_names::MAX_INPUT_BYTES (the op byte and the JSON).
 // A tool call's command text and a project's file names carry no credentials: ordinary calls.
 const MAX_CODE_ACTIONS_BYTES = 2 * 1024 * 1024 + 1;
@@ -1937,7 +1937,7 @@ function codeActionsPick(options, wanted) {
   return r;
 }
 
-/** project-file-names.cjs resolveProjectFile over the project's file names (strings, in order) and
+/** The project-file-names port (resolveProjectFile in project-file-names.cjs adapts it) over the project's file names (strings, in order) and
  *  the raw argument: `{ file }` (an index into `names`), `{ code: 'invalid', reason }`,
  *  `{ code: 'missing' }` or `{ code: 'ambiguous', candidates }`. A refusal or bad reply throws. */
 function projectFileNames(names, raw) {
@@ -2239,14 +2239,15 @@ function llamacppPresetsModel(model) {
 // Every switch that runs this module (#996). Each reads its value as trim().toLowerCase().
 // Retired switches (#1071) are not listed: the Rust path they selected is always on, and
 // verifyAtStartup() always loads this module for it.
-const IMPL_FLAGS = ['STORAGE_PATH_IMPL', 'SECRET_ENVELOPE_IMPL', 'STREAM_GUARD_IMPL', 'ROLE_CONTEXT_IMPL', 'CODE_ACTIONS_IMPL', 'PROJECT_FILE_NAMES_IMPL', 'PROVIDER_EGRESS_IMPL', 'BROWSER_POLICY_IMPL', 'TOOL_GATE_IMPL', 'TOOLBOXES_PERMITTED_IMPL', 'LLAMACPP_PRESETS_IMPL'];
+const IMPL_FLAGS = ['STORAGE_PATH_IMPL', 'SECRET_ENVELOPE_IMPL', 'STREAM_GUARD_IMPL', 'ROLE_CONTEXT_IMPL', 'CODE_ACTIONS_IMPL', 'PROVIDER_EGRESS_IMPL', 'BROWSER_POLICY_IMPL', 'TOOL_GATE_IMPL', 'TOOLBOXES_PERMITTED_IMPL', 'LLAMACPP_PRESETS_IMPL'];
 
 /** Switches whose JS path was deleted once Rust had run in production (#1071). The old value that
  *  selected Rust ('wasm', or 'on' for the advisor) is accepted silently; anything else is ignored
  *  with one warning, because Rust is always used. */
 const RETIRED_FLAGS = { CHAT_TEMPLATE_CAPS_IMPL: 'wasm', AUTOTUNE_PLAN_IMPL: 'wasm', PRESET_RELOAD_IMPL: 'wasm', LAYA_LOAD_ADVISOR: 'on', DAV_PARSE_IMPL: 'wasm', S3_PARSE_IMPL: 'wasm', MCP_FRAME_IMPL: 'wasm', UPLOAD_SNIFF_IMPL: 'wasm', S3_SIGN_IMPL: 'wasm', PROMPT_FRAMING_IMPL: 'wasm', SSRF_IMPL: 'wasm',
   POLICY_LEAVES_IMPL: 'wasm', CODE_REVIEW_VERDICT_IMPL: 'wasm', TOOL_EXCHANGE_IMPL: 'wasm', DECISION_IMPL: 'wasm', COMPLETENESS_REPORT_IMPL: 'wasm', TASK_LIFECYCLE_IMPL: 'wasm', MCP_SERVERS_IMPL: 'wasm', CODE_NET_GUARD_IMPL: 'wasm', LLAMACPP_AUTOCONFIG_IMPL: 'wasm',
-  GGUF_META_IMPL: 'wasm' };
+  GGUF_META_IMPL: 'wasm',
+  PROJECT_FILE_NAMES_IMPL: 'wasm' };
 
 /** Log one warning per retired switch that `env` still sets to something other than its old
  *  Rust-selecting value (for example =js). Returns the names warned about. Never throws. */
