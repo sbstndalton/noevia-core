@@ -72,7 +72,7 @@
 //                          projections (TOOL_GATE_IMPL, retired in #1071)
 //   - crates/toolboxes-permitted toolboxes* = toolboxes-permitted.cjs projectToolboxIds,
 //                          selectedToolboxIds and computePermittedTools over the host's
-//                          projections (TOOLBOXES_PERMITTED_IMPL)
+//                          projections (TOOLBOXES_PERMITTED_IMPL, retired in #1071)
 //   - crates/llamacpp-presets llamacppPresets* = llamacpp-presets.cjs prepare's option check (with
 //                          inference-budget.cjs clampCacheRam), canonicalOptions, the micro-batch
 //                          check and the model name pattern (LLAMACPP_PRESETS_IMPL)
@@ -2146,7 +2146,7 @@ function toolGatePublic(urls) {
   return r;
 }
 
-// --- toolboxes permitted (TOOLBOXES_PERMITTED_IMPL) ----------------------------------------------
+// --- toolboxes permitted (TOOLBOXES_PERMITTED_IMPL, retired in #1071) ----------------------------------------------
 // toolboxes_permitted::MAX_INPUT_BYTES. The host sends its projections of the project ({auto,
 // docsDefaulted, toolboxes}), id lists (a string or null each) and, for the catalogue, what the JS
 // run read from its callbacks. A refusal or bad reply throws a DavParseError, which
@@ -2239,7 +2239,7 @@ function llamacppPresetsModel(model) {
 // Every switch that runs this module (#996). Each reads its value as trim().toLowerCase().
 // Retired switches (#1071) are not listed: the Rust path they selected is always on, and
 // verifyAtStartup() always loads this module for it.
-const IMPL_FLAGS = ['STORAGE_PATH_IMPL', 'SECRET_ENVELOPE_IMPL', 'STREAM_GUARD_IMPL', 'ROLE_CONTEXT_IMPL', 'TOOLBOXES_PERMITTED_IMPL', 'LLAMACPP_PRESETS_IMPL'];
+const IMPL_FLAGS = ['STORAGE_PATH_IMPL', 'SECRET_ENVELOPE_IMPL', 'STREAM_GUARD_IMPL', 'ROLE_CONTEXT_IMPL', 'LLAMACPP_PRESETS_IMPL'];
 
 /** Switches whose JS path was deleted once Rust had run in production (#1071). The old value that
  *  selected Rust ('wasm', or 'on' for the advisor) is accepted silently; anything else is ignored
@@ -2251,7 +2251,8 @@ const RETIRED_FLAGS = { CHAT_TEMPLATE_CAPS_IMPL: 'wasm', AUTOTUNE_PLAN_IMPL: 'wa
   PROVIDER_EGRESS_IMPL: 'wasm',
   BROWSER_POLICY_IMPL: 'wasm',
   CODE_ACTIONS_IMPL: 'wasm',
-  TOOL_GATE_IMPL: 'wasm' };
+  TOOL_GATE_IMPL: 'wasm',
+  TOOLBOXES_PERMITTED_IMPL: 'wasm' };
 
 /** Log one warning per retired switch that `env` still sets to something other than its old
  *  Rust-selecting value (for example =js). Returns the names warned about. Never throws. */

@@ -1,4 +1,8 @@
 const test = require('node:test'), assert = require('node:assert/strict');
+const skipWasm = !require('node:fs').existsSync(process.env.DAV_PARSE_WASM || require('./dav-parse-wasm.cjs').DEFAULT_WASM) && process.env.DAV_PARSE_WASM_REQUIRED !== '1' && 'dav-parse.wasm not built';
+// Guards a wrong test signature (options passed twice makes node:test take the second object as the body, so the body never runs and the
+// test reports ok): when the module is there, every guarded body must have run.
+let ran = 0;
 const skills = require('./instruction-skills.cjs');
 const file = (body = 'Draft a synthetic review.', meta = 'name: Review\ndescription: Review the notes\nversion: 1') => ({ name: 'review.md', content: `---\n${meta}\n---\n${body}` });
 const fixture = () => ({ files: [file(), { name: 'notes.txt', content: 'Ordinary notes.' }], toolboxes: ['core'] });
@@ -121,9 +125,12 @@ test('a formerly-recorded candidate note is released by reconcile once it no lon
  assert.deepEqual(skills.sources(p).map(f=>f.name),['meeting.md']);
 });
 
-test('#1006 review: missing tools follow Tools Automatic, not the stored hand-picked list',()=>{
+test('#1006 review: missing tools follow Tools Automatic, not the stored hand-picked list', { skip: skipWasm }, ()=>{
+  ran++;
   const f=file('Body','name: Review\ndescription: Notes\nrequires: web');
   assert.deepEqual(skills.inspect(f,{toolboxes:['core','web']}).missingTools,[]);
   assert.deepEqual(skills.inspect(f,{toolsMode:'auto',toolboxes:['core','web']}).missingTools,['web'],'Automatic sends the default set');
   assert.deepEqual(skills.inspect(f,{}).missingTools,['web']);
 });
+
+test.after(() => { if (!skipWasm) assert.equal(ran, 1, 'a wasm-guarded test body did not run'); });

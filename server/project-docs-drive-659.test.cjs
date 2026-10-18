@@ -3,6 +3,10 @@
 // Drive file on the approval card and never overwrite a file changed since this chat read it; and
 // the tool descriptions steer project files to the project tools. Synthetic data, a fake Google.
 const test = require('node:test'), assert = require('node:assert/strict');
+const skipWasm = !require('node:fs').existsSync(process.env.DAV_PARSE_WASM || require('./dav-parse-wasm.cjs').DEFAULT_WASM) && process.env.DAV_PARSE_WASM_REQUIRED !== '1' && 'dav-parse.wasm not built';
+// Guards a wrong test signature (options passed twice makes node:test take the second object as the body, so the body never runs and the
+// test reports ok): when the module is there, every guarded body must have run.
+let ran = 0;
 const fs = require('node:fs'), os = require('node:os'), path = require('node:path'), crypto = require('node:crypto');
 const { Readable, } = require('node:stream');
 const { EventEmitter } = require('node:events');
@@ -28,7 +32,8 @@ test.after(async () => { await google.close(); for (const d of temps) fs.rmSync(
 // ── (a) Project documents by default for a project with uploads ─────────────────────────────
 const OFFERED = { offered: (id) => ['core', 'project-docs', 'web-search'].includes(id), defaults: ['core'], hadUploads: false };
 
-test('the default toolboxes of a project with an upload include the project edit tools; others keep least privilege', () => {
+test('the default toolboxes of a project with an upload include the project edit tools; others keep least privilege', { skip: skipWasm }, () => {
+  ran++;
   const upload = { name: 'notes.md', content: 'Zahl: 1' };
   const fresh = { id: 'p', toolboxes: ['core'], files: [upload] };
   assert.equal(applyProjectDocsDefault(fresh, OFFERED), true);
@@ -353,3 +358,5 @@ test('through the chat loop: read in one request, update in the next is refused;
   assert.equal(same[1].applied, true);
   assert.equal(google.files.get(id).body.toString(), 'v1 plus more');
 });
+
+test.after(() => { if (!skipWasm) assert.equal(ran, 1, 'a wasm-guarded test body did not run'); });
