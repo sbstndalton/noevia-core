@@ -84,6 +84,15 @@ test('the port can make an answer stricter: an unavailable box with its reason, 
   assert.deepEqual([boxes.code.state, boxes.code.reason, boxes.code.tools.map((t) => t.reasonCode)], ['unavailable', tp.REASONS.codeOff, ['codeOff', 'codeOff', 'codeOff']]);
 });
 
+test('an unknown harness tool reason uses the unchecked code and text together', () => {
+  const port = fakePort({ permitted: () => reply({ 4: { state: 'unavailable', reasonCode: 'unknown-harness-reason', active: false,
+    tools: [T('unavailable', 'unknown-harness-reason'), T('unavailable', 'codeOff'), T('needs-approval')] } }) });
+  const code = byId(tp.computePermittedTools(input().input, { wasmLoader: port.loader })).code;
+  assert.deepEqual([code.reason, code.reasonCode], [tp.REASONS.unchecked, 'unchecked']);
+  assert.deepEqual(code.tools.map((t) => [t.reason, t.reasonCode]),
+    [[tp.REASONS.unchecked, 'unchecked'], [tp.REASONS.codeOff, 'codeOff'], [null, null]]);
+});
+
 test('the floor: the limits of the account hold even if the port says allowed and available', () => {
   const answer = { boxes: [
     { id: 'core', ...OPEN.available, active: true, tools: [T('allowed'), T('allowed')] },
@@ -105,7 +114,7 @@ test('the floor: the limits of the account hold even if the port says allowed an
   assert.deepEqual([boxes.diary.state, boxes.diary.reasonCode, boxes.diary.tools[0].permission], ['unavailable', 'diaryOff', 'unavailable'], 'the Diary add-on is off');
 });
 
-test('the floor: a box that needs a connection is unavailable unless the port says so too', () => {
+test('the floor: a missing connection stays unavailable even if the port says available', () => {
   const answer = { boxes: [{ id: 'gmail', ...OPEN.available, active: true, tools: [T('allowed')] }, { id: 'code', ...OPEN.available, active: true, tools: [T('allowed'), T('needs-approval'), T('needs-approval')] }] };
   const { input: i } = input({ boxes: [{ id: 'gmail', tools: [tool('mail_read')] }], manifest: [], oauthServerIds: new Set(), connectorBoxes: new Set(['gmail']), connected: [] });
   const boxes = byId(tp.computePermittedTools(i, { wasmLoader: fakePort({ permitted: () => answer }).loader }));
