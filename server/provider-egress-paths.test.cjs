@@ -11,11 +11,16 @@ const pe = require('./provider-egress.cjs');
 
 const wasmFile = process.env.DAV_PARSE_WASM || davParseWasm.DEFAULT_WASM;
 const skip = !fs.existsSync(wasmFile) && process.env.DAV_PARSE_WASM_REQUIRED !== '1' && 'dav-parse.wasm not built';
+// Guards a wrong test signature (options passed twice makes node:test take the second object as the body, so the body never
+// runs and the test reports ok): when the module is there, every guarded body must have run.
+let ran = 0;
+test.after(() => { if (!skip) assert.equal(ran, 2, 'a wasm-guarded test body did not run'); });
 const REMOTE = { id: 'r', external: true, label: 'Remote', baseUrl: 'https://remote.example/v1' };
 const STORAGE = { kind: 'nextcloud', corpusRoot: 'Diary', baseUrl: 'https://nc.example/remote.php/dav/files/alice', password: 'synthetic' };
 const refusal = (path, storage = STORAGE) => pe.toolRefusal({ provider: REMOTE, toolName: 'nc_webdav_read_file', rawArgs: JSON.stringify({ path }), storage });
 
 test('#1208: every spelling of a non-ASCII Diary folder is refused; a folder the port cannot compare closes storage', { skip }, () => {
+  ran++;
   const storage = { ...STORAGE, corpusRoot: 'Tagebücher' };
   // Composed, percent-encoded, decomposed (the port composes a base letter and one combining mark), upper case.
   for (const path of ['Tageb%C3%BCcher/x.md', 'TAGEB%C3%9CCHER', 'Tagebu%CC%88cher/x.md', 'Tagebücher/x.md', 'TAGEBU%CC%88CHER']) {
@@ -30,6 +35,7 @@ test('#1208: every spelling of a non-ASCII Diary folder is refused; a folder the
 });
 
 test('#1209: long path arguments are refused before any per-character work, and a long run of dots is cheap', { skip }, () => {
+  ran++;
   const t0 = process.hrtime.bigint();
   const long = `${'/remote.php/webdav/x'.repeat(50_000)}\n`;
   assert.match(refusal(long), /in the Diary folder/);

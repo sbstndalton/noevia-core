@@ -35,6 +35,10 @@ const fixtures = JSON.parse(fs.readFileSync(FILE, 'utf8'));
 const FROZEN = JSON.parse(fs.readFileSync(FROZEN_FILE, 'utf8'));
 const wasmFile = process.env.DAV_PARSE_WASM || davParseWasm.DEFAULT_WASM;
 const skipWasm = !fs.existsSync(wasmFile) && process.env.DAV_PARSE_WASM_REQUIRED !== '1' && 'dav-parse.wasm not built';
+// Guards a wrong test signature (options passed twice makes node:test take the second object as the body, so the body never
+// runs and the test reports ok): when the module is there, every guarded body must have run.
+let ran = 0;
+test.after(() => { if (!skipWasm) assert.equal(ran, 5, 'a wasm-guarded test body did not run'); });
 
 // project_file_names::NFC_INERT_RANGES (the table provider-egress reuses).
 const INERT = [[0x0000, 0x02ff], [0x0400, 0x0482], [0x048a, 0x04ff], [0x2010, 0x2027], [0x2030, 0x205e], [0x3001, 0x3029],
@@ -88,6 +92,7 @@ test('the fixture files are frozen and pinned, line up, and no JS rule, switch o
 });
 
 test('fixture rows: the port replies exactly as the file says; the rules chat.cjs calls never let out what the frozen JS kept back', { skip: skipWasm }, () => {
+  ran++;
   assert.ok(fixtures.rows.length >= 4000);
   const seen = { external: {}, trial: {}, egress: {}, strip: {}, tool: {} };
   let strict = 0;
@@ -134,6 +139,7 @@ test('fixture rows: the port replies exactly as the file says; the rules chat.cj
 });
 
 test('the crate refuses only Diary tools and storage tools: every other tool name is allowed without asking, as chat.cjs relies on', { skip: skipWasm }, () => {
+  ran++;
   const provider = pe.providerProjection({ external: true, label: 'Label' });
   const storage = pe.storageProjection({ kind: 'nextcloud', corpusRoot: 'Diary', baseUrl: 'https://nc.example/remote.php/dav/files/alice' });
   const args = JSON.stringify({ path: 'Diary/x.md', fileId: 5, file: 'Diary/y' });
@@ -149,6 +155,7 @@ test('the crate refuses only Diary tools and storage tools: every other tool nam
 });
 
 test('every NFC-inert code point canonicalizes as this runtime does: raw, percent-encoded and between letters', { skip: skipWasm }, () => {
+  ran++;
   // The reference is the rule the port mirrors (the former JS canonicalPath), over this runtime's normalize() and toLowerCase().
   const reference = (value) => {
     let text = String(value ?? '').normalize('NFC');
@@ -194,12 +201,13 @@ function mulberry32(seed) {
     return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
   };
 }
-const SEG = ['Diary', 'diary', 'Work', '..', '.', '', '%2F', '%2e%2e', '%252F', 'Tagebücher', 'Tagebücher', 'Tagebu%CC%88cher', 'Ημερα',
-  'Σ', 'İ', 'remote.php', 'dav', 'files', 'webdav', 'https:', 'nc.example', '日記', '📓', 'x\ud800', ' ', 'Å'];
+const SEG = ['Diary', 'diary', 'Work', '..', '.', '', '%2F', '%2e%2e', '%252F', 'Tagebücher', 'Tagebücher', 'Tagebu%CC%88cher', 'Ημερα',
+  'Σ', 'İ', 'remote.php', 'dav', 'files', 'webdav', 'https:', 'nc.example', '日記', '📓', 'x\ud800', ' ', 'Å'];
 const ROOTS = ['Diary', 'Tagebücher', 'Ημερα', 'Work/Diary', '日記', '', 'diary'];
 const KEYS = ['path', 'dir', 'q', 'source', 'to', 'depth', 'recursive', 'items', 'name', 'file_id', 'deep'];
 
 test('seeded live calls: no frozen JS refusal is let out; the port adds refusals only where it is stricter, and every kind is counted', { skip: skipWasm }, () => {
+  ran++;
   const rand = mulberry32(0x1e55);
   const pick = (l) => l[Math.floor(rand() * l.length)];
   const segPath = () => Array.from({ length: Math.floor(rand() * 5) }, () => pick(SEG)).join(pick(['/', '\\', '//']));
@@ -210,7 +218,7 @@ test('seeded live calls: no frozen JS refusal is let out; the port adds refusals
     if (r < 0.3) return pick([true, false, 0, 1, '0', '1', null]);
     return (rand() < 0.1 ? 'https://nc.example/remote.php/dav/files/alice/' : '') + segPath();
   };
-  const providers = [null, { kind: 'chatgpt-oauth', label: 'ChatGPT' }, { external: true }, { baseUrl: 'https://integrate.api.nvidia.com/v1' },
+  const providers = [null, { kind: 'chatgpt-oauth', label: 'Provider A' }, { external: true }, { baseUrl: 'https://integrate.api.nvidia.com/v1' },
     { baseUrl: 'https://ｎｖｉｄｉａ.com/v1' }, { baseUrl: 'http://llama:8080/v1' }, { baseUrl: 'https://xn--nvidia.com/' }];
   const seen = { tool: {}, external: {}, egress: {}, strip: {} };
   for (let n = 0; n < 4000; n++) {
@@ -240,10 +248,11 @@ test('seeded live calls: no frozen JS refusal is let out; the port adds refusals
     assert.ok(left.every((x) => x !== 'diary') || leftJs === 3, where);
     tally(seen.strip, left.length === leftJs ? 'same' : 'port-removes-more');
   }
-  assert.deepEqual(seen, {"tool":{"same-permit":1838,"same-refusal":1529,"both-refuse-other-words:folder-unidentified":108,"js-permit port-refuses":520,"both-refuse-other-words:path-in-diary-folder":5},"external":{"js=0 now=0":1164,"js=1 now=1":2267,"js=0 now=1":569},"egress":{"same-permit":2092,"same-refusal":1525,"js-permit port-refuses":383},"strip":{"same":3431,"port-removes-more":569}});
+  assert.deepEqual(seen, {"tool":{"same-permit":1809,"same-refusal":1528,"both-refuse-other-words:folder-unidentified":108,"js-permit port-refuses":549,"both-refuse-other-words:path-in-diary-folder":6},"external":{"js=0 now=0":1164,"js=1 now=1":2267,"js=0 now=1":569},"egress":{"same-permit":2092,"same-refusal":1525,"js-permit port-refuses":383},"strip":{"same":3431,"port-removes-more":569}});
 });
 
 test('the #1209 inputs are bounded in the port and through the rules chat.cjs calls', { skip: skipWasm }, () => {
+  ran++;
   const t = process.hrtime.bigint();
   const s = '/remote.php/webdav/x'.repeat(100_000) + '\n';
   const { canonical } = davParseWasm.providerEgressCanonical([s]);
