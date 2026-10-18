@@ -1171,7 +1171,19 @@ async function handleRequestInner(req, res) {
   if (require('./features.cjs').refuseRustStorageRead(req, res, { parseRequestUrl, badRequestUrl, json })) return;
   const preAuth = requestAuth.authenticate(req);
   // accountRole: a device token acts as a member, but its account's workspace is the same one.
-  const workspace = preAuth ? workspaceStore.get(preAuth.user.id, { claim: (preAuth.accountRole || preAuth.user.role) === 'admin' }) : null;
+  const workspace = preAuth ? workspaceStore.get(preAuth.user.id, {
+    claim: (preAuth.accountRole || preAuth.user.role) === 'admin',
+    // Rust claims hold this same SQLite IMMEDIATE transaction, so an account deletion cannot
+    // remove the target between authorization and the completed copy. Keep workspace loading out
+    // of the transaction; only the legacy-root copy is serialized.
+    claimTransaction: (claim) => authService.db.transaction(() => {
+      const live = requestAuth.authenticate(req);
+      if (!live || live.user.id !== preAuth.user.id || (live.accountRole || live.user.role) !== 'admin') {
+        throw Object.assign(new Error('account authorization changed during legacy setup'), { status: live ? 401 : 410 });
+      }
+      return claim();
+    }).immediate(),
+  }) : null;
   if (workspace && preAuth.user.role === 'admin' && authService.diaryEnabled(preAuth.user.id) && fs.existsSync(path.join(workspace.dir, 'migration.json')) &&
       process.env.CORPUS_BACKEND === 'webdav' && authService.getStorage(preAuth.user.id).kind === 'local') {
     authService.saveStorage(preAuth.user.id, { kind: 'webdav', baseUrl: process.env.WEBDAV_BASE_URL || '', username: process.env.WEBDAV_USERNAME || '', secret: process.env.WEBDAV_PASSWORD || '', corpusRoot: process.env.CORPUS_ROOT || '' });
