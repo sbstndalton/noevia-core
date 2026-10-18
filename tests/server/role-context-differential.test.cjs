@@ -53,7 +53,7 @@ function jsReply(op, a, state, impl = JS) {
 }
 
 test('the fixture file is what the generator prints', { skip: !fs.existsSync(GENERATOR) && 'no generator here' }, () => {
-  const out = execFileSync(process.execPath, [GENERATOR], { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
+  const out = execFileSync(process.execPath, [GENERATOR], { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024, env: { ...process.env, DAV_PARSE_WASM: path.join(__dirname, 'no-generator-module.wasm'), ROLE_CONTEXT_IMPL: 'js' } });
   assert.equal(out, fs.readFileSync(FILE, 'utf8'));
 });
 
