@@ -172,7 +172,27 @@ test('non-streamed: a call with no id or an over-cap id does not take the id of 
   assert.deepEqual(last(r).filter((m) => m.role === 'tool').map((m) => m.tool_call_id), ids);
 });
 
+// #2033: repeated real provider ids also need a stable, unambiguous result match.
+for (const streamed of [true, false]) {
+  test(`${streamed ? 'streamed' : 'non-streamed'}: repeated real ids are replaced without taking later real ids`, async (t) => {
+    const calls = ['same-id', 'same-id', 'call-1', 'same-id', 'call-1-2'].map((id, i) => ({
+      id, function: { name: 'synthetic_read', arguments: JSON.stringify({ q: String(i) }) },
+    }));
+    const r = await run(t, streamed
+      ? { frames: calls.map((call, index) => frame({ index, ...call })) }
+      : { fallbackCalls: calls });
+    assert.equal(r.executions, calls.length, 'all valid calls execute');
+    const messages = last(r);
+    const assistant = messages.find((m) => m.role === 'assistant' && m.tool_calls).tool_calls;
+    const ids = assistant.map((c) => c.id);
+    assert.deepEqual(ids, ['same-id', 'call-1-3', 'call-1', 'call-3', 'call-1-2']);
+    assert.equal(new Set(ids).size, calls.length);
+    assert.deepEqual(assistant.map((c) => c.function.arguments), calls.map((c) => c.function.arguments));
+    assert.deepEqual(messages.filter((m) => m.role === 'tool').map((m) => m.tool_call_id), ids);
+  });
+}
+
 // Every body above must have run (a wrong test signature would make node:test skip it silently).
 let ran = 0;
 test.afterEach(() => { ran++; });
-test.after(() => assert.equal(ran, 13, 'every test body ran'));
+test.after(() => assert.equal(ran, 15, 'every test body ran'));
