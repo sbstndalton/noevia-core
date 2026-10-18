@@ -7,6 +7,11 @@ const path = require('node:path');
 const { buildRequests, loadCases, smokeSubset, rotate, LANGS, PERMUTED_ITEMS } = require('./build-requests.cjs');
 
 const SERVER = path.join(__dirname, '..', '..', 'server');
+// The tool gate's rules live in dav-parse.wasm (since #1071 there is no JS copy), so the tests that build the tool-gate requests
+// need it; skipped without it unless DAV_PARSE_WASM_REQUIRED=1. Guards a wrong test signature too: every guarded body must have run.
+const skipWasm = !fs.existsSync(process.env.DAV_PARSE_WASM || require(path.join(SERVER, 'dav-parse-wasm.cjs')).DEFAULT_WASM)
+  && process.env.DAV_PARSE_WASM_REQUIRED !== '1' && 'dav-parse.wasm not built';
+let ran = 0;
 let built;
 const records = async () => (built ||= await buildRequests());
 
@@ -23,7 +28,8 @@ function layaRefuses(b) {
   return null;
 }
 
-test('every synthetic case becomes exactly one production request; none is caught earlier by a rule', async () => {
+test('every synthetic case becomes exactly one production request; none is caught earlier by a rule', { skip: skipWasm }, async () => {
+  ran++;
   const { records: rows, skipped } = await records();
   assert.deepEqual(skipped, [], 'a tool-gate rule or a sensitivity pre-rule answered without the decision service');
   const { rows: cases } = loadCases();
@@ -32,14 +38,16 @@ test('every synthetic case becomes exactly one production request; none is caugh
   assert.equal(new Set(base.map((r) => r.id)).size, base.length);
 });
 
-test('every request is one the live decision service accepts, and its label is one of its options', async () => {
+test('every request is one the live decision service accepts, and its label is one of its options', { skip: skipWasm }, async () => {
+  ran++;
   for (const r of (await records()).records) {
     assert.equal(layaRefuses(r.body), null, `${r.id}/${r.variant}: ${layaRefuses(r.body)}`);
     assert.ok(r.body.options.some((o) => o.id === r.label), `${r.id}: label ${r.label} not offered`);
   }
 });
 
-test('coverage: about 750 labelled cases in the nine UI languages, every purpose in English', async () => {
+test('coverage: about 750 labelled cases in the nine UI languages, every purpose in English', { skip: skipWasm }, async () => {
+  ran++;
   const main = (await records()).records.filter((r) => r.variant === 'base');
   assert.ok(main.length >= 700, `${main.length} cases`);
   assert.deepEqual([...new Set(main.map((r) => r.lang))].sort(), [...LANGS].sort());
@@ -61,7 +69,8 @@ test('coverage: about 750 labelled cases in the nine UI languages, every purpose
   }
 });
 
-test('the captured bodies are the production ones: router roles, sensitivity options, tool-gate read tools only', async () => {
+test('the captured bodies are the production ones: router roles, sensitivity options, tool-gate read tools only', { skip: skipWasm }, async () => {
+  ran++;
   const rows = (await records()).records;
   const route = rows.find((r) => r.purpose === 'model.route' && r.variant === 'base');
   assert.deepEqual(route.body.options.map((o) => o.id), ['fast', 'smart', 'code']);
@@ -78,7 +87,8 @@ test('the captured bodies are the production ones: router roles, sensitivity opt
   assert.deepEqual(Object.keys(JSON.parse(advice.body.state)), ['engineError']);
 });
 
-test('order-flip variants are rotations of the base request on a fixed set of English items', async () => {
+test('order-flip variants are rotations of the base request on a fixed set of English items', { skip: skipWasm }, async () => {
+  ran++;
   const rows = (await records()).records;
   const perm1 = rows.filter((r) => r.variant === 'perm1');
   assert.equal(perm1.length, PERMUTED_ITEMS);
@@ -92,7 +102,8 @@ test('order-flip variants are rotations of the base request on a fixed set of En
   assert.deepEqual(rotate([1, 2, 3], 2), [3, 1, 2]);
 });
 
-test('the smoke subset is stratified and stable', async () => {
+test('the smoke subset is stratified and stable', { skip: skipWasm }, async () => {
+  ran++;
   const rows = (await records()).records;
   const a = smokeSubset(rows, 20), b = smokeSubset(rows, 20);
   assert.deepEqual(a.map((r) => r.id), b.map((r) => r.id));
@@ -113,7 +124,8 @@ test('loadCases refuses a label outside the purpose and an unknown language', ()
   assert.throws(() => loadCases(dir), /unknown language xx/);
 });
 
-test('#1647: the capture identity is qualified only inside this harness; the shipped production check still asks nothing', async () => {
+test('#1647: the capture identity is qualified only inside this harness; the shipped production check still asks nothing', { skip: skipWasm }, async () => {
+  ran++;
   const { createCallers } = require('./build-requests.cjs');
   const callers = createCallers(); // installs the capture backend and the permissive checks
   const harness = await callers.sensitivity('Synthetic: how do widgets work?');
@@ -136,7 +148,8 @@ const ROUTE_OPTIONS = [
   { id: 'smart', label: 'Explaining, comparing, planning, reasoning or writing more than a sentence' },
   { id: 'code', label: 'Anything involving programming code, regex, errors or software' }];
 
-test('#1739: by default the harness captures the main-branch (Laya) wording, byte for byte', async () => {
+test('#1739: by default the harness captures the main-branch (Laya) wording, byte for byte', { skip: skipWasm }, async () => {
+  ran++;
   const rows = (await records()).records;
   const base = (purpose) => rows.filter((r) => r.purpose === purpose && r.variant === 'base');
   for (const r of base('tool.gate')) assert.equal(r.body.question, 'Which tool, if any, must the assistant call before answering this user message?', r.id);
@@ -152,7 +165,8 @@ test('#1739: by default the harness captures the main-branch (Laya) wording, byt
   }
 });
 
-test('#1639: --wording kev captures the wording tuned for Kev-0.8B; the other purposes are the same for both', async () => {
+test('#1639: --wording kev captures the wording tuned for Kev-0.8B; the other purposes are the same for both', { skip: skipWasm }, async () => {
+  ran++;
   const laya = (await records()).records, kev = (await kevRecords()).records;
   assert.equal(kev.length, laya.length);
   const base = (rows, purpose) => rows.filter((r) => r.purpose === purpose && r.variant === 'base');
@@ -191,3 +205,5 @@ test('#1639: --wording kev captures the wording tuned for Kev-0.8B; the other pu
   for (const r of base(kev, 'chat.frame.kind')) assert.equal(r.body.question, 'What kind of chat does this first message start?');
   await assert.rejects(buildRequests(undefined, { wording: 'kev-0.8b' }), /unknown wording/);
 });
+
+test.after(() => { if (!skipWasm) assert.equal(ran, 9, 'a wasm-guarded test body did not run'); });

@@ -1,11 +1,15 @@
 'use strict';
+const skipWasm = !require('node:fs').existsSync(process.env.DAV_PARSE_WASM || require('./dav-parse-wasm.cjs').DEFAULT_WASM) && process.env.DAV_PARSE_WASM_REQUIRED !== '1' && 'dav-parse.wasm not built';
+// Guards a wrong test signature (options passed twice makes node:test take the second object as the body, so the body never runs and the
+// test reports ok): when the module is there, every guarded body must have run.
+let ran = 0;
 // #1639 / #1739 / #1740: the tool gate's wording follows the decision model behind the service
 // (decision-models.cjs). Laya, and any unknown or unconfigured model, gets exactly the request every
 // release before #1639 sent; Kev-0.8B gets the question tuned for it, with the choice budget lowered by
-// that question's extra characters. TOOL_GATE_IMPL=wasm (live) compares the shaped options with the
-// Rust port, which counts the question as 79 characters (noevia-rs crates/tool-gate QUESTION.len()); the
-// gate gives both sides the same lowered limits, so they still agree (tests/server/tool-gate-differential
-// runs both wordings through the port itself).
+// that question's extra characters. The Rust port shapes the options (TOOL_GATE_IMPL, retired in #1071),
+// and counts the question as 79 characters (noevia-rs crates/tool-gate QUESTION.len()); the gate gives it the
+// lowered limits for the longer question (tests/server/tool-gate-differential runs both wordings against the
+// frozen JS shaping).
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const tg = require('./tool-gate.cjs');
@@ -35,12 +39,26 @@ const TOOLS = [
   tool('diary_read_month', "Read the user's own diary entries for a month."),
   tool('nc_webdav_search_files', "Find the user's own stored files and documents."),
 ];
-const offered = new Map(TOOLS.map((t) => [t.function.name, t]));
-const readOnly = () => true;
+// What the former JS shaping (shapeOptions, frozen in tests/fixtures/tool-gate-js.v1.json) gave for a frame hint:
+// Laya with the question's real length as the budget, Kev with 79 + hint in a choice budget lowered by 40.
+const LAYA_HINT_OPTIONS = [
+  { id: 'tavily_search', label: 'Search the web for current facts a' },
+  { id: 'tavily_extract', label: 'Read the text of a web page from i' },
+  { id: 'diary_read_month', label: "Read the user's own diary entries " },
+  { id: 'nc_webdav_search_files', label: "Find the user's own stored files a" },
+  { id: 'none', label: 'No tool: answer directly' },
+];
+const KEV_HINT_OPTIONS = [
+  { id: 'tavily_search', label: 'Search the web for curre' },
+  { id: 'tavily_extract', label: 'Read the text of a web p' },
+  { id: 'diary_read_month', label: "Read the user's own diar" },
+  { id: 'nc_webdav_search_files', label: "Find the user's own stor" },
+  { id: 'none', label: 'No tool: answer directly' },
+];
 
 async function sent(wording, bias) {
   const asked = [];
-  const gate = tg.createToolGate({ enabled: () => true, isWriteTool: () => false, limits: () => SERVICE_LIMITS, env: {},
+  const gate = tg.createToolGate({ enabled: () => true, isWriteTool: () => false, limits: () => SERVICE_LIMITS,
     ...(wording === undefined ? {} : { wording }),
     decide: async (req) => { asked.push(req); return { selected: 'none', scores: { none: 1 }, source: 'configured' }; } });
   await gate.evaluate('Synthetic: who won the match last night?', TOOLS, bias);
@@ -48,7 +66,8 @@ async function sent(wording, bias) {
   return asked[0];
 }
 
-test('Laya gets the main-branch request byte for byte, by default and by name (#1739)', async () => {
+test('Laya gets the main-branch request byte for byte, by default and by name (#1739)', { skip: skipWasm }, async () => {
+  ran++;
   for (const wording of [undefined, 'laya', () => 'laya']) {
     const req = await sent(wording);
     assert.deepEqual({ purpose: req.purpose, question: req.question, options: req.options },
@@ -59,7 +78,8 @@ test('Laya gets the main-branch request byte for byte, by default and by name (#
   assert.equal(tg.questionFor('laya'), LAYA_QUESTION);
 });
 
-test('an unknown, empty or throwing wording falls back to the Laya request', async () => {
+test('an unknown, empty or throwing wording falls back to the Laya request', { skip: skipWasm }, async () => {
+  ran++;
   for (const wording of ['kev-0.8b', 'KEV', '', null, () => 'other', () => { throw Error('settings gone'); }]) {
     const req = await sent(wording);
     assert.equal(req.question, LAYA_QUESTION, String(wording));
@@ -67,7 +87,8 @@ test('an unknown, empty or throwing wording falls back to the Laya request', asy
   }
 });
 
-test('Kev gets the tuned question and the lowered budget: labels cut to 34 for this tool set', async () => {
+test('Kev gets the tuned question and the lowered budget: labels cut to 34 for this tool set', { skip: skipWasm }, async () => {
+  ran++;
   for (const wording of ['kev', () => 'kev']) {
     const req = await sent(wording);
     assert.equal(req.question, KEV_QUESTION);
@@ -78,16 +99,17 @@ test('Kev gets the tuned question and the lowered budget: labels cut to 34 for t
   assert.doesNotMatch(KEV_QUESTION, /\bmust\b/, '"must" made Kev-0.8B answer none (#1639)');
 });
 
-test('a frame hint is appended to either question and counted in the budget the same way', async () => {
+test('a frame hint is appended to either question and counted in the budget the same way', { skip: skipWasm }, async () => {
+  ran++;
   const bias = { prefer: ['search'], hint: 'The user framed this chat as a lookup.' };
   const laya = await sent('laya', bias);
   const kev = await sent('kev', bias);
   assert.equal(laya.question, `${LAYA_QUESTION} ${bias.hint}`);
   assert.equal(kev.question, `${KEV_QUESTION} ${bias.hint}`);
   // Laya: shaped exactly as main shaped it, with the question's real length as the budget.
-  assert.deepEqual(laya.options, tg.shapeOptions([...offered.values()], SERVICE_LIMITS, tg.DEFAULT_BOXES, laya.question.length, tg.DEFAULT_BOXES.search).options);
+  assert.deepEqual(laya.options, LAYA_HINT_OPTIONS);
   // Kev: 79 + hint, in a choice budget lowered by 40 (what the port counts given the same limits).
-  assert.deepEqual(kev.options, tg.shapeOptions([...offered.values()], tg.budgetLimits(SERVICE_LIMITS), tg.DEFAULT_BOXES, 79 + 1 + bias.hint.length, tg.DEFAULT_BOXES.search).options);
+  assert.deepEqual(kev.options, KEV_HINT_OPTIONS);
 });
 
 test('budgetLimits: the 40-character cut only for the Kev question, whatever maxOptions is (#1740 D3)', () => {
@@ -107,13 +129,14 @@ test('budgetLimits: the 40-character cut only for the Kev question, whatever max
   assert.equal(SERVICE_LIMITS.maxChoiceChars, 360, 'the service limit itself is unchanged');
 });
 
-test('question plus options stay within the service choice budget for both wordings, with 12 long tools and a long hint', async () => {
+test('question plus options stay within the service choice budget for both wordings, with 12 long tools and a long hint', { skip: skipWasm }, async () => {
+  ran++;
   const long = (name) => tool(name, `${name} reads synthetic data. `.repeat(12));
   const many = [...Array.from({ length: 10 }, (_, i) => long(`synthetic_reader_${i}`)), long('Web-Fetch'), long('tavily_search')];
   for (const wording of ['laya', 'kev']) {
     for (const bias of [undefined, { prefer: ['search'], hint: 'h'.repeat(300) }]) {
       const asked = [];
-      const gate = tg.createToolGate({ enabled: () => true, isWriteTool: () => false, limits: () => SERVICE_LIMITS, env: {}, wording,
+      const gate = tg.createToolGate({ enabled: () => true, isWriteTool: () => false, limits: () => SERVICE_LIMITS, wording,
         decide: async (req) => { asked.push(req); return { selected: 'none', scores: { none: 1 }, source: 'configured' }; } });
       await gate.evaluate('Please take care of the synthetic thing', many, bias);
       const req = asked[0];
@@ -123,3 +146,5 @@ test('question plus options stay within the service choice budget for both wordi
     }
   }
 });
+
+test.after(() => { if (!skipWasm) assert.equal(ran, 5, 'a wasm-guarded test body did not run'); });

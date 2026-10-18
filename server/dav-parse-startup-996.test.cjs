@@ -18,7 +18,7 @@ const wasmFile = process.env.DAV_PARSE_WASM || davParseWasm.DEFAULT_WASM;
 const skipWasm = !fs.existsSync(wasmFile) && process.env.DAV_PARSE_WASM_REQUIRED !== '1' && 'dav-parse.wasm not built';
 
 test('wasmFlags lists exactly the switches set to wasm, read as the switches read them', () => {
-  assert.deepEqual(davParseWasm.IMPL_FLAGS, ['STORAGE_PATH_IMPL', 'SECRET_ENVELOPE_IMPL', 'STREAM_GUARD_IMPL', 'ROLE_CONTEXT_IMPL', 'TOOL_GATE_IMPL', 'TOOLBOXES_PERMITTED_IMPL', 'LLAMACPP_PRESETS_IMPL']);
+  assert.deepEqual(davParseWasm.IMPL_FLAGS, ['STORAGE_PATH_IMPL', 'SECRET_ENVELOPE_IMPL', 'STREAM_GUARD_IMPL', 'ROLE_CONTEXT_IMPL', 'TOOLBOXES_PERMITTED_IMPL', 'LLAMACPP_PRESETS_IMPL']);
   assert.deepEqual(davParseWasm.wasmFlags({}), []);
   assert.deepEqual(davParseWasm.wasmFlags({ STORAGE_PATH_IMPL: 'js', ROLE_CONTEXT_IMPL: 'rust', STREAM_GUARD_IMPL: '' }), []);
   assert.deepEqual(davParseWasm.wasmFlags({ SECRET_ENVELOPE_IMPL: ' WASM ', STORAGE_PATH_IMPL: 'wasm' }), ['STORAGE_PATH_IMPL', 'SECRET_ENVELOPE_IMPL']);
@@ -42,7 +42,7 @@ test('with no switch set and the pinned module, startup verifies it and names no
 });
 
 test('retired switches: only a value other than the old Rust one warns, once per switch', () => {
-  assert.deepEqual(Object.keys(davParseWasm.RETIRED_FLAGS), ['CHAT_TEMPLATE_CAPS_IMPL', 'AUTOTUNE_PLAN_IMPL', 'PRESET_RELOAD_IMPL', 'LAYA_LOAD_ADVISOR', 'DAV_PARSE_IMPL', 'S3_PARSE_IMPL', 'MCP_FRAME_IMPL', 'UPLOAD_SNIFF_IMPL', 'S3_SIGN_IMPL', 'PROMPT_FRAMING_IMPL', 'SSRF_IMPL', 'POLICY_LEAVES_IMPL', 'CODE_REVIEW_VERDICT_IMPL', 'TOOL_EXCHANGE_IMPL', 'DECISION_IMPL', 'COMPLETENESS_REPORT_IMPL', 'TASK_LIFECYCLE_IMPL', 'MCP_SERVERS_IMPL', 'CODE_NET_GUARD_IMPL', 'LLAMACPP_AUTOCONFIG_IMPL', 'GGUF_META_IMPL', 'PROJECT_FILE_NAMES_IMPL', 'PROVIDER_EGRESS_IMPL', 'BROWSER_POLICY_IMPL', 'CODE_ACTIONS_IMPL']);
+  assert.deepEqual(Object.keys(davParseWasm.RETIRED_FLAGS), ['CHAT_TEMPLATE_CAPS_IMPL', 'AUTOTUNE_PLAN_IMPL', 'PRESET_RELOAD_IMPL', 'LAYA_LOAD_ADVISOR', 'DAV_PARSE_IMPL', 'S3_PARSE_IMPL', 'MCP_FRAME_IMPL', 'UPLOAD_SNIFF_IMPL', 'S3_SIGN_IMPL', 'PROMPT_FRAMING_IMPL', 'SSRF_IMPL', 'POLICY_LEAVES_IMPL', 'CODE_REVIEW_VERDICT_IMPL', 'TOOL_EXCHANGE_IMPL', 'DECISION_IMPL', 'COMPLETENESS_REPORT_IMPL', 'TASK_LIFECYCLE_IMPL', 'MCP_SERVERS_IMPL', 'CODE_NET_GUARD_IMPL', 'LLAMACPP_AUTOCONFIG_IMPL', 'GGUF_META_IMPL', 'PROJECT_FILE_NAMES_IMPL', 'PROVIDER_EGRESS_IMPL', 'BROWSER_POLICY_IMPL', 'CODE_ACTIONS_IMPL', 'TOOL_GATE_IMPL']);
   const warnings = [];
   const log = { warn: (m) => warnings.push(m) };
   assert.deepEqual(davParseWasm.warnRetiredFlags({}, log), []);
@@ -70,7 +70,7 @@ test('the nine switches retired in #1071 batch 3: =wasm is silent, anything else
   assert.deepEqual(warnings, batch3.map((f) => `${f} is retired; Rust is always used`));
   assert.deepEqual(davParseWasm.wasmFlags(Object.fromEntries(batch3.map((f) => [f, 'wasm']))), []);
   // The switches left are exactly the ones this batch did not touch.
-  assert.deepEqual(davParseWasm.IMPL_FLAGS, ['STORAGE_PATH_IMPL', 'SECRET_ENVELOPE_IMPL', 'STREAM_GUARD_IMPL', 'ROLE_CONTEXT_IMPL', 'TOOL_GATE_IMPL', 'TOOLBOXES_PERMITTED_IMPL', 'LLAMACPP_PRESETS_IMPL']);
+  assert.deepEqual(davParseWasm.IMPL_FLAGS, ['STORAGE_PATH_IMPL', 'SECRET_ENVELOPE_IMPL', 'STREAM_GUARD_IMPL', 'ROLE_CONTEXT_IMPL', 'TOOLBOXES_PERMITTED_IMPL', 'LLAMACPP_PRESETS_IMPL']);
 });
 
 test('GGUF_META_IMPL, retired in #1071: =wasm is silent, anything else warns once, it never selects the module', () => {
@@ -139,6 +139,19 @@ test('CODE_ACTIONS_IMPL, retired in #1071: =wasm is silent, anything else warns 
   assert.deepEqual(davParseWasm.wasmFlags({ CODE_ACTIONS_IMPL: 'wasm' }), []);
 });
 
+test('TOOL_GATE_IMPL, retired in #1071: =wasm is silent, anything else warns once, it never selects the module', () => {
+  assert.equal(davParseWasm.RETIRED_FLAGS.TOOL_GATE_IMPL, 'wasm');
+  assert.ok(!davParseWasm.IMPL_FLAGS.includes('TOOL_GATE_IMPL'));
+  const warnings = [];
+  const log = { warn: (m) => warnings.push(m) };
+  assert.deepEqual(davParseWasm.warnRetiredFlags({ TOOL_GATE_IMPL: ' WASM ' }, log), []);
+  assert.deepEqual(davParseWasm.warnRetiredFlags({ TOOL_GATE_IMPL: '' }, log), []);
+  assert.deepEqual(warnings, []);
+  assert.deepEqual(davParseWasm.warnRetiredFlags({ TOOL_GATE_IMPL: 'js' }, log), ['TOOL_GATE_IMPL']);
+  assert.deepEqual(warnings, ['TOOL_GATE_IMPL is retired; Rust is always used']);
+  assert.deepEqual(davParseWasm.wasmFlags({ TOOL_GATE_IMPL: 'wasm' }), []);
+});
+
 test('a wasm switch with a missing or tampered module throws, naming the switch and the reason', (t) => {
   const tampered = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'startup-996-')), 'dav-parse.wasm');
   t.after(() => fs.rmSync(path.dirname(tampered), { recursive: true, force: true }));
@@ -193,7 +206,7 @@ test('index.cjs refuses to start without the module even with every retired swit
     env: { ...process.env, UI_DATA_DIR: dataDir, PORT: '0', HOST: '127.0.0.1', PUBLIC_ORIGIN: 'http://localhost', DIARY_AUTH_TOKEN: 'test-cowork-token', DAV_PARSE_WASM: MISSING,
       DAV_PARSE_IMPL: 'js', S3_PARSE_IMPL: 'js', CHAT_TEMPLATE_CAPS_IMPL: 'off', AUTOTUNE_PLAN_IMPL: 'js', PRESET_RELOAD_IMPL: 'off', LAYA_LOAD_ADVISOR: 'off',
       MCP_FRAME_IMPL: 'js', UPLOAD_SNIFF_IMPL: 'js', S3_SIGN_IMPL: 'js', PROMPT_FRAMING_IMPL: 'js', SSRF_IMPL: 'js',
-      POLICY_LEAVES_IMPL: 'js', CODE_REVIEW_VERDICT_IMPL: 'js', TOOL_EXCHANGE_IMPL: 'js', DECISION_IMPL: 'js', COMPLETENESS_REPORT_IMPL: 'js', TASK_LIFECYCLE_IMPL: 'js', MCP_SERVERS_IMPL: 'js', CODE_NET_GUARD_IMPL: 'js', LLAMACPP_AUTOCONFIG_IMPL: 'js', GGUF_META_IMPL: 'js', PROJECT_FILE_NAMES_IMPL: 'js', PROVIDER_EGRESS_IMPL: 'js', BROWSER_POLICY_IMPL: 'js', CODE_ACTIONS_IMPL: 'js' },
+      POLICY_LEAVES_IMPL: 'js', CODE_REVIEW_VERDICT_IMPL: 'js', TOOL_EXCHANGE_IMPL: 'js', DECISION_IMPL: 'js', COMPLETENESS_REPORT_IMPL: 'js', TASK_LIFECYCLE_IMPL: 'js', MCP_SERVERS_IMPL: 'js', CODE_NET_GUARD_IMPL: 'js', LLAMACPP_AUTOCONFIG_IMPL: 'js', GGUF_META_IMPL: 'js', PROJECT_FILE_NAMES_IMPL: 'js', PROVIDER_EGRESS_IMPL: 'js', BROWSER_POLICY_IMPL: 'js', CODE_ACTIONS_IMPL: 'js', TOOL_GATE_IMPL: 'js' },
     encoding: 'utf8', timeout: 60000,
   });
   assert.equal(r.status, 1, `exit ${r.status} signal ${r.signal}\n${r.stderr.slice(-2000)}`);
@@ -211,7 +224,7 @@ test('index.cjs starts with the pinned module and every retired switch left at j
       NOEVIA_PROJECT_STORE_PORT: '9', NOEVIA_PROJECT_STORE_TOKEN: 'synthetic-store-token-'.padEnd(64, 'x'), NOEVIA_RUST_PROJECTS: '0',
       DAV_PARSE_IMPL: 'js', S3_PARSE_IMPL: 'js', CHAT_TEMPLATE_CAPS_IMPL: 'off', AUTOTUNE_PLAN_IMPL: 'js', PRESET_RELOAD_IMPL: 'off', LAYA_LOAD_ADVISOR: 'off',
       MCP_FRAME_IMPL: 'js', UPLOAD_SNIFF_IMPL: 'js', S3_SIGN_IMPL: 'js', PROMPT_FRAMING_IMPL: 'js', SSRF_IMPL: 'js',
-      POLICY_LEAVES_IMPL: 'js', CODE_REVIEW_VERDICT_IMPL: 'js', TOOL_EXCHANGE_IMPL: 'js', DECISION_IMPL: 'js', COMPLETENESS_REPORT_IMPL: 'js', TASK_LIFECYCLE_IMPL: 'js', MCP_SERVERS_IMPL: 'js', CODE_NET_GUARD_IMPL: 'js', LLAMACPP_AUTOCONFIG_IMPL: 'js', GGUF_META_IMPL: 'js', PROJECT_FILE_NAMES_IMPL: 'js', PROVIDER_EGRESS_IMPL: 'js', BROWSER_POLICY_IMPL: 'js', CODE_ACTIONS_IMPL: 'js' },
+      POLICY_LEAVES_IMPL: 'js', CODE_REVIEW_VERDICT_IMPL: 'js', TOOL_EXCHANGE_IMPL: 'js', DECISION_IMPL: 'js', COMPLETENESS_REPORT_IMPL: 'js', TASK_LIFECYCLE_IMPL: 'js', MCP_SERVERS_IMPL: 'js', CODE_NET_GUARD_IMPL: 'js', LLAMACPP_AUTOCONFIG_IMPL: 'js', GGUF_META_IMPL: 'js', PROJECT_FILE_NAMES_IMPL: 'js', PROVIDER_EGRESS_IMPL: 'js', BROWSER_POLICY_IMPL: 'js', CODE_ACTIONS_IMPL: 'js', TOOL_GATE_IMPL: 'js' },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   t.after(() => child.kill('SIGKILL'));

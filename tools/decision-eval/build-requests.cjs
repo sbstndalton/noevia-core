@@ -7,7 +7,10 @@
 //
 // The decision layer's request/result checks live in dav-parse.wasm, which a plain checkout does
 // not have; they validate, they do not shape the body. For capturing only, they are replaced by
-// permissive ones (permissiveDecisionChecks), in this process only.
+// permissive ones (permissiveDecisionChecks), in this process only. The tool gate's rules and option
+// shaping live in the same module and do shape the body (since #1071 there is no JS copy), so those
+// stay the real ones: capturing the tool-gate requests needs dav-parse.wasm (server/wasm or
+// DAV_PARSE_WASM), and says so when it is missing.
 //
 // The wording is per decision model (server/decision-models.cjs): --wording laya (default; what
 // production sends to Laya or an unknown model) or kev (Kev-0.8B's). The bodies are always in our
@@ -48,10 +51,12 @@ const CAPTURE_QUALIFIED = Object.freeze([Object.freeze({ ...CAPTURE_IDENTITY,
 
 function permissiveDecisionChecks() {
   const file = require.resolve(path.join(SERVER, 'dav-parse-wasm.cjs'));
+  const real = require(file); // loads no module bytes until a function that needs them is called
   const stub = new Module(file);
   stub.filename = file;
   stub.loaded = true;
-  stub.exports = { decisionInvalidRequest: () => null, decisionInvalidResult: () => null, decisionCauseOf: () => 'exception' };
+  stub.exports = { decisionInvalidRequest: () => null, decisionInvalidResult: () => null, decisionCauseOf: () => 'exception',
+    toolGateRule: real.toolGateRule, toolGateOptions: real.toolGateOptions, toolGateAnswer: real.toolGateAnswer, toolGateQueries: real.toolGateQueries };
   require.cache[file] = stub;
 }
 
@@ -129,11 +134,17 @@ function createCallers({ wording = 'laya' } = {}) {
       { chunkChars: rm.chunkCharsFor(backend), maxChunks: 1 }))),
     preRule: (message) => rm.preRule(message),
     toolGate: (message, tools, writeTools) => {
+      const logs = [];
       const gate = require(path.join(SERVER, 'tool-gate.cjs')).createToolGate({
-        enabled: () => true, isWriteTool: (n) => writeTools.has(n), deadlineMs: () => 2000, env: {}, warn: () => {},
-        limits: () => backend.limits, unavailable: () => null, decide: (r) => gateLayer.decide(r), log: () => {}, wording,
+        enabled: () => true, isWriteTool: (n) => writeTools.has(n), deadlineMs: () => 2000, warn: () => {},
+        limits: () => backend.limits, unavailable: () => null, decide: (r) => gateLayer.decide(r), log: (e) => logs.push(e), wording,
       });
-      return one(() => gate.evaluate(message, tools));
+      return one(async () => {
+        const out = await gate.evaluate(message, tools);
+        // The gate forces nothing when its Rust port cannot answer; a capture of that would silently lose the case.
+        if (logs.some((e) => e.reason === 'impl-fault')) throw Error('the tool gate could not run: it needs dav-parse.wasm (server/wasm/dav-parse.wasm or DAV_PARSE_WASM)');
+        return out;
+      });
     },
     supervise: (goal, outputs) => one(() => supervision.decide({ round: 0, goal, messages: [{ role: 'user', content: goal }, ...outputs] })),
     frameKind: (message) => one(() => framing.suggest({ message, projects: [], chats: [] })),

@@ -1,9 +1,14 @@
 'use strict';
+const skipWasm = !require('node:fs').existsSync(process.env.DAV_PARSE_WASM || require('./dav-parse-wasm.cjs').DEFAULT_WASM) && process.env.DAV_PARSE_WASM_REQUIRED !== '1' && 'dav-parse.wasm not built';
+// Guards a wrong test signature (options passed twice makes node:test take the second object as the body, so the body never runs and the
+// test reports ok): when the module is there, every guarded body must have run.
+let ran = 0;
 // Tool gate decisions (tool-gate.cjs). Synthetic messages and tools; the decision service is a
 // fake decide() function. No network, no model.
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { createToolGate, searchQuery, diaryMonth } = require('./tool-gate.cjs');
+const { createToolGate } = require('./tool-gate.cjs');
+const davParseWasm = require('./dav-parse-wasm.cjs');
 
 const fn = (name, properties = {}, required = [], description = '') => ({ type: 'function', function: { name, description, parameters: { type: 'object', properties, required } } });
 const TOOLS = {
@@ -25,7 +30,8 @@ function gate({ enabled = true, decide = async () => { throw Error('decide shoul
 }
 const all = Object.values(TOOLS);
 
-test('rules: URL, search, diary date and drive map to offered tools with prefetch or require', async () => {
+test('rules: URL, search, diary date and drive map to offered tools with prefetch or require', { skip: skipWasm }, async () => {
+  ran++;
   const { g } = gate();
   let r = await g.evaluate('Summarise https://example.invalid/post?id=1.', all);
   assert.deepEqual(r.decision, { tool: 'tavily_extract', args: { urls: ['https://example.invalid/post?id=1'] }, mode: 'prefetch' });
@@ -41,7 +47,8 @@ test('rules: URL, search, diary date and drive map to offered tools with prefetc
   assert.deepEqual(r.decision, { tool: 'nc_webdav_search_files', mode: 'require' });
 });
 
-test('rules: a tool that is not offered is ignored, and the next offered candidate is used', async () => {
+test('rules: a tool that is not offered is ignored, and the next offered candidate is used', { skip: skipWasm }, async () => {
+  ran++;
   const { g } = gate({ decide: async () => ({ selected: 'none', scores: { none: 1 }, source: 'configured' }) });
   // URL rule with no fetch tool offered: falls to Stage 2, which says none.
   let r = await g.evaluate('Read https://example.invalid/a', [TOOLS.time]);
@@ -54,7 +61,8 @@ test('rules: a tool that is not offered is ignored, and the next offered candida
   assert.deepEqual(r.decision, { tool: 'diary_read_month', mode: 'require' });
 });
 
-test('write tools are never gated, by rule or by the decision service', async () => {
+test('write tools are never gated, by rule or by the decision service', { skip: skipWasm }, async () => {
+  ran++;
   const boxesWrite = createToolGate({ enabled: () => true, isWriteTool: () => true, boxes: { drive: ['nc_webdav_write_file'] },
     decide: async () => ({ selected: 'nc_webdav_write_file', scores: { nc_webdav_write_file: 1 }, source: 'configured' }), log() {} });
   let r = await boxesWrite.evaluate('Save this to my Nextcloud folder', [TOOLS.write]);
@@ -64,7 +72,8 @@ test('write tools are never gated, by rule or by the decision service', async ()
   assert.equal(r.decision, 'none');
 });
 
-test('Stage 2: labels are the offered read-only tools plus none, temperature 0; accepted only above the bound', async () => {
+test('Stage 2: labels are the offered read-only tools plus none, temperature 0; accepted only above the bound', { skip: skipWasm }, async () => {
+  ran++;
   let seen = null;
   const decide = async (request) => { seen = request; return { selected: 'core_time', scores: { core_time: 0.8, none: 0.2 }, confidence: 0.8, source: 'configured', metadata: {} }; };
   const { g, logs } = gate({ decide });
@@ -89,7 +98,8 @@ test('Stage 2: labels are the offered read-only tools plus none, temperature 0; 
   assert.equal(fell.logs.at(-1).reason, 'no-backend-answered');
 });
 
-test('fail-open: a throwing or hanging decision service gives none and never throws', async () => {
+test('fail-open: a throwing or hanging decision service gives none and never throws', { skip: skipWasm }, async () => {
+  ran++;
   const thrown = gate({ decide: async () => { throw Error('synthetic outage'); } });
   let r = await thrown.g.evaluate('How long until the synthetic meeting?', [TOOLS.time]);
   assert.equal(r.decision, 'none'); assert.equal(thrown.logs.at(-1).reason, 'error');
@@ -107,7 +117,8 @@ test('off: the gate does nothing, calls nothing and logs nothing', async () => {
   assert.equal(logs.length, 0);
 });
 
-test('every decision is logged text-free: tool names, source, mode, confidence; never the message', async () => {
+test('every decision is logged text-free: tool names, source, mode, confidence; never the message', { skip: skipWasm }, async () => {
+  ran++;
   const { g, logs } = gate();
   await g.evaluate('Search the synthetic-secret-phrase news', all);
   g.record('gate.miss', { tool: 'tavily_search' });
@@ -118,13 +129,14 @@ test('every decision is logged text-free: tool names, source, mode, confidence; 
   assert.equal(JSON.stringify(logs).includes('synthetic-secret-phrase'), false);
 });
 
-test('helpers: query stripping and diary months', () => {
-  assert.equal(searchQuery('Please look up the weather in Synthville today?'), 'the weather in Synthville today');
-  assert.equal(diaryMonth('on 3 March 2025', () => NOW), '2025-03');
-  assert.equal(diaryMonth('nothing dated here', () => NOW), null);
+test('helpers: query stripping and diary months', { skip: skipWasm }, () => {
+  ran++;
+  assert.deepEqual(davParseWasm.toolGateQueries(['Please look up the weather in Synthville today?']).queries, ['the weather in Synthville today']);
+  assert.deepEqual(davParseWasm.toolGateMonths(['on 3 March 2025', 'nothing dated here'], NOW).months, ['2025-03', null]);
 });
 
-test('search prefetch only for a short single-line message; long, multi-line or quoted text is require', async () => {
+test('search prefetch only for a short single-line message; long, multi-line or quoted text is require', { skip: skipWasm }, async () => {
+  ran++;
   const { g } = gate();
   const short = await g.evaluate('latest news on synthetic widgets', all);
   assert.deepEqual(short.decision, { tool: 'tavily_search', args: { query: 'latest news on synthetic widgets' }, mode: 'prefetch' });
@@ -135,14 +147,16 @@ test('search prefetch only for a short single-line message; long, multi-line or 
   assert.deepEqual((await g.evaluate('> quoted latest news', all)).decision, { tool: 'tavily_search', mode: 'require' });
 });
 
-test('Stage 2 never prefetches a search, even for a short message', async () => {
+test('Stage 2 never prefetches a search, even for a short message', { skip: skipWasm }, async () => {
+  ran++;
   const { g } = gate({ decide: async () => ({ selected: 'tavily_search', scores: { tavily_search: 0.9, none: 0.1 }, source: 'configured' }) });
   const r = await g.evaluate('synthetic widgets', [TOOLS.search]);
   assert.deepEqual(r.decision, { tool: 'tavily_search', mode: 'require' });
   assert.equal(r.source, 'decision');
 });
 
-test('URL prefetch only for public http(s) hosts; private, loopback, link-local, .local and other schemes are require', async () => {
+test('URL prefetch only for public http(s) hosts; private, loopback, link-local, .local and other schemes are require', { skip: skipWasm }, async () => {
+  ran++;
   const { g } = gate({ decide: async () => ({ selected: 'none', scores: { none: 1 }, source: 'configured' }) });
   for (const url of ['http://10.69.0.130/x', 'http://localhost:3000', 'http://169.254.1.1', 'http://foo.local', 'http://127.0.0.1/a', 'http://[::1]/a', 'http://192.168.1.4', 'http://laya:8040/', 'http://user:pw@example.invalid/']) {
     const r = await g.evaluate(`Summarise ${url}`, [TOOLS.extract]);
@@ -153,7 +167,8 @@ test('URL prefetch only for public http(s) hosts; private, loopback, link-local,
   assert.equal((await g.evaluate('Summarise https://example.com/post', [TOOLS.extract])).decision.mode, 'prefetch');
 });
 
-test('a tool name offered by two boxes is one option and one decision', async () => {
+test('a tool name offered by two boxes is one option and one decision', { skip: skipWasm }, async () => {
+  ran++;
   let seen = null;
   const { g } = gate({ decide: async (request) => { seen = request; return { selected: 'core_time', scores: { core_time: 0.9, none: 0.1 }, source: 'configured' }; } });
   const r = await g.evaluate('How long until the synthetic meeting?', [TOOLS.time, fn('core_time', {}, [], 'duplicate from another box')]);
@@ -161,7 +176,8 @@ test('a tool name offered by two boxes is one option and one decision', async ()
   assert.equal(r.decision.tool, 'core_time');
 });
 
-test('#1223: a long run of trailing punctuation after a URL is stripped in linear time', async () => {
+test('#1223: a long run of trailing punctuation after a URL is stripped in linear time', { skip: skipWasm }, async () => {
+  ran++;
   const { createToolGate } = require('./tool-gate.cjs');
   const g = createToolGate({ enabled: () => true, decide: async () => ({ source: 'fallback' }), isWriteTool: () => false, log: () => {} });
   const tools = [{ type: 'function', function: { name: 'web_fetch', parameters: { properties: { url: {} } } } }];
@@ -170,14 +186,14 @@ test('#1223: a long run of trailing punctuation after a URL is stripped in linea
   const out = await g.evaluate(message, tools);
   assert.ok(Date.now() - started < 1000, `${Date.now() - started} ms`); // loose for shared runners; was ~10 s
   assert.equal(out.decision.mode, 'prefetch');
-  assert.equal(require('./tool-gate.cjs').searchQuery(`news${'?!.'.repeat(30)}`), 'news');
+  assert.deepEqual(davParseWasm.toolGateQueries([`news${'?!.'.repeat(30)}`]).queries, ['news']);
 });
 
-test('#1224: a host with an empty label is never a public URL pattern', () => {
-  const { publicUrlPattern } = require('./tool-gate.cjs');
-  for (const u of ['http://nas.local../x', 'http://corp.internal../', 'http://10.0.0.1../x', 'http://intranet../x', 'http://a..b.com/', 'http://../']) {
-    assert.equal(publicUrlPattern(u), false, u);
-  }
-  assert.equal(publicUrlPattern('https://example.com./a'), true);
-  assert.equal(publicUrlPattern('https://example.com/a'), true);
+test('#1224: a host with an empty label is never a public URL pattern', { skip: skipWasm }, () => {
+  ran++;
+  const urls = ['http://nas.local../x', 'http://corp.internal../', 'http://10.0.0.1../x', 'http://intranet../x', 'http://a..b.com/', 'http://../'];
+  assert.deepEqual(davParseWasm.toolGatePublic(urls).public, urls.map(() => false));
+  assert.deepEqual(davParseWasm.toolGatePublic(['https://example.com./a', 'https://example.com/a']).public, [true, true]);
 });
+
+test.after(() => { if (!skipWasm) assert.equal(ran, 13, 'a wasm-guarded test body did not run'); });
