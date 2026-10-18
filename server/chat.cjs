@@ -2067,10 +2067,10 @@ function createChatHandler({
                 sawAnything = true;
                 for (const tc of delta.tool_calls) {
                   const i = typeof tc.index === 'number' ? tc.index : 0;
-                  const slot = toolCalls.get(i) || { id: `call-${i}`, name: '', args: '' };
+                  const slot = toolCalls.get(i) || { id: `call-${i}`, idMade: true, name: '', args: '' };
                   if (tc.id) {
                     if (String(tc.id).length > MAX_TOOL_ARGS_UNITS) { slot.tooLarge = true; slot.args = ''; }
-                    else slot.id = tc.id;
+                    else { slot.id = tc.id; slot.idMade = false; }
                   }
                   if (tc.function?.name && !slot.nameCut) {
                     if (slot.name.length + String(tc.function.name).length > MAX_TOOL_ARGS_UNITS) { slot.tooLarge = true; slot.nameCut = true; slot.args = ''; slot.name = shownToolName(slot.name); }
@@ -2140,7 +2140,7 @@ function createChatHandler({
               const index = toolCalls.size;
               const tooLarge = [tc.id, tc.function?.name, tc.function?.arguments].some((v) => String(v || '').length > MAX_TOOL_ARGS_UNITS);
               const callName = tooLarge ? shownToolName(tc.function?.name) : tc.function?.name || '';
-              toolCalls.set(index, { id: tooLarge || !tc.id ? `call-${index}` : tc.id, name: callName, args: tooLarge ? '' : tc.function?.arguments || '', ...(tooLarge ? { tooLarge: true } : {}) });
+              toolCalls.set(index, { id: tooLarge || !tc.id ? `call-${index}` : tc.id, idMade: tooLarge || !tc.id, name: callName, args: tooLarge ? '' : tc.function?.arguments || '', ...(tooLarge ? { tooLarge: true } : {}) });
               send({ type: 'tool', index: toolOffset + index, name: callName, args: tooLarge ? '' : require('./search-query.cjs').cleanSearchArgs(tc.function?.name || '', tc.function?.arguments || '') });
             }
           }
@@ -2194,12 +2194,24 @@ function createChatHandler({
       if (toolCalls.size > 0) {
         // #1523: a search query is the question, not the request wrapper around it.
         for (const tc of toolCalls.values()) tc.args = tc.tooLarge ? '{}' : require('./search-query.cjs').cleanSearchArgs(tc.name, tc.args);
+        // An id this server made up (the provider sent none, or one over the cap) must not equal another call's id in the
+        // same message: the results are matched back to their calls by id.
+        {
+          const used = new Set([...toolCalls.values()].filter((c) => !c.idMade).map((c) => c.id));
+          for (const [i, c] of toolCalls) {
+            if (!c.idMade) continue;
+            let id = `call-${i}`;
+            for (let k = 2; used.has(id); k++) id = `call-${i}-${k}`;
+            used.add(id);
+            c.id = id;
+          }
+        }
         if (roundContent.trim()) { send({ type: 'preamble', text: roundContent }); roundHasContent = false; }
         const assistantMsg = { role: 'assistant', content: null, tool_calls: [...toolCalls.entries()].map(([i, tc]) => ({ id: tc.id, type: 'function', function: { name: tc.name, arguments: tc.args } })) };
         roundMessages = [...roundMessages, assistantMsg];
         for (const [toolIndex, tc] of toolCalls) {
           if (chatSignal.signal.aborted) break;
-          if (tc.name === 'more_tools' && routing.narrowed) {
+          if (tc.name === 'more_tools' && routing.narrowed && !tc.tooLarge) {
             let reply = 'All of this project\'s tools are already available.';
             if (!widened) {
               widened = true;

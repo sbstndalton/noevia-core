@@ -18,12 +18,13 @@ const MIB = 1024 * 1024;
 const frame = (call) => ({ choices: [{ delta: { tool_calls: [call] } }] });
 const stream = (...frames) => ({ ok: true, body: (async function* () { for (const f of frames) yield Buffer.from('data: ' + JSON.stringify(f) + '\n\n'); })() });
 
-async function run(t, { frames, fallbackCalls = null, external = false }) {
+async function run(t, { frames, fallbackCalls = null, external = false, narrowed = false }) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'noevia-tool-args-')); t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
   const events = [], res = new EventEmitter();
   res.writeHead = () => {}; res.write = (line) => events.push(JSON.parse(line.slice(6))); res.end = () => { res.writableEnded = true; res.emit('finish'); };
   const requests = [];
   let executions = 0, executedArgs = null;
+  const audits = [];
   const fetch = async (url, init) => {
     requests.push({ url: String(url), body: JSON.parse(init.body) });
     if (requests.length === 1) return fallbackCalls ? stream() : stream(...frames); // an empty stream makes chat.cjs retry without streaming
@@ -34,14 +35,14 @@ async function run(t, { frames, fallbackCalls = null, external = false }) {
   };
   const { handleChat } = createChatHandler({
     modelManager: { enabled: true, health: async () => ({ ok: true, body: { all_models_loaded: [{ model_name: 'answer-model', loaded: true, recipe_options: { ctx_size: 32768 } }] } }) },
-    reasoningEffort: require('./reasoning-effort.cjs'), authService: { audit() {} }, crypto: require('node:crypto'), path, fs, fetch,
+    reasoningEffort: require('./reasoning-effort.cjs'), authService: { audit: (kind, _a, _b, detail) => audits.push({ kind, ...detail }) }, crypto: require('node:crypto'), path, fs, fetch,
     HISTORY_CAP: 20, DEFAULT_PROVIDER_ID: 'default', createToolExchange,
     currentWorkspace: () => ({ userId: 'synthetic-user', dir, assetDir: () => '/synthetic-only' }),
     getProject: () => ({ id: 'fixture-project', model: 'answer-model', assets: [] }),
     skillsIndexFor: () => [], getProvider: () => ({ id: 'default', baseUrl: 'http://default.invalid', ...(external ? { external: true } : {}) }), providerHeaders: () => ({}), autoRoles: () => null,
     visionDescriptions: new Map(), visionProbe: createVisionProbe({ fetchImpl: fetch }),
     chatSkillRouter: { select: async () => ({ loaded: [] }) }, oauthServerIds: () => new Set(), accountReady: () => true, mcpOAuth: { connected: () => false },
-    chatToolRouter: { select: async (ids) => ({ ids, routed: false }) }, DEFAULT_TOOLBOXES: [], CONNECTOR_BOXES: new Set(['gdrive']), connectedBoxes: () => [],
+    chatToolRouter: { select: async (ids) => (narrowed ? { ids: ['narrow'], routed: true, narrowed: true } : { ids, routed: false }) }, DEFAULT_TOOLBOXES: [], CONNECTOR_BOXES: new Set(['gdrive']), connectedBoxes: () => [],
     toolPolicy: { mode: () => 'allow' }, requestScope: { getStore: () => ({}) },
     resolveTools: () => ({ tools: [{ type: 'function', function: { name: 'synthetic_read', parameters: { type: 'object' } } }], dropped: [] }), isWriteTool: () => false,
     rag: { filesContext: async () => null }, prefill: { recordSample() {} }, reduceToolResult: (text) => ({ text: String(text) }), diaryExtras: require('./diary-extras.cjs'),
@@ -52,7 +53,7 @@ async function run(t, { frames, fallbackCalls = null, external = false }) {
     awaitApproval: async () => 'approve', stepSupervision: null,
   });
   await handleChat({}, res, { projectId: 'fixture-project', chatId: 'fixture-chat', message: 'Read it.' });
-  return { events, requests, executions, executedArgs };
+  return { events, requests, executions, executedArgs, audits };
 }
 
 const last = (r) => r.requests.at(-1).body.messages;
@@ -118,7 +119,60 @@ test('arguments under the cap still run (the bound is on size only)', async (t) 
   assert.equal(r.executedArgs.length, '{"q":"'.length + MIB + '"}'.length);
 });
 
+// An oversized call named more_tools is refused (not taken for a real more_tools request): no fake success, no widening of the tool list.
+const BIG = 'z'.repeat(8 * MIB + 1);
+function assertRefusedNotWidened(r) {
+  assert.equal(r.executions, 0);
+  const content = toolMessage(r).content;
+  // more_tools is not one of the project's tool names, so an oversized call under that name is refused as any unknown tool
+  // is (it is no longer taken for a real more_tools request).
+  assert.ok(content.includes('ERROR: '), content.slice(0, 300));
+  assert.ok(!/More tools are now available|already available/.test(content), 'no fake more_tools answer');
+  assert.ok(!r.events.some((e) => e.type === 'tools_scope' && e.text === 'all tools'), 'the tool list was not widened');
+  assert.equal(assistantCall(r).function.arguments, '{}', 'the oversized arguments are not carried');
+}
+
+test('an oversized streamed call named more_tools is refused, not widened', async (t) => {
+  const r = await run(t, { narrowed: true, frames: [frame({ index: 0, id: 'call-fixture', function: { name: 'more_tools', arguments: '' } }), ...Array.from({ length: 9 }, () => frame({ index: 0, function: { arguments: 'x'.repeat(MIB) } }))] });
+  assertRefusedNotWidened(r);
+});
+
+test('an oversized non-streamed call named more_tools is refused, not widened', async (t) => {
+  const r = await run(t, { narrowed: true, fallbackCalls: [{ id: 'call-over', function: { name: 'more_tools', arguments: BIG } }] });
+  assertRefusedNotWidened(r);
+});
+
+test('control: a normal more_tools call still widens the list', async (t) => {
+  const r = await run(t, { narrowed: true, frames: [frame({ index: 0, id: 'call-fixture', function: { name: 'more_tools', arguments: '{}' } })] });
+  assert.ok(r.events.some((e) => e.type === 'tools_scope' && e.text === 'all tools'));
+  assert.ok(toolMessage(r).content.includes('More tools are now available'));
+});
+
+// Substitute ids (the provider sent none, or one over the cap) never equal another call's id in the same message.
+test('streamed: a call whose id is over the cap does not take the id of another call', async (t) => {
+  const r = await run(t, { frames: [
+    frame({ index: 0, id: 'call-1', function: { name: 'synthetic_read', arguments: '{"q":"a"}' } }),
+    frame({ index: 1, id: 'i'.repeat(8 * MIB + 1), function: { name: 'synthetic_read', arguments: '{"q":"b"}' } })] });
+  const ids = last(r).find((m) => m.role === 'assistant' && m.tool_calls).tool_calls.map((c) => c.id);
+  assert.equal(ids.length, 2);
+  assert.equal(new Set(ids).size, 2, ids.join());
+  assert.equal(ids[0], 'call-1', 'the real id is kept');
+  const toolIds = last(r).filter((m) => m.role === 'tool').map((m) => m.tool_call_id);
+  assert.deepEqual(toolIds, ids, 'each result is matched to its call');
+});
+
+test('non-streamed: a call with no id or an over-cap id does not take the id of another call', async (t) => {
+  const r = await run(t, { fallbackCalls: [
+    { function: { name: 'synthetic_read', arguments: '{"q":"a"}' } },
+    { id: 'call-0', function: { name: 'synthetic_read', arguments: '{"q":"b"}' } },
+    { id: BIG, function: { name: 'synthetic_read', arguments: '{"q":"c"}' } }] });
+  const ids = last(r).find((m) => m.role === 'assistant' && m.tool_calls).tool_calls.map((c) => c.id);
+  assert.equal(new Set(ids).size, 3, ids.join());
+  assert.equal(ids[1], 'call-0', 'the real id is kept');
+  assert.deepEqual(last(r).filter((m) => m.role === 'tool').map((m) => m.tool_call_id), ids);
+});
+
 // Every body above must have run (a wrong test signature would make node:test skip it silently).
 let ran = 0;
 test.afterEach(() => { ran++; });
-test.after(() => assert.equal(ran, 8, 'every test body ran'));
+test.after(() => assert.equal(ran, 13, 'every test body ran'));
