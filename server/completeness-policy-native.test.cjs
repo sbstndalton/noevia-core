@@ -7,19 +7,32 @@ function capture(fn){try{return {value:fn()};}catch(error){return {error:{name:e
 function quiet(fn){const warn=console.warn;console.warn=()=>{};try{return fn();}finally{console.warn=warn;}}
 // Compare graph/own-property shape without executing report evidence getters again or
 // requiring separately constructed oracle factories to share function identities.
-function graph(value,seen=new Map()){
+function sourceReferences(value,refs=new Map(),path='input'){
+  if(!value||!['object','function'].includes(typeof value)||refs.has(value))return refs;
+  refs.set(value,path);
+  // A test must not trigger an opaque Proxy trap merely to label evidence references.
+  if(require('node:util').types.isProxy(value))return refs;
+  for(const key of Reflect.ownKeys(value)){
+    const d=Object.getOwnPropertyDescriptor(value,key),next=path+'.'+String(key);
+    if(Object.hasOwn(d,'value'))sourceReferences(d.value,refs,next);
+    else{sourceReferences(d.get,refs,next+'.get');sourceReferences(d.set,refs,next+'.set');}
+  }
+  return refs;
+}
+function graph(value,seen=new Map(),sources=new Map()){
+  if(sources.has(value))return {$source:sources.get(value)};
   if(typeof value==='function')return {$function:Object.getOwnPropertyDescriptor(value,'name')?.value||''};
   if(!value||typeof value!=='object')return value;
   if(seen.has(value))return {$reference:seen.get(value)};
   const id=seen.size;seen.set(value,id);const properties=[];
   for(const key of Reflect.ownKeys(value)){
     const d=Object.getOwnPropertyDescriptor(value,key);
-    properties.push([key,{enumerable:d.enumerable,configurable:d.configurable,...(Object.hasOwn(d,'value')?{writable:d.writable,value:graph(d.value,seen)}:{get:!!d.get,set:!!d.set})}]);
+    properties.push([key,{enumerable:d.enumerable,configurable:d.configurable,...(Object.hasOwn(d,'value')?{writable:d.writable,value:graph(d.value,seen,sources)}:{get:!!d.get,set:!!d.set})}]);
   }
   return {$id:id,array:Array.isArray(value),properties};
 }
 function compare(factory,label){
-  const run=(implementation)=>{const {input,trace=[],verify}=factory(implementation);const result=capture(()=>implementation.buildCompletenessReport(input));if(result.value&&verify)verify(result.value,input);return {result:graph(result),trace:graph(trace)};};
+  const run=(implementation)=>{const {input,trace=[],verify}=factory(implementation);const result=capture(()=>implementation.buildCompletenessReport(input));if(result.value&&verify)verify(result.value,input);const recordedTrace=[...trace],sources=sourceReferences(input);return {result:graph(result,new Map(),sources),trace:graph(recordedTrace,new Map(),sources)};};
   assert.deepStrictEqual(quiet(()=>run(native)),quiet(()=>run(old)),label);
 }
 function job(){return {id:'synthetic',steps:[{id:'tests',status:'completed'}],artifacts:[{name:'qa.diff',kind:'test-report',passed:true}],plan:{status:'proposed'},uncertain:[],pendingApproval:null,checkpoint:{sha:'a'.repeat(40)}};}
@@ -41,6 +54,7 @@ test('opaque cyclic/BigInt/large and strict legacy refusal inputs keep their ful
     ()=>({input:{job:job(),expectedArtifacts:[huge]}}),
     ()=>({input:{job:{...job(),uncertain:'opaque'}}}),
     ()=>({input:{job:{...job(),uncertain:{length:1n}}}}),
+    ()=>({input:{job:{...job(),uncertain:{length:{toString(){return 'one';}}}}}}),
     ()=>({input:{job:job(),expectedArtifacts:'qa.diff'}}),
     ()=>({input:{job:job(),expectedArtifacts:[null,undefined,7,{},['missing']]}}),
     ()=>{const j=job();j.plan.self=j.plan;j.checkpoint.self=j.checkpoint;return {input:{job:j}};},
