@@ -127,6 +127,10 @@ test('custom collection failures retain exact original native TypeError text',()
 });
 
 test('read traces preserve changing collection getters and length coercion before map',()=>{
+  compare(()=>{const trace=[],items=[{id:'tests',status:'completed'}];
+    const steps=new Proxy(items,{get(target,key,receiver){trace.push('proxy.'+String(key));return Reflect.get(target,key,receiver);}});
+    return {input:{job:{...job(),steps}},trace,verify(report){assert.strictEqual(report.checks[2].evidence.steps,steps);assert.strictEqual(report.checks[0].evidence.steps[0],items[0]);}};
+  },'Proxy collection projection and original evidence identities');
   compare(()=>{const trace=[],steps=sequence(trace,'job.steps',[[{id:'tests',status:'completed'}],[{id:'other',status:'running'}],[]]);return {input:{job:{...job(),get steps(){return steps();}}},trace};},'changing job.steps');
   compare(()=>{
     const trace=[];let first=true,coerced=false;
