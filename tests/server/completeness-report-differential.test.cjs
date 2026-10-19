@@ -18,6 +18,7 @@ const test = require('node:test');
 
 const davParseWasm = require('../../server/dav-parse-wasm.cjs');
 const cr = require('../../server/completeness-report.cjs');
+const oracle=require('../reference/completeness-report-oracle.cjs');
 
 const FILE = path.join(__dirname, '../fixtures/completeness-report.v1.json');
 const GENERATOR = path.join(__dirname, '../../tools/gen-completeness-report-fixtures.cjs');
@@ -55,7 +56,7 @@ test('report and deep rows: the exact reply through the port; the switch hands o
     for (const [i, row] of fixtures[key].entries()) {
       const [job, expected] = parts(row);
       assert.equal(portReply(job, expected), row.reply, `${key} row ${i}`);
-      const js = cr.buildCompletenessReportJs({ job, expectedArtifacts: expected });
+      const js = oracle.buildCompletenessReportJs({ job, expectedArtifacts: expected });
       const switched = cr.buildCompletenessReport({ job, expectedArtifacts: expected });
       assert.deepEqual(switched, js, `${key} row ${i}: verified, unchanged`);
       assert.equal(cr.canEnterReviewing(switched), js.overall === 'pass');
@@ -76,7 +77,7 @@ test('throws rows are refused as input (the JS throws, so the port is never aske
     for (const [i, row] of fixtures.strict.entries()) {
       const [job, expected] = parts(row);
       assert.throws(() => davParseWasm.completenessReport(job, expected), (e) => e.reason === 'ambiguous', `strict row ${i}`);
-      const js = cr.buildCompletenessReportJs({ job, expectedArtifacts: expected });
+      const js = oracle.buildCompletenessReportJs({ job, expectedArtifacts: expected });
       const switched = cr.buildCompletenessReport({ job, expectedArtifacts: expected });
       assert.equal(switched.unverified, 'impl_refused', `strict row ${i}`);
       assert.equal(switched.overall, js.overall === 'fail' ? 'fail' : 'unknown');
@@ -121,7 +122,7 @@ function* liveJobs(n, seed) {
 test('seeded live jobs: the port agrees with this runtime\'s JS on every one (no false refusals)', { skip: skipWasm }, () => {
   let pass = 0, refusals = 0;
   for (const [job, expected] of liveJobs(800, 0xc0ffee)) {
-    const js = cr.buildCompletenessReportJs({ job, expectedArtifacts: expected });
+    const js = oracle.buildCompletenessReportJs({ job, expectedArtifacts: expected });
     const switched = cr.buildCompletenessReport({ job, expectedArtifacts: expected });
     if (switched.unverified) refusals++;
     else assert.deepEqual(switched, js);
@@ -133,7 +134,7 @@ test('seeded live jobs: the port agrees with this runtime\'s JS on every one (no
 
 test('a report too large to hash: the port gives the same refusal and statuses', { skip: skipWasm }, () => {
   const job = { id: 'big', steps: [{ id: 'tests', status: 'failed', title: 'x'.repeat(1_500_000) }] };
-  const js = cr.buildCompletenessReportJs({ job });
+  const js = oracle.buildCompletenessReportJs({ job });
   assert.throws(() => cr.reportHash(js), /too large/);
   assert.deepEqual(davParseWasm.completenessReport(job, null), { unhashable: 'large', overall: 'fail', statuses: js.checks.map((c) => c.status) });
   assert.deepEqual(cr.buildCompletenessReport({ job }), js);
@@ -150,7 +151,7 @@ test('in-memory values JSON cannot carry never make the switch more permissive',
       { ...base(), checkpoint: { sha: SHA, fn() {} } }, // canonical "null" vs dropped
       { ...base(), steps: [{ id: NaN, status: 'running' }] }, // "NaN" vs null
     ]) {
-      const js = cr.buildCompletenessReportJs({ job });
+      const js = oracle.buildCompletenessReportJs({ job });
       const switched = cr.buildCompletenessReport({ job });
       if (switched.unverified === undefined) assert.deepEqual(switched, js);
       if (cr.canEnterReviewing(switched)) assert.equal(js.overall, 'pass');
