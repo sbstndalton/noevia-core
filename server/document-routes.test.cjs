@@ -195,6 +195,12 @@ test('diary extras are lazy, private to the tenant, and hidden from ordinary pro
   const otherCookie = seedAccount(testDataDir, { username: 'reader', role: 'member' }).cookie;
   assert.equal((await request('/api/diary/context',{headers:{cookie:otherCookie}})).status,404);
   assert.equal((await request(`/api/projects/${p.id}/uploads/original?name=context.txt`,{headers:{cookie:otherCookie}})).status,404);
-  assert.equal((await post('/api/chats/c-fixture/context',{})).status,200);
-  assert.equal(JSON.parse((await request('/api/chats/c-fixture/context',{headers:{cookie:otherCookie}})).text).project,null);
+  // Rust owns chat-context creation. Seed only this fixture's front-owned state;
+  // actual two-tenant context isolation is covered by noevia-rs project_routes.
+  const file = path.join(testDataDir, 'users', adminId, 'projects.json');
+  const stored = JSON.parse(fs.readFileSync(file, 'utf8'));
+  stored.projects.push({ id: 'cowork-chat-context-c-fixture', name: 'Synthetic private context', files: [] });
+  fs.writeFileSync(file, JSON.stringify(stored));
+  assert.equal((await request('/api/projects/cowork-chat-context-c-fixture/uploads/original?name=context.txt', { headers: { cookie: otherCookie } })).status, 404);
+  assert.equal((await request('/api/chats/c-fixture/context', { headers: { cookie: otherCookie } })).status, 503, 'Node refuses even for another tenant');
 });

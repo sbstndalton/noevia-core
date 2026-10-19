@@ -76,15 +76,13 @@ const PASS = Symbol('unhandled');
  * @param {string} deps.DEFAULT_PROVIDER_ID
  * @param {object} deps.store   projects.cjs
  * @param {() => void} [deps.onToolboxesChange]  called after a project's toolbox selection changes (clears the permitted-tools cache)
- * @param {boolean} [deps.rustProjectWrites]  #1264 (rust-projects.cjs projectWritesEnabledFrom): the front owns PROJECT_WRITE_ROUTES; this copy refuses them
  */
 function createProjectRoutes({
   json, readBody, readJson, requestScope, dispatch, currentWorkspace, authService, storageClient, documents, documentSources, rag, fs, path,
   reasoningEffort, projectAppearance, diaryExtras, PROJECTS, DEFAULT_TOOLBOXES, sanitizeToolboxes, allToolboxes = () => [{ id: 'core' }], getProvider, ensureRolesLoaded, servedCatalogue, DEFAULT_PROVIDER_ID, store,
-  onToolboxesChange = () => {}, rustProjectWrites = false,
+  onToolboxesChange = () => {},
   storageLatch = require('../storage-latch.cjs').createStorageLatch(),
 }) {
-  const { refuseOwned } = require('../rust-projects.cjs');
   const {
     getProject, saveProjects, createProject, deleteProject, whenSaved = (fn) => fn(), pruneDocuments, withSourceLock, ensureProjectFolder, indexSource, ownsFile,
     deleteChat,
@@ -183,34 +181,6 @@ function createProjectRoutes({
         return { status, body: JSON.parse(data) };
       }, { name: backgroundSource[2] === 'sources/sync' ? null : String(body?.name || '').split('/').pop() });
       return json(res, 202, { poll: `/api/projects/${encodeURIComponent(projectId)}/source-jobs/${jobId}` });
-    }
-
-    const freeContext = /^\/api\/chats\/([^/]+)\/context$/.exec(p);
-    if (freeContext && ['GET', 'POST'].includes(req.method)) {
-      // #1264: the front answers both (a GET writes too: getProject's self-heal) while its
-      // project-writes slice is confirmed; this copy must not write behind its back.
-      if (refuseOwned(rustProjectWrites, json, res)) return true;
-      // #1902: a malformed escape is the same 400 as any other unusable id, not a URIError 500.
-      const chatId = require('../http.cjs').decodePathPart(freeContext[1]);
-      const id = chatId === null ? null : diaryExtras.chatProjectId(chatId);
-      if (!id) return json(res, 400, { error: 'Invalid chat identifier' });
-      let project = getProject(id);
-      // A deleted chat's attachments project went with it (#788); a stale tab still showing that
-      // chat must not create it again, or it would outlive the chat for good. Chat ids that reach
-      // here are already in stored form (chatProjectId accepts only [A-Za-z0-9_-]).
-      if (!project && req.method === 'POST' && require('../chat-lists.cjs').readTombstones(currentWorkspace().dir).has(chatId)) {
-        return json(res, 410, { error: 'This chat was deleted.' });
-      }
-      if (!project && req.method === 'POST') {
-        // diaryExtras.newProject() is written for the Diary project, which really does default
-        // to manual — a standalone chat's shadow context must not inherit that (#352). It starts
-        // on Auto like any other free chat with no explicit choice, until routingChosen (below)
-        // records that a person actually picked one.
-        // #1522: the Automatic mode is stated, not implied by the list (a stored list alone reads as Manual).
-        project = { ...diaryExtras.newProject(), id, name: 'Chat attachments ' + freeContext[1], instructions: '', toolboxes: [...DEFAULT_TOOLBOXES], routing: 'auto', toolsMode: 'auto' };
-        PROJECTS.push(project); saveProjects(PROJECTS);
-      }
-      return json(res, 200, { project });
     }
 
     if (p === '/api/diary/context' && ['GET', 'POST'].includes(req.method)) {
