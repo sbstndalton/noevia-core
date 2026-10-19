@@ -17,15 +17,25 @@ const getOwnDescriptor = Object.getOwnPropertyDescriptor;
 const getPrototype = Object.getPrototypeOf;
 const defineProperty = Object.defineProperty;
 const arrayPrototype = Array.prototype;
-const arrayEvery = Array.prototype.every;
+const everyDescriptor = getOwnDescriptor(arrayPrototype, 'every');
+const arrayEvery = everyDescriptor && Object.prototype.hasOwnProperty.call(everyDescriptor, 'value') ? everyDescriptor.value : undefined;
+const functionToString = Function.prototype.toString;
 const arrayIsArray = Array.isArray;
 const isProxy = require('node:util').types.isProxy;
+// Trusted Node runtime primordials supply reflection, not business callback identity.
+// A replaced/accessor/proxied collection method never qualifies for specialization.
+const intrinsicEvery = typeof arrayEvery === 'function' && !isProxy(arrayEvery)
+  && apply(functionToString, arrayEvery, []) === 'function every() { [native code] }';
+const NativeDataView = DataView, NativeArrayBuffer = ArrayBuffer, nativeBigInt = BigInt;
+const getFloat64 = DataView.prototype.getFloat64, setFloat64 = DataView.prototype.setFloat64;
+const getBigUint64 = DataView.prototype.getBigUint64, setBigUint64 = DataView.prototype.setBigUint64;
+const bigintString = BigInt.prototype.toString;
 const owns = (object, name) => apply(hasOwn, object, [name]);
 const define = (object, key, value) => {
   Object.defineProperty(object, key, { value, writable: true, enumerable: true, configurable: true });
   return object;
 };
-function binary(operator, a, b) {
+function binary(operator, a, b, fault) {
   switch (operator) {
     case '+': return a + b; case '-': return a - b; case '*': return a * b;
     case '/': return a / b; case '%': return a % b; case '**': return a ** b;
@@ -33,21 +43,21 @@ function binary(operator, a, b) {
     case '===': return a === b; case '!==': return a !== b;
     case '==': return a == b; // eslint-disable-line eqeqeq
     case '!=': return a != b; // eslint-disable-line eqeqeq
-    default: throw new AutoconfigProtocolError();
+    default: throw fault();
   }
 }
-function unary(operator, value) {
+function unary(operator, value, fault) {
   switch (operator) {
     case '!': return !value; case '+': return +value; case '-': return -value;
     case 'typeof': return typeof value; case 'void': return undefined;
-    default: throw new AutoconfigProtocolError();
+    default: throw fault();
   }
 }
 
 // Build a composition of mechanical operations selected by Rust. There is no
 // source evaluation and no input-dependent branch in these callback blocks.
 // Ordinary control flow, including the period-search loop, remains in Rust.
-function linearBinary(operator, left, right) {
+function linearBinary(operator, left, right, fault) {
   switch (operator) {
     case '+': return (a,b,c) => left(a,b,c) + right(a,b,c);
     case '-': return (a,b,c) => left(a,b,c) - right(a,b,c);
@@ -63,53 +73,53 @@ function linearBinary(operator, left, right) {
     case '!==': return (a,b,c) => left(a,b,c) !== right(a,b,c);
     case '==': return (a,b,c) => left(a,b,c) == right(a,b,c); // eslint-disable-line eqeqeq
     case '!=': return (a,b,c) => left(a,b,c) != right(a,b,c); // eslint-disable-line eqeqeq
-    default: throw new AutoconfigProtocolError();
+    default: throw fault();
   }
 }
-function linearUnary(operator, value) {
+function linearUnary(operator, value, fault) {
   switch (operator) {
     case '!': return (a,b,c) => !value(a,b,c);
     case '+': return (a,b,c) => +value(a,b,c);
     case '-': return (a,b,c) => -value(a,b,c);
     case 'typeof': return (a,b,c) => typeof value(a,b,c);
     case 'void': return (a,b,c) => void value(a,b,c);
-    default: throw new AutoconfigProtocolError();
+    default: throw fault();
   }
 }
-function linearTree(tree, environment) {
+function linearTree(tree, environment, fault) {
   const [op, data] = tree;
   switch (op) {
     case 'arg':
       if (data === 0) return a => a;
       if (data === 1) return (a,b) => b;
       if (data === 2) return (a,b,c) => c;
-      throw new AutoconfigProtocolError();
+      throw fault();
     case 'undefined': return () => undefined;
     case 'literal': return () => data;
     case 'load': return () => environment[data];
-    case 'binary': return linearBinary(data, linearTree(tree[2], environment), linearTree(tree[3], environment));
-    case 'unary': return linearUnary(data, linearTree(tree[2], environment));
+    case 'binary': return linearBinary(data, linearTree(tree[2], environment, fault), linearTree(tree[3], environment, fault), fault);
+    case 'unary': return linearUnary(data, linearTree(tree[2], environment, fault), fault);
     case 'get': {
-      const object = linearTree(data, environment), key = linearTree(tree[2], environment);
+      const object = linearTree(data, environment, fault), key = linearTree(tree[2], environment, fault);
       return (a,b,c) => object(a,b,c)[key(a,b,c)];
     }
     case 'method': {
-      const object = linearTree(data, environment), key = linearTree(tree[2], environment);
-      const arguments_ = tree[3].map(argument => linearTree(argument, environment));
+      const object = linearTree(data, environment, fault), key = linearTree(tree[2], environment, fault);
+      const arguments_ = tree[3].map(argument => linearTree(argument, environment, fault));
       return (a,b,c) => {
         const receiver = object(a,b,c), fn = receiver[key(a,b,c)];
         return apply(fn, receiver, arguments_.map(argument => argument(a,b,c)));
       };
     }
     case 'call': {
-      const fn = linearTree(data, environment);
-      const arguments_ = tree[2].map(argument => linearTree(argument, environment));
+      const fn = linearTree(data, environment, fault);
+      const arguments_ = tree[2].map(argument => linearTree(argument, environment, fault));
       return (a,b,c) => {
         const callee = fn(a,b,c);
         return apply(callee, undefined, arguments_.map(argument => argument(a,b,c)));
       };
     }
-    default: throw new AutoconfigProtocolError();
+    default: throw fault();
   }
 }
 
@@ -117,8 +127,19 @@ function linearTree(tree, environment) {
 
 // Non-observable shape facts only. Reject Proxies before any descriptor query.
 // Unsafe shapes retain the original iterator/every/getter program in Rust.
+function numberBits(value) {
+  const view = new NativeDataView(new NativeArrayBuffer(8));
+  apply(setFloat64, view, [0, value, false]);
+  const text = apply(bigintString, apply(getBigUint64, view, [0, false]), [16]);
+  return ('0000000000000000' + text).slice(-16);
+}
+function bitsNumber(text) {
+  const view = new NativeDataView(new NativeArrayBuffer(8));
+  apply(setBigUint64, view, [0, nativeBigInt('0x' + text), false]);
+  return apply(getFloat64, view, [0, false]);
+}
 function booleanArrayFacts(value) {
-  if (isProxy(value) || !arrayIsArray(value)) return { safe: false };
+  if (!intrinsicEvery || isProxy(value) || !arrayIsArray(value)) return { safe: false };
   const prototype = getPrototype(value);
   if (isProxy(prototype) || prototype !== arrayPrototype) return { safe: false };
   if (getOwnDescriptor(value, 'every') !== undefined) return { safe: false };
@@ -145,12 +166,16 @@ function booleanChunk(value, start, count) {
 
 function invocationContext(wasmLoader) {
   let module;
+  const faults = new WeakSet();
+  const fault = cause => { const error = new AutoconfigProtocolError(cause); faults.add(error); return error; };
   return {
+    fault,
+    isFault: error => (typeof error === 'object' && error !== null) && faults.has(error),
     step(op, frame) {
       try {
         module ||= wasmLoader();
         return module.llamacppAutoconfig(op, frame).reply;
-      } catch (cause) { throw new AutoconfigProtocolError(cause); }
+      } catch (cause) { throw fault(cause); }
     },
     strict(op, args) {
       let port = null, refused = null;
@@ -164,6 +189,7 @@ function evaluator(initialContext) {
   const contexts = [];
   function execute(functionId, args, parent, context) {
     const step = (op, frame) => context.step(op, frame);
+    const fault = cause => context.fault(cause);
     // Every invocation, including synchronous/reentrant native callbacks, owns its
     // reference namespace. Closures capture actual environments, never another table's IDs.
     let nextRef = 0;
@@ -175,27 +201,29 @@ function evaluator(initialContext) {
       return ref;
     };
     const get = ref => {
-      if (!owns(values, ref)) throw new AutoconfigProtocolError();
+      if (!owns(values, ref)) throw context.fault();
       return values[ref];
     };
     const environment = Object.create(parent);
     define(environment, '@args', args);
     let message = step(11, { function: functionId, env: put(environment) });
     for (;;) {
-      if (!message || typeof message !== 'object') throw new AutoconfigProtocolError();
+      if (!message || typeof message !== 'object') throw context.fault();
       if (owns(message, 'done')) return get(message.done);
       if (owns(message, 'throw')) throw get(message.throw);
-      if (!Array.isArray(message.batch) || message.batch.length < 1 || message.batch.length > 32) throw new AutoconfigProtocolError();
+      if (!Array.isArray(message.batch) || message.batch.length < 1 || message.batch.length > 32) throw context.fault();
       let state, frame;
       for (const operation of message.batch) {
         const { request, args: references } = operation;
         state = operation.state; frame = undefined;
-        if (!state || !request || !Array.isArray(references)) throw new AutoconfigProtocolError();
+        if (!state || !request || !Array.isArray(references)) throw context.fault();
         try {
         const input = references.map(get);
         const data = request.data;
         let value;
         switch (request.op) {
+          case 'numberFacts': frame = { numbers: input.map(value => value === null ? { kind: 'null' } : typeof value === 'number' ? { kind: 'number', bits: numberBits(value) } : { kind: 'other' }) }; break;
+          case 'floatBits': value = bitsNumber(data); break;
           case 'booleanArrayFacts': frame = { facts: booleanArrayFacts(input[0]) }; break;
           case 'booleanChunk': frame = { bits: booleanChunk(input[0], data.start, data.count) }; break;
           case 'literal': value = data; break;
@@ -213,7 +241,7 @@ function evaluator(initialContext) {
           case 'store': {
             let owner = input[1];
             while (owner && !owns(owner, data)) owner = Object.getPrototypeOf(owner);
-            if (!owner) throw new AutoconfigProtocolError();
+            if (!owner) throw context.fault();
             owner[data] = input[0]; value = input[0]; break;
           }
           case 'destructure':
@@ -249,13 +277,14 @@ function evaluator(initialContext) {
             if ((typeof value !== 'object' && typeof value !== 'function') || value === null) throw new TypeError('Iterator result ' + String(value) + ' is not an object');
             break;
           case 'call': value = Reflect.apply(input[0], input[1], input.slice(2)); break;
+          case 'throw': throw input[0];
           case 'construct': value = Reflect.construct(input[0], input.slice(2)); break;
-          case 'binary': value = binary(data, input[0], input[1]); break;
-          case 'unary': value = unary(data, input[0]); break;
+          case 'binary': value = binary(data, input[0], input[1], fault); break;
+          case 'unary': value = unary(data, input[0], fault); break;
           case 'increment': { let n = input[0]; if (data === 1) ++n; else --n; value = n; break; }
           case 'template': value = input[0] + `${input[1]}` + data; break;
           case 'closureLinear':
-            value = linearTree(data.tree, input[0]);
+            value = linearTree(data.tree, input[0], fault);
             defineProperty(value, 'length', { value: data.arity, configurable: true });
             break;
           case 'closure': {
@@ -268,12 +297,12 @@ function evaluator(initialContext) {
           case 'test':
             frame = { truth: data === 'undefined' ? input[0] === undefined : data === 'nullish' ? input[0] == null : !!input[0] };
             break;
-          default: throw new AutoconfigProtocolError();
+          default: throw context.fault();
         }
         if (!frame) { values[operation.ref] = value; frame = { value: operation.ref }; }
       } catch (thrown) {
         // Infrastructure faults never enter the historical estimator's catch handlers.
-        if (thrown instanceof AutoconfigProtocolError) throw thrown;
+        if (context.isFault(thrown)) throw thrown;
         frame = { thrown: put(thrown) };
         }
         if (owns(frame, 'thrown')) break;
@@ -286,10 +315,12 @@ function evaluator(initialContext) {
       };
       state = { ...state, env: remap(state.env), stack: state.stack.map(remap), catches: state.catches.map(c => [c[0], c[1], remap(c[2])]) };
       if (state.period) state.period = { ...state.period, seq: remap(state.period.seq) };
+      if (state.sum) state.sum = { ...state.sum, cache: { ...state.sum.cache, seq: remap(state.sum.cache.seq) }, raw: state.sum.raw.map(remap) };
       if (owns(frame, 'value')) frame.value = remap(frame.value);
       // Live registers only: no processed-prefix history and no recursively copied input tree.
       const live = [state.env, ...state.stack, ...state.catches.map(c => c[2])];
       if (state.period) live[live.length] = state.period.seq;
+      if (state.sum) { live[live.length] = state.sum.cache.seq; for (const ref of state.sum.raw) live[live.length] = ref; }
       if (owns(frame, 'value')) live[live.length] = frame.value;
       if (owns(frame, 'thrown')) live[live.length] = frame.thrown;
       for (const key of objectKeys(values)) {
@@ -306,7 +337,7 @@ function evaluator(initialContext) {
   return (name, args, context) => {
     contexts.push(context);
     try {
-      if (!owns(exports, name)) throw new AutoconfigProtocolError();
+      if (!owns(exports, name)) throw context.fault();
       return args === undefined ? exports[name] : Reflect.apply(exports[name], undefined, args);
     } finally { contexts.pop(); }
   };
@@ -314,9 +345,14 @@ function evaluator(initialContext) {
 // Preserve the original module closure, including the public mutable candidate array.
 // Each call and each callback still receives its own opaque-reference table.
 let sharedEvaluator;
-function invoke(name, args, wasmLoader) {
+function invokeOutcome(name, args, wasmLoader) {
   const context = invocationContext(wasmLoader);
-  sharedEvaluator ||= evaluator(context);
-  return sharedEvaluator(name, args, context);
+  try {
+    sharedEvaluator ||= evaluator(context);
+    return { value: sharedEvaluator(name, args, context) };
+  } catch (error) {
+    if (context.isFault(error)) return { fault: error };
+    throw error;
+  }
 }
-module.exports = { invoke, AutoconfigProtocolError };
+module.exports = { invokeOutcome, AutoconfigProtocolError };

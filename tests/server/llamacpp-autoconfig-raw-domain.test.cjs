@@ -227,3 +227,86 @@ test('live opaque reference IDs are recycled across large array prefixes', () =>
   assert.equal(ac.estimateFootprint(args, measured).cacheRamUnbounded, true);
   assert.ok(max < 512, 'IDs stay bounded instead of counting the processed prefix: ' + max);
 });
+
+test('scalar-loop optimization falls back for coercion hooks and per-layer head sequences', () => {
+  compare('object KV head count', () => {
+    const args = base(), trace = [];
+    const head = { [Symbol.toPrimitive](hint) { trace.push('head:' + hint); return 8; } };
+    args.meta.blockCount = 4; args.meta.slidingWindow = 1024;
+    args.meta.slidingWindowPattern = [false,true,false,true];
+    args.meta.headCountKv = [head,head,4];
+    return { args, trace };
+  });
+  const contextNumber = function (hint) { this.trace.push('ctx:' + hint); return 8192; };
+  compare('object native context', () => {
+    const args = base(), trace = [];
+    args.meta.contextLength = { trace, [Symbol.toPrimitive]: contextNumber };
+    args.meta.blockCount = 4; args.meta.slidingWindow = 1024;
+    args.meta.slidingWindowPattern = [false,true,false,true];
+    return { args, trace };
+  });
+  compare('head sequence accessor', () => {
+    const args = base(), trace = [], heads = [8,8,8,8];
+    Object.defineProperty(heads, '1', { get() { trace.push('head index1'); return 8; }, enumerable: true });
+    args.meta.blockCount = 4; args.meta.slidingWindow = 1024;
+    args.meta.slidingWindowPattern = [false,true,false,true]; args.meta.headCountKv = heads;
+    return { args, trace };
+  });
+  for (const value of [Infinity, -0, NaN]) compare('raw coefficient ' + value, () => {
+    const args = base(); args.meta.blockCount = 4; args.meta.slidingWindow = 1024;
+    args.meta.slidingWindowPattern = [false,true,false,true]; args.meta.keyLength = value;
+    return { args };
+  });
+});
+test('Boolean windows preserve non-dividing periods and cross the fixed cache size', () => {
+  for (const [length, period] of [[35,3],[70,13],[4097,7],[9000,8]]) compare('window ' + length + '/' + period, () => {
+    const args = base();
+    args.meta.blockCount = length; args.meta.slidingWindow = 1024;
+    args.meta.slidingWindowPattern = Array.from({length}, (_,i) => i % period !== period - 1);
+    return { args };
+  });
+});
+
+test('abrupt for-of bodies close raw iterators with original exception precedence', () => {
+  // Warm the shared module before substituting this intrinsic.
+  ac.kvCacheBytes({}, 1);
+  for (const mode of ['normal-return','return-getter-throws','return-call-throws','return-not-callable','return-primitive','next-throws','done-throws','value-throws']) {
+    const run = api => {
+      const trace = [], original = new Error('original iteration failure'), secondary = new Error('secondary close failure');
+      const values = [8], saved = Map.prototype.set;
+      values[Symbol.iterator] = function() {
+        let count = 0;
+        const iterator = { next() {
+          trace.push('next');
+          if (mode === 'next-throws') throw original;
+          if (count++) return {done:true};
+          return {
+            get done() { trace.push('done'); if (mode === 'done-throws') throw original; return false; },
+            get value() { trace.push('value'); if (mode === 'value-throws') throw original; return 8; },
+          };
+        }};
+        Object.defineProperty(iterator,'return',{get() {
+          trace.push('get return');
+          if (mode === 'return-getter-throws') throw secondary;
+          if (mode === 'return-not-callable') return 4;
+          return function() {
+            trace.push('call return');
+            if (mode === 'return-call-throws') throw secondary;
+            return mode === 'return-primitive' ? 4 : {};
+          };
+        }});
+        return iterator;
+      };
+      Map.prototype.set = function() { trace.push('set'); throw original; };
+      let thrown;
+      try { api.kvCacheBytes({...base().meta,headCountKv:values},4096); }
+      catch(error) { thrown = {sameOriginal:error===original,name:error.name,message:error.message}; }
+      finally { Map.prototype.set = saved; }
+      return {trace,thrown};
+    };
+    const expected = run(oldApi), actual = run(ac);
+    assert.deepEqual(actual,expected,mode);
+    assert.equal(expected.thrown.sameOriginal,true,mode);
+    assert.equal(expected.trace.includes('get return'),!['next-throws','done-throws','value-throws'].includes(mode),mode);
+  }
+});

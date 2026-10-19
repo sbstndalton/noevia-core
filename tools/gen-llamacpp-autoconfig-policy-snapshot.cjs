@@ -13,6 +13,15 @@ const fixtures = JSON.parse(fs.readFileSync(fixturePath, 'utf8'));
 const oracle = require(oraclePath);
 const wasm = require(path.join(server, 'dav-parse-wasm.cjs'));
 const loader = () => wasm;
+// Operations 4–6 are raw helpers, not switched policy wrappers.
+const OPS = {
+  1: (args) => oracle.suggest(args, { wasmLoader: loader }),
+  2: (args) => oracle.estimateInputs(args, { wasmLoader: loader }),
+  3: (args) => oracle.estimateFootprint(args, { wasmLoader: loader }),
+  4: (args) => oracle.cacheRamMibOf(args.value),
+  5: (args) => oracle.isPromptCacheFree(args.model, args.options),
+  6: (args) => oracle.parseMemoryLimit(args.value),
+};
 const quiet = console.warn;
 console.warn = () => {};
 const GIB = 1024 ** 3;
@@ -44,9 +53,10 @@ const rawRows = rawNumberCases.map(([name, op, args]) => ({
 
 const rows = fixtures.strict.map((row, index) => {
   const args = JSON.parse(row.wire);
-  const fn = ({ 1: oracle.suggest, 2: oracle.estimateInputs, 3: oracle.estimateFootprint })[row.op];
+  const fn = OPS[row.op];
+  if (typeof fn !== 'function') throw new Error('unknown strict operation ' + row.op);
   let result;
-  try { result = { kind: 'return', value: fn(args, { wasmLoader: loader }) }; }
+  try { result = { kind: 'return', value: fn(args) }; }
   catch (err) { result = { kind: 'throw', name: err?.name, code: err?.code, status: err?.status, message: err?.message }; }
   return { index, op: row.op, wire: row.wire, result };
 });

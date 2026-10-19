@@ -78,15 +78,26 @@ test('throws stay input errors; strict policy results match the frozen pre-retir
     const args = JSON.parse(row.wire);
     assert.throws(() => davParseWasm.llamacppAutoconfig(row.op, args), (e) => e.reason === 'input', `throws row ${i}`);
   }
-  const SWITCHED_BY_OP = { 1: ac.suggest, 2: ac.estimateInputs, 3: ac.estimateFootprint };
+  for (const [i, row] of fixtures.strict.entries()) {
+    assert.throws(() => davParseWasm.llamacppAutoconfig(row.op, JSON.parse(row.wire)),
+      (e) => e.reason === 'ambiguous', 'strict port row ' + i);
+  }
+  const SWITCHED_BY_OP = {
+    1: (args) => ac.suggest(args, WASM),
+    2: (args) => ac.estimateInputs(args, WASM),
+    3: (args) => ac.estimateFootprint(args, WASM),
+    4: (args) => ac.cacheRamMibOf(args.value),
+    5: (args) => ac.isPromptCacheFree(args.model, args.options),
+    6: (args) => ac.parseMemoryLimit(args.value),
+  };
   for (const row of policyFixtures.rows) {
     const fn = SWITCHED_BY_OP[row.op];
     const args = JSON.parse(row.wire);
     const capture = () => {
-      try { return { kind: 'return', value: fn(args, WASM) }; }
+      try { return { kind: 'return', value: fn(args) }; }
       catch (err) { return { kind: 'throw', name: err.name, code: err.code, status: err.status, message: err.message }; }
     };
-    assert.deepEqual(capture(), row.result, `strict host outcome row ${row.index}`);
+    assert.deepEqual(JSON.parse(JSON.stringify(capture())), row.result, 'strict host outcome row ' + row.index);
   }
 });
 

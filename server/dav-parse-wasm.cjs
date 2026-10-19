@@ -1831,14 +1831,16 @@ function taskLifecycleDerive(events) { return taskLifecycleCall(5, [taskLifecycl
 // --- llama.cpp autoconfig (LLAMACPP_AUTOCONFIG_IMPL) --------------------------------------------
 // llamacpp_autoconfig::MAX_INPUT_BYTES (the op byte and the JSON).
 const MAX_AUTOCONFIG_BYTES = 4 * 1024 * 1024 + 1;
-const AUTOCONFIG_NATIVE_EVERY = Array.prototype.every;
 const AUTOCONFIG_APPLY = Reflect.apply;
 const AUTOCONFIG_ATOM = JSON.stringify;
 const AUTOCONFIG_PARSE = JSON.parse;
 const AUTOCONFIG_KEYS = Object.keys;
 const AUTOCONFIG_ARRAY = Array.isArray;
 const AUTOCONFIG_OWN = Object.hasOwn;
-const autoconfigEvery = (array, predicate) => AUTOCONFIG_APPLY(AUTOCONFIG_NATIVE_EVERY, array, [predicate]);
+const autoconfigEvery = (array, predicate) => {
+  for (let index = 0; index < array.length; index++) if (!predicate(array[index], index)) return false;
+  return true;
+};
 const autoconfigExact = (object, keys) => !!object && typeof object === 'object' && !AUTOCONFIG_ARRAY(object) && AUTOCONFIG_KEYS(object).length === keys.length && autoconfigEvery(keys, key => AUTOCONFIG_OWN(object, key));
 // Private continuation serialization never consults inherited caller toJSON hooks.
 function autoconfigFrameText(value) {
@@ -1859,7 +1861,7 @@ function autoconfigReply(op, r) {
   const exact = op === 11 || op === 12 ? autoconfigExact : exactKeys;
   const ref = n => Number.isSafeInteger(n) && n > 0;
   const operation = r => r && exact(r, ['state', 'request', 'args', 'ref']) && Number.isSafeInteger(r.ref) && r.ref >= 0
-    && exact(r.state, ['pc', 'env', 'stack', 'catches', 'mode', 'target', 'period'])
+    && exact(r.state, ['pc', 'env', 'stack', 'catches', 'mode', 'target', 'period', 'sum'])
     && ref(r.state.env) && Array.isArray(r.state.stack) && r.state.stack.length <= 256 && autoconfigEvery(r.state.stack, ref)
     && Array.isArray(r.state.catches) && r.state.catches.length <= 8
     && autoconfigEvery(r.state.catches, c => Array.isArray(c) && c.length === 3 && Number.isSafeInteger(c[0]) && Number.isSafeInteger(c[1]) && ref(c[2]))
