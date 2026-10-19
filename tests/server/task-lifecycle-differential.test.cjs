@@ -1,14 +1,9 @@
 'use strict';
 
-// Task lifecycle (TASK_LIFECYCLE_IMPL, retired in #1071: the port always confirms the JS): tests/fixtures/task-lifecycle.v1.json (byte-identical to noevia-rs
-// crates/task-lifecycle/tests/fixtures/; CI compares them) holds task-lifecycle.cjs's table
-// answers, stage moves and journal folds, printed by tools/gen-task-lifecycle-fixtures.cjs from the
-// JS (the *Js functions of task-lifecycle.cjs, still the authority at runtime; synthetic journals only). Here every row runs through dav-parse.wasm's task_lifecycle
-// and through the confirmed functions; then seeded live journals with non-ASCII text against the
-// runtime's own JS: the port either agrees or refuses, the confirmed answer is always the JS one or
-// a refusal, and false refusals are counted (none expected). The
-// WebAssembly half needs server/wasm/dav-parse.wasm (or DAV_PARSE_WASM); skipped without it unless
-// DAV_PARSE_WASM_REQUIRED=1.
+// Task lifecycle: every immutable shared fixture and seeded journal is compared against
+// the checksum-bound independent JS oracle. Production policy comes only from Rust.
+// The old five wire operations and committed fixture bytes remain unchanged. The module
+// is mandatory here when DAV_PARSE_WASM_REQUIRED=1, as in the required workflow.
 
 const assert = require('node:assert/strict');
 const { execFileSync } = require('node:child_process');
@@ -18,6 +13,7 @@ const test = require('node:test');
 
 const davParseWasm = require('../../server/dav-parse-wasm.cjs');
 const lc = require('../../server/task-lifecycle.cjs');
+const oracle = require('../reference/task-lifecycle-oracle.cjs');
 
 const FILE = path.join(__dirname, '../fixtures/task-lifecycle.v1.json');
 const GENERATOR = path.join(__dirname, '../../tools/gen-task-lifecycle-fixtures.cjs');
@@ -26,7 +22,7 @@ const wasmFile = process.env.DAV_PARSE_WASM || davParseWasm.DEFAULT_WASM;
 const skipWasm = !fs.existsSync(wasmFile) && process.env.DAV_PARSE_WASM_REQUIRED !== '1' && 'dav-parse.wasm not built';
 
 const answer = (fn, key) => {
-  try { return { [key]: fn() }; } catch (err) { if (err instanceof lc.TaskLifecycleError) return { throws: err.code }; throw err; }
+  try { return { [key]: fn() }; } catch (err) { if (err instanceof lc.TaskLifecycleError || err instanceof oracle.TaskLifecycleError) return { throws: err.code }; throw err; }
 };
 function quietly(fn) {
   const warn = console.warn;
@@ -101,14 +97,14 @@ test('600 seeded live journals: the confirmed answer is the JS one or a refusal;
       }
       try { state = lc.step(state, events.at(-1), { authoritative: true }); } catch { /* keep the guess */ }
     }
-    const js = answer(() => lc.deriveLifecycleJs(events), 'state');
+    const js = answer(() => oracle.deriveLifecycleJs(events), 'state');
     const confirmed = quietly(() => answer(() => lc.deriveLifecycle(events), 'state'));
     if (js.state !== undefined && confirmed.state === undefined) falseRefusals++;
     else assert.deepStrictEqual(confirmed, js, `journal ${n}`);
     if (js.state !== undefined) agreed++;
     // The fold the jobs store uses, from planned, both modes.
     for (const authoritative of [false, true]) {
-      const jf = answer(() => lc.foldEventsJs(events, 'planned', { authoritative }), 'state');
+      const jf = answer(() => oracle.foldEventsJs(events, 'planned', { authoritative }), 'state');
       const wf = quietly(() => answer(() => lc.foldEvents(events, 'planned', { authoritative }), 'state'));
       if (!(jf.state !== undefined && wf.state === undefined)) assert.deepStrictEqual(wf, jf, `journal ${n} fold ${authoritative}`);
       else falseRefusals++;
@@ -144,7 +140,7 @@ test('#1126: 5,000 appends with the real port stay close to the cost with a pass
   };
   // The stand-in answers with the JS fold of the same input, so only the port's own cost differs.
   const real = davParseWasm.taskLifecycleFold;
-  davParseWasm.taskLifecycleFold = (events, from, authoritative) => ({ state: lc.foldEventsJs(events, from, { authoritative }) });
+  davParseWasm.taskLifecycleFold = (events, from, authoritative) => ({ state: oracle.foldEventsJs(events, from, { authoritative }) });
   let base;
   try { base = run(); } finally { davParseWasm.taskLifecycleFold = real; }
   const w = run();
@@ -157,6 +153,6 @@ test('an over-size journal is refused (too_large), the JS answer is not', { skip
   // Over the cap in the fold input itself (a progress stage the fold reads).
   const events = [{ type: 'job.started' }, { type: 'progress', data: { stage: 'x'.repeat(davParseWasm.MAX_TASK_LIFECYCLE_BYTES) } }];
   assert.throws(() => davParseWasm.taskLifecycleDerive(events), { reason: 'too_large' });
-  assert.equal(lc.deriveLifecycleJs(events), 'implementing');
+  assert.equal(oracle.deriveLifecycleJs(events), 'implementing');
   quietly(() => assert.equal(lc.safeDeriveLifecycle(events), null));
 });

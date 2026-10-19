@@ -1,5 +1,5 @@
 'use strict';
-// rust-projects.cjs (M4): the switch, the shared projects.json lock, the three-way merge Node saves
+// rust-projects.cjs (M4): permanent ownership, the shared projects.json lock and the three-way merge Node saves
 // with while the Rust front writes the same file, and the workspace store using them. Synthetic
 // data in throwaway directories only.
 const assert = require('node:assert/strict');
@@ -25,7 +25,7 @@ const read = (file) => JSON.parse(fs.readFileSync(file, 'utf8')).projects;
 // sbstndalton/noevia#1071: NOEVIA_RUST_PROJECTS and the slice confirmations are retired. Nothing
 // turns the project routes back over to Node; a leftover switch only warns.
 test('#1071: the projects switch is retired: no enable check is left and a leftover value only warns', () => {
-  for (const gone of ['enabledFrom', 'chatsEnabledFrom', 'freeChatsEnabledFrom']) assert.equal(rp[gone], undefined, gone);
+  for (const gone of ['enabledFrom', 'chatsEnabledFrom', 'freeChatsEnabledFrom', 'projectWritesEnabledFrom', 'refuseOwned', 'PROJECT_WRITE_ROUTES']) assert.equal(rp[gone], undefined, gone);
   for (const v of ['1', '0', '', 'true']) {
     const warned = [];
     assert.deepEqual(rp.warnRetired({ NOEVIA_RUST_PROJECTS: v }, (m) => warned.push(m)), ['NOEVIA_RUST_PROJECTS'], v);
@@ -40,7 +40,7 @@ test('#1071: the projects switch is retired: no enable check is left and a lefto
     .filter((f) => f.endsWith('.cjs') && !f.endsWith('.test.cjs') && !f.includes('node_modules'))
     .map((f) => [f, fs.readFileSync(path.join(__dirname, f), 'utf8')]);
   for (const [f, src] of sources) {
-    assert.equal(/env\.NOEVIA_RUST_PROJECTS\b(?!_)|env\.NOEVIA_RUST_(?:PROJECTS|PROJECT_CHATS|FREE_CHATS|PROJECT_STORE)_CONFIRMED\b/.test(src), false, f);
+    assert.equal(/env\.NOEVIA_RUST_(?:PROJECTS|PROJECT_WRITES)\b(?!_)|env\.NOEVIA_RUST_(?:PROJECTS|PROJECT_CHATS|FREE_CHATS|PROJECT_STORE|PROJECT_WRITES)_CONFIRMED\b/.test(src), false, f);
   }
 });
 
@@ -55,6 +55,8 @@ test('#1071: every Rust-owned project route is refused here unconditionally, bef
     ['POST', '/api/projects/p1/chats'],
     ['GET', '/api/freechats'],
     ['POST', '/api/freechats'],
+    ['GET', '/api/chats/c1/context'],
+    ['POST', '/api/chats/c1/context'],
   ];
   for (const [method, p] of owned) {
     calls.length = 0;
@@ -63,12 +65,12 @@ test('#1071: every Rust-owned project route is refused here unconditionally, bef
   }
   // The table matches OWNED_ROUTES method by method (noevia-rs routes.toml is the other half).
   const norm = (p) => p.replace(/\{[^}]*\}/g, 'x');
-  assert.deepEqual(owned.map(([m, p]) => `${m} ${p.replace(/p1|img-1/g, 'x')}`).sort(), [...rp.OWNED_ROUTES].map((r) => norm(r)).sort());
+  assert.deepEqual(owned.map(([m, p]) => `${m} ${p.replace(/p1|img-1|c1/g, 'x')}`).sort(), [...rp.OWNED_ROUTES].map((r) => norm(r)).sort());
   for (const [method, p] of [
     ['PUT', '/api/projects/p1/assets'], ['GET', '/api/projects/p1/assets'], ['POST', '/api/projects/p1/assets/img-1'],
     ['PUT', '/api/projects/p1/chats'], ['DELETE', '/api/projects/p1/chats'], ['GET', '/api/projects/p1/chats/c1'], ['DELETE', '/api/projects/p1/chats/c1'],
     ['DELETE', '/api/freechats/c1'], ['PUT', '/api/freechats'], ['GET', '/api/freechats/c1'], ['GET', '/api/freechatsx'],
-    ['GET', '/api/chats/c1/context'], ['POST', '/api/chats/c1/move'], ['POST', '/api/projects'], ['GET', '/api/workspace'],
+    ['DELETE', '/api/chats/c1/context'], ['GET', '/api/chats/c1/context/extra'], ['POST', '/api/chats/c1/move'], ['POST', '/api/projects'], ['GET', '/api/workspace'],
     ['POST', '/api/projects/p1/uploads'], ['GET', '/api/projects/p1/assets/img-1/extra'],
   ]) {
     calls.length = 0;
@@ -78,20 +80,15 @@ test('#1071: every Rust-owned project route is refused here unconditionally, bef
   assert.ok(![...rp.OWNED_ROUTES].some((r) => r.startsWith('DELETE /api/freechats')), "a free chat's delete stays Node's");
 });
 
-test('#1264: the project-writes slices need their own switch and confirmation (and no longer the retired projects switch)', async () => {
-  const warned = [];
-  const warn = (m) => warned.push(m);
-  const on = { NOEVIA_RUST_PROJECT_WRITES: '1', NOEVIA_RUST_PROJECT_WRITES_CONFIRMED: '1' };
-  assert.equal(rp.projectWritesEnabledFrom(on, warn), true);
-  assert.equal(rp.projectWritesEnabledFrom({ NOEVIA_RUST_PROJECT_WRITES_CONFIRMED: '1' }, warn), false);
-  assert.equal(warned.length, 0, 'off is not a misconfiguration');
-  for (const v of ['0', 'true', ' 1', '']) assert.equal(rp.projectWritesEnabledFrom({ ...on, NOEVIA_RUST_PROJECT_WRITES: v }, warn), false, v);
-  assert.equal(rp.projectWritesEnabledFrom({ ...on, NOEVIA_RUST_PROJECT_WRITES_CONFIRMED: '' }, warn), false);
-  assert.match(warned.at(-1), /NOEVIA_RUST_PROJECT_WRITES_CONFIRMED/);
-  // A leftover projects switch, on or off, changes nothing.
-  for (const v of ['0', '1']) assert.equal(rp.projectWritesEnabledFrom({ ...on, NOEVIA_RUST_PROJECTS: v }, () => {}), true, v);
-  assert.deepEqual([...rp.PROJECT_WRITE_ROUTES], ['GET /api/chats/{chatId}/context', 'POST /api/chats/{chatId}/context']);
-  for (const r of rp.PROJECT_WRITE_ROUTES) assert.equal(rp.OWNED_ROUTES.has(r), false, `${r} is not one of the permanent routes`);
+test('#1264/#1071: retired context switches only warn; free-chat store limits stay unchanged', () => {
+  for (const key of ['NOEVIA_RUST_PROJECT_WRITES', 'NOEVIA_RUST_PROJECT_WRITES_CONFIRMED']) {
+    for (const value of ['0', '1', '', 'true']) {
+      const warnings = [];
+      assert.deepEqual(rp.warnRetired({ [key]: value }, (m) => warnings.push(m)), [key]);
+      assert.match(warnings[0], /retired .*ignored/);
+      for (const method of ['GET', 'POST']) assert.ok(rp.ownedRoute(method, '/api/chats/synthetic/context'));
+    }
+  }
   assert.equal(rp.FREE_LIST_CAP, require('./chat-lists.cjs').LIST_CAP);
 });
 
@@ -259,18 +256,13 @@ test('uploads.prune (a writer after an await) filters the lists as on disk now, 
   assert.deepEqual(read(file)[0].assets.map((a) => a.id), ['img-rust']);
 });
 
-test("Node's copies of the switched project writes answer 503 only while their slice is on; the permanent routes are fixed", async () => {
-  const sent = [];
-  const json = (res, status, body) => sent.push([status, body]);
-  assert.equal(rp.refuseOwned(false, json, {}), false);
-  assert.equal(sent.length, 0);
-  assert.equal(rp.refuseOwned(true, json, {}), true);
-  assert.equal(sent[0][0], 503);
-  assert.equal(sent[0][1].code, 'RUST_PROJECTS_OWNED');
-  assert.deepEqual([...rp.OWNED_ROUTES].sort(), ['DELETE /api/projects/{id}/assets/{assetId}', 'GET /api/freechats', 'GET /api/projects/{id}/assets/{assetId}', 'GET /api/projects/{id}/chats', 'POST /api/freechats', 'POST /api/projects/{id}/assets', 'POST /api/projects/{id}/chats']);
-  // On in a server that is told nothing (#1071): the refusal reads no environment.
-  const r = spawnSync(process.execPath, ['-e', `const json=(res,s)=>process.stdout.write(String(s)); require(${JSON.stringify(path.join(__dirname, 'rust-projects.cjs'))}).refuseOwnedRoute({ method: 'POST' }, {}, '/api/freechats', json)`], { env: { PATH: process.env.PATH, NOEVIA_RUST_PROJECTS: '0' } });
-  assert.equal(String(r.stdout), '503');
+test('context routes refuse in a fresh process even when retired switches request Node ownership', () => {
+  for (const method of ['GET', 'POST']) {
+    const script = `const json=(res,s)=>process.stdout.write(String(s)); require(${JSON.stringify(path.join(__dirname, 'rust-projects.cjs'))}).refuseOwnedRoute({ method: ${JSON.stringify(method)} }, {}, '/api/chats/synthetic/context', json)`;
+    const r = spawnSync(process.execPath, ['-e', script], { env: { PATH: process.env.PATH, NOEVIA_RUST_PROJECTS: '0', NOEVIA_RUST_PROJECT_WRITES: '0', NOEVIA_RUST_PROJECT_WRITES_CONFIRMED: '' } });
+    assert.equal(r.status, 0, String(r.stderr));
+    assert.equal(String(r.stdout), '503');
+  }
 });
 
 test('chat metas are merged per item: a list the front saved survives a move or delete here, and the delete stands', async () => {

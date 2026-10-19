@@ -77,7 +77,13 @@ test('#1806: the per-source text answers its owner only: signed out 401, another
   assert.equal((await request(textUrl('proj-nope', 'notes.md'), { headers: { cookie } })).status, 404, 'unknown project');
   assert.equal((await request(`/api/projects/${id}/sources/text`, { headers: { cookie } })).status, 400, 'no name');
   // An internal project (a free chat's attachments) exists for this person but is not listed, so it is refused as a project.
-  assert.equal((await request('/api/chats/c-1806-synthetic/context', { method: 'POST', headers: mutation() })).status, 200);
+  // Context creation is Rust-owned; seed its output for this Node source-route test.
+  const users = path.join(testDataDir, 'users');
+  const user = fs.readdirSync(users).find((id) => fs.existsSync(path.join(users, id, 'projects.json')));
+  const file = path.join(users, user, 'projects.json');
+  const stored = JSON.parse(fs.readFileSync(file, 'utf8'));
+  stored.projects.push({ id: 'cowork-chat-context-c-1806-synthetic', files: [] });
+  fs.writeFileSync(file, JSON.stringify(stored));
   const internal = await request(textUrl('cowork-chat-context-c-1806-synthetic', 'notes.md'), { headers: { cookie } });
   assert.deepEqual([internal.status, JSON.parse(internal.text).error], [404, 'no such project']);
 

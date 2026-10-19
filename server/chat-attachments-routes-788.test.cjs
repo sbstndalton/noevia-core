@@ -67,7 +67,7 @@ const post = (url, body, headers = mutationHeaders()) => request(url, { method: 
 const realFetch = global.fetch;
 
 
-// #788 end to end through the real wiring: the free-chat context route, the free-chat delete, Delete old chats, the moved-chat delete and the /api/workspace orphan sweep.
+// #788 through Node lifecycle wiring: free-chat delete, Delete old chats, moved-chat delete and /api/workspace orphan sweep. Context creation is Rust-owned and seeded here.
 // Synthetic chats and bytes only.
 const usersDir = () => path.join(testDataDir, 'users');
 const workspaceDir = () => {
@@ -104,9 +104,11 @@ function frontSaveFree(metas) {
 }
 
 async function openWithImage(chatId) {
-  const opened = await post(`/api/chats/${chatId}/context`, {});
-  assert.equal(opened.status, 200);
-  assert.equal(JSON.parse(opened.text).project.id, ctx(chatId));
+  await request('/api/workspace', { headers: { cookie } });
+  const file = path.join(workspaceDir(), 'projects.json');
+  const data = JSON.parse(fs.readFileSync(file, 'utf8'));
+  data.projects.push({ id: ctx(chatId), name: 'Synthetic context', files: [], assets: [], chats: [] });
+  frontWrite(file, data);
   frontUploadImage(ctx(chatId));
   const assetDir = path.join(workspaceDir(), 'project-assets', ctx(chatId));
   assert.equal(fs.readdirSync(assetDir).length, 1);
@@ -132,10 +134,11 @@ test('deleting a free chat removes its attachments project, and a stale tab cann
   assert.ok(fs.existsSync(kept.assetDir) && fs.existsSync(kept.rag));
 
   const again = await post('/api/chats/c788-delete/context', {});
-  assert.equal(again.status, 410);
+  assert.equal(again.status, 503, 'Node has no context fallback; Rust route tests retain the 410 contract');
+  assert.ok(require('./chat-lists.cjs').readTombstones(workspaceDir()).has('c788-delete'), 'the actual delete publishes the tombstone Rust reads');
   assert.ok(!projectIds().includes(ctx('c788-delete')));
   const read = await request('/api/chats/c788-delete/context', { headers: { cookie } });
-  assert.deepEqual(JSON.parse(read.text), { project: null });
+  assert.equal(read.status, 503, 'context reads are also Rust-owned');
 });
 
 test('a moved chat and Delete old chats take their attachments projects along (#788)', async () => {

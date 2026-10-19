@@ -93,11 +93,9 @@ const secretStore = createSecretStore(DATA_DIR);
 // sign-in, the account routes and their tables (rust-auth.cjs); this process only reads them.
 const rustAuth = require('./rust-auth.cjs').createRustAuthGuard();
 // M4, permanent since sbstndalton/noevia#1071 (rust-projects.cjs): the Rust front always serves the
-// project images, the chat lists and the free-chat list, and is the only writer of projects.json
+// project images, chat lists, free-chat list and chat attachments context; it alone writes projects.json
 // and free-chats.json. NOEVIA_RUST_PROJECTS is retired; a leftover value only warns.
 require('./rust-projects.cjs').warnRetired(process.env);
-// sbstndalton/noevia#1264: the project writes ported to the front, on their own confirmed switch.
-const RUST_PROJECT_WRITES = require('./rust-projects.cjs').projectWritesEnabledFrom(process.env);
 // sbstndalton/noevia#1264: both files are written through the Rust front's internal store, never by
 // Node itself, so without the store (its port and secret, from the web supervisor) nothing starts.
 if (!require('./project-store-client.cjs').enabledFrom(process.env)) {
@@ -1039,7 +1037,6 @@ const projectRoutes = require('./routes/projects.cjs').createProjectRoutes({
   json, readBody, readJson, requestScope, dispatch: (req, res) => handleRequestScoped(req, res), currentWorkspace, authService, storageClient, documents, documentSources, rag, fs, path,
   reasoningEffort, projectAppearance, diaryExtras, PROJECTS, DEFAULT_TOOLBOXES, sanitizeToolboxes, allToolboxes, getProvider, ensureRolesLoaded, servedCatalogue, DEFAULT_PROVIDER_ID, store: projectStore,
   onToolboxesChange: () => permittedToolsCache.clear(),
-  rustProjectWrites: RUST_PROJECT_WRITES,
 });
 // The provider registry's routes: list, connect, test and remove (routes/providers.cjs), plus
 // Sign in with ChatGPT (chatgptOAuth, built beside mcpOAuth above) while features.chatgptOAuth is on.
