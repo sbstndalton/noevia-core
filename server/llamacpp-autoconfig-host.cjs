@@ -10,8 +10,6 @@ class AutoconfigProtocolError extends Error {
 }
 const hasOwn = Object.prototype.hasOwnProperty;
 const apply = Reflect.apply;
-const construct = Reflect.construct;
-const iteratorSymbol = Symbol.iterator;
 const objectCreate = Object.create;
 const objectKeys = Object.keys;
 const arrayIncludes = Array.prototype.includes;
@@ -173,56 +171,6 @@ function booleanChunk(value, start, count) {
 }
 
 
-// Proof of unobservable primitive-array iteration only. Current business methods
-// are checked, never trusted merely because they were captured during import.
-const literalArrayPrototype = getPrototype([]);
-const literalObjectPrototype = getPrototype({});
-function dataValue(object, key) {
-  if (object === null || (typeof object !== 'object' && typeof object !== 'function') || isProxy(object)) return undefined;
-  const descriptor = getOwnDescriptor(object, key);
-  return descriptor && owns(descriptor, 'value') ? descriptor.value : undefined;
-}
-function nativeFunction(value, name) {
-  return typeof value === 'function' && !isProxy(value)
-    && apply(functionToString, value, []) === 'function ' + name + '() { [native code] }';
-}
-function numericHeadFacts(value, sourceGlobalObject) {
-  if (value === null || typeof value !== 'object' || isProxy(value)) return {safe:false};
-  const ArrayConstructor = dataValue(sourceGlobalObject, 'Array');
-  const MapConstructor = dataValue(sourceGlobalObject, 'Map');
-  if (!nativeFunction(ArrayConstructor, 'Array') || !nativeFunction(MapConstructor, 'Map')) return {safe:false};
-  const arrayProto = dataValue(ArrayConstructor, 'prototype'), mapProto = dataValue(MapConstructor, 'prototype');
-  if (arrayProto !== literalArrayPrototype || !mapProto || isProxy(mapProto) || getPrototype(mapProto) !== literalObjectPrototype
-    || dataValue(arrayProto,'constructor') !== ArrayConstructor || dataValue(mapProto,'constructor') !== MapConstructor) return {safe:false};
-  const isArray = dataValue(ArrayConstructor, 'isArray');
-  if (!nativeFunction(isArray,'isArray') || !apply(isArray,ArrayConstructor,[value])
-    || getPrototype(value) !== arrayProto || getOwnDescriptor(value,iteratorSymbol) !== undefined) return {safe:false};
-  const arrayIterator = dataValue(arrayProto,iteratorSymbol), mapIterator = dataValue(mapProto,iteratorSymbol);
-  if (!nativeFunction(arrayIterator,'values') || dataValue(arrayProto,'values') !== arrayIterator
-    || !nativeFunction(dataValue(arrayProto,'sort'),'sort')
-    || !nativeFunction(dataValue(mapProto,'get'),'get') || !nativeFunction(dataValue(mapProto,'set'),'set')
-    || !nativeFunction(mapIterator,'entries') || dataValue(mapProto,'entries') !== mapIterator) return {safe:false};
-  // Proven native construction/iterator creation invokes no input method or
-  // iterator.next accessor. Only their descriptors are inspected below.
-  const arrayCursor = apply(arrayIterator,[],[]);
-  const mapCursor = apply(mapIterator,construct(MapConstructor,[]),[]);
-  if (isProxy(arrayCursor) || isProxy(mapCursor)) return {safe:false};
-  if (!nativeFunction(dataValue(getPrototype(arrayCursor),'next'),'next')
-    || !nativeFunction(dataValue(getPrototype(mapCursor),'next'),'next')) return {safe:false};
-  const length = dataValue(value,'length');
-  if (!Number.isSafeInteger(length) || length <= 0) return {safe:false};
-  for (let index=0;index<length;index++) {
-    const descriptor=getOwnDescriptor(value,index);
-    if (!descriptor || !owns(descriptor,'value') || typeof descriptor.value!=='number') return {safe:false};
-  }
-  return {safe:true,len:length};
-}
-function numberChunk(value,start,count) {
-  let text='';
-  for(let index=0;index<count;index++) text+=numberBits(value[start+index]);
-  return text;
-}
-
 function invocationContext(wasmLoader) {
   let module;
   const faults = new WeakSet();
@@ -282,8 +230,6 @@ function evaluator(initialContext) {
         const data = request.data;
         let value;
         switch (request.op) {
-          case 'numericHeadFacts': frame = {facts:numericHeadFacts(input[0],sourceGlobalObject)}; break;
-          case 'numberChunk': frame = {numberBits:numberChunk(input[0],data.start,data.count)}; break;
           case 'numberFacts': frame = { numbers: privateMap(input,value => value === null ? { kind: 'null' } : typeof value === 'number' ? { kind: 'number', bits: numberBits(value) } : { kind: 'other' }) }; break;
           case 'floatBits': value = bitsNumber(data); break;
           case 'booleanArrayFacts': frame = { facts: booleanArrayFacts(input[0]) }; break;
@@ -379,16 +325,14 @@ function evaluator(initialContext) {
       };
       state = { ...state, env: remap(state.env), stack: privateMap(state.stack,remap), catches: privateMap(state.catches,c => [c[0], c[1], remap(c[2])]) };
       if (state.period) state.period = { ...state.period, seq: remap(state.period.seq) };
-      if (state.sum?.kind === 'heads') state.sum = {...state.sum,seq:remap(state.sum.seq)};
-      else if (state.sum) state.sum = { ...state.sum, cache: { ...state.sum.cache, seq: remap(state.sum.cache.seq) }, raw: privateMap(state.sum.raw,remap) };
+      if (state.sum) state.sum = { ...state.sum, cache: { ...state.sum.cache, seq: remap(state.sum.cache.seq) }, raw: privateMap(state.sum.raw,remap) };
       if (owns(frame, 'value')) frame.value = remap(frame.value);
       // Live registers only: no processed-prefix history and no recursively copied input tree.
       const live = [state.env];
       for(let i=0;i<state.stack.length;i++) define(live,live.length,state.stack[i]);
       for(let i=0;i<state.catches.length;i++) define(live,live.length,state.catches[i][2]);
       if (state.period) define(live,live.length,state.period.seq);
-      if (state.sum?.kind === 'heads') define(live,live.length,state.sum.seq);
-      else if (state.sum) { define(live,live.length,state.sum.cache.seq); for (let i=0;i<state.sum.raw.length;i++) define(live,live.length,state.sum.raw[i]); }
+      if (state.sum) { define(live,live.length,state.sum.cache.seq); for (let i=0;i<state.sum.raw.length;i++) define(live,live.length,state.sum.raw[i]); }
       if (owns(frame, 'value')) define(live,live.length,frame.value);
       if (owns(frame, 'thrown')) define(live,live.length,frame.thrown);
       const valueKeys=objectKeys(values);
@@ -401,7 +345,6 @@ function evaluator(initialContext) {
     }
   }
   const globals = Object.create(globalThis);
-  const sourceGlobalObject = getPrototype(globals);
   define(globals, '__stringify', value => { try { return JSON.stringify(value); } catch { return undefined; } });
   define(globals, '__strict', (op, args) => contexts[contexts.length-1].strict(op, args));
   const exports = execute(0, [], globals, initialContext);

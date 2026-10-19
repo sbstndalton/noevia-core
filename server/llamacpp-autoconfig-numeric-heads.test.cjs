@@ -10,8 +10,7 @@ function nativeMode(values){const counts=new Map();for(const value of values)cou
 function directMode(values){
   const counts={},frames=[];
   const outcome=host.invokeOutcome('kvHeadsOf',[values,77],()=>({llamacppAutoconfig(op,args){
-    if(op===12 && args.state.sum?.kind==='heads'){
-      assert.ok(args.state.sum.bins.length<=128);
+    if(op===12){
       frames.push(JSON.stringify(args).length);
     }
     const result=wasm.llamacppAutoconfig(op,args);
@@ -20,28 +19,27 @@ function directMode(values){
   }}));
   assert.equal(outcome.fault,undefined);return {value:outcome.value,counts,frames};
 }
-test('numeric mode uses Rust SameValueZero keys and stable insertion ties with bit-preserving results',()=>{
+test('Rust-directed VM preserves SameValueZero keys and stable insertion ties with bit-preserving results',()=>{
   const nan=Buffer.from('7ff8000000000001','hex').readDoubleBE();
   for(const values of [[2,3,3,2],[3,2,2,3],[-0,0,2],[nan,NaN,4],[Infinity,-Infinity,-Infinity,Infinity],[4,8,4,8,8]]){
     const result=directMode(values);
     assert.equal(bits(result.value),bits(nativeMode(values)));
-    assert.ok(result.counts.numberChunk>0);
-    assert.equal(result.counts.iterator,undefined,'pure dense mode must avoid the original VM iterator');
+    assert.equal(result.counts.numericHeadFacts,undefined,'no eligibility proof may bypass business methods');
+    assert.equal(result.counts.iterator,1,'the original iterator must execute');
     const meta={blockCount:4,headCount:4,embeddingLength:16,headCountKv:values};
     assert.ok(Object.is(ac.kvCacheBytes(meta,4),old.kvCacheBytes(meta,4)));
   }
 });
-test('numeric mode consumes unbounded total input in fixed chunks and falls back at distinct-register overflow',()=>{
+test('Rust-directed VM accepts large and high-cardinality input with bounded continuations',()=>{
   for(const values of [Array.from({length:10000},(_,i)=>i%4+1),Array.from({length:129},(_,i)=>i+1).concat([129,129])]){
     const result=directMode(values);
     assert.equal(bits(result.value),bits(nativeMode(values)));
     assert.ok(result.frames.length>0);
     assert.ok(Math.max(...result.frames)<16384,'continuation remains fixed and bounded');
-    if(values.length===10000){assert.equal(result.counts.iterator,undefined);assert.ok(result.counts.numberChunk>=79);}
-    else assert.equal(result.counts.iterator,1,'capacity overflow is the original full VM, not input rejection');
+    assert.equal(result.counts.iterator,1,'all lengths/cardinalities use the original iterator');
   }
 });
-test('a changed globalThis alias cannot redirect current evaluator intrinsic eligibility',()=>{
+test('a changed globalThis alias cannot redirect the initialized evaluator environment',()=>{
   ac.kvCacheBytes({blockCount:4,headCount:4,embeddingLength:16,headCountKv:[2,3,3]},4);
   const original=globalThis,descriptor=Object.getOwnPropertyDescriptor(original,'globalThis');
   let reads=0;
@@ -53,13 +51,18 @@ test('a changed globalThis alias cannot redirect current evaluator intrinsic eli
 });
 
 
-test('numeric eligibility preserves current constructor/method/accessor/Proxy hooks through exact fallback',()=>{
+test('Rust-directed VM preserves current native-brand, constructor, method, accessor and Proxy behavior',()=>{
   const originalGlobal=globalThis,ArrayCtor=Array,MapCtor=Map,apply=Reflect.apply,construct=Reflect.construct;
   const own=Object.getOwnPropertyDescriptor,define=Object.defineProperty,push=Array.prototype.push;
   const arrayIterator=Array.prototype[Symbol.iterator],mapIterator=Map.prototype[Symbol.iterator];
   const arrayCursorPrototype=Object.getPrototypeOf(apply(arrayIterator,[],[]));
   const mapCursorPrototype=Object.getPrototypeOf(apply(mapIterator,new MapCtor(),[]));
   const cases=[
+    ['wrong-brand native Map.get',(hook)=>hook(MapCtor.prototype,'get',{value:WeakMap.prototype.get,writable:true})],
+    ['wrong-brand native Map.set',(hook)=>hook(MapCtor.prototype,'set',{value:WeakMap.prototype.set,writable:true})],
+    ['wrong-brand native Array.sort',(hook)=>hook(ArrayCtor.prototype,'sort',{value:Uint8Array.prototype.sort,writable:true})],
+    ['crossed native MapIterator.next',(hook)=>hook(mapCursorPrototype,'next',{value:arrayCursorPrototype.next,writable:true})],
+    ['crossed native ArrayIterator.next',(hook)=>hook(arrayCursorPrototype,'next',{value:mapCursorPrototype.next,writable:true})],
     ['global Array getter',(hook,log)=>hook(originalGlobal,'Array',{get(){log('global Array');return ArrayCtor;}})],
     ['global Map Proxy constructor',(hook,log)=>hook(originalGlobal,'Map',{value:new Proxy(MapCtor,{construct(target,args,newTarget){log('Map construct');return construct(target,args,newTarget);}}),writable:true})],
     ['global Array Proxy lookup',(hook,log)=>hook(originalGlobal,'Array',{value:new Proxy(ArrayCtor,{get(target,key,receiver){log('Array get '+String(key));return Reflect.get(target,key,receiver);}}),writable:true})],
