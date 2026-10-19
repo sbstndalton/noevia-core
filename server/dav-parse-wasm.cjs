@@ -1900,7 +1900,9 @@ const autoconfigExact = (object, keys) => !!object && typeof object === 'object'
 function autoconfigFrameText(value) {
   if (value === null || typeof value !== 'object') return AUTOCONFIG_ATOM(value);
   let text = AUTOCONFIG_ARRAY(value) ? '[' : '{', first = true;
-  for (const key of AUTOCONFIG_KEYS(value)) {
+  const keys=AUTOCONFIG_KEYS(value);
+  for (let index=0;index<keys.length;index++) {
+    const key=keys[index];
     if (!first) text += ',';
     first = false;
     if (!AUTOCONFIG_ARRAY(value)) text += AUTOCONFIG_ATOM(key) + ':';
@@ -1913,16 +1915,17 @@ const AUTOCONFIG_OPS = new Set([1, 2, 3, 4, 5, 6, 11, 12]);
 /** Strict operations 1-6 and bounded opaque-reference evaluator frames (11-12). */
 function autoconfigReply(op, r) {
   const exact = op === 11 || op === 12 ? autoconfigExact : exactKeys;
+  const privateOp = op === 11 || op === 12;
   const ref = n => Number.isSafeInteger(n) && n > 0;
   const operation = r => r && exact(r, ['state', 'request', 'args', 'ref']) && Number.isSafeInteger(r.ref) && r.ref >= 0
     && exact(r.state, ['pc', 'env', 'stack', 'catches', 'mode', 'target', 'period', 'sum'])
-    && ref(r.state.env) && Array.isArray(r.state.stack) && r.state.stack.length <= 256 && autoconfigEvery(r.state.stack, ref)
-    && Array.isArray(r.state.catches) && r.state.catches.length <= 8
-    && autoconfigEvery(r.state.catches, c => Array.isArray(c) && c.length === 3 && Number.isSafeInteger(c[0]) && Number.isSafeInteger(c[1]) && ref(c[2]))
+    && ref(r.state.env) && (privateOp ? AUTOCONFIG_ARRAY(r.state.stack) : Array.isArray(r.state.stack)) && r.state.stack.length <= 256 && autoconfigEvery(r.state.stack, ref)
+    && (privateOp ? AUTOCONFIG_ARRAY(r.state.catches) : Array.isArray(r.state.catches)) && r.state.catches.length <= 8
+    && autoconfigEvery(r.state.catches, c => (privateOp ? AUTOCONFIG_ARRAY(c) : Array.isArray(c)) && c.length === 3 && Number.isSafeInteger(c[0]) && Number.isSafeInteger(c[1]) && ref(c[2]))
     && exact(r.request, ['op', 'data']) && typeof r.request.op === 'string'
-    && Array.isArray(r.args) && autoconfigEvery(r.args, ref);
-  const continuation = r && exact(r, ['batch']) && Array.isArray(r.batch) && r.batch.length >= 1 && r.batch.length <= 32 && autoconfigEvery(r.batch, operation);
-  const ok = op <= 3 ? !!r && typeof r === 'object' && !Array.isArray(r)
+    && (privateOp ? AUTOCONFIG_ARRAY(r.args) : Array.isArray(r.args)) && autoconfigEvery(r.args, ref);
+  const continuation = r && exact(r, ['batch']) && (privateOp ? AUTOCONFIG_ARRAY(r.batch) : Array.isArray(r.batch)) && r.batch.length >= 1 && r.batch.length <= 32 && autoconfigEvery(r.batch, operation);
+  const ok = op <= 3 ? !!r && typeof r === 'object' && !(privateOp ? AUTOCONFIG_ARRAY(r) : Array.isArray(r))
     : op === 4 ? (exact(r, ['mib']) && typeof r.mib === 'number') || (exact(r, ['unbounded']) && r.unbounded === true)
       : op === 5 ? exact(r, ['free']) && typeof r.free === 'boolean'
         : op === 6 ? exact(r, ['gib']) && (r.gib === null || r.gib === 'Infinity' || typeof r.gib === 'number')

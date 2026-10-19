@@ -10,6 +10,8 @@ class AutoconfigProtocolError extends Error {
 }
 const hasOwn = Object.prototype.hasOwnProperty;
 const apply = Reflect.apply;
+const construct = Reflect.construct;
+const iteratorSymbol = Symbol.iterator;
 const objectCreate = Object.create;
 const objectKeys = Object.keys;
 const arrayIncludes = Array.prototype.includes;
@@ -35,6 +37,13 @@ const define = (object, key, value) => {
   Object.defineProperty(object, key, { value, writable: true, enumerable: true, configurable: true });
   return object;
 };
+function privateMap(array, transform, start = 0) {
+  const result = [];
+  for (let index=start;index<array.length;index++) define(result,index-start,transform(array[index],index));
+  return result;
+}
+const privateSlice = (array,start) => privateMap(array,value=>value,start);
+
 function binary(operator, a, b, fault) {
   switch (operator) {
     case '+': return a + b; case '-': return a - b; case '*': return a * b;
@@ -87,7 +96,7 @@ function linearUnary(operator, value, fault) {
   }
 }
 function linearTree(tree, environment, fault) {
-  const [op, data] = tree;
+  const op=tree[0], data=tree[1];
   switch (op) {
     case 'arg':
       if (data === 0) return a => a;
@@ -105,18 +114,18 @@ function linearTree(tree, environment, fault) {
     }
     case 'method': {
       const object = linearTree(data, environment, fault), key = linearTree(tree[2], environment, fault);
-      const arguments_ = tree[3].map(argument => linearTree(argument, environment, fault));
+      const arguments_ = privateMap(tree[3],argument => linearTree(argument, environment, fault));
       return (a,b,c) => {
         const receiver = object(a,b,c), fn = receiver[key(a,b,c)];
-        return apply(fn, receiver, arguments_.map(argument => argument(a,b,c)));
+        return apply(fn, receiver, privateMap(arguments_,argument => argument(a,b,c)));
       };
     }
     case 'call': {
       const fn = linearTree(data, environment, fault);
-      const arguments_ = tree[2].map(argument => linearTree(argument, environment, fault));
+      const arguments_ = privateMap(tree[2],argument => linearTree(argument, environment, fault));
       return (a,b,c) => {
         const callee = fn(a,b,c);
-        return apply(callee, undefined, arguments_.map(argument => argument(a,b,c)));
+        return apply(callee, undefined, privateMap(arguments_,argument => argument(a,b,c)));
       };
     }
     default: throw fault();
@@ -163,6 +172,56 @@ function booleanChunk(value, start, count) {
   return text;
 }
 
+
+// Proof of unobservable primitive-array iteration only. Current business methods
+// are checked, never trusted merely because they were captured during import.
+const literalArrayPrototype = getPrototype([]);
+const literalObjectPrototype = getPrototype({});
+function dataValue(object, key) {
+  if (object === null || (typeof object !== 'object' && typeof object !== 'function') || isProxy(object)) return undefined;
+  const descriptor = getOwnDescriptor(object, key);
+  return descriptor && owns(descriptor, 'value') ? descriptor.value : undefined;
+}
+function nativeFunction(value, name) {
+  return typeof value === 'function' && !isProxy(value)
+    && apply(functionToString, value, []) === 'function ' + name + '() { [native code] }';
+}
+function numericHeadFacts(value, sourceGlobalObject) {
+  if (value === null || typeof value !== 'object' || isProxy(value)) return {safe:false};
+  const ArrayConstructor = dataValue(sourceGlobalObject, 'Array');
+  const MapConstructor = dataValue(sourceGlobalObject, 'Map');
+  if (!nativeFunction(ArrayConstructor, 'Array') || !nativeFunction(MapConstructor, 'Map')) return {safe:false};
+  const arrayProto = dataValue(ArrayConstructor, 'prototype'), mapProto = dataValue(MapConstructor, 'prototype');
+  if (arrayProto !== literalArrayPrototype || !mapProto || isProxy(mapProto) || getPrototype(mapProto) !== literalObjectPrototype
+    || dataValue(arrayProto,'constructor') !== ArrayConstructor || dataValue(mapProto,'constructor') !== MapConstructor) return {safe:false};
+  const isArray = dataValue(ArrayConstructor, 'isArray');
+  if (!nativeFunction(isArray,'isArray') || !apply(isArray,ArrayConstructor,[value])
+    || getPrototype(value) !== arrayProto || getOwnDescriptor(value,iteratorSymbol) !== undefined) return {safe:false};
+  const arrayIterator = dataValue(arrayProto,iteratorSymbol), mapIterator = dataValue(mapProto,iteratorSymbol);
+  if (!nativeFunction(arrayIterator,'values') || dataValue(arrayProto,'values') !== arrayIterator
+    || !nativeFunction(dataValue(arrayProto,'sort'),'sort')
+    || !nativeFunction(dataValue(mapProto,'get'),'get') || !nativeFunction(dataValue(mapProto,'set'),'set')
+    || !nativeFunction(mapIterator,'entries') || dataValue(mapProto,'entries') !== mapIterator) return {safe:false};
+  // Proven native construction/iterator creation invokes no input method or
+  // iterator.next accessor. Only their descriptors are inspected below.
+  const arrayCursor = apply(arrayIterator,[],[]);
+  const mapCursor = apply(mapIterator,construct(MapConstructor,[]),[]);
+  if (isProxy(arrayCursor) || isProxy(mapCursor)) return {safe:false};
+  if (!nativeFunction(dataValue(getPrototype(arrayCursor),'next'),'next')
+    || !nativeFunction(dataValue(getPrototype(mapCursor),'next'),'next')) return {safe:false};
+  const length = dataValue(value,'length');
+  if (!Number.isSafeInteger(length) || length <= 0) return {safe:false};
+  for (let index=0;index<length;index++) {
+    const descriptor=getOwnDescriptor(value,index);
+    if (!descriptor || !owns(descriptor,'value') || typeof descriptor.value!=='number') return {safe:false};
+  }
+  return {safe:true,len:length};
+}
+function numberChunk(value,start,count) {
+  let text='';
+  for(let index=0;index<count;index++) text+=numberBits(value[start+index]);
+  return text;
+}
 
 function invocationContext(wasmLoader) {
   let module;
@@ -211,18 +270,21 @@ function evaluator(initialContext) {
       if (!message || typeof message !== 'object') throw context.fault();
       if (owns(message, 'done')) return get(message.done);
       if (owns(message, 'throw')) throw get(message.throw);
-      if (!Array.isArray(message.batch) || message.batch.length < 1 || message.batch.length > 32) throw context.fault();
+      if (!arrayIsArray(message.batch) || message.batch.length < 1 || message.batch.length > 32) throw context.fault();
       let state, frame;
-      for (const operation of message.batch) {
+      for (let operationIndex=0;operationIndex<message.batch.length;operationIndex++) {
+        const operation=message.batch[operationIndex];
         const { request, args: references } = operation;
         state = operation.state; frame = undefined;
-        if (!state || !request || !Array.isArray(references)) throw context.fault();
+        if (!state || !request || !arrayIsArray(references)) throw context.fault();
         try {
-        const input = references.map(get);
+        const input = privateMap(references,get);
         const data = request.data;
         let value;
         switch (request.op) {
-          case 'numberFacts': frame = { numbers: input.map(value => value === null ? { kind: 'null' } : typeof value === 'number' ? { kind: 'number', bits: numberBits(value) } : { kind: 'other' }) }; break;
+          case 'numericHeadFacts': frame = {facts:numericHeadFacts(input[0],sourceGlobalObject)}; break;
+          case 'numberChunk': frame = {numberBits:numberChunk(input[0],data.start,data.count)}; break;
+          case 'numberFacts': frame = { numbers: privateMap(input,value => value === null ? { kind: 'null' } : typeof value === 'number' ? { kind: 'number', bits: numberBits(value) } : { kind: 'other' }) }; break;
           case 'floatBits': value = bitsNumber(data); break;
           case 'booleanArrayFacts': frame = { facts: booleanArrayFacts(input[0]) }; break;
           case 'booleanChunk': frame = { bits: booleanChunk(input[0], data.start, data.count) }; break;
@@ -256,7 +318,9 @@ function evaluator(initialContext) {
             value = input[0];
             if (input[1] != null) {
               const source = Object(input[1]);
-              for (const key of Reflect.ownKeys(source)) {
+              const keys=Reflect.ownKeys(source);
+              for (let keyIndex=0;keyIndex<keys.length;keyIndex++) {
+                const key=keys[keyIndex];
                 if (Object.getOwnPropertyDescriptor(source, key)?.enumerable) define(value, key, source[key]);
               }
             }
@@ -276,9 +340,9 @@ function evaluator(initialContext) {
             value = Reflect.apply(input[0].next, input[0].iterator, []);
             if ((typeof value !== 'object' && typeof value !== 'function') || value === null) throw new TypeError('Iterator result ' + String(value) + ' is not an object');
             break;
-          case 'call': value = Reflect.apply(input[0], input[1], input.slice(2)); break;
+          case 'call': value = Reflect.apply(input[0], input[1], privateSlice(input,2)); break;
           case 'throw': throw input[0];
-          case 'construct': value = Reflect.construct(input[0], input.slice(2)); break;
+          case 'construct': value = Reflect.construct(input[0], privateSlice(input,2)); break;
           case 'binary': value = binary(data, input[0], input[1], fault); break;
           case 'unary': value = unary(data, input[0], fault); break;
           case 'increment': { let n = input[0]; if (data === 1) ++n; else --n; value = n; break; }
@@ -289,7 +353,7 @@ function evaluator(initialContext) {
             break;
           case 'closure': {
             const captured = input[0];
-            value = (...callArgs) => execute(data.entry, callArgs, captured, contexts.at(-1) || context);
+            value = (...callArgs) => execute(data.entry, callArgs, captured, contexts[contexts.length-1] || context);
             defineProperty(value, 'length', { value: data.arity, configurable: true });
             defineProperty(value, 'name', { value: data.name, configurable: true });
             break;
@@ -313,33 +377,40 @@ function evaluator(initialContext) {
         if (!owns(remapped, ref)) remapped[ref] = put(get(ref));
         return remapped[ref];
       };
-      state = { ...state, env: remap(state.env), stack: state.stack.map(remap), catches: state.catches.map(c => [c[0], c[1], remap(c[2])]) };
+      state = { ...state, env: remap(state.env), stack: privateMap(state.stack,remap), catches: privateMap(state.catches,c => [c[0], c[1], remap(c[2])]) };
       if (state.period) state.period = { ...state.period, seq: remap(state.period.seq) };
-      if (state.sum) state.sum = { ...state.sum, cache: { ...state.sum.cache, seq: remap(state.sum.cache.seq) }, raw: state.sum.raw.map(remap) };
+      if (state.sum?.kind === 'heads') state.sum = {...state.sum,seq:remap(state.sum.seq)};
+      else if (state.sum) state.sum = { ...state.sum, cache: { ...state.sum.cache, seq: remap(state.sum.cache.seq) }, raw: privateMap(state.sum.raw,remap) };
       if (owns(frame, 'value')) frame.value = remap(frame.value);
       // Live registers only: no processed-prefix history and no recursively copied input tree.
-      const live = [state.env, ...state.stack, ...state.catches.map(c => c[2])];
-      if (state.period) live[live.length] = state.period.seq;
-      if (state.sum) { live[live.length] = state.sum.cache.seq; for (const ref of state.sum.raw) live[live.length] = ref; }
-      if (owns(frame, 'value')) live[live.length] = frame.value;
-      if (owns(frame, 'thrown')) live[live.length] = frame.thrown;
-      for (const key of objectKeys(values)) {
+      const live = [state.env];
+      for(let i=0;i<state.stack.length;i++) define(live,live.length,state.stack[i]);
+      for(let i=0;i<state.catches.length;i++) define(live,live.length,state.catches[i][2]);
+      if (state.period) define(live,live.length,state.period.seq);
+      if (state.sum?.kind === 'heads') define(live,live.length,state.sum.seq);
+      else if (state.sum) { define(live,live.length,state.sum.cache.seq); for (let i=0;i<state.sum.raw.length;i++) define(live,live.length,state.sum.raw[i]); }
+      if (owns(frame, 'value')) define(live,live.length,frame.value);
+      if (owns(frame, 'thrown')) define(live,live.length,frame.thrown);
+      const valueKeys=objectKeys(values);
+      for (let keyIndex=0;keyIndex<valueKeys.length;keyIndex++) {
+        const key=valueKeys[keyIndex];
         const ref = +key;
-        if (!apply(arrayIncludes, live, [ref])) { delete values[ref]; if (ref < 8_000_000_000_000_000) free[free.length] = ref; }
+        if (!apply(arrayIncludes, live, [ref])) { delete values[ref]; if (ref < 8_000_000_000_000_000) define(free,free.length,ref); }
       }
       message = step(12, { state, frame });
     }
   }
   const globals = Object.create(globalThis);
+  const sourceGlobalObject = getPrototype(globals);
   define(globals, '__stringify', value => { try { return JSON.stringify(value); } catch { return undefined; } });
-  define(globals, '__strict', (op, args) => contexts.at(-1).strict(op, args));
+  define(globals, '__strict', (op, args) => contexts[contexts.length-1].strict(op, args));
   const exports = execute(0, [], globals, initialContext);
   return (name, args, context) => {
-    contexts.push(context);
+    define(contexts,contexts.length,context);
     try {
       if (!owns(exports, name)) throw context.fault();
       return args === undefined ? exports[name] : Reflect.apply(exports[name], undefined, args);
-    } finally { contexts.pop(); }
+    } finally { contexts.length-=1; }
   };
 }
 // Preserve the original module closure, including the public mutable candidate array.
