@@ -171,25 +171,25 @@ test('jobs.cjs: direct native policy fault is 502; lifecycle owner refuses befor
     let workerError, exercised = false;
     const finished = await jobs.run(id, async () => {
       try {
-      toVerifying(jobs, id, AUTHORITY);
-      const move = { from: 'verifying', to: 'reviewing', revision: 1, expectedArtifacts: ['test-report'] };
-      process.env.COMPLETENESS_REPORT_IMPL = 'js'; // retired: changes nothing
-      process.env.DAV_PARSE_WASM = path.join(dir, 'missing.wasm');
-      davParseWasm.reset();
-      const journal = path.join(dir, 'jobs', id + '.jsonl');
-      const before = fs.readFileSync(journal);
-      quietly(() => assert.throws(() => buildCompletenessReport({job:passingJob()}),
-        (e) => e.status === 502 && e.code === 'dav_parse_failed'));
-      // The actual append checks lifecycle ownership before completeness; retain that order.
-      quietly(() => assert.throws(() => jobs.append(id, 'task.stage', move, AUTHORITY),
-        (e) => e.status === 409 && /lifecycle could not be verified/.test(e.message)));
-      assert.deepEqual(fs.readFileSync(journal), before, 'fault wrote no journal bytes');
-      restore();
-      assert.equal(jobs.get(id).lifecycle, 'verifying', 'nothing was written');
-      const entered = jobs.append(id, 'task.stage', move, AUTHORITY);
-      assert.match(entered.data.reportHash, /^[0-9a-f]{64}$/);
-      exercised = true;
-      return { ok: true };
+        toVerifying(jobs, id, AUTHORITY);
+        const move = { from: 'verifying', to: 'reviewing', revision: 1, expectedArtifacts: ['test-report'] };
+        process.env.COMPLETENESS_REPORT_IMPL = 'js'; // retired: changes nothing
+        process.env.DAV_PARSE_WASM = path.join(dir, 'missing.wasm');
+        davParseWasm.reset();
+        const journal = path.join(dir, 'jobs', id + '.jsonl');
+        const before = fs.readFileSync(journal);
+        quietly(() => assert.throws(() => buildCompletenessReport({job:passingJob()}),
+          (e) => e.status === 502 && e.code === 'dav_parse_failed'));
+        // The actual append checks lifecycle ownership before completeness; retain that order.
+        quietly(() => assert.throws(() => jobs.append(id, 'task.stage', move, AUTHORITY),
+          (e) => e.status === 409 && /lifecycle could not be verified/.test(e.message)));
+        assert.deepEqual(fs.readFileSync(journal), before, 'fault wrote no journal bytes');
+        restore();
+        assert.equal(jobs.get(id).lifecycle, 'verifying', 'nothing was written');
+        const entered = jobs.append(id, 'task.stage', move, AUTHORITY);
+        assert.match(entered.data.reportHash, /^[0-9a-f]{64}$/);
+        exercised = true;
+        return { ok: true };
       } catch (error) { workerError = error; throw error; }
       finally { restore(); }
     });
