@@ -2,7 +2,8 @@
 const skipWasm = !require('node:fs').existsSync(process.env.DAV_PARSE_WASM || require('./dav-parse-wasm.cjs').DEFAULT_WASM) && process.env.DAV_PARSE_WASM_REQUIRED !== '1' && 'dav-parse.wasm not built';
 const test=require('node:test'),assert=require('node:assert/strict'),fs=require('node:fs'),os=require('node:os'),path=require('node:path');
 const {readSummaryWasm}=require('./gguf-meta.cjs');
-const {suggest,kvCacheBytes,parseMemoryLimit,CTX_CANDIDATES}=require('./llamacpp-autoconfig.cjs');
+const {suggest,estimateInputs,estimateFootprint,parseMemoryLimit,CTX_CANDIDATES}=require('./llamacpp-autoconfig.cjs');
+const {kvCacheBytes}=require('../tests/reference/llamacpp-autoconfig-js.cjs');
 const {createModelManager}=require('./model-manager.cjs');
 
 // Synthetic GGUF v3 writer: header only, no tensors.

@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 'use strict';
-// Regenerates the shared fixtures for LLAMACPP_AUTOCONFIG_IMPL: llamacpp-autoconfig.cjs's suggest,
+// Regenerates the shared fixtures from the checksum-pinned historical JavaScript oracle: suggest,
 // estimateInputs and estimateFootprint, and its cacheRamMibOf, isPromptCacheFree and
 // parseMemoryLimit. The same file is committed byte-for-byte in sbstndalton/noevia-rs
 // (crates/llamacpp-autoconfig/tests/fixtures/llamacpp-autoconfig.v1.json); noevia-core CI compares
@@ -22,7 +22,7 @@
 //   strict:  { op, wire }   the JS answers; the port refuses 'ambiguous'
 
 const path = require('node:path');
-const ac = require(path.join(__dirname, '..', 'server', 'llamacpp-autoconfig.cjs'));
+const ac = require(path.join(__dirname, '..', 'tests', 'reference', 'llamacpp-autoconfig-js.cjs'));
 
 const GIB = 1024 ** 3;
 const OPS = { 1: (a) => ac.suggestJs(a), 2: (a) => ac.estimateInputsJs(a), 3: (a) => ac.estimateFootprintJs(a),

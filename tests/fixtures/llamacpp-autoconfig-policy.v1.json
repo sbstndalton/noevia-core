@@ -1,0 +1,557 @@
+{
+  "version": 1,
+  "sourceOracleSha256": "66b436f5e2fda9719470fbc18bd92d7b1b52eb6e881885167cdbbebd02eaa040",
+  "fixtureSha256": "bd1d3e37dab082bfc1fb2cdcd37b5b0e5fbd0f846973f0d7afe2e031cff175a8",
+  "wasmSha256": "c5c300907dba8ed36b38bbfcd92dc33f18be77319712504106abb09d5b8ce05b",
+  "strictCount": 21,
+  "rows": [
+    {
+      "index": 0,
+      "op": 1,
+      "wire": "{\"meta\":{\"arch\":\"llama\",\"name\":\"synthetic\",\"contextLength\":5000.5,\"embeddingLength\":4096,\"blockCount\":32,\"headCount\":32,\"headCountKv\":8,\"keyLength\":null,\"valueLength\":null,\"keyLengthSwa\":null,\"valueLengthSwa\":null,\"slidingWindow\":null,\"slidingWindowPattern\":null,\"sharedKvLayers\":null,\"fullAttentionInterval\":null,\"ssmStateSize\":null,\"expertCount\":null,\"nextnPredictLayers\":null,\"hasChatTemplate\":true},\"modelBytes\":1073741824,\"budgetGib\":1000000}",
+      "result": {
+        "kind": "return",
+        "value": {
+          "error": "No settings suggested: the Rust sizing port did not confirm this suggestion and the JS one is not the smaller. Size the context manually and load-test it.",
+          "code": "autoconfig_impl",
+          "unverified": "impl_refused"
+        }
+      }
+    },
+    {
+      "index": 1,
+      "op": 1,
+      "wire": "{\"meta\":{\"arch\":\"llama\",\"name\":\"synthetic\",\"contextLength\":1152921504606847000,\"embeddingLength\":4096,\"blockCount\":32,\"headCount\":32,\"headCountKv\":8,\"keyLength\":null,\"valueLength\":null,\"keyLengthSwa\":null,\"valueLengthSwa\":null,\"slidingWindow\":null,\"slidingWindowPattern\":null,\"sharedKvLayers\":null,\"fullAttentionInterval\":null,\"ssmStateSize\":null,\"expertCount\":null,\"nextnPredictLayers\":null,\"hasChatTemplate\":true},\"modelBytes\":1073741824,\"budgetGib\":1000000}",
+      "result": {
+        "kind": "return",
+        "value": {
+          "error": "No settings suggested: the Rust sizing port did not confirm this suggestion and the JS one is not the smaller. Size the context manually and load-test it.",
+          "code": "autoconfig_impl",
+          "unverified": "impl_refused"
+        }
+      }
+    },
+    {
+      "index": 2,
+      "op": 1,
+      "wire": "{\"meta\":{\"arch\":\"llama\",\"name\":\"synthetic\",\"contextLength\":\"8192\",\"embeddingLength\":4096,\"blockCount\":32,\"headCount\":32,\"headCountKv\":8,\"keyLength\":null,\"valueLength\":null,\"keyLengthSwa\":null,\"valueLengthSwa\":null,\"slidingWindow\":null,\"slidingWindowPattern\":null,\"sharedKvLayers\":null,\"fullAttentionInterval\":null,\"ssmStateSize\":null,\"expertCount\":null,\"nextnPredictLayers\":null,\"hasChatTemplate\":true},\"modelBytes\":1073741824,\"budgetGib\":14}",
+      "result": {
+        "kind": "return",
+        "value": {
+          "error": "No settings suggested: the Rust sizing port did not confirm this suggestion and the JS one is not the smaller. Size the context manually and load-test it.",
+          "code": "autoconfig_impl",
+          "unverified": "impl_refused"
+        }
+      }
+    },
+    {
+      "index": 3,
+      "op": 1,
+      "wire": "{\"meta\":{\"arch\":\"llama\",\"name\":\"synthetic\",\"contextLength\":131072,\"embeddingLength\":4096,\"blockCount\":true,\"headCount\":32,\"headCountKv\":8,\"keyLength\":null,\"valueLength\":null,\"keyLengthSwa\":null,\"valueLengthSwa\":null,\"slidingWindow\":null,\"slidingWindowPattern\":null,\"sharedKvLayers\":null,\"fullAttentionInterval\":null,\"ssmStateSize\":null,\"expertCount\":null,\"nextnPredictLayers\":null,\"hasChatTemplate\":true},\"modelBytes\":1073741824,\"budgetGib\":14}",
+      "result": {
+        "kind": "return",
+        "value": {
+          "error": "No settings suggested: the Rust sizing port did not confirm this suggestion and the JS one is not the smaller. Size the context manually and load-test it.",
+          "code": "autoconfig_impl",
+          "unverified": "impl_refused"
+        }
+      }
+    },
+    {
+      "index": 4,
+      "op": 1,
+      "wire": "{\"meta\":{\"arch\":5,\"name\":\"synthetic\",\"contextLength\":131072,\"embeddingLength\":4096,\"blockCount\":32,\"headCount\":32,\"headCountKv\":8,\"keyLength\":null,\"valueLength\":null,\"keyLengthSwa\":null,\"valueLengthSwa\":null,\"slidingWindow\":null,\"slidingWindowPattern\":null,\"sharedKvLayers\":null,\"fullAttentionInterval\":null,\"ssmStateSize\":null,\"expertCount\":null,\"nextnPredictLayers\":null,\"hasChatTemplate\":true},\"modelBytes\":1073741824,\"budgetGib\":14}",
+      "result": {
+        "kind": "return",
+        "value": {
+          "error": "No settings suggested: the Rust sizing port did not confirm this suggestion and the JS one is not the smaller. Size the context manually and load-test it.",
+          "code": "autoconfig_impl",
+          "unverified": "impl_refused"
+        }
+      }
+    },
+    {
+      "index": 5,
+      "op": 1,
+      "wire": "{\"meta\":{\"arch\":\"llama\",\"name\":\"synthetic\",\"contextLength\":131072,\"embeddingLength\":4096,\"blockCount\":32,\"headCount\":32,\"headCountKv\":[[8]],\"keyLength\":null,\"valueLength\":null,\"keyLengthSwa\":null,\"valueLengthSwa\":null,\"slidingWindow\":null,\"slidingWindowPattern\":null,\"sharedKvLayers\":null,\"fullAttentionInterval\":null,\"ssmStateSize\":null,\"expertCount\":null,\"nextnPredictLayers\":null,\"hasChatTemplate\":true},\"modelBytes\":1073741824,\"budgetGib\":14}",
+      "result": {
+        "kind": "return",
+        "value": {
+          "error": "No settings suggested: the Rust sizing port did not confirm this suggestion and the JS one is not the smaller. Size the context manually and load-test it.",
+          "code": "autoconfig_impl",
+          "unverified": "impl_refused"
+        }
+      }
+    },
+    {
+      "index": 6,
+      "op": 1,
+      "wire": "{\"meta\":{\"arch\":\"llama\",\"name\":\"synthetic\",\"contextLength\":131072,\"embeddingLength\":4096,\"blockCount\":2,\"headCount\":32,\"headCountKv\":8,\"keyLength\":null,\"valueLength\":null,\"keyLengthSwa\":null,\"valueLengthSwa\":null,\"slidingWindow\":64,\"slidingWindowPattern\":[{},true],\"sharedKvLayers\":null,\"fullAttentionInterval\":null,\"ssmStateSize\":null,\"expertCount\":null,\"nextnPredictLayers\":null,\"hasChatTemplate\":true},\"modelBytes\":1073741824,\"budgetGib\":14}",
+      "result": {
+        "kind": "return",
+        "value": {
+          "error": "No settings suggested: the Rust sizing port did not confirm this suggestion and the JS one is not the smaller. Size the context manually and load-test it.",
+          "code": "autoconfig_impl",
+          "unverified": "impl_refused"
+        }
+      }
+    },
+    {
+      "index": 7,
+      "op": 1,
+      "wire": "{\"meta\":{\"arch\":\"llama\",\"name\":\"synthetic\",\"contextLength\":131072,\"embeddingLength\":4096,\"blockCount\":32,\"headCount\":32,\"headCountKv\":8,\"keyLength\":null,\"valueLength\":null,\"keyLengthSwa\":null,\"valueLengthSwa\":null,\"slidingWindow\":null,\"slidingWindowPattern\":null,\"sharedKvLayers\":null,\"fullAttentionInterval\":null,\"ssmStateSize\":null,\"expertCount\":null,\"nextnPredictLayers\":null,\"hasChatTemplate\":true},\"modelBytes\":[1073741824],\"budgetGib\":14}",
+      "result": {
+        "kind": "return",
+        "value": {
+          "error": "No settings suggested: the Rust sizing port did not confirm this suggestion and the JS one is not the smaller. Size the context manually and load-test it.",
+          "code": "autoconfig_impl",
+          "unverified": "impl_refused"
+        }
+      }
+    },
+    {
+      "index": 8,
+      "op": 1,
+      "wire": "{\"meta\":{\"arch\":\"llama\",\"name\":\"synthetic\",\"contextLength\":131072,\"embeddingLength\":4096,\"blockCount\":32,\"headCount\":32,\"headCountKv\":8,\"keyLength\":null,\"valueLength\":null,\"keyLengthSwa\":null,\"valueLengthSwa\":null,\"slidingWindow\":null,\"slidingWindowPattern\":null,\"sharedKvLayers\":null,\"fullAttentionInterval\":null,\"ssmStateSize\":null,\"expertCount\":null,\"nextnPredictLayers\":null,\"hasChatTemplate\":true},\"modelBytes\":1073741824,\"budgetGib\":{\"v\":14}}",
+      "result": {
+        "kind": "return",
+        "value": {
+          "error": "No inference memory budget is configured to size against."
+        }
+      }
+    },
+    {
+      "index": 9,
+      "op": 1,
+      "wire": "{\"meta\":{\"arch\":\"llama\",\"name\":\"synthetic\",\"contextLength\":131072,\"embeddingLength\":4096,\"blockCount\":32,\"headCount\":32,\"headCountKv\":8,\"keyLength\":null,\"valueLength\":null,\"keyLengthSwa\":null,\"valueLengthSwa\":null,\"slidingWindow\":null,\"slidingWindowPattern\":null,\"sharedKvLayers\":null,\"fullAttentionInterval\":null,\"ssmStateSize\":null,\"expertCount\":null,\"nextnPredictLayers\":null,\"hasChatTemplate\":true},\"modelBytes\":1073741824,\"mmprojBytes\":1073741824,\"budgetGib\":14,\"current\":{\"ubatch-size\":[\"2048\"]}}",
+      "result": {
+        "kind": "return",
+        "value": {
+          "error": "No settings suggested: the Rust sizing port did not confirm this suggestion and the JS one is not the smaller. Size the context manually and load-test it.",
+          "code": "autoconfig_impl",
+          "unverified": "impl_refused"
+        }
+      }
+    },
+    {
+      "index": 10,
+      "op": 1,
+      "wire": "{\"meta\":{\"arch\":\"llama\",\"name\":\"synthetic\",\"contextLength\":131072,\"embeddingLength\":4096,\"blockCount\":32,\"headCount\":32,\"headCountKv\":8,\"keyLength\":null,\"valueLength\":null,\"keyLengthSwa\":null,\"valueLengthSwa\":null,\"slidingWindow\":null,\"slidingWindowPattern\":null,\"sharedKvLayers\":null,\"fullAttentionInterval\":null,\"ssmStateSize\":null,\"expertCount\":null,\"nextnPredictLayers\":null,\"hasChatTemplate\":true},\"modelBytes\":1073741824,\"budgetGib\":14,\"cacheRamMaxMib\":[1024]}",
+      "result": {
+        "kind": "return",
+        "value": {
+          "error": "No settings suggested: the Rust sizing port did not confirm this suggestion and the JS one is not the smaller. Size the context manually and load-test it.",
+          "code": "autoconfig_impl",
+          "unverified": "impl_refused"
+        }
+      }
+    },
+    {
+      "index": 11,
+      "op": 1,
+      "wire": "{\"meta\":{\"arch\":\"llama\",\"name\":\"synthetic\",\"contextLength\":131072,\"embeddingLength\":4096,\"blockCount\":5000,\"headCount\":32,\"headCountKv\":8,\"keyLength\":null,\"valueLength\":null,\"keyLengthSwa\":null,\"valueLengthSwa\":null,\"slidingWindow\":64,\"slidingWindowPattern\":[false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,true],\"sharedKvLayers\":null,\"fullAttentionInterval\":null,\"ssmStateSize\":null,\"expertCount\":null,\"nextnPredictLayers\":null,\"hasChatTemplate\":true},\"modelBytes\":1073741824,\"budgetGib\":14}",
+      "result": {
+        "kind": "return",
+        "value": {
+          "error": "This model needs about 3.1 GiB before any context, more than the 14 GiB budget. Use a smaller quantization.",
+          "rows": [
+            {
+              "ctx": 4096,
+              "modelGib": 1,
+              "kvGib": 41.5,
+              "extraGib": 1,
+              "cacheRamGib": 1,
+              "totalGib": 46.67,
+              "fits": false
+            },
+            {
+              "ctx": 8192,
+              "modelGib": 1,
+              "kvGib": 82.99,
+              "extraGib": 1,
+              "cacheRamGib": 1,
+              "totalGib": 90.24,
+              "fits": false
+            },
+            {
+              "ctx": 12288,
+              "modelGib": 1,
+              "kvGib": 124.49,
+              "extraGib": 1,
+              "cacheRamGib": 1,
+              "totalGib": 133.81,
+              "fits": false
+            },
+            {
+              "ctx": 16384,
+              "modelGib": 1,
+              "kvGib": 165.98,
+              "extraGib": 1,
+              "cacheRamGib": 1,
+              "totalGib": 177.38,
+              "fits": false
+            },
+            {
+              "ctx": 24576,
+              "modelGib": 1,
+              "kvGib": 248.97,
+              "extraGib": 1,
+              "cacheRamGib": 1,
+              "totalGib": 264.52,
+              "fits": false
+            },
+            {
+              "ctx": 32768,
+              "modelGib": 1,
+              "kvGib": 331.96,
+              "extraGib": 1,
+              "cacheRamGib": 1,
+              "totalGib": 351.66,
+              "fits": false
+            },
+            {
+              "ctx": 40960,
+              "modelGib": 1,
+              "kvGib": 414.96,
+              "extraGib": 1,
+              "cacheRamGib": 1,
+              "totalGib": 438.8,
+              "fits": false
+            },
+            {
+              "ctx": 49152,
+              "modelGib": 1,
+              "kvGib": 497.95,
+              "extraGib": 1,
+              "cacheRamGib": 1,
+              "totalGib": 525.94,
+              "fits": false
+            },
+            {
+              "ctx": 57344,
+              "modelGib": 1,
+              "kvGib": 580.94,
+              "extraGib": 1,
+              "cacheRamGib": 1,
+              "totalGib": 613.09,
+              "fits": false
+            },
+            {
+              "ctx": 65536,
+              "modelGib": 1,
+              "kvGib": 663.93,
+              "extraGib": 1,
+              "cacheRamGib": 1,
+              "totalGib": 700.23,
+              "fits": false
+            },
+            {
+              "ctx": 73728,
+              "modelGib": 1,
+              "kvGib": 746.92,
+              "extraGib": 1,
+              "cacheRamGib": 1,
+              "totalGib": 787.37,
+              "fits": false
+            },
+            {
+              "ctx": 81920,
+              "modelGib": 1,
+              "kvGib": 829.91,
+              "extraGib": 1,
+              "cacheRamGib": 1,
+              "totalGib": 874.51,
+              "fits": false
+            },
+            {
+              "ctx": 90112,
+              "modelGib": 1,
+              "kvGib": 912.9,
+              "extraGib": 1,
+              "cacheRamGib": 1,
+              "totalGib": 961.65,
+              "fits": false
+            },
+            {
+              "ctx": 98304,
+              "modelGib": 1,
+              "kvGib": 995.89,
+              "extraGib": 1,
+              "cacheRamGib": 1,
+              "totalGib": 1048.79,
+              "fits": false
+            },
+            {
+              "ctx": 106496,
+              "modelGib": 1,
+              "kvGib": 1078.89,
+              "extraGib": 1,
+              "cacheRamGib": 1,
+              "totalGib": 1135.93,
+              "fits": false
+            },
+            {
+              "ctx": 114688,
+              "modelGib": 1,
+              "kvGib": 1161.88,
+              "extraGib": 1,
+              "cacheRamGib": 1,
+              "totalGib": 1223.07,
+              "fits": false
+            },
+            {
+              "ctx": 122880,
+              "modelGib": 1,
+              "kvGib": 1244.87,
+              "extraGib": 1,
+              "cacheRamGib": 1,
+              "totalGib": 1310.21,
+              "fits": false
+            },
+            {
+              "ctx": 131072,
+              "modelGib": 1,
+              "kvGib": 1327.86,
+              "extraGib": 1,
+              "cacheRamGib": 1,
+              "totalGib": 1397.35,
+              "fits": false
+            }
+          ],
+          "budgetGib": 14
+        }
+      }
+    },
+    {
+      "index": 12,
+      "op": 2,
+      "wire": "{\"meta\":{\"arch\":\"llama\",\"name\":\"synthetic\",\"contextLength\":131072,\"embeddingLength\":4096,\"blockCount\":32,\"headCount\":32,\"headCountKv\":8,\"keyLength\":null,\"valueLength\":null,\"keyLengthSwa\":null,\"valueLengthSwa\":null,\"slidingWindow\":null,\"slidingWindowPattern\":null,\"sharedKvLayers\":null,\"fullAttentionInterval\":null,\"ssmStateSize\":null,\"expertCount\":null,\"nextnPredictLayers\":null,\"hasChatTemplate\":true},\"current\":{\"cache-ram\":[\"1\"]}}",
+      "result": {
+        "kind": "throw",
+        "name": "AutoconfigImplError",
+        "code": "autoconfig_impl",
+        "status": 503,
+        "message": "the memory estimate (Will it fit?) could not be confirmed by the Rust sizing port, and the JS estimate is not the larger one."
+      }
+    },
+    {
+      "index": 13,
+      "op": 2,
+      "wire": "{\"meta\":{\"arch\":\"llama\",\"name\":\"synthetic\",\"contextLength\":131072,\"embeddingLength\":4096,\"blockCount\":32,\"headCount\":32,\"headCountKv\":8,\"keyLength\":null,\"valueLength\":null,\"keyLengthSwa\":null,\"valueLengthSwa\":null,\"slidingWindow\":null,\"slidingWindowPattern\":null,\"sharedKvLayers\":null,\"fullAttentionInterval\":null,\"ssmStateSize\":null,\"expertCount\":null,\"nextnPredictLayers\":null,\"hasChatTemplate\":true},\"current\":{\"ctx-size\":{\"n\":1}}}",
+      "result": {
+        "kind": "throw",
+        "name": "AutoconfigImplError",
+        "code": "autoconfig_impl",
+        "status": 503,
+        "message": "the memory estimate (Will it fit?) could not be confirmed by the Rust sizing port, and the JS estimate is not the larger one."
+      }
+    },
+    {
+      "index": 14,
+      "op": 3,
+      "wire": "{\"meta\":{\"arch\":\"llama\",\"name\":\"synthetic\",\"contextLength\":131072,\"embeddingLength\":4096,\"blockCount\":32,\"headCount\":32,\"headCountKv\":8,\"keyLength\":null,\"valueLength\":null,\"keyLengthSwa\":null,\"valueLengthSwa\":null,\"slidingWindow\":null,\"slidingWindowPattern\":null,\"sharedKvLayers\":null,\"fullAttentionInterval\":null,\"ssmStateSize\":null,\"expertCount\":null,\"nextnPredictLayers\":null,\"hasChatTemplate\":true},\"options\":{\"cache-type-k\":[\"q8_0\"]}}",
+      "result": {
+        "kind": "throw",
+        "name": "AutoconfigImplError",
+        "code": "autoconfig_impl",
+        "status": 503,
+        "message": "the memory estimate (load footprint) could not be confirmed by the Rust sizing port, and the JS estimate is not the larger one."
+      }
+    },
+    {
+      "index": 15,
+      "op": 3,
+      "wire": "{\"meta\":{\"arch\":\"llama\",\"name\":\"synthetic\",\"contextLength\":131072,\"embeddingLength\":4096,\"blockCount\":32,\"headCount\":32,\"headCountKv\":8,\"keyLength\":null,\"valueLength\":null,\"keyLengthSwa\":null,\"valueLengthSwa\":null,\"slidingWindow\":null,\"slidingWindowPattern\":null,\"sharedKvLayers\":null,\"fullAttentionInterval\":null,\"ssmStateSize\":null,\"expertCount\":null,\"nextnPredictLayers\":null,\"hasChatTemplate\":true},\"options\":{},\"model\":[\"embed\"]}",
+      "result": {
+        "kind": "throw",
+        "name": "AutoconfigImplError",
+        "code": "autoconfig_impl",
+        "status": 503,
+        "message": "the memory estimate (load footprint) could not be confirmed by the Rust sizing port, and the JS estimate is not the larger one."
+      }
+    },
+    {
+      "index": 16,
+      "op": 3,
+      "wire": "{\"meta\":{\"arch\":\"llama\",\"name\":\"synthetic\",\"contextLength\":131072,\"embeddingLength\":4096,\"blockCount\":32,\"headCount\":32,\"headCountKv\":8,\"keyLength\":null,\"valueLength\":null,\"keyLengthSwa\":null,\"valueLengthSwa\":null,\"slidingWindow\":null,\"slidingWindowPattern\":null,\"sharedKvLayers\":null,\"fullAttentionInterval\":null,\"ssmStateSize\":null,\"expertCount\":null,\"nextnPredictLayers\":null,\"hasChatTemplate\":true},\"options\":{\"cache-ram\":\"0xffffffffffffffffffffffffffffffffffffffff\"}}",
+      "result": {
+        "kind": "throw",
+        "name": "AutoconfigImplError",
+        "code": "autoconfig_impl",
+        "status": 503,
+        "message": "the memory estimate (load footprint) could not be confirmed by the Rust sizing port, and the JS estimate is not the larger one."
+      }
+    },
+    {
+      "index": 17,
+      "op": 4,
+      "wire": "{\"value\":[\"1\"]}",
+      "result": {
+        "kind": "throw",
+        "name": "TypeError",
+        "message": "fn is not a function"
+      }
+    },
+    {
+      "index": 18,
+      "op": 4,
+      "wire": "{\"value\":\"0x111111111111111111111111111111111\"}",
+      "result": {
+        "kind": "throw",
+        "name": "TypeError",
+        "message": "fn is not a function"
+      }
+    },
+    {
+      "index": 19,
+      "op": 5,
+      "wire": "{\"model\":\"x\",\"options\":{\"embedding\":[]}}",
+      "result": {
+        "kind": "throw",
+        "name": "TypeError",
+        "message": "fn is not a function"
+      }
+    },
+    {
+      "index": 20,
+      "op": 6,
+      "wire": "{\"value\":[16]}",
+      "result": {
+        "kind": "throw",
+        "name": "TypeError",
+        "message": "fn is not a function"
+      }
+    }
+  ],
+  "rawNumberCount": 6,
+  "rawNumberRows": [
+    {
+      "name": "suggest-budget-nan",
+      "op": 1,
+      "wire": "{\"meta\":{\"arch\":\"llama\",\"contextLength\":131072,\"embeddingLength\":4096,\"blockCount\":32,\"headCount\":32,\"headCountKv\":8,\"hasChatTemplate\":true},\"modelBytes\":1073741824,\"budgetGib\":null,\"current\":{\"ctx-size\":null}}",
+      "numbers": [
+        {
+          "path": [
+            "budgetGib"
+          ],
+          "kind": "nan"
+        },
+        {
+          "path": [
+            "current",
+            "ctx-size"
+          ],
+          "kind": "nan"
+        }
+      ],
+      "result": {
+        "kind": "return",
+        "json": "{\"error\":\"No inference memory budget is configured to size against.\"}"
+      }
+    },
+    {
+      "name": "inputs-modelbytes-nan",
+      "op": 2,
+      "wire": "{\"meta\":{\"arch\":\"llama\",\"contextLength\":131072,\"embeddingLength\":4096,\"blockCount\":32,\"headCount\":32,\"headCountKv\":8,\"hasChatTemplate\":true},\"modelBytes\":null,\"current\":{\"ctx-size\":null,\"ubatch-size\":null}}",
+      "numbers": [
+        {
+          "path": [
+            "modelBytes"
+          ],
+          "kind": "nan"
+        },
+        {
+          "path": [
+            "current",
+            "ctx-size"
+          ],
+          "kind": "positive-infinity"
+        },
+        {
+          "path": [
+            "current",
+            "ubatch-size"
+          ],
+          "kind": "negative-infinity"
+        }
+      ],
+      "result": {
+        "kind": "throw",
+        "name": "AutoconfigImplError",
+        "code": "autoconfig_impl",
+        "status": 503,
+        "message": "the memory estimate (Will it fit?) could not be confirmed by the Rust sizing port, and the JS estimate is not the larger one."
+      }
+    },
+    {
+      "name": "footprint-context-infinity",
+      "op": 3,
+      "wire": "{\"meta\":{\"arch\":\"llama\",\"contextLength\":131072,\"embeddingLength\":4096,\"blockCount\":32,\"headCount\":32,\"headCountKv\":8,\"hasChatTemplate\":true},\"modelBytes\":1073741824,\"options\":{\"ctx-size\":null,\"cache-ram\":\"1024\"}}",
+      "numbers": [
+        {
+          "path": [
+            "options",
+            "ctx-size"
+          ],
+          "kind": "positive-infinity"
+        }
+      ],
+      "result": {
+        "kind": "throw",
+        "name": "AutoconfigImplError",
+        "code": "autoconfig_impl",
+        "status": 503,
+        "message": "the memory estimate (load footprint) could not be confirmed by the Rust sizing port, and the JS estimate is not the larger one."
+      }
+    },
+    {
+      "name": "footprint-cache-unbounded-nan-context",
+      "op": 3,
+      "wire": "{\"meta\":{\"arch\":\"llama\",\"contextLength\":131072,\"embeddingLength\":4096,\"blockCount\":32,\"headCount\":32,\"headCountKv\":8,\"hasChatTemplate\":true},\"modelBytes\":1073741824,\"options\":{\"cache-ram\":-1,\"ctx-size\":null}}",
+      "numbers": [
+        {
+          "path": [
+            "options",
+            "ctx-size"
+          ],
+          "kind": "nan"
+        }
+      ],
+      "result": {
+        "kind": "return",
+        "json": "{\"ctx\":131072,\"modelGib\":1,\"kvGib\":16,\"extraGib\":1,\"cacheRamGib\":null,\"cacheRamUnbounded\":true,\"totalGib\":null,\"sizeable\":true}"
+      }
+    },
+    {
+      "name": "footprint-nan-cache-scale",
+      "op": 3,
+      "wire": "{\"meta\":{\"arch\":\"llama\",\"contextLength\":131072,\"embeddingLength\":4096,\"blockCount\":32,\"headCount\":32,\"headCountKv\":8,\"hasChatTemplate\":true},\"modelBytes\":1073741824,\"options\":{\"cache-type-k\":\"constructor\"}}",
+      "numbers": [],
+      "result": {
+        "kind": "return",
+        "json": "{\"ctx\":131072,\"modelGib\":1,\"kvGib\":null,\"extraGib\":1,\"cacheRamGib\":8,\"cacheRamUnbounded\":false,\"totalGib\":null,\"sizeable\":true}"
+      }
+    },
+    {
+      "name": "footprint-context-negative-infinity",
+      "op": 3,
+      "wire": "{\"meta\":{\"arch\":\"llama\",\"contextLength\":131072,\"embeddingLength\":4096,\"blockCount\":32,\"headCount\":32,\"headCountKv\":8,\"hasChatTemplate\":true},\"modelBytes\":1073741824,\"options\":{\"ctx-size\":null,\"cache-ram\":\"1024\"}}",
+      "numbers": [
+        {
+          "path": [
+            "options",
+            "ctx-size"
+          ],
+          "kind": "negative-infinity"
+        }
+      ],
+      "result": {
+        "kind": "throw",
+        "name": "AutoconfigImplError",
+        "code": "autoconfig_impl",
+        "status": 503,
+        "message": "the memory estimate (load footprint) could not be confirmed by the Rust sizing port, and the JS estimate is not the larger one."
+      }
+    }
+  ]
+}

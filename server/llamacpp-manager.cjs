@@ -499,8 +499,8 @@ function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloa
     if (!(budgetGib > 0)) return null;
     const held = quarantineRefusal(model, budgetGib);
     if (held) return held;
-    // Rust confirmation (LLAMACPP_AUTOCONFIG_IMPL, retired in #1071): an estimate the Rust port could not confirm (and the JS one not
-    // the larger) refuses the load; any other failure is "no estimate", as before.
+    // The Rust-owned estimator returns either its confirmed footprint or a fail-closed 503;
+    // unrelated sizing-source failures still mean no estimate, as before.
     let est;
     try { est = await footprint(model); } catch (err) {
       if (err?.code !== 'autoconfig_impl') est = null;

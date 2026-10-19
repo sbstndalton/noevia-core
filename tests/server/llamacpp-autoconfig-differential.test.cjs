@@ -1,11 +1,11 @@
 'use strict';
 
-// llama.cpp autoconfig (LLAMACPP_AUTOCONFIG_IMPL, retired in #1071: the port always confirms the JS): tests/fixtures/llamacpp-autoconfig.v1.json (byte-identical to noevia-rs
+// llama.cpp autoconfig authority retirement: Rust now owns suggestion and estimate decisions. tests/fixtures/llamacpp-autoconfig.v1.json (byte-identical to noevia-rs
 // crates/llamacpp-autoconfig/tests/fixtures/; CI compares them) holds llamacpp-autoconfig.cjs's
 // answers (suggest, estimateInputs, estimateFootprint and the helpers) as the exact replies the Rust
 // port must give, printed by tools/gen-llamacpp-autoconfig-fixtures.cjs from the JS itself
 // (synthetic model metadata; nothing is read from disk and no model is loaded). Here every row runs
-// through dav-parse.wasm's llamacpp_autoconfig and through the switched functions; then seeded
+// through dav-parse.wasm's llamacpp_autoconfig and through the Rust policy operations; then seeded
 // arguments built in memory the way llamacpp-manager.cjs builds them (undefined members, numbers
 // and odd strings in preset options): the switch returns the JS answer and never settings or an
 // estimate the JS would not give. The WebAssembly half needs server/wasm/dav-parse.wasm (or
@@ -14,20 +14,24 @@
 const assert = require('node:assert/strict');
 const { execFileSync } = require('node:child_process');
 const fs = require('node:fs');
+const crypto = require('node:crypto');
 const path = require('node:path');
 const test = require('node:test');
 
 const davParseWasm = require('../../server/dav-parse-wasm.cjs');
 const ac = require('../../server/llamacpp-autoconfig.cjs');
+const oracle = require('../reference/llamacpp-autoconfig-js.cjs');
 
 const FILE = path.join(__dirname, '../fixtures/llamacpp-autoconfig.v1.json');
 const GENERATOR = path.join(__dirname, '../../tools/gen-llamacpp-autoconfig-fixtures.cjs');
 const fixtures = JSON.parse(fs.readFileSync(FILE, 'utf8'));
+const policyFixtures = JSON.parse(fs.readFileSync(path.join(__dirname, '../fixtures/llamacpp-autoconfig-policy.v1.json'), 'utf8'));
+const ORACLE_SHA256 = '66b436f5e2fda9719470fbc18bd92d7b1b52eb6e881885167cdbbebd02eaa040';
 const wasmFile = process.env.DAV_PARSE_WASM || davParseWasm.DEFAULT_WASM;
 const skipWasm = !fs.existsSync(wasmFile) && process.env.DAV_PARSE_WASM_REQUIRED !== '1' && 'dav-parse.wasm not built';
-const WASM = {};
+const WASM = { wasmLoader: () => davParseWasm };
 const SWITCHED = { 1: ac.suggest, 2: ac.estimateInputs, 3: ac.estimateFootprint };
-const JS = { 1: ac.suggestJs, 2: ac.estimateInputsJs, 3: ac.estimateFootprintJs };
+const JS = { 1: oracle.suggestJs, 2: oracle.estimateInputsJs, 3: oracle.estimateFootprintJs };
 const GIB = 1024 ** 3;
 
 function quiet(fn) {
@@ -35,12 +39,19 @@ function quiet(fn) {
   try { return fn(); } finally { console.warn = warn; }
 }
 
+test('the frozen JavaScript oracle remains byte-bound and generates the original fixture answers', () => {
+  const oraclePath = path.join(__dirname, '../reference/llamacpp-autoconfig-js.cjs');
+  assert.equal(crypto.createHash('sha256').update(fs.readFileSync(oraclePath)).digest('hex'), ORACLE_SHA256);
+  assert.equal(policyFixtures.sourceOracleSha256, ORACLE_SHA256);
+  assert.equal(policyFixtures.strictCount, fixtures.strict.length);
+});
+
 test('the fixture file is what the generator prints', { skip: !fs.existsSync(GENERATOR) && 'no generator here' }, () => {
   const out = execFileSync(process.execPath, [GENERATOR], { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
   assert.equal(out, fs.readFileSync(FILE, 'utf8'));
 });
 
-test('answer rows: the exact reply through the port; the switch returns the JS answer', { skip: skipWasm }, () => {
+test('normal rows keep their original replies through the Rust-owned host API', { skip: skipWasm }, () => {
   for (const [key, op, min] of [['suggest', 1, 500], ['inputs', 2, 150], ['footprint', 3, 400]]) {
     assert.ok(fixtures[key].length >= min, key);
     for (const [i, row] of fixtures[key].entries()) {
@@ -55,30 +66,28 @@ test('answer rows: the exact reply through the port; the switch returns the JS a
   }
 });
 
-test('throws rows are refused as input (the JS throws, so the port is never asked); strict rows as ambiguous, and the switch is never more permissive', { skip: skipWasm }, () => {
+test('autotune footprint API matches the frozen estimate for every footprint fixture', { skip: skipWasm }, () => {
+  for (const [i, row] of fixtures.footprint.entries()) {
+    const args = JSON.parse(row.wire);
+    assert.deepEqual(ac.estimateFootprintForAutotune(args, WASM), oracle.estimateFootprintJs(args), `autotune row ${i}`);
+  }
+});
+
+test('throws stay input errors; strict policy results match the frozen pre-retirement host outcomes', { skip: skipWasm }, () => {
   for (const [i, row] of fixtures.throws.entries()) {
     const args = JSON.parse(row.wire);
     assert.throws(() => davParseWasm.llamacppAutoconfig(row.op, args), (e) => e.reason === 'input', `throws row ${i}`);
-    if (SWITCHED[row.op]) {
-      let asked = false;
-      assert.throws(() => SWITCHED[row.op](args, { wasmLoader: () => { asked = true; return davParseWasm; } }), `throws row ${i}: the JS throws`);
-      assert.equal(asked, false);
-    }
   }
-  quiet(() => {
-    for (const [i, row] of fixtures.strict.entries()) {
-      const args = JSON.parse(row.wire);
-      assert.throws(() => davParseWasm.llamacppAutoconfig(row.op, args), (e) => e.reason === 'ambiguous', `strict row ${i}`);
-      if (!SWITCHED[row.op]) continue;
-      const js = JS[row.op](args);
-      let got;
-      try { got = SWITCHED[row.op](args, WASM); } catch (err) { assert.equal(err.code, 'autoconfig_impl', `strict row ${i}`); continue; }
-      if (row.op === 1 && got.code === 'autoconfig_impl') { assert.equal(got.values, undefined); continue; }
-      assert.deepEqual(got, js, `strict row ${i}: only the conservative JS answer passes`);
-      if (row.op === 1) assert.ok(js.error !== undefined, 'a refused port never lets JS settings through');
-      if (row.op === 3) assert.ok(js.cacheRamUnbounded || Number.isNaN(js.totalGib), 'only a JS estimate that refuses the load');
-    }
-  });
+  const SWITCHED_BY_OP = { 1: ac.suggest, 2: ac.estimateInputs, 3: ac.estimateFootprint };
+  for (const row of policyFixtures.rows) {
+    const fn = SWITCHED_BY_OP[row.op];
+    const args = JSON.parse(row.wire);
+    const capture = () => {
+      try { return { kind: 'return', value: fn(args, WASM) }; }
+      catch (err) { return { kind: 'throw', name: err.name, code: err.code, status: err.status, message: err.message }; }
+    };
+    assert.deepEqual(capture(), row.result, `strict host outcome row ${row.index}`);
+  }
 });
 
 // Arguments as llamacpp-manager.cjs builds them: summarize() metadata, file sizes, the preset's
@@ -143,7 +152,7 @@ test('seeded live arguments: the port agrees with this runtime\'s JS on every JS
         let got;
         try { got = SWITCHED[op](args, WASM); } catch (err) { assert.equal(err.code, 'autoconfig_impl'); continue; }
         if (op === 1 && got.code === 'autoconfig_impl') { assert.equal(got.values, undefined); continue; }
-        assert.deepEqual(got, js);
+        assert.equal(JSON.stringify(got), JSON.stringify(js));
         agreed++;
         if (op === 1 && js.values) values++;
       }
@@ -154,20 +163,39 @@ test('seeded live arguments: the port agrees with this runtime\'s JS on every JS
   assert.ok(values >= 100, `suggestions with settings: ${values}`);
 });
 
-test('values JSON cannot carry: the switch keeps the JS answer only when it is the conservative one', { skip: skipWasm }, () => {
+test('typed non-finite inputs preserve checksum-frozen old host outcomes and module faults fail closed', { skip: skipWasm }, () => {
   const meta = { arch: 'llama', contextLength: 131072, embeddingLength: 4096, blockCount: 32, headCount: 32, headCountKv: 8, hasChatTemplate: true };
-  quiet(() => {
-    // ctx-size Infinity (a number): the JS sizes an infinite KV cache, the wire says null.
-    const inf = { meta, modelBytes: GIB, options: { 'ctx-size': Infinity, 'cache-ram': '1024' } };
-    const js = ac.estimateFootprintJs(inf);
-    assert.equal(js.totalGib, null);
-    assert.throws(() => ac.estimateFootprint(inf, WASM), (e) => e.code === 'autoconfig_impl', 'an Infinity total is never handed out unconfirmed');
-    // cache-ram -1 as a number: the JS estimate refuses any load, so it may stand.
-    const open = { meta, modelBytes: GIB, options: { 'cache-ram': -1, 'ctx-size': NaN } };
-    assert.deepEqual(ac.estimateFootprint(open, WASM), ac.estimateFootprintJs(open));
-    // A BigInt cannot be serialised at all: the port gives no answer, the JS settings are withheld.
-    const big = { meta, modelBytes: GIB, budgetGib: 14, current: { 'batch-size': 10n } };
-    const s = ac.suggest(big, WASM);
-    assert.equal(s.code, 'autoconfig_impl'); assert.equal(s.values, undefined);
-  });
+  const capture = fn => { try { const value = fn(); return { kind: 'return', json: JSON.stringify(value) }; } catch (error) { return { kind: 'throw', name: error.name, code: error.code, status: error.status, message: error.message }; } };
+  const cases = [
+    ['suggest-budget-nan', 1, { meta, modelBytes: GIB, budgetGib: NaN, current: { 'ctx-size': NaN } }],
+    ['inputs-modelbytes-nan', 2, { meta, modelBytes: NaN, current: { 'ctx-size': Infinity, 'ubatch-size': -Infinity } }],
+    ['footprint-context-infinity', 3, { meta, modelBytes: GIB, options: { 'ctx-size': Infinity, 'cache-ram': '1024' } }],
+    ['footprint-cache-unbounded-nan-context', 3, { meta, modelBytes: GIB, options: { 'cache-ram': -1, 'ctx-size': NaN } }],
+    ['footprint-nan-cache-scale', 3, { meta, modelBytes: GIB, options: { 'cache-type-k': 'constructor' } }],
+    ['footprint-context-negative-infinity', 3, { meta, modelBytes: GIB, options: { 'ctx-size': -Infinity, 'cache-ram': '1024' } }],
+  ];
+  assert.equal(policyFixtures.rawNumberCount, policyFixtures.rawNumberRows.length);
+  for (const [name, op, args] of cases) {
+    const fixture = policyFixtures.rawNumberRows.find(row => row.name === name);
+    assert.ok(fixture, `${name} has a frozen old-host answer`);
+    assert.equal(fixture.op, op);
+    const oldHost = capture(() => ({ 1: oracle.suggest, 2: oracle.estimateInputs, 3: oracle.estimateFootprint })[op](args, WASM));
+    const nativeHost = capture(() => SWITCHED[op](args, WASM));
+    assert.deepEqual(oldHost, fixture.result, `${name}: oracle still matches its checked-in result`);
+    assert.deepEqual(nativeHost, fixture.result, `${name}: Rust-owned API preserves the old wire result`);
+  }
+  const big = { meta, modelBytes: GIB, budgetGib: 14, current: { 'batch-size': 10n } };
+  const oldSuggestion = capture(() => oracle.suggest(big, WASM));
+  const nativeSuggestion = capture(() => ac.suggest(big, WASM));
+  assert.deepEqual(nativeSuggestion, oldSuggestion);
+});
+
+test('the Rust-owned estimator preserves old unbounded-cache behavior beyond the strict pattern cap', { skip: skipWasm }, () => {
+  const meta = { arch: 'llama', contextLength: 8192, embeddingLength: 4096, blockCount: 32, headCount: 32, headCountKv: 8, slidingWindow: 4096, slidingWindowPattern: Array.from({ length: 5000 }, (_, i) => i % 3 !== 0) };
+  const args = { meta, modelBytes: GIB, options: { 'ctx-size': 8192, 'cache-ram': -1 } };
+  const old = oracle.estimateFootprint(args, WASM);
+  const got = ac.estimateFootprint(args, WASM);
+  assert.equal(JSON.stringify(got), JSON.stringify(old));
+  assert.equal(got.cacheRamUnbounded, true);
+  assert.equal(ac.estimateFootprintForAutotune(args, WASM).cacheRamUnbounded, true);
 });

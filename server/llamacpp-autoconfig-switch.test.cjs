@@ -1,217 +1,65 @@
 'use strict';
-const skipWasm = !require('node:fs').existsSync(process.env.DAV_PARSE_WASM || require('./dav-parse-wasm.cjs').DEFAULT_WASM) && process.env.DAV_PARSE_WASM_REQUIRED !== '1' && 'dav-parse.wasm not built';
-// LLAMACPP_AUTOCONFIG_IMPL (retired in #1071: the port always confirms the JS): every path where the Rust port
-// refuses, faults or disagrees, with stand-in ports (no WebAssembly needed). The JS answer is
-// returned only when the port agrees byte for byte or the JS answer is the conservative one;
-// otherwise suggest offers no settings and the estimates refuse the load or save. Then the model
-// manager with an unusable module: loads, preset saves and the Will-it-fit panel refuse
-// instead of passing unconfirmed. Synthetic GGUF headers and a fake router only: nothing is loaded.
-const test = require('node:test'), assert = require('node:assert/strict'), fs = require('node:fs'), os = require('node:os'), path = require('node:path');
+const test = require('node:test');
+const assert = require('node:assert/strict');
 const ac = require('./llamacpp-autoconfig.cjs');
-const davParseWasm = require('./dav-parse-wasm.cjs');
-const { createModelManager } = require('./model-manager.cjs');
-
+const native = require('./dav-parse-wasm.cjs');
+const oracle = require('../tests/reference/llamacpp-autoconfig-js.cjs');
 const GIB = 1024 ** 3;
-const HYBRID_ARCH = 'qwen35'; // GGUF architecture identifier and metadata-key prefix required by the format reader.
-const meta = { arch: HYBRID_ARCH, contextLength: 262144, embeddingLength: 4096, blockCount: 32, headCount: 16, headCountKv: 4, keyLength: 256, valueLength: 256, fullAttentionInterval: 4, hasChatTemplate: true };
-const SUGGEST = { meta, modelBytes: 5.56 * GIB, mmprojBytes: 0.86 * GIB, budgetGib: 14, current: { 'ubatch-size': '1024' } };
-const FOOT = { meta, modelBytes: 5.56 * GIB, options: { 'ctx-size': '65536', 'cache-type-k': 'q8_0', 'cache-type-v': 'q8_0', 'cache-ram': '1024' }, model: 'm' };
-const INPUTS = { meta, modelBytes: 5.56 * GIB, current: { 'cache-ram': '1024' } };
-
-function capture(fn) {
-  const warn = console.warn, lines = [];
-  console.warn = (...a) => lines.push(a.join(' '));
-  try { return { value: fn(), lines }; } finally { console.warn = warn; }
-}
-const reply = (value) => () => ({ llamacppAutoconfig: () => ({ text: JSON.stringify(value), reply: value }) });
-const faulty = (reason) => () => ({ llamacppAutoconfig: () => { throw Object.assign(Error('refused'), { reason }); } });
-const wasm = (wasmLoader) => ({ wasmLoader });
-
-test('LLAMACPP_AUTOCONFIG_IMPL is retired: no switch, the port is always asked, an old =js changes nothing', () => {
-  assert.equal(ac.autoconfigImpl, undefined);
-  assert.ok(!davParseWasm.IMPL_FLAGS.includes('LLAMACPP_AUTOCONFIG_IMPL'));
-  assert.equal(davParseWasm.RETIRED_FLAGS.LLAMACPP_AUTOCONFIG_IMPL, 'wasm');
-  // `env` and `impl` are not options any more: even an old =js, the port is asked and its refusal withholds the JS settings.
-  const never = () => { throw Error('asked'); };
-  const r = capture(() => ac.suggest(SUGGEST, { env: { LLAMACPP_AUTOCONFIG_IMPL: 'js' }, impl: 'js', wasmLoader: never })).value;
-  assert.equal(r.code, 'autoconfig_impl'); assert.equal(r.values, undefined); assert.equal(r.unverified, 'impl_refused');
-  assert.throws(() => capture(() => ac.estimateFootprint(FOOT, { env: { LLAMACPP_AUTOCONFIG_IMPL: 'js' }, wasmLoader: never })), (e) => e.code === 'autoconfig_impl');
-  assert.equal(ac.suggest(SUGGEST, { wasmLoader: reply(ac.suggestJs(SUGGEST)) }).values['ctx-size'], ac.suggestJs(SUGGEST).values['ctx-size']);
-  // The messages no longer advise a switch that is gone.
-  assert.doesNotMatch(r.error, /LLAMACPP_AUTOCONFIG_IMPL/);
-  assert.throws(() => capture(() => ac.estimateFootprint(FOOT, wasm(faulty('trap')))), (e) => !/LLAMACPP_AUTOCONFIG_IMPL/.test(e.message));
+const META = { arch: 'llama', contextLength: 8192, embeddingLength: 4096, blockCount: 32, headCount: 32, headCountKv: 8, hasChatTemplate: true };
+const SUGGEST = { meta: META, modelBytes: 5.56 * GIB, budgetGib: 14 };
+const INPUTS = { meta: META, modelBytes: 5.5 * GIB, current: { 'ctx-size': '16384', 'cache-type-k': 'q8_0' } };
+const FOOT = { meta: META, modelBytes: 5.56 * GIB, model: 'chat-model', options: { 'ctx-size': '8192', 'cache-ram': '1024' } };
+const capture = fn => { try { return { value: fn() }; } catch (error) { return { error }; } };
+const strictRefuses = () => ({ llamacppAutoconfig(op, args) {
+  if (op <= 3) throw Object.assign(new Error('synthetic strict refusal'), { reason: 'ambiguous' });
+  return native.llamacppAutoconfig(op, args);
+} });
+test('suggest returns only a Rust-program answer or its refusal', () => {
+  assert.deepEqual(ac.suggest(SUGGEST), oracle.suggestJs(SUGGEST));
+  const result = ac.suggest(SUGGEST, { wasmLoader: strictRefuses });
+  assert.equal(result.code, 'autoconfig_impl');
+  assert.equal(result.unverified, 'impl_refused');
+  assert.equal(result.values, undefined);
 });
-
-test('an agreeing port: the JS answer, unchanged and unlogged', () => {
-  for (const [fn, jsFn, args] of [[ac.suggest, ac.suggestJs, SUGGEST], [ac.estimateFootprint, ac.estimateFootprintJs, FOOT], [ac.estimateInputs, ac.estimateInputsJs, INPUTS]]) {
-    const js = jsFn(args);
-    const { value, lines } = capture(() => fn(args, wasm(reply(js))));
-    assert.deepEqual(value, js); assert.equal(lines.length, 0);
+test('panels preserve the established 503 error when strict confirmation is absent', () => {
+  for (const [fn, args, what] of [[ac.estimateInputs, INPUTS, 'Will it fit?'], [ac.estimateFootprint, FOOT, 'load footprint']]) {
+    const got = capture(() => fn(args, { wasmLoader: strictRefuses }));
+    assert.equal(got.error.code, 'autoconfig_impl');
+    assert.equal(got.error.status, 503);
+    assert.equal(got.error.message, 'the memory estimate (' + what + ') could not be confirmed by the Rust sizing port, and the JS estimate is not the larger one.');
   }
 });
-
-test('suggest: a port that refuses or faults withholds JS settings, but a JS error passes', () => {
-  const { value, lines } = capture(() => ac.suggest(SUGGEST, wasm(faulty('trap'))));
-  assert.equal(value.code, 'autoconfig_impl'); assert.equal(value.values, undefined); assert.equal(value.unverified, 'impl_refused');
-  assert.match(value.error, /^No settings suggested: the Rust sizing port did not confirm this suggestion/);
-  assert.equal(lines.length, 1); assert.match(lines[0], /suggest\.wasm_refused \(trap; refused\)/);
-  // Logged once per reason.
-  assert.equal(capture(() => ac.suggest(SUGGEST, wasm(faulty('trap')))).lines.length, 0);
-  const noBudget = { ...SUGGEST, budgetGib: 0 };
-  assert.deepEqual(capture(() => ac.suggest(noBudget, wasm(faulty('ambiguous')))).value, ac.suggestJs(noBudget));
+test('Rust keeps an unbounded conservative answer when only the strict port refuses', () => {
+  const args = { ...FOOT, options: { 'cache-ram': '-1' } };
+  assert.deepEqual(ac.estimateFootprint(args, { wasmLoader: strictRefuses }), oracle.estimateFootprintJs(args));
 });
-
-test('suggest: a disagreeing port lets the JS through only when every JS knob is no larger', () => {
-  const js = ac.suggestJs(SUGGEST);
-  const bump = (k, v) => ({ ...js, values: { ...js.values, [k]: v } });
-  // The port would offer more: the JS (smaller) stands, logged.
-  for (const [k, v] of [['ctx-size', '262144'], ['cache-ram', '2048'], ['ubatch-size', '4096']]) {
-    const { value, lines } = capture(() => ac.suggest(SUGGEST, wasm(reply(bump(k, v)))));
-    assert.deepEqual(value, js, k); assert.ok(lines.some((l) => /impl_mismatch.*conservative/.test(l)) || lines.length === 0);
-  }
-  // The port would offer less, a different cache type, an extra or a missing knob, or no settings.
-  const noKnob = { ...js, values: { ...js.values } }; delete noKnob.values['image-max-tokens'];
-  for (const port of [bump('ctx-size', '4096'), bump('cache-ram', '256'), bump('cache-type-k', 'f16'), bump('spec-type', 'draft-mtp'), bump('threads', '8'), noKnob, { error: 'x' }, null, 'junk']) {
-    const r = capture(() => ac.suggest(SUGGEST, wasm(reply(port)))).value;
-    assert.equal(r.code, 'autoconfig_impl', JSON.stringify(port)?.slice(0, 80)); assert.equal(r.values, undefined);
-  }
+test('missing or faulty native policy modules fail closed', () => {
+  const fail = () => { throw new Error('native module trap'); };
+  assert.equal(ac.suggest(SUGGEST, { wasmLoader: fail }).code, 'autoconfig_impl');
+  assert.equal(capture(() => ac.estimateInputs(INPUTS, { wasmLoader: fail })).error.code, 'autoconfig_impl');
+  assert.equal(capture(() => ac.estimateFootprint(FOOT, { wasmLoader: fail })).error.code, 'autoconfig_impl');
+  assert.equal(capture(() => ac.estimateFootprintForAutotune(FOOT, { wasmLoader: fail })).error.code, 'autoconfig_impl');
 });
-
-test('estimateFootprint: a refused or smaller-than-JS port answer keeps the JS; a larger one refuses', () => {
-  const js = ac.estimateFootprintJs(FOOT);
-  assert.ok(js.totalGib > 0 && !js.cacheRamUnbounded);
-  const bigger = { ...js, totalGib: js.totalGib + 0.01 }, smaller = { ...js, totalGib: js.totalGib - 0.01 };
-  assert.deepEqual(capture(() => ac.estimateFootprint(FOOT, wasm(reply(smaller)))).value, js);
-  for (const port of [bigger, { ...js, cacheRamUnbounded: true, totalGib: null, cacheRamGib: null }, { ...smaller, sizeable: false, kvGib: 0 }]) {
-    assert.throws(() => capture(() => ac.estimateFootprint(FOOT, wasm(reply(port)))), (e) => e instanceof ac.AutoconfigImplError && e.code === 'autoconfig_impl' && e.status === 503);
-  }
-  assert.throws(() => capture(() => ac.estimateFootprint(FOOT, wasm(faulty('missing')))), (e) => e.code === 'autoconfig_impl');
-  // A JS estimate that refuses any load stands whatever the port says.
-  const open = { ...FOOT, options: { ...FOOT.options, 'cache-ram': '-1' } };
-  assert.deepEqual(capture(() => ac.estimateFootprint(open, wasm(faulty('trap')))).value, ac.estimateFootprintJs(open));
-  // The JS throws: the port is not asked.
-  let asked = false;
-  assert.throws(() => ac.estimateFootprint({ ...FOOT, options: null }, wasm(() => { asked = true; return {}; })), TypeError);
-  assert.equal(asked, false);
+test('autotune shares the Rust evaluator and never asks the strict port to serialize', () => {
+  const operations = [], args = { ...FOOT, unused: 1n };
+  const got = ac.estimateFootprintForAutotune(args, { wasmLoader: () => ({ llamacppAutoconfig(op, frame) {
+    operations.push(op);
+    return native.llamacppAutoconfig(op, frame);
+  } }) });
+  assert.deepEqual(got, oracle.estimateFootprintJs(args));
+  assert.ok(operations.length > 0);
+  assert.ok(operations.every(op => op === 11 || op === 12));
 });
-
-test('estimateInputs: JS figures at least the port\'s stand; anything else refuses', () => {
-  const js = ac.estimateInputsJs(INPUTS);
-  const lower = { ...js, modelGib: js.modelGib - 0.5, rows: js.rows.map((r) => ({ ...r, kvQ8Gib: r.kvQ8Gib / 2 })) };
-  assert.deepEqual(capture(() => ac.estimateInputs(INPUTS, wasm(reply(lower)))).value, js);
-  // noevia#1134: lower figures do not excuse different facts.
-  for (const port of [{ ...lower, moe: !js.moe }, { ...lower, chat: !js.chat }, { ...lower, nativeCtx: 4096 }, { ...lower, current: { ...js.current, ctx: 8192 } },
-    { ...lower, current: { ...js.current, kv: 'q4_0' } }, { ...lower, current: null }]) {
-    assert.throws(() => capture(() => ac.estimateInputs(INPUTS, wasm(reply(port)))), (e) => e.code === 'autoconfig_impl', JSON.stringify(port).slice(0, 60));
-  }
-  for (const port of [{ ...js, pinnedGib: js.pinnedGib + 1 }, { ...js, rows: js.rows.slice(1) }, { ...js, cacheRamGib: 99 }, { ...js, rows: js.rows.map((r) => ({ ...r, kvQ8Gib: r.kvQ8Gib + 1 })) }]) {
-    assert.throws(() => capture(() => ac.estimateInputs(INPUTS, wasm(reply(port)))), (e) => e.code === 'autoconfig_impl');
-  }
-  assert.throws(() => capture(() => ac.estimateInputs(INPUTS, wasm(faulty('trap')))), (e) => e.code === 'autoconfig_impl');
-});
-
-test('property: whatever the port answers, the confirmed suggestion is the JS one or none', () => {
-  let x = 0x5eed;
-  const rnd = () => { x ^= x << 13; x >>>= 0; x ^= x >>> 17; x ^= x << 5; x >>>= 0; return x / 4294967296; };
-  for (let i = 0; i < 300; i++) {
-    const args = { ...SUGGEST, budgetGib: 4 + rnd() * 30, modelBytes: (1 + rnd() * 10) * GIB, cacheRamMaxMib: Math.floor(rnd() * 3000) };
-    const js = ac.suggestJs(args);
-    const port = js.values ? { ...js, values: Object.fromEntries(Object.entries(js.values).map(([k, v]) => [k, /^\d+$/.test(v) && rnd() < 0.5 ? String(Math.floor(Number(v) * (0.5 + rnd()))) : v])) } : js;
-    const got = capture(() => ac.suggest(args, wasm(reply(port)))).value;
-    if (got.values) {
-      assert.deepEqual(got, js);
-      for (const [k, v] of Object.entries(got.values)) if (/^\d+$/.test(v)) assert.ok(Number(v) <= Number(js.values[k]), k);
-    } else if (js.values) assert.equal(got.code, 'autoconfig_impl');
-  }
-});
-
-// ── llamacpp-manager.cjs with an unusable module ─────────────────────────────────
-
-function gguf(kv) {
-  const u32 = (n) => { const b = Buffer.alloc(4); b.writeUInt32LE(n); return b; };
-  const u64 = (n) => { const b = Buffer.alloc(8); b.writeBigUInt64LE(BigInt(n)); return b; };
-  const str = (s) => { const b = Buffer.from(s); return Buffer.concat([u64(b.length), b]); };
-  const val = (type, v) => (type === 4 ? u32(v) : str(v));
-  return Buffer.concat([Buffer.from('GGUF'), u32(3), u64(0), u64(Object.keys(kv).length), ...Object.entries(kv).map(([k, [t, v]]) => Buffer.concat([str(k), u32(t), val(t, v)]))]);
-}
-const HYBRID_HEADER = { 'general.architecture': [8, 'qwen35'], 'qwen35.context_length': [4, 262144], 'qwen35.embedding_length': [4, 4096], 'qwen35.block_count': [4, 32], 'qwen35.attention.head_count': [4, 16], 'qwen35.attention.head_count_kv': [4, 4], 'qwen35.attention.key_length': [4, 256], 'qwen35.attention.value_length': [4, 256], 'qwen35.full_attention_interval': [4, 4], 'tokenizer.chat_template': [8, '{{ messages }}'] };
-
-function manager(t, budget = 64) {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'autoconfig-impl-'));
-  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
-  fs.writeFileSync(path.join(dir, 'q.gguf'), gguf(HYBRID_HEADER));
-  const ini = path.join(dir, 'models.ini');
-  fs.writeFileSync(ini, 'version = 1\n\n[small]\nmodel = /models/q.gguf\nctx-size = 4096\ncache-ram = 0\n');
-  const calls = [], state = { small: 'unloaded' };
-  const m = createModelManager({ kind: 'llamacpp', baseUrl: 'http://synthetic', presetPath: ini, autoconfig: { modelsPath: dir, cacheRamMaxMib: 1024 },
-    inferenceBudget: { budgetGib: () => budget },
-    fetchJson: async (url, options = {}) => {
-      const p = new URL(url).pathname;
-      calls.push(`${options.method || 'GET'} ${p}`);
-      if (p === '/models/load') state.small = 'loaded';
-      return { ok: true, status: 200, body: p === '/models' ? { data: [{ id: 'small', status: { value: state.small } }] } : { success: true } };
-    } });
-  return { m, calls, ini };
-}
-
-// The sizing port alone is made unusable (it faults like a trapped module). Pointing DAV_PARSE_WASM at
-// nothing would also stop the GGUF reader, which is Rust-only since #1071 (see the next-but-one test),
-// so the metadata read would refuse the request before the sizing confirmation ran.
-function withUnusableModule(t) {
-  const saved = { impl: process.env.LLAMACPP_AUTOCONFIG_IMPL, fn: davParseWasm.llamacppAutoconfig };
-  process.env.LLAMACPP_AUTOCONFIG_IMPL = 'js'; // retired: changes nothing
-  davParseWasm.llamacppAutoconfig = () => { throw new davParseWasm.DavParseError('dav-parse module is missing', 'missing'); };
-  const warn = console.warn; console.warn = () => {};
-  t.after(() => {
-    console.warn = warn;
-    davParseWasm.llamacppAutoconfig = saved.fn;
-    if (saved.impl === undefined) delete process.env.LLAMACPP_AUTOCONFIG_IMPL; else process.env.LLAMACPP_AUTOCONFIG_IMPL = saved.impl;
-  });
-}
-
-test('manager: the small model loads with the real module; with an unusable sizing port the load is refused, not waved through', { skip: skipWasm }, async (t) => {
-  const real = manager(t);
-  assert.equal((await real.m.load('small')).ok, true);
-  withUnusableModule(t);
-  const { m, calls } = manager(t);
-  const r = await m.load('small');
-  assert.equal(r.ok, false); assert.equal(r.status, 409); assert.equal(r.body.code, 'autoconfig_impl');
-  assert.match(r.body.error, /^small was not loaded: the memory estimate \(load footprint\) could not be confirmed/);
-  assert.ok(!calls.includes('POST /models/load'), calls.join('\n'));
-});
-
-test('manager: with an unusable sizing port a preset save is refused, the panel is a 503 and no settings are suggested', { skip: skipWasm }, async (t) => {
-  withUnusableModule(t);
-  const { m, ini } = manager(t);
-  const before = fs.readFileSync(ini, 'utf8');
-  const refusal = await m.presetRefusal('small', { 'ctx-size': '8192' });
-  assert.equal(refusal.code, 'autoconfig_impl'); assert.match(refusal.error, /^Not saved: /);
-  const rev = (await m.getPreset('small')).body.revision;
-  const saved = await m.applyPreset({ model: 'small', baseRevision: rev, confirmReload: true, options: { 'ctx-size': '8192' } });
-  assert.equal(saved.status, 409); assert.equal(saved.body.code, 'autoconfig_impl');
-  assert.equal(fs.readFileSync(ini, 'utf8'), before);
-  const panel = await m.estimateMemory('small');
-  assert.equal(panel.status, 503); assert.equal(panel.body.code, 'autoconfig_impl');
-  const s = await m.suggestPreset('small');
-  assert.equal(s.status, 200); assert.equal(s.body.code, 'autoconfig_impl'); assert.equal(s.body.values, undefined);
-  // The Models page shows no estimate rather than a wrong one.
-  const est = await m.inferenceEstimates();
-  assert.equal(est.body.models[0].estimate, null); assert.equal(est.body.models[0].fits, null);
-});
-
-test('manager: with no dav-parse.wasm at all the GGUF read refuses (Rust-only since #1071): no suggestion, no panel, no estimate, and the preset is untouched', { skip: skipWasm }, async (t) => {
-  const saved = process.env.DAV_PARSE_WASM;
-  process.env.DAV_PARSE_WASM = path.join(os.tmpdir(), 'no-such-dav-parse.wasm');
-  davParseWasm.reset();
-  t.after(() => { if (saved === undefined) delete process.env.DAV_PARSE_WASM; else process.env.DAV_PARSE_WASM = saved; davParseWasm.reset(); });
-  const { m, ini } = manager(t);
-  const before = fs.readFileSync(ini, 'utf8');
-  const suggested = await m.suggestPreset('small');
-  assert.equal(suggested.status, 422);
-  assert.match(suggested.body.error, /^Could not read model metadata: GGUF header could not be checked \(missing\)/);
-  assert.equal((await m.estimateMemory('small')).status, 422);
-  // Unreadable metadata means no estimate (the runtime watchdog covers what cannot be estimated), never a made-up one.
-  const est = await m.inferenceEstimates();
-  assert.equal(est.body.models[0].estimate, null); assert.equal(est.body.models[0].fits, null);
-  assert.equal(fs.readFileSync(ini, 'utf8'), before);
+test('opaque continuations have bounded size independent of unused scalar input', () => {
+  const frames = [], args = { ...FOOT, options: { 'cache-ram': -1 }, unused: 'x'.repeat(5 * 1024 * 1024) };
+  const result = ac.estimateFootprint(args, { wasmLoader: () => ({ llamacppAutoconfig(op, frame) {
+    if (op >= 11) {
+      const text = JSON.stringify(frame); frames.push(text.length);
+      assert.ok(text.length < 4096);
+      assert.ok(!text.includes('xxxxx'));
+    }
+    return native.llamacppAutoconfig(op, frame);
+  } }) });
+  assert.equal(result.cacheRamUnbounded, true);
+  assert.ok(frames.length > 0);
 });
