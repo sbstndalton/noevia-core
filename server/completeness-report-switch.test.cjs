@@ -11,7 +11,8 @@ const path = require('node:path');
 const cr = require('./completeness-report.cjs');
 const davParseWasm = require('./dav-parse-wasm.cjs');
 
-const { buildCompletenessReport, buildCompletenessReportJs, canEnterReviewing, reportHash } = cr;
+const { buildCompletenessReport, canEnterReviewing, reportHash } = cr;
+const {buildCompletenessReportJs}=require('../tests/reference/completeness-report-oracle.cjs');
 
 const SHA = 'b'.repeat(40);
 const passingJob = () => ({
@@ -158,7 +159,7 @@ function toVerifying(jobs, id, AUTHORITY) {
   jobs.append(id, 'artifact.created', { name: 'test-report', kind: 'test-report', passed: true, exitCode: 0, headSha: SHA1 });
 }
 
-test('jobs.cjs: hybrid completeness refusal and lifecycle owner leave journal unchanged; worker recovery is asserted outside run', async () => {
+test('jobs.cjs: direct native policy fault is 502; lifecycle owner refuses before append; restored module completes review', async () => {
   const { createJobs, claimLifecycleAuthority } = require('./jobs.cjs');
   const AUTHORITY = claimLifecycleAuthority();
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cr-switch-'));
@@ -177,9 +178,8 @@ test('jobs.cjs: hybrid completeness refusal and lifecycle owner leave journal un
         davParseWasm.reset();
         const journal = path.join(dir, 'jobs', id + '.jsonl');
         const before = fs.readFileSync(journal);
-        const {value:unverified} = quietly(() => buildCompletenessReport({job:passingJob()}));
-        assert.equal(unverified.unverified, 'impl_refused', 'hybrid completeness preserves its conservative report');
-        assert.equal(canEnterReviewing(unverified), false);
+        quietly(() => assert.throws(() => buildCompletenessReport({job:passingJob()}),
+          (e) => e.status === 502 && e.code === 'dav_parse_failed'));
         // The actual append checks lifecycle ownership before completeness; retain that order.
         quietly(() => assert.throws(() => jobs.append(id, 'task.stage', move, AUTHORITY),
           (e) => e.status === 409 && /lifecycle could not be verified/.test(e.message)));
