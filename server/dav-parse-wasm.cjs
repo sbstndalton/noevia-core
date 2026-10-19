@@ -1940,9 +1940,102 @@ function autoconfigCompactReply(r) {
   return { batch: r.batch };
 }
 
+// Dense literals create own slots without invoking inherited numeric setters.
+// These are existing VM metadata bounds, never bounds on caller values.
+function autoconfigDenseMetadata(length) {
+  let array;
+  if (length <= 0) array = [];
+  else if (length <= 1) array = [0];
+  else if (length <= 2) array = [0, 0];
+  else if (length <= 4) array = [0, 0, 0, 0];
+  else if (length <= 8) array = [0, 0, 0, 0, 0, 0, 0, 0];
+  else if (length <= 16) array = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+  else if (length <= 32) array = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+  else if (length <= 64) array = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+  else if (length <= 128) array = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+  else if (length <= 256) array = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+  else throw new DavParseError('llama.cpp autoconfig metadata exceeds its register bound', 'reply');
+  array.length = length;
+  return array;
+}
+
+// state-v2 aliases only explicit output reference slots. It never interprets
+// request.data, counters, raw floating-point bits, or references sent to Rust.
+// Only the loader passes owned=true, immediately after its captured JSON.parse.
+// Public helper calls keep immutable-copy semantics; parsed dense own slots may
+// be overwritten privately without invoking inherited numeric setters.
+function autoconfigSignedReply(r, owned = false) {
+  const invalid = () => { throw new DavParseError('llama.cpp autoconfig signed reply has an unexpected shape', 'reply'); };
+  const integer = n => typeof n === 'number' && n % 1 === 0 && n >= 0
+    && n <= 9007199254740991 && !(n === 0 && 1 / n < 0);
+  const count = n => { if (!integer(n)) return invalid(); return n; };
+  const reference = (n, zero = false) => {
+    if (typeof n === 'number' && n % 1 === 0 && n >= -32 && n <= -1) return 8000000000000000 - n;
+    if (!integer(n) || (!zero && n === 0)) return invalid();
+    return n;
+  };
+  const vector = (source, limit, decode) => {
+    if (!AUTOCONFIG_ARRAY(source) || source.length > limit) return invalid();
+    const result = owned ? source : autoconfigDenseMetadata(source.length);
+    for (let index = 0; index < source.length; index++) result[index] = decode(source[index]);
+    return result;
+  };
+  const period = source => {
+    if (source === null) return null;
+    if (!autoconfigExact(source, ['seq', 'returnPc', 'len', 'p', 'i', 'need', 'chunks'])) return invalid();
+    return {
+      seq: reference(source.seq), returnPc: count(source.returnPc), len: count(source.len),
+      p: count(source.p), i: count(source.i), need: count(source.need),
+      chunks: vector(source.chunks, 2, chunk => {
+        if (!autoconfigExact(chunk, ['base', 'hex']) || typeof chunk.hex !== 'string') return invalid();
+        return { base: count(chunk.base), hex: chunk.hex };
+      }),
+    };
+  };
+  const sum = source => {
+    if (source === null) return null;
+    if (!autoconfigExact(source, ['cache', 'raw', 'numbers', 'total']) || source.cache === null
+      || !AUTOCONFIG_ARRAY(source.raw) || !(source.raw.length === 0 || source.raw.length === 8)
+      || !AUTOCONFIG_ARRAY(source.numbers) || source.numbers.length !== 6
+      || typeof source.total !== 'string') return invalid();
+    return {
+      cache: period(source.cache), raw: vector(source.raw, 8, n => reference(n)),
+      numbers: vector(source.numbers, 6, text => {
+        if (typeof text !== 'string') return invalid();
+        return text;
+      }), total: source.total,
+    };
+  };
+  const state = fields => {
+    if (!AUTOCONFIG_ARRAY(fields) || fields.length !== 8 || !integer(fields[4]) || fields[4] > 7) return invalid();
+    return {
+      pc: count(fields[0]), env: reference(fields[1]),
+      stack: vector(fields[2], 256, n => reference(n)),
+      catches: vector(fields[3], 8, entry => {
+        if (!AUTOCONFIG_ARRAY(entry) || entry.length !== 3) return invalid();
+        return [count(entry[0]), count(entry[1]), reference(entry[2])];
+      }),
+      mode: fields[4], target: count(fields[5]), period: period(fields[6]), sum: sum(fields[7]),
+    };
+  };
+  if (!r || r.wire !== 'state-v2') return invalid();
+  if (autoconfigExact(r, ['wire', 'done'])) return { done: reference(r.done) };
+  if (autoconfigExact(r, ['wire', 'throw'])) return { throw: reference(r.throw) };
+  if (!autoconfigExact(r, ['wire', 'batch']) || !AUTOCONFIG_ARRAY(r.batch)
+    || r.batch.length < 1 || r.batch.length > 32) return invalid();
+  return { batch: vector(r.batch, 32, operation => {
+    if (!autoconfigExact(operation, ['state', 'request', 'args', 'ref'])) return invalid();
+    return {
+      state: state(operation.state), request: operation.request,
+      args: vector(operation.args, 256, n => reference(n)), ref: reference(operation.ref, true),
+    };
+  }) };
+}
+
 /** Strict operations 1-6 and bounded opaque-reference evaluator frames (11-12). */
 function autoconfigReply(op, r, compact = false) {
-  if (compact && (op === 11 || op === 12)) r = autoconfigCompactReply(r);
+  if (compact === 'state-v2' && (op === 11 || op === 12)) r = autoconfigSignedReply(r);
+  else if (compact && (op === 11 || op === 12)) r = autoconfigCompactReply(r);
   const exact = op === 11 || op === 12 ? autoconfigExact : exactKeys;
   const privateOp = op === 11 || op === 12;
   const ref = n => Number.isSafeInteger(n) && n > 0;
@@ -1969,14 +2062,14 @@ function llamacppAutoconfig(op, args) {
   let body;
   try {
     if (op === 11) {
-      body = autoconfigFrameText({ function: args.function, env: args.env, wire: 'state-v1' });
+      body = autoconfigFrameText({ function: args.function, env: args.env, wire: 'state-v2' });
     } else if (op === 12) {
       const state = args.state;
       // Array literal elements create own data properties, even when numeric
       // prototype setters exist. No mutable collection method packs the tuple.
       const fields = [state.pc, state.env, state.stack, state.catches,
         state.mode, state.target, state.period, state.sum];
-      body = autoconfigFrameText({ state: fields, frame: args.frame, wire: 'state-v1' });
+      body = autoconfigFrameText({ state: fields, frame: args.frame, wire: 'state-v2' });
     } else {
       body = JSON.stringify(args);
     }
@@ -1994,7 +2087,8 @@ function llamacppAutoconfig(op, args) {
     const code = reply && typeof reply.error === 'string' ? reply.error : 'unknown';
     throw new DavParseError(`llama.cpp autoconfig input refused by dav-parse (${code})`, code);
   }
-  return { text, reply: autoconfigReply(op, reply, op === 11 || op === 12) };
+  if (op === 11 || op === 12) reply = autoconfigSignedReply(reply, true);
+  return { text, reply: autoconfigReply(op, reply) };
 }
 
 // --- code actions (CODE_ACTIONS_IMPL, retired in #1071) and project file names (PROJECT_FILE_NAMES_IMPL, retired in #1071) ----------
