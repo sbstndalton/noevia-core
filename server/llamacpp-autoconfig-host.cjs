@@ -2,6 +2,7 @@
 // A mechanical ECMAScript host for Rust's stateless evaluator. No estimator,
 // policy table, candidate traversal, arithmetic expression or conservative decision lives here.
 // Values (including strings of any length) remain opaque host references.
+const { build: buildLinearFamily } = require('./llamacpp-autoconfig-linear-family.cjs');
 class AutoconfigProtocolError extends Error {
   constructor(cause) {
     super('Rust autoconfig evaluator protocol failed', { cause });
@@ -94,7 +95,7 @@ function linearUnary(operator, value, fault) {
     default: throw fault();
   }
 }
-function linearTree(tree, environment, fault) {
+function linearTreeComposed(tree, environment, fault) {
   const op=tree[0], data=tree[1];
   switch (op) {
     case 'arg':
@@ -105,23 +106,23 @@ function linearTree(tree, environment, fault) {
     case 'undefined': return () => undefined;
     case 'literal': return () => data;
     case 'load': return () => environment[data];
-    case 'binary': return linearBinary(data, linearTree(tree[2], environment, fault), linearTree(tree[3], environment, fault), fault);
-    case 'unary': return linearUnary(data, linearTree(tree[2], environment, fault), fault);
+    case 'binary': return linearBinary(data, linearTreeComposed(tree[2], environment, fault), linearTreeComposed(tree[3], environment, fault), fault);
+    case 'unary': return linearUnary(data, linearTreeComposed(tree[2], environment, fault), fault);
     case 'get': {
-      const object = linearTree(data, environment, fault), key = linearTree(tree[2], environment, fault);
+      const object = linearTreeComposed(data, environment, fault), key = linearTreeComposed(tree[2], environment, fault);
       return (a,b,c) => object(a,b,c)[key(a,b,c)];
     }
     case 'method': {
-      const object = linearTree(data, environment, fault), key = linearTree(tree[2], environment, fault);
-      const arguments_ = privateArgs(tree[3],argument => linearTree(argument, environment, fault));
+      const object = linearTreeComposed(data, environment, fault), key = linearTreeComposed(tree[2], environment, fault);
+      const arguments_ = privateArgs(tree[3],argument => linearTreeComposed(argument, environment, fault));
       return (a,b,c) => {
         const receiver = object(a,b,c), fn = receiver[key(a,b,c)];
         return apply(fn, receiver, privateArgs(arguments_,argument => argument(a,b,c)));
       };
     }
     case 'call': {
-      const fn = linearTree(data, environment, fault);
-      const arguments_ = privateArgs(tree[2],argument => linearTree(argument, environment, fault));
+      const fn = linearTreeComposed(data, environment, fault);
+      const arguments_ = privateArgs(tree[2],argument => linearTreeComposed(argument, environment, fault));
       return (a,b,c) => {
         const callee = fn(a,b,c);
         return apply(callee, undefined, privateArgs(arguments_,argument => argument(a,b,c)));
@@ -129,6 +130,10 @@ function linearTree(tree, environment, fault) {
     }
     default: throw fault();
   }
+}
+
+function linearTree(tree, environment, fault) {
+  return buildLinearFamily(tree, environment) || linearTreeComposed(tree, environment, fault);
 }
 
 
