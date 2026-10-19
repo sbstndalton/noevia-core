@@ -60,13 +60,24 @@ test('every native policy fault refuses without exposing option values or writin
  assert.ok(seen.length<=1,seen.join('\n'));assert.ok(seen.every(m=>!m.includes('parallel')&&!m.includes('synthetic')));assert.equal(fs.readFileSync(file,'utf8'),before);
 });
 test('manager section save retains400 invalid_size when canonical policy cannot answer',async t=>{
- const file=fixture(t),wasmPath=require.resolve('./dav-parse-wasm.cjs'),saved=require.cache[wasmPath];
- require.cache[wasmPath]={id:wasmPath,filename:wasmPath,loaded:true,exports:standIn({llamacppPresetsCanonical:()=>{throw Error('synthetic');}})()};
+ const file=fixture(t),before=fs.readFileSync(file,'utf8'),wasmPath=require.resolve('./dav-parse-wasm.cjs'),saved=require.cache[wasmPath];
+ let autoconfigCalls=0;
+ // Fault only the preset policy under test: manager/calibration imports need
+ // the real Rust-backed autoconfig constants and every other bridge export.
+ const overlay=(over,calls)=>({...dav,...standIn(over,calls)(),llamacppAutoconfig(...args){autoconfigCalls++;return dav.llamacppAutoconfig(...args);}});
+ const failedCalls=[];
+ require.cache[wasmPath]={id:wasmPath,filename:wasmPath,loaded:true,exports:overlay({llamacppPresetsCanonical:()=>{throw Error('synthetic');}},failedCalls)};
  t.after(()=>{if(saved)require.cache[wasmPath]=saved;else delete require.cache[wasmPath];});
  const {createLlamaCppManager}=require('./llamacpp-manager.cjs');
  const manager=createLlamaCppManager({baseUrl:'http://synthetic',presetPath:file,fetchJson:async()=>({ok:true,status:200,body:{data:[]}})});
+ assert.ok(autoconfigCalls>0,'manager imports must reach the actual Rust autoconfig bridge');
  const refusal=await manager.presetRefusal('synthetic',{c:'1048576',parallel:'1'});
  assert.equal(refusal.code,'invalid_size');assert.equal(refusal.error,'Not saved: the preset option "c" could not be checked.');
- require.cache[wasmPath]={id:wasmPath,filename:wasmPath,loaded:true,exports:standIn()()};
+ assert.ok(failedCalls.includes('llamacppPresetsCanonical'),'the scoped canonical fault must be exercised');
+ assert.equal(fs.readFileSync(file,'utf8'),before);
+ const healthyCalls=[];
+ require.cache[wasmPath]={id:wasmPath,filename:wasmPath,loaded:true,exports:overlay({},healthyCalls)};
  assert.equal(await manager.presetRefusal('synthetic',{parallel:'1'}),null);
+ assert.ok(healthyCalls.includes('llamacppPresetsCanonical'),'the healthy canonical control must be exercised');
+ assert.equal(fs.readFileSync(file,'utf8'),before);
 });
