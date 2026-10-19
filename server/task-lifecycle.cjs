@@ -50,57 +50,18 @@
 // ignored, and only the run ending without the pipeline's say-so (failed, cancelled,
 // interrupted) still forces `blocked`. A journal without one folds exactly as before.
 //
-// Rust confirmation (TASK_LIFECYCLE_IMPL, retired in #1071: always on), in canTransition,
-// transition, assertStageMove, foldEvents, deriveLifecycle, safeDeriveLifecycle and confirmFold.
-// Each also asks noevia-rs's task-lifecycle crate (dav-parse.wasm task_lifecycle) for the same
-// answer. The JS answer (the *Js functions below) is still computed first, is the authority and is
-// the only one ever returned: a move is allowed only when both allow it.
-// When the JS throws, the port is not asked. When the JS allows and the port refuses, faults,
-// replies badly or disagrees, canTransition answers false and the others throw TaskLifecycleError
-// (code 'impl_refused' / 'impl_mismatch', status 409; logged once per reason, journal-text free),
-// so jobs.cjs's existing paths refuse the stage write and derive no lifecycle (null). step() is
-// the JS alone; jobs.cjs derive() confirms its whole fold once through confirmFold(). A missing or
-// tampered dav-parse.wasm stops startup.
-// The port is sent only what the fold reads (#1126, foldInput): the event types that can move the
-// lifecycle or make a journal authoritative, each with only the data fields step() reads, so a large
-// tool payload costs nothing and is never re-sent. Every dropped event is a no-op for the JS.
-// Stricter than the JS (the crate docs): fold input over 8 MiB as JSON, or one JSON.stringify cannot
-// write, is refused. canTransitionToReviewing's completeness half
-// (completeness-report.cjs canEnterReviewing) is not part of this port.
-
+// Rust is the policy authority (#1071). Opcode 6 supplies state/transition metadata and
+// diagnostics; the original five operations remain unchanged for the final wire-size,
+// serialization and representation checks. No JavaScript state table or policy fold remains.
 const { canEnterReviewing } = require('./completeness-report.cjs');
-
-const STATES = Object.freeze([
-  'planned',
-  'implementing',
-  'verifying',
-  'reviewing',
-  'changes_requested',
-  'merged',
-  'blocked',
-]);
-const STATE_SET = new Set(STATES);
-const INITIAL_STATE = 'planned';
-// The server-only lifecycle authority events (#701). See the module header.
-const AUTHORITY_TYPES = Object.freeze(new Set(['task.stage', 'task.revision']));
-const REPORT_HASH = /^[0-9a-f]{64}$/;
+const defaultLoader = () => require('./dav-parse-wasm.cjs');
+const metadata = defaultLoader().taskLifecycleDiagnostic(0);
+const STATES = Object.freeze([...metadata.states]);
+const INITIAL_STATE = metadata.initial;
+const TRANSITIONS = Object.freeze(Object.fromEntries(Object.entries(metadata.transitions).map(([k, v]) => [k, Object.freeze([...v])])));
+const AUTHORITY_TYPES = Object.freeze(new Set(metadata.authorityTypes));
+const MAX_STATE_UNITS = Math.max(...STATES.map((s) => s.length));
 const isAuthoritative = (events) => (events || []).some((e) => e && AUTHORITY_TYPES.has(e.type));
-
-// Guarded transition table: the only legal moves. `merged` is terminal (no outgoing edges).
-// Anything not listed here is illegal and `transition()` throws for it. `reviewing`,
-// `changes_requested` and `merged` are part of this table for a future real review/merge
-// feature to drive (see the module header); today's derivation never targets them.
-const TRANSITIONS = Object.freeze({
-  planned: Object.freeze(['implementing', 'blocked']),
-  implementing: Object.freeze(['verifying', 'reviewing', 'merged', 'blocked']),
-  // verifying → changes_requested: the operator's tests failed (#705), the same loop a review's
-  // "request changes" starts.
-  verifying: Object.freeze(['reviewing', 'implementing', 'changes_requested', 'merged', 'blocked']),
-  reviewing: Object.freeze(['implementing', 'changes_requested', 'merged', 'blocked']),
-  changes_requested: Object.freeze(['implementing', 'reviewing', 'merged', 'blocked']),
-  blocked: Object.freeze(['implementing', 'planned']),
-  merged: Object.freeze([]),
-});
 
 class TaskLifecycleError extends Error {
   constructor(message, { from, to, code } = {}) {
@@ -108,154 +69,10 @@ class TaskLifecycleError extends Error {
     this.name = 'TaskLifecycleError';
     this.from = from;
     this.to = to;
-    // What went wrong, for the Rust comparison: unknown_state, illegal, stale,
-    // report_hash, merge_from_reviewing, or (the port's refusal) impl_refused / impl_mismatch.
     this.code = code;
     this.status = 409;
   }
 }
-
-function assertKnownState(state, label) {
-  if (!STATE_SET.has(state)) {
-    throw new TaskLifecycleError(`Unknown task-lifecycle state: ${label} = ${JSON.stringify(state)}`, { [label]: state, code: 'unknown_state' });
-  }
-}
-
-// True/false; throws only for an unknown state. Staying in the same state is always allowed (a
-// no-op transition). The JS table alone; canTransition below adds the Rust confirmation.
-function canTransitionJs(from, to) {
-  assertKnownState(from, 'from');
-  assertKnownState(to, 'to');
-  if (from === to) return true;
-  return TRANSITIONS[from].includes(to);
-}
-
-// Guarded transition: returns `to` on success, throws TaskLifecycleError on an illegal move
-// (including moves out of the terminal `merged` state, or into/out of an unknown state).
-function transitionJs(from, to) {
-  if (!canTransitionJs(from, to)) {
-    throw new TaskLifecycleError(`Illegal task-lifecycle transition: ${from} -> ${to}`, { from, to, code: 'illegal' });
-  }
-  return to;
-}
-
-// Caller-chosen `progress` stage tokens this layer treats as meaningful. Deliberately does
-// NOT include 'reviewing': a free-text progress stage is never treated as evidence that a
-// real review happened. Any other stage string (the vast majority of existing job kinds use
-// free-text stages for UI display) is ignored here, exactly as before this module existed.
-const CANONICAL_STAGES = new Set(['implementing', 'verifying']);
-
-// One step of the fold: applies a single existing jobs.cjs journal event to a lifecycle
-// state and returns the next state. Exported as a low-level primitive so a caller that
-// already loops over a job's events once (jobs.cjs's own `derive()`) can fold the lifecycle
-// in that same pass instead of re-reading the journal a second time.
-//
-// - `job.created` / unrecognized types (step.*, tool.*, artifact.created, checkpoint.created,
-//   tool.uncertain, plan.*, assistant.output) are no-ops.
-// - `job.started` moves to `implementing`.
-// - `progress` only acts on the canonical stages above.
-// - `approval.requested` / `approval.decided` are today's per-tool-call write-approval gate,
-//   not a task-level review, and their `data` is attacker/model-reachable (see module header)
-//   — they are ALWAYS a no-op here, unconditionally, with no data-carried override.
-// - `job.completed` means the harness finished, not that anyone reviewed or merged it: it
-//   ALWAYS moves to `verifying`, unconditionally, with no data-carried override.
-// - `job.failed` / `job.cancelled` / `job.interrupted` all move to `blocked`.
-//
-// With `{ authoritative: true }` (a journal carrying a lifecycle authority event, #701):
-// - `task.stage` moves through `transition()`; its `from` must be the current state, and
-//   entering `reviewing` must carry the hash of the completeness report that allowed it.
-// - `task.revision` is a no-op here (jobs.cjs derives the revision itself).
-// - job.started / progress / job.completed / approval.* are no-ops: only the pipeline says
-//   where an authoritative task is.
-// - job.failed / job.cancelled / job.interrupted still force `blocked`, except out of the
-//   terminal `merged`, which they leave alone (the merge already happened).
-function step(state, event, { authoritative = false } = {}) {
-  if (!event || typeof event.type !== 'string') return state;
-  const data = event.data || {};
-  if (event.type === 'task.stage') return stageStep(state, data);
-  if (event.type === 'task.revision') return state;
-  if (authoritative) {
-    if (event.type === 'job.failed' || event.type === 'job.cancelled' || event.type === 'job.interrupted') {
-      return state === 'merged' ? state : advance(state, 'blocked');
-    }
-    return state;
-  }
-  switch (event.type) {
-    case 'job.created':
-      return state; // already `planned` (or wherever a prior fold left it)
-    case 'job.started':
-      return advance(state, 'implementing');
-    case 'progress':
-      return CANONICAL_STAGES.has(data.stage) ? advance(state, data.stage) : state;
-    case 'approval.requested':
-    case 'approval.decided':
-      // Never a review: this is the per-tool-call write-approval gate, and its data is
-      // sourced from the approval card / harness output, which model or page content can
-      // influence. No key in `data` can move the lifecycle here — see module header.
-      return state;
-    case 'job.completed':
-      // Never a merge: only that the harness finished. No key in `data` (including the
-      // harness/model-influenced `result`) can move this to `merged` — see module header.
-      return advance(state, 'verifying');
-    case 'job.failed':
-    case 'job.cancelled':
-    case 'job.interrupted':
-      return advance(state, 'blocked');
-    default:
-      return state;
-  }
-}
-
-// A derived jump that is illegal per the guarded table is rejected the same way an explicit
-// caller-driven `transition()` would be: this is what "illegal transitions are rejected with
-// explicit errors" means for derivation too. Callers deriving lifecycle from a real job's
-// journal (task-lifecycle-wiring is defensive — see jobs.cjs) should expect this can throw
-// on a journal that was never shaped with this layer in mind, and treat that as "no derived
-// lifecycle available" rather than a crash.
-function stageStep(state, data) {
-  assertKnownState(data.to, 'to');
-  if (data.from !== state) {
-    throw new TaskLifecycleError(`Stale task-lifecycle stage: recorded from ${JSON.stringify(data.from)} but the task is ${state}`, { from: data.from, to: data.to, code: 'stale' });
-  }
-  // Only a string can be a report hash (#1125): an array or object is refused here as itself, never
-  // run through String() (where [hash] would pass and an own toString key would throw a TypeError).
-  if (data.to === 'reviewing' && data.to !== state && (typeof data.reportHash !== 'string' || !REPORT_HASH.test(data.reportHash))) {
-    throw new TaskLifecycleError('Entering reviewing needs the hash of the completeness report that allowed it', { from: state, to: data.to, code: 'report_hash' });
-  }
-  return assertStageMoveJs(state, data.to);
-}
-
-// The pipeline's own moves are stricter than the general table: a task reaches `merged` only
-// from `reviewing`, never straight from implementing/verifying/changes_requested.
-function assertStageMoveJs(from, to) {
-  if (to === 'merged' && from !== 'merged' && from !== 'reviewing') {
-    throw new TaskLifecycleError(`A task is merged only from reviewing, not ${from}`, { from, to, code: 'merge_from_reviewing' });
-  }
-  return transitionJs(from, to);
-}
-
-function advance(from, to) {
-  if (from === to) return from;
-  return transitionJs(from, to);
-}
-
-// Pure fold over an ordered event array (as produced by jobs.cjs's own journal reader),
-// starting from `fromState` (defaults to the initial state). Deterministic and side-effect
-// free: replaying the same events, in the same order, from the same starting state always
-// yields the same result — including in chunks (fold(events.slice(0, k)) then
-// fold(events.slice(k), thatResult) === fold(events)), which is what a server restart relies
-// on: the journal is replayed from disk, not resumed from in-memory state.
-function foldEventsJs(events, fromState, options) {
-  assertKnownState(fromState, 'fromState');
-  let state = fromState;
-  for (const event of events || []) state = step(state, event, options);
-  return state;
-}
-
-// ── Rust confirmation ───────────────────────────────────────────────────────
-
-const defaultLoader = () => require('./dav-parse-wasm.cjs');
-
 const warnedPort = new Set();
 function portWarn(event, reason) {
   const key = `${event}:${reason}`;
@@ -263,23 +80,81 @@ function portWarn(event, reason) {
   warnedPort.add(key);
   console.warn(`[task-lifecycle] ${event} (${reason}); the transition was refused`);
 }
-
-// The port's answer for a call the JS already answered: `{ state }`, `{ allowed }` or `{ throws }`
-// as the port saw it, or null after a refusal or fault (logged).
 function askPort(ask) {
-  try {
-    return ask();
-  } catch (err) {
+  try { return ask(); }
+  catch (err) {
     portWarn('task_lifecycle.wasm_fault', String(err?.reason || 'unexpected').slice(0, 40));
     return null;
   }
 }
-
-// What the fold reads (#1126). Any other event type is a no-op in both modes (see step()), and these
-// are the only data fields step() reads, each read as step() reads it (`(event.data || {})[k]`).
+function refused() {
+  throw new TaskLifecycleError('Task lifecycle refused by the Rust port', { code: 'impl_refused' });
+}
+function mismatch(reason) {
+  portWarn('task_lifecycle.impl_mismatch', reason);
+  throw new TaskLifecycleError('Task lifecycle disagrees with the Rust port', { code: 'impl_mismatch' });
+}
+function confirmState(ask, state) {
+  const port = askPort(ask);
+  if (!port) return refused();
+  if (port.state !== state) return mismatch(port.throws !== undefined ? 'throws' : 'state');
+  return state;
+}
+// Type/size projections only. An object with toJSON must never become an accepted string
+// state/hash. Unknown raw values remain available to the error formatter, unchanged.
+const stateWire = (value) => typeof value === 'string' && value.length <= MAX_STATE_UNITS ? value : null;
+const hashWire = (value) => typeof value === 'string' && value.length <= 64 ? value : null;
+function policy(operation, args) {
+  const reply = askPort(() => defaultLoader().taskLifecycleDiagnostic(operation, args));
+  if (!reply) return refused();
+  return reply;
+}
+function policyError(reply, context) {
+  const d = reply.diagnostic, code = reply.throws;
+  const event = d.event === undefined ? context.event : context.events?.[d.event];
+  const data = event?.data || {};
+  let from = d.current === undefined ? context.from : d.current;
+  let to = d.target === undefined ? context.to : d.target;
+  if (code === 'unknown_state') {
+    const label = d.site === 'event_to' ? 'to' : d.site;
+    const value = d.site === 'event_to' ? data.to : label === 'fromState' ? context.fromState : context[label];
+    throw new TaskLifecycleError(`Unknown task-lifecycle state: ${label} = ${JSON.stringify(value)}`, { [label]: value, code });
+  }
+  if (d.site === 'pair') { from = context.from; to = context.to; }
+  if (code === 'stale') {
+    throw new TaskLifecycleError(`Stale task-lifecycle stage: recorded from ${JSON.stringify(data.from)} but the task is ${from}`,
+      { from: data.from, to: data.to, code });
+  }
+  const message = code === 'illegal' ? `Illegal task-lifecycle transition: ${from} -> ${to}`
+    : code === 'report_hash' ? 'Entering reviewing needs the hash of the completeness report that allowed it'
+      : `A task is merged only from reviewing, not ${from}`;
+  throw new TaskLifecycleError(message, { from, to, code });
+}
+function pair(operation, from, to) {
+  const reply = policy(operation, [stateWire(from), stateWire(to)]);
+  if (reply.throws !== undefined) policyError(reply, { from, to });
+  return reply;
+}
+function canTransition(from, to, { wasmLoader = defaultLoader } = {}) {
+  const answer = pair(1, from, to);
+  if (!answer.allowed) return false;
+  const port = askPort(() => wasmLoader().taskLifecycleCanTransition(from, to));
+  if (port && port.allowed === true) return true;
+  if (port) portWarn('task_lifecycle.impl_mismatch', port.throws !== undefined ? 'throws' : 'allowed');
+  return false;
+}
+function transition(from, to, { wasmLoader = defaultLoader } = {}) {
+  const answer = pair(2, from, to);
+  return confirmState(() => wasmLoader().taskLifecycleTransition(from, to), answer.state);
+}
+function assertStageMove(from, to, { wasmLoader = defaultLoader } = {}) {
+  const answer = pair(3, from, to);
+  return confirmState(() => wasmLoader().taskLifecycleStageMove(from, to), answer.state);
+}
+// The same bounded host projection used by the previous implementation. It is also the final
+// serialization/refusal boundary, after the first policy error has had its original precedence.
 const FOLD_FIELDS = new Map([['task.stage', ['from', 'to', 'reportHash']], ['task.revision', []], ['job.started', []],
   ['progress', ['stage']], ['job.completed', []], ['job.failed', []], ['job.cancelled', []], ['job.interrupted', []]]);
-/** The port's view of `events`: `null` for none, a non-array as is (the host refuses it). */
 function foldInput(events) {
   if (events === undefined || events === null) return null;
   if (!Array.isArray(events)) return events;
@@ -294,116 +169,63 @@ function foldInput(events) {
   }
   return out;
 }
-
-// The JS answer `state` stands only if the port gives the same state. Throws otherwise.
-function confirmState(ask, state) {
-  const port = askPort(ask);
-  if (!port) throw new TaskLifecycleError('Task lifecycle refused by the Rust port', { code: 'impl_refused' });
-  if (port.state !== state) {
-    portWarn('task_lifecycle.impl_mismatch', port.throws !== undefined ? 'throws' : 'state');
-    throw new TaskLifecycleError('Task lifecycle disagrees with the Rust port', { code: 'impl_mismatch' });
-  }
+function step(state, event, { authoritative = false } = {}) {
+  // Reading these fields is host projection; Rust decides which event can move which state.
+  const type = event && typeof event.type === 'string' ? event.type : null;
+  const data = type === null ? {} : event.data || {};
+  const projected = { type: FOLD_FIELDS.has(type) ? type : null };
+  let same = false;
+  if (type === 'task.stage') {
+    // A staged diagnostic request preserves the old to-before-from-before-hash read order.
+    const to = stateWire(data.to);
+    let answer = policy(6, [stateWire(state), { type, data: { to } }, Boolean(authoritative), false]);
+    if (answer.throws === 'unknown_state') return policyError(answer, { from: state, event });
+    const from = data.from;
+    same = from === state;
+    projected.data = { from: stateWire(from), to };
+    answer = policy(6, [stateWire(state), projected, Boolean(authoritative), same]);
+    if (answer.throws !== 'report_hash') {
+      if (answer.throws !== undefined) return policyError(answer, { from: state, event });
+      return answer.unchanged ? state : answer.state;
+    }
+    projected.data.reportHash = hashWire(data.reportHash);
+  } else if (type === 'progress') projected.data = { stage: stateWire(data.stage) };
+  const answer = policy(6, [stateWire(state), projected, Boolean(authoritative), same]);
+  if (answer.throws !== undefined) return policyError(answer, { from: state, event });
+  return answer.unchanged ? state : answer.state;
+}
+// This loop contains no policy rules: every step and every error comes from Rust. Each event
+// crosses once with bounded scalar fields; no repeated prefix or growing journal is re-sent.
+function policyFold(events, fromState, options) {
+  const start = policy(4, [[], stateWire(fromState), false]);
+  if (start.throws !== undefined) return policyError(start, { fromState });
+  let state = fromState;
+  for (const event of events || []) state = step(state, event, options);
   return state;
 }
-
-/** canTransition(from, to): true only when the JS table and the port both allow.
- *  Throws (unknown state) only where the JS does. Option: `wasmLoader`. */
-function canTransition(from, to, { wasmLoader = defaultLoader } = {}) {
-  const allowed = canTransitionJs(from, to);
-  if (!allowed) return allowed;
-  const port = askPort(() => wasmLoader().taskLifecycleCanTransition(from, to));
-  if (port && port.allowed === true) return true;
-  if (port) portWarn('task_lifecycle.impl_mismatch', port.throws !== undefined ? 'throws' : 'allowed');
-  return false;
-}
-
-/** Guarded transition: returns `to` on success, throws TaskLifecycleError on an illegal move
- *  (including moves out of the terminal `merged` state, or into/out of an unknown state), and
- *  when the port does not allow it too. */
-function transition(from, to, { wasmLoader = defaultLoader } = {}) {
-  const state = transitionJs(from, to);
-  return confirmState(() => wasmLoader().taskLifecycleTransition(from, to), state);
-}
-
-/** The pipeline's own move (see assertStageMoveJs), confirmed by the port. */
-function assertStageMove(from, to, { wasmLoader = defaultLoader } = {}) {
-  const state = assertStageMoveJs(from, to);
-  return confirmState(() => wasmLoader().taskLifecycleStageMove(from, to), state);
-}
-
-/** foldEventsJs (below the module header's rules), confirmed by the port. Options:
- *  `authoritative`, `wasmLoader`. */
 function foldEvents(events, fromState = INITIAL_STATE, options = {}) {
   const { wasmLoader = defaultLoader, ...opts } = options || {};
-  const state = foldEventsJs(events, fromState, options);
+  const state = policyFold(events, fromState, options);
   return confirmState(() => wasmLoader().taskLifecycleFold(foldInput(events), fromState, Boolean(opts.authoritative)), state);
 }
-
-/** For a caller that folded `events` itself with step() from INITIAL_STATE (jobs.cjs derive()):
- *  `state` only when the port folds the same journal to it, else null ("no derived lifecycle
- *  available"). Never throws. */
 function confirmFold(events, state, options = {}) {
   const { wasmLoader = defaultLoader, ...opts } = options || {};
-  try {
-    return confirmState(() => wasmLoader().taskLifecycleFold(foldInput(events), INITIAL_STATE, Boolean(opts.authoritative)), state);
-  } catch {
-    return null;
-  }
+  try { return confirmState(() => wasmLoader().taskLifecycleFold(foldInput(events), INITIAL_STATE, Boolean(opts.authoritative)), state); }
+  catch { return null; }
 }
-
-const deriveLifecycleJs = (events) => foldEventsJs(events, INITIAL_STATE, { authoritative: isAuthoritative(events) });
-
-// Convenience: derive the lifecycle state for a full journal from the beginning. Whether the
-// journal is authoritative is decided by the whole journal (see the module header).
 function deriveLifecycle(events, { wasmLoader = defaultLoader } = {}) {
-  const state = deriveLifecycleJs(events);
+  const state = policyFold(events, INITIAL_STATE, { authoritative: isAuthoritative(events) });
   return confirmState(() => wasmLoader().taskLifecycleDerive(foldInput(events)), state);
 }
-
-// Defensive variant for wiring into read paths that must never throw: returns null instead
-// of raising when the journal implies an illegal transition (e.g. a job kind whose events
-// were never authored with this lifecycle in mind). Never hides a bug from `transition()` or
-// `deriveLifecycle()` themselves — only from call sites that attach this as extra, optional
-// information on top of an existing, already-correct job object.
 function safeDeriveLifecycle(events, options) {
-  try {
-    return deriveLifecycle(events, options);
-  } catch (e) {
-    if (e instanceof TaskLifecycleError) return null;
-    throw e;
-  }
+  try { return deriveLifecycle(events, options); }
+  catch (error) { if (error instanceof TaskLifecycleError) return null; throw error; }
 }
-
-// Pure guard for a future `transition()` caller entering `reviewing` (#514, part of #511):
-// legal per the guarded state table AND the deterministic completeness report
-// (completeness-report.cjs) says nothing required is failing or unknown. Exported only —
-// nothing in this module calls it, `step()`/`deriveLifecycle()` are completely unaffected, and
-// today's derivation still NEVER reaches `reviewing` on its own (see the module header). A
-// future real review/merge feature calls this before its own `transition(from, 'reviewing')`.
 function canTransitionToReviewing(from, report, options) {
   return canTransition(from, 'reviewing', options) && canEnterReviewing(report);
 }
-
 module.exports = {
-  STATES,
-  INITIAL_STATE,
-  AUTHORITY_TYPES,
-  isAuthoritative,
-  assertStageMove,
-  TRANSITIONS,
-  TaskLifecycleError,
-  canTransition,
-  transition,
-  step,
-  foldEvents,
-  deriveLifecycle,
-  safeDeriveLifecycle,
-  canTransitionToReviewing,
-  confirmFold,
-  foldInput,
-  canTransitionJs,
-  transitionJs,
-  assertStageMoveJs,
-  foldEventsJs,
-  deriveLifecycleJs,
+  STATES, INITIAL_STATE, AUTHORITY_TYPES, isAuthoritative, assertStageMove, TRANSITIONS,
+  TaskLifecycleError, canTransition, transition, step, foldEvents, deriveLifecycle,
+  safeDeriveLifecycle, canTransitionToReviewing, confirmFold, foldInput,
 };
