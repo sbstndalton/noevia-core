@@ -3,6 +3,7 @@
 // policy table, candidate traversal, arithmetic expression or conservative decision lives here.
 // Values (including strings of any length) remain opaque host references.
 const { build: buildLinearFamily } = require('./llamacpp-autoconfig-linear-family.cjs');
+const { create: createRegExpLiteral } = require('./llamacpp-autoconfig-regexp-literals.cjs');
 class AutoconfigProtocolError extends Error {
   constructor(cause) {
     super('Rust autoconfig evaluator protocol failed', { cause });
@@ -249,7 +250,17 @@ function evaluator(initialContext) {
           case 'booleanChunk': frame = { bits: booleanChunk(input[0], data.start, data.count) }; break;
           case 'literal': value = data; break;
           case 'undefined': value = undefined; break;
-          case 'regexp': value = new RegExp(data.pattern, data.flags); break;
+          case 'regexp': {
+            // Only compiler-bound literal metadata is accepted. No global
+            // constructor or caller key coercion participates in literal creation.
+            if (data === null || typeof data !== 'object' || isProxy(data) || arrayIsArray(data)) throw fault();
+            const keys = objectKeys(data), pattern = getOwnDescriptor(data, 'pattern'), flags = getOwnDescriptor(data, 'flags');
+            if (keys.length !== 2 || !pattern || !flags || !owns(pattern, 'value') || !owns(flags, 'value')
+              || !pattern.enumerable || !flags.enumerable) throw fault();
+            value = createRegExpLiteral(pattern.value, flags.value);
+            if (value === undefined) throw fault();
+            break;
+          }
           case 'object': value = {}; break;
           case 'array': value = []; break;
           case 'scope': value = Object.create(input[0]); break;
