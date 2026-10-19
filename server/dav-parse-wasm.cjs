@@ -1912,8 +1912,37 @@ function autoconfigFrameText(value) {
 }
 const AUTOCONFIG_OPS = new Set([1, 2, 3, 4, 5, 6, 11, 12]);
 
+// state-v1 is a private mechanical transport; ordinary evaluator state objects
+// are reconstructed before validation or any program-selected operation.
+function autoconfigCompactReply(r) {
+  const invalid = () => { throw new DavParseError('llama.cpp autoconfig compact reply has an unexpected shape', 'reply'); };
+  if (!r || r.wire !== 'state-v1') return invalid();
+  if (autoconfigExact(r, ['wire', 'done'])) return { done: r.done };
+  if (autoconfigExact(r, ['wire', 'throw'])) return { throw: r.throw };
+  if (!autoconfigExact(r, ['wire', 'batch']) || !AUTOCONFIG_ARRAY(r.batch)
+    || r.batch.length < 1 || r.batch.length > 32) return invalid();
+  for (let index = 0; index < r.batch.length; index++) {
+    const operation = r.batch[index];
+    if (!autoconfigExact(operation, ['state', 'request', 'args', 'ref'])) return invalid();
+    const fields = operation.state;
+    if (!AUTOCONFIG_ARRAY(fields) || fields.length !== 8
+      || !Number.isSafeInteger(fields[0]) || fields[0] < 0
+      || !Number.isSafeInteger(fields[1]) || fields[1] <= 0
+      || !Number.isSafeInteger(fields[4]) || fields[4] < 0 || fields[4] > 7
+      || !Number.isSafeInteger(fields[5]) || fields[5] < 0
+      || !(fields[6] === null || typeof fields[6] === 'object' && !AUTOCONFIG_ARRAY(fields[6]))
+      || !(fields[7] === null || typeof fields[7] === 'object' && !AUTOCONFIG_ARRAY(fields[7]))) return invalid();
+    operation.state = {
+      pc: fields[0], env: fields[1], stack: fields[2], catches: fields[3],
+      mode: fields[4], target: fields[5], period: fields[6], sum: fields[7],
+    };
+  }
+  return { batch: r.batch };
+}
+
 /** Strict operations 1-6 and bounded opaque-reference evaluator frames (11-12). */
-function autoconfigReply(op, r) {
+function autoconfigReply(op, r, compact = false) {
+  if (compact && (op === 11 || op === 12)) r = autoconfigCompactReply(r);
   const exact = op === 11 || op === 12 ? autoconfigExact : exactKeys;
   const privateOp = op === 11 || op === 12;
   const ref = n => Number.isSafeInteger(n) && n > 0;
@@ -1938,7 +1967,20 @@ function autoconfigReply(op, r) {
 function llamacppAutoconfig(op, args) {
   if (op !== 11 && op !== 12 && !AUTOCONFIG_OPS.has(op)) throw new DavParseError('llama.cpp autoconfig op is unknown', 'input');
   let body;
-  try { body = op === 11 || op === 12 ? autoconfigFrameText(args) : JSON.stringify(args); } catch { body = undefined; }
+  try {
+    if (op === 11) {
+      body = autoconfigFrameText({ function: args.function, env: args.env, wire: 'state-v1' });
+    } else if (op === 12) {
+      const state = args.state;
+      // Array literal elements create own data properties, even when numeric
+      // prototype setters exist. No mutable collection method packs the tuple.
+      const fields = [state.pc, state.env, state.stack, state.catches,
+        state.mode, state.target, state.period, state.sum];
+      body = autoconfigFrameText({ state: fields, frame: args.frame, wire: 'state-v1' });
+    } else {
+      body = JSON.stringify(args);
+    }
+  } catch { body = undefined; }
   if (typeof body !== 'string') throw new DavParseError('llama.cpp autoconfig input cannot be serialised', 'input');
   const bytes = encoder.encode(body);
   if (bytes.length + 1 > MAX_AUTOCONFIG_BYTES) throw new DavParseError('llama.cpp autoconfig input is too large', 'too_large');
@@ -1952,7 +1994,7 @@ function llamacppAutoconfig(op, args) {
     const code = reply && typeof reply.error === 'string' ? reply.error : 'unknown';
     throw new DavParseError(`llama.cpp autoconfig input refused by dav-parse (${code})`, code);
   }
-  return { text, reply: autoconfigReply(op, reply) };
+  return { text, reply: autoconfigReply(op, reply, op === 11 || op === 12) };
 }
 
 // --- code actions (CODE_ACTIONS_IMPL, retired in #1071) and project file names (PROJECT_FILE_NAMES_IMPL, retired in #1071) ----------

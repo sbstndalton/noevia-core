@@ -33,3 +33,28 @@ test('pre-import collection overrides never masquerade as a native every method'
     assert.ok(result.old.trace.length>0,mode);
   }
 });
+
+function prototypeSetterScenario() {
+  const path = require('node:path'), root = process.argv[1], phase = process.argv[2];
+  const define = Object.defineProperty, descriptor = Object.getOwnPropertyDescriptor;
+  const targets = [Object, Reflect], originals = targets.map(target => descriptor(target, 'setPrototypeOf'));
+  const oracle = require(process.env.NOEVIA_FROZEN_CORE_ROOT ? path.join(process.env.NOEVIA_FROZEN_CORE_ROOT, 'server/llamacpp-autoconfig.cjs') : path.join(root, '../tests/reference/llamacpp-autoconfig-js.cjs'));
+  const expected = oracle.kvCacheBytes({blockCount:4,headCount:4,embeddingLength:16,headCountKv:[2,3,3]},4);
+  let candidate, reads = 0, value;
+  if (phase === 'after') candidate = require(path.join(root, 'llamacpp-autoconfig.cjs'));
+  try {
+    for (const target of targets) define(target, 'setPrototypeOf', { configurable: true, get() { reads++; throw new Error('unexpected prototype setter read'); } });
+    candidate ||= require(path.join(root, 'llamacpp-autoconfig.cjs'));
+    value = candidate.kvCacheBytes({blockCount:4,headCount:4,embeddingLength:16,headCountKv:[2,3,3]},4);
+  } finally {
+    for (let index = 0; index < targets.length; index++) define(targets[index], 'setPrototypeOf', originals[index]);
+  }
+  process.stdout.write(JSON.stringify({value, expected, reads}));
+}
+test('private argument storage never reads mutable prototype setters before or after import', () => {
+  for (const phase of ['before', 'after']) {
+    const result = JSON.parse(execFileSync(process.execPath, ['-e', '(' + prototypeSetterScenario.toString() + ')()', __dirname, phase], {encoding:'utf8'}));
+    assert.equal(result.reads, 0, phase);
+    assert.equal(result.value, result.expected, phase);
+  }
+});

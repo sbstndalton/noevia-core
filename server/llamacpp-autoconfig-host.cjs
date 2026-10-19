@@ -13,19 +13,8 @@ const apply = Reflect.apply;
 const objectCreate = Object.create;
 const objectKeys = Object.keys;
 const arrayIncludes = Array.prototype.includes;
-const getOwnDescriptor = Object.getOwnPropertyDescriptor;
-const getPrototype = Object.getPrototypeOf;
 const defineProperty = Object.defineProperty;
-const arrayPrototype = Array.prototype;
-const everyDescriptor = getOwnDescriptor(arrayPrototype, 'every');
-const arrayEvery = everyDescriptor && Object.prototype.hasOwnProperty.call(everyDescriptor, 'value') ? everyDescriptor.value : undefined;
-const functionToString = Function.prototype.toString;
 const arrayIsArray = Array.isArray;
-const isProxy = require('node:util').types.isProxy;
-// Trusted Node runtime primordials supply reflection, not business callback identity.
-// A replaced/accessor/proxied collection method never qualifies for specialization.
-const intrinsicEvery = typeof arrayEvery === 'function' && !isProxy(arrayEvery)
-  && apply(functionToString, arrayEvery, []) === 'function every() { [native code] }';
 const NativeDataView = DataView, NativeArrayBuffer = ArrayBuffer, nativeBigInt = BigInt;
 const getFloat64 = DataView.prototype.getFloat64, setFloat64 = DataView.prototype.setFloat64;
 const getBigUint64 = DataView.prototype.getBigUint64, setBigUint64 = DataView.prototype.setBigUint64;
@@ -41,6 +30,16 @@ function privateMap(array, transform, start = 0) {
   return result;
 }
 const privateSlice = (array,start) => privateMap(array,value=>value,start);
+// These vectors never cross a wire or dynamic reflection boundary. A fresh
+// null-prototype literal avoids inherited numeric setters without invoking a
+// mutable native method; captured apply consumes the same indexed values.
+function privateArgs(array, transform) {
+  const result = { __proto__: null, length: 0 };
+  let length = 0;
+  for (let index = 0; index < array.length; index++) result[length++] = transform(array[index], index);
+  result.length = length;
+  return result;
+}
 
 function binary(operator, a, b, fault) {
   switch (operator) {
@@ -112,18 +111,18 @@ function linearTree(tree, environment, fault) {
     }
     case 'method': {
       const object = linearTree(data, environment, fault), key = linearTree(tree[2], environment, fault);
-      const arguments_ = privateMap(tree[3],argument => linearTree(argument, environment, fault));
+      const arguments_ = privateArgs(tree[3],argument => linearTree(argument, environment, fault));
       return (a,b,c) => {
         const receiver = object(a,b,c), fn = receiver[key(a,b,c)];
-        return apply(fn, receiver, privateMap(arguments_,argument => argument(a,b,c)));
+        return apply(fn, receiver, privateArgs(arguments_,argument => argument(a,b,c)));
       };
     }
     case 'call': {
       const fn = linearTree(data, environment, fault);
-      const arguments_ = privateMap(tree[2],argument => linearTree(argument, environment, fault));
+      const arguments_ = privateArgs(tree[2],argument => linearTree(argument, environment, fault));
       return (a,b,c) => {
         const callee = fn(a,b,c);
-        return apply(callee, undefined, privateMap(arguments_,argument => argument(a,b,c)));
+        return apply(callee, undefined, privateArgs(arguments_,argument => argument(a,b,c)));
       };
     }
     default: throw fault();
@@ -132,8 +131,8 @@ function linearTree(tree, environment, fault) {
 
 
 
-// Non-observable shape facts only. Reject Proxies before any descriptor query.
-// Unsafe shapes retain the original iterator/every/getter program in Rust.
+// Number payloads preserve raw bits. Collection methods execute through the
+// original program rather than a host-side identity or shape assumption.
 function numberBits(value) {
   const view = new NativeDataView(new NativeArrayBuffer(8));
   apply(setFloat64, view, [0, value, false]);
@@ -146,19 +145,11 @@ function bitsNumber(text) {
   return apply(getFloat64, view, [0, false]);
 }
 function booleanArrayFacts(value) {
-  if (!intrinsicEvery || isProxy(value) || !arrayIsArray(value)) return { safe: false };
-  const prototype = getPrototype(value);
-  if (isProxy(prototype) || prototype !== arrayPrototype) return { safe: false };
-  if (getOwnDescriptor(value, 'every') !== undefined) return { safe: false };
-  const method = getOwnDescriptor(prototype, 'every');
-  if (!method || !owns(method, 'value') || method.value !== arrayEvery) return { safe: false };
-  const length = getOwnDescriptor(value, 'length').value;
-  for (let index = 0; index < length; index++) {
-    const descriptor = getOwnDescriptor(value, index);
-    if (!descriptor || !owns(descriptor, 'value') || typeof descriptor.value !== 'boolean') return { safe: false };
-  }
-  return { safe: true, len: length };
+  // Shape or native-function spelling cannot prove the current method's brand
+  // or behavior. Both period and sum shortcuts resume the original program.
+  return { safe: false };
 }
+
 function booleanChunk(value, start, count) {
   let text = '', nibble = 0;
   for (let index = 0; index < count; index++) {
@@ -226,7 +217,7 @@ function evaluator(initialContext) {
         state = operation.state; frame = undefined;
         if (!state || !request || !arrayIsArray(references)) throw context.fault();
         try {
-        const input = privateMap(references,get);
+        const input = privateArgs(references,get);
         const data = request.data;
         let value;
         switch (request.op) {
