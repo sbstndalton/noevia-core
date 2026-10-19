@@ -1828,6 +1828,50 @@ function taskLifecycleFold(events, fromState, authoritative) {
 /** deriveLifecycle(events): `{ state }` or `{ throws }`. A refusal or bad reply throws. */
 function taskLifecycleDerive(events) { return taskLifecycleCall(5, [taskLifecycleEvents(events)], 'state'); }
 
+// Additive diagnostic operation. The five original functions retain their exact wire API.
+const TASK_DIAGNOSTIC_SITES = new Set(['from', 'to', 'fromState', 'pair', 'event_to', 'stale', 'move']);
+function taskLifecycleDiagnostic(operation, args = []) {
+  if (!Number.isInteger(operation) || operation < 0 || operation > 7 || !Array.isArray(args)) {
+    throw new DavParseError('task lifecycle diagnostic arguments', 'input');
+  }
+  let r;
+  try { r = opJson(6, [operation, ...args], MAX_TASK_LIFECYCLE_BYTES, (e) => e.task_lifecycle(), 'task lifecycle diagnostic'); }
+  catch (err) { if (err instanceof DavParseError) throw err; throw new DavParseError('task lifecycle input cannot be serialised', 'input'); }
+  return taskLifecycleDiagnosticReply(operation, args, r);
+}
+function taskLifecycleDiagnosticReply(operation, args, r) {
+  const state = (v) => typeof v === 'string' && TASK_LIFECYCLE_STATES.has(v);
+  if (operation === 0 && exactKeys(r, ['states', 'initial', 'transitions', 'authorityTypes'])
+    && Array.isArray(r.states) && r.states.length === TASK_LIFECYCLE_STATES.size
+    && new Set(r.states).size === r.states.length && r.states.every(state) && state(r.initial)
+    && Array.isArray(r.authorityTypes) && r.authorityTypes.length === 2
+    && r.authorityTypes[0] === 'task.stage' && r.authorityTypes[1] === 'task.revision'
+    && exactKeys(r.transitions, r.states) && Object.values(r.transitions).every((v) => Array.isArray(v) && v.every(state))) return r;
+  if (operation === 1 && exactKeys(r, ['allowed']) && typeof r.allowed === 'boolean') return r;
+  if (operation > 1 && exactKeys(r, ['state']) && state(r.state)) return r;
+  if ((operation === 6 || operation === 7) && exactKeys(r, ['unchanged']) && r.unchanged === true) return r;
+  const d = r?.diagnostic;
+  const sites = { unknown_state: ['from', 'to', 'fromState', 'event_to'], illegal: ['pair', 'move'],
+    stale: ['stale'], report_hash: ['move'], merge_from_reviewing: ['pair', 'move'] };
+  const pairOperation = operation >= 1 && operation <= 3 || operation === 7;
+  const foldOperation = operation === 4 || operation === 5;
+  const eventError = foldOperation && d?.site !== 'fromState';
+  const knownFields = ['site', ...(eventError ? ['event'] : []),
+    ...(['stale', 'move'].includes(d?.site) ? ['current'] : []), ...(d?.site === 'move' ? ['target'] : [])];
+  if (exactKeys(r, ['throws', 'diagnostic']) && TASK_LIFECYCLE_THROWS.has(r.throws)
+    && d && typeof d === 'object' && !Array.isArray(d) && TASK_DIAGNOSTIC_SITES.has(d.site)
+    && sites[r.throws]?.includes(d.site) && Object.keys(d).every((k) => knownFields.includes(k))
+    && (pairOperation ? ['from', 'to', 'pair'].includes(d.site)
+      : operation === 6 ? ['from', 'event_to', 'stale', 'move'].includes(d.site)
+        : foldOperation && (d.site !== 'fromState' || operation === 4))
+    && (!eventError || Array.isArray(args[0]) && Number.isSafeInteger(d.event) && d.event >= 0 && d.event < args[0].length)
+    && (d.current === undefined || state(d.current))
+    && (d.site !== 'move' || state(d.target))
+    && (!['stale', 'move'].includes(d.site) || d.current !== undefined || operation === 6 && !state(args[0]))
+    && (operation !== 6 || d.current === undefined || d.current === args[0])) return r;
+  throw new DavParseError('task lifecycle diagnostic reply has an unexpected shape', 'reply');
+}
+
 // --- llama.cpp autoconfig (LLAMACPP_AUTOCONFIG_IMPL) --------------------------------------------
 // llamacpp_autoconfig::MAX_INPUT_BYTES (the op byte and the JSON).
 const MAX_AUTOCONFIG_BYTES = 4 * 1024 * 1024 + 1;
@@ -2307,4 +2351,4 @@ function verifyAtStartup(env = process.env, { hostname } = {}) {
 function reset() { cached = null; }
 
 module.exports = { llamacppPresetsValues, llamacppPresetsCanonical, llamacppPresetsBatch, llamacppPresetsModel, MAX_LLAMACPP_PRESETS_BYTES, toolGateRule, toolGateOptions, toolGateAnswer, toolGateQueries, toolGateMonths, toolGatePublic, MAX_TOOL_GATE_BYTES,
-  toolboxesProjectIds, toolboxesSelectedIds, toolboxesPermitted, MAX_TOOLBOXES_BYTES, browserPolicyClassify, browserPolicyNavigation, browserPolicySubstitute, browserPolicyFold, MAX_BROWSER_POLICY_BYTES, providerEgressExternal, providerEgressRefusal, providerEgressStrip, providerEgressToolRefusal, providerEgressCanonical, providerEgressFolder, MAX_PROVIDER_EGRESS_BYTES, codeActionsClassify, codeActionsDecide, codeActionsPick, MAX_CODE_ACTIONS_BYTES, projectFileNames, MAX_PROJECT_FILE_NAMES_BYTES, llamacppAutoconfig, autoconfigReply, MAX_AUTOCONFIG_BYTES, taskLifecycleCanTransition, taskLifecycleTransition, taskLifecycleStageMove, taskLifecycleFold, taskLifecycleDerive, taskLifecycleReply, MAX_TASK_LIFECYCLE_BYTES, completenessReport, completenessReply, MAX_COMPLETENESS_BYTES, roleContextProject, roleContextDossier, roleContextReply, MAX_ROLE_CONTEXT_BYTES, codeNetSpec, codeNetResolved, codeNetRefuses, MAX_CODE_NET_BYTES, MAX_CODE_NET_ENTRIES, mcpServersParse, mcpToolboxes, mcpToolboxOffered, MAX_MCP_SERVERS_BYTES, decisionRequestTag, decisionResultTag, decisionInvalidRequest, decisionInvalidResult, decisionCauseOf, decisionErrorFacts, decisionRequest, MAX_DECISION_MESSAGE_UNITS, MAX_DECISION_BYTES, DECISION_ENTRIES, reviewTag, reviewVerdictRead, reviewEventBound, reviewVerdictReply, MAX_REVIEW_BYTES, toolExchangeCheck, toolExchangeError, MAX_EXCHANGE_ARGS_UNITS, MAX_EXCHANGE_NAME_UNITS, ggufSummary, ggufSummaryReply, MAX_GGUF_WINDOW_BYTES, MAX_GGUF_SEGMENTS, authTokens, toolPolicyMode, toolPolicySet, MAX_POLICY_UNITS, MAX_POLICY_TOOLS, streamGuardSchema, streamGuardOptions, streamGuardNew, streamGuardFeed, streamGuardEnd, streamGuardCheck, streamGuardCheckReply, streamGuardCorrection, streamGuardReply, plainJson, MAX_GUARD_BYTES, MAX_GUARD_DEPTH, MAX_GUARD_SCHEMA_BYTES, MAX_GUARD_STATE_BYTES, MAX_GUARD_INPUT_BYTES, MAX_CORRECTION_UNITS, s3Sign, s3Region, MAX_S3_FIELD_BYTES, MAX_S3_QUERY_PAIRS, MAX_S3_PAYLOAD_BYTES, wasmFlags, RETIRED_FLAGS, warnRetiredFlags, verifyAtStartup, framingRuntimeMatches, IMPL_FLAGS, ssrfUrl, ssrfAddressesPublic, ssrfUrlReply, ssrfAddressesReply, MAX_SSRF_BYTES, MAX_SSRF_ADDRESSES, frameUntrusted, escapeClosing, provenanceNew, provenanceIngest, provenanceAdd, provenanceSource, provenanceCheck, provenanceProbe, packetParse, packetValidate, packetRender, FRAME_TEXT_UNITS, FRAME_LABEL_UNITS, MAX_PROVENANCE_BYTES, MAX_PACKET_BYTES, listRecords, s3ListPage, storagePath, uploadValidate, uploadClassify, uploadDecode, secretOpen, secretSeal, mcpRpcBody, mcpSchemaRefs, templateCaps, providerErrorKind, servingVerdict, autotunePlan, autotunePlanText, MAX_PLAN_BYTES, presetReload, MAX_RELOAD_BYTES, loadVerdict, loadVerdictText, MAX_VERDICT_BYTES, tuneContention, tuneContentionText, MAX_CONTENTION_BYTES, longProfilePairs, longProfileSection, longProfilePick, longProfileText, MAX_LONG_PROFILE_BYTES, MAX_TEMPLATE_BYTES, MCP_BODY_UNITS, MCP_SCHEMA_UNITS, MAX_SECRET_PLAIN_BYTES, MAX_SECRET_UNITS, MAX_SECRET_USER_BYTES, load, readLock, reset, memoryBytes, DavParseError, DEFAULT_WASM, MAX_INPUT_BYTES, MAX_DECODE_BYTES, SNIFF_BYTES, RESET_AFTER_BYTES };
+  toolboxesProjectIds, toolboxesSelectedIds, toolboxesPermitted, MAX_TOOLBOXES_BYTES, browserPolicyClassify, browserPolicyNavigation, browserPolicySubstitute, browserPolicyFold, MAX_BROWSER_POLICY_BYTES, providerEgressExternal, providerEgressRefusal, providerEgressStrip, providerEgressToolRefusal, providerEgressCanonical, providerEgressFolder, MAX_PROVIDER_EGRESS_BYTES, codeActionsClassify, codeActionsDecide, codeActionsPick, MAX_CODE_ACTIONS_BYTES, projectFileNames, MAX_PROJECT_FILE_NAMES_BYTES, llamacppAutoconfig, autoconfigReply, MAX_AUTOCONFIG_BYTES, taskLifecycleDiagnostic, taskLifecycleDiagnosticReply, taskLifecycleCanTransition, taskLifecycleTransition, taskLifecycleStageMove, taskLifecycleFold, taskLifecycleDerive, taskLifecycleReply, MAX_TASK_LIFECYCLE_BYTES, completenessReport, completenessReply, MAX_COMPLETENESS_BYTES, roleContextProject, roleContextDossier, roleContextReply, MAX_ROLE_CONTEXT_BYTES, codeNetSpec, codeNetResolved, codeNetRefuses, MAX_CODE_NET_BYTES, MAX_CODE_NET_ENTRIES, mcpServersParse, mcpToolboxes, mcpToolboxOffered, MAX_MCP_SERVERS_BYTES, decisionRequestTag, decisionResultTag, decisionInvalidRequest, decisionInvalidResult, decisionCauseOf, decisionErrorFacts, decisionRequest, MAX_DECISION_MESSAGE_UNITS, MAX_DECISION_BYTES, DECISION_ENTRIES, reviewTag, reviewVerdictRead, reviewEventBound, reviewVerdictReply, MAX_REVIEW_BYTES, toolExchangeCheck, toolExchangeError, MAX_EXCHANGE_ARGS_UNITS, MAX_EXCHANGE_NAME_UNITS, ggufSummary, ggufSummaryReply, MAX_GGUF_WINDOW_BYTES, MAX_GGUF_SEGMENTS, authTokens, toolPolicyMode, toolPolicySet, MAX_POLICY_UNITS, MAX_POLICY_TOOLS, streamGuardSchema, streamGuardOptions, streamGuardNew, streamGuardFeed, streamGuardEnd, streamGuardCheck, streamGuardCheckReply, streamGuardCorrection, streamGuardReply, plainJson, MAX_GUARD_BYTES, MAX_GUARD_DEPTH, MAX_GUARD_SCHEMA_BYTES, MAX_GUARD_STATE_BYTES, MAX_GUARD_INPUT_BYTES, MAX_CORRECTION_UNITS, s3Sign, s3Region, MAX_S3_FIELD_BYTES, MAX_S3_QUERY_PAIRS, MAX_S3_PAYLOAD_BYTES, wasmFlags, RETIRED_FLAGS, warnRetiredFlags, verifyAtStartup, framingRuntimeMatches, IMPL_FLAGS, ssrfUrl, ssrfAddressesPublic, ssrfUrlReply, ssrfAddressesReply, MAX_SSRF_BYTES, MAX_SSRF_ADDRESSES, frameUntrusted, escapeClosing, provenanceNew, provenanceIngest, provenanceAdd, provenanceSource, provenanceCheck, provenanceProbe, packetParse, packetValidate, packetRender, FRAME_TEXT_UNITS, FRAME_LABEL_UNITS, MAX_PROVENANCE_BYTES, MAX_PACKET_BYTES, listRecords, s3ListPage, storagePath, uploadValidate, uploadClassify, uploadDecode, secretOpen, secretSeal, mcpRpcBody, mcpSchemaRefs, templateCaps, providerErrorKind, servingVerdict, autotunePlan, autotunePlanText, MAX_PLAN_BYTES, presetReload, MAX_RELOAD_BYTES, loadVerdict, loadVerdictText, MAX_VERDICT_BYTES, tuneContention, tuneContentionText, MAX_CONTENTION_BYTES, longProfilePairs, longProfileSection, longProfilePick, longProfileText, MAX_LONG_PROFILE_BYTES, MAX_TEMPLATE_BYTES, MCP_BODY_UNITS, MCP_SCHEMA_UNITS, MAX_SECRET_PLAIN_BYTES, MAX_SECRET_UNITS, MAX_SECRET_USER_BYTES, load, readLock, reset, memoryBytes, DavParseError, DEFAULT_WASM, MAX_INPUT_BYTES, MAX_DECODE_BYTES, SNIFF_BYTES, RESET_AFTER_BYTES };

@@ -1,14 +1,13 @@
 'use strict';
-// TASK_LIFECYCLE_IMPL (retired in #1071: the port always confirms the JS): the fail-closed paths, with a stand-in for the Rust port (no
-// dav-parse.wasm needed; tests/server/task-lifecycle-differential.test.cjs runs the real module).
-// The JS answer is the only one ever returned, and only when the port gives the same:
-// a move is allowed only when both allow it. A port refusal, fault, bad reply or disagreement makes
-// canTransition false and every throwing entry point throw TaskLifecycleError (impl_refused /
-// impl_mismatch, 409); through jobs.cjs that refuses the stage write (nothing is appended) and
-// derives no lifecycle (null). Synthetic journals only.
+// TASK_LIFECYCLE_IMPL is retired. Rust is the policy authority; stand-ins below exercise
+// the final compatibility/representation boundary, after the native decision. The immutable
+// checksum-bound JS oracle exists only in tests/reference and supplies independent answers.
+// A refusal, fault, malformed reply or disagreement still refuses the stage write and yields
+// no derived lifecycle. Journals are synthetic; no model or storage-service calls.
 const test = require('node:test'), assert = require('node:assert/strict');
 const fs = require('node:fs'), os = require('node:os'), path = require('node:path');
 const lc = require('./task-lifecycle.cjs');
+const oracle = require('./../tests/reference/task-lifecycle-oracle.cjs');
 const davParseWasm = require('./dav-parse-wasm.cjs');
 const { createJobs, derive, claimLifecycleAuthority } = require('./jobs.cjs');
 const { CHECK_NAMES } = require('./completeness-report.cjs');
@@ -19,17 +18,17 @@ const ev = (type, data) => ({ type, ...(data === undefined ? {} : { data }) });
 const stage = (from, to, extra = {}) => ev('task.stage', { from, to, revision: 0, ...extra });
 
 const answer = (fn, key) => {
-  try { return { [key]: fn() }; } catch (err) { if (err instanceof TaskLifecycleError) return { throws: err.code }; throw err; }
+  try { return { [key]: fn() }; } catch (err) { if (err instanceof TaskLifecycleError || err instanceof oracle.TaskLifecycleError) return { throws: err.code }; throw err; }
 };
 /** A port that answers as the JS does, with `over` replacing any call. */
 function fakePort(over = {}) {
   const calls = [];
   const port = {
-    taskLifecycleCanTransition: (f, t) => { calls.push('can'); return answer(() => lc.canTransitionJs(f, t), 'allowed'); },
-    taskLifecycleTransition: (f, t) => { calls.push('transition'); return answer(() => lc.transitionJs(f, t), 'state'); },
-    taskLifecycleStageMove: (f, t) => { calls.push('stage'); return answer(() => lc.assertStageMoveJs(f, t), 'state'); },
-    taskLifecycleFold: (e, f, a) => { calls.push('fold'); return answer(() => lc.foldEventsJs(e, f, { authoritative: a }), 'state'); },
-    taskLifecycleDerive: (e) => { calls.push('derive'); return answer(() => lc.deriveLifecycleJs(e), 'state'); },
+    taskLifecycleCanTransition: (f, t) => { calls.push('can'); return answer(() => oracle.canTransitionJs(f, t), 'allowed'); },
+    taskLifecycleTransition: (f, t) => { calls.push('transition'); return answer(() => oracle.transitionJs(f, t), 'state'); },
+    taskLifecycleStageMove: (f, t) => { calls.push('stage'); return answer(() => oracle.assertStageMoveJs(f, t), 'state'); },
+    taskLifecycleFold: (e, f, a) => { calls.push('fold'); return answer(() => oracle.foldEventsJs(e, f, { authoritative: a }), 'state'); },
+    taskLifecycleDerive: (e) => { calls.push('derive'); return answer(() => oracle.deriveLifecycleJs(e), 'state'); },
     ...over,
   };
   return { loader: () => port, calls };
@@ -75,7 +74,7 @@ test('an agreeing port leaves every answer as the JS gives it', () => {
   assert.deepEqual(port.calls, ['can', 'transition', 'stage', 'fold', 'derive', 'derive', 'fold']);
 });
 
-test('when the JS refuses or throws, the port is not asked and the JS error stands', () => {
+test('when native policy refuses or throws, the compatibility port is not asked and the exact error stands', () => {
   const port = fakePort();
   const o = wasm(port);
   assert.equal(lc.canTransition('planned', 'merged', o), false);
@@ -133,12 +132,12 @@ test('#1126: the port is sent only the events and fields the fold reads, and agr
   for (const authoritative of [false, true]) {
     for (const k of [0, 3, 5, 11, journal.length]) {
       const part = journal.slice(0, k);
-      assert.deepEqual(answer(() => lc.foldEventsJs(lc.foldInput(part), 'planned', { authoritative }), 'state'),
-        answer(() => lc.foldEventsJs(part, 'planned', { authoritative }), 'state'), `${k} ${authoritative}`);
+      assert.deepEqual(answer(() => oracle.foldEventsJs(lc.foldInput(part), 'planned', { authoritative }), 'state'),
+        answer(() => oracle.foldEventsJs(part, 'planned', { authoritative }), 'state'), `${k} ${authoritative}`);
     }
   }
   const seen = [];
-  const port = fakePort({ taskLifecycleDerive: (e) => { seen.push(e); return answer(() => lc.deriveLifecycleJs(e), 'state'); } });
+  const port = fakePort({ taskLifecycleDerive: (e) => { seen.push(e); return answer(() => oracle.deriveLifecycleJs(e), 'state'); } });
   assert.equal(lc.deriveLifecycle(journal, wasm(port)), 'blocked');
   assert.ok(JSON.stringify(seen[0]).length < 300, 'no payload sent');
 });
@@ -147,11 +146,11 @@ test('#1125: a non-string reportHash is a TaskLifecycleError (report_hash), neve
   const hash = 'ab'.repeat(32);
   for (const reportHash of [[hash], [[hash]], { toString: hash }, { valueOf: hash }, {}, 1, true]) {
     const journal = [stage('planned', 'implementing'), stage('implementing', 'reviewing', { reportHash })];
-    assert.throws(() => lc.deriveLifecycleJs(journal), (e) => e instanceof TaskLifecycleError && e.code === 'report_hash');
-    assert.equal(lc.safeDeriveLifecycle(journal, { wasmLoader: () => { throw Error('asked'); } }), null, 'the JS throws first: the port is not asked');
+    assert.throws(() => oracle.deriveLifecycleJs(journal), (e) => e instanceof oracle.TaskLifecycleError && e.code === 'report_hash');
+    assert.equal(lc.safeDeriveLifecycle(journal, { wasmLoader: () => { throw Error('asked'); } }), null, 'the native policy error precedes the final compatibility port');
     assert.equal(derive([{ type: 'job.created', job: 'x', data: { kind: 'code' } }, ...journal]).lifecycle, null);
   }
-  assert.equal(lc.deriveLifecycleJs([stage('planned', 'implementing'), stage('implementing', 'reviewing', { reportHash: hash })]), 'reviewing');
+  assert.equal(oracle.deriveLifecycleJs([stage('planned', 'implementing'), stage('implementing', 'reviewing', { reportHash: hash })]), 'reviewing');
 });
 
 test('port warnings are logged once per reason and carry no journal text', () => {
@@ -208,7 +207,7 @@ test('jobs.cjs: an agreeing port writes the stage; a refusing one writes nothing
   assert.ok(CHECK_NAMES.length > 0);
 });
 
-test('jobs.cjs derive: a journal the JS cannot fold is null without asking the port', () => {
+test('jobs.cjs derive: a journal native policy rejects is null before the final compatibility port', () => {
   let asked = 0;
   const job = withPort({ ...agree, taskLifecycleFold: () => { asked++; return { state: 'verifying' }; } },
     () => derive([{ type: 'job.created', job: 'x', data: { kind: 'chat' } }, { type: 'job.completed', data: {} }]));
