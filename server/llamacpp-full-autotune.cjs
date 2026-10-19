@@ -725,7 +725,14 @@ function createFullAutotuner({ request: engineRequest, rawModels: engineRawModel
     const before = { ...presets.get(j.model).options }, results = [];
     // #1057: sized once, every model unloaded, for the precision-first choice below.
     await unloadAll();
-    const ceilings = await kvCeilings(j, j.model, kvs);
+    let ceilings;
+    try { ceilings = await kvCeilings(j, j.model, kvs); }
+    catch (error) {
+      // Preparation has only unloaded models; no profile was written. A sizing
+      // fault must stop before proposals, including an unchanged restore write.
+      delete p._beforeText;
+      throw error;
+    }
     // #1058: the order can grow by one, f16 right after a bf16 that failed to load.
     const order = [...kvs];
     let kvFallback = null;

@@ -2191,12 +2191,16 @@ test('entire raw evaluator fault stops independent KV sizing before load or pres
   t.after(() => { davParseWasm.llamacppAutoconfig = saved; davParseWasm.autotunePlan = savedPlanner; });
   fs.writeFileSync(f.ini, fs.readFileSync(f.ini, 'utf8').replace('parallel = 1\n', 'parallel = 1\ncache-ram = 1024\n'));
   const before = fs.readFileSync(f.ini, 'utf8');
+  const savedRename = fs.renameSync; let iniWrites = 0;
+  fs.renameSync = function(source, target) { if (target === f.ini) iniWrites++; return savedRename.apply(this, arguments); };
+  t.after(() => { fs.renameSync = savedRename; });
   await f.manager.autotune.start('synthetic', {confirmPause:true});
   const job = await finished(f.manager);
   assert.ok(evaluatorCalls > 0, 'the real sizing caller must hit the failed evaluator');
   assert.equal(loads, 0, 'no engine candidate may load with unconfirmed native sizing');
   assert.equal(f.requests.length, 0);
   assert.equal(fs.readFileSync(f.ini, 'utf8'), before, 'no preset proposal may be committed');
+  assert.equal(iniWrites, 0, 'not even an unchanged restore may write the preset file');
   assert.equal(job.status, 'failed');
   assert.match(String(job.error), /could not be confirmed by the Rust sizing port/);
   assert.equal(phase(job.models[0], 'kv')?.status, 'failed');
