@@ -158,7 +158,7 @@ function toVerifying(jobs, id, AUTHORITY) {
   jobs.append(id, 'artifact.created', { name: 'test-report', kind: 'test-report', passed: true, exitCode: 0, headSha: SHA1 });
 }
 
-test('jobs.cjs: an unusable module keeps a complete task out of reviewing (409, unverified); the real module lets it in', async () => {
+test('jobs.cjs: hybrid completeness refusal and lifecycle owner leave journal unchanged; worker recovery is asserted outside run', async () => {
   const { createJobs, claimLifecycleAuthority } = require('./jobs.cjs');
   const AUTHORITY = claimLifecycleAuthority();
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cr-switch-'));
@@ -167,20 +167,37 @@ test('jobs.cjs: an unusable module keeps a complete task out of reviewing (409, 
   try {
     const jobs = createJobs({ dir, kinds: ['code'], maxJobs: 10 });
     const id = jobs.create({ kind: 'code', projectId: 'p-synthetic', capabilities: ['read', 'edit'] });
-    await jobs.run(id, async () => {
-      toVerifying(jobs, id, AUTHORITY);
-      const move = { from: 'verifying', to: 'reviewing', revision: 1, expectedArtifacts: ['test-report'] };
-      process.env.COMPLETENESS_REPORT_IMPL = 'js'; // retired: changes nothing
-      process.env.DAV_PARSE_WASM = path.join(dir, 'missing.wasm');
-      davParseWasm.reset();
-      quietly(() => assert.throws(() => jobs.append(id, 'task.stage', move, AUTHORITY),
-        (e) => e.status === 409 && /unverified: impl_refused/.test(e.message)));
-      restore();
-      assert.equal(jobs.get(id).lifecycle, 'verifying', 'nothing was written');
-      const entered = jobs.append(id, 'task.stage', move, AUTHORITY);
-      assert.match(entered.data.reportHash, /^[0-9a-f]{64}$/);
-      return { ok: true };
+    let workerError, exercised = false;
+    const finished = await jobs.run(id, async () => {
+      try {
+        toVerifying(jobs, id, AUTHORITY);
+        const move = { from: 'verifying', to: 'reviewing', revision: 1, expectedArtifacts: ['test-report'] };
+        process.env.COMPLETENESS_REPORT_IMPL = 'js'; // retired: changes nothing
+        process.env.DAV_PARSE_WASM = path.join(dir, 'missing.wasm');
+        davParseWasm.reset();
+        const journal = path.join(dir, 'jobs', id + '.jsonl');
+        const before = fs.readFileSync(journal);
+        const {value:unverified} = quietly(() => buildCompletenessReport({job:passingJob()}));
+        assert.equal(unverified.unverified, 'impl_refused', 'hybrid completeness preserves its conservative report');
+        assert.equal(canEnterReviewing(unverified), false);
+        // The actual append checks lifecycle ownership before completeness; retain that order.
+        quietly(() => assert.throws(() => jobs.append(id, 'task.stage', move, AUTHORITY),
+          (e) => e.status === 409 && /lifecycle could not be verified/.test(e.message)));
+        assert.deepEqual(fs.readFileSync(journal), before, 'fault wrote no journal bytes');
+        restore();
+        assert.equal(jobs.get(id).lifecycle, 'verifying', 'nothing was written');
+        const entered = jobs.append(id, 'task.stage', move, AUTHORITY);
+        assert.match(entered.data.reportHash, /^[0-9a-f]{64}$/);
+        exercised = true;
+        return { ok: true };
+      } catch (error) { workerError = error; throw error; }
+      finally { restore(); }
     });
+    // jobs.run deliberately consumes worker exceptions. Re-throw assertions outside it.
+    if (workerError) throw workerError;
+    assert.equal(exercised, true, 'recovery assertions were reached');
+    assert.equal(finished.status, 'completed', 'worker assertions cannot silently become job.failed');
+    assert.deepEqual(finished.result, {ok:true});
   } finally {
     restore();
     fs.rmSync(dir, { recursive: true, force: true });
