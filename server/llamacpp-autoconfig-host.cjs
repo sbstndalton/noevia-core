@@ -15,6 +15,8 @@ const objectKeys = Object.keys;
 const arrayIncludes = Array.prototype.includes;
 const defineProperty = Object.defineProperty;
 const arrayIsArray = Array.isArray;
+const getOwnDescriptor = Object.getOwnPropertyDescriptor;
+const isProxy = require('node:util').types.isProxy;
 const NativeDataView = DataView, NativeArrayBuffer = ArrayBuffer, nativeBigInt = BigInt;
 const getFloat64 = DataView.prototype.getFloat64, setFloat64 = DataView.prototype.setFloat64;
 const getBigUint64 = DataView.prototype.getBigUint64, setBigUint64 = DataView.prototype.setBigUint64;
@@ -145,9 +147,23 @@ function bitsNumber(text) {
   return apply(getFloat64, view, [0, false]);
 }
 function booleanArrayFacts(value) {
-  // Shape or native-function spelling cannot prove the current method's brand
-  // or behavior. Both period and sum shortcuts resume the original program.
+  // Method spelling cannot prove brand or behavior: periodOf must perform
+  // the original every lookups, calls and callbacks.
   return { safe: false };
+}
+
+// Only the already-evaluated scalar Sum asks for these fresh prefix facts.
+// No method/brand/length lookup or coercion occurs; proof failure uses the
+// original sum loop. Until chunks are consumed, all remaining work is private
+// bookkeeping and primitive numeric arithmetic, with no user callback or yield.
+function ownBooleanPrefixFacts(value, count, fault) {
+  if (typeof count !== 'number' || count < 0 || count > 9007199254740991 || count % 1 !== 0) throw fault();
+  if (value === null || typeof value !== 'object' || isProxy(value)) return { safe: false };
+  for (let index = 0; index < count; index++) {
+    const descriptor = getOwnDescriptor(value, index);
+    if (!descriptor || !owns(descriptor, 'value') || typeof descriptor.value !== 'boolean') return { safe: false };
+  }
+  return { safe: true, len: count };
 }
 
 function booleanChunk(value, start, count) {
@@ -224,6 +240,7 @@ function evaluator(initialContext) {
           case 'numberFacts': frame = { numbers: privateMap(input,value => value === null ? { kind: 'null' } : typeof value === 'number' ? { kind: 'number', bits: numberBits(value) } : { kind: 'other' }) }; break;
           case 'floatBits': value = bitsNumber(data); break;
           case 'booleanArrayFacts': frame = { facts: booleanArrayFacts(input[0]) }; break;
+          case 'ownBooleanPrefixFacts': frame = { facts: ownBooleanPrefixFacts(input[0], data?.count, fault) }; break;
           case 'booleanChunk': frame = { bits: booleanChunk(input[0], data.start, data.count) }; break;
           case 'literal': value = data; break;
           case 'undefined': value = undefined; break;
