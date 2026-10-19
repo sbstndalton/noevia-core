@@ -115,3 +115,103 @@ test('malformed diagnostic context is refused, including forged locations and un
   assert.deepStrictEqual(check(4,[[],'bad',false],{throws:'unknown_state',diagnostic:{site:'fromState'}}),
     {throws:'unknown_state',diagnostic:{site:'fromState'}});
 });
+
+function compareGetterStep(make, label, authoritative = false) {
+  const run = (module) => {
+    const { state, event, trace } = make();
+    const result = capture(() => module.step(state, event, { authoritative }));
+    return { result, preservesRawIdentity: Object.hasOwn(result, 'value') && result.value === state, trace };
+  };
+  assert.deepStrictEqual(run(lc), run(old), label);
+}
+function getterSequence(trace, name, values) {
+  let n = 0;
+  return () => {
+    trace.push(name + ':' + n);
+    const value = values[Math.min(n++, values.length - 1)];
+    if (value instanceof Error) throw value;
+    return value;
+  };
+}
+test('2082: raw stage getters retain captured targets, cached data, lazy coercions and error metadata', () => {
+  for (const first of ['shipped', undefined, null]) {
+    for (const second of ['blocked', new TypeError('second target must not be read')]) {
+      compareGetterStep(() => {
+        const trace = [], data = { from: 'planned', get to() { return to(); } };
+        const to = getterSequence(trace, 'to', [first, second]);
+        const getData = getterSequence(trace, 'data', [data, new TypeError('second data must not be read')]);
+        return { state: 'planned', event: { type: 'task.stage', get data() { return getData(); } }, trace };
+      }, 'captured unknown target');
+    }
+  }
+  for (const targets of [
+    ['implementing', 'blocked', 'implementing'],
+    ['implementing', 'reviewing', 'reviewing', 'blocked'],
+    ['reviewing', 'reviewing', 'reviewing', 'blocked'],
+    ['reviewing', 'reviewing', 'implementing', 'merged'],
+    ['implementing', 'blocked', undefined],
+  ]) for (const hashes of [[null], ['a'.repeat(64)], ['a'.repeat(64), 1n],
+    ['a'.repeat(64), Symbol('hash')], ['a'.repeat(64), { toString() { return 'a'.repeat(64); } }]]) {
+    compareGetterStep(() => {
+      const trace = [], to = getterSequence(trace, 'to', targets), hash = getterSequence(trace, 'hash', hashes);
+      return { state: 'implementing', event: { type: 'task.stage', data: {
+        from: 'implementing', get to() { return to(); }, get reportHash() { return hash(); },
+      } }, trace };
+    }, 'lazy stage target and hash reads');
+  }
+  compareGetterStep(() => {
+    const trace = [], from = getterSequence(trace, 'from', ['wrong', 'message-value', 'metadata-value']);
+    const to = getterSequence(trace, 'to', ['implementing', 'blocked']);
+    const data = { get from() { return from(); }, get to() { return to(); } };
+    const getData = getterSequence(trace, 'data', [data, new TypeError('cached data')]);
+    return { state: 'planned', event: { type: 'task.stage', get data() { return getData(); } }, trace };
+  }, 'stale formatter retains original from/from/to rereads');
+});
+test('2082: progress identity and event type getters preserve original read order and raw errors', () => {
+  compareGetterStep(() => {
+    const trace = [], state = {}, stage = getterSequence(trace, 'stage', ['implementing', state]);
+    return { state, trace, event: { type: 'progress', data: { get stage() { return stage(); } } } };
+  }, 'raw advance identity precedes known-state validation');
+  for (const state of ['planned', 'implementing', undefined, null]) for (const stages of [
+    ['implementing', 'verifying'], ['ignored', new TypeError('unread second stage')],
+    ['verifying', new TypeError('second stage error')],
+  ]) compareGetterStep(() => {
+    const trace = [], stage = getterSequence(trace, 'stage', stages);
+    return { state, trace, event: { type: 'progress', data: { get stage() { return stage(); } } } };
+  }, 'canonical progress predicate then actual advance');
+  for (const types of [
+    ['ignored', 'task.stage'], ['ignored', 'ignored', 'task.revision'],
+    ['ignored', 'ignored', 'ignored', 'progress'],
+    ['ignored', 'ignored', 'ignored', 'ignored', 'job.cancelled'],
+    ['ignored', 'ignored', 'ignored', 'ignored', 'ignored', 'job.interrupted'],
+    ['ignored', new TypeError('second type')],
+    [undefined, new TypeError('unread type')],
+  ]) for (const authoritative of [false, true]) compareGetterStep(() => {
+    const trace = [], type = getterSequence(trace, 'type', types);
+    const data = { from: 'planned', to: 'implementing', stage: 'implementing' };
+    return { state: 'planned', trace, event: {
+      get type() { return type(); }, get data() { trace.push('data'); return data; },
+    } };
+  }, 'event type read schedule', authoritative);
+  for (const method of ['deriveLifecycle', 'safeDeriveLifecycle']) {
+    const run = (module) => capture(() => module[method]([{ type: 'task.stage', get data() {
+      throw new TypeError('raw getter error');
+    } }]));
+    assert.deepStrictEqual(run(lc), run(old), method + ' propagates non-policy exception');
+  }
+});
+
+test('2082: changing valid stage targets retain every lazy branch and first-failure order', () => {
+  const choices = [...old.STATES, null, undefined, new TypeError('later target getter')];
+  for (const state of ['planned', 'implementing', 'reviewing']) {
+    for (const first of old.STATES) for (const second of choices) for (const third of choices) {
+      compareGetterStep(() => {
+        const trace = [], to = getterSequence(trace, 'to', [first, second, third, 'blocked']);
+        const hash = getterSequence(trace, 'hash', ['a'.repeat(64), 'bad']);
+        return { state, trace, event: { type: 'task.stage', data: {
+          from: state, get to() { return to(); }, get reportHash() { return hash(); },
+        } } };
+      }, 'lazy stage matrix ' + state + '/' + first);
+    }
+  }
+});

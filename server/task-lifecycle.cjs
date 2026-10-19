@@ -111,16 +111,16 @@ function policy(operation, args) {
 }
 function policyError(reply, context) {
   const d = reply.diagnostic, code = reply.throws;
-  const event = d.event === undefined ? context.event : context.events?.[d.event];
-  const data = event?.data || {};
+  // Error formatting uses the data object already read by step; never re-read event.data.
+  const data = context.data;
   let from = d.current === undefined ? context.from : d.current;
   let to = d.target === undefined ? context.to : d.target;
   if (code === 'unknown_state') {
     const label = d.site === 'event_to' ? 'to' : d.site;
-    const value = d.site === 'event_to' ? data.to : label === 'fromState' ? context.fromState : context[label];
+    const value = d.site === 'event_to' ? context.to : label === 'fromState' ? context.fromState : context[label];
     throw new TaskLifecycleError(`Unknown task-lifecycle state: ${label} = ${JSON.stringify(value)}`, { [label]: value, code });
   }
-  if (d.site === 'pair') { from = context.from; to = context.to; }
+  if (d.site === 'pair' || context.rawMovement) { from = context.from; to = context.to; }
   if (code === 'stale') {
     throw new TaskLifecycleError(`Stale task-lifecycle stage: recorded from ${JSON.stringify(data.from)} but the task is ${from}`,
       { from: data.from, to: data.to, code });
@@ -169,30 +169,74 @@ function foldInput(events) {
   }
   return out;
 }
-function step(state, event, { authoritative = false } = {}) {
-  // Reading these fields is host projection; Rust decides which event can move which state.
-  const type = event && typeof event.type === 'string' ? event.type : null;
-  const data = type === null ? {} : event.data || {};
-  const projected = { type: FOLD_FIELDS.has(type) ? type : null };
-  let same = false;
-  if (type === 'task.stage') {
-    // A staged diagnostic request preserves the old to-before-from-before-hash read order.
-    const to = stateWire(data.to);
-    let answer = policy(6, [stateWire(state), { type, data: { to } }, Boolean(authoritative), false]);
-    if (answer.throws === 'unknown_state') return policyError(answer, { from: state, event });
-    const from = data.from;
-    same = from === state;
-    projected.data = { from: stateWire(from), to };
-    answer = policy(6, [stateWire(state), projected, Boolean(authoritative), same]);
-    if (answer.throws !== 'report_hash') {
-      if (answer.throws !== undefined) return policyError(answer, { from: state, event });
-      return answer.unchanged ? state : answer.state;
+// Rust chooses the result; these small probes preserve the original lazy property-read
+// schedule for exported raw steps. Getters may change values or throw on a later read.
+function rawStep(state, type, authoritative) {
+  const reply = policy(6, [stateWire(state), { type: FOLD_FIELDS.has(type) ? type : null }, Boolean(authoritative), false]);
+  if (reply.throws !== undefined) policyError(reply, { from: state });
+  return reply.unchanged ? state : reply.state;
+}
+function rawAdvance(state, to) {
+  const reply = policy(7, [stateWire(state), stateWire(to), state === to]);
+  if (reply.throws !== undefined) policyError(reply, { from: state, to });
+  return reply.unchanged ? state : reply.state;
+}
+function stageStep(state, data) {
+  const firstTo = data.to;
+  // A reflexive pair asks only whether this captured target is a known state.
+  const known = policy(1, [stateWire(firstTo), stateWire(firstTo)]);
+  if (known.throws !== undefined) policyError({ ...known, diagnostic: { site: 'event_to' } }, { to: firstTo });
+  const firstFrom = data.from;
+  const stale = policy(6, [stateWire(state), { type: 'task.stage', data: {
+    from: stateWire(firstFrom), to: stateWire(firstTo),
+  } }, false, firstFrom === state]);
+  if (stale.throws === 'stale') policyError(stale, { from: state, data });
+  // Rust's report-hash gate identifies whether the second target read needs the third
+  // read and hash reads. This probe's anchor state never chooses the actual move.
+  const nextTo = data.to;
+  const gate = policy(6, [INITIAL_STATE, { type: 'task.stage', data: {
+    from: INITIAL_STATE, to: stateWire(nextTo),
+  } }, false, true]);
+  if (gate.throws === 'report_hash' && data.to !== state) {
+    const firstHash = data.reportHash;
+    // RegExp.test in the original coerces its second read (but not the typeof read).
+    // Template interpolation performs the same ToString, including throwing for Symbol.
+    const hash = typeof firstHash === 'string' ? `${data.reportHash}` : null;
+    const checked = policy(6, [INITIAL_STATE, { type: 'task.stage', data: {
+      from: INITIAL_STATE, to: stateWire(nextTo), reportHash: hashWire(hash),
+    } }, false, true]);
+    if (checked.throws === 'report_hash') {
+      policyError(checked, { from: state, to: data.to, rawMovement: true });
     }
-    projected.data.reportHash = hashWire(data.reportHash);
-  } else if (type === 'progress') projected.data = { stage: stateWire(data.stage) };
-  const answer = policy(6, [stateWire(state), projected, Boolean(authoritative), same]);
-  if (answer.throws !== undefined) return policyError(answer, { from: state, event });
-  return answer.unchanged ? state : answer.state;
+  }
+  return pair(3, state, data.to).state;
+}
+function step(state, event, { authoritative = false } = {}) {
+  if (!event || typeof event.type !== 'string') return rawStep(state, null, authoritative);
+  const data = event.data || {};
+  if (event.type === 'task.stage') return stageStep(state, data);
+  if (event.type === 'task.revision') return rawStep(state, 'task.revision', authoritative);
+  if (authoritative) {
+    // These comparisons schedule the same lazy reads as the old short-circuit expression;
+    // Rust still decides whether the resulting event moves or preserves the raw state.
+    let type = event.type;
+    if (type !== 'job.failed') {
+      type = event.type;
+      if (type !== 'job.cancelled') {
+        type = event.type;
+        if (type !== 'job.interrupted') type = null;
+      }
+    }
+    return rawStep(state, type, authoritative);
+  }
+  const type = event.type;
+  if (type === 'progress') {
+    const firstStage = data.stage;
+    const gate = policy(6, [INITIAL_STATE, { type, data: { stage: stateWire(firstStage) } }, false, false]);
+    if (gate.unchanged) return state;
+    return rawAdvance(state, data.stage);
+  }
+  return rawStep(state, type, false);
 }
 // This loop contains no policy rules: every step and every error comes from Rust. Each event
 // crosses once with bounded scalar fields; no repeated prefix or growing journal is re-sent.

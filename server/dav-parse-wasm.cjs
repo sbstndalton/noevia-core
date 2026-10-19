@@ -1831,7 +1831,7 @@ function taskLifecycleDerive(events) { return taskLifecycleCall(5, [taskLifecycl
 // Additive diagnostic operation. The five original functions retain their exact wire API.
 const TASK_DIAGNOSTIC_SITES = new Set(['from', 'to', 'fromState', 'pair', 'event_to', 'stale', 'move']);
 function taskLifecycleDiagnostic(operation, args = []) {
-  if (!Number.isInteger(operation) || operation < 0 || operation > 6 || !Array.isArray(args)) {
+  if (!Number.isInteger(operation) || operation < 0 || operation > 7 || !Array.isArray(args)) {
     throw new DavParseError('task lifecycle diagnostic arguments', 'input');
   }
   let r;
@@ -1849,11 +1849,11 @@ function taskLifecycleDiagnosticReply(operation, args, r) {
     && exactKeys(r.transitions, r.states) && Object.values(r.transitions).every((v) => Array.isArray(v) && v.every(state))) return r;
   if (operation === 1 && exactKeys(r, ['allowed']) && typeof r.allowed === 'boolean') return r;
   if (operation > 1 && exactKeys(r, ['state']) && state(r.state)) return r;
-  if (operation === 6 && exactKeys(r, ['unchanged']) && r.unchanged === true) return r;
+  if ((operation === 6 || operation === 7) && exactKeys(r, ['unchanged']) && r.unchanged === true) return r;
   const d = r?.diagnostic;
   const sites = { unknown_state: ['from', 'to', 'fromState', 'event_to'], illegal: ['pair', 'move'],
     stale: ['stale'], report_hash: ['move'], merge_from_reviewing: ['pair', 'move'] };
-  const pairOperation = operation >= 1 && operation <= 3;
+  const pairOperation = operation >= 1 && operation <= 3 || operation === 7;
   const foldOperation = operation === 4 || operation === 5;
   const eventError = foldOperation && d?.site !== 'fromState';
   const knownFields = ['site', ...(eventError ? ['event'] : []),
