@@ -122,8 +122,15 @@ test('on a real listener, the connection\'s own local address is what decides', 
   }
 });
 
-test('the override names web\'s code-network address and no longer claims the sandbox cannot reach web', () => {
-  const yaml = fs.readFileSync(path.join(__dirname, '../../../deploy/examples/code-sandbox.override.yml'), 'utf8');
+// The override is in the monorepo's deploy/. CI lays the monorepo out as ws/ with this checkout at
+// ws/apps/web, so the path below resolves there. A standalone noevia-core checkout has no deploy/: the
+// test is skipped with that reason. In CI it never skips: a missing file fails the run.
+const OVERRIDE = path.join(__dirname, '../../../deploy/examples/code-sandbox.override.yml');
+const overrideSkip = fs.existsSync(OVERRIDE) || process.env.CI ? false
+  : 'deploy/examples is not beside this checkout (standalone noevia-core); CI runs it against the monorepo layout';
+
+test('the override names web\'s code-network address and no longer claims the sandbox cannot reach web', { skip: overrideSkip }, () => {
+  const yaml = fs.readFileSync(OVERRIDE, 'utf8');
   assert.match(yaml, /^\s+COWORK_CODE_NET_ADDR: \$\{COWORK_CODE_NET_ADDR:-egress\}$/m);
   assert.doesNotMatch(yaml, /cannot resolve, let alone reach, web/);
   assert.match(yaml, /aliases: \[egress\]/, 'the alias the default resolves');

@@ -23,7 +23,7 @@ const store = () => { const m = new Map(); return { get: (k) => m.get(k), set: (
 const tool = (name, description = `${name} reads synthetic data. `.repeat(12)) => ({ type: 'function', function: { name, description, parameters: { type: 'object', properties: {}, required: [] } } });
 
 /** The request checks of services/laya/server.py validate(), mirrored. */
-function layaRefuses(body) {
+function decisionRefuses(body) {
   if (!body || Object.keys(body).sort().join() !== 'options,question,state') return 'shape';
   if (typeof body.state !== 'string' || body.state.length > 4000) return 'state';
   if (typeof body.question !== 'string' || !(body.question.length >= 1 && body.question.length <= 500)) return 'question';
@@ -40,7 +40,7 @@ function fakeLaya(pick, seen = []) {
   return async (url, init) => {
     const body = JSON.parse(init.body);
     seen.push(body);
-    if (layaRefuses(body)) return Response.json({ error: 'Invalid or over-budget decision request' }, { status: 422 });
+    if (decisionRefuses(body)) return Response.json({ error: 'Invalid or over-budget decision request' }, { status: 422 });
     const ids = body.options.map((o) => o.id);
     const chosen = typeof pick === 'function' ? pick(ids) : pick;
     const rest = (1 - 0.9) / (ids.length - 1);
@@ -102,7 +102,7 @@ test('the tool gate request fits the service: at most 8 options, safe ids, short
   const out = await gateFor(settings, logs).evaluate('Please take care of the synthetic thing', offered);
   assert.equal(seen.length, 1);
   const body = seen[0];
-  assert.equal(layaRefuses(body), null);
+  assert.equal(decisionRefuses(body), null);
   assert.ok(body.options.length <= SERVICE_LIMITS.maxOptions);
   const chars = body.question.length + body.options.reduce((n, o) => n + o.id.length + o.label.length + 2, 0);
   assert.ok(chars <= SERVICE_LIMITS.maxChoiceChars, `${chars} chars`);
@@ -120,7 +120,7 @@ test('an id the service would refuse is mapped there and back', async () => {
   const seen = [];
   const settings = configured(fakeLaya('web_fetch_2', seen));
   const out = await gateFor(settings, []).evaluate('Take care of the synthetic thing', [tool('Web-Fetch'), tool('web_fetch')]);
-  assert.equal(layaRefuses(seen[0]), null);
+  assert.equal(decisionRefuses(seen[0]), null);
   // web_fetch is a tool the gate's rules know, so it is listed first and keeps its own id.
   assert.deepEqual(seen[0].options.map((o) => o.id), ['web_fetch', 'web_fetch_2', 'none']);
   assert.equal(out.decision.tool, 'Web-Fetch');
