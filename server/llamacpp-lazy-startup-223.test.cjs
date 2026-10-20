@@ -16,7 +16,7 @@ const skipWasm = !fs.existsSync(process.env.DAV_PARSE_WASM || davParseWasm.DEFAU
 const AUTOCONFIG = path.join(__dirname, 'llamacpp-autoconfig.cjs');
 const CALIBRATION = path.join(__dirname, 'llamacpp-calibration.cjs');
 const HOST = path.join(__dirname, 'llamacpp-autoconfig-host.cjs');
-const EXPECTED_RAN = 31;
+const EXPECTED_RAN = 35;
 
 let ran = 0;
 test.after(() => { assert.equal(ran, skipWasm ? 0 : EXPECTED_RAN, 'every guarded body must have run'); });
@@ -59,7 +59,7 @@ async function settle(m) {
   assert.notEqual(m.calibration.status().body.job?.status, 'running', 'the cancelled calibration must stop');
 }
 
-function synthetic(t, { autoconfig = {}, inferenceBudget, native } = {}) {
+function synthetic(t, { autoconfig = {}, inferenceBudget, native, autotuneOptions } = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'lazy-223-'));
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
   fs.writeFileSync(path.join(dir, 'q.gguf'), gguf(HEADER));
@@ -68,7 +68,7 @@ function synthetic(t, { autoconfig = {}, inferenceBudget, native } = {}) {
   const calls = [], state = { small: 'unloaded' };
   const m = createModelManager({ kind: 'llamacpp', baseUrl: 'http://synthetic', presetPath: ini, calibrationStatePath: path.join(dir, 'cal.json'), autotuneStatePath: path.join(dir, 'tune.json'),
     autoconfig: { modelsPath: dir, cacheRamMaxMib: 1024, ...autoconfig }, ...(inferenceBudget ? { inferenceBudget } : {}),
-    calibrationOptions: { sleep: async () => {}, readMemory: () => 20 },
+    calibrationOptions: { sleep: async () => {}, readMemory: () => 20 }, ...(autotuneOptions ? { autotuneOptions } : {}),
     fetchJson: async (url, options = {}) => {
       const p = new URL(url).pathname;
       calls.push(`${options.method || 'GET'} ${p}`);
@@ -174,6 +174,73 @@ test('calibration: with the real evaluator start() is accepted (202) and can be 
   ran++;
   assert.equal(r.ok, true); assert.equal(r.status, 202);
   await settle(m);
+});
+
+// ---- auto-tune: the ladder fault refuses instead of falling back to the standard order ----------------------
+
+async function tuneSettled(m) {
+  for (let i = 0; i < 400 && m.autotune.status().body.job?.status === 'running'; i++) await new Promise((resolve) => setTimeout(resolve, 25));
+  return m.autotune.status().body.job;
+}
+const TUNE = { confirmPause: true, promptBudgetSeconds: 30 };
+
+test('auto-tune: a CTX_CANDIDATES getter fault refuses start() with 503 autoconfig_impl before any hold or write', { skip: skipWasm }, async (t) => {
+  const mods = freshModules(t);
+  Object.defineProperty(mods.autoconfig(), 'CTX_CANDIDATES', { get() { throw new Error('synthetic getter fault'); }, configurable: true, enumerable: true });
+  const { m, calls, ini } = synthetic(t, { native: 32768, inferenceBudget: { budgetGib: () => 64 } });
+  const before = fs.readFileSync(ini, 'utf8');
+  const r = await m.autotune.start('small', TUNE);
+  ran++;
+  assert.equal(r.ok, false); assert.equal(r.status, 503); assert.equal(r.body.code, 'autoconfig_impl');
+  assert.match(r.body.error, /^Auto-tune is unavailable: .*context ladder/);
+  assert.ok(!m.autotune.status().body.job, 'no job record');
+  assert.equal(m.tuningActive(), false, 'the gate was never held');
+  assert.equal(fs.readFileSync(ini, 'utf8'), before);
+  assert.deepEqual(WRITES(calls), [], calls.join('\n'));
+  // Validation still answers first and unchanged.
+  assert.equal((await m.autotune.start('small', { promptBudgetSeconds: 30 })).status, 400);
+});
+
+test('auto-tune: an evaluator-wide fault refuses start() the same way and loads nothing', { skip: skipWasm }, async (t) => {
+  const probe = faultyEvaluator(t);
+  freshModules(t);
+  const { m, calls, ini } = synthetic(t, { native: 32768, inferenceBudget: { budgetGib: () => 64 } });
+  const before = fs.readFileSync(ini, 'utf8');
+  const r = await m.autotune.start('small', TUNE);
+  ran++;
+  assert.ok(probe.ran > 0);
+  assert.equal(r.status, 503); assert.equal(r.body.code, 'autoconfig_impl');
+  assert.ok(!m.autotune.status().body.job);
+  assert.equal(fs.readFileSync(ini, 'utf8'), before);
+  assert.deepEqual(WRITES(calls), [], calls.join('\n'));
+});
+
+test('auto-tune: an autoconfig_impl refusal while planning stops the job with its own reason, not the standard-order fallback', { skip: skipWasm }, async (t) => {
+  freshModules(t);
+  const refusal = Object.assign(new Error('synthetic sizing refusal'), { code: 'autoconfig_impl', status: 503 });
+  const { m, calls, ini } = synthetic(t, { native: 32768, inferenceBudget: { budgetGib: () => 64 }, autotuneOptions: { budgetGib: () => { throw refusal; } } });
+  const before = fs.readFileSync(ini, 'utf8');
+  const r = await m.autotune.start('small', TUNE);
+  assert.equal(r.status, 202, 'the ladder is readable, so the run is accepted');
+  const job = await tuneSettled(m);
+  ran++;
+  assert.equal(job.status, 'failed');
+  assert.match(job.error, /synthetic sizing refusal/);
+  assert.ok(!(job.log || []).some((line) => /standard tuning order/.test(JSON.stringify(line))), 'no silent fallback to the standard order');
+  assert.equal(fs.readFileSync(ini, 'utf8'), before, 'the preset is untouched');
+  assert.ok(!calls.includes('POST /models/load'), calls.join('\n'));
+});
+
+test('auto-tune: a planning failure that is not a refusal still falls back to the standard order (unchanged)', { skip: skipWasm }, async (t) => {
+  freshModules(t);
+  const { m } = synthetic(t, { native: 32768, inferenceBudget: { budgetGib: () => 64 }, autotuneOptions: { planFacts: async () => { throw new Error('model file unreadable'); } } });
+  const r = await m.autotune.start('small', TUNE);
+  assert.equal(r.status, 202);
+  m.autotune.cancel();
+  const job = await tuneSettled(m);
+  ran++;
+  assert.notEqual(job?.status, 'running');
+  assert.ok(!/synthetic|autoconfig_impl/.test(String(job?.error || '')), String(job?.error));
 });
 
 // ---- manager: a boot-time budget fault refuses the dependent features per request --------------------------

@@ -616,7 +616,10 @@ function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloa
   // Starting settings for calibration: structural values from the model file; the context
   // itself is measured, so an unconfigured memory budget is not an obstacle here.
   async function conservativeFor(model) {
-    if(budgetFaultReason())return null; // #223: no budget to size against, and none is invented
+    // #223: on a budget fault there is nothing to size against and no figure is invented, so this returns null. The
+    // cost is that calibration then gets neither the file-derived native context nor the suggested starting values
+    // (it falls back to the engine's n_ctx_train and the profile's own settings); it still measures the context.
+    if(budgetFaultReason())return null;
     const read=await readModel(model);
     if(read.error)return null;
     const profile=presets.get(model);
