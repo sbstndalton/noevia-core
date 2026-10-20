@@ -13,12 +13,13 @@
 // Each guarded step counts ran++ and test.after asserts the total.
 const test = require('node:test'), assert = require('node:assert/strict'), fs = require('node:fs'), os = require('node:os'), path = require('node:path');
 const http = require('node:http');
-const { spawn } = require('node:child_process');
-const { seedAccount } = require('./seed-account.cjs');
+const { spawn, execFile } = require('node:child_process');
 const { startProjectStore } = require('./project-store-server.cjs');
 const davParseWasm = require('../../server/dav-parse-wasm.cjs');
 
-const skipWasm = !fs.existsSync(process.env.DAV_PARSE_WASM || davParseWasm.DEFAULT_WASM) && process.env.DAV_PARSE_WASM_REQUIRED !== '1' && 'dav-parse.wasm not built';
+const serverRequire = require('node:module').createRequire(path.join(__dirname, '..', '..', 'server', 'package.json'));
+const noSqlite = (() => { try { serverRequire.resolve('better-sqlite3'); return false; } catch { return 'better-sqlite3 not installed here'; } })();
+const skipWasm = noSqlite || (!fs.existsSync(process.env.DAV_PARSE_WASM || davParseWasm.DEFAULT_WASM) && process.env.DAV_PARSE_WASM_REQUIRED !== '1' && 'dav-parse.wasm not built');
 const SERVER = path.join(__dirname, '..', '..', 'server', 'index.cjs');
 const SERVER_DIR = path.dirname(SERVER);
 const BOOT_FAULT = /could not be evaluated at startup/;
@@ -68,18 +69,25 @@ function fakeRouter() {
   return new Promise((resolve) => server.listen(0, '127.0.0.1', () => resolve({ server, calls, port: server.address().port })));
 }
 
-// One loopback request over node:http (no proxy or dispatcher settings can apply to it).
+// One loopback request, made by a short-lived helper process with a clean environment. The test workers run
+// under tests/hermetic-network.cjs, which refuses a connection to any port this process did not open itself;
+// the booted server is a child process, so its port is not one of them. The helper is not under that guard.
+const CLIENT = `const http = require('node:http');
+const [base, method, p, headers, body] = process.argv.slice(1);
+const req = http.request(base + p, { method, headers: JSON.parse(headers), agent: false, timeout: 30000 }, (res) => {
+  const chunks = [];
+  res.on('data', (c) => chunks.push(c));
+  res.on('end', () => process.stdout.write(JSON.stringify({ status: res.statusCode, text: Buffer.concat(chunks).toString('utf8') })));
+});
+req.on('timeout', () => req.destroy(new Error('request timed out')));
+req.on('error', (e) => { process.stderr.write(String(e.code || e.message)); process.exit(2); });
+req.end(body || undefined);`;
 function request(base, method, p, { headers = {}, body } = {}) {
   return new Promise((resolve, reject) => {
-    const req = http.request(base + p, { method, headers, agent: false, timeout: 30000 }, (res) => {
-      const chunks = [];
-      res.on('data', (c) => chunks.push(c));
-      res.on('end', () => resolve({ status: res.statusCode, text: Buffer.concat(chunks).toString('utf8') }));
-      res.on('error', reject);
+    execFile(process.execPath, ['-e', CLIENT, base, method, p, JSON.stringify(headers), body ?? ''], { env: { PATH: process.env.PATH }, timeout: 40000, maxBuffer: 1 << 24 }, (err, stdout, stderr) => {
+      if (err) reject(Object.assign(new Error(stderr || err.message), { code: stderr || err.code }));
+      else resolve(JSON.parse(stdout));
     });
-    req.on('timeout', () => req.destroy(new Error('request timed out')));
-    req.on('error', reject);
-    req.end(body);
   });
 }
 
@@ -137,6 +145,7 @@ async function boot(t, mode) {
     } catch (e) { last = `${base} ${e?.name}: ${e?.message} ${e?.code || ''}`; }
     await new Promise((resolve) => setTimeout(resolve, 200));
   }
+  const { seedAccount } = require('./seed-account.cjs'); // needs better-sqlite3, which the skip above guarantees
   const admin = seedAccount(dataDir, { username: 'synthetic-admin', publicOrigin: base });
   const call = async (method, p, body) => {
     const payload = body === undefined ? undefined : JSON.stringify(body);
