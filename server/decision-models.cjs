@@ -11,7 +11,7 @@
 // Adding or changing a profile changes what production sends; the wording behind 'kev' was tuned and
 // measured on the #1639 split (tools/decision-eval), the temperature fitted there (T 0.45).
 
-// The id the decision service (Laya) reports for itself in a reply. The one place this literal lives in
+// The id the decision service reports for itself in a reply. The one place this literal lives in
 // non-test code (#221): decision-endpoint.cjs and system-one-router.cjs expose a reported model only when it
 // equals this, and null for anything else. It is the identity the service answers with, not a setting: changing
 // it changes what the callers accept, so it is a code change like the profile table below.
@@ -19,7 +19,7 @@ const DECISION_SERVICE_REPORTED_MODEL = "convaiinnovations/laya";
 
 const PROFILES = Object.freeze({
   // services/laya: POST /v1/decisions { state, question, options } -> { selected, scores, model, ... }.
-  laya: Object.freeze({ id: 'laya', protocol: 'laya', wording: 'laya', temperature: 1, reportedModel: DECISION_SERVICE_REPORTED_MODEL }),
+  laya: Object.freeze({ id: 'laya', protocol: 'laya', wording: 'laya', temperature: 1 }),
   // Kev-0.8B served by Ollaya 0.13.0 (TypeSafe /v1/decisions, a bearer key), as in the #1639 evaluation.
   'kev-0.8b': Object.freeze({ id: 'kev-0.8b', protocol: 'typesafe', servedModel: 'ollaya.dev/library/kev:0.8b', wording: 'kev', temperature: 0.45 }),
 });

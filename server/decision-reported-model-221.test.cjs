@@ -4,17 +4,15 @@
 // pinned here, once, so a change to the accepted id is a visible test change, not a silent one.
 const test = require("node:test");
 const assert = require("node:assert/strict");
-const { DECISION_SERVICE_REPORTED_MODEL, PROFILES } = require("./decision-models.cjs");
+const { DECISION_SERVICE_REPORTED_MODEL } = require("./decision-models.cjs");
 const { createDecisionEndpoint } = require("./decision-endpoint.cjs");
 const { createSystemOneRouter } = require("./system-one-router.cjs");
 
-const env = { COWORK_DECISION_URL: "http://laya:8040" };
+const env = { COWORK_DECISION_URL: "http://decision:8040" };
 const options = [{ id: "a", label: "A" }, { id: "b", label: "B" }];
 
-test("the accepted id is the one deployed before #221, and the Laya profile carries it", () => {
+test("the accepted id is the one deployed before #221", () => {
   assert.equal(DECISION_SERVICE_REPORTED_MODEL, "convaiinnovations/laya");
-  assert.equal(PROFILES.laya.reportedModel, DECISION_SERVICE_REPORTED_MODEL);
-  assert.equal(PROFILES["kev-0.8b"].reportedModel, undefined, "only the Laya wire reports a model id");
 });
 
 async function endpointModel(reported) {
