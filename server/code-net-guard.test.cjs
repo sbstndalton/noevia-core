@@ -166,5 +166,8 @@ test('a logger that throws during a retry leaves no unhandled rejection', async 
   });
   assert.ok(logged >= 2, 'the retry ran and its log threw');
   assert.deepEqual(seen, []);
+  // The retry died before it could schedule another, so the address set may be incomplete: refuse.
+  assert.equal(await guard.refuses(CODE_ADDR), true, 'a code-network address is refused, not served');
+  assert.equal(await guard.refuses(DEFAULT_ADDR), true, 'and so is every other request (fails closed)');
   guard.stop();
 });

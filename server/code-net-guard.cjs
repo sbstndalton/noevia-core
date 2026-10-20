@@ -137,8 +137,9 @@ function createCodeNetGuard({ spec = '', lookup = defaultLookup, log = () => {},
       // take the whole UI down — so keep trying (backing off), and say so each time.
       const wait = nextRetryMs;
       nextRetryMs = Math.min(nextRetryMs * 2, maxRetryMs);
-      // A retry that throws (only a logger can) must not become an unhandled rejection (#213).
-      retryTimer = setTimeout(() => { retryTimer = null; resolveOnce().catch(() => {}); }, wait);
+      // A retry that throws (only a logger can) must not become an unhandled rejection (#213), and it
+      // leaves the address set possibly incomplete with no retry scheduled: refuse everything (fails closed).
+      retryTimer = setTimeout(() => { retryTimer = null; resolveOnce().catch(() => { broken = true; }); }, wait);
       retryTimer.unref?.();
     } else if (enabled && !broken) {
       log({ event: 'codenet.guarding', addresses: [...addresses] });
