@@ -106,6 +106,30 @@ test('throws stay input errors; strict policy results match the frozen pre-retir
   }
 });
 
+test('the throws rows through the public switched API: the old input error, never an answer and never a fault code', { skip: skipWasm }, (t) => {
+  // The raw module reports reason `input` for these rows; the public API must surface the frozen oracle's own error
+  // (a TypeError from the old host), not an answer, and not the autoconfig_impl fault (503) that would mean the Rust
+  // program was unreachable rather than the input invalid. `ran` counts the rows exercised; test.after asserts all 8.
+  let ran = 0;
+  t.after(() => assert.equal(ran, 8, 'every fixtures.throws row must run through the public API'));
+  assert.equal(fixtures.throws.length, 8);
+  const PUBLIC = { 1: (a) => ac.suggest(a, WASM), 2: (a) => ac.estimateInputs(a, WASM), 3: (a) => ac.estimateFootprint(a, WASM), 5: (a) => ac.isPromptCacheFree(a.model, a.options) };
+  const ORACLE = { 1: (a) => oracle.suggestJs(a), 2: (a) => oracle.estimateInputsJs(a), 3: (a) => oracle.estimateFootprintJs(a), 5: (a) => oracle.isPromptCacheFree(a.model, a.options) };
+  const outcome = (fn) => { try { return { kind: 'return', value: fn() }; } catch (e) { return { kind: 'throw', name: e.name, message: e.message, code: e.code, status: e.status }; } };
+  for (const [i, row] of fixtures.throws.entries()) {
+    const args = JSON.parse(row.wire);
+    assert.ok(PUBLIC[row.op], `throws row ${i}: op ${row.op} has a public entry point`);
+    const got = outcome(() => PUBLIC[row.op](args));
+    ran++;
+    assert.equal(got.kind, 'throw', `throws row ${i}: the public API must not answer`);
+    assert.notEqual(got.code, 'autoconfig_impl', `throws row ${i}: an input error, not a module fault`);
+    assert.equal(got.name, 'TypeError', `throws row ${i}`);
+    assert.deepEqual(got, outcome(() => ORACLE[row.op](args)), `throws row ${i}: same error as the frozen oracle`);
+  }
+  // The call named in the issue, directly.
+  assert.throws(() => ac.suggest(null, WASM), (e) => e instanceof TypeError && e.code === undefined);
+});
+
 test('typed non-finite inputs preserve checksum-frozen old host outcomes and module faults fail closed', { skip: skipWasm }, () => {
   const meta = { arch: 'llama', contextLength: 131072, embeddingLength: 4096, blockCount: 32, headCount: 32, headCountKv: 8, hasChatTemplate: true };
   const capture = fn => { try { const value = fn(); return { kind: 'return', json: JSON.stringify(value) }; } catch (error) { return { kind: 'throw', name: error.name, code: error.code, status: error.status, message: error.message }; } };
