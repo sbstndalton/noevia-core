@@ -137,7 +137,8 @@ function createCodeNetGuard({ spec = '', lookup = defaultLookup, log = () => {},
       // take the whole UI down — so keep trying (backing off), and say so each time.
       const wait = nextRetryMs;
       nextRetryMs = Math.min(nextRetryMs * 2, maxRetryMs);
-      retryTimer = setTimeout(() => { retryTimer = null; void resolveOnce(); }, wait);
+      // A retry that throws (only a logger can) must not become an unhandled rejection (#213).
+      retryTimer = setTimeout(() => { retryTimer = null; resolveOnce().catch(() => {}); }, wait);
       retryTimer.unref?.();
     } else if (enabled && !broken) {
       log({ event: 'codenet.guarding', addresses: [...addresses] });
@@ -145,6 +146,10 @@ function createCodeNetGuard({ spec = '', lookup = defaultLookup, log = () => {},
   }
   // The first resolution is awaited by the first requests, so none slips through at startup.
   const ready = enabled ? resolveOnce() : Promise.resolve();
+  // Nothing in production awaits `ready` (#213): if resolution throws (only a logger can), the
+  // rejection is marked handled here so it cannot crash the process. Callers that do await `ready`
+  // still see the rejection, and a request then fails closed as before (it is destroyed).
+  ready.catch(() => {});
 
   let refused = 0, lastLogged = -Infinity;
   /** Whether a connection that arrived on `localAddress` came in over the code network. */

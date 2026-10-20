@@ -128,3 +128,43 @@ test('the override names web\'s code-network address and no longer claims the sa
   assert.doesNotMatch(yaml, /cannot resolve, let alone reach, web/);
   assert.match(yaml, /aliases: \[egress\]/, 'the alias the default resolves');
 });
+
+// #213: nothing in production awaits `ready`, so a logger that throws must not leave an unhandled rejection.
+async function unhandledDuring(fn) {
+  const seen = [];
+  const onUnhandled = (err) => seen.push(err);
+  process.on('unhandledRejection', onUnhandled);
+  try {
+    await fn();
+    await new Promise((r) => setTimeout(r, 30)); // unhandledRejection is raised after the microtask queue drains
+  } finally { process.off('unhandledRejection', onUnhandled); }
+  return seen;
+}
+
+test('a logger that throws on the first resolution leaves no unhandled rejection; ready still rejects for a caller that awaits it', async () => {
+  let guard;
+  const seen = await unhandledDuring(async () => {
+    guard = createCodeNetGuard({ spec: 'egress', retryMs: 3_600_000, log: () => { throw Error('log sink is gone'); },
+      lookup: async () => { throw Error('getaddrinfo ENOTFOUND egress'); } });
+    await new Promise((r) => setTimeout(r, 10));
+  });
+  assert.deepEqual(seen, []);
+  await assert.rejects(guard.ready, /log sink is gone/);
+  const res = fakeRes();
+  await guard.wrap(() => assert.fail('handler must not run'), 'ui')(req(CODE_ADDR), res);
+  assert.equal(res.destroyed, true, 'a request is still destroyed, not served');
+  guard.stop();
+});
+
+test('a logger that throws during a retry leaves no unhandled rejection', async () => {
+  let logged = 0, guard;
+  const seen = await unhandledDuring(async () => {
+    guard = createCodeNetGuard({ spec: 'egress', retryMs: 5, log: () => { if (++logged > 1) throw Error('log sink is gone'); },
+      lookup: async () => { throw Error('getaddrinfo ENOTFOUND egress'); } });
+    await guard.ready;
+    for (let i = 0; i < 100 && logged < 2; i++) await new Promise((r) => setTimeout(r, 10));
+  });
+  assert.ok(logged >= 2, 'the retry ran and its log threw');
+  assert.deepEqual(seen, []);
+  guard.stop();
+});
