@@ -102,10 +102,10 @@ function createToolGate({ enabled, decide, boxes = DEFAULT_BOXES, isWriteTool, l
   }
 
   async function readout(message, offered, bias) {
-    // #1639: the wording of the model behind the service; only the Kev question is longer than the port
-    // counts, so only it lowers the choice budget (Laya: the limits as given, as before #1639).
+    // #1639: the wording of the model behind the service; only the tuned question is longer than the port
+    // counts, so only it lowers the choice budget (default wording: the limits as given, as before #1639).
     let words = 'laya';
-    try { words = value(wording) === 'kev' ? 'kev' : 'laya'; } catch { /* unknown: Laya's */ }
+    try { words = value(wording) === 'kev' ? 'kev' : 'laya'; } catch { /* unknown: the default wording */ }
     const lim = budgetLimits(value(limits), questionFor(words));
     if (![...offered.values()].some((t) => readOnly(toolName(t)))) return { reason: 'no-read-tools' };
     const hint = typeof bias?.hint === 'string' && bias.hint ? bias.hint : '';
@@ -198,24 +198,24 @@ function createToolGate({ enabled, decide, boxes = DEFAULT_BOXES, isWriteTool, l
 }
 
 // The Stage 2 question, per decision model (#1639, decision-models.cjs `wording`). 'laya' is the one
-// every release before #1639 sent, kept byte-identical for Laya and any unknown model (#1739).
-// 'kev' was tuned for Kev-0.8B on a seeded tuning split of tools/decision-eval's synthetic cases (48.5%
-// -> 69.1% there; held-out results on #1639): the Laya question's "must" made Kev answer "none" to
+// every release before #1639 sent, kept byte-identical for the default wording and any unknown model (#1739).
+// 'kev' was tuned for a small decision model on a seeded tuning split of tools/decision-eval's synthetic cases (48.5%
+// -> 69.1% there; held-out results on #1639): the default question's "must" made that model answer "none" to
 // nearly every message, and saying that the assistant on its own has no current news and none of the
-// user's data moved web search from 2/16 to 13/16. With Laya it cost English tool-gate accuracy.
+// user's data moved web search from 2/16 to 13/16. With the default wording it cost English tool-gate accuracy.
 const QUESTION = 'Which tool, if any, must the assistant call before answering this user message?';
 const KEV_QUESTION = 'Without tools the assistant knows no current news and nothing the user wrote or saved. Which tool does it need, if any?';
 const questionFor = (wording) => (wording === 'kev' ? KEV_QUESTION : QUESTION);
 // The Rust port (noevia-rs crates/tool-gate) shapes the options and counts the question as 79 characters plus any
 // hint, the length of QUESTION, and tests/fixtures/tool-gate.v1.json must stay byte-identical with the port's copy.
-// So with the longer Kev question the gate itself (budgetLimits) lowers the choice budget it gives the port by the
-// extra characters, and question plus options stay within maxChoiceChars (Laya's option-head budget). Change this
+// So with the longer tuned question the gate itself (budgetLimits) lowers the choice budget it gives the port by the
+// extra characters, and question plus options stay within maxChoiceChars (the default wording's option-head budget). Change this
 // number only together with the port.
 const BUDGET_QUESTION_CHARS = 79;
 
 /** #1639: `limits` with the choice budget lowered by the characters `question` has beyond what the port
  *  counts, so question plus options fit maxChoiceChars and the port, given the same limits, shapes the
- *  same options. A question no longer than that (Laya's), no limits, or no finite choice budget: the
+ *  same options. A question no longer than that (the default one), no limits, or no finite choice budget: the
  *  limits object itself, unchanged. The cut does not depend on maxOptions (#1740). */
 function budgetLimits(limits, question = KEV_QUESTION) {
   const excess = String(question).length - BUDGET_QUESTION_CHARS;

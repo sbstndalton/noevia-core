@@ -16,7 +16,7 @@ let built;
 const records = async () => (built ||= await buildRequests());
 
 // services/laya/server.py validate(): what the live service accepts.
-function layaRefuses(b) {
+function serviceRefuses(b) {
   if (!b || Object.keys(b).sort().join() !== 'options,question,state') return 'keys';
   if (typeof b.state !== 'string' || b.state.length > 4000) return 'state';
   if (typeof b.question !== 'string' || b.question.length < 1 || b.question.length > 500) return 'question';
@@ -41,7 +41,7 @@ test('every synthetic case becomes exactly one production request; none is caugh
 test('every request is one the live decision service accepts, and its label is one of its options', { skip: skipWasm }, async () => {
   ran++;
   for (const r of (await records()).records) {
-    assert.equal(layaRefuses(r.body), null, `${r.id}/${r.variant}: ${layaRefuses(r.body)}`);
+    assert.equal(serviceRefuses(r.body), null, `${r.id}/${r.variant}: ${serviceRefuses(r.body)}`);
     assert.ok(r.body.options.some((o) => o.id === r.label), `${r.id}: label ${r.label} not offered`);
   }
 });
@@ -141,14 +141,14 @@ test('#1647: the capture identity is qualified only inside this harness; the shi
   assert.equal(asked, 0);
 });
 
-let builtKev;
-const kevRecords = async () => (builtKev ||= await buildRequests(undefined, { wording: 'kev' }));
+let builtTuned;
+const tunedRecords = async () => (builtTuned ||= await buildRequests(undefined, { wording: 'kev' }));
 const ROUTE_OPTIONS = [
   { id: 'fast', label: 'Greetings, thanks, or a one-line factual answer' },
   { id: 'smart', label: 'Explaining, comparing, planning, reasoning or writing more than a sentence' },
   { id: 'code', label: 'Anything involving programming code, regex, errors or software' }];
 
-test('#1739: by default the harness captures the main-branch (Laya) wording, byte for byte', { skip: skipWasm }, async () => {
+test('#1739: by default the harness captures the main-branch (default) wording, byte for byte', { skip: skipWasm }, async () => {
   ran++;
   const rows = (await records()).records;
   const base = (purpose) => rows.filter((r) => r.purpose === purpose && r.variant === 'base');
@@ -165,22 +165,22 @@ test('#1739: by default the harness captures the main-branch (Laya) wording, byt
   }
 });
 
-test('#1639: --wording kev captures the wording tuned for Kev-0.8B; the other purposes are the same for both', { skip: skipWasm }, async () => {
+test('#1639: --wording kev captures the wording tuned for a small decision model; the other purposes are the same for both', { skip: skipWasm }, async () => {
   ran++;
-  const laya = (await records()).records, kev = (await kevRecords()).records;
-  assert.equal(kev.length, laya.length);
+  const dflt = (await records()).records, tuned = (await tunedRecords()).records;
+  assert.equal(tuned.length, dflt.length);
   const base = (rows, purpose) => rows.filter((r) => r.purpose === purpose && r.variant === 'base');
-  for (const r of base(kev, 'tool.gate')) assert.equal(r.body.question, 'Without tools the assistant knows no current news and nothing the user wrote or saved. Which tool does it need, if any?', r.id);
+  for (const r of base(tuned, 'tool.gate')) assert.equal(r.body.question, 'Without tools the assistant knows no current news and nothing the user wrote or saved. Which tool does it need, if any?', r.id);
   // Shaped in a choice budget lowered by the longer question (budgetLimits): 34-character labels for this
-  // tool set (44 with Laya's question), then trimmed on the wire.
-  assert.deepEqual(base(kev, 'tool.gate')[0].body.options, [
+  // tool set (44 with the default question), then trimmed on the wire.
+  assert.deepEqual(base(tuned, 'tool.gate')[0].body.options, [
     { id: 'tavily_extract', label: 'Read the text of a web page from i' },
     { id: 'tavily_search', label: 'Search the web for current facts a' },
     { id: 'diary_read_month', label: "Read the user's own diary entries" }, // decision-settings trims the label
     { id: 'nc_webdav_search_files', label: "Find the user's own stored files a" },
     { id: 'none', label: 'No tool: answer directly' },
   ]);
-  for (const r of base(kev, 'step.supervise')) {
+  for (const r of base(tuned, 'step.supervise')) {
     assert.equal(r.body.question, 'What should the assistant do next with these tool results?', r.id);
     assert.deepEqual(r.body.options.map((o) => o.label), [
       'Answer now: the results are relevant, consistent and safe',
@@ -189,21 +189,21 @@ test('#1639: --wording kev captures the wording tuned for Kev-0.8B; the other pu
   }
   // Unchanged by the wording: sensitivity, framing and the load advisor send the same bodies for both.
   for (const purpose of ['routing.sensitivity', 'chat.frame.kind', 'load.advisor']) {
-    assert.deepEqual(base(kev, purpose).map((r) => r.body), base(laya, purpose).map((r) => r.body), purpose);
+    assert.deepEqual(base(tuned, purpose).map((r) => r.body), base(dflt, purpose).map((r) => r.body), purpose);
   }
-  // #1901: routing sends the same question and state, with Kev's Fast/Smart labels; Laya keeps ROUTE_OPTIONS
-  // (and the Code label is shared: a tuned Code label cost Laya-en 8 points on the held-out split).
+  // #1901: routing sends the same question and state, with the tuned Fast/Smart labels; the default wording keeps ROUTE_OPTIONS
+  // (and the Code label is shared: a tuned Code label cost the default wording 8 points on English on the held-out split).
   const { ROUTE_LABELS } = require('../../server/system-one-router.cjs');
-  const kevRoute = base(kev, 'model.route'), layaRoute = base(laya, 'model.route');
-  assert.deepEqual(kevRoute.map((r) => [r.body.question, r.body.state]), layaRoute.map((r) => [r.body.question, r.body.state]));
-  for (const r of layaRoute) assert.deepEqual(r.body.options, ROUTE_OPTIONS);
-  for (const r of kevRoute) {
+  const tunedRoute = base(tuned, 'model.route'), defaultRoute = base(dflt, 'model.route');
+  assert.deepEqual(tunedRoute.map((r) => [r.body.question, r.body.state]), defaultRoute.map((r) => [r.body.question, r.body.state]));
+  for (const r of defaultRoute) assert.deepEqual(r.body.options, ROUTE_OPTIONS);
+  for (const r of tunedRoute) {
     assert.deepEqual(r.body.options.slice(0, 2), [{ id: 'fast', label: ROUTE_LABELS.kev.fast }, { id: 'smart', label: ROUTE_LABELS.kev.smart }]);
     assert.deepEqual(r.body.options.slice(2), ROUTE_OPTIONS.slice(2));
   }
-  for (const r of base(kev, 'routing.sensitivity')) assert.equal(r.body.question, 'Does this content contain sensitive personal or confidential information?');
-  for (const r of base(kev, 'chat.frame.kind')) assert.equal(r.body.question, 'What kind of chat does this first message start?');
-  await assert.rejects(buildRequests(undefined, { wording: 'kev-0.8b' }), /unknown wording/);
+  for (const r of base(tuned, 'routing.sensitivity')) assert.equal(r.body.question, 'Does this content contain sensitive personal or confidential information?');
+  for (const r of base(tuned, 'chat.frame.kind')) assert.equal(r.body.question, 'What kind of chat does this first message start?');
+  await assert.rejects(buildRequests(undefined, { wording: 'tuned-0.8b' }), /unknown wording/);
 });
 
 test.after(() => { if (!skipWasm) assert.equal(ran, 9, 'a wasm-guarded test body did not run'); });
