@@ -13,7 +13,7 @@ const davParseWasm = require('./dav-parse-wasm.cjs');
 
 const CODE_ADDR = '172.30.0.2';
 const OTHER = '172.18.0.5';
-const EXPECTED_PORT_CALLS = 121; // the stand-in port calls the tests below make
+const EXPECTED_PORT_CALLS = 130; // the stand-in port calls the tests below make
 
 let ran = 0;
 test.after(() => assert.equal(ran, EXPECTED_PORT_CALLS, 'every stand-in port call this file relies on ran'));
@@ -138,7 +138,7 @@ test('a fault reading a lookup refuses every request from then on, whatever was 
   assert.equal(broken.count('codeNetRefuses'), 0, 'refused without asking the crate');
   assert.deepEqual(looked, ['egress'], 'nothing left to resolve');
   assert.deepEqual(faults(resolveLogs).map((e) => [e.where, e.reason]), [['resolve', 'ambiguous']]);
-  assert.ok(resolveLogs.some((e) => e.event === 'codenet.guarding'));
+  assert.ok(!resolveLogs.some((e) => e.event === 'codenet.guarding'), 'a broken guard does not claim to be guarding');
   g.stop();
   // A reply that is not a list of address texts is a fault, not an address.
   for (const bad of ['x', null, undefined, {}, [1], [CODE_ADDR, null], [[CODE_ADDR]]]) {
@@ -222,6 +222,12 @@ test('the spec is the crate\'s reading, and a malformed one, a refusal, a fault 
     { literals: [], hosts: [null] }, { malformed: '' }, { malformed: 5 }, { malformed: null }]) {
     assert.throws(() => guard('egress', fakePort({ codeNetSpec: () => bad })), /unexpected shape|should list/, JSON.stringify(bad));
   }
+  // A spec with content that the crate reads as nothing would leave the guard off: refuse to start.
+  for (const content of ['egress', CODE_ADDR, ' , egress,', 'a_b']) {
+    assert.throws(() => guard(content, fakePort({ codeNetSpec: () => ({ literals: [], hosts: [] }) })), /read no address or host name/, content);
+  }
+  // Only white space and commas is genuinely empty: the guard is off, as for an unset spec.
+  for (const empty of ['', ' ', ',', ' , ,'+String.fromCharCode(9, 10)]) assert.equal(guard(empty, fakePort({ codeNetSpec: () => ({ literals: [], hosts: [] }) })).enabled, false, JSON.stringify(empty));
   // The crate is always asked, and is handed the spec as text; an unset spec is the empty text.
   const port = fakePort();
   guard(undefined, port);
@@ -246,6 +252,21 @@ test('input the crate cannot be sent refuses: more guarded addresses than one ca
   assert.equal(port.count('codeNetRefuses'), 1);
   assert.deepEqual(faults(logs).map((e) => [e.where, e.reason]), [['request', 'input']]);
   g.stop();
+});
+
+test('a guard whose first resolution rejects destroys the request: it is neither served nor answered', async () => {
+  // A throwing log inside the failed-lookup handler makes `ready` reject.
+  const port = fakePort();
+  const g = guard('egress', port, { lookup: async () => { throw Error('lookup failed'); }, log: () => { throw Error('log failed'); } });
+  g.ready.catch(() => {});
+  let destroyed = 0, status = null, served = false;
+  const res = { writeHead(s) { status = s; }, end() {}, destroy() { destroyed++; } };
+  await g.wrap(() => { served = true; })({ socket: { localAddress: CODE_ADDR }, headers: {} }, res);
+  assert.equal(destroyed, 1, 'the request is destroyed');
+  assert.equal(served, false, 'the handler is not called');
+  assert.equal(status, null, 'and no response is written');
+  assert.equal(port.count('codeNetRefuses'), 0, 'the crate was never asked');
+  await assert.rejects(g.ready, /log failed/);
 });
 
 test('the 403 path is unchanged when a request is refused by a fault, and a served request reaches the handler', async () => {

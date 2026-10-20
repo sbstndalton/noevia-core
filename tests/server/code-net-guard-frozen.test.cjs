@@ -102,6 +102,15 @@ test('the frozen files, the oracle and the module they were made with are the pi
   assert.equal(frozen.version, 1);
   assert.deepEqual(frozen.counts, COUNTS);
   assert.deepEqual(relations(), COUNTS, 'the counts are what the rows say');
+  // The crate reading nothing from text that has content would leave the guard off (the host refuses
+  // to start then); it never does for a frozen spec the crate parses.
+  let withContent = 0, empty = 0;
+  for (const { spec, port } of frozen.specRows) {
+    if (port.literals === undefined) continue;
+    if (/[^\s,]/.test(spec)) { withContent++; if (port.literals.length + port.hosts.length === 0) empty++; }
+  }
+  assert.ok(withContent > 300, `${withContent} specs with content`);
+  assert.equal(empty, 0, 'no frozen spec with content reads as empty');
   assert.equal(frozen.specRows.length + frozen.answerRows.length + frozen.guardRows.length, EXPECTED_RAN);
   for (const section of ['spec', 'answers', 'guard']) assert.equal(COUNTS[section].weaker, 0, `${section}: the JavaScript refused and Rust permits`);
 });

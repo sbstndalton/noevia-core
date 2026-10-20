@@ -46,9 +46,10 @@ const isTextList = (xs) => Array.isArray(xs) && xs.every((x) => typeof x === 'st
 /** `COWORK_CODE_NET_ADDR` as the crate reads it: IP literals and host names. A malformed entry, a
  *  refusal, a fault or a reply of the wrong shape is a startup error. */
 function readSpec(raw, wasmLoader) {
-  let spec;
+  let spec, text;
   try {
-    spec = wasmLoader().codeNetSpec(String(raw || ''));
+    text = String(raw || '');
+    spec = wasmLoader().codeNetSpec(text);
   } catch (err) {
     throw Error(`the Rust port refused COWORK_CODE_NET_ADDR (${String(err?.reason || 'unexpected')}); list plain IP addresses or host names`);
   }
@@ -58,6 +59,12 @@ function readSpec(raw, wasmLoader) {
   }
   if (spec === null || typeof spec !== 'object' || !isTextList(spec.literals) || !isTextList(spec.hosts)) {
     throw Error('the Rust port answered COWORK_CODE_NET_ADDR in an unexpected shape; refusing to start');
+  }
+  // Text that is not just white space and commas names something (an address, a host name, or a
+  // malformed entry the crate reports). Both lists empty for it means the crate dropped the entry:
+  // the guard would be off, so refuse to start rather than serve unguarded.
+  if (/[^\s,]/.test(text) && spec.literals.length === 0 && spec.hosts.length === 0) {
+    throw Error('the Rust port read no address or host name in COWORK_CODE_NET_ADDR; refusing to start');
   }
   return { literals: spec.literals, hosts: spec.hosts };
 }
@@ -132,7 +139,7 @@ function createCodeNetGuard({ spec = '', lookup = defaultLookup, log = () => {},
       nextRetryMs = Math.min(nextRetryMs * 2, maxRetryMs);
       retryTimer = setTimeout(() => { retryTimer = null; void resolveOnce(); }, wait);
       retryTimer.unref?.();
-    } else if (enabled) {
+    } else if (enabled && !broken) {
       log({ event: 'codenet.guarding', addresses: [...addresses] });
     }
   }
