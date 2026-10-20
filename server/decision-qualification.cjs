@@ -8,8 +8,8 @@
 //
 // An entry is keyed by the identity the decision service itself reports with each answer (its model
 // id AND a content revision pinning the served weights; decision-endpoint.cjs identityOf), never by
-// a file name or a display name: a name says nothing about the weights behind it (the Laya service
-// reports 'convaiinnovations/laya' whatever is mounted at /model). An entry counts only with its
+// a file name or a display name: a name says nothing about the weights behind it (the decision service
+// reports DECISION_SERVICE_REPORTED_MODEL, decision-models.cjs, whatever is mounted at /model). An entry counts only with its
 // qualifying evidence recorded next to it and at or above the bar; anything else is ignored.
 //
 // Adding a model here is the owner's decision (#1639), made on a measured run, not a code change
@@ -26,7 +26,7 @@ const BARS = Object.freeze({
 });
 
 // Measured and NOT qualified (kept here so nobody adds them by name):
-// - Laya-en, the live decision service (convaiinnovations/laya, HF revision
+// - Laya-en, the live decision service (reported id DECISION_SERVICE_REPORTED_MODEL, HF revision
 //   1c5edc17a7acd8701df6fc341c0d179f1c62c982), #1639 run 2026-10-13: sensitive recall 1.9% over all
 //   languages and 0 of 40 English sensitive texts in the production request shape (18 of 40 with the
 //   Context section left out); 48.0% sensitivity accuracy. Every one of the 40 English sensitive

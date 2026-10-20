@@ -2,6 +2,7 @@
 const { parseServiceUrl, serviceFetch } = require('./service-endpoint.cjs');
 const { createDecisions, CAUSE_RE } = require('./decision/index.cjs');
 const { llamaLogitBackend } = require('./decision/backends.cjs');
+const { DECISION_SERVICE_REPORTED_MODEL } = require('./decision-models.cjs');
 
 // Operator configuration only. No browser-supplied endpoint, model loading or downloads.
 // A dedicated private endpoint avoids silently changing the loaded answering model.
@@ -84,7 +85,7 @@ function createSystemOneRouter({ enabled, roles, fallback, env = process.env, ba
       ? result.metadata.fellBack : 'rejected');
     return { role, routingDecision: { offered, scores, selectedRole: accepted ? result.selected : null,
       effectiveRole: role, backend: accepted ? (routing.backend.id === 'llama-logit' ? 'llama-logit' : 'decision-service') : 'legacy',
-      model: accepted && result.metadata?.model === 'convaiinnovations/laya' ? 'convaiinnovations/laya' : null,
+      model: accepted && result.metadata?.model === DECISION_SERVICE_REPORTED_MODEL ? DECISION_SERVICE_REPORTED_MODEL : null,
       calibrated: false, latencyMs: Number.isFinite(result.metadata?.latencyMs) ? result.metadata.latencyMs : null,
       // The badge states the real reason (#1070): e.g. http-503 is Laya missing its own deadline.
       status: accepted ? 'accepted' : 'fallback', fallbackReason, fallbackCause: cause } };

@@ -16,6 +16,7 @@ const { createFeatures } = require('./features.cjs');
 const { createToolGate, offeredProjection, boxesProjection, DEFAULT_BOXES } = require('./tool-gate.cjs');
 const { createStepSupervision } = require('./step-supervision.cjs');
 const { createSystemOneRouter } = require('./system-one-router.cjs');
+const { DECISION_SERVICE_REPORTED_MODEL } = require('./decision-models.cjs');
 const { createDecisionLog, summarize } = require('./decision-log.cjs');
 
 const SECRET = 'SYNTHETIC-PRIVATE-SENTINEL-7f3a';
@@ -44,7 +45,7 @@ function fakeDecisionService(pick, seen = []) {
     const ids = body.options.map((o) => o.id);
     const chosen = typeof pick === 'function' ? pick(ids) : pick;
     const rest = (1 - 0.9) / (ids.length - 1);
-    return Response.json({ selected: chosen, scores: Object.fromEntries(ids.map((id) => [id, id === chosen ? 0.9 : rest])), model: 'convaiinnovations/laya', calibrated: false });
+    return Response.json({ selected: chosen, scores: Object.fromEntries(ids.map((id) => [id, id === chosen ? 0.9 : rest])), model: DECISION_SERVICE_REPORTED_MODEL, calibrated: false });
   };
 }
 
