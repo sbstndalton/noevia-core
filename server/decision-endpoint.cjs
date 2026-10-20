@@ -1,7 +1,7 @@
 'use strict';
 // Operator-configured private decision service; independent of answering-provider credentials.
 const { identityOf } = require('./decision-qualification.cjs');
-const { profileFor, tempered } = require('./decision-models.cjs');
+const { profileFor, tempered, DECISION_SERVICE_REPORTED_MODEL } = require('./decision-models.cjs');
 const { toTypeSafe, fromTypeSafe } = require('./decision-typesafe.cjs');
 const { parseServiceUrl, serviceFetch, decisionServiceFetch } = require('./service-endpoint.cjs');
 // #1755: any service on this network (service-endpoint.cjs): a Docker service name such as `laya` or
@@ -161,7 +161,7 @@ function createDecisionEndpoint({ env=process.env, linkLocal=true, fetchImpl=lin
         Math.abs(Object.values(result.scores).reduce((a,b)=>a+b,0)-1)>0.002 ||
         ids.some(id=>id!==result.selected && result.scores[id]>=result.scores[result.selected])) throw failure('invalid-result','Invalid decision result');
       // Only expose a known model identifier, never arbitrary service-provided text or URLs.
-      const model = typesafe ? profile.id : result.model === 'convaiinnovations/laya' ? result.model : null;
+      const model = typesafe ? profile.id : result.model === DECISION_SERVICE_REPORTED_MODEL ? result.model : null;
       // #1640: `confidence` is the winning option's share of the service's probability map (Laya's
       // `probabilities`, checked above: one per option, each in [0,1], summing to 1, the selected one
       // the strict maximum). It was null, so decide()'s minConfidence bound (the sensitivity check's
