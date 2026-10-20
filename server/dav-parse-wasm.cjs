@@ -1940,6 +1940,12 @@ function autoconfigCompactReply(r) {
   return { batch: r.batch };
 }
 
+// Keep the same captured validation calls and short-circuit order without per-row key/closure allocations.
+function autoconfigDeltaRequestExact(request) {
+  return !!request && typeof request === 'object' && !AUTOCONFIG_ARRAY(request)
+    && AUTOCONFIG_KEYS(request).length === 2 && AUTOCONFIG_OWN(request, 'op') && AUTOCONFIG_OWN(request, 'data');
+}
+
 /** Decode the private state-v2d delta grammar without expanding per-row states. */
 function autoconfigDeltaReply(r) {
   const invalid = () => { throw new DavParseError('llama.cpp autoconfig delta reply has an unexpected shape', 'reply'); };
@@ -2013,7 +2019,7 @@ function autoconfigDeltaReply(r) {
         if (catchCount > 8) return invalid();
       }
       for (let item = 0; item < catchCount; item++) if (!safeCatch(catches[item])) return invalid();
-      if (!request || !autoconfigExact(request, ['op', 'data']) || typeof request.op !== 'string'
+      if (!request || !autoconfigDeltaRequestExact(request) || typeof request.op !== 'string'
         || !AUTOCONFIG_ARRAY(args) || !safeInteger(resultRef, 0)) return invalid();
       const argsCount = parserLength(args);
       if (argsCount > 256) return invalid();
