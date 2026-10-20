@@ -6,8 +6,8 @@
 // port must give, printed by tools/gen-llamacpp-autoconfig-fixtures.cjs from the JS itself
 // (synthetic model metadata; nothing is read from disk and no model is loaded). Here every row runs
 // through dav-parse.wasm's llamacpp_autoconfig and through the Rust policy operations; the seeded in-memory arguments live in
-// llamacpp-autoconfig-differential-seeded.test.cjs (split out so each file keeps its own 120 s budget; same
-// cases, same assertions). The WebAssembly half needs server/wasm/dav-parse.wasm (or
+// llamacpp-autoconfig-differential-seeded-{a,b,c,d}.test.cjs (four slices of one
+// seeded sequence so each file keeps its own 120 s budget; same cases, same assertions). The WebAssembly half needs server/wasm/dav-parse.wasm (or
 // DAV_PARSE_WASM); skipped without it unless DAV_PARSE_WASM_REQUIRED=1.
 
 const assert = require('node:assert/strict');
@@ -25,6 +25,7 @@ const FILE = path.join(__dirname, '../fixtures/llamacpp-autoconfig.v1.json');
 const GENERATOR = path.join(__dirname, '../../tools/gen-llamacpp-autoconfig-fixtures.cjs');
 const fixtures = JSON.parse(fs.readFileSync(FILE, 'utf8'));
 const policyFixtures = JSON.parse(fs.readFileSync(path.join(__dirname, '../fixtures/llamacpp-autoconfig-policy.v1.json'), 'utf8'));
+const FROZEN_WASM_SHA256 = 'c5c300907dba8ed36b38bbfcd92dc33f18be77319712504106abb09d5b8ce05b'; // the pre-retirement dav-parse.wasm (see llamacpp-autoconfig-raw-domain.test.cjs)
 const ORACLE_SHA256 = '66b436f5e2fda9719470fbc18bd92d7b1b52eb6e881885167cdbbebd02eaa040';
 const wasmFile = process.env.DAV_PARSE_WASM || davParseWasm.DEFAULT_WASM;
 const skipWasm = !fs.existsSync(wasmFile) && process.env.DAV_PARSE_WASM_REQUIRED !== '1' && 'dav-parse.wasm not built';
@@ -38,6 +39,16 @@ test('the frozen JavaScript oracle remains byte-bound and generates the original
   assert.equal(crypto.createHash('sha256').update(fs.readFileSync(oraclePath)).digest('hex'), ORACLE_SHA256);
   assert.equal(policyFixtures.sourceOracleSha256, ORACLE_SHA256);
   assert.equal(policyFixtures.strictCount, fixtures.strict.length);
+  // The snapshot is bound to the exact fixture bytes and to the frozen pre-retirement module (not the
+  // currently pinned one) whose outcomes it records; its row counts are literals so a dropped row cannot
+  // pass by shrinking both sides.
+  assert.equal(policyFixtures.fixtureSha256, crypto.createHash('sha256').update(fs.readFileSync(FILE)).digest('hex'));
+  assert.equal(policyFixtures.fixtureSha256, 'bd1d3e37dab082bfc1fb2cdcd37b5b0e5fbd0f846973f0d7afe2e031cff175a8');
+  assert.equal(policyFixtures.wasmSha256, FROZEN_WASM_SHA256);
+  assert.equal(policyFixtures.strictCount, 21);
+  assert.equal(policyFixtures.rows.length, 21);
+  assert.equal(policyFixtures.rawNumberCount, 6);
+  assert.equal(policyFixtures.rawNumberRows.length, 6);
 });
 
 test('the fixture file is what the generator prints', { skip: !fs.existsSync(GENERATOR) && 'no generator here' }, () => {

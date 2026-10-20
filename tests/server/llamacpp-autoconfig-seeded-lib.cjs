@@ -1,13 +1,26 @@
 'use strict';
 
-// Seeded half of the llama.cpp autoconfig differential (split from llamacpp-autoconfig-differential.test.cjs
-// so each file has its own test-timeout budget; the cases and assertions are unchanged). Arguments are built
-// in memory the way llamacpp-manager.cjs builds them (undefined members, numbers and odd strings in preset
-// options): the switch returns the JS answer and never settings or an estimate the JS would not give.
-// Needs server/wasm/dav-parse.wasm (or DAV_PARSE_WASM); skipped without it unless DAV_PARSE_WASM_REQUIRED=1.
+// Shared body of the seeded llama.cpp autoconfig differential. The 1000 cases of the single seeded
+// sequence (seed 0xac0f) are evaluated in four slices, one test file each
+// (llamacpp-autoconfig-differential-seeded-{a,b,c,d}.test.cjs), so every file keeps its own
+// test-timeout budget on a slow runner. The generator below is the same sequence for every slice: a
+// slice replays the stream from case 0 and only evaluates its own half-open index range, so the
+// union of the slices is exactly the original 1000 cases with the original assertions.
+//
+// Arguments are built in memory the way llamacpp-manager.cjs builds them (undefined members, numbers and odd
+// strings in preset options): the switch returns the JS answer and never settings or an estimate the JS would
+// not give. Needs server/wasm/dav-parse.wasm (or DAV_PARSE_WASM); skipped without it unless
+// DAV_PARSE_WASM_REQUIRED=1.
+//
+// Totals. The thresholds (faithful >= 2000, agreed >= 2500, suggestions with settings >= 100) are about the
+// whole sequence, which no single file runs. Each slice therefore asserts its counts EXACTLY against SLICES
+// (the counts are deterministic for the seed), and every file also checks, without evaluating anything, that
+// SLICES tile 0..1000 and that their sums meet the thresholds. A slice that regressed to fewer agreements
+// fails its own exact match, so the union cannot silently fall below a threshold.
 
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
+const path = require('node:path');
 const test = require('node:test');
 
 const davParseWasm = require('../../server/dav-parse-wasm.cjs');
@@ -20,6 +33,18 @@ const WASM = { wasmLoader: () => davParseWasm };
 const SWITCHED = { 1: ac.suggest, 2: ac.estimateInputs, 3: ac.estimateFootprint };
 const JS = { 1: oracle.suggestJs, 2: oracle.estimateInputsJs, 3: oracle.estimateFootprintJs };
 const GIB = 1024 ** 3;
+
+const SEED = 0xac0f;
+const TOTAL_CASES = 1000;
+const THRESHOLDS = { faithful: 2000, agreed: 2500, values: 100 };
+const SLICE_FILES = ['a', 'b', 'c', 'd'].map((k) => `llamacpp-autoconfig-differential-seeded-${k}.test.cjs`);
+// [from, to) case indexes of the seeded sequence and the exact counts that slice produces.
+const SLICES = [
+  [0, 250, { faithful: 699, agreed: 746, values: 62 }],
+  [250, 500, { faithful: 666, agreed: 745, values: 79 }],
+  [500, 750, { faithful: 678, agreed: 749, values: 73 }],
+  [750, 1000, { faithful: 684, agreed: 745, values: 70 }],
+]; // sums 2727 / 2985 / 284, identical to the former single-file run
 
 function quiet(fn) {
   const warn = console.warn; console.warn = () => {};
@@ -40,7 +65,7 @@ function* liveArgs(n, seed) {
     const layers = pick([12, 24, 32, 42, 48, 61, 80]);
     const swa = rnd() < 0.3;
     const meta = {
-      arch: pick(['llama', 'qwen35', 'gemma4', 'phi3', 'nomic-bert', 'mistral3', 'ünï']), name: 'synthetic',
+      arch: pick(['llama', 'arch-a', 'arch-b', 'arch-c', 'synthetic-bert', 'arch-d', 'ünï']), name: 'synthetic',
       contextLength: pick([2048, 4096, 8192, 32768, 40960, 131072, 262144, 1048576, null, 100000, 5000]),
       embeddingLength: pick([768, 2048, 2560, 4096, 5120, 8192, null]), blockCount: rnd() < 0.05 ? null : layers,
       headCount: pick([8, 16, 32, 40, 64, null]),
@@ -61,15 +86,17 @@ function* liveArgs(n, seed) {
     yield {
       meta, modelBytes: pick([0.4, 1, 4.3, 5.56, 9, 17, 30]) * GIB + int(0, 1 << 20), mmprojBytes: rnd() < 0.3 ? pick([0.3, 0.86]) * GIB : 0,
       budgetGib: pick([2, 6, 12, 14, 16, 24, 1e6, 0]), cacheRamMaxMib: pick([undefined, 512, 1024, 2048, 128]),
-      options, model: pick(['', 'chat-model', 'nomic-embed', 'bge-reranker', undefined]),
+      options, model: pick(['', 'chat-model', 'synthetic-embed', 'synthetic-reranker', undefined]),
     };
   }
 }
 
-test('seeded live arguments: the port agrees with this runtime\'s JS on every JSON-faithful one, and the switch never gives more than the JS', { skip: skipWasm }, () => {
-  let agreed = 0, values = 0, faithful = 0;
+
+function runSlice(from, to) {
+  let agreed = 0, values = 0, faithful = 0, index = 0;
   quiet(() => {
-    for (const a of liveArgs(1000, 0xac0f)) {
+    for (const a of liveArgs(to, SEED)) {
+      if (index++ < from) continue;
       // Undefined members drop and -0 is written 0, which the JS treats alike; NaN and Infinity
       // become null, which it does not.
       const wireable = !Object.values(a.options).some((v) => typeof v === 'number' && !Number.isFinite(v));
@@ -83,7 +110,7 @@ test('seeded live arguments: the port agrees with this runtime\'s JS on every JS
         const port = (() => { try { return davParseWasm.llamacppAutoconfig(op, args); } catch (err) { return { refused: err.reason }; } })();
         if (wireable) {
           faithful++;
-          assert.equal(port.text, JSON.stringify(js), `op ${op}: ${JSON.stringify(args).slice(0, 300)}`);
+          assert.equal(port.text, JSON.stringify(js), `case ${index - 1} op ${op}: ${JSON.stringify(args).slice(0, 300)}`);
         }
         let got;
         try { got = SWITCHED[op](args, WASM); } catch (err) { assert.equal(err.code, 'autoconfig_impl'); continue; }
@@ -94,7 +121,28 @@ test('seeded live arguments: the port agrees with this runtime\'s JS on every JS
       }
     }
   });
-  assert.ok(faithful >= 2000, `faithful: ${faithful}`);
-  assert.ok(agreed >= 2500, `agreed: ${agreed}`);
-  assert.ok(values >= 100, `suggestions with settings: ${values}`);
-});
+  assert.equal(index, to, 'the sequence has the sliced cases');
+  return { faithful, agreed, values };
+}
+
+function defineSlice(n) {
+  const [from, to, expected] = SLICES[n];
+  test(`seeded live arguments, cases ${from}..${to - 1}: the port agrees with this runtime's JS on every JSON-faithful one, and the switch never gives more than the JS`, { skip: skipWasm }, () => {
+    assert.deepEqual(runSlice(from, to), expected);
+  });
+  test('the seeded slices tile the whole sequence and their pinned counts meet the totals thresholds', () => {
+    let next = 0; const sum = { faithful: 0, agreed: 0, values: 0 };
+    for (const [f, t, c] of SLICES) {
+      assert.equal(f, next); next = t;
+      for (const k of Object.keys(sum)) sum[k] += c[k];
+    }
+    assert.equal(next, TOTAL_CASES);
+    assert.ok(sum.faithful >= THRESHOLDS.faithful, `faithful: ${sum.faithful}`);
+    assert.ok(sum.agreed >= THRESHOLDS.agreed, `agreed: ${sum.agreed}`);
+    assert.ok(sum.values >= THRESHOLDS.values, `suggestions with settings: ${sum.values}`);
+    assert.deepEqual(fs.readdirSync(__dirname).filter((f) => /^llamacpp-autoconfig-differential-seeded-.*\.test\.cjs$/.test(f)).sort(), SLICE_FILES);
+    assert.equal(SLICES.length, SLICE_FILES.length);
+  });
+}
+
+module.exports = { defineSlice, runSlice, SLICES, SEED, TOTAL_CASES, THRESHOLDS };

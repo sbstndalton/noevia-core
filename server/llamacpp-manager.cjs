@@ -544,9 +544,10 @@ function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloa
     let defaults = {};
     try { defaults = presets.get(model).defaults || {}; } catch {}
     const opts = { ...defaults, ...options };
-    if (opts['cache-ram'] === undefined || opts['cache-ram'] === '') opts['cache-ram'] = require('./llamacpp-autoconfig.cjs').isPromptCacheFree(model, opts) ? '0' : String((autoconfig.cacheRam || require('./inference-budget.cjs').cacheRamLimits()).capMib);
     let est;
     try {
+      // isPromptCacheFree is a Rust evaluator call too: its fault is the same fail-closed refusal, not a thrown error.
+      if (opts['cache-ram'] === undefined || opts['cache-ram'] === '') opts['cache-ram'] = require('./llamacpp-autoconfig.cjs').isPromptCacheFree(model, opts) ? '0' : String((autoconfig.cacheRam || require('./inference-budget.cjs').cacheRamLimits()).capMib);
       est = require('./llamacpp-autoconfig.cjs').estimateFootprint({ meta: read.meta, modelBytes: read.modelFile.size, mmprojBytes: read.mmproj?.size || 0, options: opts, model });
     } catch (err) {
       if (err?.code !== 'autoconfig_impl') throw err;
