@@ -14,7 +14,7 @@
 // restores the original preset file on cancel, failure or an interrupted run.
 const fs = require('node:fs');
 const crypto = require('node:crypto');
-const { CTX_CANDIDATES } = require('./llamacpp-autoconfig.cjs');
+const autoconfig = require('./llamacpp-autoconfig.cjs');
 const { isSystemModel, modelPathFromArgs, SYSTEM_MODEL_REASON } = require('./model-system.cjs');
 
 const PAD = 'This is synthetic padding for a context allocation validation.\n';
@@ -30,9 +30,26 @@ function readMemAvailableGib() {
   } catch { return null; }
 }
 
+// #223: the candidate list is the Rust program's CTX_CANDIDATES. It is read on first use, not when this
+// module loads, so an evaluator fault surfaces per operation (every caller of ladder() refuses with the
+// autoconfig_impl error) instead of stopping the service at boot. Only a successful read is kept; a fault
+// is never memoized, guessed at or replaced by a default list.
+let ctxCandidates;
+function candidates() {
+  if (ctxCandidates === undefined) {
+    let read;
+    try { read = autoconfig.CTX_CANDIDATES; } catch (cause) {
+      throw Object.assign(new autoconfig.AutoconfigImplError('context ladder'), { cause });
+    }
+    if (!Array.isArray(read)) throw new autoconfig.AutoconfigImplError('context ladder');
+    ctxCandidates = read;
+  }
+  return ctxCandidates;
+}
+
 function ladder(native) {
   const ceiling = native > 0 ? native : 131072; // unknown training length: stay conservative
-  return [...new Set([...CTX_CANDIDATES, ...(native > 0 ? [native] : [])])].filter(c => c >= 4096 && c <= ceiling).sort((a, b) => a - b);
+  return [...new Set([...candidates(), ...(native > 0 ? [native] : [])])].filter(c => c >= 4096 && c <= ceiling).sort((a, b) => a - b);
 }
 
 function createCalibrator(deps) {
@@ -493,6 +510,12 @@ function createCalibrator(deps) {
       for (const [key, value] of Object.entries(conservative.values)) if (key !== 'ctx-size' && profile.fields.includes(key)) base[key] = value;
     }
     if (!profile.exists && !base.parallel) base.parallel = '1';
+    // #223: the ladder needs the evaluator's candidate list; a fault refuses here, before the gate is held
+    // or any preset is touched, and never falls back to a list of our own.
+    try { ladder(native); } catch (err) {
+      if (err?.code !== 'autoconfig_impl') throw err;
+      return { ok: false, status: err.status || 503, body: { error: `Calibration is unavailable: ${err.message}`, code: 'autoconfig_impl' } };
+    }
     let release;
     try { release = maintenance.hold(`Chat is paused while noevia calibrates ${model}. It will be available again when calibration finishes or is cancelled.`); }
     catch { return { ok: false, status: 409, body: { error: 'Requests are in progress. Wait for them to finish, then start calibration.' } }; }

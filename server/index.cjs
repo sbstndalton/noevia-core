@@ -342,6 +342,20 @@ const folderSync = process.env.MODEL_LOADER_URL ? require('./model-folder-sync.c
   log: (message) => console.log(message),
 }) : null;
 
+// #223: an evaluator fault reading LLAMACPP_MEMORY_LIMIT must not stop the service. The budget is then
+// unknown (0, which sizes nothing), the reason is kept and logged once, and the features that need it
+// refuse per request with that reason (llamacpp-manager.cjs). A fault never yields a guessed figure.
+const autoconfigBudget = (() => {
+  const explicit = Number(process.env.LLAMACPP_AUTOCONFIG_MEMORY_GIB);
+  if (explicit) return { budgetGib: explicit };
+  try { return { budgetGib: require('./llamacpp-autoconfig.cjs').parseMemoryLimit(process.env.LLAMACPP_MEMORY_LIMIT) || 0 }; }
+  catch (err) {
+    const budgetFault = `the container memory limit (LLAMACPP_MEMORY_LIMIT) could not be evaluated at startup: ${err?.message || err}`;
+    console.error(`Autoconfig: ${budgetFault}. Memory suggestions, estimates and auto-tune refuse until the service is restarted; nothing else is affected.`);
+    return { budgetGib: 0, budgetFault };
+  }
+})();
+
 const modelManager = createModelManager({
   kind: MODEL_MANAGER_KIND,
   presetPath: process.env.LLAMACPP_PRESET_PATH,
@@ -349,7 +363,9 @@ const modelManager = createModelManager({
   presetWriter: require('./models-ini-writer.cjs').createModelsIniWriter({ mode: process.env.MODELS_INI_WRITER, url: process.env.MODEL_LOADER_URL, token: process.env.MODEL_LOADER_TOKEN, fetchJson }),
   autoconfig: {
     modelsPath: process.env.LLAMACPP_MODELS_PATH || '',
-    budgetGib: Number(process.env.LLAMACPP_AUTOCONFIG_MEMORY_GIB) || require('./llamacpp-autoconfig.cjs').parseMemoryLimit(process.env.LLAMACPP_MEMORY_LIMIT) || 0,
+    budgetGib: autoconfigBudget.budgetGib,
+    // #223: set when the memory limit could not be evaluated at boot; the sizing features then refuse per request.
+    ...(autoconfigBudget.budgetFault ? { budgetFault: autoconfigBudget.budgetFault } : {}),
     // #697: with an inference budget only this explicit figure may lower autoconfig's sizing.
     explicitBudgetGib: Number(process.env.LLAMACPP_AUTOCONFIG_MEMORY_GIB) || 0,
     // #697: the prompt-cache cap autoconfig and new presets write, and the hard maximum every write keeps.
