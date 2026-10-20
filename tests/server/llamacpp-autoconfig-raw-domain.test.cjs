@@ -8,6 +8,12 @@ const wasm = require('../../server/dav-parse-wasm.cjs');
 const oracle = require('../reference/llamacpp-autoconfig-js.cjs');
 const options = { wasmLoader: () => wasm };
 let oldApi = oracle, oldOptions = options;
+// Frozen-module attestation (#211): CI leaves NOEVIA_FROZEN_CORE_ROOT unset on purpose, so there the frozen
+// pre-retirement module (wasm c5c3...) is attested only by the hashes recorded in tests/fixtures/llamacpp-autoconfig-policy.v1.json
+// and in the differential test. Re-hashing it in CI would need a second noevia-rs wasm build at the old pin plus a full-depth
+// checkout of the old server/ tree, and the old build is not guaranteed to reproduce on today's toolchain, so it is not cheap and
+// not safe to gate every PR on. To attest it by hand, unpack the pre-retirement tree (server/llamacpp-autoconfig.cjs at af26c9b)
+// with its wasm under server/wasm/ and run this file with NOEVIA_FROZEN_CORE_ROOT=<that directory>; the asserts below re-hash both.
 if (process.env.NOEVIA_FROZEN_CORE_ROOT) {
   const path = require('node:path'), root = process.env.NOEVIA_FROZEN_CORE_ROOT;
   const file = path.join(root, 'server/wasm/dav-parse.wasm');
