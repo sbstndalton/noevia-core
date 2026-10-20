@@ -125,8 +125,11 @@ function child(mode) {
     bridge.llamacppAutoconfig = function (op, args) {
       const result = original(op, args);
       if (op === 11 || op === 12) {
-        for (const operation of result.reply.batch || []) if (operation.request.op === 'regexp') {
-          observations++; operation.request.data = mutate(operation.request.data);
+        for (const operation of result.reply.batch || []) {
+          const request = result.reply.wire === 'state-v2d' ? operation[1] : operation.request;
+          if (request.op === 'regexp') {
+            observations++; request.data = mutate(request.data);
+          }
         }
       }
       return result;

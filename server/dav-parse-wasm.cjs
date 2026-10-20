@@ -1940,6 +1940,99 @@ function autoconfigCompactReply(r) {
   return { batch: r.batch };
 }
 
+/** Decode the private state-v2d delta grammar without expanding per-row states. */
+function autoconfigDeltaReply(r) {
+  const invalid = () => { throw new DavParseError('llama.cpp autoconfig delta reply has an unexpected shape', 'reply'); };
+  const safeInteger = (value, minimum = -9_007_199_254_740_991, maximum = 9_007_199_254_740_991) =>
+    typeof value === 'number' && value >= minimum && value <= maximum && value % 1 === 0;
+  try {
+    const wire = r && r.wire;
+    if (wire !== 'state-v2d' || !autoconfigExact(r, ['wire', 'batch'])) return invalid();
+    const batch = r.batch;
+    if (!AUTOCONFIG_ARRAY(batch)) return invalid();
+    let lengthCache = null;
+    const parserLength = array => {
+      for (let entry = lengthCache; entry; entry = entry.next) if (entry.array === array) return entry.length;
+      const length = array.length;
+      if (!safeInteger(length, 0)) return invalid();
+      const entry = { __proto__: null, array, length, next: lengthCache };
+      lengthCache = entry;
+      return length;
+    };
+    const batchCount = parserLength(batch);
+    if (batchCount < 1 || batchCount > 32) return invalid();
+    const deltas = { __proto__: null };
+    const active = [undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined];
+    let stackCount = 0, catchCount = 0;
+    const safeRef = value => safeInteger(value, 1);
+    const safeCatch = tuple => {
+      if (!AUTOCONFIG_ARRAY(tuple) || parserLength(tuple) !== 3) return false;
+      const pc = tuple[0], depth = tuple[1], env = tuple[2];
+      return safeInteger(pc) && safeInteger(depth) && safeRef(env);
+    };
+    for (let index = 0; index < batchCount; index++) {
+      const row = batch[index];
+      if (!AUTOCONFIG_ARRAY(row) || parserLength(row) !== 4) return invalid();
+      const delta = row[0], request = row[1], args = row[2], resultRef = row[3];
+      if (!AUTOCONFIG_ARRAY(delta)) return invalid();
+      const deltaLength = parserLength(delta);
+      const mask = delta[0];
+      if (!safeInteger(mask, 0, 255) || (index === 0 && mask !== 255)) return invalid();
+      let changed = 0;
+      for (let bit = 0; bit < 8; bit++) if (mask & (1 << bit)) changed++;
+      if (deltaLength !== changed + 1) return invalid();
+      const descriptor = { __proto__: null }, fields = { __proto__: null };
+      descriptor.mask = mask; descriptor.fields = fields;
+      let payloadIndex = 1;
+      for (let bit = 0; bit < 8; bit++) {
+        if (mask & (1 << bit)) {
+          const field = delta[payloadIndex++];
+          fields[bit] = field;
+          active[bit] = field;
+        }
+      }
+      const pc = active[0], env = active[1], stack = active[2], catches = active[3];
+      const mode = active[4], target = active[5], period = active[6], sum = active[7];
+      if (!safeInteger(pc, 0) || !safeRef(env) || !safeInteger(mode, 0, 7)
+        || !safeInteger(target, 0)
+        || !(period === null || typeof period === 'object' && !AUTOCONFIG_ARRAY(period))
+        || !(sum === null || typeof sum === 'object' && !AUTOCONFIG_ARRAY(sum))) return invalid();
+      if (mask & 4) {
+        if (!AUTOCONFIG_ARRAY(stack)) return invalid();
+        stackCount = parserLength(stack);
+        if (stackCount > 256) return invalid();
+      }
+      for (let item = 0; item < stackCount; item++) if (!safeRef(stack[item])) return invalid();
+      if (mask & 8) {
+        if (!AUTOCONFIG_ARRAY(catches)) return invalid();
+        catchCount = parserLength(catches);
+        if (catchCount > 8) return invalid();
+      }
+      for (let item = 0; item < catchCount; item++) if (!safeCatch(catches[item])) return invalid();
+      if (!request || !autoconfigExact(request, ['op', 'data']) || typeof request.op !== 'string'
+        || !AUTOCONFIG_ARRAY(args) || !safeInteger(resultRef, 0)) return invalid();
+      const argsCount = parserLength(args);
+      if (argsCount > 256) return invalid();
+      for (let item = 0; item < argsCount; item++) if (!safeRef(args[item])) return invalid();
+      descriptor.row = row;
+      descriptor.args = args;
+      descriptor.argsCount = argsCount;
+      descriptor.stackCount = stackCount;
+      descriptor.catchCount = catchCount;
+      deltas[index] = descriptor;
+    }
+    const decoded = { __proto__: null };
+    decoded.wire = 'state-v2d';
+    decoded.batch = batch;
+    decoded.batchCount = batchCount;
+    decoded.stateDeltas = deltas;
+    return decoded;
+  } catch (error) {
+    if (error instanceof DavParseError) throw error;
+    return invalid();
+  }
+}
+
 /** Strict operations 1-6 and bounded opaque-reference evaluator frames (11-12). */
 function autoconfigReply(op, r, compact = false) {
   if (compact && (op === 11 || op === 12)) r = autoconfigCompactReply(r);
@@ -1969,14 +2062,14 @@ function llamacppAutoconfig(op, args) {
   let body;
   try {
     if (op === 11) {
-      body = autoconfigFrameText({ function: args.function, env: args.env, wire: 'state-v1' });
+      body = autoconfigFrameText({ function: args.function, env: args.env, wire: 'state-v2d' });
     } else if (op === 12) {
       const state = args.state;
       // Array literal elements create own data properties, even when numeric
       // prototype setters exist. No mutable collection method packs the tuple.
       const fields = [state.pc, state.env, state.stack, state.catches,
         state.mode, state.target, state.period, state.sum];
-      body = autoconfigFrameText({ state: fields, frame: args.frame, wire: 'state-v1' });
+      body = autoconfigFrameText({ state: fields, frame: args.frame, wire: 'state-v2d' });
     } else {
       body = JSON.stringify(args);
     }
@@ -1994,7 +2087,15 @@ function llamacppAutoconfig(op, args) {
     const code = reply && typeof reply.error === 'string' ? reply.error : 'unknown';
     throw new DavParseError(`llama.cpp autoconfig input refused by dav-parse (${code})`, code);
   }
-  return { text, reply: autoconfigReply(op, reply, op === 11 || op === 12) };
+  if (op === 11 || op === 12) {
+    if (reply && reply.wire === 'state-v2d') return { text, reply: autoconfigDeltaReply(reply) };
+    if (reply && reply.wire === 'state-v1'
+      && (autoconfigExact(reply, ['wire', 'done']) || autoconfigExact(reply, ['wire', 'throw']))) {
+      return { text, reply: autoconfigReply(op, autoconfigCompactReply(reply)) };
+    }
+    throw new DavParseError('llama.cpp autoconfig reply has an unexpected private wire version', 'reply');
+  }
+  return { text, reply: autoconfigReply(op, reply, false) };
 }
 
 // --- code actions (CODE_ACTIONS_IMPL, retired in #1071) and project file names (PROJECT_FILE_NAMES_IMPL, retired in #1071) ----------
