@@ -44,6 +44,21 @@ function privateArgs(array, transform) {
   result.length = length;
   return result;
 }
+function privateArgsBounded(array, count, transform) {
+  const result = { __proto__: null, length: 0 };
+  let length = 0;
+  for (let index = 0; index < count; index++) result[length++] = transform(array[index], index);
+  result.length = length;
+  return result;
+}
+function privateMapBounded(array, count, transform, start = 0) {
+  const result = [];
+  for (let index = start; index < count; index++) define(result, index - start, transform(array[index], index));
+  return result;
+}
+function privateSafeInteger(value, minimum, maximum) {
+  return typeof value === 'number' && value >= minimum && value <= maximum && value % 1 === 0;
+}
 
 function binary(operator, a, b, fault) {
   switch (operator) {
@@ -231,18 +246,64 @@ function evaluator(initialContext) {
       if (!message || typeof message !== 'object') throw context.fault();
       if (owns(message, 'done')) return get(message.done);
       if (owns(message, 'throw')) throw get(message.throw);
-      if (!arrayIsArray(message.batch) || message.batch.length < 1 || message.batch.length > 32) throw context.fault();
-      let state, frame;
-      for (let operationIndex=0;operationIndex<message.batch.length;operationIndex++) {
-        const operation=message.batch[operationIndex];
-        const { request, args: references } = operation;
-        state = operation.state; frame = undefined;
-        if (!state || !request || !arrayIsArray(references)) throw context.fault();
+      const deltaWire = message.wire === 'state-v2d';
+      const batch = deltaWire ? message.batch : undefined;
+      let batchCount;
+      if (deltaWire) {
+        batchCount = message.batchCount;
+        if (!arrayIsArray(batch) || !privateSafeInteger(batchCount, 1, 32)
+          || !message.stateDeltas || typeof message.stateDeltas !== 'object') throw context.fault();
+      } else if (!arrayIsArray(message.batch) || message.batch.length < 1 || message.batch.length > 32) throw context.fault();
+      let state, frame, activeState = deltaWire ? [undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined] : null;
+      let lastStackCount = 0, lastCatchCount = 0, hasSelectedDelta = false;
+      for (let operationIndex=0;deltaWire ? operationIndex<batchCount : operationIndex<message.batch.length;operationIndex++) {
+        let operation, request, references, descriptor, argsCount;
+        if (deltaWire) {
+          try {
+            operation = batch[operationIndex];
+            descriptor = message.stateDeltas[operationIndex];
+            if (!descriptor || typeof descriptor !== 'object') throw context.fault();
+            const mask = descriptor.mask, selectedArgsCount = descriptor.argsCount;
+            const selectedStackCount = descriptor.stackCount, selectedCatchCount = descriptor.catchCount;
+            const fields = descriptor.fields;
+            if (!privateSafeInteger(mask, 0, 255)
+              || !privateSafeInteger(selectedArgsCount, 0, 256)
+              || !privateSafeInteger(selectedStackCount, 0, 256)
+              || !privateSafeInteger(selectedCatchCount, 0, 8)
+              || !fields || typeof fields !== 'object') throw context.fault();
+            argsCount = selectedArgsCount;
+            lastStackCount = selectedStackCount;
+            lastCatchCount = selectedCatchCount;
+            hasSelectedDelta = true;
+            for (let bit = 0; bit < 8; bit++) if (mask & (1 << bit)) activeState[bit] = fields[bit];
+            const operationLength = operation === descriptor.row ? 4 : (arrayIsArray(operation) ? operation.length : 0);
+            if (!arrayIsArray(operation) || !privateSafeInteger(operationLength, 4, 4)) throw context.fault();
+            request = operation[1]; references = operation[2];
+            if (!request || typeof request !== 'object' || arrayIsArray(request) || !arrayIsArray(references)) throw context.fault();
+            if (references !== descriptor.args) {
+              const currentLength = references.length;
+              if (!privateSafeInteger(currentLength, argsCount, 9_007_199_254_740_991)) throw context.fault();
+            }
+          } catch (error) { if (context.isFault(error)) throw error; throw context.fault(); }
+        } else {
+          operation = message.batch[operationIndex];
+          const { request: legacyRequest, args: legacyReferences } = operation;
+          request = legacyRequest; references = legacyReferences; state = operation.state;
+          if (!state || !request || !arrayIsArray(references)) throw context.fault();
+        }
+        frame = undefined;
         try {
-        const input = privateArgs(references,get);
+        const input = deltaWire
+          ? privateArgsBounded(references, argsCount, reference => {
+            if (!privateSafeInteger(reference, 1, 9_007_199_254_740_991)) throw context.fault();
+            return get(reference);
+          })
+          : privateArgs(references,get);
         const data = request.data;
+        const requestOp = request.op;
+        if (deltaWire && typeof requestOp !== 'string') throw context.fault();
         let value;
-        switch (request.op) {
+        switch (requestOp) {
           case 'numberFacts': frame = { numbers: privateMap(input,value => value === null ? { kind: 'null' } : typeof value === 'number' ? { kind: 'number', bits: numberBits(value) } : { kind: 'other' }) }; break;
           case 'floatBits': value = bitsNumber(data); break;
           case 'booleanArrayFacts': frame = { facts: booleanArrayFacts(input[0]) }; break;
@@ -333,7 +394,16 @@ function evaluator(initialContext) {
             break;
           default: throw context.fault();
         }
-        if (!frame) { values[operation.ref] = value; frame = { value: operation.ref }; }
+        if (!frame) {
+          if (deltaWire) {
+            const resultRef = operation[3];
+            if (!privateSafeInteger(resultRef, 0, 9_007_199_254_740_991)) throw context.fault();
+            values[resultRef] = value;
+            const frameRef = operation[3];
+            if (!privateSafeInteger(frameRef, 0, 9_007_199_254_740_991)) throw context.fault();
+            frame = { value: frameRef };
+          } else { values[operation.ref] = value; frame = { value: operation.ref }; }
+        }
       } catch (thrown) {
         // Infrastructure faults never enter the historical estimator's catch handlers.
         if (context.isFault(thrown)) throw thrown;
@@ -341,16 +411,52 @@ function evaluator(initialContext) {
         }
         if (owns(frame, 'thrown')) break;
       }
+      if (deltaWire) {
+        if (!hasSelectedDelta) throw context.fault();
+        state = { pc: activeState[0], env: activeState[1], stack: activeState[2], catches: activeState[3],
+          mode: activeState[4], target: activeState[5], period: activeState[6], sum: activeState[7] };
+      }
       const remapped = objectCreate(null);
       const remap = ref => {
         if (ref < 8_000_000_000_000_000) return ref;
         if (!owns(remapped, ref)) remapped[ref] = put(get(ref));
         return remapped[ref];
       };
-      state = { ...state, env: remap(state.env), stack: privateMap(state.stack,remap), catches: privateMap(state.catches,c => [c[0], c[1], remap(c[2])]) };
-      if (state.period) state.period = { ...state.period, seq: remap(state.period.seq) };
-      if (state.sum) state.sum = { ...state.sum, cache: { ...state.sum.cache, seq: remap(state.sum.cache.seq) }, raw: privateMap(state.sum.raw,remap) };
-      if (owns(frame, 'value')) frame.value = remap(frame.value);
+      if (deltaWire) {
+        const checkedReference = (ref, allowZero = false) => {
+          if (!privateSafeInteger(ref, allowZero ? 0 : 1, 9_007_199_254_740_991)) throw context.fault();
+          return remap(ref);
+        };
+        try {
+          state = { ...state, env: checkedReference(state.env),
+            stack: privateMapBounded(state.stack, lastStackCount, ref => checkedReference(ref)),
+            catches: privateMapBounded(state.catches, lastCatchCount, tuple => {
+              if (!arrayIsArray(tuple)) throw context.fault();
+              let pc, depth, env;
+              try { pc = tuple[0]; depth = tuple[1]; env = tuple[2]; } catch { throw context.fault(); }
+              if (!privateSafeInteger(pc, -9_007_199_254_740_991, 9_007_199_254_740_991) || !privateSafeInteger(depth, -9_007_199_254_740_991, 9_007_199_254_740_991) || !privateSafeInteger(env, 1, 9_007_199_254_740_991)) throw context.fault();
+              return [pc, depth, checkedReference(env)];
+            }) };
+          if (state.period) state.period = { ...state.period, seq: checkedReference(state.period.seq, true) };
+          if (state.sum) {
+            const checkedRaw = raw => {
+              if (!arrayIsArray(raw)) throw context.fault();
+              const rawCount = raw.length;
+              if (!privateSafeInteger(rawCount, 0, 8) || (rawCount !== 0 && rawCount !== 8)) throw context.fault();
+              return privateMapBounded(raw, rawCount, ref => checkedReference(ref, true));
+            };
+            state.sum = { ...state.sum, cache: { ...state.sum.cache, seq: checkedReference(state.sum.cache.seq, true) },
+              raw: checkedRaw(state.sum.raw) };
+          }
+        } catch (error) { if (context.isFault(error)) throw error; throw context.fault(); }
+      } else {
+        state = { ...state, env: remap(state.env), stack: privateMap(state.stack,remap), catches: privateMap(state.catches,c => [c[0], c[1], remap(c[2])]) };
+        if (state.period) state.period = { ...state.period, seq: remap(state.period.seq) };
+        if (state.sum) state.sum = { ...state.sum, cache: { ...state.sum.cache, seq: remap(state.sum.cache.seq) }, raw: privateMap(state.sum.raw,remap) };
+      }
+      if (owns(frame, 'value')) frame.value = deltaWire
+        ? (privateSafeInteger(frame.value, 0, 9_007_199_254_740_991) ? remap(frame.value) : (() => { throw context.fault(); })())
+        : remap(frame.value);
       // Live registers only: no processed-prefix history and no recursively copied input tree.
       const live = [state.env];
       for(let i=0;i<state.stack.length;i++) define(live,live.length,state.stack[i]);

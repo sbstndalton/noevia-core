@@ -14,7 +14,7 @@ function directMode(values){
       frames.push(JSON.stringify(args).length);
     }
     const result=wasm.llamacppAutoconfig(op,args);
-    for(const operation of result.reply.batch || [])counts[operation.request.op]=(counts[operation.request.op]||0)+1;
+    for(const operation of result.reply.batch || []){const request=result.reply.wire==='state-v2d'?operation[1]:operation.request;counts[request.op]=(counts[request.op]||0)+1;}
     return result;
   }}));
   assert.equal(outcome.fault,undefined);return {value:outcome.value,counts,frames};

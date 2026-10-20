@@ -91,8 +91,9 @@ function observe(kind, context, candidate) {
           if (op === 12 && args.state.mode === 6) stats.facts.push(args.frame.facts.safe);
           const response = port.llamacppAutoconfig(op, args);
           for (const operation of response.reply.batch || []) {
-            if (operation.request.op === 'ownBooleanPrefixFacts') stats.requests.push(operation.request.data.count);
-            if (operation.request.op === 'booleanChunk') stats.chunks++;
+            const request = response.reply.wire === 'state-v2d' ? operation[1] : operation.request;
+            if (request.op === 'ownBooleanPrefixFacts') stats.requests.push(request.data.count);
+            if (request.op === 'booleanChunk') stats.chunks++;
           }
           return response;
         },
@@ -161,8 +162,9 @@ test('malformed own-prefix metadata remains an infrastructure fault', () => {
       llamacppAutoconfig(op, args) {
         const response = port.llamacppAutoconfig(op, args);
         for (const operation of response.reply.batch || []) {
-          if (operation.request.op === 'ownBooleanPrefixFacts') {
-            operation.request.data = data;
+          const request = response.reply.wire === 'state-v2d' ? operation[1] : operation.request;
+          if (request.op === 'ownBooleanPrefixFacts') {
+            request.data = data;
             injected = true;
           }
         }
