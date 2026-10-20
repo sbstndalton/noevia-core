@@ -24,7 +24,7 @@ const DEFAULT_OPTIONS = [
   { id: 'nc_webdav_search_files', label: "Find the user's own stored files and documen" },
   { id: 'none', label: 'No tool: answer directly' },
 ];
-const KEV_QUESTION = 'Without tools the assistant knows no current news and nothing the user wrote or saved. Which tool does it need, if any?';
+const TUNED_QUESTION = 'Without tools the assistant knows no current news and nothing the user wrote or saved. Which tool does it need, if any?';
 const TUNED_OPTIONS = [
   { id: 'tavily_extract', label: 'Read the text of a web page from i' },
   { id: 'tavily_search', label: 'Search the web for current facts a' },
@@ -68,19 +68,19 @@ async function sent(wording, bias) {
 
 test('the default wording gets the main-branch request byte for byte, by default and by name (#1739)', { skip: skipWasm }, async () => {
   ran++;
-  for (const wording of [undefined, 'laya', () => 'laya']) {
+  for (const wording of [undefined, 'standard', () => 'standard']) {
     const req = await sent(wording);
     assert.deepEqual({ purpose: req.purpose, question: req.question, options: req.options },
       { purpose: 'tool.gate', question: DEFAULT_QUESTION, options: DEFAULT_OPTIONS });
     assert.equal(JSON.stringify(req.options), JSON.stringify(DEFAULT_OPTIONS));
   }
   assert.equal(tg.QUESTION, DEFAULT_QUESTION);
-  assert.equal(tg.questionFor('laya'), DEFAULT_QUESTION);
+  assert.equal(tg.questionFor('standard'), DEFAULT_QUESTION);
 });
 
 test('an unknown, empty or throwing wording falls back to the default request', { skip: skipWasm }, async () => {
   ran++;
-  for (const wording of ['tuned-0.8b', 'KEV', '', null, () => 'other', () => { throw Error('settings gone'); }]) {
+  for (const wording of ['tuned-0.8b', 'KEV', 'TUNED', 'Standard',  '', null, () => 'other', () => { throw Error('settings gone'); }]) {
     const req = await sent(wording);
     assert.equal(req.question, DEFAULT_QUESTION, String(wording));
     assert.deepEqual(req.options, DEFAULT_OPTIONS, String(wording));
@@ -89,23 +89,23 @@ test('an unknown, empty or throwing wording falls back to the default request', 
 
 test('the tuned wording gets the tuned question and the lowered budget: labels cut to 34 for this tool set', { skip: skipWasm }, async () => {
   ran++;
-  for (const wording of ['kev', () => 'kev']) {
+  for (const wording of ['tuned', () => 'tuned']) {
     const req = await sent(wording);
-    assert.equal(req.question, KEV_QUESTION);
+    assert.equal(req.question, TUNED_QUESTION);
     assert.deepEqual(req.options, TUNED_OPTIONS);
     assert.ok(req.question.length + req.options.reduce((n, o) => n + o.id.length + o.label.length + 2, 0) <= SERVICE_LIMITS.maxChoiceChars);
   }
-  assert.equal(tg.KEV_QUESTION, KEV_QUESTION);
-  assert.doesNotMatch(KEV_QUESTION, /\bmust\b/, '"must" made the tuned model answer none (#1639)');
+  assert.equal(tg.TUNED_QUESTION, TUNED_QUESTION);
+  assert.doesNotMatch(TUNED_QUESTION, /\bmust\b/, '"must" made the tuned model answer none (#1639)');
 });
 
 test('a frame hint is appended to either question and counted in the budget the same way', { skip: skipWasm }, async () => {
   ran++;
   const bias = { prefer: ['search'], hint: 'The user framed this chat as a lookup.' };
-  const dflt = await sent('laya', bias);
-  const tuned = await sent('kev', bias);
+  const dflt = await sent('standard', bias);
+  const tuned = await sent('tuned', bias);
   assert.equal(dflt.question, `${DEFAULT_QUESTION} ${bias.hint}`);
-  assert.equal(tuned.question, `${KEV_QUESTION} ${bias.hint}`);
+  assert.equal(tuned.question, `${TUNED_QUESTION} ${bias.hint}`);
   // Default wording: shaped exactly as main shaped it, with the question's real length as the budget.
   assert.deepEqual(dflt.options, DEFAULT_HINT_OPTIONS);
   // Tuned wording: 79 + hint, in a choice budget lowered by 40 (what the port counts given the same limits).
@@ -115,9 +115,9 @@ test('a frame hint is appended to either question and counted in the budget the 
 test('budgetLimits: the 40-character cut only for the tuned question, whatever maxOptions is (#1740 D3)', () => {
   assert.equal(tg.BUDGET_QUESTION_CHARS, 79);
   assert.equal(DEFAULT_QUESTION.length, 79, 'the question the port budgets');
-  assert.equal(KEV_QUESTION.length - 79, 40);
+  assert.equal(TUNED_QUESTION.length - 79, 40);
   assert.deepEqual(tg.budgetLimits(SERVICE_LIMITS), { ...SERVICE_LIMITS, maxChoiceChars: 320 });
-  assert.deepEqual(tg.budgetLimits(SERVICE_LIMITS, KEV_QUESTION), { ...SERVICE_LIMITS, maxChoiceChars: 320 });
+  assert.deepEqual(tg.budgetLimits(SERVICE_LIMITS, TUNED_QUESTION), { ...SERVICE_LIMITS, maxChoiceChars: 320 });
   assert.equal(tg.budgetLimits(SERVICE_LIMITS, DEFAULT_QUESTION), SERVICE_LIMITS, 'default wording: the limits object itself');
   assert.equal(tg.budgetLimits(null), null);
   const noBudget = { maxOptions: 8, maxLabelChars: 120 };
@@ -133,7 +133,7 @@ test('question plus options stay within the service choice budget for both wordi
   ran++;
   const long = (name) => tool(name, `${name} reads synthetic data. `.repeat(12));
   const many = [...Array.from({ length: 10 }, (_, i) => long(`synthetic_reader_${i}`)), long('Web-Fetch'), long('tavily_search')];
-  for (const wording of ['laya', 'kev']) {
+  for (const wording of ['standard', 'tuned', 'laya', 'kev']) {
     for (const bias of [undefined, { prefer: ['search'], hint: 'h'.repeat(300) }]) {
       const asked = [];
       const gate = tg.createToolGate({ enabled: () => true, isWriteTool: () => false, limits: () => SERVICE_LIMITS, wording,
@@ -147,4 +147,21 @@ test('question plus options stay within the service choice budget for both wordi
   }
 });
 
-test.after(() => { if (!skipWasm) assert.equal(ran, 5, 'a wasm-guarded test body did not run'); });
+// #2093: the first names of the two wordings, 'laya' and 'kev', are deprecated but still accepted, as a value or a function.
+test('the deprecated wording values laya and kev send exactly what standard and tuned send', { skip: skipWasm }, async () => {
+  ran++;
+  const bias = { prefer: ['search'], hint: 'The user framed this chat as a lookup.' };
+  for (const [old, now] of [['laya', 'standard'], ['kev', 'tuned']]) {
+    for (const b of [undefined, bias]) {
+      assert.deepEqual(await sent(old, b), await sent(now, b), `${old} ${!!b}`);
+      assert.deepEqual(await sent(() => old, b), await sent(now, b), `${old} as a function`);
+    }
+  }
+  assert.equal(tg.questionFor('kev'), tg.TUNED_QUESTION);
+  assert.equal(tg.questionFor('tuned'), tg.TUNED_QUESTION);
+  assert.equal(tg.questionFor('laya'), tg.QUESTION);
+  assert.equal(tg.questionFor(undefined), tg.QUESTION);
+  assert.equal(tg.questionFor('Kev'), tg.QUESTION, 'the match is exact, as before');
+});
+
+test.after(() => { if (!skipWasm) assert.equal(ran, 6, 'a wasm-guarded test body did not run'); });

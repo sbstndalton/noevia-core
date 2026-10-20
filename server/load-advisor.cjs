@@ -1,5 +1,5 @@
 'use strict';
-// #1004 (always on since #1071; it was LAYA_LOAD_ADVISOR=on): the decision service (Laya) as an advisor inside
+// #1004 (always on since #1071; it was DECISION_LOAD_ADVISOR=on, once LAYA_LOAD_ADVISOR=on): the decision service as an advisor inside
 // auto-tune's script, never its driver. When a fill-and-recall step fails for a reason the
 // calibrator only guessed (a refused load, a failed router row, a stream error, an engine that
 // went away), Rust's load-verdict (dav-parse.wasm load_verdict) names the outcome from the

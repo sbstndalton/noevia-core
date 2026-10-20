@@ -42,18 +42,55 @@ test('with no switch set and the pinned module, startup verifies it and names no
 });
 
 test('retired switches: only a value other than the old Rust one warns, once per switch', () => {
-  assert.deepEqual(Object.keys(davParseWasm.RETIRED_FLAGS), ['LLAMACPP_PRESETS_IMPL', 'STREAM_GUARD_IMPL', 'ROLE_CONTEXT_IMPL', 'CHAT_TEMPLATE_CAPS_IMPL', 'AUTOTUNE_PLAN_IMPL', 'PRESET_RELOAD_IMPL', 'LAYA_LOAD_ADVISOR', 'DAV_PARSE_IMPL', 'S3_PARSE_IMPL', 'MCP_FRAME_IMPL', 'UPLOAD_SNIFF_IMPL', 'S3_SIGN_IMPL', 'PROMPT_FRAMING_IMPL', 'SSRF_IMPL', 'POLICY_LEAVES_IMPL', 'CODE_REVIEW_VERDICT_IMPL', 'TOOL_EXCHANGE_IMPL', 'DECISION_IMPL', 'COMPLETENESS_REPORT_IMPL', 'TASK_LIFECYCLE_IMPL', 'MCP_SERVERS_IMPL', 'CODE_NET_GUARD_IMPL', 'LLAMACPP_AUTOCONFIG_IMPL', 'GGUF_META_IMPL', 'PROJECT_FILE_NAMES_IMPL', 'PROVIDER_EGRESS_IMPL', 'BROWSER_POLICY_IMPL', 'CODE_ACTIONS_IMPL', 'TOOL_GATE_IMPL', 'TOOLBOXES_PERMITTED_IMPL']);
+  assert.deepEqual(Object.keys(davParseWasm.RETIRED_FLAGS), ['LLAMACPP_PRESETS_IMPL', 'STREAM_GUARD_IMPL', 'ROLE_CONTEXT_IMPL', 'CHAT_TEMPLATE_CAPS_IMPL', 'AUTOTUNE_PLAN_IMPL', 'PRESET_RELOAD_IMPL', 'DECISION_LOAD_ADVISOR', 'DAV_PARSE_IMPL', 'S3_PARSE_IMPL', 'MCP_FRAME_IMPL', 'UPLOAD_SNIFF_IMPL', 'S3_SIGN_IMPL', 'PROMPT_FRAMING_IMPL', 'SSRF_IMPL', 'POLICY_LEAVES_IMPL', 'CODE_REVIEW_VERDICT_IMPL', 'TOOL_EXCHANGE_IMPL', 'DECISION_IMPL', 'COMPLETENESS_REPORT_IMPL', 'TASK_LIFECYCLE_IMPL', 'MCP_SERVERS_IMPL', 'CODE_NET_GUARD_IMPL', 'LLAMACPP_AUTOCONFIG_IMPL', 'GGUF_META_IMPL', 'PROJECT_FILE_NAMES_IMPL', 'PROVIDER_EGRESS_IMPL', 'BROWSER_POLICY_IMPL', 'CODE_ACTIONS_IMPL', 'TOOL_GATE_IMPL', 'TOOLBOXES_PERMITTED_IMPL']);
   const warnings = [];
   const log = { warn: (m) => warnings.push(m) };
   assert.deepEqual(davParseWasm.warnRetiredFlags({}, log), []);
-  assert.deepEqual(davParseWasm.warnRetiredFlags({ DAV_PARSE_IMPL: 'wasm', S3_PARSE_IMPL: ' WASM ', LAYA_LOAD_ADVISOR: 'on', AUTOTUNE_PLAN_IMPL: '', PRESET_RELOAD_IMPL: 'wasm', CHAT_TEMPLATE_CAPS_IMPL: 'wasm' }, log), []);
+  assert.deepEqual(davParseWasm.warnRetiredFlags({ DAV_PARSE_IMPL: 'wasm', S3_PARSE_IMPL: ' WASM ', DECISION_LOAD_ADVISOR: 'on', AUTOTUNE_PLAN_IMPL: '', PRESET_RELOAD_IMPL: 'wasm', CHAT_TEMPLATE_CAPS_IMPL: 'wasm' }, log), []);
   assert.deepEqual(warnings, []);
-  assert.deepEqual(davParseWasm.warnRetiredFlags({ DAV_PARSE_IMPL: 'js', CHAT_TEMPLATE_CAPS_IMPL: 'off', LAYA_LOAD_ADVISOR: 'off', S3_PARSE_IMPL: 'js' }, log),
-    ['CHAT_TEMPLATE_CAPS_IMPL', 'LAYA_LOAD_ADVISOR', 'DAV_PARSE_IMPL', 'S3_PARSE_IMPL']);
-  assert.deepEqual(warnings, ['CHAT_TEMPLATE_CAPS_IMPL is retired; Rust is always used', 'LAYA_LOAD_ADVISOR is retired; Rust is always used',
+  assert.deepEqual(davParseWasm.warnRetiredFlags({ DAV_PARSE_IMPL: 'js', CHAT_TEMPLATE_CAPS_IMPL: 'off', DECISION_LOAD_ADVISOR: 'off', S3_PARSE_IMPL: 'js' }, log),
+    ['CHAT_TEMPLATE_CAPS_IMPL', 'DECISION_LOAD_ADVISOR', 'DAV_PARSE_IMPL', 'S3_PARSE_IMPL']);
+  assert.deepEqual(warnings, ['CHAT_TEMPLATE_CAPS_IMPL is retired; Rust is always used', 'DECISION_LOAD_ADVISOR is retired; Rust is always used',
     'DAV_PARSE_IMPL is retired; Rust is always used', 'S3_PARSE_IMPL is retired; Rust is always used']);
   // A retired switch is not a startup switch: it never selects or deselects the module.
   assert.deepEqual(davParseWasm.wasmFlags({ DAV_PARSE_IMPL: 'wasm', CHAT_TEMPLATE_CAPS_IMPL: 'wasm' }), []);
+});
+
+test('#2093: LAYA_LOAD_ADVISOR is a deprecated alias of DECISION_LOAD_ADVISOR: same outcome whichever is set, the new name wins, one note per process', () => {
+  assert.deepEqual(davParseWasm.DEPRECATED_FLAG_ALIASES, { LAYA_LOAD_ADVISOR: 'DECISION_LOAD_ADVISOR' });
+  const run = (env, { reset = true } = {}) => {
+    if (reset) davParseWasm.resetDeprecatedFlagNotes();
+    const lines = [];
+    const warned = davParseWasm.warnRetiredFlags(env, { warn: (m) => lines.push(m) });
+    return { warned, retired: lines.filter((m) => /is retired/.test(m)), notes: lines.filter((m) => /deprecated alias/.test(m)) };
+  };
+  for (const value of ['on', ' ON ', 'wasm', 'off', 'js', '  ', '']) {
+    const viaNew = run({ DECISION_LOAD_ADVISOR: value });
+    const viaOld = run({ LAYA_LOAD_ADVISOR: value });
+    assert.deepEqual(viaOld.warned, viaNew.warned, JSON.stringify(value));
+    assert.deepEqual(viaOld.retired, viaNew.retired, JSON.stringify(value));
+    assert.deepEqual(viaNew.notes, [], 'the new name is never noted');
+    assert.equal(viaOld.notes.length, value.trim() === '' ? 0 : 1, JSON.stringify(value));
+  }
+  assert.deepEqual(run({ LAYA_LOAD_ADVISOR: 'off' }).retired, ['DECISION_LOAD_ADVISOR is retired; Rust is always used']);
+  assert.deepEqual(run({ LAYA_LOAD_ADVISOR: 'on' }).warned, []);
+  // Both set: the new name decides, whatever the old one says.
+  assert.deepEqual(run({ DECISION_LOAD_ADVISOR: 'on', LAYA_LOAD_ADVISOR: 'js' }).warned, []);
+  assert.deepEqual(run({ DECISION_LOAD_ADVISOR: 'js', LAYA_LOAD_ADVISOR: 'on' }).warned, ['DECISION_LOAD_ADVISOR']);
+  const both = run({ DECISION_LOAD_ADVISOR: 'on', LAYA_LOAD_ADVISOR: 'js' });
+  assert.deepEqual(both.notes, ['LAYA_LOAD_ADVISOR is a deprecated alias of DECISION_LOAD_ADVISOR; set DECISION_LOAD_ADVISOR instead (DECISION_LOAD_ADVISOR is set, so LAYA_LOAD_ADVISOR is ignored)']);
+  // A new name that is unset, empty or blank falls back to the old one.
+  for (const blank of [undefined, '', '   ']) assert.deepEqual(run({ DECISION_LOAD_ADVISOR: blank, LAYA_LOAD_ADVISOR: 'js' }).warned, ['DECISION_LOAD_ADVISOR']);
+  // One note per process, not per call; the retired warning itself is per call, as before.
+  davParseWasm.resetDeprecatedFlagNotes();
+  const again = [run({ LAYA_LOAD_ADVISOR: 'js' }, { reset: false }), run({ LAYA_LOAD_ADVISOR: 'js' }, { reset: false })];
+  assert.deepEqual(again.map((r) => r.notes.length), [1, 0]);
+  assert.deepEqual(again.map((r) => r.retired.length), [1, 1]);
+  // A logger that throws on the note changes nothing about the answer.
+  davParseWasm.resetDeprecatedFlagNotes();
+  assert.deepEqual(davParseWasm.warnRetiredFlags({ LAYA_LOAD_ADVISOR: 'on' }, { warn() { throw new Error('logger down'); } }), []);
+  // Neither name selects the module.
+  assert.deepEqual(davParseWasm.wasmFlags({ LAYA_LOAD_ADVISOR: 'wasm', DECISION_LOAD_ADVISOR: 'wasm' }), []);
 });
 
 test('the nine switches retired in #1071 batch 3: =wasm is silent, anything else warns once, none selects the module', () => {
@@ -217,7 +254,7 @@ test('index.cjs refuses to start without the module even with every retired swit
   t.after(() => fs.rmSync(dataDir, { recursive: true, force: true }));
   const r = spawnSync(process.execPath, [path.join(__dirname, 'index.cjs')], {
     env: { ...process.env, UI_DATA_DIR: dataDir, PORT: '0', HOST: '127.0.0.1', PUBLIC_ORIGIN: 'http://localhost', DIARY_AUTH_TOKEN: 'test-cowork-token', DAV_PARSE_WASM: MISSING,
-      LLAMACPP_PRESETS_IMPL: 'js', STREAM_GUARD_IMPL: 'js', ROLE_CONTEXT_IMPL: 'js', DAV_PARSE_IMPL: 'js', S3_PARSE_IMPL: 'js', CHAT_TEMPLATE_CAPS_IMPL: 'off', AUTOTUNE_PLAN_IMPL: 'js', PRESET_RELOAD_IMPL: 'off', LAYA_LOAD_ADVISOR: 'off',
+      LLAMACPP_PRESETS_IMPL: 'js', STREAM_GUARD_IMPL: 'js', ROLE_CONTEXT_IMPL: 'js', DAV_PARSE_IMPL: 'js', S3_PARSE_IMPL: 'js', CHAT_TEMPLATE_CAPS_IMPL: 'off', AUTOTUNE_PLAN_IMPL: 'js', PRESET_RELOAD_IMPL: 'off', DECISION_LOAD_ADVISOR: 'off',
       MCP_FRAME_IMPL: 'js', UPLOAD_SNIFF_IMPL: 'js', S3_SIGN_IMPL: 'js', PROMPT_FRAMING_IMPL: 'js', SSRF_IMPL: 'js',
       POLICY_LEAVES_IMPL: 'js', CODE_REVIEW_VERDICT_IMPL: 'js', TOOL_EXCHANGE_IMPL: 'js', DECISION_IMPL: 'js', COMPLETENESS_REPORT_IMPL: 'js', TASK_LIFECYCLE_IMPL: 'js', MCP_SERVERS_IMPL: 'js', CODE_NET_GUARD_IMPL: 'js', LLAMACPP_AUTOCONFIG_IMPL: 'js', GGUF_META_IMPL: 'js', PROJECT_FILE_NAMES_IMPL: 'js', PROVIDER_EGRESS_IMPL: 'js', BROWSER_POLICY_IMPL: 'js', CODE_ACTIONS_IMPL: 'js', TOOL_GATE_IMPL: 'js', TOOLBOXES_PERMITTED_IMPL: 'js' },
     encoding: 'utf8', timeout: 60000,
@@ -248,6 +285,8 @@ test('index.cjs starts with the pinned module and every retired switch left at j
   assert.match(out, /\[dav-parse\] dav-parse\.wasm verified/, `stdout ${out.slice(-500)} stderr ${err.slice(-500)}`);
   assert.equal(child.exitCode, null, 'still running');
   for (const flag of Object.keys(davParseWasm.RETIRED_FLAGS)) assert.match(err, new RegExp(`${flag} is retired; Rust is always used`));
+  // This run sets the deprecated LAYA_LOAD_ADVISOR: it counts as DECISION_LOAD_ADVISOR, and says it is deprecated (#2093).
+  assert.match(err, /LAYA_LOAD_ADVISOR is a deprecated alias of DECISION_LOAD_ADVISOR; set DECISION_LOAD_ADVISOR instead/);
 });
 
 test('index.cjs refuses to start without the Rust project store, and a leftover NOEVIA_RUST_PROJECTS is only a warning (#1071)', { skip: skipWasm }, (t) => {

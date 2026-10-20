@@ -88,7 +88,7 @@ const PLAN_CAUSE = { oom: 'oom', load: 'load_failed', time: 'over_time', recall:
 const PLAN_STEP_LIMIT = 64;
 // #1004: a guessed failure cause is named by Rust's rules (load-verdict), the decision service
 // advising only when no rule matches (load-advisor.cjs). Always on since #1071 (it was
-// LAYA_LOAD_ADVISOR=on); an unconfigured decision service just means no advice.
+// DECISION_LOAD_ADVISOR=on); an unconfigured decision service just means no advice.
 function defaultLoadAdvisor() { return require('./load-advisor.cjs').createLoadAdvisor(); }
 const QUALITY = [
   { id: 'arithmetic', prompt: 'Compute (17 * 4) - 9. Reply with only the integer.', expected: '59' },

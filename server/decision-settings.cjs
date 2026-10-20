@@ -36,7 +36,8 @@ function hostOf(url) {
 function startupWarnings(env=process.env) {
   const out=[];
   const {profileFor}=require('./decision-models.cjs');
-  if(hostOf(env.COWORK_DECISION_URL)==='kev' && profileFor(env.COWORK_DECISION_MODEL).wording!=='kev')
+  const {TUNED}=require('./decision-wording.cjs');
+  if(hostOf(env.COWORK_DECISION_URL)==='kev' && profileFor(env.COWORK_DECISION_MODEL).wording!==TUNED)
     out.push(`[system-one] COWORK_DECISION_URL points at the host "kev", but COWORK_DECISION_MODEL (${env.COWORK_DECISION_MODEL ? JSON.stringify(String(env.COWORK_DECISION_MODEL).slice(0,64)) : 'unset'}) is not a Kev model; Laya-format requests will be sent and every decision will fail. Set COWORK_DECISION_MODEL=kev-0.8b.`);
   return out;
 }

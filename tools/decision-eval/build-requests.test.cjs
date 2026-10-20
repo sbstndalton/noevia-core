@@ -142,7 +142,7 @@ test('#1647: the capture identity is qualified only inside this harness; the shi
 });
 
 let builtTuned;
-const tunedRecords = async () => (builtTuned ||= await buildRequests(undefined, { wording: 'kev' }));
+const tunedRecords = async () => (builtTuned ||= await buildRequests(undefined, { wording: 'tuned' }));
 const ROUTE_OPTIONS = [
   { id: 'fast', label: 'Greetings, thanks, or a one-line factual answer' },
   { id: 'smart', label: 'Explaining, comparing, planning, reasoning or writing more than a sentence' },
@@ -165,7 +165,7 @@ test('#1739: by default the harness captures the main-branch (default) wording, 
   }
 });
 
-test('#1639: --wording kev captures the wording tuned for a small decision model; the other purposes are the same for both', { skip: skipWasm }, async () => {
+test('#1639: --wording tuned captures the wording tuned for a small decision model; the other purposes are the same for both', { skip: skipWasm }, async () => {
   ran++;
   const dflt = (await records()).records, tuned = (await tunedRecords()).records;
   assert.equal(tuned.length, dflt.length);
@@ -198,7 +198,7 @@ test('#1639: --wording kev captures the wording tuned for a small decision model
   assert.deepEqual(tunedRoute.map((r) => [r.body.question, r.body.state]), defaultRoute.map((r) => [r.body.question, r.body.state]));
   for (const r of defaultRoute) assert.deepEqual(r.body.options, ROUTE_OPTIONS);
   for (const r of tunedRoute) {
-    assert.deepEqual(r.body.options.slice(0, 2), [{ id: 'fast', label: ROUTE_LABELS.kev.fast }, { id: 'smart', label: ROUTE_LABELS.kev.smart }]);
+    assert.deepEqual(r.body.options.slice(0, 2), [{ id: 'fast', label: ROUTE_LABELS.tuned.fast }, { id: 'smart', label: ROUTE_LABELS.tuned.smart }]);
     assert.deepEqual(r.body.options.slice(2), ROUTE_OPTIONS.slice(2));
   }
   for (const r of base(tuned, 'routing.sensitivity')) assert.equal(r.body.question, 'Does this content contain sensitive personal or confidential information?');
@@ -206,4 +206,28 @@ test('#1639: --wording kev captures the wording tuned for a small decision model
   await assert.rejects(buildRequests(undefined, { wording: 'tuned-0.8b' }), /unknown wording/);
 });
 
-test.after(() => { if (!skipWasm) assert.equal(ran, 9, 'a wasm-guarded test body did not run'); });
+// #2093: the wording values are 'standard' and 'tuned'; the first names, 'laya' and 'kev', are still accepted, in the API and as --wording.
+test('the deprecated wording values laya and kev, in buildRequests and as --wording, capture exactly what standard and tuned capture', { skip: skipWasm }, async () => {
+  ran++;
+  const { spawnSync } = require('node:child_process');
+  const dflt = (await records()).records, tuned = (await tunedRecords()).records;
+  assert.deepEqual((await buildRequests(undefined, { wording: 'standard' })).records, dflt);
+  assert.deepEqual((await buildRequests(undefined, { wording: 'laya' })).records, dflt);
+  assert.deepEqual((await buildRequests(undefined, { wording: 'kev' })).records, tuned);
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'wording-flag-'));
+  try {
+    const want = { tuned: tuned, kev: tuned, standard: dflt, laya: dflt };
+    for (const [flag, rows] of Object.entries(want)) {
+      const out = path.join(dir, `${flag}.jsonl`);
+      const r = spawnSync(process.execPath, [path.join(__dirname, 'build-requests.cjs'), '--out', out, '--wording', flag], { encoding: 'utf8', timeout: 120000 });
+      assert.equal(r.status, 0, `--wording ${flag}: ${r.stderr.slice(-500)}`);
+      assert.equal(fs.readFileSync(out, 'utf8'), rows.map((x) => JSON.stringify(x)).join('\n') + '\n', `--wording ${flag}`);
+    }
+    const bad = spawnSync(process.execPath, [path.join(__dirname, 'build-requests.cjs'), '--out', path.join(dir, 'bad.jsonl'), '--wording', 'Kev'], { encoding: 'utf8', timeout: 120000 });
+    assert.notEqual(bad.status, 0);
+    assert.match(bad.stderr, /unknown wording Kev/);
+    assert.equal(fs.existsSync(path.join(dir, 'bad.jsonl')), false, 'nothing is written for an unknown wording');
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test.after(() => { if (!skipWasm) assert.equal(ran, 10, 'a wasm-guarded test body did not run'); });

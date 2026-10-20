@@ -8,7 +8,7 @@ const davParseWasm = require('./dav-parse-wasm.cjs');
 const wasmFile = process.env.DAV_PARSE_WASM || davParseWasm.DEFAULT_WASM;
 const skipWasm = !fs.existsSync(wasmFile) && process.env.DAV_PARSE_WASM_REQUIRED !== '1' && 'dav-parse.wasm not built';
 
-const ON = { LAYA_LOAD_ADVISOR: 'on' };
+const ON = { DECISION_LOAD_ADVISOR: 'on' };
 // A decision service answering `label` at `confidence`, recording what it was asked.
 function fakeService({ label = 'oom', confidence = 0.9, delayMs = 0, fail = null } = {}) {
   const asked = [];
@@ -38,10 +38,10 @@ function fakeVerdict(calls = []) {
   };
 }
 
-test('LAYA_LOAD_ADVISOR is retired: there is no enabled switch, whatever the environment says', () => {
+test('DECISION_LOAD_ADVISOR (and its old name LAYA_LOAD_ADVISOR) is retired: there is no enabled switch, whatever the environment says', () => {
   assert.equal(require('./load-advisor.cjs').enabled, undefined);
   assert.equal(require('./load-advisor.cjs').FLAG, undefined);
-  for (const env of [{}, ON, { LAYA_LOAD_ADVISOR: 'off' }]) assert.equal(createLoadAdvisor({ env, endpoint: null }).enabled, undefined);
+  for (const env of [{}, ON, { DECISION_LOAD_ADVISOR: 'off' }, { LAYA_LOAD_ADVISOR: 'on' }, { LAYA_LOAD_ADVISOR: 'off' }]) assert.equal(createLoadAdvisor({ env, endpoint: null }).enabled, undefined);
   assert.equal(ADVICE_BUDGET_MS, 2000);
 });
 

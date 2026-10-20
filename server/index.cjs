@@ -855,7 +855,7 @@ const toolGate = require('./tool-gate.cjs').createToolGate({
   // answer `choice` at all; an unsupported service is reported once and in Settings.
   limits: () => decisionSettings.backend()?.limits || null,
   // #1639: the question, labels and choice budget follow the model behind the service (decision-models.cjs).
-  wording: () => decisionSettings.backend()?.wording || 'laya',
+  wording: () => require('./decision-wording.cjs').normalizeWording(decisionSettings.backend()?.wording) || 'standard',
   unavailable: () => decisionSettings.unavailable('choice'),
   decide: (request) => {
     const backend = decisionSettings.backend();

@@ -209,7 +209,7 @@ test('#1666 nothing chosen: the deployment model applies, the GET reply keeps it
   const f = decisionFixture();
   const got = await f.call('GET');
   assert.deepEqual(got.body, { url: 'http://kev:11435', timeoutMs: 1500, source: 'deployment' }, 'unchanged (the HTTP contract corpus)');
-  assert.deepEqual([f.settings.backend().model, f.settings.backend().wording], ['kev-0.8b', 'kev']);
+  assert.deepEqual([f.settings.backend().model, f.settings.backend().wording], ['kev-0.8b', 'tuned']);
   const row = modelAssignments({ installed: [], env: KEV_ENV, admin: true, decision: f.settings.describe() }).services.find((s) => s.id === 'decision');
   assert.deepEqual([row.models, row.deploymentModel], [['laya', 'kev-0.8b'], 'kev-0.8b']);
   assert.equal('models' in modelAssignments({ installed: [], env: KEV_ENV, admin: false }).services.find((s) => s.id === 'decision'), false);
@@ -220,12 +220,12 @@ test('#1666 choosing a model is an admin save next to the URL: requests and word
   // Laya on the deployment's own Kev URL: Laya format and wording, even though COWORK_DECISION_MODEL says Kev.
   const laya = await f.call('PUT', { url: 'http://kev:11435', timeoutMs: 1500, model: 'laya' });
   assert.deepEqual([laya.status, laya.body.model, laya.body.source], [200, 'laya', 'admin']);
-  assert.deepEqual([f.settings.backend().model, f.settings.backend().wording], ['laya', 'laya']);
+  assert.deepEqual([f.settings.backend().model, f.settings.backend().wording], ['laya', 'standard']);
   assert.deepEqual(f.audits.at(-1), ['decision.configure', 'admin-1', { url: 'http://kev:11435', timeoutMs: 1500, model: 'laya' }]);
   assert.deepEqual(describeDecision(KEV_ENV, f.settings.get()).decision, { model: 'laya', state: 'active', source: 'admin', modelSource: 'admin' });
   // Kev on another URL (before #1666 that URL always got Laya), case-insensitive.
   await f.call('PUT', { url: 'http://192.168.1.20:11435', timeoutMs: 900, model: ' KEV-0.8B ' });
-  assert.deepEqual([f.settings.backend().model, f.settings.backend().wording], ['kev-0.8b', 'kev']);
+  assert.deepEqual([f.settings.backend().model, f.settings.backend().wording], ['kev-0.8b', 'tuned']);
   assert.equal(f.settings.describe().decision.model, 'kev-0.8b');
   assert.equal(f.settings.describe().sensitivity.model, 'kev-0.8b', 'a shared sensitivity check follows the chosen model');
   // Automatic ('' or absent) goes back to the #1639 rule: another URL gets Laya, the deployment URL its model.
@@ -248,7 +248,7 @@ test('#1666 an unknown model id is refused (not silently sent as Laya), and memb
   assert.equal(f.settings.get().source, 'deployment');
   // An unknown COWORK_DECISION_MODEL still falls back to Laya wording, as before.
   const typo = decisionFixture({ COWORK_DECISION_URL: 'http://laya:8040', COWORK_DECISION_MODEL: 'kev-typo' });
-  assert.equal(typo.settings.backend().wording, 'laya');
+  assert.equal(typo.settings.backend().wording, 'standard');
 });
 
 test('#1666 reset forgets the chosen model with the URL; a saved record from before #1666 reads as automatic', async () => {

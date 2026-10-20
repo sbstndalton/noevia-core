@@ -1180,7 +1180,7 @@ test('#1029 planned: a second load timeout stops the run with a fixed message an
 
 // ── #1004: rules name a guessed failure, the decision service only on a tie ──
 const { createLoadAdvisor } = require('./load-advisor.cjs');
-const ADVISOR_ON = {}; // the advisor is always on since #1071; a retired LAYA_LOAD_ADVISOR value changes nothing
+const ADVISOR_ON = {}; // the advisor is always on since #1071; a retired DECISION_LOAD_ADVISOR (or LAYA_LOAD_ADVISOR) value changes nothing
 function decisionService({ label, confidence = 0.9, delayMs = 0 } = {}) {
   const asked = [];
   return { asked, async choice(input, { signal } = {}) {

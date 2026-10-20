@@ -3,6 +3,7 @@ const { parseServiceUrl, serviceFetch } = require('./service-endpoint.cjs');
 const { createDecisions, CAUSE_RE } = require('./decision/index.cjs');
 const { llamaLogitBackend } = require('./decision/backends.cjs');
 const { DECISION_SERVICE_REPORTED_MODEL } = require('./decision-models.cjs');
+const { STANDARD, TUNED, normalizeWording } = require('./decision-wording.cjs');
 
 // Operator configuration only. No browser-supplied endpoint, model loading or downloads.
 // A dedicated private endpoint avoids silently changing the loaded answering model.
@@ -13,15 +14,15 @@ function configuration(env = process.env) {
   return parsed.reason ? { reason } : { baseUrl: parsed.baseUrl, reason: null };
 }
 
-// #1639 soak / #1873: route labels per decision-model wording (decision-models.cjs). Laya keeps the wording it was
-// measured with (docs/research/system-one/19-routing-labels.md). With it, Kev sent short creative asks (a 4-line poem,
+// #1639 soak / #1873: route labels per decision-model wording (decision-models.cjs). The standard wording keeps the labels it was
+// measured with (docs/research/system-one/19-routing-labels.md). With them, the tuned model sent short creative asks (a 4-line poem,
 // a limerick, a short story) to Smart, because "writing more than a sentence" names them, and Smart then ran at the
-// account-default High effort. Kev's labels name simple short tasks as Fast (synthetic set, 2026-10-16: simple 12/16 ->
+// account-default High effort. The tuned labels name simple short tasks as Fast (synthetic set, 2026-10-16: simple 12/16 ->
 // 14/16 Fast, reasoning 7/8 -> 8/8 Smart).
 const ROUTE_LABELS = Object.freeze({
-  laya: Object.freeze({ fast: 'Greetings, thanks, or a one-line factual answer',
+  [STANDARD]: Object.freeze({ fast: 'Greetings, thanks, or a one-line factual answer',
     smart: 'Explaining, comparing, planning, reasoning or writing more than a sentence' }),
-  kev: Object.freeze({ fast: 'Small talk, a quick fact, or a simple short task: counting, lists, a joke, a short poem or a short story',
+  [TUNED]: Object.freeze({ fast: 'Small talk, a quick fact, or a simple short task: counting, lists, a joke, a short poem or a short story',
     smart: 'Explaining, comparing, planning, multi-step reasoning or maths, or long careful writing' }),
 });
 // A cheap pre-check before the decision call: a short single-line ask for a plainly simple task (count, list, spell,
@@ -51,7 +52,8 @@ function createSystemOneRouter({ enabled, roles, fallback, env = process.env, ba
   async function classifyWithDetails(message) {
     const active = roles();
     const routing = enabled() ? currentDecisions() : null;
-    const labels = ROUTE_LABELS[routing?.backend?.wording] || ROUTE_LABELS.laya;
+    // A backend that still says 'laya' or 'kev' gets the same labels as before (decision-wording.cjs).
+    const labels = ROUTE_LABELS[normalizeWording(routing?.backend?.wording) || STANDARD];
     const options = [{ id: 'fast', label: labels.fast }, { id: 'smart', label: labels.smart }];
     if (active?.code) options.push({ id: 'code', label: 'Anything involving programming code, regex, errors or software' });
     const offered = active?.fast && active?.smart ? options : [];
