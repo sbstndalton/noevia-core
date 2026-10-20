@@ -4,8 +4,8 @@ const skipWasm = !require('node:fs').existsSync(process.env.DAV_PARSE_WASM || re
 // test reports ok): when the module is there, every guarded body must have run.
 let ran = 0;
 // #1639 / #1739 / #1740: the tool gate's wording follows the decision model behind the service
-// (decision-models.cjs). Laya, and any unknown or unconfigured model, gets exactly the request every
-// release before #1639 sent; Kev-0.8B gets the question tuned for it, with the choice budget lowered by
+// (decision-models.cjs). The default wording, used for any unknown or unconfigured model, is exactly the request every
+// release before #1639 sent; the tuned wording is the question tuned for a small decision model, with the choice budget lowered by
 // that question's extra characters. The Rust port shapes the options (TOOL_GATE_IMPL, retired in #1071),
 // and counts the question as 79 characters (noevia-rs crates/tool-gate QUESTION.len()); the gate gives it the
 // lowered limits for the longer question (tests/server/tool-gate-differential runs both wordings against the
@@ -16,8 +16,8 @@ const tg = require('./tool-gate.cjs');
 const { SERVICE_LIMITS } = require('./decision-settings.cjs');
 
 // The main-branch request (before #1639), byte for byte: tools/decision-eval build-requests on main.
-const LAYA_QUESTION = 'Which tool, if any, must the assistant call before answering this user message?';
-const LAYA_OPTIONS = [
+const DEFAULT_QUESTION = 'Which tool, if any, must the assistant call before answering this user message?';
+const DEFAULT_OPTIONS = [
   { id: 'tavily_extract', label: 'Read the text of a web page from its URL.' },
   { id: 'tavily_search', label: 'Search the web for current facts and news.' },
   { id: 'diary_read_month', label: "Read the user's own diary entries for a mont" },
@@ -25,7 +25,7 @@ const LAYA_OPTIONS = [
   { id: 'none', label: 'No tool: answer directly' },
 ];
 const KEV_QUESTION = 'Without tools the assistant knows no current news and nothing the user wrote or saved. Which tool does it need, if any?';
-const KEV_OPTIONS = [
+const TUNED_OPTIONS = [
   { id: 'tavily_extract', label: 'Read the text of a web page from i' },
   { id: 'tavily_search', label: 'Search the web for current facts a' },
   { id: 'diary_read_month', label: "Read the user's own diary entries " },
@@ -40,15 +40,15 @@ const TOOLS = [
   tool('nc_webdav_search_files', "Find the user's own stored files and documents."),
 ];
 // What the former JS shaping (shapeOptions, frozen in tests/fixtures/tool-gate-js.v1.json) gave for a frame hint:
-// Laya with the question's real length as the budget, Kev with 79 + hint in a choice budget lowered by 40.
-const LAYA_HINT_OPTIONS = [
+// the default wording with the question's real length as the budget, the tuned wording with 79 + hint in a choice budget lowered by 40.
+const DEFAULT_HINT_OPTIONS = [
   { id: 'tavily_search', label: 'Search the web for current facts a' },
   { id: 'tavily_extract', label: 'Read the text of a web page from i' },
   { id: 'diary_read_month', label: "Read the user's own diary entries " },
   { id: 'nc_webdav_search_files', label: "Find the user's own stored files a" },
   { id: 'none', label: 'No tool: answer directly' },
 ];
-const KEV_HINT_OPTIONS = [
+const TUNED_HINT_OPTIONS = [
   { id: 'tavily_search', label: 'Search the web for curre' },
   { id: 'tavily_extract', label: 'Read the text of a web p' },
   { id: 'diary_read_month', label: "Read the user's own diar" },
@@ -66,59 +66,59 @@ async function sent(wording, bias) {
   return asked[0];
 }
 
-test('Laya gets the main-branch request byte for byte, by default and by name (#1739)', { skip: skipWasm }, async () => {
+test('the default wording gets the main-branch request byte for byte, by default and by name (#1739)', { skip: skipWasm }, async () => {
   ran++;
   for (const wording of [undefined, 'laya', () => 'laya']) {
     const req = await sent(wording);
     assert.deepEqual({ purpose: req.purpose, question: req.question, options: req.options },
-      { purpose: 'tool.gate', question: LAYA_QUESTION, options: LAYA_OPTIONS });
-    assert.equal(JSON.stringify(req.options), JSON.stringify(LAYA_OPTIONS));
+      { purpose: 'tool.gate', question: DEFAULT_QUESTION, options: DEFAULT_OPTIONS });
+    assert.equal(JSON.stringify(req.options), JSON.stringify(DEFAULT_OPTIONS));
   }
-  assert.equal(tg.QUESTION, LAYA_QUESTION);
-  assert.equal(tg.questionFor('laya'), LAYA_QUESTION);
+  assert.equal(tg.QUESTION, DEFAULT_QUESTION);
+  assert.equal(tg.questionFor('laya'), DEFAULT_QUESTION);
 });
 
-test('an unknown, empty or throwing wording falls back to the Laya request', { skip: skipWasm }, async () => {
+test('an unknown, empty or throwing wording falls back to the default request', { skip: skipWasm }, async () => {
   ran++;
-  for (const wording of ['kev-0.8b', 'KEV', '', null, () => 'other', () => { throw Error('settings gone'); }]) {
+  for (const wording of ['tuned-0.8b', 'KEV', '', null, () => 'other', () => { throw Error('settings gone'); }]) {
     const req = await sent(wording);
-    assert.equal(req.question, LAYA_QUESTION, String(wording));
-    assert.deepEqual(req.options, LAYA_OPTIONS, String(wording));
+    assert.equal(req.question, DEFAULT_QUESTION, String(wording));
+    assert.deepEqual(req.options, DEFAULT_OPTIONS, String(wording));
   }
 });
 
-test('Kev gets the tuned question and the lowered budget: labels cut to 34 for this tool set', { skip: skipWasm }, async () => {
+test('the tuned wording gets the tuned question and the lowered budget: labels cut to 34 for this tool set', { skip: skipWasm }, async () => {
   ran++;
   for (const wording of ['kev', () => 'kev']) {
     const req = await sent(wording);
     assert.equal(req.question, KEV_QUESTION);
-    assert.deepEqual(req.options, KEV_OPTIONS);
+    assert.deepEqual(req.options, TUNED_OPTIONS);
     assert.ok(req.question.length + req.options.reduce((n, o) => n + o.id.length + o.label.length + 2, 0) <= SERVICE_LIMITS.maxChoiceChars);
   }
   assert.equal(tg.KEV_QUESTION, KEV_QUESTION);
-  assert.doesNotMatch(KEV_QUESTION, /\bmust\b/, '"must" made Kev-0.8B answer none (#1639)');
+  assert.doesNotMatch(KEV_QUESTION, /\bmust\b/, '"must" made the tuned model answer none (#1639)');
 });
 
 test('a frame hint is appended to either question and counted in the budget the same way', { skip: skipWasm }, async () => {
   ran++;
   const bias = { prefer: ['search'], hint: 'The user framed this chat as a lookup.' };
-  const laya = await sent('laya', bias);
-  const kev = await sent('kev', bias);
-  assert.equal(laya.question, `${LAYA_QUESTION} ${bias.hint}`);
-  assert.equal(kev.question, `${KEV_QUESTION} ${bias.hint}`);
-  // Laya: shaped exactly as main shaped it, with the question's real length as the budget.
-  assert.deepEqual(laya.options, LAYA_HINT_OPTIONS);
-  // Kev: 79 + hint, in a choice budget lowered by 40 (what the port counts given the same limits).
-  assert.deepEqual(kev.options, KEV_HINT_OPTIONS);
+  const dflt = await sent('laya', bias);
+  const tuned = await sent('kev', bias);
+  assert.equal(dflt.question, `${DEFAULT_QUESTION} ${bias.hint}`);
+  assert.equal(tuned.question, `${KEV_QUESTION} ${bias.hint}`);
+  // Default wording: shaped exactly as main shaped it, with the question's real length as the budget.
+  assert.deepEqual(dflt.options, DEFAULT_HINT_OPTIONS);
+  // Tuned wording: 79 + hint, in a choice budget lowered by 40 (what the port counts given the same limits).
+  assert.deepEqual(tuned.options, TUNED_HINT_OPTIONS);
 });
 
-test('budgetLimits: the 40-character cut only for the Kev question, whatever maxOptions is (#1740 D3)', () => {
+test('budgetLimits: the 40-character cut only for the tuned question, whatever maxOptions is (#1740 D3)', () => {
   assert.equal(tg.BUDGET_QUESTION_CHARS, 79);
-  assert.equal(LAYA_QUESTION.length, 79, 'the question the port budgets');
+  assert.equal(DEFAULT_QUESTION.length, 79, 'the question the port budgets');
   assert.equal(KEV_QUESTION.length - 79, 40);
   assert.deepEqual(tg.budgetLimits(SERVICE_LIMITS), { ...SERVICE_LIMITS, maxChoiceChars: 320 });
   assert.deepEqual(tg.budgetLimits(SERVICE_LIMITS, KEV_QUESTION), { ...SERVICE_LIMITS, maxChoiceChars: 320 });
-  assert.equal(tg.budgetLimits(SERVICE_LIMITS, LAYA_QUESTION), SERVICE_LIMITS, 'Laya: the limits object itself');
+  assert.equal(tg.budgetLimits(SERVICE_LIMITS, DEFAULT_QUESTION), SERVICE_LIMITS, 'default wording: the limits object itself');
   assert.equal(tg.budgetLimits(null), null);
   const noBudget = { maxOptions: 8, maxLabelChars: 120 };
   assert.equal(tg.budgetLimits(noBudget), noBudget, 'no finite choice budget: unchanged');
