@@ -12,11 +12,12 @@
 // stay the real ones: capturing the tool-gate requests needs dav-parse.wasm (server/wasm or
 // DAV_PARSE_WASM), and says so when it is missing.
 //
-// The wording is per decision model (server/decision-models.cjs): --wording laya (default; what
-// production sends to Laya or an unknown model) or kev (Kev-0.8B's). The bodies are always in our
+// The wording is per decision model (server/decision-models.cjs): --wording standard (default; what
+// production sends to Laya or an unknown model) or compact (Kev-0.8B's). The old values laya and kev are still
+// accepted and mean standard and compact. The bodies are always in our
 // contract; run.cjs --target ollaya converts them for a TypeSafe server, as production does.
 //
-// Usage: node build-requests.cjs --out requests.jsonl [--wording laya|kev] [--cases dir] [--smoke 20 --smoke-out smoke.jsonl]
+// Usage: node build-requests.cjs --out requests.jsonl [--wording standard|compact] [--cases dir] [--smoke 20 --smoke-out smoke.jsonl]
 
 const fs = require('node:fs');
 const path = require('node:path');
@@ -75,8 +76,10 @@ function createCapture() {
 }
 
 /** The production callers wired to one capturing decision backend. */
-function createCallers({ wording = 'laya' } = {}) {
-  if (!['laya', 'kev'].includes(wording)) throw Error(`unknown wording ${wording}`);
+function createCallers({ wording: requested = 'standard' } = {}) {
+  const { normalizeWording } = require(path.join(SERVER, 'decision-wording.cjs'));
+  const wording = normalizeWording(requested);
+  if (!wording) throw Error(`unknown wording ${requested}`);
   permissiveDecisionChecks();
   const capture = createCapture();
   const { createDecisionSettings } = require(path.join(SERVER, 'decision-settings.cjs'));
@@ -91,7 +94,7 @@ function createCallers({ wording = 'laya' } = {}) {
   const routers = {};
   // #1901: the route labels follow the backend's wording; precheck:false so every case reaches the model (the
   // simple-ask rule is core's own and is tested in system-one-router.test.cjs, not measured here).
-  const routeBackend = wording === 'kev' ? { ...backend, wording: 'kev' } : backend;
+  const routeBackend = wording === 'compact' ? { ...backend, wording } : backend;
   const router = (code) => (routers[code] ||= require(path.join(SERVER, 'system-one-router.cjs')).createSystemOneRouter({
     enabled: () => true, env: {}, log: () => {}, fallback: async () => 'smart', precheck: false,
     roles: () => ({ fast: 'fast-model', smart: 'smart-model', ...(code ? { code: 'code-model' } : {}) }),
@@ -109,9 +112,9 @@ function createCallers({ wording = 'laya' } = {}) {
     enabled: () => true, decide: (r) => framingLayer.decide(r), deadlineMs: () => 2000, log: () => {},
   });
   const supervision = require(path.join(SERVER, 'step-supervision.cjs')).createStepSupervision({
-    enabled: () => true, provider: { decide: (...a) => (wording === 'laya' ? backend.supervise(...a) : supervising.decide(...a)) }, deadlineMs: 1500, getDeadlineMs: () => 2000, log: () => {},
+    enabled: () => true, provider: { decide: (...a) => (wording === 'standard' ? backend.supervise(...a) : supervising.decide(...a)) }, deadlineMs: 1500, getDeadlineMs: () => 2000, log: () => {},
   });
-  // The Kev wording on our contract (production sends it through the TypeSafe codec instead).
+  // The compact wording on our contract (production sends it through the TypeSafe codec instead).
   const supervising = createDecisionEndpoint({ env: { COWORK_DECISION_URL: CAPTURE_URL }, fetchImpl: capture.fetchImpl, wording });
   const endpoint = createDecisionEndpoint({ env: { COWORK_DECISION_URL: CAPTURE_URL }, fetchImpl: capture.fetchImpl });
   const advisor = require(path.join(SERVER, 'load-advisor.cjs')).createLoadAdvisor({
@@ -182,7 +185,7 @@ function loadCases(dir = CASES) {
 const rotate = (list, k) => list.slice(k).concat(list.slice(0, k));
 
 /** Builds every request record: { id, purpose, variant, lang, label, body }, plus what was skipped and why. */
-async function buildRequests(dir = CASES, { wording = 'laya' } = {}) {
+async function buildRequests(dir = CASES, { wording = 'standard' } = {}) {
   const { rows, gate } = loadCases(dir);
   const callers = createCallers({ wording });
   const tools = gate.tools.map(({ write, ...t }) => t);
@@ -245,8 +248,8 @@ const toJsonl = (rows) => rows.map((r) => JSON.stringify(r)).join('\n') + '\n';
 async function main(argv) {
   const args = {};
   for (let i = 0; i < argv.length; i += 2) args[argv[i].replace(/^--/, '')] = argv[i + 1];
-  if (!args.out) throw Error('usage: node build-requests.cjs --out requests.jsonl [--wording laya|kev] [--cases dir] [--smoke N --smoke-out smoke.jsonl]');
-  const { records, skipped } = await buildRequests(args.cases || CASES, { wording: args.wording || 'laya' });
+  if (!args.out) throw Error('usage: node build-requests.cjs --out requests.jsonl [--wording standard|compact] [--cases dir] [--smoke N --smoke-out smoke.jsonl]');
+  const { records, skipped } = await buildRequests(args.cases || CASES, { wording: args.wording || 'standard' });
   fs.writeFileSync(args.out, toJsonl(records));
   if (args.smoke) fs.writeFileSync(args['smoke-out'], toJsonl(smokeSubset(records, Number(args.smoke))));
   const counts = {};

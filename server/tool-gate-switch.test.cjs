@@ -152,11 +152,11 @@ test('a search suitability fault warns about the query, without claiming a tool 
 
 test('Stage 2: the options are the port\'s, sent as the service\'s options; a fault or no option fitting asks nobody', async () => {
   const port = fakePort({ rule: NO_RULE, options: OPTIONS, answer: () => ({ reason: 'none' }) });
-  const { g, logs, decided } = gate({ port, limits: { maxOptions: 8, maxLabelChars: 120, maxChoiceChars: 360 }, wording: 'kev' });
+  const { g, logs, decided } = gate({ port, limits: { maxOptions: 8, maxLabelChars: 120, maxChoiceChars: 360 }, wording: 'compact' });
   await g.evaluate('hello there', TOOLS, { prefer: ['search'], hint: 'The user framed this chat as a lookup.' });
   assert.equal(decided.length, 1);
   assert.deepEqual(decided[0].options, OPTIONS().options);
-  assert.equal(decided[0].question, `${tg.KEV_QUESTION} The user framed this chat as a lookup.`);
+  assert.equal(decided[0].question, `${tg.COMPACT_QUESTION} The user framed this chat as a lookup.`);
   assert.deepEqual(logs.at(-1).options, 2);
   assert.deepEqual(logs.at(-1).trimmed, 1);
   const [, [tools, prefer, hint, limits]] = port.calls.find(([n]) => n === 'options');

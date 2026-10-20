@@ -2371,7 +2371,7 @@ const IMPL_FLAGS = ['STORAGE_PATH_IMPL', 'SECRET_ENVELOPE_IMPL'];
 /** Switches whose JS path was deleted once Rust had run in production (#1071). The old value that
  *  selected Rust ('wasm', or 'on' for the advisor) is accepted silently; anything else is ignored
  *  with one warning, because Rust is always used. */
-const RETIRED_FLAGS = { LLAMACPP_PRESETS_IMPL: 'wasm', STREAM_GUARD_IMPL: 'wasm', ROLE_CONTEXT_IMPL: 'wasm', CHAT_TEMPLATE_CAPS_IMPL: 'wasm', AUTOTUNE_PLAN_IMPL: 'wasm', PRESET_RELOAD_IMPL: 'wasm', LAYA_LOAD_ADVISOR: 'on', DAV_PARSE_IMPL: 'wasm', S3_PARSE_IMPL: 'wasm', MCP_FRAME_IMPL: 'wasm', UPLOAD_SNIFF_IMPL: 'wasm', S3_SIGN_IMPL: 'wasm', PROMPT_FRAMING_IMPL: 'wasm', SSRF_IMPL: 'wasm',
+const RETIRED_FLAGS = { LLAMACPP_PRESETS_IMPL: 'wasm', STREAM_GUARD_IMPL: 'wasm', ROLE_CONTEXT_IMPL: 'wasm', CHAT_TEMPLATE_CAPS_IMPL: 'wasm', AUTOTUNE_PLAN_IMPL: 'wasm', PRESET_RELOAD_IMPL: 'wasm', DECISION_LOAD_ADVISOR: 'on', DAV_PARSE_IMPL: 'wasm', S3_PARSE_IMPL: 'wasm', MCP_FRAME_IMPL: 'wasm', UPLOAD_SNIFF_IMPL: 'wasm', S3_SIGN_IMPL: 'wasm', PROMPT_FRAMING_IMPL: 'wasm', SSRF_IMPL: 'wasm',
   POLICY_LEAVES_IMPL: 'wasm', CODE_REVIEW_VERDICT_IMPL: 'wasm', TOOL_EXCHANGE_IMPL: 'wasm', DECISION_IMPL: 'wasm', COMPLETENESS_REPORT_IMPL: 'wasm', TASK_LIFECYCLE_IMPL: 'wasm', MCP_SERVERS_IMPL: 'wasm', CODE_NET_GUARD_IMPL: 'wasm', LLAMACPP_AUTOCONFIG_IMPL: 'wasm',
   GGUF_META_IMPL: 'wasm',
   PROJECT_FILE_NAMES_IMPL: 'wasm',
@@ -2381,15 +2381,46 @@ const RETIRED_FLAGS = { LLAMACPP_PRESETS_IMPL: 'wasm', STREAM_GUARD_IMPL: 'wasm'
   TOOL_GATE_IMPL: 'wasm',
   TOOLBOXES_PERMITTED_IMPL: 'wasm' };
 
+/** #2093: switches renamed for the role of the service they involve. The load advisor asks the decision
+ *  service (server/load-advisor.cjs), so LAYA_LOAD_ADVISOR is now DECISION_LOAD_ADVISOR. The old name is a
+ *  deprecated alias: read only when the new name is unset or empty, so the new name wins when both are set,
+ *  and noted once per process. Key: the old name; value: the name that replaces it. */
+const DEPRECATED_FLAG_ALIASES = { LAYA_LOAD_ADVISOR: 'DECISION_LOAD_ADVISOR' };
+const notedAliases = new Set();
+
+/** The variable that decides a retired switch in `env` and its value, trimmed and lower-cased: the switch's
+ *  own name first, then any deprecated alias of it (`name` is the alias then, so a warning names what was
+ *  actually set). The first time an alias is set, one line says it is deprecated. Never throws. */
+function retiredFlagValue(env, flag, log) {
+  const read = (name) => String(env[name] ?? '').trim().toLowerCase();
+  const value = read(flag);
+  let decided = { name: flag, value };
+  for (const [old, current] of Object.entries(DEPRECATED_FLAG_ALIASES)) {
+    if (current !== flag) continue;
+    const legacy = read(old);
+    if (legacy === '') continue;
+    if (!notedAliases.has(old)) {
+      notedAliases.add(old);
+      try { log.warn(`${old} is a deprecated alias of ${flag}; set ${flag} instead${value === '' ? '' : ` (${flag} is set, so ${old} is ignored)`}`); } catch { /* a logger fault never matters */ }
+    }
+    if (value === '') decided = { name: old, value: legacy };
+  }
+  return decided;
+}
+
+/** Test hook: forget which deprecated aliases have been noted, so the next use notes them again. */
+function resetDeprecatedFlagNotes() { notedAliases.clear(); }
+
 /** Log one warning per retired switch that `env` still sets to something other than its old
- *  Rust-selecting value (for example =js). Returns the names warned about. Never throws. */
+ *  Rust-selecting value (for example =js). Returns the names warned about: the variable that was set, so
+ *  the deprecated LAYA_LOAD_ADVISOR when only that is set. Never throws. */
 function warnRetiredFlags(env = process.env, log = console) {
   const warned = [];
   for (const [flag, rust] of Object.entries(RETIRED_FLAGS)) {
-    const value = String(env[flag] ?? '').trim().toLowerCase();
+    const { name, value } = retiredFlagValue(env, flag, log);
     if (value === '' || value === rust) continue;
-    warned.push(flag);
-    log.warn(`${flag} is retired; Rust is always used`);
+    warned.push(name);
+    log.warn(`${name} is retired; Rust is always used`);
   }
   return warned;
 }
@@ -2434,4 +2465,4 @@ function verifyAtStartup(env = process.env, { hostname } = {}) {
 function reset() { cached = null; }
 
 module.exports = { llamacppPresetsValues, llamacppPresetsCanonical, llamacppPresetsBatch, llamacppPresetsModel, MAX_LLAMACPP_PRESETS_BYTES, toolGateRule, toolGateOptions, toolGateAnswer, toolGateQueries, toolGateMonths, toolGatePublic, MAX_TOOL_GATE_BYTES,
-  toolboxesProjectIds, toolboxesSelectedIds, toolboxesPermitted, MAX_TOOLBOXES_BYTES, browserPolicyClassify, browserPolicyNavigation, browserPolicySubstitute, browserPolicyFold, MAX_BROWSER_POLICY_BYTES, providerEgressExternal, providerEgressRefusal, providerEgressStrip, providerEgressToolRefusal, providerEgressCanonical, providerEgressFolder, MAX_PROVIDER_EGRESS_BYTES, codeActionsClassify, codeActionsDecide, codeActionsPick, MAX_CODE_ACTIONS_BYTES, projectFileNames, MAX_PROJECT_FILE_NAMES_BYTES, llamacppAutoconfig, autoconfigReply, MAX_AUTOCONFIG_BYTES, taskLifecycleDiagnostic, taskLifecycleDiagnosticReply, taskLifecycleCanTransition, taskLifecycleTransition, taskLifecycleStageMove, taskLifecycleFold, taskLifecycleDerive, taskLifecycleReply, MAX_TASK_LIFECYCLE_BYTES, completenessReport, completenessReply, completenessPolicy, MAX_COMPLETENESS_BYTES, roleContextProject, roleContextDossier, roleContextReply, MAX_ROLE_CONTEXT_BYTES, codeNetSpec, codeNetResolved, codeNetRefuses, MAX_CODE_NET_BYTES, MAX_CODE_NET_ENTRIES, mcpServersParse, mcpToolboxes, mcpToolboxOffered, MAX_MCP_SERVERS_BYTES, decisionRequestTag, decisionResultTag, decisionInvalidRequest, decisionInvalidResult, decisionCauseOf, decisionErrorFacts, decisionRequest, MAX_DECISION_MESSAGE_UNITS, MAX_DECISION_BYTES, DECISION_ENTRIES, reviewTag, reviewVerdictRead, reviewEventBound, reviewVerdictReply, MAX_REVIEW_BYTES, toolExchangeCheck, toolExchangeError, MAX_EXCHANGE_ARGS_UNITS, MAX_EXCHANGE_NAME_UNITS, ggufSummary, ggufSummaryReply, MAX_GGUF_WINDOW_BYTES, MAX_GGUF_SEGMENTS, authTokens, toolPolicyMode, toolPolicySet, MAX_POLICY_UNITS, MAX_POLICY_TOOLS, streamGuardSchema, streamGuardOptions, streamGuardNew, streamGuardFeed, streamGuardEnd, streamGuardCheck, streamGuardCheckReply, streamGuardCorrection, streamGuardReply, plainJson, MAX_GUARD_BYTES, MAX_GUARD_DEPTH, MAX_GUARD_SCHEMA_BYTES, MAX_GUARD_STATE_BYTES, MAX_GUARD_INPUT_BYTES, MAX_CORRECTION_UNITS, s3Sign, s3Region, MAX_S3_FIELD_BYTES, MAX_S3_QUERY_PAIRS, MAX_S3_PAYLOAD_BYTES, wasmFlags, RETIRED_FLAGS, warnRetiredFlags, verifyAtStartup, framingRuntimeMatches, IMPL_FLAGS, ssrfUrl, ssrfAddressesPublic, ssrfUrlReply, ssrfAddressesReply, MAX_SSRF_BYTES, MAX_SSRF_ADDRESSES, frameUntrusted, escapeClosing, provenanceNew, provenanceIngest, provenanceAdd, provenanceSource, provenanceCheck, provenanceProbe, packetParse, packetValidate, packetRender, FRAME_TEXT_UNITS, FRAME_LABEL_UNITS, MAX_PROVENANCE_BYTES, MAX_PACKET_BYTES, listRecords, s3ListPage, storagePath, uploadValidate, uploadClassify, uploadDecode, secretOpen, secretSeal, mcpRpcBody, mcpSchemaRefs, templateCaps, providerErrorKind, servingVerdict, autotunePlan, autotunePlanText, MAX_PLAN_BYTES, presetReload, MAX_RELOAD_BYTES, loadVerdict, loadVerdictText, MAX_VERDICT_BYTES, tuneContention, tuneContentionText, MAX_CONTENTION_BYTES, longProfilePairs, longProfileSection, longProfilePick, longProfileText, MAX_LONG_PROFILE_BYTES, MAX_TEMPLATE_BYTES, MCP_BODY_UNITS, MCP_SCHEMA_UNITS, MAX_SECRET_PLAIN_BYTES, MAX_SECRET_UNITS, MAX_SECRET_USER_BYTES, load, readLock, reset, memoryBytes, DavParseError, DEFAULT_WASM, MAX_INPUT_BYTES, MAX_DECODE_BYTES, SNIFF_BYTES, RESET_AFTER_BYTES };
+  toolboxesProjectIds, toolboxesSelectedIds, toolboxesPermitted, MAX_TOOLBOXES_BYTES, browserPolicyClassify, browserPolicyNavigation, browserPolicySubstitute, browserPolicyFold, MAX_BROWSER_POLICY_BYTES, providerEgressExternal, providerEgressRefusal, providerEgressStrip, providerEgressToolRefusal, providerEgressCanonical, providerEgressFolder, MAX_PROVIDER_EGRESS_BYTES, codeActionsClassify, codeActionsDecide, codeActionsPick, MAX_CODE_ACTIONS_BYTES, projectFileNames, MAX_PROJECT_FILE_NAMES_BYTES, llamacppAutoconfig, autoconfigReply, MAX_AUTOCONFIG_BYTES, taskLifecycleDiagnostic, taskLifecycleDiagnosticReply, taskLifecycleCanTransition, taskLifecycleTransition, taskLifecycleStageMove, taskLifecycleFold, taskLifecycleDerive, taskLifecycleReply, MAX_TASK_LIFECYCLE_BYTES, completenessReport, completenessReply, completenessPolicy, MAX_COMPLETENESS_BYTES, roleContextProject, roleContextDossier, roleContextReply, MAX_ROLE_CONTEXT_BYTES, codeNetSpec, codeNetResolved, codeNetRefuses, MAX_CODE_NET_BYTES, MAX_CODE_NET_ENTRIES, mcpServersParse, mcpToolboxes, mcpToolboxOffered, MAX_MCP_SERVERS_BYTES, decisionRequestTag, decisionResultTag, decisionInvalidRequest, decisionInvalidResult, decisionCauseOf, decisionErrorFacts, decisionRequest, MAX_DECISION_MESSAGE_UNITS, MAX_DECISION_BYTES, DECISION_ENTRIES, reviewTag, reviewVerdictRead, reviewEventBound, reviewVerdictReply, MAX_REVIEW_BYTES, toolExchangeCheck, toolExchangeError, MAX_EXCHANGE_ARGS_UNITS, MAX_EXCHANGE_NAME_UNITS, ggufSummary, ggufSummaryReply, MAX_GGUF_WINDOW_BYTES, MAX_GGUF_SEGMENTS, authTokens, toolPolicyMode, toolPolicySet, MAX_POLICY_UNITS, MAX_POLICY_TOOLS, streamGuardSchema, streamGuardOptions, streamGuardNew, streamGuardFeed, streamGuardEnd, streamGuardCheck, streamGuardCheckReply, streamGuardCorrection, streamGuardReply, plainJson, MAX_GUARD_BYTES, MAX_GUARD_DEPTH, MAX_GUARD_SCHEMA_BYTES, MAX_GUARD_STATE_BYTES, MAX_GUARD_INPUT_BYTES, MAX_CORRECTION_UNITS, s3Sign, s3Region, MAX_S3_FIELD_BYTES, MAX_S3_QUERY_PAIRS, MAX_S3_PAYLOAD_BYTES, wasmFlags, RETIRED_FLAGS, warnRetiredFlags, DEPRECATED_FLAG_ALIASES, resetDeprecatedFlagNotes, verifyAtStartup, framingRuntimeMatches, IMPL_FLAGS, ssrfUrl, ssrfAddressesPublic, ssrfUrlReply, ssrfAddressesReply, MAX_SSRF_BYTES, MAX_SSRF_ADDRESSES, frameUntrusted, escapeClosing, provenanceNew, provenanceIngest, provenanceAdd, provenanceSource, provenanceCheck, provenanceProbe, packetParse, packetValidate, packetRender, FRAME_TEXT_UNITS, FRAME_LABEL_UNITS, MAX_PROVENANCE_BYTES, MAX_PACKET_BYTES, listRecords, s3ListPage, storagePath, uploadValidate, uploadClassify, uploadDecode, secretOpen, secretSeal, mcpRpcBody, mcpSchemaRefs, templateCaps, providerErrorKind, servingVerdict, autotunePlan, autotunePlanText, MAX_PLAN_BYTES, presetReload, MAX_RELOAD_BYTES, loadVerdict, loadVerdictText, MAX_VERDICT_BYTES, tuneContention, tuneContentionText, MAX_CONTENTION_BYTES, longProfilePairs, longProfileSection, longProfilePick, longProfileText, MAX_LONG_PROFILE_BYTES, MAX_TEMPLATE_BYTES, MCP_BODY_UNITS, MCP_SCHEMA_UNITS, MAX_SECRET_PLAIN_BYTES, MAX_SECRET_UNITS, MAX_SECRET_USER_BYTES, load, readLock, reset, memoryBytes, DavParseError, DEFAULT_WASM, MAX_INPUT_BYTES, MAX_DECODE_BYTES, SNIFF_BYTES, RESET_AFTER_BYTES };

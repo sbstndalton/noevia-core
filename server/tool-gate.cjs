@@ -25,6 +25,7 @@
 // options. A fault is logged once, and again at the 10th, 100th, 1000th and so on, without the message.
 
 const { causeOf, CAUSE_RE } = require('./decision/index.cjs');
+const { STANDARD, COMPACT, normalizeWording } = require('./decision-wording.cjs');
 
 // Rule kind -> candidate tools in preference order. The first one offered on this request wins (the crate applies it).
 const DEFAULT_BOXES = Object.freeze({
@@ -55,7 +56,7 @@ const propsOf = (tool) => paramsOf(tool).properties || {};
  *   log: text-free entries only (tool names, source, mode, confidence, timings, never the message).
  */
 function createToolGate({ enabled, decide, boxes = DEFAULT_BOXES, isWriteTool, log = () => {}, now = Date.now,
-  minConfidence = DEFAULT_MIN_CONFIDENCE, deadlineMs = DEFAULT_DEADLINE_MS, limits = null, unavailable = () => null, wording = 'laya',
+  minConfidence = DEFAULT_MIN_CONFIDENCE, deadlineMs = DEFAULT_DEADLINE_MS, limits = null, unavailable = () => null, wording = STANDARD,
   warn = (line) => console.warn(line), wasmLoader = defaultLoader }) {
   const value = (v) => (typeof v === 'function' ? v() : v);
   const safeLog = (entry) => { try { log(entry); } catch { /* logging never breaks a chat */ } };
@@ -102,10 +103,10 @@ function createToolGate({ enabled, decide, boxes = DEFAULT_BOXES, isWriteTool, l
   }
 
   async function readout(message, offered, bias) {
-    // #1639: the wording of the model behind the service; only the tuned question is longer than the port
+    // #1639: the wording of the model behind the service; only the compact question is longer than the port
     // counts, so only it lowers the choice budget (default wording: the limits as given, as before #1639).
-    let words = 'laya';
-    try { words = value(wording) === 'kev' ? 'kev' : 'laya'; } catch { /* unknown: the default wording */ }
+    let words = STANDARD;
+    try { words = normalizeWording(value(wording)) === COMPACT ? COMPACT : STANDARD; } catch { /* unknown: the default wording */ }
     const lim = budgetLimits(value(limits), questionFor(words));
     if (![...offered.values()].some((t) => readOnly(toolName(t)))) return { reason: 'no-read-tools' };
     const hint = typeof bias?.hint === 'string' && bias.hint ? bias.hint : '';
@@ -197,18 +198,19 @@ function createToolGate({ enabled, decide, boxes = DEFAULT_BOXES, isWriteTool, l
   return { evaluate, record };
 }
 
-// The Stage 2 question, per decision model (#1639, decision-models.cjs `wording`). 'laya' is the one
+// The Stage 2 question, per decision model (#1639, decision-models.cjs `wording`). 'standard' is the one
 // every release before #1639 sent, kept byte-identical for the default wording and any unknown model (#1739).
-// 'kev' was tuned for a small decision model on a seeded tuning split of tools/decision-eval's synthetic cases (48.5%
+// 'compact' was tuned for a small decision model on a seeded tuning split of tools/decision-eval's synthetic cases (48.5%
 // -> 69.1% there; held-out results on #1639): the default question's "must" made that model answer "none" to
 // nearly every message, and saying that the assistant on its own has no current news and none of the
 // user's data moved web search from 2/16 to 13/16. With the default wording it cost English tool-gate accuracy.
 const QUESTION = 'Which tool, if any, must the assistant call before answering this user message?';
-const KEV_QUESTION = 'Without tools the assistant knows no current news and nothing the user wrote or saved. Which tool does it need, if any?';
-const questionFor = (wording) => (wording === 'kev' ? KEV_QUESTION : QUESTION);
+const COMPACT_QUESTION = 'Without tools the assistant knows no current news and nothing the user wrote or saved. Which tool does it need, if any?';
+// The deprecated values 'laya' and 'kev' (decision-wording.cjs) still select the standard and the compact question.
+const questionFor = (wording) => (normalizeWording(wording) === COMPACT ? COMPACT_QUESTION : QUESTION);
 // The Rust port (noevia-rs crates/tool-gate) shapes the options and counts the question as 79 characters plus any
 // hint, the length of QUESTION, and tests/fixtures/tool-gate.v1.json must stay byte-identical with the port's copy.
-// So with the longer tuned question the gate itself (budgetLimits) lowers the choice budget it gives the port by the
+// So with the longer compact question the gate itself (budgetLimits) lowers the choice budget it gives the port by the
 // extra characters, and question plus options stay within maxChoiceChars (the default wording's option-head budget). Change this
 // number only together with the port.
 const BUDGET_QUESTION_CHARS = 79;
@@ -217,7 +219,7 @@ const BUDGET_QUESTION_CHARS = 79;
  *  counts, so question plus options fit maxChoiceChars and the port, given the same limits, shapes the
  *  same options. A question no longer than that (the default one), no limits, or no finite choice budget: the
  *  limits object itself, unchanged. The cut does not depend on maxOptions (#1740). */
-function budgetLimits(limits, question = KEV_QUESTION) {
+function budgetLimits(limits, question = COMPACT_QUESTION) {
   const excess = String(question).length - BUDGET_QUESTION_CHARS;
   if (!limits || excess <= 0 || !Number.isFinite(Number(limits.maxChoiceChars))) return limits;
   return { ...limits, maxChoiceChars: Number(limits.maxChoiceChars) - excess };
@@ -292,4 +294,4 @@ function limitsProjection(limits) {
     maxChoiceChars: numberProjection(Number(limits.maxChoiceChars) || Infinity) };
 }
 module.exports = { createToolGate, BUDGET_QUESTION_CHARS, budgetLimits, prefetchableSearch, DEFAULT_BOXES, DEFAULT_MIN_CONFIDENCE,
-  toolProjection, offeredProjection, boxesProjection, limitsProjection, numberProjection, QUESTION, KEV_QUESTION, questionFor };
+  toolProjection, offeredProjection, boxesProjection, limitsProjection, numberProjection, QUESTION, COMPACT_QUESTION, questionFor };

@@ -1180,7 +1180,7 @@ test('#1029 planned: a second load timeout stops the run with a fixed message an
 
 // ── #1004: rules name a guessed failure, the decision service only on a tie ──
 const { createLoadAdvisor } = require('./load-advisor.cjs');
-const ADVISOR_ON = {}; // the advisor is always on since #1071; a retired LAYA_LOAD_ADVISOR value changes nothing
+const ADVISOR_ON = {}; // the advisor is always on since #1071; a retired DECISION_LOAD_ADVISOR (or LAYA_LOAD_ADVISOR) value changes nothing
 function decisionService({ label, confidence = 0.9, delayMs = 0 } = {}) {
   const asked = [];
   return { asked, async choice(input, { signal } = {}) {
@@ -1627,7 +1627,7 @@ const skipContention = !contentionImpl && 'no tune_contention implementation her
 const foreignOptions = (extra = {}) => ({ contention: contentionImpl?.decide, foreignQuietMs: 5, foreignPollMs: 1, foreignWaitMs: 60000, ...extra });
 const logText = j => (j.log || []).map(l => l.text).join('\n');
 
-test('#1062 a client that evicts the tuned model mid-tune is waited for, then tuning resumes and passes', { skip: skipContention }, async t => {
+test('#1062 a client that evicts the compact model mid-tune is waited for, then tuning resumes and passes', { skip: skipContention }, async t => {
   let busy = 0, injected = false, metricsReads = 0;
   const unloads = [];
   const f = fixture(t, { models: ['synthetic', 'outside'], autotuneExtra: foreignOptions(),
@@ -1796,7 +1796,7 @@ test('#1069 a request failed by another client evicting the model mid-request is
   assert.match(logText(disturbed.j), /Another client is using outside/);
 });
 
-// #1062 re-review: restore with the tuned model already evicted, and the deferred re-read.
+// #1062 re-review: restore with the compact model already evicted, and the deferred re-read.
 async function gaveUpRestored(t, extra = {}) {
   let injected = false;
   const reloads = [];
@@ -1809,7 +1809,7 @@ async function gaveUpRestored(t, extra = {}) {
   return { f, j, reloads };
 }
 
-test('#1062 a tuned model already evicted at restore (unload refused with 404) still restores, and the tune resumes', { skip: skipContention }, async t => {
+test('#1062 a compact model already evicted at restore (unload refused with 404) still restores, and the tune resumes', { skip: skipContention }, async t => {
   const { f, j } = await gaveUpRestored(t);
   assert.equal(j.status, 'interrupted', j.error);
   assert.ok(j.models[0].phases.every(p => p.restored !== false), JSON.stringify(j.models[0].phases.map(p => [p.id, p.restored])));
@@ -1819,10 +1819,10 @@ test('#1062 a tuned model already evicted at restore (unload refused with 404) s
   assert.equal((await finished(f.manager)).status, 'passed');
 });
 
-test('#1062 a deferred re-read happens before the tuned model next loads, and before a new tune', { skip: skipContention }, async t => {
+test('#1062 a deferred re-read happens before the compact model next loads, and before a new tune', { skip: skipContention }, async t => {
   const { f, reloads } = await gaveUpRestored(t);
   const before = reloads.length;
-  // A chat load of the tuned model: the router re-reads models.ini first.
+  // A chat load of the compact model: the router re-reads models.ini first.
   const loaded = await f.manager.load('synthetic');
   assert.equal(reloads.length, before + 1, JSON.stringify(loaded));
   assert.equal(reloads.at(-1).synthetic, 'unloaded', 're-read before the load');
@@ -2171,7 +2171,7 @@ test('noevia#1133: unavailable planning and confirmation operations cannot remov
 });
 
 test('#1758 a model that went to sleep during auto-tune is unloaded before the next profile write', async t => {
-  // The tuned model idles into `sleeping` after its first measurement (llama.cpp --sleep-idle-seconds).
+  // The compact model idles into `sleeping` after its first measurement (llama.cpp --sleep-idle-seconds).
   let slept = false;
   const f = fixture(t, { unloadPolls: 1, onChat: ({ status }) => { if (!slept) { slept = true; queueMicrotask(() => { status.synthetic = 'sleeping'; }); } } });
   await f.manager.autotune.start('synthetic', { confirmPause: true });

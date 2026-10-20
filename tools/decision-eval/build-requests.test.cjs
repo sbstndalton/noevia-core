@@ -141,8 +141,8 @@ test('#1647: the capture identity is qualified only inside this harness; the shi
   assert.equal(asked, 0);
 });
 
-let builtTuned;
-const tunedRecords = async () => (builtTuned ||= await buildRequests(undefined, { wording: 'kev' }));
+let builtCompact;
+const compactRecords = async () => (builtCompact ||= await buildRequests(undefined, { wording: 'compact' }));
 const ROUTE_OPTIONS = [
   { id: 'fast', label: 'Greetings, thanks, or a one-line factual answer' },
   { id: 'smart', label: 'Explaining, comparing, planning, reasoning or writing more than a sentence' },
@@ -165,22 +165,22 @@ test('#1739: by default the harness captures the main-branch (default) wording, 
   }
 });
 
-test('#1639: --wording kev captures the wording tuned for a small decision model; the other purposes are the same for both', { skip: skipWasm }, async () => {
+test('#1639: --wording compact captures the compact wording for a small decision model; the other purposes are the same for both', { skip: skipWasm }, async () => {
   ran++;
-  const dflt = (await records()).records, tuned = (await tunedRecords()).records;
-  assert.equal(tuned.length, dflt.length);
+  const dflt = (await records()).records, compact = (await compactRecords()).records;
+  assert.equal(compact.length, dflt.length);
   const base = (rows, purpose) => rows.filter((r) => r.purpose === purpose && r.variant === 'base');
-  for (const r of base(tuned, 'tool.gate')) assert.equal(r.body.question, 'Without tools the assistant knows no current news and nothing the user wrote or saved. Which tool does it need, if any?', r.id);
+  for (const r of base(compact, 'tool.gate')) assert.equal(r.body.question, 'Without tools the assistant knows no current news and nothing the user wrote or saved. Which tool does it need, if any?', r.id);
   // Shaped in a choice budget lowered by the longer question (budgetLimits): 34-character labels for this
   // tool set (44 with the default question), then trimmed on the wire.
-  assert.deepEqual(base(tuned, 'tool.gate')[0].body.options, [
+  assert.deepEqual(base(compact, 'tool.gate')[0].body.options, [
     { id: 'tavily_extract', label: 'Read the text of a web page from i' },
     { id: 'tavily_search', label: 'Search the web for current facts a' },
     { id: 'diary_read_month', label: "Read the user's own diary entries" }, // decision-settings trims the label
     { id: 'nc_webdav_search_files', label: "Find the user's own stored files a" },
     { id: 'none', label: 'No tool: answer directly' },
   ]);
-  for (const r of base(tuned, 'step.supervise')) {
+  for (const r of base(compact, 'step.supervise')) {
     assert.equal(r.body.question, 'What should the assistant do next with these tool results?', r.id);
     assert.deepEqual(r.body.options.map((o) => o.label), [
       'Answer now: the results are relevant, consistent and safe',
@@ -189,21 +189,45 @@ test('#1639: --wording kev captures the wording tuned for a small decision model
   }
   // Unchanged by the wording: sensitivity, framing and the load advisor send the same bodies for both.
   for (const purpose of ['routing.sensitivity', 'chat.frame.kind', 'load.advisor']) {
-    assert.deepEqual(base(tuned, purpose).map((r) => r.body), base(dflt, purpose).map((r) => r.body), purpose);
+    assert.deepEqual(base(compact, purpose).map((r) => r.body), base(dflt, purpose).map((r) => r.body), purpose);
   }
-  // #1901: routing sends the same question and state, with the tuned Fast/Smart labels; the default wording keeps ROUTE_OPTIONS
-  // (and the Code label is shared: a tuned Code label cost the default wording 8 points on English on the held-out split).
+  // #1901: routing sends the same question and state, with the compact Fast/Smart labels; the default wording keeps ROUTE_OPTIONS
+  // (and the Code label is shared: a compact Code label cost the default wording 8 points on English on the held-out split).
   const { ROUTE_LABELS } = require('../../server/system-one-router.cjs');
-  const tunedRoute = base(tuned, 'model.route'), defaultRoute = base(dflt, 'model.route');
-  assert.deepEqual(tunedRoute.map((r) => [r.body.question, r.body.state]), defaultRoute.map((r) => [r.body.question, r.body.state]));
+  const compactRoute = base(compact, 'model.route'), defaultRoute = base(dflt, 'model.route');
+  assert.deepEqual(compactRoute.map((r) => [r.body.question, r.body.state]), defaultRoute.map((r) => [r.body.question, r.body.state]));
   for (const r of defaultRoute) assert.deepEqual(r.body.options, ROUTE_OPTIONS);
-  for (const r of tunedRoute) {
-    assert.deepEqual(r.body.options.slice(0, 2), [{ id: 'fast', label: ROUTE_LABELS.kev.fast }, { id: 'smart', label: ROUTE_LABELS.kev.smart }]);
+  for (const r of compactRoute) {
+    assert.deepEqual(r.body.options.slice(0, 2), [{ id: 'fast', label: ROUTE_LABELS.compact.fast }, { id: 'smart', label: ROUTE_LABELS.compact.smart }]);
     assert.deepEqual(r.body.options.slice(2), ROUTE_OPTIONS.slice(2));
   }
-  for (const r of base(tuned, 'routing.sensitivity')) assert.equal(r.body.question, 'Does this content contain sensitive personal or confidential information?');
-  for (const r of base(tuned, 'chat.frame.kind')) assert.equal(r.body.question, 'What kind of chat does this first message start?');
+  for (const r of base(compact, 'routing.sensitivity')) assert.equal(r.body.question, 'Does this content contain sensitive personal or confidential information?');
+  for (const r of base(compact, 'chat.frame.kind')) assert.equal(r.body.question, 'What kind of chat does this first message start?');
   await assert.rejects(buildRequests(undefined, { wording: 'tuned-0.8b' }), /unknown wording/);
 });
 
-test.after(() => { if (!skipWasm) assert.equal(ran, 9, 'a wasm-guarded test body did not run'); });
+// #2093: the wording values are 'standard' and 'compact'; the first names, 'laya' and 'kev', are still accepted, in the API and as --wording.
+test('the deprecated wording values laya and kev, in buildRequests and as --wording, capture exactly what standard and compact capture', { skip: skipWasm }, async () => {
+  ran++;
+  const { spawnSync } = require('node:child_process');
+  const dflt = (await records()).records, compact = (await compactRecords()).records;
+  assert.deepEqual((await buildRequests(undefined, { wording: 'standard' })).records, dflt);
+  assert.deepEqual((await buildRequests(undefined, { wording: 'laya' })).records, dflt);
+  assert.deepEqual((await buildRequests(undefined, { wording: 'kev' })).records, compact);
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'wording-flag-'));
+  try {
+    const want = { compact: compact, kev: compact, standard: dflt, laya: dflt };
+    for (const [flag, rows] of Object.entries(want)) {
+      const out = path.join(dir, `${flag}.jsonl`);
+      const r = spawnSync(process.execPath, [path.join(__dirname, 'build-requests.cjs'), '--out', out, '--wording', flag], { encoding: 'utf8', timeout: 120000 });
+      assert.equal(r.status, 0, `--wording ${flag}: ${r.stderr.slice(-500)}`);
+      assert.equal(fs.readFileSync(out, 'utf8'), rows.map((x) => JSON.stringify(x)).join('\n') + '\n', `--wording ${flag}`);
+    }
+    const bad = spawnSync(process.execPath, [path.join(__dirname, 'build-requests.cjs'), '--out', path.join(dir, 'bad.jsonl'), '--wording', 'Kev'], { encoding: 'utf8', timeout: 120000 });
+    assert.notEqual(bad.status, 0);
+    assert.match(bad.stderr, /unknown wording Kev/);
+    assert.equal(fs.existsSync(path.join(dir, 'bad.jsonl')), false, 'nothing is written for an unknown wording');
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test.after(() => { if (!skipWasm) assert.equal(ran, 10, 'a wasm-guarded test body did not run'); });

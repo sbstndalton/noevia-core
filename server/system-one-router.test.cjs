@@ -142,16 +142,17 @@ test('#1901: clearly simple short asks go Fast with no decision call; reasoning 
   const d = await h.router.classifyWithDetails('count to ten');
   assert.equal(d.routingDecision.status, 'accepted'); assert.equal(d.routingDecision.selectedRole, 'fast');
 });
-test('#1901: Kev gets route labels that name short simple tasks Fast; Laya keeps its measured labels', async () => {
+test('#1901: the compact wording gets route labels that name short simple tasks Fast; the standard one keeps its measured labels (the deprecated laya and kev still select them, #2093)', async () => {
   const { ROUTE_LABELS } = require('./system-one-router.cjs');
-  for (const wording of ['kev', 'laya', undefined]) {
+  for (const wording of ['compact', 'standard', 'kev', 'laya', undefined, 'unknown', 'Kev']) {
     let seen;
     const router = createSystemOneRouter({ enabled: () => true, roles: () => ({ fast: 'a', smart: 'b' }), fallback: async () => 'fast', log: () => {},
       backend: { wording, supports: () => true, locality: 'local', decide: async (r) => { seen = r.options; return { selected: 'fast', scores: { fast: 0.9, smart: 0.1 } }; } } });
     await router.classify('What is the capital of France?');
-    const want = ROUTE_LABELS[wording] || ROUTE_LABELS.laya;
+    const want = ROUTE_LABELS[{ kev: 'compact', compact: 'compact' }[wording] || 'standard'];
     assert.deepEqual(seen.map(o => o.label), [want.fast, want.smart]);
   }
-  assert.equal(ROUTE_LABELS.laya.fast, 'Greetings, thanks, or a one-line factual answer');
-  assert.match(ROUTE_LABELS.kev.fast, /short poem/);
+  assert.equal(ROUTE_LABELS.standard.fast, 'Greetings, thanks, or a one-line factual answer');
+  assert.match(ROUTE_LABELS.compact.fast, /short poem/);
+  assert.deepEqual(Object.keys(ROUTE_LABELS), ['standard', 'compact']);
 });

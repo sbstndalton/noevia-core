@@ -27,7 +27,7 @@ test('override unset: sensitivity uses the shared backend, exactly as before #16
     const { calls, fetchImpl } = recorder();
     const settings = createDecisionSettings({ store: memory(), env: { COWORK_DECISION_URL: LAYA, ...extra }, fetchImpl });
     assert.equal(settings.sensitivityBackend(), settings.backend());
-    assert.equal(settings.backend().wording, 'laya');
+    assert.equal(settings.backend().wording, 'standard');
     await settings.sensitivityBackend().decide(request('routing.sensitivity'));
     assert.deepEqual(calls.map((c) => c.url), [`${LAYA}/v1/decisions`]);
     assert.deepEqual(Object.keys(calls[0].body), ['state', 'question', 'options']);
@@ -40,7 +40,7 @@ test('override set: sensitivity requests go only to that URL, on Laya wording an
     COWORK_DECISION_API_KEY: 'synthetic-key', COWORK_SENSITIVITY_DECISION_URL: LAYA } });
   const shared = settings.backend(), sensitivity = settings.sensitivityBackend();
   assert.notEqual(shared, sensitivity);
-  assert.deepEqual([shared.model, shared.wording, sensitivity.model, sensitivity.wording], ['kev-0.8b', 'kev', 'laya', 'laya']);
+  assert.deepEqual([shared.model, shared.wording, sensitivity.model, sensitivity.wording], ['kev-0.8b', 'compact', 'laya', 'standard']);
   await sensitivity.decide(request('routing.sensitivity'));
   await shared.decide(request('tool.gate'));
   await shared.supervise({ goal: 'synthetic', outputs: [{ role: 'tool', content: 'r' }] }).catch(() => {}); // options differ from the stub: refused, still sent
@@ -75,16 +75,16 @@ test('a set override that is not a private decision-service URL disables sensiti
 
 test('the sensitivity model defaults to Laya even when the shared one is Kev; it can be named explicitly', () => {
   const env = { COWORK_DECISION_URL: KEV, COWORK_DECISION_MODEL: 'kev-0.8b', COWORK_SENSITIVITY_DECISION_URL: LAYA };
-  assert.equal(createDecisionSettings({ store: memory(), env }).sensitivityBackend().wording, 'laya');
+  assert.equal(createDecisionSettings({ store: memory(), env }).sensitivityBackend().wording, 'standard');
   assert.equal(createDecisionSettings({ store: memory(), env: { ...env, COWORK_SENSITIVITY_DECISION_MODEL: 'laya' } }).sensitivityBackend().model, 'laya');
 });
 
 test('the model belongs to COWORK_DECISION_URL: an admin-saved other URL gets the Laya profile', () => {
   const env = { COWORK_DECISION_URL: KEV, COWORK_DECISION_MODEL: 'kev-0.8b' };
-  assert.equal(createDecisionSettings({ store: memory(), env }).backend().wording, 'kev');
-  assert.equal(createDecisionSettings({ store: memory({ url: KEV, timeoutMs: 1500 }), env }).backend().wording, 'kev', 'saved, same URL');
-  assert.equal(createDecisionSettings({ store: memory({ url: LAYA, timeoutMs: 1500 }), env }).backend().wording, 'laya', 'saved, Laya URL');
-  assert.equal(createDecisionSettings({ store: memory(), env: { COWORK_DECISION_URL: LAYA, COWORK_DECISION_MODEL: 'something-new' } }).backend().wording, 'laya', 'unknown model');
+  assert.equal(createDecisionSettings({ store: memory(), env }).backend().wording, 'compact');
+  assert.equal(createDecisionSettings({ store: memory({ url: KEV, timeoutMs: 1500 }), env }).backend().wording, 'compact', 'saved, same URL');
+  assert.equal(createDecisionSettings({ store: memory({ url: LAYA, timeoutMs: 1500 }), env }).backend().wording, 'standard', 'saved, Laya URL');
+  assert.equal(createDecisionSettings({ store: memory(), env: { COWORK_DECISION_URL: LAYA, COWORK_DECISION_MODEL: 'something-new' } }).backend().wording, 'standard', 'unknown model');
 });
 
 test('the backend object is stable between calls, so the callers keep their decision layers', () => {
@@ -136,7 +136,7 @@ test('a Settings-saved URL other than the deployment URL gets Laya wording while
     const { calls, fetchImpl } = recorder();
     const settings = createDecisionSettings({ store: memory({ url: savedUrl, timeoutMs: 1500 }), env, fetchImpl });
     assert.equal(settings.get().source, 'admin');
-    assert.equal(settings.backend().wording, 'laya', savedUrl);
+    assert.equal(settings.backend().wording, 'standard', savedUrl);
     assert.equal(settings.backend().model, 'laya', savedUrl);
     await settings.backend().decide(request('routing.route'));
     assert.deepEqual(Object.keys(calls[0].body), ['state', 'question', 'options'], 'the Laya contract');

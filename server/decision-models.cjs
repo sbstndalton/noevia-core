@@ -1,4 +1,5 @@
 'use strict';
+const { STANDARD, COMPACT } = require('./decision-wording.cjs');
 // #1639: which decision model serves a decision endpoint, and what follows from it: the wire protocol,
 // the wording the callers use, and the calibration temperature applied to its scores.
 //
@@ -6,10 +7,10 @@
 // COWORK_SENSITIVITY_DECISION_MODEL for the sensitivity override), never a file name or a name the
 // service reports: wording must be chosen before the first request is sent, and a name says nothing
 // about the weights behind it. Unset or unknown ids get the Laya profile, which is exactly what every
-// release before #1639 sent: the Laya contract, the Laya-measured wording and no temperature.
+// release before #1639 sent: the Laya contract, the standard wording and no temperature.
 //
-// Adding or changing a profile changes what production sends; the wording behind 'kev' was tuned and
-// measured on the #1639 split (tools/decision-eval), the temperature fitted there (T 0.45).
+// Adding or changing a profile changes what production sends; the compact wording (behind 'kev-0.8b') was
+// tuned and measured on the #1639 split (tools/decision-eval), the temperature fitted there (T 0.45).
 
 // The id the decision service reports for itself in a reply. The one place this literal lives in
 // non-test code (#221): decision-endpoint.cjs and system-one-router.cjs expose a reported model only when it
@@ -19,9 +20,9 @@ const DECISION_SERVICE_REPORTED_MODEL = "convaiinnovations/laya";
 
 const PROFILES = Object.freeze({
   // services/laya: POST /v1/decisions { state, question, options } -> { selected, scores, model, ... }.
-  laya: Object.freeze({ id: 'laya', protocol: 'laya', wording: 'laya', temperature: 1 }),
+  laya: Object.freeze({ id: 'laya', protocol: 'laya', wording: STANDARD, temperature: 1 }),
   // Kev-0.8B served by Ollaya 0.13.0 (TypeSafe /v1/decisions, a bearer key), as in the #1639 evaluation.
-  'kev-0.8b': Object.freeze({ id: 'kev-0.8b', protocol: 'typesafe', servedModel: 'ollaya.dev/library/kev:0.8b', wording: 'kev', temperature: 0.45 }),
+  'kev-0.8b': Object.freeze({ id: 'kev-0.8b', protocol: 'typesafe', servedModel: 'ollaya.dev/library/kev:0.8b', wording: COMPACT, temperature: 0.45 }),
 });
 
 /** The profile for an operator-set model id; unset or unknown: Laya's. */
