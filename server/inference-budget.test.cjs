@@ -4,7 +4,8 @@ const skipWasm = !require('node:fs').existsSync(process.env.DAV_PARSE_WASM || re
 // router and fake sysfs only; no model is ever loaded and no real engine is contacted.
 const test = require('node:test'), assert = require('node:assert/strict'), fs = require('node:fs'), os = require('node:os'), path = require('node:path');
 const { createInferenceBudget, hostRamGib, cacheRamLimits, clampCacheRam, DEFAULT_BUDGET_GIB } = require('./inference-budget.cjs');
-const { estimateFootprint, suggest, kvCacheBytes } = require('./llamacpp-autoconfig.cjs');
+const { estimateFootprint, suggest } = require('./llamacpp-autoconfig.cjs');
+const { kvCacheBytes } = require('../tests/reference/llamacpp-autoconfig-js.cjs');
 const { createPresetStore } = require('./llamacpp-presets.cjs');
 const { createModelManager } = require('./model-manager.cjs');
 const { createInferenceBudgetWatch, gpuMemoryFiles, readGpuMemory, engineReaderFromModelLoader, isEngineContainer } = require('./inference-budget-watch.cjs');

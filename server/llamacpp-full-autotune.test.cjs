@@ -2151,8 +2151,12 @@ test('noevia#1133: unavailable planning and confirmation operations cannot remov
   // #203: required preset policy still uses the actual pinned module. Isolate the
   // advisory autoconfig operation, whose fault must not suppress the planning estimate.
   const saved = { confirmation:davParseWasm.llamacppAutoconfig, planner:davParseWasm.autotunePlan };
-  let confirmationCalls = 0, plannerCalls = 0;
-  davParseWasm.llamacppAutoconfig = () => { confirmationCalls++; throw new Error('synthetic confirmation fault'); };
+  let confirmationCalls = 0, plannerCalls = 0, evaluatorCalls = 0;
+  davParseWasm.llamacppAutoconfig = (op, args) => {
+    if (op <= 3) { confirmationCalls++; throw new Error('synthetic confirmation fault'); }
+    evaluatorCalls++;
+    return saved.confirmation(op, args);
+  };
   davParseWasm.autotunePlan = () => { plannerCalls++; throw new Error('synthetic planner fault'); };
   t.after(() => { davParseWasm.llamacppAutoconfig = saved.confirmation; davParseWasm.autotunePlan = saved.planner; });
   const f = fixture(t, { autotuneExtra: { planFacts: async () => DENSE_64K, budgetGib: () => 6 } });
@@ -2160,6 +2164,7 @@ test('noevia#1133: unavailable planning and confirmation operations cannot remov
   const j = await finished(f.manager), kv = phase(j.models[0], 'kv');
   assert.ok(plannerCalls > 0, 'the real caller must exercise the unavailable planner');
   assert.equal(confirmationCalls, 0, 'independent ceilings must not call the unavailable confirmation');
+  assert.ok(evaluatorCalls > 0, 'independent ceilings must use the Rust evaluator');
   assert.ok(kv, JSON.stringify({status:j.status,error:j.error,phases:j.models[0].phases.map(p=>p.id)}));
   assert.deepEqual(kv.value.candidates.map(c => [c.kv, c.ceiling]), [['bf16', 12288], ['q8_0', 24576]]);
   assert.equal(kv.value.kv, 'q8_0');
@@ -2174,4 +2179,29 @@ test('#1758 a model that went to sleep during auto-tune is unloaded before the n
   assert.ok(slept);
   assert.doesNotMatch(String(j.error || ''), /Timed out waiting for router unload/);
   assert.equal(j.status, 'passed', j.error);
+});
+
+test('entire raw evaluator fault stops independent KV sizing before load or preset writes', async t => {
+  const davParseWasm = require('./dav-parse-wasm.cjs'), saved = davParseWasm.llamacppAutoconfig, savedPlanner = davParseWasm.autotunePlan;
+  let evaluatorCalls = 0, loads = 0;
+  const f = fixture(t, { onLoad: () => { loads++; },
+    autotuneExtra: {planFacts: async () => DENSE_64K,budgetGib: () => 6} });
+  davParseWasm.llamacppAutoconfig = () => { evaluatorCalls++; throw new Error('synthetic entire evaluator fault'); };
+  davParseWasm.autotunePlan = () => { throw new Error('synthetic planner fault'); };
+  t.after(() => { davParseWasm.llamacppAutoconfig = saved; davParseWasm.autotunePlan = savedPlanner; });
+  fs.writeFileSync(f.ini, fs.readFileSync(f.ini, 'utf8').replace('parallel = 1\n', 'parallel = 1\ncache-ram = 1024\n'));
+  const before = fs.readFileSync(f.ini, 'utf8');
+  const savedRename = fs.renameSync; let iniWrites = 0;
+  fs.renameSync = function(source, target) { if (target === f.ini) iniWrites++; return savedRename.apply(this, arguments); };
+  t.after(() => { fs.renameSync = savedRename; });
+  await f.manager.autotune.start('synthetic', {confirmPause:true});
+  const job = await finished(f.manager);
+  assert.ok(evaluatorCalls > 0, 'the real sizing caller must hit the failed evaluator');
+  assert.equal(loads, 0, 'no engine candidate may load with unconfirmed native sizing');
+  assert.equal(f.requests.length, 0);
+  assert.equal(fs.readFileSync(f.ini, 'utf8'), before, 'no preset proposal may be committed');
+  assert.equal(iniWrites, 0, 'not even an unchanged restore may write the preset file');
+  assert.equal(job.status, 'failed');
+  assert.match(String(job.error), /could not be confirmed by the Rust sizing port/);
+  assert.equal(phase(job.models[0], 'kv')?.status, 'failed');
 });

@@ -725,7 +725,14 @@ function createFullAutotuner({ request: engineRequest, rawModels: engineRawModel
     const before = { ...presets.get(j.model).options }, results = [];
     // #1057: sized once, every model unloaded, for the precision-first choice below.
     await unloadAll();
-    const ceilings = await kvCeilings(j, j.model, kvs);
+    let ceilings;
+    try { ceilings = await kvCeilings(j, j.model, kvs); }
+    catch (error) {
+      // Preparation has only unloaded models; no profile was written. A sizing
+      // fault must stop before proposals, including an unchanged restore write.
+      delete p._beforeText;
+      throw error;
+    }
     // #1058: the order can grow by one, f16 right after a bf16 that failed to load.
     const order = [...kvs];
     let kvFallback = null;
@@ -1022,8 +1029,8 @@ function createFullAutotuner({ request: engineRequest, rawModels: engineRawModel
       const cacheMib = tuneCacheMib(eff);
       if (!Number.isFinite(cacheMib)) { unplanned('the cache size is not a number'); return null; }
       const { ladder } = require('./llamacpp-calibration.cjs');
-      // noevia#1133: planning, not the gate: the JS estimate, so the Rust confirmation (LLAMACPP_AUTOCONFIG_IMPL, retired) cannot remove the ceilings.
-      const { estimateFootprintJs: estimateFootprint } = require('./llamacpp-autoconfig.cjs');
+      // noevia#1133: this plans ceilings before qualification; the Rust-owned estimate cannot remove independent KV gates.
+      const { estimateFootprintForAutotune: estimateFootprint } = require('./llamacpp-autoconfig.cjs');
       const free = readMemory();
       const usableMib = Math.min(Number(budgetGib()) * 1024, free == null ? Infinity : free * 1024 - servicesReserveMib - memoryFloorGib * 1024);
       const rungs = ladder(uint(read.meta.contextLength, 1 << 24));
@@ -1039,7 +1046,8 @@ function createFullAutotuner({ request: engineRequest, rawModels: engineRawModel
       if (Object.values(out).some(v => v != null)) return out;
       unplanned('no context rung fits the memory budget');
       return null;
-    } catch {
+    } catch (err) {
+      if (err?.code === 'autoconfig_impl') throw err;
       unplanned('the sizing check failed');
       return null;
     }

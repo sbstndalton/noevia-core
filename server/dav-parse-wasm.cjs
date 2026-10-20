@@ -1885,30 +1885,102 @@ function taskLifecycleDiagnosticReply(operation, args, r) {
 // --- llama.cpp autoconfig (LLAMACPP_AUTOCONFIG_IMPL) --------------------------------------------
 // llamacpp_autoconfig::MAX_INPUT_BYTES (the op byte and the JSON).
 const MAX_AUTOCONFIG_BYTES = 4 * 1024 * 1024 + 1;
-const AUTOCONFIG_OPS = new Set([1, 2, 3, 4, 5, 6]);
+const AUTOCONFIG_APPLY = Reflect.apply;
+const AUTOCONFIG_ATOM = JSON.stringify;
+const AUTOCONFIG_PARSE = JSON.parse;
+const AUTOCONFIG_KEYS = Object.keys;
+const AUTOCONFIG_ARRAY = Array.isArray;
+const AUTOCONFIG_OWN = Object.hasOwn;
+const autoconfigEvery = (array, predicate) => {
+  for (let index = 0; index < array.length; index++) if (!predicate(array[index], index)) return false;
+  return true;
+};
+const autoconfigExact = (object, keys) => !!object && typeof object === 'object' && !AUTOCONFIG_ARRAY(object) && AUTOCONFIG_KEYS(object).length === keys.length && autoconfigEvery(keys, key => AUTOCONFIG_OWN(object, key));
+// Private continuation serialization never consults inherited caller toJSON hooks.
+function autoconfigFrameText(value) {
+  if (value === null || typeof value !== 'object') return AUTOCONFIG_ATOM(value);
+  let text = AUTOCONFIG_ARRAY(value) ? '[' : '{', first = true;
+  const keys=AUTOCONFIG_KEYS(value);
+  for (let index=0;index<keys.length;index++) {
+    const key=keys[index];
+    if (!first) text += ',';
+    first = false;
+    if (!AUTOCONFIG_ARRAY(value)) text += AUTOCONFIG_ATOM(key) + ':';
+    text += autoconfigFrameText(value[key]);
+  }
+  return text + (AUTOCONFIG_ARRAY(value) ? ']' : '}');
+}
+const AUTOCONFIG_OPS = new Set([1, 2, 3, 4, 5, 6, 11, 12]);
 
-/** Check one llamacpp_autoconfig reply's shape for `op`: an object for 1-3 (the JS's answer as
- *  JSON.stringify writes it), `{ mib }`/`{ unbounded: true }` for 4, `{ free }` for 5 and
- *  `{ gib }` (number, null or "Infinity") for 6. */
-function autoconfigReply(op, r) {
-  const ok = op <= 3 ? !!r && typeof r === 'object' && !Array.isArray(r)
-    : op === 4 ? (exactKeys(r, ['mib']) && typeof r.mib === 'number') || (exactKeys(r, ['unbounded']) && r.unbounded === true)
-      : op === 5 ? exactKeys(r, ['free']) && typeof r.free === 'boolean'
-        : exactKeys(r, ['gib']) && (r.gib === null || r.gib === 'Infinity' || typeof r.gib === 'number');
+// state-v1 is a private mechanical transport; ordinary evaluator state objects
+// are reconstructed before validation or any program-selected operation.
+function autoconfigCompactReply(r) {
+  const invalid = () => { throw new DavParseError('llama.cpp autoconfig compact reply has an unexpected shape', 'reply'); };
+  if (!r || r.wire !== 'state-v1') return invalid();
+  if (autoconfigExact(r, ['wire', 'done'])) return { done: r.done };
+  if (autoconfigExact(r, ['wire', 'throw'])) return { throw: r.throw };
+  if (!autoconfigExact(r, ['wire', 'batch']) || !AUTOCONFIG_ARRAY(r.batch)
+    || r.batch.length < 1 || r.batch.length > 32) return invalid();
+  for (let index = 0; index < r.batch.length; index++) {
+    const operation = r.batch[index];
+    if (!autoconfigExact(operation, ['state', 'request', 'args', 'ref'])) return invalid();
+    const fields = operation.state;
+    if (!AUTOCONFIG_ARRAY(fields) || fields.length !== 8
+      || !Number.isSafeInteger(fields[0]) || fields[0] < 0
+      || !Number.isSafeInteger(fields[1]) || fields[1] <= 0
+      || !Number.isSafeInteger(fields[4]) || fields[4] < 0 || fields[4] > 7
+      || !Number.isSafeInteger(fields[5]) || fields[5] < 0
+      || !(fields[6] === null || typeof fields[6] === 'object' && !AUTOCONFIG_ARRAY(fields[6]))
+      || !(fields[7] === null || typeof fields[7] === 'object' && !AUTOCONFIG_ARRAY(fields[7]))) return invalid();
+    operation.state = {
+      pc: fields[0], env: fields[1], stack: fields[2], catches: fields[3],
+      mode: fields[4], target: fields[5], period: fields[6], sum: fields[7],
+    };
+  }
+  return { batch: r.batch };
+}
+
+/** Strict operations 1-6 and bounded opaque-reference evaluator frames (11-12). */
+function autoconfigReply(op, r, compact = false) {
+  if (compact && (op === 11 || op === 12)) r = autoconfigCompactReply(r);
+  const exact = op === 11 || op === 12 ? autoconfigExact : exactKeys;
+  const privateOp = op === 11 || op === 12;
+  const ref = n => Number.isSafeInteger(n) && n > 0;
+  const operation = r => r && exact(r, ['state', 'request', 'args', 'ref']) && Number.isSafeInteger(r.ref) && r.ref >= 0
+    && exact(r.state, ['pc', 'env', 'stack', 'catches', 'mode', 'target', 'period', 'sum'])
+    && ref(r.state.env) && (privateOp ? AUTOCONFIG_ARRAY(r.state.stack) : Array.isArray(r.state.stack)) && r.state.stack.length <= 256 && autoconfigEvery(r.state.stack, ref)
+    && (privateOp ? AUTOCONFIG_ARRAY(r.state.catches) : Array.isArray(r.state.catches)) && r.state.catches.length <= 8
+    && autoconfigEvery(r.state.catches, c => (privateOp ? AUTOCONFIG_ARRAY(c) : Array.isArray(c)) && c.length === 3 && Number.isSafeInteger(c[0]) && Number.isSafeInteger(c[1]) && ref(c[2]))
+    && exact(r.request, ['op', 'data']) && typeof r.request.op === 'string'
+    && (privateOp ? AUTOCONFIG_ARRAY(r.args) : Array.isArray(r.args)) && autoconfigEvery(r.args, ref);
+  const continuation = r && exact(r, ['batch']) && (privateOp ? AUTOCONFIG_ARRAY(r.batch) : Array.isArray(r.batch)) && r.batch.length >= 1 && r.batch.length <= 32 && autoconfigEvery(r.batch, operation);
+  const ok = op <= 3 ? !!r && typeof r === 'object' && !(privateOp ? AUTOCONFIG_ARRAY(r) : Array.isArray(r))
+    : op === 4 ? (exact(r, ['mib']) && typeof r.mib === 'number') || (exact(r, ['unbounded']) && r.unbounded === true)
+      : op === 5 ? exact(r, ['free']) && typeof r.free === 'boolean'
+        : op === 6 ? exact(r, ['gib']) && (r.gib === null || r.gib === 'Infinity' || typeof r.gib === 'number')
+          : op === 11 || op === 12 ? continuation || (exact(r, ['done']) && ref(r.done)) || (exact(r, ['throw']) && ref(r.throw)) : false;
   if (!ok) throw new DavParseError('llama.cpp autoconfig reply has an unexpected shape', 'reply');
   return r;
 }
 
-/** llamacpp-autoconfig.cjs through the Rust port: op 1 suggest, 2 estimateInputs, 3
- *  estimateFootprint (`args` the parameter object), 4 cacheRamMibOf ({ value }), 5
- *  isPromptCacheFree ({ model, options }), 6 parseMemoryLimit ({ value }). Returns `{ text, reply }`
- *  (the reply text, byte-comparable with JSON.stringify of the JS answer, and its parse). A refusal
- *  ('input', 'too_large', 'ambiguous': see the crate docs), args JSON.stringify cannot write or a
- *  bad reply throws. */
+/** Serialize a strict request or a bounded continuation, never an eager copy of raw input. */
 function llamacppAutoconfig(op, args) {
-  if (!AUTOCONFIG_OPS.has(op)) throw new DavParseError('llama.cpp autoconfig op is unknown', 'input');
+  if (op !== 11 && op !== 12 && !AUTOCONFIG_OPS.has(op)) throw new DavParseError('llama.cpp autoconfig op is unknown', 'input');
   let body;
-  try { body = JSON.stringify(args); } catch { body = undefined; }
+  try {
+    if (op === 11) {
+      body = autoconfigFrameText({ function: args.function, env: args.env, wire: 'state-v1' });
+    } else if (op === 12) {
+      const state = args.state;
+      // Array literal elements create own data properties, even when numeric
+      // prototype setters exist. No mutable collection method packs the tuple.
+      const fields = [state.pc, state.env, state.stack, state.catches,
+        state.mode, state.target, state.period, state.sum];
+      body = autoconfigFrameText({ state: fields, frame: args.frame, wire: 'state-v1' });
+    } else {
+      body = JSON.stringify(args);
+    }
+  } catch { body = undefined; }
   if (typeof body !== 'string') throw new DavParseError('llama.cpp autoconfig input cannot be serialised', 'input');
   const bytes = encoder.encode(body);
   if (bytes.length + 1 > MAX_AUTOCONFIG_BYTES) throw new DavParseError('llama.cpp autoconfig input is too large', 'too_large');
@@ -1917,12 +1989,12 @@ function llamacppAutoconfig(op, args) {
   const { status, bytes: out } = invokeRaw(input, (e) => e.llamacpp_autoconfig(), MAX_AUTOCONFIG_BYTES);
   const text = utf8(out);
   let reply;
-  try { reply = JSON.parse(text); } catch { throw new DavParseError('dav-parse reply is not JSON', 'reply'); }
+  try { reply = op === 11 || op === 12 ? AUTOCONFIG_PARSE(text) : JSON.parse(text); } catch { throw new DavParseError('dav-parse reply is not JSON', 'reply'); }
   if (status !== 0) {
     const code = reply && typeof reply.error === 'string' ? reply.error : 'unknown';
     throw new DavParseError(`llama.cpp autoconfig input refused by dav-parse (${code})`, code);
   }
-  return { text, reply: autoconfigReply(op, reply) };
+  return { text, reply: autoconfigReply(op, reply, op === 11 || op === 12) };
 }
 
 // --- code actions (CODE_ACTIONS_IMPL, retired in #1071) and project file names (PROJECT_FILE_NAMES_IMPL, retired in #1071) ----------

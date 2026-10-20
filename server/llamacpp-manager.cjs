@@ -499,8 +499,8 @@ function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloa
     if (!(budgetGib > 0)) return null;
     const held = quarantineRefusal(model, budgetGib);
     if (held) return held;
-    // Rust confirmation (LLAMACPP_AUTOCONFIG_IMPL, retired in #1071): an estimate the Rust port could not confirm (and the JS one not
-    // the larger) refuses the load; any other failure is "no estimate", as before.
+    // The Rust-owned estimator returns either its confirmed footprint or a fail-closed 503;
+    // unrelated sizing-source failures still mean no estimate, as before.
     let est;
     try { est = await footprint(model); } catch (err) {
       if (err?.code !== 'autoconfig_impl') est = null;
@@ -544,9 +544,10 @@ function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloa
     let defaults = {};
     try { defaults = presets.get(model).defaults || {}; } catch {}
     const opts = { ...defaults, ...options };
-    if (opts['cache-ram'] === undefined || opts['cache-ram'] === '') opts['cache-ram'] = require('./llamacpp-autoconfig.cjs').isPromptCacheFree(model, opts) ? '0' : String((autoconfig.cacheRam || require('./inference-budget.cjs').cacheRamLimits()).capMib);
     let est;
     try {
+      // isPromptCacheFree is a Rust evaluator call too: its fault is the same fail-closed refusal, not a thrown error.
+      if (opts['cache-ram'] === undefined || opts['cache-ram'] === '') opts['cache-ram'] = require('./llamacpp-autoconfig.cjs').isPromptCacheFree(model, opts) ? '0' : String((autoconfig.cacheRam || require('./inference-budget.cjs').cacheRamLimits()).capMib);
       est = require('./llamacpp-autoconfig.cjs').estimateFootprint({ meta: read.meta, modelBytes: read.modelFile.size, mmprojBytes: read.mmproj?.size || 0, options: opts, model });
     } catch (err) {
       if (err?.code !== 'autoconfig_impl') throw err;
