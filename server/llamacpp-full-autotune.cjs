@@ -1218,7 +1218,12 @@ function createFullAutotuner({ request: engineRequest, rawModels: engineRawModel
     const plan = item.plan;
     if (!plan.request) {
       await unloadAll();
-      const request = await planRequest(item.model, itemKv(item)).catch(() => ({ fallback: 'its model file could not be read' }));
+      // #223: an autoconfig_impl refusal (the ladder or the budget could not be evaluated) stops the item; only an
+      // unreadable model file falls back to the standard order. The job fails with the refusal's own text.
+      const request = await planRequest(item.model, itemKv(item)).catch(err => {
+        if (err?.code === 'autoconfig_impl') throw err;
+        return { fallback: 'its model file could not be read' };
+      });
       if (request.fallback) return fallBack(j, item, request.fallback);
       plan.request = request; save();
     }
@@ -1459,6 +1464,12 @@ function createFullAutotuner({ request: engineRequest, rawModels: engineRawModel
       return { ok: false, status: 400, body: { error: 'Choose a prompt time limit between 15 and 1800 seconds.' } };
     if (starting || state.job?.status === 'running') return { ok: false, status: 409, body: { error: 'Auto-tune is already running.' } };
     if (!bulk && isSystemModel(model)) return { ok: false, status: 400, body: { error: SYSTEM_MODEL_REASON } };
+    // #223: both orders size against the context ladder (the Rust program's candidate list). If it cannot be read the
+    // run refuses here, 503 autoconfig_impl, before any hold or preset write; no list of our own is substituted.
+    try { require('./llamacpp-calibration.cjs').ladder(0); } catch (err) {
+      if (err?.code !== 'autoconfig_impl') throw err;
+      return { ok: false, status: err.status || 503, body: { error: `Auto-tune is unavailable: ${err.message}`, code: 'autoconfig_impl' } };
+    }
     starting = true;
     try {
       await flushReload();

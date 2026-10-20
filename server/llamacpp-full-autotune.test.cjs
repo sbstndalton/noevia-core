@@ -2183,9 +2183,14 @@ test('#1758 a model that went to sleep during auto-tune is unloaded before the n
 
 test('entire raw evaluator fault stops independent KV sizing before load or preset writes', async t => {
   const davParseWasm = require('./dav-parse-wasm.cjs'), saved = davParseWasm.llamacppAutoconfig, savedPlanner = davParseWasm.autotunePlan;
-  let evaluatorCalls = 0, loads = 0;
+  let evaluatorCalls = 0, loads = 0, factsCalls = 0;
+  // #223: the first read (the planner's) fails for a reason that is not a refusal, so the item falls back to the standard
+  // order, whose independent KV sizing (the second read) is what this case exercises.
   const f = fixture(t, { onLoad: () => { loads++; },
-    autotuneExtra: {planFacts: async () => DENSE_64K,budgetGib: () => 6} });
+    autotuneExtra: {planFacts: async () => { if (factsCalls++ === 0) throw new Error('synthetic planner facts unavailable'); return DENSE_64K; },budgetGib: () => 6} });
+  // #223: start() refuses outright when the context ladder cannot be read (llamacpp-lazy-startup-223.test.cjs). This case
+  // is the later one: the ladder was read (and is memoized), then the evaluator faults inside the independent KV sizing.
+  require('./llamacpp-calibration.cjs').ladder(0);
   davParseWasm.llamacppAutoconfig = () => { evaluatorCalls++; throw new Error('synthetic entire evaluator fault'); };
   davParseWasm.autotunePlan = () => { throw new Error('synthetic planner fault'); };
   t.after(() => { davParseWasm.llamacppAutoconfig = saved; davParseWasm.autotunePlan = savedPlanner; });
@@ -2194,7 +2199,8 @@ test('entire raw evaluator fault stops independent KV sizing before load or pres
   const savedRename = fs.renameSync; let iniWrites = 0;
   fs.renameSync = function(source, target) { if (target === f.ini) iniWrites++; return savedRename.apply(this, arguments); };
   t.after(() => { fs.renameSync = savedRename; });
-  await f.manager.autotune.start('synthetic', {confirmPause:true});
+  const started = await f.manager.autotune.start('synthetic', {confirmPause:true});
+  assert.equal(started.status, 202, JSON.stringify(started.body));
   const job = await finished(f.manager);
   assert.ok(evaluatorCalls > 0, 'the real sizing caller must hit the failed evaluator');
   assert.equal(loads, 0, 'no engine candidate may load with unconfirmed native sizing');

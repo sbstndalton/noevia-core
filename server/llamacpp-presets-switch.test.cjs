@@ -62,15 +62,14 @@ test('every native policy fault refuses without exposing option values or writin
 test('manager section save retains400 invalid_size when canonical policy cannot answer',async t=>{
  const file=fixture(t),before=fs.readFileSync(file,'utf8'),wasmPath=require.resolve('./dav-parse-wasm.cjs'),saved=require.cache[wasmPath];
  let autoconfigCalls=0;
- // Fault only the preset policy under test: manager/calibration imports need
- // the real Rust-backed autoconfig constants and every other bridge export.
+ // Fault only the preset policy under test: the manager still needs every other bridge export.
  const overlay=(over,calls)=>({...dav,...standIn(over,calls)(),llamacppAutoconfig(...args){autoconfigCalls++;return dav.llamacppAutoconfig(...args);}});
  const failedCalls=[];
  require.cache[wasmPath]={id:wasmPath,filename:wasmPath,loaded:true,exports:overlay({llamacppPresetsCanonical:()=>{throw Error('synthetic');}},failedCalls)};
  t.after(()=>{if(saved)require.cache[wasmPath]=saved;else delete require.cache[wasmPath];});
  const {createLlamaCppManager}=require('./llamacpp-manager.cjs');
  const manager=createLlamaCppManager({baseUrl:'http://synthetic',presetPath:file,fetchJson:async()=>({ok:true,status:200,body:{data:[]}})});
- assert.ok(autoconfigCalls>0,'manager imports must reach the actual Rust autoconfig bridge');
+ assert.equal(autoconfigCalls,0,'#223: building the manager (and loading calibration) no longer reads the evaluator at import; the first sizing call does');
  const refusal=await manager.presetRefusal('synthetic',{c:'1048576',parallel:'1'});
  assert.equal(refusal.code,'invalid_size');assert.equal(refusal.error,'Not saved: the preset option "c" could not be checked.');
  assert.ok(failedCalls.includes('llamacppPresetsCanonical'),'the scoped canonical fault must be exercised');

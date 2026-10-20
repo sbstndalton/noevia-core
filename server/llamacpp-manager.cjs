@@ -437,6 +437,13 @@ function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloa
     if (inference > 0) return explicit > 0 ? Math.min(inference, explicit) : inference;
     return Number(autoconfig.budgetGib) > 0 ? Number(autoconfig.budgetGib) : 0;
   }
+  // #223: when the boot-time memory limit could not be evaluated and no other budget exists, the
+  // features that size against it refuse with that reason. A budget that is known (the inference budget
+  // or the explicit figure) is unaffected, and a fault never stands in for a figure.
+  function budgetFaultReason() {
+    return autoconfig.budgetFault && !(sizingBudgetGib() > 0) ? String(autoconfig.budgetFault) : null;
+  }
+  const budgetFaultBody = (prefix, reason) => ({ error: `${prefix}: ${reason}`, code: 'autoconfig_impl' });
   // noevia#1132: ctx-size (c), ubatch-size and batch-size, when set, must be whole numbers (a leading
   // '+' allowed, as llama.cpp reads them): positive, except that ctx-size 0 means the model's native
   // context (llama.cpp's meaning, and how estimateFootprint sizes it). -1, Infinity, 1e400 or NaN
@@ -581,6 +588,8 @@ function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloa
     if(!presets)return unsupported('Native preset suggestions; configure LLAMACPP_PRESET_PATH');
     const {modelsPath,cacheRamMaxMib}=autoconfig;const budgetGib=sizingBudgetGib();
     if(!modelsPath)return {ok:false,status:501,body:{error:'Suggestions need the model directory mounted read-only; set LLAMACPP_MODELS_PATH.'}};
+    const budgetFault=budgetFaultReason();
+    if(budgetFault)return {ok:false,status:503,body:budgetFaultBody('Suggestions unavailable',budgetFault)};
     if(!(budgetGib>0))return {ok:false,status:501,body:{error:'Suggestions need an inference memory budget; set LLAMACPP_AUTOCONFIG_MEMORY_GIB or LLAMACPP_MEMORY_LIMIT.'}};
     const profile=presets.get(model);
     const read=await readModel(model);
@@ -593,6 +602,8 @@ function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloa
   async function estimateMemory(model) {
     if(!presets)return unsupported('Memory estimates; configure LLAMACPP_PRESET_PATH');
     if(!autoconfig.modelsPath)return {ok:false,status:501,body:{error:'Estimates need the model directory mounted read-only; set LLAMACPP_MODELS_PATH.'}};
+    const budgetFault=budgetFaultReason();
+    if(budgetFault)return {ok:false,status:503,body:budgetFaultBody('Estimate unavailable',budgetFault)};
     const profile=presets.get(model);
     const read=await readModel(model);
     if(read.error)return {ok:false,status:read.status,body:{error:read.error}};
@@ -605,6 +616,10 @@ function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloa
   // Starting settings for calibration: structural values from the model file; the context
   // itself is measured, so an unconfigured memory budget is not an obstacle here.
   async function conservativeFor(model) {
+    // #223: on a budget fault there is nothing to size against and no figure is invented, so this returns null. The
+    // cost is that calibration then gets neither the file-derived native context nor the suggested starting values
+    // (it falls back to the engine's n_ctx_train and the profile's own settings); it still measures the context.
+    if(budgetFaultReason())return null;
     const read=await readModel(model);
     if(read.error)return null;
     const profile=presets.get(model);
@@ -737,7 +752,7 @@ function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloa
       // #1003: the planner reads the GGUF facts and the sizing budget.
       ...(autotuneOptions.planner?{planner:autotuneOptions.planner}:{}),
       planFacts:async model=>{const r=await readModel(model);return r.error?null:{meta:r.meta,modelBytes:r.modelFile.size,mmprojBytes:r.mmproj?.size||0};},
-      budgetGib:()=>sizingBudgetGib()||require('./inference-budget.cjs').DEFAULT_BUDGET_GIB,
+      budgetGib:()=>{const fault=budgetFaultReason();if(fault)throw Object.assign(new Error(fault),{code:'autoconfig_impl',status:503});return sizingBudgetGib()||require('./inference-budget.cjs').DEFAULT_BUDGET_GIB;},
       ...(autotuneOptions.planFacts?{planFacts:autotuneOptions.planFacts}:{}),
       ...(autotuneOptions.budgetGib?{budgetGib:autotuneOptions.budgetGib}:{}),
       // #1004: tests inject their own advisor (a fake decision service).
@@ -787,7 +802,7 @@ function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloa
     async presetsInRouter(){try{const l=await rawModels();return l.ok&&Array.isArray(l.body?.data)?reloadGuard.routerText(l.body.data):null;}catch{return null;}},
     evidence, recordEvidence, importEvidence,
     calibration: calibrator ? { start: calibrator.start, cancel: calibrator.cancel, status: calibrator.status, recover: calibrator.recover } : null,
-    autotune: autotuner ? { start: autotuner.start, resume: autotuner.resume, cancel: autotuner.cancel, clear: autotuner.clear, status: autotuner.status, setSettings: autotuner.setSettings, recover: autotuner.recover, untuned: autotuner.untuned } : null,
+    autotune: autotuner ? { start: (...args) => { const fault = budgetFaultReason(); return fault ? Promise.resolve({ ok: false, status: 503, body: budgetFaultBody('Auto-tune unavailable', fault) }) : autotuner.start(...args); }, resume: autotuner.resume, cancel: autotuner.cancel, clear: autotuner.clear, status: autotuner.status, setSettings: autotuner.setSettings, recover: autotuner.recover, untuned: autotuner.untuned } : null,
     unload: model => mutate(()=>withAdmission(()=>post('/models/unload', { model }))),
     // #697 watchdog: unload without waiting behind admission or maintenance; memory is running out.
     emergencyUnload: model => post('/models/unload', { model }, 60000),
