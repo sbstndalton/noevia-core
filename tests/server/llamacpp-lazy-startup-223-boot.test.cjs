@@ -68,6 +68,21 @@ function fakeRouter() {
   return new Promise((resolve) => server.listen(0, '127.0.0.1', () => resolve({ server, calls, port: server.address().port })));
 }
 
+// One loopback request over node:http (no proxy or dispatcher settings can apply to it).
+function request(base, method, p, { headers = {}, body } = {}) {
+  return new Promise((resolve, reject) => {
+    const req = http.request(base + p, { method, headers, agent: false, timeout: 30000 }, (res) => {
+      const chunks = [];
+      res.on('data', (c) => chunks.push(c));
+      res.on('end', () => resolve({ status: res.statusCode, text: Buffer.concat(chunks).toString('utf8') }));
+      res.on('error', reject);
+    });
+    req.on('timeout', () => req.destroy(new Error('request timed out')));
+    req.on('error', reject);
+    req.end(body);
+  });
+}
+
 // Loopback stand-in for the Diary add-on: it only keeps a stray call from hanging.
 function fakeDiary() {
   const server = http.createServer((req, res) => { req.resume(); res.writeHead(503, { 'content-type': 'application/json' }); res.end('{"detail":"synthetic diary"}'); });
@@ -116,20 +131,18 @@ async function boot(t, mode) {
     assert.equal(child.exitCode, null, `the server must not exit during boot (${mode}):\n${log.join('').slice(-1500)}`);
     assert.ok(Date.now() - started < 60000, `the server did not become ready in 60 s (${mode}); last poll: ${last}\n${log.join('').slice(-1500)}`);
     try {
-      const r = await fetch(`${base}/api/ready`, { signal: AbortSignal.timeout(5000) });
-      const text = await r.text();
-      last = `${r.status} ${text.slice(0, 200)}`;
-      if (r.ok && JSON.parse(text).ready) break;
-    } catch (e) { last = `${e?.name}: ${e?.message} ${e?.cause?.code || ''}`; }
+      const r = await request(base, 'GET', '/api/ready');
+      last = `${base} ${r.status} ${r.text.slice(0, 200)}`;
+      if (r.status === 200 && JSON.parse(r.text).ready) break;
+    } catch (e) { last = `${base} ${e?.name}: ${e?.message} ${e?.code || ''}`; }
     await new Promise((resolve) => setTimeout(resolve, 200));
   }
   const admin = seedAccount(dataDir, { username: 'synthetic-admin', publicOrigin: base });
   const call = async (method, p, body) => {
-    const res = await fetch(base + p, { method, headers: { ...admin.headers(base), accept: 'application/json', ...(body === undefined ? {} : { 'content-type': 'application/json' }) },
-      body: body === undefined ? undefined : JSON.stringify(body), redirect: 'manual', signal: AbortSignal.timeout(30000) });
-    const text = await res.text();
-    let json = null; try { json = JSON.parse(text); } catch { /* not JSON */ }
-    return { status: res.status, json, text };
+    const payload = body === undefined ? undefined : JSON.stringify(body);
+    const res = await request(base, method, p, { headers: { ...admin.headers(base), accept: 'application/json', ...(payload === undefined ? {} : { 'content-type': 'application/json', 'content-length': Buffer.byteLength(payload) }) }, body: payload });
+    let json = null; try { json = JSON.parse(res.text); } catch { /* not JSON */ }
+    return { status: res.status, json, text: res.text };
   };
   return { call, router, log: () => log.join(''), bootFaults: () => log.join('').split('\n').filter((l) => BOOT_FAULT.test(l)).length, running: () => child.exitCode === null };
 }
