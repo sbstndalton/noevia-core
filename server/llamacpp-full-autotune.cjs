@@ -82,7 +82,7 @@ const PLANNED_PHASES = [['context', 'Context and KV cache'], ['sampling', 'Sampl
 function defaultPlanner() {
   return { plan: request => require('./dav-parse-wasm.cjs').autotunePlan(request) };
 }
-// Kept free beside the tuned model for the services that run alongside it (Laya).
+// Kept free beside the compact model for the services that run alongside it (Laya).
 const SERVICES_RESERVE_MIB = 2560;
 const PLAN_CAUSE = { oom: 'oom', load: 'load_failed', time: 'over_time', recall: 'recall_failed' };
 const PLAN_STEP_LIMIT = 64;
@@ -851,7 +851,7 @@ function createFullAutotuner({ request: engineRequest, rawModels: engineRawModel
     if (p._beforeText == null) return true;
     if (presets.snapshot().revision !== j._revision) { p.restored = false; return false; }
     try {
-      // #1068: restoring the file needs only the tuned model stopped, never another client's; the
+      // #1068: restoring the file needs only the compact model stopped, never another client's; the
       // router's re-read waits while another client has a model live.
       await unloadOwn(j);
       await presets.commit({ baseRevision: j._revision, text: p._beforeText }, j._backedUp ? { backup: false } : undefined);
@@ -863,7 +863,7 @@ function createFullAutotuner({ request: engineRequest, rawModels: engineRawModel
     } catch { p.restored = false; save(); return false; }
   }
   async function unloadOwn(j) {
-    // The tuned model is often gone already (evicted by another client): ask only when it runs, and
+    // The compact model is often gone already (evicted by another client): ask only when it runs, and
     // a refused unload is not a failure if the row goes (or is) unloaded anyway.
     const first = await rawModels();
     if (!first.ok || !Array.isArray(first.body?.data)) throw Error('The model server stopped responding while unloading.');
@@ -912,7 +912,7 @@ function createFullAutotuner({ request: engineRequest, rawModels: engineRawModel
     }, Math.max(foreignPollMs * 15, 1));
     reloadTimer.unref?.();
   }
-  /** #1068: before the tuned model loads again (chat or a new tune), the router re-reads the restored
+  /** #1068: before the compact model loads again (chat or a new tune), the router re-reads the restored
    *  file even with another client live (its unchanged preset keeps it running), so it never serves
    *  the test profile. A no-op unless a re-read is pending (for `model`, when given). */
   async function flushReload(model = null) {

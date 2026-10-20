@@ -13,11 +13,11 @@
 // DAV_PARSE_WASM), and says so when it is missing.
 //
 // The wording is per decision model (server/decision-models.cjs): --wording standard (default; what
-// production sends to Laya or an unknown model) or tuned (Kev-0.8B's). The old values laya and kev are still
-// accepted and mean standard and tuned. The bodies are always in our
+// production sends to Laya or an unknown model) or compact (Kev-0.8B's). The old values laya and kev are still
+// accepted and mean standard and compact. The bodies are always in our
 // contract; run.cjs --target ollaya converts them for a TypeSafe server, as production does.
 //
-// Usage: node build-requests.cjs --out requests.jsonl [--wording standard|tuned] [--cases dir] [--smoke 20 --smoke-out smoke.jsonl]
+// Usage: node build-requests.cjs --out requests.jsonl [--wording standard|compact] [--cases dir] [--smoke 20 --smoke-out smoke.jsonl]
 
 const fs = require('node:fs');
 const path = require('node:path');
@@ -94,7 +94,7 @@ function createCallers({ wording: requested = 'standard' } = {}) {
   const routers = {};
   // #1901: the route labels follow the backend's wording; precheck:false so every case reaches the model (the
   // simple-ask rule is core's own and is tested in system-one-router.test.cjs, not measured here).
-  const routeBackend = wording === 'tuned' ? { ...backend, wording } : backend;
+  const routeBackend = wording === 'compact' ? { ...backend, wording } : backend;
   const router = (code) => (routers[code] ||= require(path.join(SERVER, 'system-one-router.cjs')).createSystemOneRouter({
     enabled: () => true, env: {}, log: () => {}, fallback: async () => 'smart', precheck: false,
     roles: () => ({ fast: 'fast-model', smart: 'smart-model', ...(code ? { code: 'code-model' } : {}) }),
@@ -114,7 +114,7 @@ function createCallers({ wording: requested = 'standard' } = {}) {
   const supervision = require(path.join(SERVER, 'step-supervision.cjs')).createStepSupervision({
     enabled: () => true, provider: { decide: (...a) => (wording === 'standard' ? backend.supervise(...a) : supervising.decide(...a)) }, deadlineMs: 1500, getDeadlineMs: () => 2000, log: () => {},
   });
-  // The tuned wording on our contract (production sends it through the TypeSafe codec instead).
+  // The compact wording on our contract (production sends it through the TypeSafe codec instead).
   const supervising = createDecisionEndpoint({ env: { COWORK_DECISION_URL: CAPTURE_URL }, fetchImpl: capture.fetchImpl, wording });
   const endpoint = createDecisionEndpoint({ env: { COWORK_DECISION_URL: CAPTURE_URL }, fetchImpl: capture.fetchImpl });
   const advisor = require(path.join(SERVER, 'load-advisor.cjs')).createLoadAdvisor({
@@ -248,7 +248,7 @@ const toJsonl = (rows) => rows.map((r) => JSON.stringify(r)).join('\n') + '\n';
 async function main(argv) {
   const args = {};
   for (let i = 0; i < argv.length; i += 2) args[argv[i].replace(/^--/, '')] = argv[i + 1];
-  if (!args.out) throw Error('usage: node build-requests.cjs --out requests.jsonl [--wording standard|tuned] [--cases dir] [--smoke N --smoke-out smoke.jsonl]');
+  if (!args.out) throw Error('usage: node build-requests.cjs --out requests.jsonl [--wording standard|compact] [--cases dir] [--smoke N --smoke-out smoke.jsonl]');
   const { records, skipped } = await buildRequests(args.cases || CASES, { wording: args.wording || 'standard' });
   fs.writeFileSync(args.out, toJsonl(records));
   if (args.smoke) fs.writeFileSync(args['smoke-out'], toJsonl(smokeSubset(records, Number(args.smoke))));

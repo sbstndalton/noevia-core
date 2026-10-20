@@ -67,12 +67,14 @@ test('#2093: LAYA_LOAD_ADVISOR is a deprecated alias of DECISION_LOAD_ADVISOR: s
   for (const value of ['on', ' ON ', 'wasm', 'off', 'js', '  ', '']) {
     const viaNew = run({ DECISION_LOAD_ADVISOR: value });
     const viaOld = run({ LAYA_LOAD_ADVISOR: value });
-    assert.deepEqual(viaOld.warned, viaNew.warned, JSON.stringify(value));
-    assert.deepEqual(viaOld.retired, viaNew.retired, JSON.stringify(value));
+    // The same outcome; the warning names the variable that was actually set.
+    assert.deepEqual(viaOld.warned, viaNew.warned.map((n) => n.replace('DECISION_LOAD_ADVISOR', 'LAYA_LOAD_ADVISOR')), JSON.stringify(value));
+    assert.deepEqual(viaOld.retired, viaNew.retired.map((m) => m.replace('DECISION_LOAD_ADVISOR', 'LAYA_LOAD_ADVISOR')), JSON.stringify(value));
     assert.deepEqual(viaNew.notes, [], 'the new name is never noted');
     assert.equal(viaOld.notes.length, value.trim() === '' ? 0 : 1, JSON.stringify(value));
   }
-  assert.deepEqual(run({ LAYA_LOAD_ADVISOR: 'off' }).retired, ['DECISION_LOAD_ADVISOR is retired; Rust is always used']);
+  assert.deepEqual(run({ LAYA_LOAD_ADVISOR: 'off' }).retired, ['LAYA_LOAD_ADVISOR is retired; Rust is always used']);
+  assert.deepEqual(run({ LAYA_LOAD_ADVISOR: 'off' }).notes, ['LAYA_LOAD_ADVISOR is a deprecated alias of DECISION_LOAD_ADVISOR; set DECISION_LOAD_ADVISOR instead']);
   assert.deepEqual(run({ LAYA_LOAD_ADVISOR: 'on' }).warned, []);
   // Both set: the new name decides, whatever the old one says.
   assert.deepEqual(run({ DECISION_LOAD_ADVISOR: 'on', LAYA_LOAD_ADVISOR: 'js' }).warned, []);
@@ -80,7 +82,7 @@ test('#2093: LAYA_LOAD_ADVISOR is a deprecated alias of DECISION_LOAD_ADVISOR: s
   const both = run({ DECISION_LOAD_ADVISOR: 'on', LAYA_LOAD_ADVISOR: 'js' });
   assert.deepEqual(both.notes, ['LAYA_LOAD_ADVISOR is a deprecated alias of DECISION_LOAD_ADVISOR; set DECISION_LOAD_ADVISOR instead (DECISION_LOAD_ADVISOR is set, so LAYA_LOAD_ADVISOR is ignored)']);
   // A new name that is unset, empty or blank falls back to the old one.
-  for (const blank of [undefined, '', '   ']) assert.deepEqual(run({ DECISION_LOAD_ADVISOR: blank, LAYA_LOAD_ADVISOR: 'js' }).warned, ['DECISION_LOAD_ADVISOR']);
+  for (const blank of [undefined, '', '   ']) assert.deepEqual(run({ DECISION_LOAD_ADVISOR: blank, LAYA_LOAD_ADVISOR: 'js' }).warned, ['LAYA_LOAD_ADVISOR']);
   // One note per process, not per call; the retired warning itself is per call, as before.
   davParseWasm.resetDeprecatedFlagNotes();
   const again = [run({ LAYA_LOAD_ADVISOR: 'js' }, { reset: false }), run({ LAYA_LOAD_ADVISOR: 'js' }, { reset: false })];
@@ -284,8 +286,8 @@ test('index.cjs starts with the pinned module and every retired switch left at j
   while (!/dav-parse\.wasm verified/.test(out) && child.exitCode === null && Date.now() < deadline) await new Promise((r) => setTimeout(r, 100));
   assert.match(out, /\[dav-parse\] dav-parse\.wasm verified/, `stdout ${out.slice(-500)} stderr ${err.slice(-500)}`);
   assert.equal(child.exitCode, null, 'still running');
-  for (const flag of Object.keys(davParseWasm.RETIRED_FLAGS)) assert.match(err, new RegExp(`${flag} is retired; Rust is always used`));
-  // This run sets the deprecated LAYA_LOAD_ADVISOR: it counts as DECISION_LOAD_ADVISOR, and says it is deprecated (#2093).
+  // This run sets the deprecated LAYA_LOAD_ADVISOR: it counts as DECISION_LOAD_ADVISOR, the warning names the variable that was set, and a note says it is deprecated (#2093).
+  for (const flag of Object.keys(davParseWasm.RETIRED_FLAGS)) assert.match(err, new RegExp(`${flag === 'DECISION_LOAD_ADVISOR' ? 'LAYA_LOAD_ADVISOR' : flag} is retired; Rust is always used`));
   assert.match(err, /LAYA_LOAD_ADVISOR is a deprecated alias of DECISION_LOAD_ADVISOR; set DECISION_LOAD_ADVISOR instead/);
 });
 

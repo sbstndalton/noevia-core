@@ -40,7 +40,7 @@ test('override set: sensitivity requests go only to that URL, on Laya wording an
     COWORK_DECISION_API_KEY: 'synthetic-key', COWORK_SENSITIVITY_DECISION_URL: LAYA } });
   const shared = settings.backend(), sensitivity = settings.sensitivityBackend();
   assert.notEqual(shared, sensitivity);
-  assert.deepEqual([shared.model, shared.wording, sensitivity.model, sensitivity.wording], ['kev-0.8b', 'tuned', 'laya', 'standard']);
+  assert.deepEqual([shared.model, shared.wording, sensitivity.model, sensitivity.wording], ['kev-0.8b', 'compact', 'laya', 'standard']);
   await sensitivity.decide(request('routing.sensitivity'));
   await shared.decide(request('tool.gate'));
   await shared.supervise({ goal: 'synthetic', outputs: [{ role: 'tool', content: 'r' }] }).catch(() => {}); // options differ from the stub: refused, still sent
@@ -81,8 +81,8 @@ test('the sensitivity model defaults to Laya even when the shared one is Kev; it
 
 test('the model belongs to COWORK_DECISION_URL: an admin-saved other URL gets the Laya profile', () => {
   const env = { COWORK_DECISION_URL: KEV, COWORK_DECISION_MODEL: 'kev-0.8b' };
-  assert.equal(createDecisionSettings({ store: memory(), env }).backend().wording, 'tuned');
-  assert.equal(createDecisionSettings({ store: memory({ url: KEV, timeoutMs: 1500 }), env }).backend().wording, 'tuned', 'saved, same URL');
+  assert.equal(createDecisionSettings({ store: memory(), env }).backend().wording, 'compact');
+  assert.equal(createDecisionSettings({ store: memory({ url: KEV, timeoutMs: 1500 }), env }).backend().wording, 'compact', 'saved, same URL');
   assert.equal(createDecisionSettings({ store: memory({ url: LAYA, timeoutMs: 1500 }), env }).backend().wording, 'standard', 'saved, Laya URL');
   assert.equal(createDecisionSettings({ store: memory(), env: { COWORK_DECISION_URL: LAYA, COWORK_DECISION_MODEL: 'something-new' } }).backend().wording, 'standard', 'unknown model');
 });

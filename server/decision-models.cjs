@@ -1,5 +1,5 @@
 'use strict';
-const { STANDARD, TUNED } = require('./decision-wording.cjs');
+const { STANDARD, COMPACT } = require('./decision-wording.cjs');
 // #1639: which decision model serves a decision endpoint, and what follows from it: the wire protocol,
 // the wording the callers use, and the calibration temperature applied to its scores.
 //
@@ -9,7 +9,7 @@ const { STANDARD, TUNED } = require('./decision-wording.cjs');
 // about the weights behind it. Unset or unknown ids get the Laya profile, which is exactly what every
 // release before #1639 sent: the Laya contract, the standard wording and no temperature.
 //
-// Adding or changing a profile changes what production sends; the tuned wording (behind 'kev-0.8b') was
+// Adding or changing a profile changes what production sends; the compact wording (behind 'kev-0.8b') was
 // tuned and measured on the #1639 split (tools/decision-eval), the temperature fitted there (T 0.45).
 
 // The id the decision service reports for itself in a reply. The one place this literal lives in
@@ -22,7 +22,7 @@ const PROFILES = Object.freeze({
   // services/laya: POST /v1/decisions { state, question, options } -> { selected, scores, model, ... }.
   laya: Object.freeze({ id: 'laya', protocol: 'laya', wording: STANDARD, temperature: 1 }),
   // Kev-0.8B served by Ollaya 0.13.0 (TypeSafe /v1/decisions, a bearer key), as in the #1639 evaluation.
-  'kev-0.8b': Object.freeze({ id: 'kev-0.8b', protocol: 'typesafe', servedModel: 'ollaya.dev/library/kev:0.8b', wording: TUNED, temperature: 0.45 }),
+  'kev-0.8b': Object.freeze({ id: 'kev-0.8b', protocol: 'typesafe', servedModel: 'ollaya.dev/library/kev:0.8b', wording: COMPACT, temperature: 0.45 }),
 });
 
 /** The profile for an operator-set model id; unset or unknown: Laya's. */

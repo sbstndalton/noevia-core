@@ -18,7 +18,7 @@ Synthetic cases only: no chats, no Diary.
 
 ```sh
 node build-requests.cjs --out requests.jsonl --smoke 20 --smoke-out smoke.jsonl           # standard wording (production default)
-node build-requests.cjs --wording tuned --out requests-tuned.jsonl                              # tuned wording for Kev-0.8B (#1739); the old values laya and kev still work
+node build-requests.cjs --wording compact --out requests-compact.jsonl                              # compact wording for Kev-0.8B (#1739); the old values laya and kev still work
 node run.cjs --requests requests.jsonl --out laya.jsonl --target laya --url http://<laya>:8040 --min-interval-ms 1000 --gate ./gate.sh
 node run.cjs --requests requests.jsonl --out decima.jsonl --target ollaya --url http://127.0.0.1:11535 --model decima:small --api-key-file <key> --warmup 3 --gate ./gate.sh
 node score.cjs --out report.json --md report.md --rss rss.json laya.jsonl decima.jsonl

@@ -2388,11 +2388,13 @@ const RETIRED_FLAGS = { LLAMACPP_PRESETS_IMPL: 'wasm', STREAM_GUARD_IMPL: 'wasm'
 const DEPRECATED_FLAG_ALIASES = { LAYA_LOAD_ADVISOR: 'DECISION_LOAD_ADVISOR' };
 const notedAliases = new Set();
 
-/** The value a retired switch is set to in `env`, trimmed and lower-cased: its own name first, then any
- *  deprecated alias of it. The first time an alias is set, one line says it is deprecated. Never throws. */
+/** The variable that decides a retired switch in `env` and its value, trimmed and lower-cased: the switch's
+ *  own name first, then any deprecated alias of it (`name` is the alias then, so a warning names what was
+ *  actually set). The first time an alias is set, one line says it is deprecated. Never throws. */
 function retiredFlagValue(env, flag, log) {
   const read = (name) => String(env[name] ?? '').trim().toLowerCase();
   const value = read(flag);
+  let decided = { name: flag, value };
   for (const [old, current] of Object.entries(DEPRECATED_FLAG_ALIASES)) {
     if (current !== flag) continue;
     const legacy = read(old);
@@ -2401,23 +2403,24 @@ function retiredFlagValue(env, flag, log) {
       notedAliases.add(old);
       try { log.warn(`${old} is a deprecated alias of ${flag}; set ${flag} instead${value === '' ? '' : ` (${flag} is set, so ${old} is ignored)`}`); } catch { /* a logger fault never matters */ }
     }
-    if (value === '') return legacy;
+    if (value === '') decided = { name: old, value: legacy };
   }
-  return value;
+  return decided;
 }
 
 /** Test hook: forget which deprecated aliases have been noted, so the next use notes them again. */
 function resetDeprecatedFlagNotes() { notedAliases.clear(); }
 
 /** Log one warning per retired switch that `env` still sets to something other than its old
- *  Rust-selecting value (for example =js). Returns the names warned about. Never throws. */
+ *  Rust-selecting value (for example =js). Returns the names warned about: the variable that was set, so
+ *  the deprecated LAYA_LOAD_ADVISOR when only that is set. Never throws. */
 function warnRetiredFlags(env = process.env, log = console) {
   const warned = [];
   for (const [flag, rust] of Object.entries(RETIRED_FLAGS)) {
-    const value = retiredFlagValue(env, flag, log);
+    const { name, value } = retiredFlagValue(env, flag, log);
     if (value === '' || value === rust) continue;
-    warned.push(flag);
-    log.warn(`${flag} is retired; Rust is always used`);
+    warned.push(name);
+    log.warn(`${name} is retired; Rust is always used`);
   }
   return warned;
 }

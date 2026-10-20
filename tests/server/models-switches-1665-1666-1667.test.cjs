@@ -209,7 +209,7 @@ test('#1666 nothing chosen: the deployment model applies, the GET reply keeps it
   const f = decisionFixture();
   const got = await f.call('GET');
   assert.deepEqual(got.body, { url: 'http://kev:11435', timeoutMs: 1500, source: 'deployment' }, 'unchanged (the HTTP contract corpus)');
-  assert.deepEqual([f.settings.backend().model, f.settings.backend().wording], ['kev-0.8b', 'tuned']);
+  assert.deepEqual([f.settings.backend().model, f.settings.backend().wording], ['kev-0.8b', 'compact']);
   const row = modelAssignments({ installed: [], env: KEV_ENV, admin: true, decision: f.settings.describe() }).services.find((s) => s.id === 'decision');
   assert.deepEqual([row.models, row.deploymentModel], [['laya', 'kev-0.8b'], 'kev-0.8b']);
   assert.equal('models' in modelAssignments({ installed: [], env: KEV_ENV, admin: false }).services.find((s) => s.id === 'decision'), false);
@@ -225,7 +225,7 @@ test('#1666 choosing a model is an admin save next to the URL: requests and word
   assert.deepEqual(describeDecision(KEV_ENV, f.settings.get()).decision, { model: 'laya', state: 'active', source: 'admin', modelSource: 'admin' });
   // Kev on another URL (before #1666 that URL always got Laya), case-insensitive.
   await f.call('PUT', { url: 'http://192.168.1.20:11435', timeoutMs: 900, model: ' KEV-0.8B ' });
-  assert.deepEqual([f.settings.backend().model, f.settings.backend().wording], ['kev-0.8b', 'tuned']);
+  assert.deepEqual([f.settings.backend().model, f.settings.backend().wording], ['kev-0.8b', 'compact']);
   assert.equal(f.settings.describe().decision.model, 'kev-0.8b');
   assert.equal(f.settings.describe().sensitivity.model, 'kev-0.8b', 'a shared sensitivity check follows the chosen model');
   // Automatic ('' or absent) goes back to the #1639 rule: another URL gets Laya, the deployment URL its model.
