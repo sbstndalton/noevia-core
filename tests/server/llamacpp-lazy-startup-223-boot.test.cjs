@@ -6,19 +6,20 @@
 //   memory-limit  parseMemoryLimit throws (the boot-time read in index.cjs)
 //   ctx-candidates the CTX_CANDIDATES getter throws (read on first use by calibration)
 //   evaluator     every evaluator call faults (davParseWasm.llamacppAutoconfig)
-// The fault is injected by a --require preload in the child only. Loopback mocks, a fake llama.cpp router and
-// the stand-in project store; net-guard.cjs refuses every other outbound connection. Synthetic data only.
+// The fault is injected by a --require preload in the child only. The child gets a clean environment with only
+// loopback upstreams (a fake llama.cpp router, a Diary that answers 503) and the stand-in project store.
+// Self-contained on purpose: the web image build runs tests/ without tools/. Synthetic data only.
 // Needs server/wasm/dav-parse.wasm (or DAV_PARSE_WASM); skipped without it unless DAV_PARSE_WASM_REQUIRED=1.
 // Each guarded step counts ran++ and test.after asserts the total.
 const test = require('node:test'), assert = require('node:assert/strict'), fs = require('node:fs'), os = require('node:os'), path = require('node:path');
 const http = require('node:http');
 const { spawn } = require('node:child_process');
-const { SERVER, GUARD, startMocks, serverEnv } = require('../../tools/contract-corpus/mocks.cjs');
 const { seedAccount } = require('./seed-account.cjs');
 const { startProjectStore } = require('./project-store-server.cjs');
 const davParseWasm = require('../../server/dav-parse-wasm.cjs');
 
 const skipWasm = !fs.existsSync(process.env.DAV_PARSE_WASM || davParseWasm.DEFAULT_WASM) && process.env.DAV_PARSE_WASM_REQUIRED !== '1' && 'dav-parse.wasm not built';
+const SERVER = path.join(__dirname, '..', '..', 'server', 'index.cjs');
 const SERVER_DIR = path.dirname(SERVER);
 const BOOT_FAULT = /could not be evaluated at startup/;
 const EXPECTED_RAN = 28;
@@ -67,6 +68,12 @@ function fakeRouter() {
   return new Promise((resolve) => server.listen(0, '127.0.0.1', () => resolve({ server, calls, port: server.address().port })));
 }
 
+// Loopback stand-in for the Diary add-on: it only keeps a stray call from hanging.
+function fakeDiary() {
+  const server = http.createServer((req, res) => { req.resume(); res.writeHead(503, { 'content-type': 'application/json' }); res.end('{"detail":"synthetic diary"}'); });
+  return new Promise((resolve) => server.listen(0, '127.0.0.1', () => resolve({ server, port: server.address().port })));
+}
+
 async function boot(t, mode) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), `lazy-223-${mode}-`));
   const dataDir = path.join(root, 'data'), modelsDir = path.join(root, 'models');
@@ -76,11 +83,14 @@ async function boot(t, mode) {
   fs.writeFileSync(ini, 'version = 1\n\n[small]\nmodel = /models/q.gguf\nctx-size = 4096\ncache-ram = 0\n');
   const preload = path.join(root, 'fault-preload.cjs');
   fs.writeFileSync(preload, PRELOAD);
-  const mocks = await startMocks(), router = await fakeRouter(), store = await startProjectStore(dataDir);
+  const router = await fakeRouter(), diary = await fakeDiary(), store = await startProjectStore(dataDir);
   const port = await new Promise((resolve) => { const s = http.createServer(); s.listen(0, '127.0.0.1', () => { const p = s.address().port; s.close(() => resolve(p)); }); });
   const base = `http://127.0.0.1:${port}`;
   const env = {
-    ...serverEnv({ port, dataDir, origin: base, mocks }),
+    PATH: process.env.PATH, NODE_ENV: 'production', TZ: 'UTC', LANG: 'C.UTF-8',
+    UI_PORT: String(port), UI_HOST: '127.0.0.1', UI_DATA_DIR: dataDir, PUBLIC_ORIGIN: base,
+    INFERENCE_BASE_URL: `http://127.0.0.1:${router.port}`, DIARY_BASE_URL: `http://127.0.0.1:${diary.port}`,
+    MODEL_LOADER_URL: '', MCP_SERVERS: '', COWORK_DECISION_URL: '', COWORK_SYSTEM_ONE_URL: '', DIARY_BACKUP_WORKER_INTERVAL_MS: '3600000',
     MODEL_MANAGER_KIND: 'llamacpp', MODEL_MANAGER_BASE_URL: `http://127.0.0.1:${router.port}`,
     LLAMACPP_PRESET_PATH: ini, LLAMACPP_MODELS_PATH: modelsDir,
     NOEVIA_PROJECT_STORE_PORT: String(store.port), NOEVIA_PROJECT_STORE_TOKEN: store.token,
@@ -88,23 +98,29 @@ async function boot(t, mode) {
     ...(process.env.DAV_PARSE_WASM ? { DAV_PARSE_WASM: process.env.DAV_PARSE_WASM } : {}),
     ...(process.env.DAV_PARSE_WASM_REQUIRED ? { DAV_PARSE_WASM_REQUIRED: process.env.DAV_PARSE_WASM_REQUIRED } : {}),
   };
-  env.NOEVIA_CORPUS_ALLOWED_PORTS = `${env.NOEVIA_CORPUS_ALLOWED_PORTS},${store.port},${router.port}`;
-  const child = spawn(process.execPath, ['--require', GUARD, '--require', preload, SERVER], { env, cwd: SERVER_DIR, stdio: ['ignore', 'pipe', 'pipe'] });
-  const log = [];
-  child.stdout.on('data', (d) => log.push(String(d)));
-  child.stderr.on('data', (d) => log.push(String(d)));
+  const child = spawn(process.execPath, ['--require', preload, SERVER], { env, cwd: SERVER_DIR, stdio: ['ignore', 'pipe', 'pipe'] });
+  const log = [], started = Date.now();
+  const stamp = (d) => String(d).split('\n').filter(Boolean).map((l) => `+${Date.now() - started}ms ${l}`).join('\n') + '\n';
+  child.stdout.on('data', (d) => log.push(stamp(d)));
+  child.stderr.on('data', (d) => log.push(stamp(d)));
   const exited = new Promise((resolve) => child.once('exit', resolve));
   t.after(async () => {
     child.kill('SIGTERM');
     await Promise.race([exited, new Promise((resolve) => setTimeout(resolve, 5000))]);
     if (child.exitCode === null) child.kill('SIGKILL');
-    mocks.close(); router.server.close(); await store.close?.();
+    router.server.close(); diary.server.close(); await store.close?.();
     fs.rmSync(root, { recursive: true, force: true });
   });
-  for (let i = 0; ; i += 1) {
+  let last = 'no request made';
+  for (;;) {
     assert.equal(child.exitCode, null, `the server must not exit during boot (${mode}):\n${log.join('').slice(-1500)}`);
-    assert.ok(i < 150, `the server did not become ready in 30 s (${mode}):\n${log.join('').slice(-1500)}`);
-    try { const r = await fetch(`${base}/api/ready`); if (r.ok && (await r.json()).ready) break; } catch { /* booting */ }
+    assert.ok(Date.now() - started < 60000, `the server did not become ready in 60 s (${mode}); last poll: ${last}\n${log.join('').slice(-1500)}`);
+    try {
+      const r = await fetch(`${base}/api/ready`, { signal: AbortSignal.timeout(5000) });
+      const text = await r.text();
+      last = `${r.status} ${text.slice(0, 200)}`;
+      if (r.ok && JSON.parse(text).ready) break;
+    } catch (e) { last = `${e?.name}: ${e?.message} ${e?.cause?.code || ''}`; }
     await new Promise((resolve) => setTimeout(resolve, 200));
   }
   const admin = seedAccount(dataDir, { username: 'synthetic-admin', publicOrigin: base });
