@@ -1,12 +1,14 @@
 #!/usr/bin/env node
 'use strict';
-// Regenerates the shared fixtures for CODE_NET_GUARD_IMPL: code-net-guard.cjs's COWORK_CODE_NET_ADDR
-// parsing, the addresses resolveOnce keeps from a lookup, and refuses(localAddress). The same file is
-// committed byte-for-byte in sbstndalton/noevia-rs
-// (crates/code-net-guard/tests/fixtures/code-net-guard.v1.json); noevia-core CI compares them.
+// Regenerates the shared fixtures for the code-net guard: COWORK_CODE_NET_ADDR parsing, the addresses
+// resolveOnce keeps from a lookup, and refuses(localAddress). The same file is committed
+// byte-for-byte in sbstndalton/noevia-rs (crates/code-net-guard/tests/fixtures/code-net-guard.v1.json);
+// noevia-core CI compares them.
 //   node tools/gen-code-net-guard-fixtures.cjs > tests/fixtures/code-net-guard.v1.json
 //
-// Every expectation is what the JS itself returns (parseCodeNetSpec, normalizeAddress, net.isIP).
+// Every expectation is what the JavaScript guard returned (parseCodeNetSpec, normalizeAddress,
+// net.isIP). That guard is retired from server/ (#1071); the byte-pinned copy in
+// tests/reference/code-net-guard-js.cjs is what answers here, so the file is unchanged.
 // All addresses and names are synthetic. Rows whose JS answer could depend on the Node/ICU version
 // or the resolver (non-ASCII text, a %zone literal, an xn-- label, IPv4-like host names; #1115)
 // record no JS answer: they sit in the strict tables with want { refused: 'ambiguous' }.
@@ -23,7 +25,7 @@
 
 const net = require('node:net');
 const path = require('node:path');
-const { parseCodeNetSpec, normalizeAddress } = require(path.join(__dirname, '..', 'server', 'code-net-guard.cjs'));
+const { parseCodeNetSpec, normalizeAddress } = require(path.join(__dirname, '..', 'tests', 'reference', 'code-net-guard-js.cjs'));
 
 const refused = { refused: 'ambiguous' };
 

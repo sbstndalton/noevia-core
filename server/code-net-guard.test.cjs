@@ -3,7 +3,7 @@
 // network. Fake sockets for the address logic; one real loopback server for the wiring. No DNS.
 const test = require('node:test'), assert = require('node:assert/strict');
 const http = require('node:http'), fs = require('node:fs'), path = require('node:path');
-const { createCodeNetGuard, parseCodeNetSpec, normalizeAddress } = require('./code-net-guard.cjs');
+const { createCodeNetGuard } = require('./code-net-guard.cjs');
 
 const CODE_ADDR = '172.30.0.2';      // web's address on the code network (synthetic)
 const DEFAULT_ADDR = '172.18.0.5';   // web's address on its default network (synthetic)
@@ -80,14 +80,23 @@ test('a name that does not resolve fails open, is logged, and is retried until i
   guard.stop();
 });
 
-test('the setting is validated: IPs and host names only', () => {
-  assert.deepEqual([...parseCodeNetSpec(`${CODE_ADDR}, egress fd00::2`).literals], [CODE_ADDR, 'fd00::2']);
-  assert.deepEqual(parseCodeNetSpec('egress').hosts, ['egress']);
+test('the setting is validated: IPs and host names only', async () => {
+  const looked = [];
+  const guard = createCodeNetGuard({ spec: `${CODE_ADDR}, egress fd00::2`, lookup: async (host) => { looked.push(host); return []; }, retryMs: 3_600_000 });
+  await guard.ready;
+  assert.deepEqual(looked, ['egress'], 'the one name is looked up; the two addresses are guarded as they are');
+  assert.equal(await guard.refuses(CODE_ADDR), true);
+  assert.equal(await guard.refuses('FD00::2'), true, 'case does not matter');
+  assert.equal(await guard.refuses(DEFAULT_ADDR), false);
+  guard.stop();
   for (const bad of ['http://egress', 'egress:8021', '172.30.0.0/16', 'a_b']) {
-    assert.throws(() => parseCodeNetSpec(bad), /COWORK_CODE_NET_ADDR/, bad);
+    assert.throws(() => createCodeNetGuard({ spec: bad }), { message: `COWORK_CODE_NET_ADDR should list IP addresses or host names, not "${bad}"` }, bad);
   }
-  assert.equal(normalizeAddress('::FFFF:10.0.0.1'), '10.0.0.1');
-  assert.equal(normalizeAddress('FD00::2'), 'fd00::2');
+  // An IPv4-mapped IPv6 address is the IPv4 address either way round.
+  const mapped = createCodeNetGuard({ spec: '10.0.0.1' });
+  assert.equal(await mapped.refuses('::FFFF:10.0.0.1'), true);
+  const literalMapped = createCodeNetGuard({ spec: '::FFFF:10.0.0.1' });
+  assert.equal(await literalMapped.refuses('10.0.0.1'), true);
 });
 
 test('on a real listener, the connection\'s own local address is what decides', async () => {

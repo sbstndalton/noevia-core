@@ -47,8 +47,9 @@
 //                          parseMcpServers, parseEnabledToolboxes, toolboxOffered (was MCP_SERVERS_IMPL, retired #1071)
 //   - crates/decision      decisionInvalidRequest/decisionInvalidResult/decisionCauseOf =
 //                          decision/index.cjs's pure checks over a projection (was DECISION_IMPL, retired #1071)
-//   - crates/code-net-guard codeNetSpec/codeNetResolved/codeNetRefuses = code-net-guard.cjs
-//                          parseCodeNetSpec, resolveOnce's address filter and refuses (was CODE_NET_GUARD_IMPL, retired #1071)
+//   - crates/code-net-guard codeNetSpec/codeNetResolved/codeNetRefuses = the code-net guard's spec reading,
+//                          lookup address filter and request decision, the only authority of
+//                          code-net-guard.cjs (was CODE_NET_GUARD_IMPL, retired #1071)
 //   - crates/role-context  roleContextProject/roleContextDossier = role-context.cjs
 //                          projectRoleContext/projectSharedDossier, a secret call (ROLE_CONTEXT_IMPL)
 //   - crates/completeness-report completenessReport = completeness-report.cjs
@@ -1664,7 +1665,7 @@ function decisionCauseOf(error) {
 /** Test hook: the cached instance's linear memory in bytes (0 when there is none). */
 function memoryBytes() { return cached?.instance ? cached.instance.exports.memory.buffer.byteLength : 0; }
 
-// --- code net guard (CODE_NET_GUARD_IMPL) ------------------------------------------------------
+// --- code net guard (was CODE_NET_GUARD_IMPL, retired #1071) -----------------------------------
 // code_net_guard::MAX_INPUT_BYTES (the op byte and the JSON) and MAX_ENTRIES.
 const MAX_CODE_NET_BYTES = 64 * 1024 + 1;
 const MAX_CODE_NET_ENTRIES = 1024;
@@ -1673,8 +1674,8 @@ const codeNetRequest = (op, value) => opJson(op, value, MAX_CODE_NET_BYTES, (e) 
 const ipText = (s) => typeof s === 'string' && net.isIP(s) !== 0;
 const codeNetList = (xs) => Array.isArray(xs) && xs.length <= MAX_CODE_NET_ENTRIES;
 
-/** code-net-guard.cjs parseCodeNetSpec through the Rust port: `{ literals, hosts }` (literals IP
- *  addresses, hosts lower-case names) or `{ malformed }` (the entry the JS throws on). A refusal
+/** COWORK_CODE_NET_ADDR as the Rust port reads it: `{ literals, hosts }` (literals IP addresses,
+ *  hosts lower-case names) or `{ malformed }` (the first entry that is neither). A refusal
  *  ('ambiguous': see the crate docs) or a bad reply throws. */
 function codeNetSpec(raw) {
   if (typeof raw !== 'string') throw new DavParseError('code net guard input has the wrong type', 'input');
@@ -1688,7 +1689,7 @@ function codeNetSpec(raw) {
   return { literals: r.literals, hosts: r.hosts };
 }
 
-/** The addresses resolveOnce keeps from one lookup's answers (each a string, or null for anything
+/** The addresses the guard keeps from one lookup's answers (each a string, or null for anything
  *  else), through the Rust port. A refusal or bad reply throws. */
 function codeNetResolved(answers) {
   if (!codeNetList(answers) || !answers.every((a) => a === null || typeof a === 'string')) throw new DavParseError('code net guard input has the wrong type', 'input');
