@@ -22,7 +22,7 @@ const SECRET = 'SYNTHETIC-PRIVATE-SENTINEL-7f3a';
 const store = () => { const m = new Map(); return { get: (k) => m.get(k), set: (k, v) => m.set(k, v) }; };
 const tool = (name, description = `${name} reads synthetic data. `.repeat(12)) => ({ type: 'function', function: { name, description, parameters: { type: 'object', properties: {}, required: [] } } });
 
-/** The request checks of services/laya/server.py validate(), mirrored. */
+/** The request checks of the decision service's validate(), mirrored. */
 function decisionRefuses(body) {
   if (!body || Object.keys(body).sort().join() !== 'options,question,state') return 'shape';
   if (typeof body.state !== 'string' || body.state.length > 4000) return 'state';
@@ -35,8 +35,8 @@ function decisionRefuses(body) {
   return null;
 }
 
-/** A fake Laya: refuses what the real one refuses (422), otherwise picks `pick` (a service id). */
-function fakeLaya(pick, seen = []) {
+/** A fake decision service: refuses what the real one refuses (422), otherwise picks `pick` (an option id). */
+function fakeDecisionService(pick, seen = []) {
   return async (url, init) => {
     const body = JSON.parse(init.body);
     seen.push(body);
@@ -53,7 +53,7 @@ function fakeLaya(pick, seen = []) {
 let nextPort = 8040;
 function configured(fetchImpl, kinds) {
   const settings = createDecisionSettings({ store: store(), env: {}, fetchImpl, ...(kinds ? { kinds } : {}) });
-  settings.save({ url: `http://laya:${nextPort++}`, timeoutMs: 1500 }, 'admin');
+  settings.save({ url: `http://decision-service:${nextPort++}`, timeoutMs: 1500 }, 'admin');
   return settings;
 }
 
@@ -97,7 +97,7 @@ test('the tool gate request fits the service: at most 8 options, safe ids, short
   // 12 read tools with long descriptions and one awkward name; before #682 this was a 422 every time.
   const offered = [...Array.from({ length: 10 }, (_, i) => tool(`synthetic_reader_${i}`)), tool('Web-Fetch'), tool('tavily_search'), tool('nc_webdav_write_file')];
   const seen = [];
-  const settings = configured(fakeLaya((ids) => ids.find((id) => id === 'tavily_search'), seen));
+  const settings = configured(fakeDecisionService((ids) => ids.find((id) => id === 'tavily_search'), seen));
   const logs = [];
   const out = await gateFor(settings, logs).evaluate('Please take care of the synthetic thing', offered);
   assert.equal(seen.length, 1);
@@ -118,7 +118,7 @@ test('the tool gate request fits the service: at most 8 options, safe ids, short
 
 test('an id the service would refuse is mapped there and back', async () => {
   const seen = [];
-  const settings = configured(fakeLaya('web_fetch_2', seen));
+  const settings = configured(fakeDecisionService('web_fetch_2', seen));
   const out = await gateFor(settings, []).evaluate('Take care of the synthetic thing', [tool('Web-Fetch'), tool('web_fetch')]);
   assert.equal(decisionRefuses(seen[0]), null);
   // web_fetch is a tool the gate's rules know, so it is listed first and keeps its own id.
@@ -188,7 +188,7 @@ test('log schema: route, tool-gate, supervise and outcome records hold only know
     async () => new Response(`${SECRET}{`, { status: 200 }),
     async () => { throw Error(SECRET); },
   ];
-  for (const fetchImpl of [...failing, fakeLaya((ids) => ids[0])]) {
+  for (const fetchImpl of [...failing, fakeDecisionService((ids) => ids[0])]) {
     const settings = configured(fetchImpl);
     await createSystemOneRouter({ enabled: () => true, env: {}, roles: () => ({ fast: 'f', smart: 's', code: 'c' }), fallback: async () => 'smart',
       getBackend: settings.backend, log: (e) => record('route', e) }).classifyWithDetails(`${SECRET} route`);
