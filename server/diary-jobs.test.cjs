@@ -120,13 +120,15 @@ test('#1422 an orphaned running record (written by an earlier process) can be ma
  assert.equal(jobs.acknowledge(other,data.entryDay,data.exchangeId).state,'uncertain');
 });
 
-test('#230 a failed row keeps the string reason next to the code, limited like the code; a non-string one is never stored',t=>{
+test('#230 a failed row keeps the reason token next to the code; a non-string or over-long one is never stored',t=>{
  const failedRow=event=>{const w=fixture(t),j=jobs.start(w,data);j.event({type:'error',saved:false,text:'Nothing was saved.',...event});j.finish();return jobs.list(w,data.entryDay)[0];};
  for(const reason of ['chat_timeout','length_cap']){
   const row=failedRow({code:'modelFailed',reason});
   assert.equal(row.state,'failed');assert.equal(row.code,'modelFailed');assert.equal(row.reason,reason);
  }
- assert.equal(failedRow({code:'modelFailed',reason:'z'.repeat(1000)}).reason,'z'.repeat(40));
+ assert.equal('reason' in failedRow({code:'modelFailed',reason:'z'.repeat(1000)}),false,'dropped, not cut to 40');
+ assert.equal('reason' in failedRow({code:'modelFailed',reason:'z'.repeat(41)}),false);
+ assert.equal(failedRow({code:'modelFailed',reason:'z'.repeat(40)}).reason,'z'.repeat(40));
  for(const reason of [42,null,true,{nested:'chat_timeout'},['length_cap']]){
   const row=failedRow({code:'modelFailed',reason});assert.equal('reason' in row,false,JSON.stringify(reason));
  }
@@ -144,4 +146,29 @@ test('#230 the stream records the reason on the recovered row, and an older reco
  const file=path.join(w.dir,'diary-conversations',data.entryDay,data.exchangeId+'.json');const old=JSON.parse(fs.readFileSync(file));delete old.reason;fs.writeFileSync(file,JSON.stringify(old));
  const [legacy]=jobs.list(w,data.entryDay);assert.equal(legacy.code,'modelFailed');assert.equal('reason' in legacy,false);
  assert.equal(jobs.acknowledge(w,data.entryDay,data.exchangeId).state,'failed');
+});
+// #232: the row writer applies the same rule as the live stream, for any direct caller of job.event.
+test('#232 a row keeps a reason only for modelFailed and only as a token',t=>{
+ const failedRow=event=>{const w=fixture(t),j=jobs.start(w,data);j.event({type:'error',saved:false,text:'Nothing was saved.',...event});j.finish();return jobs.list(w,data.entryDay)[0];};
+ for(const code of ['contextFailed','modelNotServed','diaryUnavailable',undefined]){
+  const row=failedRow({code,reason:'chat_timeout'});
+  assert.equal(row.state,'failed');assert.equal(row.code,code);assert.equal('reason' in row,false,String(code));
+ }
+ for(const reason of ['chat\ntimeout','chat_timeout\n','chat\u0000timeout','‮schat_timeout','chat⁦timeout','chat timeout','chat-timeout','']){
+  const row=failedRow({code:'modelFailed',reason});
+  assert.equal(row.state,'failed');assert.equal(row.code,'modelFailed');assert.equal('reason' in row,false,JSON.stringify(reason));
+ }
+ for(const reason of ['some_new_code','empty_answer','chat_timeout','length_cap'])assert.equal(failedRow({code:'modelFailed',reason}).reason,reason);
+});
+test('#232 a verbatim contextFailed event through the proxy leaves no reason on the stored row',async t=>{
+ const w=fixture(t);
+ const upstream=new Response(new ReadableStream({start(c){for(const e of [{type:'status',text:'Opening diary context…'},{type:'error',code:'contextFailed',saved:false,reason:'chat_timeout',text:'x'}])c.enqueue(new TextEncoder().encode('data: '+JSON.stringify(e)+'\n\n'));c.close();}}),{headers:{'Content-Type':'text/event-stream'}});
+ t.mock.method(globalThis,'fetch',async()=>upstream);
+ const written=[];
+ const res=Object.assign(new (require('node:events'))(),{writeHead(){},write(chunk){written.push(String(chunk));return true;},end(){},destroyed:false,writableEnded:false});
+ await proxyDiaryStream(res,'http://synthetic',{}, {job:jobs.start(w,data)});
+ const browser=written.join('').split('\n\n').filter(f=>f.startsWith('data: ')).map(f=>JSON.parse(f.slice(6))).find(e=>e.type==='error');
+ assert.equal(browser.code,'contextFailed');assert.equal(browser.saved,false);assert.equal('reason' in browser,false);
+ const [row]=jobs.list(w,data.entryDay);
+ assert.equal(row.state,'failed');assert.equal(row.code,'contextFailed');assert.equal('reason' in row,false);
 });

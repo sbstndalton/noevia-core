@@ -28,12 +28,22 @@ const MESSAGES = {
 function notSaved(code, extra = {}) {
   return { type: 'error', code, saved: false, text: MESSAGES[code] || MESSAGES.diaryUnavailable, ...extra };
 }
-// #230: the relayed `reason` is a short token the companion chose (chat_timeout, length_cap, or a code
-// added later), so it is not limited to the known values. It must be a string of at most this many
-// characters (the same bound the recovery record puts on `code`); anything else is dropped, not cut,
-// because a truncated token would be a different token from the one the companion sent.
-const MAX_REASON = 40;
-const relayableReason = value => typeof value === 'string' && value.length <= MAX_REASON;
+// #230, #232: the relayed `reason` is a short token the companion chose (chat_timeout, length_cap, or a
+// code added later), so it is not limited to the known values. One rule applies on the live stream and
+// in the recovery record (diary-jobs.cjs): the reason is kept only when it is a token of letters,
+// digits and underscores, 1 to 40 characters, and only on a `modelFailed` event. Anything else is
+// dropped, never cut or cleaned, because a changed token would be a different token from the one the
+// companion sent, and control, newline or bidirectional-override characters must never be relayed.
+const REASON_TOKEN = /^[a-z0-9_]{1,40}$/i;
+const relayableReason = value => typeof value === 'string' && REASON_TOKEN.test(value);
+/** The reason an error event may carry: its own, when the event is `modelFailed` and the reason is a token. */
+const eventReason = event => event?.code === 'modelFailed' && relayableReason(event.reason) ? event.reason : undefined;
+/** The event itself when its reason may stay (or it has none); otherwise a copy without the reason. */
+function withoutDisallowedReason(event) {
+  if (event?.type !== 'error' || !('reason' in event) || eventReason(event) !== undefined) return event;
+  const { reason: _dropped, ...rest } = event;
+  return rest;
+}
 const CONNECT_REFUSED = new Set(['ECONNREFUSED', 'ENOTFOUND', 'EAI_AGAIN']);
 
 // Keep the browser/proxy connection alive throughout one journaled operation.
@@ -69,7 +79,8 @@ async function proxyDiaryStream(res, url, options, { heartbeatMs = 5000, onEvent
   // can never collide.
   const refine = async event => {
     if (event?.type !== 'error' || event.saved !== undefined || stage === 'save' || stage === 'start') return event;
-    const reason = relayableReason(event.reason) ? { reason: event.reason } : {};
+    // A companion event naming another code never lends its reason to the reworded modelFailed one.
+    const reason = (event.code === undefined || event.code === 'modelFailed') && relayableReason(event.reason) ? { reason: event.reason } : {};
     if (stage === 'model') {
       let found = null;
       try { found = diagnose ? await diagnose() : null; } catch { /* the plain wording below stands */ }
@@ -110,14 +121,12 @@ async function proxyDiaryStream(res, url, options, { heartbeatMs = 5000, onEvent
           try { const line = frame.split('\n').find(l => l.startsWith('data: ')); if (line) event = JSON.parse(line.slice(6)); } catch { /* A non-JSON data frame (e.g. `[DONE]`) must not look like an interrupted stream. */ }
           if (event && typeof event === 'object') {
             track(event);
-            // #228: `reason` is relayed only as the string the companion sent; anything else is dropped.
-            // #230: and only when it is short (MAX_REASON), so a runaway value never reaches the browser or the record.
-            if (event.type === 'error' && 'reason' in event && !relayableReason(event.reason)) {
-              const { reason: _dropped, ...rest } = event;
-              event = rest; frame = `data: ${JSON.stringify(event)}\n\n`;
-            }
-            const refined = await refine(event);
-            if (refined !== event) { event = refined; frame = `data: ${JSON.stringify(event)}\n\n`; }
+            // #228, #232: `reason` is relayed only as a token the companion sent, on a `modelFailed` event (the
+            // rule is checked on what is finally sent, so a verbatim event is held to it as well).
+            const refined = withoutDisallowedReason(await refine(event));
+            if (refined !== event) { event = refined; frame = `data: ${JSON.stringify(event)}
+
+`; }
             if (onEvent) { try { onEvent(event); } catch { /* Optional telemetry must never break diary capture. */ } }
             if (job) { try { job.event(event); } catch { /* A failed recovery write must not look like an interrupted stream. */ } }
           }
@@ -152,4 +161,4 @@ async function proxyDiaryStream(res, url, options, { heartbeatMs = 5000, onEvent
     if (!res.destroyed) res.end();
   }
 }
-module.exports = {proxyDiaryStream, notSaved};
+module.exports = {proxyDiaryStream, notSaved, eventReason};
