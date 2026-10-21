@@ -35,9 +35,9 @@ function notSaved(code, extra = {}) {
 // dropped, never cut or cleaned, because a changed token would be a different token from the one the
 // companion sent, and control, newline or bidirectional-override characters must never be relayed.
 const REASON_TOKEN = /^[a-z0-9_]{1,40}$/i;
-const relayableReason = value => typeof value === 'string' && REASON_TOKEN.test(value);
+const relayableToken = value => typeof value === 'string' && REASON_TOKEN.test(value);
 /** The reason an error event may carry: its own, when the event is `modelFailed` and the reason is a token. */
-const eventReason = event => event?.code === 'modelFailed' && relayableReason(event.reason) ? event.reason : undefined;
+const eventReason = event => event?.code === 'modelFailed' && relayableToken(event.reason) ? event.reason : undefined;
 /** The event itself when its reason may stay (or it has none); otherwise a copy without the reason. */
 function withoutDisallowedReason(event) {
   if (event?.type !== 'error' || !('reason' in event) || eventReason(event) !== undefined) return event;
@@ -80,7 +80,7 @@ async function proxyDiaryStream(res, url, options, { heartbeatMs = 5000, onEvent
   const refine = async event => {
     if (event?.type !== 'error' || event.saved !== undefined || stage === 'save' || stage === 'start') return event;
     // A companion event naming another code never lends its reason to the reworded modelFailed one.
-    const reason = (event.code === undefined || event.code === 'modelFailed') && relayableReason(event.reason) ? { reason: event.reason } : {};
+    const reason = (event.code === undefined || event.code === 'modelFailed') && relayableToken(event.reason) ? { reason: event.reason } : {};
     if (stage === 'model') {
       let found = null;
       try { found = diagnose ? await diagnose() : null; } catch { /* the plain wording below stands */ }
@@ -124,9 +124,7 @@ async function proxyDiaryStream(res, url, options, { heartbeatMs = 5000, onEvent
             // #228, #232: `reason` is relayed only as a token the companion sent, on a `modelFailed` event (the
             // rule is checked on what is finally sent, so a verbatim event is held to it as well).
             const refined = withoutDisallowedReason(await refine(event));
-            if (refined !== event) { event = refined; frame = `data: ${JSON.stringify(event)}
-
-`; }
+            if (refined !== event) { event = refined; frame = `data: ${JSON.stringify(event)}\n\n`; }
             if (onEvent) { try { onEvent(event); } catch { /* Optional telemetry must never break diary capture. */ } }
             if (job) { try { job.event(event); } catch { /* A failed recovery write must not look like an interrupted stream. */ } }
           }
@@ -161,4 +159,4 @@ async function proxyDiaryStream(res, url, options, { heartbeatMs = 5000, onEvent
     if (!res.destroyed) res.end();
   }
 }
-module.exports = {proxyDiaryStream, notSaved, eventReason};
+module.exports = {proxyDiaryStream, notSaved, eventReason, relayableToken};

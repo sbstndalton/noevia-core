@@ -172,3 +172,10 @@ test('#232 a verbatim contextFailed event through the proxy leaves no reason on 
  const [row]=jobs.list(w,data.entryDay);
  assert.equal(row.state,'failed');assert.equal(row.code,'contextFailed');assert.equal('reason' in row,false);
 });
+test('#234 a failed row keeps a known code as sent and drops, never cuts, anything that is not a token',t=>{
+ const failedRow=event=>{const w=fixture(t),j=jobs.start(w,data);j.event({type:'error',saved:false,text:'Nothing was saved.',...event});j.finish();return jobs.list(w,data.entryDay)[0];};
+ for(const code of ['modelFailed','storageLoginRejected','x'.repeat(40)])assert.equal(failedRow({code}).code,code);
+ const bad=['x'.repeat(41),'x'.repeat(1000),'model failed','model\nFailed','model"Failed','model\u0000Failed','modèl','‮model','',42,null,true,{a:1},['modelFailed'],undefined];
+ for(const code of bad){const row=failedRow({code});assert.equal(row.state,'failed',JSON.stringify(code));assert.equal('code' in row,false,JSON.stringify(code));}
+ assert.equal('code' in failedRow({}),false);
+});
