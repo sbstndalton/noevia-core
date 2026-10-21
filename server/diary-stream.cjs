@@ -28,6 +28,12 @@ const MESSAGES = {
 function notSaved(code, extra = {}) {
   return { type: 'error', code, saved: false, text: MESSAGES[code] || MESSAGES.diaryUnavailable, ...extra };
 }
+// #230: the relayed `reason` is a short token the companion chose (chat_timeout, length_cap, or a code
+// added later), so it is not limited to the known values. It must be a string of at most this many
+// characters (the same bound the recovery record puts on `code`); anything else is dropped, not cut,
+// because a truncated token would be a different token from the one the companion sent.
+const MAX_REASON = 40;
+const relayableReason = value => typeof value === 'string' && value.length <= MAX_REASON;
 const CONNECT_REFUSED = new Set(['ECONNREFUSED', 'ENOTFOUND', 'EAI_AGAIN']);
 
 // Keep the browser/proxy connection alive throughout one journaled operation.
@@ -53,18 +59,27 @@ async function proxyDiaryStream(res, url, options, { heartbeatMs = 5000, onEvent
     else if (stage !== 'save') stage = event.text === MODEL_STATUS ? 'model' : stage === 'start' ? 'context' : stage;
   };
   // The companion's own error event, reworded when its stage proves nothing was saved.
-  // #228: the companion names why the model failed in a string `reason` (chat_timeout, length_cap). A
-  // reworded event keeps it, so the browser can say the real cause; the browser words it, not this proxy.
+  // #228: the companion names why the model failed in a string `reason` (chat_timeout, length_cap). The
+  // reworded event keeps it so the browser can say the real cause; the browser words it, not this proxy.
+  // #230: the reason belongs to `modelFailed` only. A `contextFailed` event or a diagnosed code (for
+  // example `modelNotServed`) names a different cause, so the companion's reason is not attached to it.
+  // For `modelFailed` the companion's reason is the only `reason` that can appear: a diagnosis that
+  // itself answers `modelFailed` has its own `reason` field removed. For any other diagnosed code the
+  // diagnosis fields pass through as they are, and the companion's reason is not mixed in, so the two
+  // can never collide.
   const refine = async event => {
     if (event?.type !== 'error' || event.saved !== undefined || stage === 'save' || stage === 'start') return event;
-    const reason = typeof event.reason === 'string' ? { reason: event.reason } : {};
+    const reason = relayableReason(event.reason) ? { reason: event.reason } : {};
     if (stage === 'model') {
       let found = null;
       try { found = diagnose ? await diagnose() : null; } catch { /* the plain wording below stands */ }
-      if (found?.code && MESSAGES[found.code]) return notSaved(found.code, { ...reason, ...Object.fromEntries(Object.entries(found).filter(([key]) => key !== 'code')) });
+      if (found?.code && MESSAGES[found.code]) {
+        const extra = Object.fromEntries(Object.entries(found).filter(([key]) => key !== 'code' && !(found.code === 'modelFailed' && key === 'reason')));
+        return notSaved(found.code, found.code === 'modelFailed' ? { ...extra, ...reason } : extra);
+      }
       return notSaved('modelFailed', reason);
     }
-    return notSaved('contextFailed', reason);
+    return notSaved('contextFailed');
   };
   try {
     send({type:'status',text:'Connecting to diary companion…'});
@@ -96,7 +111,8 @@ async function proxyDiaryStream(res, url, options, { heartbeatMs = 5000, onEvent
           if (event && typeof event === 'object') {
             track(event);
             // #228: `reason` is relayed only as the string the companion sent; anything else is dropped.
-            if (event.type === 'error' && 'reason' in event && typeof event.reason !== 'string') {
+            // #230: and only when it is short (MAX_REASON), so a runaway value never reaches the browser or the record.
+            if (event.type === 'error' && 'reason' in event && !relayableReason(event.reason)) {
               const { reason: _dropped, ...rest } = event;
               event = rest; frame = `data: ${JSON.stringify(event)}\n\n`;
             }
