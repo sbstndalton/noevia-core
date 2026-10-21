@@ -131,9 +131,9 @@ test('#230 a diagnosis field named reason never overrides the companion reason',
  for(const e of [win.wire,win.job]){assert.equal(e.code,'modelFailed');assert.equal(e.reason,'length_cap');assert.equal(e.detail,'kept');}
  const none=await relayed(t,[...GENERATING,{type:'error',text:'x'}],{diagnose:async()=>({code:'modelFailed',reason:'diagnosis_reason'})});
  assert.equal('reason' in none.wire,false);
- // A different diagnosed code keeps its own fields (including its own reason); the companion reason is not mixed in.
+ // A different diagnosed code keeps its own other fields; the companion reason is not mixed in, and (#232) a reason field of the diagnosis itself is dropped too, because only modelFailed carries one.
  const other=await relayed(t,[...GENERATING,{type:'error',reason:'length_cap',text:'x'}],{diagnose:async()=>({code:'modelNotServed',reason:'diagnosis_reason'})});
- assert.equal(other.wire.code,'modelNotServed');assert.equal(other.wire.reason,'diagnosis_reason');
+ assert.equal(other.wire.code,'modelNotServed');assert.equal('reason' in other.wire,false);assert.equal('reason' in other.job,false);
 });
 test('#230 a reason longer than 40 characters is dropped (not truncated); 40 characters and new codes pass',async t=>{
  const long='x'.repeat(1000);
@@ -148,4 +148,35 @@ test('#230 a reason longer than 40 characters is dropped (not truncated); 40 cha
   assert.equal((await relayed(t,[...GENERATING,{type:'error',code:'modelFailed',reason,saved:false,text:'x'}])).wire.reason,reason);
  }
  assert.equal('reason' in (await relayed(t,[...GENERATING,{type:'error',reason:'y'.repeat(41),text:'x'}])).wire,false);
+});
+// #232: one rule for the reason. It is a token (letters, digits, underscore; 1 to 40 characters), it is dropped
+// and never cut or cleaned, and only a modelFailed event carries it, including an event relayed as sent.
+test('#232 a verbatim event with another code never carries the reason, on the wire or in the record',async t=>{
+ for(const code of ['contextFailed','modelNotServed','diaryUnavailable','storageLoginRejected']){
+  const sent=await relayed(t,[...GENERATING,{type:'error',code,saved:false,reason:'chat_timeout',text:'Synthetic companion text'}]);
+  for(const e of [sent.wire,sent.job]){assert.equal(e.code,code);assert.equal(e.saved,false);assert.equal(e.text,'Synthetic companion text');assert.equal('reason' in e,false,code);}
+ }
+ // The same holds before the model stage (the proxy's early return for a verbatim event).
+ const early=await relayed(t,[{type:'error',code:'contextFailed',saved:false,reason:'chat_timeout',text:'x'}]);
+ for(const e of [early.wire,early.job]){assert.equal(e.code,'contextFailed');assert.equal('reason' in e,false);}
+ // A code-less verbatim error (nothing names it modelFailed) does not carry one either.
+ const bare=await relayed(t,[...GENERATING,{type:'error',saved:false,reason:'chat_timeout',text:'x'}]);
+ for(const e of [bare.wire,bare.job])assert.equal('reason' in e,false);
+ // An event without a saved flag that names another code is reworded by stage, and its reason is not lent to the new code.
+ const unflagged=await relayed(t,[...GENERATING,{type:'error',code:'contextFailed',reason:'chat_timeout',text:'x'}]);
+ for(const e of [unflagged.wire,unflagged.job]){assert.equal(e.code,'modelFailed');assert.equal(e.saved,false);assert.equal('reason' in e,false);}
+});
+test('#232 only a token passes: control, newline, bidirectional and other characters are dropped, new codes stay',async t=>{
+ const bad=['chat\ntimeout','chat_timeout\n','chat\rtimeout','chat\u0000timeout','chat\u001btimeout','‮schat_timeout','chat_‭timeout','chat⁦timeout','chat​timeout','chat timeout','chat-timeout','chat.timeout','chat_timeoutä','',' ','y'.repeat(41)];
+ for(const reason of bad){
+  const sent=await relayed(t,[...GENERATING,{type:'error',code:'modelFailed',reason,saved:false,text:'Synthetic companion text'}]);
+  const reworded=await relayed(t,[...GENERATING,{type:'error',code:'modelFailed',reason,text:'x'}]);
+  for(const e of [sent.wire,sent.job,reworded.wire,reworded.job]){assert.equal(e.code,'modelFailed',JSON.stringify(reason));assert.equal('reason' in e,false,JSON.stringify(reason));}
+  assert.equal(sent.wire.text,'Synthetic companion text');
+ }
+ for(const reason of ['some_new_code','chat_timeout','length_cap','empty_answer','CamelCase9','_','7','y'.repeat(40)]){
+  const sent=await relayed(t,[...GENERATING,{type:'error',code:'modelFailed',reason,saved:false,text:'x'}]);
+  const reworded=await relayed(t,[...GENERATING,{type:'error',code:'modelFailed',reason,text:'x'}]);
+  for(const e of [sent.wire,sent.job,reworded.wire,reworded.job])assert.equal(e.reason,reason);
+ }
 });
