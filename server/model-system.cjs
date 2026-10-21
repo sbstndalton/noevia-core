@@ -2,14 +2,25 @@
 // Some router entries are internal system routing models, not chat models a person configures
 // or tunes — Laya (the multilingual detector the Auto route consults) is the only one today.
 // #1179/#1596: the marker is an entry in noevia's own roles file beside models.ini
-// (models.roles.json: {"<section>": "laya"}). It is NOT a key in models.ini: llama-server reads that
+// (models.roles.json: {"<section>": "system-routing"}). It is NOT a key in models.ini: llama-server reads that
 // file too and its preset loader throws on an option it does not know. The name/path rule below is only
 // a deprecated fallback for a section that has no role; it is logged once per id.
 const fs = require('node:fs');
 const path = require('node:path');
 const LAYA_PREFIX = /^laya(?:[_.-]|$)/i;
-const LAYA_ROLE = 'laya';
+// noevia#2093 phase 1: a roles file may name the role ("system-routing") or still carry the legacy role
+// key. Readers accept both; the legacy key is accepted until phase 3 of that migration. Writers, the
+// oracle generators and the files on disk do not change in phase 1.
+const SYSTEM_ROUTING_ROLE = 'system-routing';
+const LEGACY_SYSTEM_ROUTING_ROLES = Object.freeze(['laya']);
+/** @deprecated the legacy role key; use isSystemRoutingRole (kept so an importer of the old name still works). */
+const LAYA_ROLE = LEGACY_SYSTEM_ROUTING_ROLES[0];
 const ROLES_FILENAME = 'models.roles.json';
+
+/** True when `role` (a roles-file value, as sectionRolesOf returns it: trimmed and lower-cased) is the system routing role, spelled by name or by the legacy key. */
+function isSystemRoutingRole(role) {
+  return role === SYSTEM_ROUTING_ROLE || LEGACY_SYSTEM_ROUTING_ROLES.includes(role);
+}
 
 function isLayaToken(value) {
   return LAYA_PREFIX.test(String(value || '').trim());
@@ -95,12 +106,13 @@ function fallbackLaya(token, where) {
  * True when `id` (a router/preset model id) or `modelPath` (a "--model" argument or preset file
  * path) identifies Laya, noevia's internal multilingual routing model. Laya is never offered for
  * tuning or manual configuration: it fits the system rather than a person tuning it. An explicit
- * an explicit "laya" role for the id in models.roles.json decides; only without one does the name/path rule apply.
+ * system routing role for the id in models.roles.json ("system-routing", or the legacy role key
+ * until phase 3 of noevia#2093) decides; only without one does the name/path rule apply.
  */
 function isSystemModel(id, modelPath) {
   const key = id === undefined || id === null ? '' : String(id).trim();
   refreshRoles();
-  if (key && sectionRoles.has(key)) return sectionRoles.get(key) === LAYA_ROLE;
+  if (key && sectionRoles.has(key)) return isSystemRoutingRole(sectionRoles.get(key));
   if (isLayaToken(key)) return fallbackLaya(key, 'name');
   const path = String(modelPath || '');
   if (!path) return false;
@@ -172,5 +184,6 @@ const MISSING_MODEL_FILE_REASON = 'This preset points at a model file that is no
 module.exports = {
   SYSTEM_MODEL_LOAD_REASON, SIDECAR_MODEL_LOAD_REASON, MISSING_MODEL_FILE_REASON,
   isSystemModel, modelPathFromArgs, SYSTEM_MODEL_REASON, SYSTEM_MODEL_DELETE_REASON, sectionRolesOf, rememberSectionRoles, useRolesBeside, refreshRoles, rolesFileFor, ROLES_FILENAME, LAYA_ROLE,
+  SYSTEM_ROUTING_ROLE, LEGACY_SYSTEM_ROUTING_ROLES, isSystemRoutingRole,
   sidecarModelNames, isSidecarModel, SIDECAR_MODEL_DELETE_REASON,
 };
