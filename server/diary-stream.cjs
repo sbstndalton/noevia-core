@@ -53,15 +53,18 @@ async function proxyDiaryStream(res, url, options, { heartbeatMs = 5000, onEvent
     else if (stage !== 'save') stage = event.text === MODEL_STATUS ? 'model' : stage === 'start' ? 'context' : stage;
   };
   // The companion's own error event, reworded when its stage proves nothing was saved.
+  // #228: the companion names why the model failed in a string `reason` (chat_timeout, length_cap). A
+  // reworded event keeps it, so the browser can say the real cause; the browser words it, not this proxy.
   const refine = async event => {
     if (event?.type !== 'error' || event.saved !== undefined || stage === 'save' || stage === 'start') return event;
+    const reason = typeof event.reason === 'string' ? { reason: event.reason } : {};
     if (stage === 'model') {
       let found = null;
       try { found = diagnose ? await diagnose() : null; } catch { /* the plain wording below stands */ }
-      if (found?.code && MESSAGES[found.code]) return notSaved(found.code, Object.fromEntries(Object.entries(found).filter(([key]) => key !== 'code')));
-      return notSaved('modelFailed');
+      if (found?.code && MESSAGES[found.code]) return notSaved(found.code, { ...reason, ...Object.fromEntries(Object.entries(found).filter(([key]) => key !== 'code')) });
+      return notSaved('modelFailed', reason);
     }
-    return notSaved('contextFailed');
+    return notSaved('contextFailed', reason);
   };
   try {
     send({type:'status',text:'Connecting to diary companion…'});
@@ -92,6 +95,11 @@ async function proxyDiaryStream(res, url, options, { heartbeatMs = 5000, onEvent
           try { const line = frame.split('\n').find(l => l.startsWith('data: ')); if (line) event = JSON.parse(line.slice(6)); } catch { /* A non-JSON data frame (e.g. `[DONE]`) must not look like an interrupted stream. */ }
           if (event && typeof event === 'object') {
             track(event);
+            // #228: `reason` is relayed only as the string the companion sent; anything else is dropped.
+            if (event.type === 'error' && 'reason' in event && typeof event.reason !== 'string') {
+              const { reason: _dropped, ...rest } = event;
+              event = rest; frame = `data: ${JSON.stringify(event)}\n\n`;
+            }
             const refined = await refine(event);
             if (refined !== event) { event = refined; frame = `data: ${JSON.stringify(event)}\n\n`; }
             if (onEvent) { try { onEvent(event); } catch { /* Optional telemetry must never break diary capture. */ } }

@@ -73,3 +73,43 @@ test('#1422 the companion stage decides: an error before saving began is not sav
   assert.equal(events.find(e=>e.type==='error').code,expected,statuses.join('|'));
  }
 });
+// #228: the companion's `reason` (chat_timeout, length_cap) names why the model failed. It is relayed
+// unchanged when it is a string; a missing reason stays missing; a non-string reason is not forwarded.
+const reasonStream=events=>new Response(new ReadableStream({start(c){for(const e of events)c.enqueue(new TextEncoder().encode('data: '+JSON.stringify(e)+'\n\n'));c.close();}}),{headers:{'Content-Type':'text/event-stream'}});
+async function relayed(t,events,options={}){
+ t.mock.restoreAll();t.mock.method(globalThis,'fetch',async()=>reasonStream(events));
+ const seen=[];const {res,text}=response();await proxyDiaryStream(res,'http://synthetic',{}, {...options,job:{event:e=>seen.push(e),finish(){}}});
+ const wire=text().split('\n\n').filter(s=>s.startsWith('data: ')).map(s=>JSON.parse(s.slice(6))).find(e=>e.type==='error');
+ return {wire,job:seen.find(e=>e.type==='error')};
+}
+const GENERATING=[{type:'status',text:'Opening diary context…'},{type:'status',text:'Generating companion response…'}];
+test('#228 a saved:false model error keeps its string reason exactly, on the wire and in the recovery record',async t=>{
+ for(const reason of ['chat_timeout','length_cap']){
+  const error={type:'error',code:'modelFailed',reason,saved:false,text:'Synthetic companion text'};
+  const {wire,job}=await relayed(t,[...GENERATING,error]);
+  assert.deepEqual(wire,error,reason);assert.deepEqual(job,error,reason);
+ }
+});
+test('#228 a model error the proxy rewords (no saved flag) still carries the companion reason',async t=>{
+ for(const reason of ['chat_timeout','length_cap']){
+  const {wire,job}=await relayed(t,[...GENERATING,{type:'error',code:'modelFailed',reason,text:'Synthetic companion text'}]);
+  for(const e of [wire,job]){assert.equal(e.code,'modelFailed',reason);assert.equal(e.saved,false,reason);assert.equal(e.reason,reason);}
+ }
+ // The diagnosis path names a different cause but still keeps what the companion said.
+ const {wire}=await relayed(t,[...GENERATING,{type:'error',reason:'length_cap',text:'x'}],{diagnose:async()=>({code:'modelNotServed',model:'synthetic-model'})});
+ assert.equal(wire.code,'modelNotServed');assert.equal(wire.model,'synthetic-model');assert.equal(wire.reason,'length_cap');
+});
+test('#228 a missing reason stays missing',async t=>{
+ const verbatim=await relayed(t,[...GENERATING,{type:'error',code:'modelFailed',saved:false,text:'Synthetic companion text'}]);
+ const reworded=await relayed(t,[...GENERATING,{type:'error',text:'x'}]);
+ for(const e of [verbatim.wire,verbatim.job,reworded.wire,reworded.job])assert.equal('reason' in e,false);
+ assert.equal(reworded.wire.code,'modelFailed');
+});
+test('#228 a non-string reason is not forwarded, whether the error is relayed as sent or reworded',async t=>{
+ for(const reason of [42,null,true,{nested:'chat_timeout'},['length_cap']]){
+  const sent=await relayed(t,[...GENERATING,{type:'error',code:'modelFailed',reason,saved:false,text:'Synthetic companion text'}]);
+  const reworded=await relayed(t,[...GENERATING,{type:'error',reason,text:'x'}]);
+  for(const e of [sent.wire,sent.job,reworded.wire,reworded.job])assert.equal('reason' in e,false,JSON.stringify(reason));
+  assert.equal(sent.wire.code,'modelFailed');assert.equal(sent.wire.saved,false);assert.equal(sent.wire.text,'Synthetic companion text');
+ }
+});
