@@ -95,9 +95,6 @@ test('#228 a model error the proxy rewords (no saved flag) still carries the com
   const {wire,job}=await relayed(t,[...GENERATING,{type:'error',code:'modelFailed',reason,text:'Synthetic companion text'}]);
   for(const e of [wire,job]){assert.equal(e.code,'modelFailed',reason);assert.equal(e.saved,false,reason);assert.equal(e.reason,reason);}
  }
- // The diagnosis path names a different cause but still keeps what the companion said.
- const {wire}=await relayed(t,[...GENERATING,{type:'error',reason:'length_cap',text:'x'}],{diagnose:async()=>({code:'modelNotServed',model:'synthetic-model'})});
- assert.equal(wire.code,'modelNotServed');assert.equal(wire.model,'synthetic-model');assert.equal(wire.reason,'length_cap');
 });
 test('#228 a missing reason stays missing',async t=>{
  const verbatim=await relayed(t,[...GENERATING,{type:'error',code:'modelFailed',saved:false,text:'Synthetic companion text'}]);
@@ -112,4 +109,43 @@ test('#228 a non-string reason is not forwarded, whether the error is relayed as
   for(const e of [sent.wire,sent.job,reworded.wire,reworded.job])assert.equal('reason' in e,false,JSON.stringify(reason));
   assert.equal(sent.wire.code,'modelFailed');assert.equal(sent.wire.saved,false);assert.equal(sent.wire.text,'Synthetic companion text');
  }
+});
+
+// #230: the reason belongs to `modelFailed` only, the companion's reason is never overridden by a
+// diagnosis field of the same name, and a relayed reason is a short string (dropped, not cut, above 40).
+test('#230 the companion reason is attached to modelFailed only, not to contextFailed or a diagnosed code',async t=>{
+ const companion={type:'error',reason:'chat_timeout',text:'x'};
+ const model=await relayed(t,[...GENERATING,companion]);
+ for(const e of [model.wire,model.job]){assert.equal(e.code,'modelFailed');assert.equal(e.reason,'chat_timeout');}
+ const context=await relayed(t,[GENERATING[0],companion]);
+ for(const e of [context.wire,context.job]){assert.equal(e.code,'contextFailed');assert.equal(e.saved,false);assert.equal('reason' in e,false);}
+ const diagnosed=await relayed(t,[...GENERATING,companion],{diagnose:async()=>({code:'modelNotServed',model:'synthetic-model'})});
+ for(const e of [diagnosed.wire,diagnosed.job]){assert.equal(e.code,'modelNotServed');assert.equal(e.model,'synthetic-model');assert.equal('reason' in e,false);}
+ // A diagnosis that names no known code falls back to modelFailed, which does carry the companion reason.
+ const unknown=await relayed(t,[...GENERATING,companion],{diagnose:async()=>({code:'somethingNew'})});
+ assert.equal(unknown.wire.code,'modelFailed');assert.equal(unknown.wire.reason,'chat_timeout');
+});
+test('#230 a diagnosis field named reason never overrides the companion reason',async t=>{
+ // Diagnosis answering modelFailed itself: the companion reason wins; with none from the companion, the diagnosis one is not used.
+ const win=await relayed(t,[...GENERATING,{type:'error',reason:'length_cap',text:'x'}],{diagnose:async()=>({code:'modelFailed',reason:'diagnosis_reason',detail:'kept'})});
+ for(const e of [win.wire,win.job]){assert.equal(e.code,'modelFailed');assert.equal(e.reason,'length_cap');assert.equal(e.detail,'kept');}
+ const none=await relayed(t,[...GENERATING,{type:'error',text:'x'}],{diagnose:async()=>({code:'modelFailed',reason:'diagnosis_reason'})});
+ assert.equal('reason' in none.wire,false);
+ // A different diagnosed code keeps its own fields (including its own reason); the companion reason is not mixed in.
+ const other=await relayed(t,[...GENERATING,{type:'error',reason:'length_cap',text:'x'}],{diagnose:async()=>({code:'modelNotServed',reason:'diagnosis_reason'})});
+ assert.equal(other.wire.code,'modelNotServed');assert.equal(other.wire.reason,'diagnosis_reason');
+});
+test('#230 a reason longer than 40 characters is dropped (not truncated); 40 characters and new codes pass',async t=>{
+ const long='x'.repeat(1000);
+ const sent=await relayed(t,[...GENERATING,{type:'error',code:'modelFailed',reason:long,saved:false,text:'Synthetic companion text'}]);
+ const reworded=await relayed(t,[...GENERATING,{type:'error',reason:long,text:'x'}]);
+ for(const e of [sent.wire,sent.job,reworded.wire,reworded.job])assert.equal('reason' in e,false);
+ assert.equal(sent.wire.code,'modelFailed');assert.equal(sent.wire.text,'Synthetic companion text');assert.equal(reworded.wire.code,'modelFailed');
+ assert.ok(!JSON.stringify([sent.wire,reworded.wire]).includes('xxxxxxxxxx'));
+ for(const reason of ['a_new_companion_code','y'.repeat(40)]){
+  const e=await relayed(t,[...GENERATING,{type:'error',reason,text:'x'}]);
+  assert.equal(e.wire.reason,reason);assert.equal(e.job.reason,reason);
+  assert.equal((await relayed(t,[...GENERATING,{type:'error',code:'modelFailed',reason,saved:false,text:'x'}])).wire.reason,reason);
+ }
+ assert.equal('reason' in (await relayed(t,[...GENERATING,{type:'error',reason:'y'.repeat(41),text:'x'}])).wire,false);
 });

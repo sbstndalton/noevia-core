@@ -56,7 +56,7 @@ function start(workspace,{entryDay,exchangeId,message,kind,preparationId},{saveI
     // #1422: a failure after which the server KNOWS nothing was saved (the proxy proves it from the
     // companion's stage or an HTTP refusal before the exchange started) is `failed`, not `uncertain`:
     // there is nothing to check, the message can simply be resent.
-    if(event.saved===false){row.state='failed';row.code=typeof event.code==='string'?event.code.slice(0,40):undefined;row.error=String(event.text||'Nothing was saved. You can resend.').slice(0,400);}
+    if(event.saved===false){row.state='failed';row.code=typeof event.code==='string'?event.code.slice(0,40):undefined;row.reason=typeof event.reason==='string'?event.reason.slice(0,40):undefined;row.error=String(event.text||'Nothing was saved. You can resend.').slice(0,400);}
     else if(row.state!=='failed'){row.state='uncertain';row.error='The connection or save was interrupted. Check the saved diary before sending again.';}
    }
    if(event.type==='done'){row.state=(row.kind==='preparation'||row.decision&&row.decision!=='error')&&row.state!=='uncertain'&&row.state!=='failed'?'complete':row.state==='failed'?'failed':'uncertain';}
