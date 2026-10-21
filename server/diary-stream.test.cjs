@@ -180,3 +180,15 @@ test('#232 only a token passes: control, newline, bidirectional and other charac
   for(const e of [sent.wire,sent.job,reworded.wire,reworded.job])assert.equal(e.reason,reason);
  }
 });
+test('#234 a rebuilt frame is exactly the JSON data line and a bare LF LF terminator',async t=>{
+ // A reason that is not a token is dropped, so the proxy rebuilds the frame rather than relaying it verbatim.
+ const {res,text}=response();t.mock.restoreAll();t.mock.method(globalThis,'fetch',async()=>reasonStream([{type:'error',code:'modelFailed',reason:'not a token',saved:false,text:'Synthetic'}]));
+ await proxyDiaryStream(res,'http://synthetic',{}, {});
+ const expected='data: '+JSON.stringify({type:'status',text:'Connecting to diary companion…'})+'\n\n'+'data: '+JSON.stringify({type:'error',code:'modelFailed',saved:false,text:'Synthetic'})+'\n\n';
+ assert.equal(text(),expected);assert.equal(text().endsWith('\n\n'),true);assert.equal(text().includes('\r'),false);assert.equal(text().endsWith('\n\n\n'),false);
+});
+test('#234 relayableToken is the one rule: tokens pass, everything else fails',()=>{
+ const {relayableToken}=require('./diary-stream.cjs');
+ for(const v of ['a','chat_timeout','storageLoginRejected','z'.repeat(40)])assert.equal(relayableToken(v),true,v);
+ for(const v of ['','z'.repeat(41),'a b','a\nb','a"b','a\u0000b','é','‮a',undefined,null,42,{},[]])assert.equal(relayableToken(v),false,JSON.stringify(v));
+});

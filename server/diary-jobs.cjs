@@ -1,7 +1,7 @@
 'use strict';
 const fs=require('node:fs'),path=require('node:path');
 const {atomicJson}=require('./workspace.cjs');
-const {eventReason}=require('./diary-stream.cjs');
+const {eventReason,relayableToken}=require('./diary-stream.cjs');
 const active=new Set();
 const validDay=day=>typeof day==='string'&&/^\d{4}-\d{2}-\d{2}$/.test(day)&&Number.isFinite(Date.parse(day+'T12:00:00Z'))&&new Date(day+'T12:00:00Z').toISOString().slice(0,10)===day;
 function location(workspace,day,id){
@@ -57,7 +57,8 @@ function start(workspace,{entryDay,exchangeId,message,kind,preparationId},{saveI
     // #1422: a failure after which the server KNOWS nothing was saved (the proxy proves it from the
     // companion's stage or an HTTP refusal before the exchange started) is `failed`, not `uncertain`:
     // there is nothing to check, the message can simply be resent.
-    if(event.saved===false){row.state='failed';row.code=typeof event.code==='string'?event.code.slice(0,40):undefined;row.reason=eventReason(event);row.error=String(event.text||'Nothing was saved. You can resend.').slice(0,400);}
+    if(event.saved===false){row.state='failed';row.code=relayableToken(event.code)?event.code:undefined; // #234: the reason rule: a token is kept as sent, anything else is dropped, never cut
+    row.reason=eventReason(event);row.error=String(event.text||'Nothing was saved. You can resend.').slice(0,400);}
     else if(row.state!=='failed'){row.state='uncertain';row.error='The connection or save was interrupted. Check the saved diary before sending again.';}
    }
    if(event.type==='done'){row.state=(row.kind==='preparation'||row.decision&&row.decision!=='error')&&row.state!=='uncertain'&&row.state!=='failed'?'complete':row.state==='failed'?'failed':'uncertain';}
