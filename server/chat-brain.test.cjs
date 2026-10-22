@@ -428,3 +428,17 @@ test('handleChat: brain context never reaches an external or other off-box provi
     assert.equal(JSON.stringify(on), JSON.stringify(base), `${provider.id}: the request is the one without brain context`);
   }
 });
+
+test('builder: a failed reply (its partial text) is not part of the transcript the reasoner reads (#2116)', async () => {
+  const { b, calls } = builder();
+  const r = await b.build({ chat: { id: 'c1', title: 'Shed' }, history: [...history,
+    { role: 'user', content: 'And the roof?' }, { role: 'assistant', content: 'PARTIAL-TEXT-OF-A-FAILED-REPLY', failure: 'The reply failed.' }] });
+  assert.equal(r.ok, true);
+  assert.doesNotMatch(calls[0].messages[1].content, /PARTIAL-TEXT-OF-A-FAILED-REPLY/);
+  assert.match(calls[0].messages[1].content, /And the roof\?/, 'the question stays');
+  // Nothing but a failed reply to read: nothing to summarise.
+  const only = builder();
+  const empty = await only.b.build({ chat: { id: 'c2', title: 'x' }, history: [{ role: 'assistant', content: 'partial', failure: 'The reply failed.' }] });
+  assert.deepEqual([empty.ok, empty.reason], [false, 'empty']);
+  assert.equal(only.calls.length, 0);
+});

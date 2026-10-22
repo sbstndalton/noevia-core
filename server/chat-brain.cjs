@@ -27,6 +27,7 @@
 const crypto = require('node:crypto');
 const { frameUntrusted } = require('./prompt-framing.cjs');
 const { chatMarkdown } = require('./chat-export.cjs');
+const { isFailedTurn } = require('./chat-sources.cjs');
 
 const BRAIN_SCHEMA = 1;
 const LIMITS = Object.freeze({
@@ -258,7 +259,7 @@ function createBrainBuilder({ enabled, model, complete, admit, loadedModel = () 
     const skip = (reason, extra = {}) => { if (reason !== 'off') safeLog(log, { event: 'brain.fallback', reason, ms: Math.max(0, now() - started), ...extra }); return { ok: false, reason }; };
     try {
       if (enabled() !== true) return skip('off');
-      const turns = (Array.isArray(history) ? history : []).filter((m) => m && (m.role === 'user' || m.role === 'assistant') && String(m.content || '').trim());
+      const turns = (Array.isArray(history) ? history : []).filter((m) => m && (m.role === 'user' || m.role === 'assistant') && String(m.content || '').trim() && !isFailedTurn(m));
       if (!turns.length) return skip('empty');
       const m = String(model() || '').trim();
       if (!m) return skip('no-model');
