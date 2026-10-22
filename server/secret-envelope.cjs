@@ -1,7 +1,7 @@
 'use strict';
 
-// Credential envelopes (#979): versionOf, decryptWith, open and encrypt, moved here unchanged from
-// secrets.cjs. secrets.cjs keeps the key files, rotation and derivation and passes key bytes in.
+// Credential envelopes (#979): open and encrypt. secrets.cjs keeps the key files, rotation and
+// derivation and passes key bytes in.
 //
 // Formats:
 //   enc:v1:<iv|tag|body>  legacy, no associated data (still decrypts)
@@ -11,16 +11,18 @@
 // looks like a ciphertext is treated as plaintext, never stored verbatim.
 //
 // `secret-envelope` (sbstndalton/noevia-rs, in the dav-parse.wasm module pinned by
-// server/dav-parse.lock) is the Rust port. SECRET_ENVELOPE_IMPL=js|wasm picks one (default js; any
-// other value means js, with one warning). Both read and write the same formats, so switching
-// needs no migration and every existing v1/v2 value opens either way; a value written by one opens
-// in the other.
+// server/dav-parse.lock) seals and opens, always (since #1071; it was SECRET_ENVELOPE_IMPL=wasm,
+// default js). It reads and writes the formats the JS code wrote, so no stored value needs a
+// migration (tests/fixtures/secret-envelope-release.v1.json holds values the last JS-sealing
+// release wrote). The Rust front's native reads open with the same crate. A leftover
+// SECRET_ENVELOPE_IMPL only warns at startup (dav-parse-wasm.cjs RETIRED_FLAGS). The JS code is a
+// test oracle: tests/server/oracle/secret-envelope.cjs.
 //
-// `wasm` FAILS CLOSED: a missing or tampered module, a trap or an unexpected reply throws; nothing
-// falls back to the JS code and nothing is re-encrypted on a failure. A value that cannot be opened
-// throws 'credential could not be opened' (a v2 value without a user keeps the JS message
-// 'credential is bound to an account'); a seal failure throws 'credential could not be sealed'.
-// Only the failure reason is logged (module failures only), never a key, plaintext or ciphertext.
+// It FAILS CLOSED: a missing or tampered module, a trap or an unexpected reply throws; nothing
+// falls back to JS and nothing is re-encrypted on a failure. A value that cannot be opened throws
+// "credential could not be opened" (a v2 value without a user: "credential is bound to an
+// account"); a seal failure throws "credential could not be sealed". Only the failure reason is
+// logged (module failures only), never a key, plaintext or ciphertext.
 //
 // What crosses: the key bytes (current, and previous when configured), String(userId) when the
 // value is bound, and the value as UTF-16 units (so Node's lenient base64url reading of odd text is
@@ -29,66 +31,20 @@
 // dav-parse-wasm.cjs zeroes the whole linear memory and drops the instance after every secret call.
 // The plaintext copies made here are zeroed after use; the key Buffers belong to secrets.cjs.
 //
-// Differences (wasm refuses, js would try): values over 12 Mi UTF-16 units, plaintext over 8 MiB,
-// user ids over 64 KiB. Both refuse an envelope whose tag is shorter than 16 bytes (#995).
+// Bounds the JS code did not have (refused, never answered differently): values over 12 Mi UTF-16
+// units, plaintext over 8 MiB, user ids over 64 KiB. An envelope whose tag is shorter than 16
+// bytes is refused, as the JS code also did since #995.
 
 const crypto = require('crypto');
 const davParseWasm = require('./dav-parse-wasm.cjs');
 
-const aadFor = (userId) => Buffer.from(`noevia:user:${userId}`, 'utf8');
 const hasUser = (userId) => userId !== undefined && userId !== null && userId !== '';
+/** The envelope version a stored value claims (2, 1, or 0 for a plain value): rotation's bookkeeping. */
 const versionOf = (text) => (text.startsWith('enc:v2:') ? 2 : text.startsWith('enc:v1:') ? 1 : 0);
-
-function encryptJs(key, value, userId) {
-  if (value === undefined || value === null || value === '') return '';
-  const bound = hasUser(userId);
-  const iv = crypto.randomBytes(12); const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
-  if (bound) cipher.setAAD(aadFor(userId));
-  const body = Buffer.concat([cipher.update(String(value), 'utf8'), cipher.final()]);
-  return `enc:${bound ? 'v2' : 'v1'}:${Buffer.concat([iv, cipher.getAuthTag(), body]).toString('base64url')}`;
-}
-
-function decryptWithJs(k, text, version, userId) {
-  const raw = Buffer.from(text.slice(7), 'base64url');
-  // iv(12) + tag(16) at least, and only a full 16-byte tag (#995): Node would otherwise check a
-  // truncated tag. encrypt never writes one, so no stored value is affected.
-  if (raw.length < 28) throw new Error('credential envelope is truncated');
-  const decipher = crypto.createDecipheriv('aes-256-gcm', k, raw.subarray(0, 12), { authTagLength: 16 });
-  if (version === 2) decipher.setAAD(aadFor(userId));
-  decipher.setAuthTag(raw.subarray(12, 28));
-  return Buffer.concat([decipher.update(raw.subarray(28)), decipher.final()]).toString('utf8');
-}
-
-// Returns { plain, keyUsed: 'current'|'previous'|'none' }; throws when no key opens it.
-function openJs(key, previousKey, value, userId) {
-  const text = String(value || '');
-  const version = versionOf(text);
-  if (!version) return { plain: value || '', keyUsed: 'none' };
-  if (version === 2 && !hasUser(userId)) throw new Error('credential is bound to an account');
-  try { return { plain: decryptWithJs(key, text, version, userId), keyUsed: 'current' }; } catch (e) {
-    if (!previousKey) throw e;
-  }
-  return { plain: decryptWithJs(previousKey, text, version, userId), keyUsed: 'previous' };
-}
 
 const OPEN_FAILURE = 'credential could not be opened';
 const SEAL_FAILURE = 'credential could not be sealed';
 const BOUND_FAILURE = 'credential is bound to an account';
-const IMPLS = new Set(['js', 'wasm']);
-let warnedImpl = '';
-
-/** SECRET_ENVELOPE_IMPL, read per call so a test (or an owner flip plus restart) takes effect. */
-function secretEnvelopeImpl(env = process.env) {
-  const raw = env.SECRET_ENVELOPE_IMPL;
-  if (raw === undefined || raw === '') return 'js';
-  const value = String(raw).trim().toLowerCase();
-  if (IMPLS.has(value)) return value;
-  if (warnedImpl !== value) {
-    warnedImpl = value;
-    console.warn(`[secrets] SECRET_ENVELOPE_IMPL=${JSON.stringify(String(raw))} is not js or wasm; using js`);
-  }
-  return 'js';
-}
 
 const MODULE_REASONS = new Set(['lock', 'missing', 'checksum', 'compile', 'abi', 'trap', 'reply', 'unknown']);
 
@@ -100,7 +56,10 @@ function failure(op, err, message) {
   return Object.assign(new Error(reason === 'bound' ? BOUND_FAILURE : message), { code: 'secret_envelope_failed', reason });
 }
 
-function openWasm(key, previousKey, value, userId) {
+/** Opens a stored value with `key`, then `previousKey` (a Buffer or null). Returns
+ *  { plain, keyUsed: 'current'|'previous'|'none' } ('none': not an envelope, returned as it is);
+ *  throws when no key opens it. */
+function open(key, previousKey, value, userId) {
   const text = String(value || '');
   let r;
   try {
@@ -112,7 +71,9 @@ function openWasm(key, previousKey, value, userId) {
   return { plain, keyUsed: r.keyUsed };
 }
 
-function encryptWasm(key, value, userId) {
+/** Seals String(value) under `key`: enc:v2 bound to `userId` when there is one, else enc:v1. An
+ *  empty value (undefined, null or '') stays ''. */
+function encrypt(key, value, userId) {
   if (value === undefined || value === null || value === '') return '';
   const plain = Buffer.from(String(value), 'utf8');
   try {
@@ -120,14 +81,4 @@ function encryptWasm(key, value, userId) {
   } catch (err) { throw failure('seal', err, SEAL_FAILURE); } finally { plain.fill(0); }
 }
 
-/** encryptJs or its Rust port, by SECRET_ENVELOPE_IMPL. */
-function encrypt(key, value, userId, { impl = secretEnvelopeImpl() } = {}) {
-  return impl === 'wasm' ? encryptWasm(key, value, userId) : encryptJs(key, value, userId);
-}
-
-/** openJs or its Rust port, by SECRET_ENVELOPE_IMPL. */
-function open(key, previousKey, value, userId, { impl = secretEnvelopeImpl() } = {}) {
-  return impl === 'wasm' ? openWasm(key, previousKey, value, userId) : openJs(key, previousKey, value, userId);
-}
-
-module.exports = { aadFor, hasUser, versionOf, encryptJs, decryptWithJs, openJs, encrypt, open, secretEnvelopeImpl, OPEN_FAILURE, SEAL_FAILURE, BOUND_FAILURE };
+module.exports = { hasUser, versionOf, encrypt, open, OPEN_FAILURE, SEAL_FAILURE, BOUND_FAILURE };

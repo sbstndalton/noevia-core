@@ -2,7 +2,7 @@
 'use strict';
 // Regenerates the shared differential fixtures for the S3 listing scan (#976) and the storage path
 // rules (#978). Expectations come from the JS references (tests/server/oracle/s3-listing.cjs s3PageRecordsJs,
-// server/storage-path.cjs *Js). The same files are committed byte-for-byte in sbstndalton/noevia-rs
+// tests/server/oracle/storage-path.cjs *Js). The same files are committed byte-for-byte in sbstndalton/noevia-rs
 // (crates/s3-list-parse/tests/fixtures/s3-list.v1.json, crates/storage-path/tests/fixtures/
 // storage-path.v1.json); noevia-core CI compares them.
 //   node tools/gen-storage-fixtures.cjs s3 > tests/fixtures/s3-list.v1.json
@@ -10,7 +10,7 @@
 // Every bucket, key, host and path below is made up. No real storage content.
 
 const { s3PageRecordsJs } = require('../tests/server/oracle/s3-listing.cjs');
-const { safeRelativePathJs, cleanRootJs, joinRootJs, isPlainFilenameJs } = require('../server/storage-path.cjs');
+const { safeRelativePathJs, cleanRootJs, joinRootJs, isPlainFilenameJs } = require('../tests/server/oracle/storage-path.cjs');
 
 const which = process.argv[2];
 let seed = which === 's3' ? 0x976 : 0x978;

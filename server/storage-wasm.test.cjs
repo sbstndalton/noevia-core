@@ -1,7 +1,8 @@
 'use strict';
 
-// The S3 page scan (#976, always Rust since #1071) and the STORAGE_PATH_IMPL switch (#978): js is the
-// default and unchanged; Rust runs inside dav-parse.wasm and fails closed with fixed public messages.
+// The S3 page scan (#976) and the storage path rules (#978), both always Rust since #1071 (the path
+// rules were STORAGE_PATH_IMPL, default js): they run inside dav-parse.wasm and fail closed with
+// fixed public messages; a leftover STORAGE_PATH_IMPL never brings the JS rules back.
 // Synthetic buckets, keys and paths only.
 
 const assert = require('node:assert/strict');
@@ -49,40 +50,32 @@ async function withS3(fn) {
 const EXPECTED_S3 = [['a&b.md', 'Docs/a&b.md', false, 42, '.md'], ['huge.bin', 'Docs/huge.bin', false, 1e20, '.bin'], ['R&D', 'Docs/R&D', true, null, ''], ['two.txt', 'Docs/two.txt', false, null, '.txt']];
 const shape = (list) => list.map((e) => [e.name, e.path, e.isDir, e.size, e.ext]);
 
-test('STORAGE_PATH_IMPL defaults to js; unknown values mean js with one warning', (t) => {
-  const fn = storagePath.storagePathImpl, key = 'STORAGE_PATH_IMPL';
-  assert.equal(fn({}), 'js');
-  assert.equal(fn({ [key]: '' }), 'js');
-  assert.equal(fn({ [key]: 'js' }), 'js');
-  assert.equal(fn({ [key]: ' WASM ' }), 'wasm');
-  const warn = t.mock.method(console, 'warn', () => {});
-  assert.equal(fn({ [key]: 'rust' }), 'js');
-  assert.equal(fn({ [key]: 'rust' }), 'js');
-  assert.equal(warn.mock.callCount(), 1);
-});
-
-test('STORAGE_PATH_IMPL is independent of the retired S3_PARSE_IMPL and DAV_PARSE_IMPL', () => {
-  assert.equal(storagePath.storagePathImpl({ DAV_PARSE_IMPL: 'wasm', S3_PARSE_IMPL: 'wasm' }), 'js');
+test('STORAGE_PATH_IMPL is retired (#1071): no selector and no JS rules are left in production', () => {
+  assert.deepEqual(Object.keys(storagePath).sort(), ['PUBLIC_FAILURE', 'cleanRoot', 'joinRoot', 'safeRelativePath']);
+  for (const gone of ['storagePathImpl', 'safeRelativePathJs', 'cleanRootJs', 'joinRootJs', 'isPlainFilenameJs', 'isPlainFilename']) assert.equal(storagePath[gone], undefined, gone);
+  assert.equal(davParseWasm.RETIRED_FLAGS.STORAGE_PATH_IMPL, 'wasm');
   assert.equal(s3Listing.s3ParseImpl, undefined);
   assert.equal(s3Listing.s3PageRecordsJs, undefined);
 });
 
-test('the S3 listing is Rust even with the retired S3_PARSE_IMPL=js, and the js path rules never touch the module', { skip: skipWasm }, () => withEnv(
-  { S3_PARSE_IMPL: 'js', STORAGE_PATH_IMPL: undefined, DAV_PARSE_WASM: undefined },
+test('the S3 listing and the path rules are Rust even with the retired S3_PARSE_IMPL=js and STORAGE_PATH_IMPL=js', { skip: skipWasm }, () => withEnv(
+  { S3_PARSE_IMPL: 'js', STORAGE_PATH_IMPL: 'js', DAV_PARSE_WASM: undefined },
   () => withS3(async (seen) => {
     assert.deepEqual(shape(await storageClient.listFiles(s3Conn, 'Docs')), EXPECTED_S3);
     assert.deepEqual(seen, [null, 'tok&1'], 'the repeated token stops the walk');
     assert.equal(storageClient.safeRelativePath(' a\\b//c '), 'a/b/c');
     assert.doesNotThrow(() => uploads.validate('a.md', Buffer.from('x')));
+    // Only the module refuses a lone surrogate (the JS rules answered 'a\ud800'): Rust decided.
+    assert.throws(() => storageClient.safeRelativePath('a\ud800'), (e) => e.code === 'storage_path_failed' && e.reason === 'input');
   })));
 
 test('the S3 listing fails closed with a fixed public message when the module is missing', (t) => withEnv(
   { DAV_PARSE_WASM: MISSING },
   () => withS3(async () => {
     const warn = t.mock.method(console, 'warn', () => {});
-    // The whole listing fails closed (the S3 region check, also Rust, is the first to stop it)...
+    // The whole listing fails closed (the path rule, also Rust since #1071, is the first to stop it)...
     const whole = await storageClient.listFiles(s3Conn, 'Docs').then(() => null, (e) => e);
-    assert.ok(whole && whole.status === 502 && /could not be (read|checked)$/.test(whole.message), String(whole?.message));
+    assert.ok(whole && whole.status === 500 && whole.code === 'storage_path_failed' && whole.message === storagePath.PUBLIC_FAILURE, String(whole?.message));
     // ...and the page scan itself answers with its own fixed message.
     const err = (() => { try { s3Listing.s3Page('<ListBucketResult/>', ''); } catch (e) { return e; } return null; })();
     assert.equal(err?.message, 'storage listing could not be read');
@@ -92,20 +85,31 @@ test('the S3 listing fails closed with a fixed public message when the module is
     assert.ok(warn.mock.calls.some((c) => /s3-list-parse failed \(missing\): .*no-such-storage-dav-parse\.wasm/.test(String(c.arguments[0]))));
   })));
 
-test('STORAGE_PATH_IMPL=wasm fails closed with a fixed public message when the module is missing', (t) => withEnv(
-  { STORAGE_PATH_IMPL: 'wasm', DAV_PARSE_WASM: MISSING },
-  () => {
-    const warn = t.mock.method(console, 'warn', () => {});
-    for (const call of [() => storageClient.safeRelativePath('a/b'), () => storagePath.cleanRoot('/r/'), () => storagePath.joinRoot('r', 'a'), () => storagePath.isPlainFilename('a.md')]) {
-      assert.throws(call, (e) => e.message === storagePath.PUBLIC_FAILURE && e.status === 500 && e.code === 'storage_path_failed' && e.reason === 'missing');
-    }
-    assert.match(String(warn.mock.calls[0].arguments[0]), /storage-path safeRelativePath failed \(missing\)/);
-    // An empty name is refused before the module is needed, exactly as the JS rule refuses it.
-    assert.throws(() => uploads.validate('', Buffer.from('x')), /plain filename/);
-  }));
+for (const leftover of [undefined, 'js', 'wasm']) {
+  test(`the path rules fail closed with a fixed public message when the module is missing (STORAGE_PATH_IMPL=${leftover})`, (t) => withEnv(
+    { STORAGE_PATH_IMPL: leftover, DAV_PARSE_WASM: MISSING },
+    () => {
+      const warn = t.mock.method(console, 'warn', () => {});
+      for (const call of [() => storageClient.safeRelativePath('a/b'), () => storagePath.cleanRoot('/r/'), () => storagePath.joinRoot('r', 'a'),
+        // Refusals too: no JS rule answers '' for a traversal instead of the module.
+        () => storageClient.safeRelativePath('../x'), () => storagePath.safeRelativePath('')]) {
+        assert.throws(call, (e) => e.message === storagePath.PUBLIC_FAILURE && e.status === 500 && e.code === 'storage_path_failed' && e.reason === 'missing');
+      }
+      assert.match(String(warn.mock.calls[0].arguments[0]), /storage-path safeRelativePath failed \(missing\)/);
+      // An empty name is refused before the module is needed, exactly as the JS rule refused it.
+      assert.throws(() => uploads.validate('', Buffer.from('x')), /plain filename/);
+      // Every listing, read and write stops before any request leaves.
+      const conn = { kind: 'webdav', baseUrl: 'https://storage.invalid/dav', corpusRoot: 'r' };
+      const real = globalThis.fetch;
+      globalThis.fetch = async () => assert.fail('no request may leave');
+      return Promise.all([() => storageClient.listFiles(conn, 'a'), () => storageClient.readTextFile(conn, 'a.md'), () => storageClient.writeFile(conn, 'a.md', Buffer.from('x'))]
+        .map((call) => assert.rejects(call, (e) => e.code === 'storage_path_failed' && e.status === 500)))
+        .finally(() => { globalThis.fetch = real; });
+    }));
+}
 
 test('wasm: the S3 listing and the path rules match the JS, and refusals fail closed', { skip: skipWasm }, (t) => withEnv(
-  { STORAGE_PATH_IMPL: 'wasm' },
+  { STORAGE_PATH_IMPL: undefined },
   () => withS3(async (seen) => {
     assert.deepEqual(shape(await storageClient.listFiles(s3Conn, 'Docs')), EXPECTED_S3);
     assert.deepEqual(seen, [null, 'tok&1']);
