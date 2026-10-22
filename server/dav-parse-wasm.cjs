@@ -3,16 +3,18 @@
 // Loader for dav-parse.wasm: noevia-rs's storage parsers in one module, built from
 // sbstndalton/noevia-rs (bins/dav-parse-wasm) at the ref in server/dav-parse.lock and placed at
 // server/wasm/dav-parse.wasm by the image build (or DAV_PARSE_WASM). Node's built-in WebAssembly
-// runs it: no imports, no WASI, no native addon. It carries three Rust ports, each behind its own
-// switch (default js), except the ones marked always on (#1071: no JS twin at runtime, tests/server/oracle/ keeps it for the fixtures):
+// runs it: no imports, no WASI, no native addon. It carries the Rust ports below. Every one is always
+// on (#1071): no switch selects a JS twin at runtime; tests/server/oracle/ keeps the JS references
+// for the fixtures and the differential tests:
 //   - crates/dav-parse      listRecords  = tests/server/oracle/dav-listing.cjs listingRecordsJs  (#967; always on, #1071)
 //   - crates/s3-list-parse  s3ListPage   = tests/server/oracle/s3-listing.cjs s3PageRecordsJs    (#976; always on, #1071)
-//   - crates/storage-path   storagePath  = storage-path.cjs's rules          (STORAGE_PATH_IMPL, #978)
+//   - crates/storage-path   storagePath  = tests/server/oracle/storage-path.cjs's rules
+//                                                                             (#978; always on, #1071)
 //   - crates/upload-sniff   uploadValidate/uploadClassify/uploadDecode
 //                                        = upload-sniff.cjs validate/classify/decodeText
 //                                                                             (#977; always on, #1071)
-//   - crates/secret-envelope secretOpen/secretSeal = secret-envelope.cjs openJs/encryptJs
-//                                                                             (SECRET_ENVELOPE_IMPL, #979)
+//   - crates/secret-envelope secretOpen/secretSeal = tests/server/oracle/secret-envelope.cjs openJs/encryptJs
+//                                                                             (#979; always on, #1071)
 //   - crates/mcp-frame     mcpRpcBody/mcpSchemaRefs = mcp.cjs parseRpcBody/resolveSchemaRefs
 //                                                                             (#980; always on, #1071)
 //   - crates/chat-template-caps + provider-error  templateCaps/providerErrorKind/servingVerdict
@@ -263,7 +265,7 @@ function s3ListPage(body, queryPrefix) {
 
 const PATH_OPS = { safeRelativePath: 1, cleanRoot: 2, joinRoot: 3, isPlainFilename: 4 };
 
-/** One storage-path rule (#978) on strings `a` (and `b` for joinRoot), through the module: a
+/** One storage-path rule (#978; tests/server/oracle/storage-path.cjs) on strings `a` (and `b` for joinRoot), through the module: a
  *  string for the path rules, a boolean for isPlainFilename. */
 function storagePath(op, a, b = '') {
   const code = PATH_OPS[op];
@@ -394,7 +396,7 @@ function secretUser(user) {
 
 const isKey = (k) => k instanceof Uint8Array && k.length === KEY_BYTES;
 
-/** secret-envelope.cjs openJs (#979), through the module. `keys` is [current] or [current,
+/** tests/server/oracle/secret-envelope.cjs openJs (#979), through the module. `keys` is [current] or [current,
  *  previous]; `user` is String(userId) or null (no user); `text` is the stored value as a string.
  *  Returns `{ keyUsed: 'none'|'current'|'previous', plain: Uint8Array }` (plain is empty for
  *  'none'; the caller decodes and then zeroes it). Refusals throw a DavParseError whose reason is
@@ -424,7 +426,7 @@ function secretOpen(keys, user, text) {
 
 const ENVELOPE_TEXT = /^enc:v([12]):[A-Za-z0-9_-]+$/;
 
-/** secret-envelope.cjs encryptJs (#979) after its empty-value check, through the module.
+/** tests/server/oracle/secret-envelope.cjs encryptJs (#979) after its empty-value check, through the module.
  *  `plain` is the UTF-8 bytes, `nonce` 12 bytes from crypto.randomBytes, `user` as secretOpen. */
 function secretSeal(key, nonce, plain, user) {
   if (!isKey(key) || !(nonce instanceof Uint8Array) || nonce.length !== NONCE_BYTES || !(plain instanceof Uint8Array)) throw new DavParseError('secret seal input has the wrong shape', 'input');
@@ -2363,10 +2365,11 @@ function llamacppPresetsModel(model) {
   return r;
 }
 
-// Every switch that runs this module (#996). Each reads its value as trim().toLowerCase().
-// Retired switches (#1071) are not listed: the Rust path they selected is always on, and
-// verifyAtStartup() always loads this module for it.
-const IMPL_FLAGS = ['STORAGE_PATH_IMPL', 'SECRET_ENVELOPE_IMPL'];
+// Every switch that selects this module (#996). None is left: the last two, STORAGE_PATH_IMPL and
+// SECRET_ENVELOPE_IMPL, were retired in #1071. Retired switches are not listed: the Rust path they
+// selected is always on, and verifyAtStartup() always loads this module for it. Kept (empty) for
+// wasmFlags() and the startup line.
+const IMPL_FLAGS = Object.freeze([]);
 
 /** Switches whose JS path was deleted once Rust had run in production (#1071). The old value that
  *  selected Rust ('wasm', or 'on' for the advisor) is accepted silently; anything else is ignored
@@ -2379,7 +2382,9 @@ const RETIRED_FLAGS = { LLAMACPP_PRESETS_IMPL: 'wasm', STREAM_GUARD_IMPL: 'wasm'
   BROWSER_POLICY_IMPL: 'wasm',
   CODE_ACTIONS_IMPL: 'wasm',
   TOOL_GATE_IMPL: 'wasm',
-  TOOLBOXES_PERMITTED_IMPL: 'wasm' };
+  TOOLBOXES_PERMITTED_IMPL: 'wasm',
+  STORAGE_PATH_IMPL: 'wasm',
+  SECRET_ENVELOPE_IMPL: 'wasm' };
 
 /** #2093: switches renamed for the role of the service they involve. The load advisor asks the decision
  *  service (server/load-advisor.cjs), so LAYA_LOAD_ADVISOR is now DECISION_LOAD_ADVISOR. The old name is a
