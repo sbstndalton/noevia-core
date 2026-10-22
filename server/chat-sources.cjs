@@ -95,15 +95,30 @@ function sanitizePin(value) {
   return typeof value === 'string' && STORED_PIN.test(value) ? value : undefined;
 }
 
-// One history item with its client-supplied `sources` and `skill` bounded by its role: sources survive on an
-// assistant turn only, a skill pin on a user turn only. The same object when it carries neither field.
+// #2116: the failure sentence of an assistant turn whose reply failed. It is saved so a reload still shows the failure
+// and Retry. Client-supplied text shown as plain text: kept only as a non-empty string on an assistant turn, bounded.
+const STORED_FAILURE_MAX = 1000;
+/** An assistant history entry that records a failed reply (#2116): it carries the sentence the person was shown. */
+function isFailedTurn(entry) {
+  return !!entry && typeof entry === 'object' && entry.role === 'assistant' && sanitizeFailure(entry.failure) !== undefined;
+}
+
+function sanitizeFailure(value) {
+  if (typeof value !== 'string') return undefined;
+  const text = value.trim().slice(0, STORED_FAILURE_MAX);
+  return text || undefined;
+}
+
+// One history item with its client-supplied `sources`, `skill` and `failure` bounded by its role: sources and a failure
+// survive on an assistant turn only, a skill pin on a user turn only. The same object when it carries none of them.
 function cleanItem(m, role) {
-  if (!m || typeof m !== 'object' || !('sources' in m || 'skill' in m)) return m;
-  if (!('sources' in m) && role === 'user' && sanitizePin(m.skill) === m.skill) return m; // an exact pin on a user turn: nothing to remove
-  const { sources, skill, ...rest } = m;
+  if (!m || typeof m !== 'object' || !('sources' in m || 'skill' in m || 'failure' in m)) return m;
+  if (!('sources' in m) && !('failure' in m) && role === 'user' && sanitizePin(m.skill) === m.skill) return m; // an exact pin on a user turn: nothing to remove
+  const { sources, skill, failure, ...rest } = m;
   const cleanSources = role === 'assistant' ? sanitizeStored(sources) : undefined;
   const cleanSkill = role === 'user' ? sanitizePin(skill) : undefined;
-  return { ...rest, ...(cleanSources ? { sources: cleanSources } : {}), ...(cleanSkill ? { skill: cleanSkill } : {}) };
+  const cleanFailure = role === 'assistant' ? sanitizeFailure(failure) : undefined;
+  return { ...rest, ...(cleanSources ? { sources: cleanSources } : {}), ...(cleanSkill ? { skill: cleanSkill } : {}), ...(cleanFailure ? { failure: cleanFailure } : {}) };
 }
 
 function sanitizeHistory(history) {
@@ -116,4 +131,4 @@ function sanitizeHistory(history) {
   });
 }
 
-module.exports = { MAX_SOURCES, SNIPPET_MAX, STORED_PIN, buildSources, usedInjected, sanitizeStored, sanitizePin, sanitizeHistory };
+module.exports = { MAX_SOURCES, SNIPPET_MAX, STORED_PIN, STORED_FAILURE_MAX, buildSources, usedInjected, sanitizeStored, sanitizePin, sanitizeFailure, isFailedTurn, sanitizeHistory };
