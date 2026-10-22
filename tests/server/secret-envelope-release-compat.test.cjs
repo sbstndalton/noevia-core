@@ -29,8 +29,10 @@ const userOf = (c) => (c.openUser === null ? undefined : c.openUser);
 
 const wasmFile = process.env.DAV_PARSE_WASM || davParseWasm.DEFAULT_WASM;
 const skipWasm = !fs.existsSync(wasmFile) && process.env.DAV_PARSE_WASM_REQUIRED !== '1' && 'dav-parse.wasm not built';
+// Resolved from server/ (it has its own dependencies), as auth.cjs resolves it.
+const serverRequire = require('node:module').createRequire(path.join(__dirname, '../../server/package.json'));
 let haveSqlite = true;
-try { require('better-sqlite3'); } catch { haveSqlite = false; }
+try { serverRequire.resolve('better-sqlite3'); } catch { haveSqlite = false; }
 
 function storeWithKeys(t) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'release-compat-'));
