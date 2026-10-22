@@ -126,6 +126,34 @@ test('a saved turn keeps its last 10 variants; the chosen one is never dropped (
   assert.equal(read[0].answers[1].content, 'synthetic answer 2', 'the oldest of the others went');
 });
 
+test('a failed reply is stored with its failure sentence and comes back unchanged after a reload (#2116)', async () => {
+  const failure = 'The model took too long to unload, so the reply was ended. Try again.';
+  const history = [{ role: 'user', content: 'q' }, { role: 'assistant', content: '', failure }];
+  assert.equal((await post('/api/chats/c-failed-2116/history', { history })).status, 200);
+  const read = JSON.parse((await request('/api/chats/c-failed-2116/history', { headers: mutationHeaders() })).text);
+  assert.deepEqual(read.history, history, 'the failed turn is returned as it was saved');
+  // A later save by the same client (the answered retry) replaces it.
+  assert.equal((await post('/api/chats/c-failed-2116/history', { history: [history[0], { role: 'assistant', content: 'an answer' }], baseRevision: read.revision })).status, 200);
+  const next = JSON.parse((await request('/api/chats/c-failed-2116/history', { headers: mutationHeaders() })).text).history;
+  assert.deepEqual(next[1], { role: 'assistant', content: 'an answer' });
+});
+
+test('only a non-empty failure sentence on an assistant turn is stored, bounded on save (#2116)', async () => {
+  const long = 'x'.repeat(5000);
+  const history = [
+    { role: 'user', content: 'u', failure: 'not a failed user turn' },
+    { role: 'assistant', content: 'a', failure: long },
+    { role: 'assistant', content: 'b', failure: '   ' },
+    { role: 'assistant', content: 'c', failure: { text: 'object' } },
+    { role: 'assistant', content: 'd', failure: 7 },
+  ];
+  assert.equal((await post('/api/chats/c-failed-2116b/history', { history })).status, 200);
+  const stored = JSON.parse((await request('/api/chats/c-failed-2116b/history', { headers: mutationHeaders() })).text).history;
+  assert.equal('failure' in stored[0], false, 'a user turn is never a failed reply');
+  assert.equal(stored[1].failure.length, 1000, 'bounded');
+  for (const i of [2, 3, 4]) assert.equal('failure' in stored[i], false, `dropped: entry ${i}`);
+});
+
 test('a user turn keeps its exact Skill pin across a reload; anything else is dropped on save (#571)', async () => {
   const pin = `skill_${'a'.repeat(32)}@${'b'.repeat(64)}`;
   const history = [{ role: 'user', content: 'q', skill: pin }, { role: 'assistant', content: 'a', skill: pin }];
