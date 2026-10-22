@@ -124,9 +124,22 @@ test('a Retry after a failed reply that saved a change sends that change as done
   assert.deepEqual({ ...base[1].paused }, { reason: 'stopped', applied: 1 });
   // Without a saved change, Retry is what it always was: everything before the user turn.
   assert.equal(exports.rerunBase([{ id: 'u1', role: 'user', content: 'x' }, { id: 'r1', role: 'assistant', content: 'Request failed', error: true }], 1).length, 0);
-  // A failed reply is persisted only as that record.
-  assert.equal(exports.persistableMessage({ id: 'r2', role: 'assistant', content: 'Request failed', error: true }), null);
-  assert.equal(exports.persistableMessage(failed).content, '');
+  // #2116: a failed reply is persisted as a failed turn (so a reload shows it with Retry): empty content, `error` and the
+  // sentence it showed in `failure`; a reply that saved a change also keeps that change's record. It is never replayed
+  // as text: the model history leaves it out and only the saved change is told as done.
+  assert.deepEqual(JSON.parse(JSON.stringify(exports.persistableMessage({ id: 'r2', role: 'assistant', content: 'Request failed', error: true }))),
+    { id: 'r2', role: 'assistant', content: '', error: true, failure: 'Request failed' });
+  const stored = exports.persistableMessage(failed);
+  assert.equal(stored.content, '', 'the failure text is not saved as the reply');
+  assert.equal(stored.error, true);
+  assert.equal(stored.failure, 'Request failed — synthetic outage');
+  assert.deepEqual({ ...stored.paused }, { reason: 'stopped', applied: 1 });
+  assert.equal(stored.toolCalls.length, 1);
+  // After a reload that stored turn is what the page holds. A Retry from it is the same Retry as before the reload ...
+  const reloaded = [transcript[0], JSON.parse(JSON.stringify(stored))];
+  assert.deepEqual(JSON.parse(JSON.stringify(exports.rerunBase(reloaded, 1))).map((m) => [m.role, m.content, !!m.error]), [['user', 'Add "Zusatz: 2" to qa-notes.md', false], ['assistant', '', false]]);
+  // ... and so is a NEW message: the failed turn adds no empty assistant turn and no text, the change is still told as done.
+  assert.deepEqual(JSON.parse(JSON.stringify(exports.modelHistory(reloaded))).map((e) => e.role), ['user', 'tool']);
 
   const history = JSON.parse(JSON.stringify(exports.modelHistory(base)));
   assert.deepEqual(history.map((e) => e.role), ['user', 'assistant', 'tool']);
@@ -145,6 +158,16 @@ test('a Retry after a failed reply that saved a change sends that change as done
   assert.match(note.content, /<untrusted kind="applied change"/, 'the tool text stays framed as data');
   assert.deepEqual(sent.filter((m) => m.role !== 'system').map((m) => m.role), ['user', 'assistant', 'user']);
   assert.equal(events.at(-1).type, 'done');
+
+  // A new message after the reload (not a Retry): the saved change is told as done, nothing is replayed, and the failed
+  // turn's sentence never reaches the model.
+  const h2 = harness(t);
+  h2.state.turns.push([say('That is already saved.')]);
+  await h2.send({ message: 'Thanks. What else is in the file?', history: JSON.parse(JSON.stringify(exports.modelHistory(reloaded))) });
+  assert.equal(h2.state.executed.length, 0, 'the completed write is not replayed');
+  const sent2 = JSON.stringify(h2.state.requests[0].messages);
+  assert.match(sent2, /Already done earlier in this chat: synthetic_append ran after the user approved it/);
+  assert.ok(!sent2.includes('synthetic outage'), 'the failure sentence reached the model');
 });
 
 test('Edit and re-run keeps the records of changes the dropped replies saved, so the model is told they are done (#658 review)', async (t) => {
