@@ -110,15 +110,22 @@ test('the account store reads, upgrades and keeps release-written storage secret
   assert.ok(storageCases.length >= 3);
   const now = Date.now();
   let n = 0;
+  // The account tables are the Rust front's (Node's connection refuses them, server/rust-auth.cjs):
+  // the rows the live system holds are seeded through a connection of our own, as
+  // tests/server/seed-account.cjs does, with the fixture's fixed account ids.
+  const Database = serverRequire('better-sqlite3');
+  const seed = (fn) => { const db = new Database(path.join(dir, 'cowork.db')); try { db.pragma('busy_timeout = 5000'); db.pragma('foreign_keys = ON'); fn(db); } finally { db.close(); } };
   for (const c of storageCases) {
     const id = c.openUser;
-    if (!auth.db.prepare('SELECT 1 FROM users WHERE id=?').get(id)) {
-      n += 1;
-      auth.db.prepare('INSERT INTO users(id,username,username_norm,display_name,role,password_hash,webauthn_user_id,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)')
-        .run(id, `synthetic-${n}`, `synthetic-${n}`, 'Synthetic', 'member', 'synthetic-hash', `synthetic-webauthn-${n}`, now, now);
-    }
-    auth.db.prepare('INSERT OR REPLACE INTO storage_connections(user_id,kind,base_url,username,secret,corpus_root,updated_at) VALUES(?,?,?,?,?,?,?)')
-      .run(id, 'webdav', 'https://storage.invalid/dav', 'synthetic', c.value, 'root', 1);
+    seed((db) => {
+      if (!db.prepare('SELECT 1 FROM users WHERE id=?').get(id)) {
+        n += 1;
+        db.prepare('INSERT INTO users(id,username,username_norm,display_name,role,password_hash,webauthn_user_id,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)')
+          .run(id, `synthetic-${n}`, `synthetic-${n}`, 'Synthetic', 'member', 'synthetic-no-password', `synthetic-webauthn-${n}`, now, now);
+      }
+      db.prepare('INSERT OR REPLACE INTO storage_connections(user_id,kind,base_url,username,secret,corpus_root,updated_at) VALUES(?,?,?,?,?,?,?)')
+        .run(id, 'webdav', 'https://storage.invalid/dav', 'synthetic', c.value, 'root', 1);
+    });
     const got = auth.getStorage(id, true);
     assert.equal(got.secret, plainOf(c), c.name);
     assert.equal(got.secretNeedsReauth, false, c.name);
