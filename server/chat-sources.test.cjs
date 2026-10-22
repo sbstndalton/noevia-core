@@ -31,6 +31,18 @@ test('sanitizeHistory leaves untouched entries alone and strips sources from use
   assert.equal('sources' in b, false);
 });
 
+test('sanitizeHistory keeps a bounded failure sentence on assistant turns only (#2116)', () => {
+  const { STORED_FAILURE_MAX } = require('./chat-sources.cjs');
+  const out = sanitizeHistory([
+    { role: 'assistant', content: '', failure: '  The reply failed.  ' },
+    { role: 'assistant', content: '', failure: 'y'.repeat(STORED_FAILURE_MAX + 10) },
+    { role: 'user', content: 'u', failure: 'no' }, { role: 'assistant', content: '', failure: '' }, { role: 'assistant', content: '', failure: 3 },
+  ]);
+  assert.equal(out[0].failure, 'The reply failed.');
+  assert.equal(out[1].failure.length, STORED_FAILURE_MAX);
+  for (const i of [2, 3, 4]) assert.equal('failure' in out[i], false, `entry ${i}`);
+});
+
 test('sanitizeHistory keeps only an exact skill pin on user turns (#571)', () => {
   const pin = `skill_${'0'.repeat(32)}@${'f'.repeat(64)}`;
   const out = sanitizeHistory([{ role: 'user', content: 'u', skill: pin }, { role: 'assistant', content: 'a', skill: pin }, { role: 'user', content: 'u', skill: 'skill_1@2' }]);

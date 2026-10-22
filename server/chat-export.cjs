@@ -40,12 +40,18 @@ function zipStore(entries, when = Date.now()) {
   return Buffer.concat([...locals, ...centrals, end]);
 }
 
+// #2116: a failed reply (an assistant turn with a `failure` sentence) is not an answer: it says it failed, after any text that
+// had streamed in before the failure. noevia-rs crates/server-export markdown.rs renders the same words.
+const failed = (m) => m.role === 'assistant' && typeof m.failure === 'string' && m.failure.trim() !== '';
+
 function chatMarkdown(chat, history) {
   const lines = [`# ${chat.title || 'Untitled chat'}`, ''];
   if (chat.updatedAt) lines.push(`_Last updated ${new Date(chat.updatedAt).toISOString()}_`, '');
   for (const m of history) {
     if (m.role !== 'user' && m.role !== 'assistant') continue;
-    lines.push(`## ${m.role === 'user' ? 'You' : 'Assistant'}`, '', String(m.content || '').trim() || '_(no text)_', '');
+    const text = String(m.content || '').trim();
+    const body = failed(m) ? (text ? `${text}\n\n_(The reply failed before it finished.)_` : '_(The reply failed; no answer was written.)_') : text || '_(no text)_';
+    lines.push(`## ${m.role === 'user' ? 'You' : 'Assistant'}`, '', body, '');
     const tools = (m.toolCalls || []).map((t) => t && t.name).filter(Boolean);
     if (tools.length) lines.push(`_Tools used: ${tools.join(', ')}_`, '');
   }
