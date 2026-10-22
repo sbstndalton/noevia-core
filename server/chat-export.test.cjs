@@ -40,3 +40,19 @@ test('chatMarkdown keeps roles, content and tool names, and never prints reasoni
   assert.match(md, /Tools used: project_search/);
   assert.doesNotMatch(md, /private chain/);
 });
+
+test('a failed reply is rendered as a failure, not as an answer (#2116)', () => {
+  const md = chatMarkdown({ title: 'Failed' }, [
+    { role: 'user', content: 'Summarise the notes.' },
+    { role: 'assistant', content: '', failure: 'The model took too long, so the reply was ended.' },
+    { role: 'user', content: 'Try again, shorter.' },
+    { role: 'assistant', content: 'The notes say three things:', failure: 'The model stream failed.' },
+    { role: 'user', content: 'And now?' },
+    { role: 'assistant', content: 'A real answer.', failure: '   ' },
+  ]);
+  assert.match(md, /## Assistant\n\n_\(The reply failed; no answer was written\.\)_\n/);
+  assert.match(md, /## Assistant\n\nThe notes say three things:\n\n_\(The reply failed before it finished\.\)_\n/);
+  assert.match(md, /## Assistant\n\nA real answer\.\n/, 'a blank failure field is not a failure');
+  assert.doesNotMatch(md, /_\(no text\)_/);
+  assert.doesNotMatch(md, /took too long|stream failed/, 'the sentence itself is not exported');
+});

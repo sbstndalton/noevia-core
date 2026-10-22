@@ -4,6 +4,7 @@
 // overwrites or deletes one. Content is treated as untrusted: only user/assistant text and tool
 // names survive, with the same size caps as history saves.
 const { FORMAT } = require('./chat-export.cjs');
+const { sanitizeFailure } = require('./chat-sources.cjs');
 
 const MAX_CHATS = 2000;
 const SAFE_ID = /^c-[A-Za-z0-9_-]{1,80}$/;
@@ -17,6 +18,9 @@ function cleanHistory(history, { maxMessages, maxChars }) {
     .slice(-maxMessages)
     .map((m) => {
       const out = { role: m.role, content: m.content.slice(0, maxChars) };
+      // #2116: a reply that failed stays a failed turn (the web page shows it with Retry and never replays it to a model).
+      const failure = m.role === 'assistant' ? sanitizeFailure(m.failure) : undefined;
+      if (failure) out.failure = failure;
       const tools = Array.isArray(m.toolCalls) ? m.toolCalls.filter((t) => t && typeof t.name === 'string').slice(0, 50) : [];
       if (tools.length) out.toolCalls = tools.map((t) => ({ name: t.name.slice(0, 120), status: 'done' }));
       return out;

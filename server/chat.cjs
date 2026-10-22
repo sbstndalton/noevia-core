@@ -413,6 +413,8 @@ function createChatHandler({
     const declinedEntry = (h) => h.role === 'tool' && h.declined === true && h.applied !== true && typeof h.name === 'string' && typeof h.content === 'string';
     const mappedHistory = (Array.isArray(history) ? history : [])
       .filter((h) => h && ['user', 'assistant', 'tool', 'function'].includes(h.role) && ((typeof h.content === 'string' && h.content) || appliedEntry(h)))
+      // #2116: a saved failed reply (its partial text and sentence) is a record for the person, never a turn the model said.
+      .filter((h) => !require('./chat-sources.cjs').isFailedTurn(h))
       .slice(-HISTORY_CAP)
       .map((h) => appliedEntry(h)
         ? { role: 'tool', content: h.content, name: h.name, applied: true,

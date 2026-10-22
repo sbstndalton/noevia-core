@@ -57,3 +57,20 @@ test('bounded: too many chats is refused rather than silently truncated', () => 
   const chats = Array.from({ length: 2001 }, (_, i) => ({ id: `c-${i}`, title: String(i), history: [] }));
   assert.throws(() => planImport(payload(chats), { existingChatIds: new Set(), tombstones: new Set(), projects: [], newId: ids }), /2000 chats/);
 });
+
+test('a failed reply keeps its failure sentence through import, so it stays a failed turn (#2116)', () => {
+  const failure = 'The model took too long, so the reply was ended.';
+  const plan = planImport(payload([{ id: 'c-fail', title: 'Failed', updatedAt: 1, history: [
+    { role: 'user', content: 'q' },
+    { role: 'assistant', content: 'partial text', failure: `  ${failure}  ` },
+    { role: 'user', content: 'u', failure: 'not on a user turn' },
+    { role: 'assistant', content: 'b', failure: '' }, { role: 'assistant', content: 'c', failure: { x: 1 } },
+    { role: 'assistant', content: 'd', failure: 'y'.repeat(5000) },
+  ] }]), { existingChatIds: new Set(), tombstones: new Set(), projects: [], newId: ids });
+  const h = plan.histories['c-fail'];
+  assert.deepEqual(h[1], { role: 'assistant', content: 'partial text', failure });
+  assert.equal('failure' in h[2], false);
+  assert.equal('failure' in h[3], false);
+  assert.equal('failure' in h[4], false);
+  assert.equal(h[5].failure.length, 1000);
+});
