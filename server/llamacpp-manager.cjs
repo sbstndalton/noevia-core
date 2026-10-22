@@ -40,7 +40,7 @@ const AVAILABLE_STATES = new Set(['loaded', 'sleeping']);
 const isAvailable = model => AVAILABLE_STATES.has(model.status?.value);
 const alreadyRunning = result => result?.status === 400 && /already running/i.test(JSON.stringify(result?.body ?? ''));
 
-function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloadStatePath, fetchStream, autoconfig = {}, calibrationStatePath, calibrationOptions = {}, evidenceDir, autotuneStatePath, autotuneOptions = {}, presetWriter = null, unloadWait = {}, inferenceBudget = null, reloadStatePath = null, reloadGuard: reloadGuardOption = null }) {
+function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloadStatePath, fetchStream, autoconfig = {}, calibrationStatePath, calibrationOptions = {}, evidenceDir, autotuneStatePath, autotuneOptions = {}, presetWriter = null, inferenceBudget = null, reloadStatePath = null, reloadGuard: reloadGuardOption = null, gate = null, gateAdminToken = null }) {
   const base = String(baseUrl || '').replace(/\/+$/, '').replace(/\/v1$/, '');
   const url = new URL(base);
   if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password || url.search || url.hash) throw Error('Invalid llama.cpp router URL');
@@ -49,7 +49,7 @@ function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloa
   }
   const rawRequest = (path, options = {}, timeout = 8000) => fetchJson(base + path, { ...options, headers: headers(options.headers) }, timeout);
   // #697: every load this process asks for (the Models page, calibration, auto-tune) passes the
-  // inference memory budget first. Chat loads pass it in makeRoomFor, before anything is evicted.
+  // inference memory budget first. Chat turns pass it in prepareLoad, before they ask for a lease.
   async function request(path, options = {}, timeout = 8000) {
     if (path === '/models/load' && String(options.method || 'GET').toUpperCase() === 'POST') {
       let model = null;
@@ -60,6 +60,11 @@ function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloa
     return rawRequest(path, options, timeout);
   }
   const post = (path, body, timeout = 120000, signal) => request(path, { method: 'POST', body: JSON.stringify(body), signal }, timeout);
+  // noevia#2115: the inference gate in front of the router decides which chat model runs and is the
+  // only process that unloads one in use (inference-gate-client.cjs). `gate` is for tests.
+  const gateClient = gate || require('./inference-gate-client.cjs').createGateClient({ baseUrl: base, adminToken: gateAdminToken });
+  // An unload that may end a request in progress: the admin header, and `force` for the gate.
+  const forcedUnload = (model, timeout) => request('/models/unload', { method: 'POST', body: JSON.stringify({ model, force: true }), headers: gateClient.adminHeaders() || {} }, timeout);
   const unsupported = operation => Promise.resolve({ ok: false, status: 501, body: { error: `${operation} is not exposed by this llama.cpp adapter` } });
   const modelQuery = model => '?model=' + encodeURIComponent(model) + '&autoload=false';
   const rawModels = signal => request('/models', {signal});
@@ -96,35 +101,6 @@ function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloa
     return result;
   }
   async function mutate(fn) {const leave=maintenance.enter();try{return await fn();}finally{leave();}}
-  // Serialize only admission/eviction, never the inference that follows it.
-  let admission = Promise.resolve();
-  // #1785: admissions (model loads and swaps) queued or running, for inferenceBusy.
-  let admissionsPending = 0;
-  async function withAdmission(work, signal) {
-    signal?.throwIfAborted();
-    admissionsPending++;
-    const previous = admission;
-    let release;
-    admission = new Promise(resolve => { release = resolve; });
-    let onAbort, acquired = false;
-    const cancelled = signal && new Promise((_, reject) => {
-      onAbort = () => reject(signal.reason);
-      signal.addEventListener('abort', onAbort, { once: true });
-      if (signal.aborted) onAbort();
-    });
-    try {
-      await (cancelled ? Promise.race([previous, cancelled]) : previous);
-      acquired = true;
-      signal?.throwIfAborted();
-      return await work();
-    } finally {
-      if (onAbort) signal.removeEventListener('abort', onAbort);
-      // An aborted waiter returns promptly, but its queue slot remains behind the previous
-      // operation until that operation finishes; later admissions cannot overtake it.
-      if (acquired) release(); else void previous.then(release);
-      admissionsPending--;
-    }
-  }
   // #1079: which rows are a model and its `<model>-long` profile (Rust's pairing; none on failure).
   const longProfiles=autotuneOptions.longProfiles||require('./long-profile.cjs').createLongProfiles();
   async function listModels() {
@@ -169,74 +145,6 @@ function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloa
     }
     return { ...response, body: { manager: 'llamacpp', version: null, all_models_loaded: models } };
   }
-  // Before a chat model is used, any other loaded model except those in `keep` is unloaded first.
-  // The engine runs one model at a time (compose --models-max, #697); on a multi-slot engine the
-  // small models in keepAlongside() may stay, but two chat models never share it.
-  const admissionError = message => Object.assign(Error(message), { status: 409, publicMessage: message });
-  // #1863: after a refused unload of a loading model, poll /models (≤ unloadWait.loadingTimeoutMs, 30 s) until it is
-  // gone (true) or loaded, then unload it once more (true when that is accepted). False: still there at the deadline.
-  async function settleLoadingEvictee(id, signal) {
-    const timeoutMs = Math.min(unloadWait.loadingTimeoutMs ?? 30000, 30000), sleep = unloadWait.sleep || (ms => new Promise(resolve => setTimeout(resolve, ms)));
-    const deadline = Date.now() + timeoutMs;
-    let delay = 100;
-    while (Date.now() < deadline) {
-      signal?.throwIfAborted();
-      await sleep(delay);
-      delay = Math.min(delay * 2, 1000);
-      const listing = await rawModels(signal);
-      if (!listing.ok || !Array.isArray(listing.body?.data)) continue;
-      const status = listing.body.data.find((m) => m.id === id)?.status?.value;
-      if (!['loaded', 'loading', 'sleeping'].includes(status)) return true;
-      if (status === 'loading') continue;
-      const again = await post('/models/unload', { model: id }, 60000, signal);
-      if (again.ok) return true;
-    }
-    return false;
-  }
-  async function makeRoomForUnlocked(model, keep, signal) {
-    // #1068: a restored models.ini the router has not re-read yet is re-read before this model loads.
-    await autotuner?.flushReload?.(model);
-    // Refuse before evicting anything: an over-budget model must not cost the loaded one.
-    const refusal = await overBudget(model);
-    if (refusal) throw Object.assign(admissionError(refusal.body.error), { code: refusal.body.code });
-    const listing = await rawModels(signal);
-    if (!listing.ok || !Array.isArray(listing.body?.data)) throw admissionError('Could not check loaded models before switching. Try again.');
-    const targetStatus = listing.body.data.find((m) => m.id === model)?.status?.value ?? null;
-    const others = listing.body.data.filter((m) => m.id !== model && !keep.includes(m.id) && ['loaded', 'loading'].includes(m.status?.value));
-    for (const m of others) {
-      signal?.throwIfAborted();
-      const result = await post('/models/unload', { model: m.id }, 60000, signal);
-      if (result.ok) continue;
-      // #1863: a model still loading (an unused pre-load, say). llama.cpp b11610 (tools/server/server-models.cpp,
-      // server_models::unload) accepts that unload and force-kills the loading process; it answers 400 "model is not
-      // running" only once the model has already left. A refusal here therefore never fails the turn: wait, bounded,
-      // until the model is loaded (then unload it) or gone.
-      if (m.status?.value === 'loading' && await settleLoadingEvictee(m.id, signal)) continue;
-      throw admissionError('Another model could not be unloaded. Try again when it is idle.');
-    }
-    if (others.length) {
-      // The router acknowledges /models/unload before the process has exited, so the listing can
-      // still show the old model as loaded for a few seconds. Wait for it to actually leave
-      // (bounded, with backoff) instead of failing the first switch and succeeding on retry.
-      const timeoutMs = unloadWait.timeoutMs ?? 30000, sleep = unloadWait.sleep || (ms => new Promise(resolve => setTimeout(resolve, ms)));
-      const deadline = Date.now() + timeoutMs;
-      let delay = 100;
-      for (;;) {
-        const updated = await rawModels(signal);
-        if (!updated.ok || !Array.isArray(updated.body?.data)) throw admissionError('Could not check loaded models after unloading. Try again.');
-        if (!updated.body.data.some(m => m.id !== model && !keep.includes(m.id) && ['loaded', 'loading'].includes(m.status?.value))) break;
-        if (Date.now() >= deadline) throw admissionError(`Another model was still unloading after ${Math.round(timeoutMs / 1000)} seconds. Try again when it is idle.`);
-        signal?.throwIfAborted();
-        await sleep(delay);
-        delay = Math.min(delay * 2, 1000);
-      }
-    }
-    // The target's status as listed before any eviction (#1758: load() skips a sleeping one).
-    return { targetStatus };
-  }
-  async function makeRoomFor(model, keep = keepAlongside(), signal) {
-    await withAdmission(() => makeRoomForUnlocked(model, keep, signal), signal);
-  }
   const alreadyRunningLogged = new Set();
   function logAlreadyRunning(model) {
     if (alreadyRunningLogged.has(model)) return;
@@ -244,42 +152,69 @@ function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloa
     if (alreadyRunningLogged.size > 64) alreadyRunningLogged.delete(alreadyRunningLogged.values().next().value);
     console.log('[llamacpp] ' + JSON.stringify({ event: 'load-already-running', model }));
   }
-  async function load(model, options = {}, signal) {
+  // noevia#2115: what stays in this process before a chat model is used. A restored models.ini the
+  // router has not re-read yet is re-read first (#1068), and a model above the inference memory
+  // budget is refused before anything is switched (#697; phase 1 keeps the estimate here). Throws a
+  // 409 with a publicMessage and a code. Switching models is the gate's: it unloads the previous
+  // model only once no request and no lease is using it.
+  async function prepareLoad(model) {
+    await autotuner?.flushReload?.(model);
+    const refusal = await overBudget(model);
+    if (refusal) throw Object.assign(Error(refusal.body.error), { status: 409, publicMessage: refusal.body.error, code: refusal.body.code });
+  }
+  // A lease on `model` from the gate (null without a gate): prepareLoad, then the gate's queue.
+  // `onQueued({ position, waitedMs })` reports the wait; a GateError is a refusal.
+  async function acquireLease(model, options = {}) {
+    await prepareLoad(model);
+    options.signal?.throwIfAborted();
+    return gateClient.acquire(model, options);
+  }
+  const failure = error => ({ ok: false, status: error.status || 502, body: { error: error.publicMessage || 'Could not prepare the selected model.',
+    ...(error.code ? { code: error.code } : {}), ...(error.retryable ? { retryable: true } : {}) } });
+  // `lease`: a chat turn's own lease, so its explicit load is part of the turn. Without one the load
+  // takes its own lease for as long as it runs (the Models page, the route pre-load).
+  async function load(model, options = {}, signal, { lease = null } = {}) {
     if (Object.keys(options).length) return unsupported('Runtime option changes; configure a native model preset');
     const leave=maintenance.enter();
+    let own=null;
     try {
-      return await withAdmission(async () => {
-        signal?.throwIfAborted();
-        let room;
-        try { room = await makeRoomForUnlocked(model, keepAlongside(), signal); }
+      signal?.throwIfAborted();
+      if(!lease){
+        try { own = await acquireLease(model, { signal }); }
         catch (error) {
           if (signal?.aborted) throw error;
-          return {ok:false,status:error.status || 502,body:{error:error.publicMessage || 'Could not make room for the selected model.',...(error.code?{code:error.code}:{})}};
+          return failure(error);
         }
+      }
+      const held=lease||own;
+      signal?.throwIfAborted();
+      // #1758: never ask the router to load a sleeping model; the next request wakes it.
+      const before=await rawModels(signal);
+      signal?.throwIfAborted();
+      if(before.ok&&Array.isArray(before.body?.data)&&before.body.data.find(m=>m.id===model)?.status?.value==='sleeping')return {ok:true,status:200,body:{success:true,sleeping:true}};
+      let started=await request('/models/load',{method:'POST',body:JSON.stringify({model}),signal,headers:held?held.headers():{}},120000);
+      // Woke or slept between the listing and the load: the router already runs it (#1758).
+      if(alreadyRunning(started)){
+        logAlreadyRunning(model);
+        started={ok:true,status:200,body:{success:true,alreadyRunning:true}};
+      }
+      if(!started.ok){
+        const refusal=gateClient.refusal(started.status,started.body);
+        return refusal?failure(refusal):started;
+      }
+      // Native load acknowledges launch; readiness must be observed separately.
+      const deadline=Date.now()+120000;
+      while(Date.now()<deadline) {
         signal?.throwIfAborted();
-        // #1758: never ask the router to load a sleeping model; the next request wakes it.
-        if(room?.targetStatus==='sleeping')return {ok:true,status:200,body:{success:true,sleeping:true}};
-        let started=await post('/models/load', { model },120000,signal);
-        // Woke or slept between the listing and the load: the router already runs it (#1758).
-        if(alreadyRunning(started)){
-          logAlreadyRunning(model);
-          started={ok:true,status:200,body:{success:true,alreadyRunning:true}};
-        }
-        if(!started.ok)return started;
-        // Native load acknowledges launch; readiness must be observed separately.
-        const deadline=Date.now()+120000;
-        while(Date.now()<deadline) {
-          signal?.throwIfAborted();
-          const listing=await rawModels(signal);
-          if(!listing.ok)return listing;
-          const entry=listing.body?.data?.find(m=>m.id===model);
-          if(entry&&isAvailable(entry))return started;
-          if(!entry || entry.status?.failed || entry.status?.value==='unloaded')return {ok:false,status:502,body:{error:'The native model failed to become ready. Check its artifact and preset.'}};
-          await new Promise(resolve=>setTimeout(resolve,200));
-        }
-        return {ok:false,status:504,body:{error:'Native model loading is still unconfirmed. Check its status before retrying.'}};
-      }, signal);
-    }finally{leave();}
+        const listing=await rawModels(signal);
+        if(!listing.ok)return listing;
+        const entry=listing.body?.data?.find(m=>m.id===model);
+        if(entry&&isAvailable(entry))return started;
+        if(!entry || entry.status?.failed || entry.status?.value==='unloaded')return {ok:false,status:502,body:{error:'The native model failed to become ready. Check its artifact and preset.'}};
+        await new Promise(resolve=>setTimeout(resolve,200));
+      }
+      return {ok:false,status:504,body:{error:'Native model loading is still unconfirmed. Check its status before retrying.'}};
+    }finally{leave();if(own)await own.release();}
   }
   async function downloads() {
     tracker.connect();
@@ -765,15 +700,17 @@ function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloa
     kind: 'llamacpp', enabled: true, baseUrl: base, headers, request,
     capabilities: { routing: true, load: true, unload: true, download: true, deleteCached: true, runtimeOptions: false, hardware: false, presets: !!presets, autotune: !!autotuner },
     requireEnabled() {},
-    listModels, health, load, downloads, makeRoomFor,
-    // The admission lock itself, for callers that must check residency and send as one step (#702).
-    withAdmission,
+    listModels, health, load, downloads,
+    // noevia#2115: the budget check before a model is used, a lease from the inference gate, and a
+    // lease's requests (inference-gate-client.cjs).
+    prepareLoad, acquireLease,
     close:tracker.close,
     enterInference: maintenance.enter,
     enterInferenceWithin: maintenance.enterWithin,
     // #1785: read-only. Busy when the maintenance gate is held, more inference requests than the caller's own `own`
-    // are in flight, or a model load/swap is queued or running. Optional work (a chat title) checks it and skips.
-    inferenceBusy: (own = 0) => maintenance.held() || (typeof maintenance.active === 'function' && maintenance.active() > own) || admissionsPending > 0,
+    // are in flight, or this process is waiting for a lease (another model may be about to load; noevia#2115).
+    // Optional work (a chat title) checks it and skips.
+    inferenceBusy: (own = 0) => maintenance.held() || (typeof maintenance.active === 'function' && maintenance.active() > own) || gateClient.waiting() > 0,
     // #872: read-only views for writers outside this process's gate (the model folder sync):
     // the gate itself, or any calibration/auto-tune job still running (auto-tune releases the
     // gate between models but still restores settings by revision).
@@ -803,9 +740,16 @@ function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloa
     evidence, recordEvidence, importEvidence,
     calibration: calibrator ? { start: calibrator.start, cancel: calibrator.cancel, status: calibrator.status, recover: calibrator.recover } : null,
     autotune: autotuner ? { start: (...args) => { const fault = budgetFaultReason(); return fault ? Promise.resolve({ ok: false, status: 503, body: budgetFaultBody('Auto-tune unavailable', fault) }) : autotuner.start(...args); }, resume: autotuner.resume, cancel: autotuner.cancel, clear: autotuner.clear, status: autotuner.status, setSettings: autotuner.setSettings, recover: autotuner.recover, untuned: autotuner.untuned } : null,
-    unload: model => mutate(()=>withAdmission(()=>post('/models/unload', { model }))),
-    // #697 watchdog: unload without waiting behind admission or maintenance; memory is running out.
-    emergencyUnload: model => post('/models/unload', { model }, 60000),
+    // noevia#2115: the gate refuses to unload a model in use (409 `model_in_use`); `unloadAnyway` is the
+    // admin's choice to end what it is answering, and needs INFERENCE_GATE_ADMIN_TOKEN.
+    unload: model => mutate(()=>post('/models/unload', { model })),
+    unloadAnyway: model => gateClient.hasAdmin()
+      ? mutate(()=>forcedUnload(model, 60000))
+      : Promise.resolve({ ok: false, status: 403, body: { error: 'Unloading a model in use is not set up on this server.', code: 'admin_required' } }),
+    gateAdmin: () => gateClient.hasAdmin(),
+    // #697 watchdog: unload without waiting behind maintenance; memory is running out. With the admin
+    // token it ends a model in use (the gate logs it); without one the gate unloads only an idle model.
+    emergencyUnload: model => gateClient.hasAdmin() ? forcedUnload(model, 60000) : post('/models/unload', { model }, 60000),
     pull: ({ checkpoint }) => mutate(async () => {
       if (!/^[\w.-]+\/[\w.-]+(?::[\w.-]+)?$/.test(checkpoint || '')) return { ok: false, status: 400, body: { error: 'Choose a Hugging Face repository and quantization' } };
       tracker.requested(checkpoint);
@@ -813,10 +757,10 @@ function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloa
       if(!response.ok)tracker.rejected(checkpoint);
       return response.ok ? { ...response, body: { ...response.body, id: checkpoint, modelName: checkpoint } } : response;
     }),
-    deleteModel: model => mutate(()=>withAdmission(async () => { const r = await request('/models?model=' + encodeURIComponent(model), { method: 'DELETE' }, 60000); if (r.ok) identityCache.delete(model); return r; })),
-    // Hold web admission across unload and delete. The router can still receive a load from
-    // another client outside this process, so retry once if deletion is refused.
-    removeModel: model => mutate(()=>withAdmission(async () => {
+    deleteModel: model => mutate(async () => { const r = await request('/models?model=' + encodeURIComponent(model), { method: 'DELETE' }, 60000); if (r.ok) identityCache.delete(model); return r; }),
+    // Unload, then delete. A request from another client can load the model again in between, so
+    // retry once if deletion is refused. The gate refuses to unload a model in use.
+    removeModel: model => mutate(async () => {
       let unloaded = !!(await post('/models/unload', { model }).catch(() => null))?.ok;
       let del = await request('/models?model=' + encodeURIComponent(model), { method: 'DELETE' }, 60000);
       if (!del.ok) {
@@ -825,7 +769,7 @@ function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloa
       }
       if (del.ok) identityCache.delete(model);
       return { ...del, unloaded };
-    })),
+    }),
     // Exposed so callers that delete a model's files through a different path (the raw
     // model-manager folder-scan proxy, routes/models.cjs) can still drop its cached identity.
     forgetIdentity: model => identityCache.delete(model),

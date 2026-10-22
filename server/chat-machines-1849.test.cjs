@@ -93,7 +93,7 @@ async function turn(t, { chatMachines = null, project = { routing: 'manual', mod
   process.env.MODEL_MANAGER_KIND = 'llamacpp'; process.env.INFERENCE_BASE_URL = 'http://default.invalid';
   t.after(() => { for (const [k, v] of [['MODEL_MANAGER_KIND', saved.kind], ['INFERENCE_BASE_URL', saved.base]]) if (v === undefined) delete process.env[k]; else process.env[k] = v; });
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'noevia-1849-')); t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
-  const events = [], localRequests = [], engine = { makeRoomFor: [], health: 0, props: [] };
+  const events = [], localRequests = [], engine = { leases: [], health: 0, props: [] };
   let replied = null, catalogueReads = 0;
   const res = new EventEmitter(); res.writeHead = () => {}; res.end = () => { res.writableEnded = true; res.emit('finish'); };
   res.write = (chunk) => { for (const line of String(chunk).split('\n')) if (line.startsWith('data:')) { try { events.push(JSON.parse(line.slice(5))); } catch { /* not json */ } } };
@@ -102,7 +102,7 @@ async function turn(t, { chatMachines = null, project = { routing: 'manual', mod
     return { ok: true, status: 200, body: (async function* () { yield Buffer.from(`data: ${JSON.stringify({ choices: [{ delta: { content: 'Local hello.' } }] })}\n\n`); })() };
   };
   const toolDefs = tools ? [{ type: 'function', function: { name: 'synthetic_lookup', description: 'Synthetic lookup.', parameters: { type: 'object', properties: { q: { type: 'string' } } } } }] : [];
-  const modelManager = { enabled: true, makeRoomFor: async (m) => { engine.makeRoomFor.push(m); },
+  const modelManager = { enabled: true, acquireLease: async (m) => { engine.leases.push(m); return null; },
     health: async () => { engine.health++; return { ok: true, body: { all_models_loaded: catalogue.map((m) => ({ model_name: m.name, loaded: true, recipe_options: { ctx_size: 32768 } })) } }; } };
   if (localProps) modelManager.props = async (m) => { engine.props.push(m); return { ok: true, body: { chat_template: localProps } }; };
   const { handleChat } = createChatHandler({
@@ -149,7 +149,7 @@ test('#1849 Manual: a model only a machine serves runs on that machine (no local
   assert.equal(chat.headers.authorization, undefined, 'the local API key never leaves for another host');
   assert.equal(JSON.stringify(chat.headers).includes(LOCAL_KEY), false);
   assert.equal(out.meta.model, REMOTE_MODEL);
-  assert.deepEqual(out.engine.makeRoomFor, [], 'no load or unload on this machine');
+  assert.deepEqual(out.engine.leases, [], 'no load or unload on this machine');
   assert.equal(out.engine.health, 0, 'no local residency read');
   assert.match(JSON.stringify(out.events), /Remote hello/);
 });
@@ -170,7 +170,7 @@ test('#1849 Manual: an unreachable machine fails the turn clearly and never fall
   assert.equal(out.replied.body.code, 'machineUnreachable');
   assert.match(out.replied.body.error, /^Smart model’s machine \(Synthetic Pi\) is unreachable/);
   assert.equal(out.localRequests.length, 0);
-  assert.deepEqual(out.engine.makeRoomFor, []);
+  assert.deepEqual(out.engine.leases, []);
 });
 
 test('#1849 Manual: a machine that now serves another model fails with the wrong-model error', async (t) => {
@@ -191,7 +191,7 @@ test('#1849 Manual default: nothing assigned sends exactly the request it did be
   assert.equal(localChats(before).length, 1);
   assert.equal(shape(after), shape(before), 'byte-identical local request');
   assert.equal(after.catalogueReads, before.catalogueReads, 'no catalogue read for the machine lookup');
-  assert.deepEqual(after.engine.makeRoomFor, before.engine.makeRoomFor);
+  assert.deepEqual(after.engine.leases, before.engine.leases);
 });
 
 test('#1849 machineModels lists each machine model once with its roles; empty when nothing is assigned', async () => {

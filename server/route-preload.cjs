@@ -18,8 +18,9 @@
 //    loading (a pre-load would evict it, possibly mid-generation or mid-decision);
 //  - the model is already loaded or sleeping (nothing to gain).
 // A wrong guess (the decision still picks Code) cancels the pre-load as soon as the route is known: the turn stops
-// waiting on it and its own makeRoomFor unloads the half-loaded, unused model before loading the Code model, as it
-// unloads any idle model today. Nothing in use is ever unloaded, since a pre-load only starts on an empty engine.
+// waiting on it and takes its lease on the Code model; the inference gate switches once the pre-loaded model is idle
+// (noevia#2115). Nothing in use is ever unloaded: the gate never unloads a model in use, and a pre-load only starts
+// on an empty engine. The pre-load's own load holds a lease only while it runs.
 const PRELOAD_ROLES = Object.freeze(['fast', 'smart', 'code', 'creative']);
 
 /** The shared Fast/Smart local model when a pre-load is safe for this turn, or null. */
@@ -51,10 +52,9 @@ async function startPreload({ manager, model, signal, busy = () => false, log = 
     // Anything else resident or arriving (a chat model, a decision model on the engine, the embedding model): a
     // load would evict it or contend with it. Skip; the turn's own load decides as before.
     if (rows.some((m) => m.id !== model && (m.loaded || ['loaded', 'loading', 'sleeping'].includes(m.status?.value)))) return null;
-    // This "nothing else loaded" listing is read outside the admission lock, so it can be stale by now. The busy()
-    // re-check is what makes it safe: a load or swap that started since is a pending admission, and a generation in
-    // flight is an active inference, so either makes busy() true and nothing is pre-loaded. (A model that loaded and
-    // went idle in between is evicted by load() exactly as any other load would evict an idle model.)
+    // This "nothing else loaded" listing can be stale by now. The busy() re-check narrows it: a turn of this server
+    // waiting for the inference gate, or a generation in flight, makes busy() true and nothing is pre-loaded. Either
+    // way the gate decides the switch, and it never unloads a model in use (noevia#2115).
     if (signal?.aborted || busy()) return null;
     const controller = new AbortController();
     const onAbort = () => controller.abort(signal.reason);

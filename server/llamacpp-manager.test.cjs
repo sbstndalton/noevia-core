@@ -2,9 +2,10 @@
 const test = require('node:test'), assert = require('node:assert/strict');
 const {createModelManager}=require('./model-manager.cjs');
 const {resolveRuntimeLimit}=require('./chat-context.cjs');
+const {fakeGate,gateRefusal}=require('./fixtures/fake-inference-gate.cjs');
 function fixture(){
  const calls=[];let loaded=false;
- const manager=createModelManager({fetchStream:async()=>({ok:false}),kind:'llamacpp',baseUrl:'http://synthetic-router/v1/',apiKey:'fixture-key',fetchJson:async(url,options)=>{
+ const manager=createModelManager({gate:fakeGate(),fetchStream:async()=>({ok:false}),kind:'llamacpp',baseUrl:'http://synthetic-router/v1/',apiKey:'fixture-key',fetchJson:async(url,options)=>{
   calls.push({url,options});const path=new URL(url).pathname;
   if(path==='/models/load')loaded=true;
   return {ok:true,status:200,body:path==='/models'?{data:[{id:'fixture/model:Q8_0',status:{value:loaded?'loaded':'unloaded'},meta:{n_ctx_train:262144}}]}:path==='/props'?{default_generation_settings:{n_ctx:32768},total_slots:4}:{success:true}};
@@ -88,13 +89,13 @@ test('onCompleted throwing or rejecting never reverts or re-marks a completed do
 
 test('native launch acknowledgement is not readiness; failed asynchronous load rejects',async()=>{
  let listed=0;
- const manager=createModelManager({kind:'llamacpp',baseUrl:'http://synthetic',fetchJson:async url=>({ok:true,status:200,body:url.endsWith('/models/load')?{success:true}:{data:[{id:'fixture',status:++listed===1?{value:'loading'}:{value:'unloaded',failed:true}}]}})});
+ const manager=createModelManager({gate:fakeGate(),kind:'llamacpp',baseUrl:'http://synthetic',fetchJson:async url=>({ok:true,status:200,body:url.endsWith('/models/load')?{success:true}:{data:[{id:'fixture',status:++listed===1?{value:'loading'}:{value:'unloaded',failed:true}}]}})});
  const result=await manager.load('fixture');assert.equal(result.ok,false);assert.equal(listed,2);
 });
 
 test('cancelling a pending native load stops waiting without unloading shared models',async()=>{
  const abort=new AbortController(),calls=[];
- const manager=createModelManager({kind:'llamacpp',baseUrl:'http://synthetic',fetchJson:async url=>{calls.push(url);if(url.endsWith('/models'))abort.abort();return {ok:true,status:200,body:{data:[{id:'fixture',status:{value:'loading'}}]}};}});
+ const manager=createModelManager({gate:fakeGate(),kind:'llamacpp',baseUrl:'http://synthetic',fetchJson:async url=>{calls.push(url);if(url.endsWith('/models'))abort.abort();return {ok:true,status:200,body:{data:[{id:'fixture',status:{value:'loading'}}]}};}});
  await assert.rejects(manager.load('fixture',{},abort.signal),{name:'AbortError'});assert.ok(!calls.some(c=>c.includes('unload')));
 });
 
@@ -104,7 +105,7 @@ test('native loaded and cold capability labels use effective flags without leaki
   {id:'opaque-ranker-'+value,status:{value,args:['--reranking']}},
   {id:'nomic-name-is-not-a-capability-'+value,status:{value,args:['--model','/models/embedding.gguf']},architecture:{input_modalities:['text','image']}},
  ]);
- const manager=createModelManager({kind:'llamacpp',baseUrl:'http://synthetic',fetchJson:async()=>({ok:true,status:200,body:{data}})});
+ const manager=createModelManager({gate:fakeGate(),kind:'llamacpp',baseUrl:'http://synthetic',fetchJson:async()=>({ok:true,status:200,body:{data}})});
  const rows=(await manager.listModels()).body.data;
  assert.deepEqual(rows.map(m=>m.id),data.map(m=>m.id));
  for(let i=0;i<rows.length;i+=3){assert.deepEqual(rows[i].labels,['embeddings']);assert.deepEqual(rows[i+1].labels,['reranking']);assert.deepEqual(rows[i+2].labels,['vision']);}
@@ -118,7 +119,7 @@ test('qualification evidence is tied to the live configuration and goes stale wh
   fs.writeFileSync(path.join(models,'fx','fx.gguf'),Buffer.alloc(2048,7));
   const ini=path.join(root,'models.ini');
   fs.writeFileSync(ini,'version = 1\n\n[fx]\nmodel = /models/fx/fx.gguf\nctx-size = 8192\n');
-  const manager=createModelManager({kind:'llamacpp',baseUrl:'http://synthetic-router/v1/',presetPath:ini,evidenceDir:ev,autoconfig:{modelsPath:models},fetchStream:async()=>({ok:false}),
+  const manager=createModelManager({gate:fakeGate(),kind:'llamacpp',baseUrl:'http://synthetic-router/v1/',presetPath:ini,evidenceDir:ev,autoconfig:{modelsPath:models},fetchStream:async()=>({ok:false}),
    fetchJson:async(url)=>{const p=new URL(url).pathname;return {ok:true,status:200,body:p==='/models'?{data:[{id:'fx',status:{value:'unloaded',args:[]}}]}:p==='/props'?{build_info:'b-synthetic'}:{}};}});
   const unverified=(await manager.evidence('fx')).body;
   assert.equal(unverified.categories.find(c=>c.category==='context_capacity').state,'unverified');
@@ -158,149 +159,11 @@ test('qualification evidence is tied to the live configuration and goes stale wh
  }finally{fs.rmSync(root,{recursive:true,force:true});}
 });
 
-test('before a chat model loads, other chat models are unloaded but the embedding model stays',async()=>{
- const prev=process.env.EMBEDDING_MODEL;process.env.EMBEDDING_MODEL='fixture-embed';
- const unloaded=[];let state={'chat-a':'loaded','fixture-embed':'loaded','chat-b':'unloaded'};
- const manager=createModelManager({fetchStream:async()=>({ok:false}),kind:'llamacpp',baseUrl:'http://synthetic',fetchJson:async(url,options)=>{
-  const path=new URL(url).pathname,body=options?.body?JSON.parse(options.body):{};
-  if(path==='/models/unload'){unloaded.push(body.model);state[body.model]='unloaded';}
-  if(path==='/models/load')state[body.model]='loaded';
-  return {ok:true,status:200,body:path==='/models'?{data:Object.entries(state).map(([id,value])=>({id,status:{value}}))}:{success:true}};
- }});
- try{
-  assert.equal((await manager.load('chat-b')).ok,true);
-  assert.deepEqual(unloaded,['chat-a']);assert.equal(state['fixture-embed'],'loaded');
-  await manager.makeRoomFor('chat-b',['fixture-embed']);assert.deepEqual(unloaded,['chat-a'],'nothing else to unload');
- }finally{if(prev===undefined)delete process.env.EMBEDDING_MODEL;else process.env.EMBEDDING_MODEL=prev;}
-});
-
-test('with RAG rerank allowed on the shared engine, the reranker also stays beside the chat model',async()=>{
- // #697: only an operator who allowed the reranker on the shared engine keeps it resident.
- const keys=['EMBEDDING_MODEL','NOEVIA_FEATURE_RAG_RERANK','RERANK_MODEL','RERANK_BASE_URL','INFERENCE_BASE_URL','RERANK_SHARED_ENGINE'],prev=Object.fromEntries(keys.map(k=>[k,process.env[k]]));
- Object.assign(process.env,{EMBEDDING_MODEL:'fixture-embed',NOEVIA_FEATURE_RAG_RERANK:'1',RERANK_MODEL:'fixture-rerank',RERANK_BASE_URL:'http://synthetic/v1',INFERENCE_BASE_URL:'http://synthetic/v1',RERANK_SHARED_ENGINE:'allow'});
- const unloaded=[];const state={'chat-a':'loaded','fixture-rerank':'loaded','chat-b':'unloaded'};
- const manager=createModelManager({fetchStream:async()=>({ok:false}),kind:'llamacpp',baseUrl:'http://synthetic',fetchJson:async(url,options)=>{
-  const path=new URL(url).pathname,body=options?.body?JSON.parse(options.body):{};
-  if(path==='/models/unload'){unloaded.push(body.model);state[body.model]='unloaded';}
-  if(path==='/models/load')state[body.model]='loaded';
-  return {ok:true,status:200,body:path==='/models'?{data:Object.entries(state).map(([id,value])=>({id,status:{value}}))}:{success:true}};
- }});
- try{
-  assert.equal((await manager.load('chat-b')).ok,true);
-  assert.deepEqual(unloaded,['chat-a']);assert.equal(state['fixture-rerank'],'loaded');
- }finally{for(const k of keys){if(prev[k]===undefined)delete process.env[k];else process.env[k]=prev[k];}}
-});
-
-test('concurrent distinct native loads serialize eviction and admission',async()=>{
- const calls=[],state={alpha:'unloaded',beta:'unloaded'};
- const manager=createModelManager({kind:'llamacpp',baseUrl:'http://synthetic',fetchJson:async(url,options={})=>{
-  const route=new URL(url).pathname,body=options.body?JSON.parse(options.body):{};
-  calls.push(`${options.method||'GET'} ${route}${body.model?' '+body.model:''}`);
-  if(route==='/models')return {ok:true,status:200,body:{data:Object.entries(state).map(([id,value])=>({id,status:{value}}))}};
-  if(route==='/models/unload'){state[body.model]='unloaded';return {ok:true,status:200,body:{success:true}};}
-  if(route==='/models/load'){state[body.model]='loaded';return {ok:true,status:200,body:{success:true}};}
-  throw Error(`Unexpected route ${route}`);
- }});
- const results=await Promise.all([manager.load('alpha'),manager.load('beta')]);
- assert.ok(results.every(r=>r.ok));
- assert.deepEqual(state,{alpha:'unloaded',beta:'loaded'});
- assert.ok(calls.indexOf('POST /models/unload alpha')<calls.indexOf('POST /models/load beta'));
-});
-
-test('a failed or unconfirmed eviction stops native admission, including the chat preflight',async()=>{
- for(const confirm of [false,true]){
-  const calls=[];
-  const manager=createModelManager({kind:'llamacpp',baseUrl:'http://synthetic',fetchJson:async(url,options={})=>{
-   const route=new URL(url).pathname,body=options.body?JSON.parse(options.body):{};
-   calls.push(`${options.method||'GET'} ${route}${body.model?' '+body.model:''}`);
-   if(route==='/models')return {ok:true,status:200,body:{data:[{id:'alpha',status:{value:'loaded'}},{id:'beta',status:{value:'unloaded'}}]}};
-   if(route==='/models/unload')return {ok:confirm,status:confirm?200:409,body:{success:confirm}};
-   if(route==='/models/load')throw Error('must not load after failed eviction');
-   throw Error(`Unexpected route ${route}`);
-  }});
-  const result=await manager.load('beta');
-  assert.equal(result.ok,false);
-  assert.equal(result.status,409);
-  await assert.rejects(manager.makeRoomFor('beta'),{status:409});
-  assert.equal(calls.some(c=>c==='POST /models/load beta'),false);
- }
-});
-
-test('a newly appearing loaded model after eviction blocks native admission',async()=>{
- const calls=[],state={alpha:'loaded',beta:'unloaded'};
- const manager=require('./llamacpp-manager.cjs').createLlamaCppManager({unloadWait:{timeoutMs:0},baseUrl:'http://synthetic',fetchJson:async(url,options={})=>{
-  const route=new URL(url).pathname,body=options.body?JSON.parse(options.body):{};
-  calls.push(`${options.method||'GET'} ${route}${body.model?' '+body.model:''}`);
-  if(route==='/models')return {ok:true,status:200,body:{data:Object.entries(state).map(([id,value])=>({id,status:{value}}))}};
-  if(route==='/models/unload'){
-   assert.equal(body.model,'alpha');state.alpha='unloaded';state.gamma='loaded';
-   return {ok:true,status:200,body:{success:true}};
-  }
-  if(route==='/models/load')throw Error('must not admit while a newly appearing model is loaded');
-  throw Error(`Unexpected route ${route}`);
- }});
- const result=await manager.load('beta');
- assert.equal(result.ok,false);assert.equal(result.status,409);
- assert.deepEqual(calls,['GET /models','POST /models/unload alpha','GET /models']);
-});
-
-test('a queued native load observes cancellation before it can evict or load',async()=>{
- let releaseFirst;const holdFirst=new Promise(resolve=>{releaseFirst=resolve;});
- let firstStarted;const firstPost=new Promise(resolve=>{firstStarted=resolve;});
- const calls=[],state={alpha:'unloaded',beta:'unloaded'};
- const manager=createModelManager({kind:'llamacpp',baseUrl:'http://synthetic',fetchJson:async(url,options={})=>{
-  const route=new URL(url).pathname,body=options.body?JSON.parse(options.body):{};
-  calls.push(`${options.method||'GET'} ${route}${body.model?' '+body.model:''}`);
-  if(route==='/models')return {ok:true,status:200,body:{data:Object.entries(state).map(([id,value])=>({id,status:{value}}))}};
-  if(route==='/models/load'&&body.model==='alpha'){firstStarted();await holdFirst;state.alpha='loaded';return {ok:true,status:200,body:{success:true}};}
-  if(route==='/models/unload'){state[body.model]='unloaded';return {ok:true,status:200,body:{success:true}};}
-  if(route==='/models/load'&&body.model==='beta'){state.beta='loaded';return {ok:true,status:200,body:{success:true}};}
-  throw Error(`Unexpected route ${route}`);
- }});
- const first=manager.load('alpha');await firstPost;
- const controller=new AbortController();
- const second=manager.load('beta',{},controller.signal);
- controller.abort();
- await assert.rejects(second,{name:'AbortError'});
- assert.deepEqual(calls,['GET /models','POST /models/load alpha'],'cancellation settles while the first load is held');
- const third=manager.load('beta');
- await new Promise(resolve=>setImmediate(resolve));
- assert.deepEqual(calls,['GET /models','POST /models/load alpha'],'later admissions cannot pass the held first load or cancelled queue slot');
- releaseFirst();
- assert.equal((await first).ok,true);
- assert.equal((await third).ok,true);
- assert.equal(calls.filter(c=>c==='POST /models/load beta').length,1);
- assert.ok(calls.indexOf('POST /models/unload alpha')<calls.indexOf('POST /models/load beta'));
-});
-
-test('chat room checks and explicit unload wait for a pending native admission',async()=>{
- let releaseFirst;const holdFirst=new Promise(resolve=>{releaseFirst=resolve;});
- let firstStarted;const firstPost=new Promise(resolve=>{firstStarted=resolve;});
- const calls=[],state={alpha:'unloaded',beta:'unloaded'};
- const manager=createModelManager({kind:'llamacpp',baseUrl:'http://synthetic',fetchJson:async(url,options={})=>{
-  const route=new URL(url).pathname,body=options.body?JSON.parse(options.body):{};
-  calls.push(`${options.method||'GET'} ${route}${body.model?' '+body.model:''}`);
-  if(route==='/models')return {ok:true,status:200,body:{data:Object.entries(state).map(([id,value])=>({id,status:{value}}))}};
-  if(route==='/models/load'){firstStarted();await holdFirst;state[body.model]='loaded';return {ok:true,status:200,body:{success:true}};}
-  if(route==='/models/unload'){state[body.model]='unloaded';return {ok:true,status:200,body:{success:true}};}
-  throw Error(`Unexpected route ${route}`);
- }});
- const loading=manager.load('alpha');await firstPost;
- const room=manager.makeRoomFor('beta');
- const explicit=manager.unload('alpha');
- assert.deepEqual(calls,['GET /models','POST /models/load alpha'],'neither later operation reaches the router while admission is pending');
- releaseFirst();
- assert.equal((await loading).ok,true);
- await room;
- assert.equal((await explicit).ok,true);
- assert.ok(calls.indexOf('POST /models/unload alpha')>calls.indexOf('POST /models/load alpha'));
-});
-
 // removeModel (#302 follow-up): unload and delete inside a single mutate() gate, with the
 // delete retried once (after one more unload attempt) if the router refuses it the first time.
 test('removeModel unloads then deletes as one call, and reports unloaded:true on success',async()=>{
  const calls=[];
- const manager=createModelManager({fetchStream:async()=>({ok:false}),kind:'llamacpp',baseUrl:'http://synthetic',fetchJson:async(url,options)=>{
+ const manager=createModelManager({gate:fakeGate(),fetchStream:async()=>({ok:false}),kind:'llamacpp',baseUrl:'http://synthetic',fetchJson:async(url,options)=>{
   const path=new URL(url).pathname;calls.push(`${options?.method||'GET'} ${path}`);
   if(path==='/models/unload')return {ok:true,status:200,body:{success:true}};
   if(path==='/models'&&options?.method==='DELETE')return {ok:true,status:200,body:{deleted:true}};
@@ -313,7 +176,7 @@ test('removeModel unloads then deletes as one call, and reports unloaded:true on
 
 test('removeModel retries the unload once, then retries the delete, if the first delete is refused',async()=>{
  const calls=[];let deleteAttempts=0;
- const manager=createModelManager({fetchStream:async()=>({ok:false}),kind:'llamacpp',baseUrl:'http://synthetic',fetchJson:async(url,options)=>{
+ const manager=createModelManager({gate:fakeGate(),fetchStream:async()=>({ok:false}),kind:'llamacpp',baseUrl:'http://synthetic',fetchJson:async(url,options)=>{
   const path=new URL(url).pathname;calls.push(`${options?.method||'GET'} ${path}`);
   if(path==='/models/unload')return {ok:true,status:200,body:{success:true}};
   if(path==='/models'&&options?.method==='DELETE'){deleteAttempts+=1;return deleteAttempts===1?{ok:false,status:409,body:{error:'busy'}}:{ok:true,status:200,body:{deleted:true}};}
@@ -325,7 +188,7 @@ test('removeModel retries the unload once, then retries the delete, if the first
 });
 
 test('removeModel gives up after the retry and still reports whether anything actually unloaded',async()=>{
- const manager=createModelManager({fetchStream:async()=>({ok:false}),kind:'llamacpp',baseUrl:'http://synthetic',fetchJson:async(url,options)=>{
+ const manager=createModelManager({gate:fakeGate(),fetchStream:async()=>({ok:false}),kind:'llamacpp',baseUrl:'http://synthetic',fetchJson:async(url,options)=>{
   const path=new URL(url).pathname;
   if(path==='/models/unload')return {ok:false,status:404,body:{error:'not loaded'}};
   if(path==='/models'&&options?.method==='DELETE')return {ok:false,status:409,body:{error:'still busy'}};
@@ -336,25 +199,97 @@ test('removeModel gives up after the retry and still reports whether anything ac
 });
 
 test('forgetIdentity drops a cached identity without needing a live request',async()=>{
- const manager=createModelManager({fetchStream:async()=>({ok:false}),kind:'llamacpp',baseUrl:'http://synthetic',fetchJson:async()=>({ok:true,status:200,body:{}})});
+ const manager=createModelManager({gate:fakeGate(),fetchStream:async()=>({ok:false}),kind:'llamacpp',baseUrl:'http://synthetic',fetchJson:async()=>({ok:true,status:200,body:{}})});
  assert.doesNotThrow(()=>manager.forgetIdentity('whatever-not-cached'));
 });
 
-test('#578: switching models waits for the old model to finish unloading instead of failing the first time', async () => {
- const {createLlamaCppManager}=require('./llamacpp-manager.cjs');
- for(const [polls,timeoutMs,expectOk] of [[3,30000,true],[1000,0,false]]){
-  const state={'chat-a':'loaded','chat-b':'unloaded'};let stillLoaded=polls,unloadedAt=false,sleeps=[],loadedBeforeUnloadDone=false;
-  const manager=createLlamaCppManager({baseUrl:'http://synthetic',unloadWait:{timeoutMs,sleep:async ms=>{sleeps.push(ms);}},fetchJson:async(url,options={})=>{
-   const path=new URL(url).pathname,body=options.body?JSON.parse(options.body):{};
-   if(path==='/models/unload'){unloadedAt=true;return {ok:true,status:200,body:{success:true}};}
-   if(path==='/models/load'){loadedBeforeUnloadDone=state['chat-a']==='loaded';state[body.model]='loaded';return {ok:true,status:200,body:{success:true}};}
-   if(path==='/models'){if(unloadedAt&&stillLoaded>0){stillLoaded--;if(stillLoaded===0)state['chat-a']='unloaded';}
-    return {ok:true,status:200,body:{data:Object.entries(state).map(([id,value])=>({id,status:{value}}))}};}
-   throw Error('unexpected '+path);
-  }});
-  const result=await manager.load('chat-b');
-  assert.equal(result.ok,expectOk,JSON.stringify(result));
-  if(expectOk){assert.equal(loadedBeforeUnloadDone,false,'load only after unload finished');assert.ok(sleeps.length>=1);assert.ok(sleeps.every((v,i)=>i===0||v>=sleeps[i-1]),'backoff does not shrink');}
-  else{assert.equal(result.status,409);assert.match(result.body.error,/still unloading/);}
- }
+// noevia#2115, #2117: the inference gate decides which chat model runs; this manager no longer evicts anything.
+const routerFake=(state,calls,{answer}={})=>async(url,options={})=>{
+ const route=new URL(url).pathname,body=options.body?JSON.parse(options.body):{};
+ calls.push({route,method:options.method||'GET',body,lease:options.headers?.['X-Noevia-Lease']||null,admin:options.headers?.['X-Noevia-Gate-Admin']||null});
+ const custom=answer?.(route,body,options);if(custom)return custom;
+ if(route==='/models/load'){for(const id of Object.keys(state))if(state[id]==='loaded')state[id]='unloaded';state[body.model]='loaded';}
+ if(route==='/models/unload')state[body.model]='unloaded';
+ return {ok:true,status:200,body:route==='/models'?{data:Object.entries(state).map(([id,value])=>({id,status:{value}}))}:{success:true}};
+};
+const tick=()=>new Promise(resolve=>setImmediate(resolve));
+
+test('noevia#2115: a load waits for its own lease, carries it and gives it back; it never unloads another model',async()=>{
+ const gate=fakeGate({hold:true}),calls=[],state={'chat-a':'loaded','chat-b':'unloaded'};
+ const manager=createModelManager({gate,kind:'llamacpp',baseUrl:'http://synthetic',fetchJson:routerFake(state,calls)});
+ const loading=manager.load('chat-b');
+ await tick();
+ assert.deepEqual(calls,[],'nothing reaches the router while the lease waits');
+ assert.equal(manager.inferenceBusy(0),true,'a lease being waited for makes the engine busy (an optional title skips)');
+ assert.equal(gate.grant(),true);
+ assert.equal((await loading).ok,true);
+ const load=calls.find(c=>c.route==='/models/load');
+ assert.equal(load.body.model,'chat-b');assert.match(load.lease,/^[0-9a-f]{32}$/);
+ assert.ok(!calls.some(c=>c.route==='/models/unload'),'the switch is the gate\'s; nothing here unloads the other model');
+ assert.deepEqual(gate.log.acquired,['chat-b']);assert.deepEqual(gate.log.released,['chat-b'],'the load\'s own lease is given back');
+ assert.equal(manager.inferenceBusy(0),false);
+ assert.equal(typeof manager.makeRoomFor,'undefined');assert.equal(typeof manager.withAdmission,'undefined');
+});
+
+test('noevia#2115: a turn\'s explicit load runs under the turn\'s lease and leaves it held',async()=>{
+ const gate=fakeGate(),calls=[],state={'chat-b':'unloaded'};
+ const manager=createModelManager({gate,kind:'llamacpp',baseUrl:'http://synthetic',fetchJson:routerFake(state,calls)});
+ const lease=await manager.acquireLease('chat-b');
+ assert.equal((await manager.load('chat-b',{},undefined,{lease})).ok,true);
+ assert.equal(calls.find(c=>c.route==='/models/load').lease,lease.token);
+ assert.deepEqual(gate.log.acquired,['chat-b'],'no second lease');assert.deepEqual(gate.log.released,[],'the turn gives it back, not the load');
+ const value=await resolveRuntimeLimit({manager,model:'chat-b',lease});
+ assert.ok(value.limit>0);assert.deepEqual(gate.log.acquired,['chat-b']);
+});
+
+test('noevia#2115: a refusal from the gate fails the load with its code and loads nothing',async()=>{
+ const refuse={code:'engine_switch_stuck',status:503,retryable:true,message:'The local model engine is still releasing the previous model. Try again shortly.'};
+ const calls=[],manager=createModelManager({gate:fakeGate({refuse}),kind:'llamacpp',baseUrl:'http://synthetic',fetchJson:routerFake({beta:'unloaded'},calls)});
+ const r=await manager.load('beta');
+ assert.equal(r.ok,false);assert.equal(r.status,503);assert.deepEqual(r.body,{error:refuse.message,code:'engine_switch_stuck',retryable:true});
+ assert.deepEqual(calls,[]);
+ await assert.rejects(manager.acquireLease('beta'),e=>e.name==='GateError'&&e.code==='engine_switch_stuck'&&e.retryable===true&&e.publicMessage===refuse.message);
+ // A refusal the gate answers to the load request itself (a lease that ended meanwhile) is passed on the same way.
+ const late=createModelManager({gate:fakeGate(),kind:'llamacpp',baseUrl:'http://synthetic',fetchJson:routerFake({beta:'unloaded'},[],{answer:route=>route==='/models/load'?gateRefusal(503,'inference_queue_timeout','Another chat was still using the local model. Try again when it has finished.',true):null})});
+ const lateResult=await late.load('beta');
+ assert.equal(lateResult.status,503);assert.equal(lateResult.body.code,'inference_queue_timeout');assert.equal(lateResult.body.retryable,true);
+});
+
+test('noevia#2115: a load waiting for its lease observes cancellation and loads nothing',async()=>{
+ const gate=fakeGate({hold:true}),calls=[];
+ const manager=createModelManager({gate,kind:'llamacpp',baseUrl:'http://synthetic',fetchJson:routerFake({beta:'unloaded'},calls)});
+ const controller=new AbortController();
+ const waiting=manager.load('beta',{},controller.signal);
+ await tick();
+ controller.abort();
+ await assert.rejects(waiting,{name:'AbortError'});
+ assert.deepEqual(gate.log.aborted,['beta'],'the wait left the gate\'s queue');assert.deepEqual(calls,[]);
+ assert.equal(manager.inferenceBusy(0),false);
+});
+
+test('noevia#2115: the gate\'s refusal to unload a model in use reaches the caller; unloading it anyway needs the admin token',async()=>{
+ const answer=(route,body,options)=>route==='/models/unload'&&!(body.force===true&&options.headers?.['X-Noevia-Gate-Admin'])?gateRefusal(409,'model_in_use','The model is answering a request. Unload it when it is idle, or unload it anyway as an admin.',true):null;
+ const calls=[],plain=createModelManager({gate:fakeGate(),kind:'llamacpp',baseUrl:'http://synthetic',fetchJson:routerFake({alpha:'loaded'},calls,{answer})});
+ const refused=await plain.unload('alpha');
+ assert.equal(refused.status,409);assert.equal(refused.body.error.code,'model_in_use');
+ assert.equal(plain.gateAdmin(),false);
+ const noAdmin=await plain.unloadAnyway('alpha');
+ assert.equal(noAdmin.status,403);assert.equal(noAdmin.body.code,'admin_required');
+ assert.equal(calls.filter(c=>c.route==='/models/unload').length,1,'nothing is sent without the admin token');
+ // The memory watchdog without the token: a plain unload, which the gate refuses for a model in use.
+ assert.equal((await plain.emergencyUnload('alpha')).status,409);
+ assert.deepEqual(calls.at(-1).body,{model:'alpha'});
+ const adminCalls=[],admin=createModelManager({gate:fakeGate({admin:'synthetic-admin-0001'}),kind:'llamacpp',baseUrl:'http://synthetic',fetchJson:routerFake({alpha:'loaded'},adminCalls,{answer})});
+ assert.equal(admin.gateAdmin(),true);
+ assert.equal((await admin.unload('alpha')).status,409,'a plain unload stays refused with a token configured');
+ assert.equal((await admin.unloadAnyway('alpha')).ok,true);
+ assert.deepEqual(adminCalls.at(-1).body,{model:'alpha',force:true});assert.equal(adminCalls.at(-1).admin,'synthetic-admin-0001');
+ assert.equal((await admin.emergencyUnload('alpha')).ok,true);
+ assert.deepEqual(adminCalls.at(-1).body,{model:'alpha',force:true});assert.equal(adminCalls.at(-1).admin,'synthetic-admin-0001');
+});
+
+test('noevia#2115: the admission queue, the eviction and their helpers are deleted from the manager',()=>{
+ const source=require('node:fs').readFileSync(require.resolve('./llamacpp-manager.cjs'),'utf8');
+ for(const gone of ['makeRoomFor','makeRoomForUnlocked','settleLoadingEvictee','withAdmission','admissionsPending','still unloading after','could not be unloaded'])
+  assert.equal(source.includes(gone),false,gone);
 });

@@ -27,6 +27,8 @@ async function providerFailureText(response, chatgptProvider, partial = false) {
   const context = require('./chat-context.cjs');
   const detail = (await readCappedText(response, PROVIDER_ERROR_BODY_CAP).catch(() => ({ text: '' }))).text;
   let msg = context.providerError(detail, Number.isInteger(response?.status) ? response.status : undefined, { partial });
+  // noevia#2115: the inference gate's refusals are written for people (queue full, engine switching, ...).
+  if (response.headers?.get?.('x-noevia-gate-refusal')) { try { const e = JSON.parse(detail).error; if (e?.type === 'gate_error' && e.message) msg = String(e.message).slice(0, 300); } catch { /* keep the mapped text */ } }
   if (chatgptProvider && response.headers?.get?.('x-noevia-provider-message') === '1') { try { msg = String(JSON.parse(detail).error.message).slice(0, 300) || msg; } catch { /* keep the generic text */ } }
   return msg;
 }
@@ -761,14 +763,16 @@ function createChatHandler({
       if (cached && cached.until > Date.now()) return cached.text;
       const stageTimeout = AbortSignal.timeout(VISION_STAGE_TIMEOUT_MS);
       const stageSignal = AbortSignal.any([chatSignal.signal, stageTimeout]);
-      // #697: the vision model is admitted to the shared engine (one model, memory budget) first;
-      // a refusal falls back to handing the images to the answering model, as a failure does.
+      // #697: the vision model must fit the memory budget; noevia#2115: the stage takes a lease on it from the
+      // inference gate, which switches models only once the previous one is idle. A refusal falls back to handing the
+      // images to the answering model, as a failure does.
       // #1840: a Vision role on an Inference machine loads nothing here; it must answer its health check instead.
+      let stageLease = null;
       if (onMachine) {
         const ready = await chatMachines.ready(onMachine);
         if (!ready.ok) { describeFailure = 'unreachable'; describeUnreachable = ready.error; return null; }
-      } else if (typeof modelManager.makeRoomFor === 'function') {
-        try { await modelManager.makeRoomFor(visionModel, undefined, stageSignal); }
+      } else if (typeof modelManager.acquireLease === 'function') {
+        try { stageLease = await modelManager.acquireLease(visionModel, { signal: stageSignal }); }
         catch (err) {
           describeFailure = stageTimeout.aborted ? 'timeout' : 'failed';
           console.warn(`[vision] ${visionModel} not admitted: ${stageTimeout.aborted ? 'timeout' : String(err?.code || err?.status || 'error')}`);
@@ -783,7 +787,7 @@ function createChatHandler({
         `The question that will be asked is: ${question.slice(0, 500)}`,
       ].join(' ');
       try {
-        const r = await (onMachine ? chatMachines.fetch : fetch)(url, {
+        const r = await (onMachine ? chatMachines.fetch : stageLease ? stageLease.fetch(fetch) : fetch)(url, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json', ...headers },
           body: JSON.stringify({
@@ -816,7 +820,7 @@ function createChatHandler({
         if (onMachine && !stageTimeout.aborted) describeUnreachable = chatMachines.connectError(onMachine, err);
         console.warn(`[vision] describe failed: ${stageTimeout.aborted ? `no description within ${VISION_STAGE_TIMEOUT_MS / 1000} s` : String((err && err.message) || err)}`);
         return null;
-      }
+      } finally { void stageLease?.release(); }
     };
 
     // A project's image sources ride along with the latest user turn, as image
@@ -1088,7 +1092,7 @@ function createChatHandler({
       if (routingDecision) routingDecision = { ...routingDecision, effectiveRole: routedRole };
       recordResend(body.resend, { auto: true, role: routedRole, status: routingDecision?.status || null });
       // #1863: a wrong guess (Code, or another model) stops waiting on the pre-load now, so the swap is not held up.
-      if (routePreload && routePreload.model !== model) { if (!chatSignal.signal.aborted) routePreload.use(); routePreload.cancel(); } // its makeRoomFor evicts it
+      if (routePreload && routePreload.model !== model) { if (!chatSignal.signal.aborted) routePreload.use(); routePreload.cancel(); } // the gate switches once it is idle
     } else if (!model && provider.id === DEFAULT_PROVIDER_ID && modelManager.enabled) {
       // No hardcoded model name: default to whatever the manager reports as loaded.
       try {
@@ -1527,18 +1531,19 @@ function createChatHandler({
           read: () => (typeof rag.readCaption === 'function' ? rag.readCaption(project.id, uid, image.hash) : null),
           write: (caption, by) => { if (typeof rag.writeCaption === 'function') rag.writeCaption(project.id, uid, image.hash, caption, by); },
           generate: async () => {
+            let captionLease = null; // noevia#2115: the caption's lease on the vision model
             if (captionRemote) {
               if (!(await chatMachines.ready(captionRemote)).ok) { console.warn('[vision] the Vision role\'s machine is not answering; no caption'); return null; }
-            } else if (typeof modelManager.makeRoomFor === 'function') {
-              try { await modelManager.makeRoomFor(visionModel, undefined, chatSignal.signal); }
+            } else if (typeof modelManager.acquireLease === 'function') {
+              try { captionLease = await modelManager.acquireLease(visionModel, { signal: chatSignal.signal }); }
               catch (err) { console.warn(`[vision] ${visionModel} not admitted for a caption: ${String(err?.code || err?.status || 'error')}`); return null; }
             }
             let bytes;
-            try { bytes = image.bytes(); } catch { return null; }
+            try { bytes = image.bytes(); } catch { void captionLease?.release(); return null; }
             // #1880: a caption on the Vision role's machine counts as a turn there while it runs.
             const releaseCaption = captionRemote && typeof chatMachines?.beginTurn === 'function' ? chatMachines.beginTurn(captionRemote.machine.id) : () => {};
             try {
-              const r = await (captionRemote ? chatMachines.fetch : fetch)(`${String(captionProvider.baseUrl).replace(/\/+$/, '').replace(/\/v1$/, '')}/v1/chat/completions`, {
+              const r = await (captionRemote ? chatMachines.fetch : captionLease ? captionLease.fetch(fetch) : fetch)(`${String(captionProvider.baseUrl).replace(/\/+$/, '').replace(/\/v1$/, '')}/v1/chat/completions`, {
                 method: 'POST', headers: { 'Content-Type': 'application/json', ...providerHeaders(captionProvider) }, redirect: 'error',
                 body: JSON.stringify({ model: visionModel, max_tokens: 1024, chat_template_kwargs: { enable_thinking: false }, messages: [{ role: 'user', content: [
                   { type: 'text', text: 'Describe this image in detail, so someone who cannot see it can answer questions about it. Transcribe any text exactly, including numbers, labels and headings. If text is unclear, say so rather than guessing.' },
@@ -1551,7 +1556,7 @@ function createChatHandler({
               if (!text || out?.choices?.[0]?.finish_reason === 'length') return null;
               return { caption: text, model: visionModel };
             } catch (err) { console.warn(`[vision] caption failed: ${String((err && err.message) || err)}`); return null; }
-            finally { releaseCaption(); }
+            finally { releaseCaption(); void captionLease?.release(); }
           },
         });
       };
@@ -1731,11 +1736,10 @@ function createChatHandler({
     const notApprovedResults = new Set(), notRunResults = new Set();
     let paused = false;
     let prepared,limit,limitSource,summarizeContext,requestStartedAt=Date.now();
+    let turnLease=null;
     try {
-      // Native engine: free the GPU of any other chat model before this one loads (it holds two
-      // models so the embedding model can stay beside the chat model; two chat models do not fit).
       // #1863: a pre-load for another model (the turn moved after all) is not needed; one for this model is
-      // awaited here (makeRoomFor queues behind it anyway) with the usual loading status.
+      // awaited here with the usual loading status.
       if(routePreload&&!chatSignal.signal.aborted)routePreload.use(); // a stopped turn leaves it to releaseIfUnused
       if(routePreload&&routePreload.model!==model)routePreload.cancel();
       else if(routePreload&&routePreload.pending()){
@@ -1743,7 +1747,22 @@ function createChatHandler({
         send({type:'status',text:context.loadingStatus(model,routedRole||null,seconds),id:'loadingModel',detail:{model,...(routedRole?{role:routedRole}:{}),...(seconds?{expectedSeconds:seconds}:{})}});
         await routePreload.settled;
       }
-      if(provider.id===DEFAULT_PROVIDER_ID&&typeof modelManager.makeRoomFor==='function')await modelManager.makeRoomFor(model,undefined,chatSignal.signal);
+      // noevia#2115, #2117: the turn's lease on its model from the inference gate. While another chat's model is in
+      // use, the turn waits in the gate's queue and the status says so; the gate unloads a model only once no request
+      // and no lease is using it, so no other chat's answer is cut. Every request of the turn (each round, retry,
+      // compaction and the title) carries the lease, so the model stays between them. Released when the turn ends.
+      if(provider.id===DEFAULT_PROVIDER_ID&&typeof modelManager.acquireLease==='function'){
+        turnLease=await modelManager.acquireLease(model,{signal:chatSignal.signal,onQueued:({position,waitedMs})=>{
+          const seconds=Math.round(waitedMs/1000);
+          send({type:'status',text:context.waitingStatus(model,routedRole||null,position,seconds),id:'waitingForModel',
+            detail:{model,...(routedRole?{role:routedRole}:{}),position,waitedSeconds:seconds}});
+        }});
+        if(turnLease){
+          const lease=turnLease,end=()=>{void lease.release();};
+          res.once('finish',end);res.once('close',end);
+          providerFetch=lease.fetch(providerFetch);
+        }
+      }
       ({limit,limitSource}=await context.resolveRuntimeLimit({
         manager:provider.id===DEFAULT_PROVIDER_ID?modelManager:null,model,dir:chatWorkspace.dir,
         scope:require('node:crypto').createHash('sha256').update(JSON.stringify([provider.baseUrl,provider.apiKey,modelManager.baseUrl])).digest('hex'),
@@ -1753,6 +1772,8 @@ function createChatHandler({
         role:routedRole||null,
         // #536: a hosted/custom provider's own context setting (or the hosted default); the local default is unchanged.
         hosted:provider.id===DEFAULT_PROVIDER_ID?null:provider,
+        // noevia#2115: an explicit load is part of the turn.
+        lease:turnLease,
       }));
       summarizeContext=async(summary,older,maxTokens)=>{
           const response=await reasoningEffort.requestWithEffort(providerFetch,upstreamUrl,{method:'POST',headers:upstreamHeaders,signal:AbortSignal.any([chatSignal.signal,AbortSignal.timeout(180000)]),redirect:'error'},
@@ -1765,7 +1786,11 @@ function createChatHandler({
       prepared=await context.prepare({dir:chatWorkspace.dir,id:contextId,messages:wire,tools:activeTools,limit,limitSource,model,force:body.compactOnly===true,
         onStatus:(text,id)=>send({type:'status',text,...(id?{id}:{})}),summarize:summarizeContext,assertActive:assertWorkspaceActive});
       send({type:'context',...prepared.meter});
-    } catch(error) {send({type:'error',text:error.message});res.end();return;}
+    } catch(error) {
+      // noevia#2115: a gate refusal (queue full or timed out, engine down) says whether trying again may help.
+      const gate=error?.name==='GateError';
+      send({type:'error',text:gate?error.publicMessage:error.message,...(gate?{code:error.code,retryable:error.retryable}:{})});res.end();return;
+    }
     if(body.compactOnly){send({type:'done',model});res.end();return;}
     // #1475/#1477: the local engine's thinking cap for this effort, leaving the answer its room (thinking-budget.cjs).
     const localThinkingCap = provider.id===DEFAULT_PROVIDER_ID && !fastThinkingOff ? require('./thinking-budget.cjs').thinkingCap(effort, prepared.maxTokens) : null;
@@ -2498,7 +2523,8 @@ function createChatHandler({
     // message; the client adopts it from the `title` event. Bounded and failure-free (chat-title.cjs).
     // It runs after `done`, so it never holds the reply's completion; the client reads every event until the connection
     // closes (web api.ts streamChat) and still adopts it (web#58). Skipped while the engine is busy: other inference in
-    // flight (this turn holds one request in the gate, index.cjs), a held maintenance gate or a pending model load/swap.
+    // flight (this turn holds one request in the gate, index.cjs), a held maintenance gate or a turn of this server
+    // waiting for the inference gate (noevia#2115). It carries the turn's lease, which is still held.
     // Reopen: the first COMPLETED reply names the chat, not only turn 1. A chat whose first reply was stopped (it is in
     // the history as an assistant turn) still carries the title derived from its FIRST message, so a later completed
     // reply asks for a title while the store says it is still auto-named. A rename wins (no longer derived).
@@ -2515,7 +2541,7 @@ function createChatHandler({
       && (provider.id === DEFAULT_PROVIDER_ID || provider.machine) && !offBoxTurn({ externalProvider, routeTarget, provider, DEFAULT_PROVIDER_ID })
       && titleDue() && titleAttempts.allowed(titleAttemptKey) && (provider.machine || !engineBusy())) {
       titleAttempts.record(titleAttemptKey);
-      const title = await chatTitleLib.generateTitle({ fetch: provider.machine ? providerFetch : fetch, url: upstreamUrl, headers: upstreamHeaders, model, message, reply: roundContent,
+      const title = await chatTitleLib.generateTitle({ fetch: provider.machine ? providerFetch : turnLease ? turnLease.fetch(fetch) : fetch, url: upstreamUrl, headers: upstreamHeaders, model, message, reply: roundContent,
         signal: chatSignal.signal, readJson: readCappedJson });
       if (chatSignal.signal.aborted) return;
       if (title) {

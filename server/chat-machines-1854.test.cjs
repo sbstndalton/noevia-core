@@ -94,7 +94,7 @@ async function turn(t, { chatMachines = null, project, route = 'fast', localTemp
   process.env.MODEL_MANAGER_KIND = 'llamacpp'; process.env.INFERENCE_BASE_URL = 'http://default.invalid';
   t.after(() => { for (const [k, v] of [['MODEL_MANAGER_KIND', saved.kind], ['INFERENCE_BASE_URL', saved.base]]) if (v === undefined) delete process.env[k]; else process.env[k] = v; });
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'noevia-1854-')); t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
-  const events = [], localRequests = [], engine = { makeRoomFor: [], props: [] };
+  const events = [], localRequests = [], engine = { leases: [], props: [] };
   let replied = null;
   const res = new EventEmitter(); res.writeHead = () => {}; res.end = () => { res.writableEnded = true; res.emit('finish'); };
   res.write = (chunk) => { for (const line of String(chunk).split('\n')) if (line.startsWith('data:')) { try { events.push(JSON.parse(line.slice(5))); } catch { /* not json */ } } };
@@ -102,7 +102,7 @@ async function turn(t, { chatMachines = null, project, route = 'fast', localTemp
     localRequests.push({ url: String(url), headers: init?.headers, body: init?.body ? JSON.parse(init.body) : null });
     return { ok: true, status: 200, body: (async function* () { yield Buffer.from(`data: ${JSON.stringify({ choices: [{ delta: { content: 'Local hello.' } }] })}\n\n`); })() };
   };
-  const modelManager = { enabled: true, makeRoomFor: async (m) => { engine.makeRoomFor.push(m); },
+  const modelManager = { enabled: true, acquireLease: async (m) => { engine.leases.push(m); return null; },
     props: async (m) => { engine.props.push(m); return localTemplates[m] ? { ok: true, body: { chat_template: localTemplates[m] } } : { ok: false, status: 404 }; },
     health: async () => ({ ok: true, body: { all_models_loaded: catalogue.map((m) => ({ model_name: m.name, loaded: true, recipe_options: { ctx_size: 32768 } })) } }) };
   const { handleChat } = createChatHandler({
@@ -154,7 +154,7 @@ test('#1854 move: Fast here cannot take tools, Smart on a machine can: the turn 
   assert.equal(chat.headers.authorization, undefined, 'the local key never leaves for another host');
   assert.equal(JSON.stringify(chat.headers).includes(LOCAL_KEY), false);
   assert.equal(out.route, 'smart', 'the client is told the route it really got');
-  assert.deepEqual(out.engine.makeRoomFor, [], 'nothing loaded or unloaded here');
+  assert.deepEqual(out.engine.leases, [], 'nothing loaded or unloaded here');
   assert.ok(fake.props().length >= 1, 'the machine template was read from its own /props');
   assert.deepEqual(out.warnings, []);
 });
@@ -170,7 +170,7 @@ test('#1854 move: Fast on a machine cannot take tools, Smart here can: the turn 
   assert.ok(allModel(out, ROLES.smart));
   assert.deepEqual(first.body.tools.map((x) => x.function.name), ['synthetic_lookup']);
   assert.equal(first.headers.Authorization, `Bearer ${LOCAL_KEY}`, 'the local provider and its key, as for a turn routed here');
-  assert.deepEqual(out.engine.makeRoomFor, [ROLES.smart], 'the local engine loads the model it now answers with');
+  assert.deepEqual(out.engine.leases, [ROLES.smart], 'the local engine loads the model it now answers with');
   assert.equal(out.route, 'smart');
 });
 

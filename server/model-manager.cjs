@@ -1,8 +1,8 @@
 'use strict';
 
-function createModelManager({ kind, baseUrl, apiKey, fetchJson, presetPath, downloadStatePath, fetchStream, autoconfig, calibrationStatePath, calibrationOptions, evidenceDir, autotuneStatePath, autotuneOptions, presetWriter, inferenceBudget = null, reloadStatePath = null }) {
+function createModelManager({ kind, baseUrl, apiKey, fetchJson, presetPath, downloadStatePath, fetchStream, autoconfig, calibrationStatePath, calibrationOptions, evidenceDir, autotuneStatePath, autotuneOptions, presetWriter, inferenceBudget = null, reloadStatePath = null, gateAdminToken = null, gate = null }) {
   const normalizedKind = String(kind || 'none').toLowerCase();
-  if (normalizedKind === 'llamacpp') return require('./llamacpp-manager.cjs').createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloadStatePath, fetchStream, autoconfig, calibrationStatePath, calibrationOptions, evidenceDir, autotuneStatePath, autotuneOptions, presetWriter, inferenceBudget, reloadStatePath });
+  if (normalizedKind === 'llamacpp') return require('./llamacpp-manager.cjs').createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloadStatePath, fetchStream, autoconfig, calibrationStatePath, calibrationOptions, evidenceDir, autotuneStatePath, autotuneOptions, presetWriter, inferenceBudget, reloadStatePath, gateAdminToken, gate });
   const enabled = normalizedKind === 'lemonade';
   if (!enabled && normalizedKind !== 'none') {
     throw new Error(`unsupported MODEL_MANAGER_KIND: ${normalizedKind}`);
