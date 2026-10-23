@@ -192,7 +192,7 @@ const driveAccounts = require('./drive-accounts.cjs').createDriveAccounts({
   }),
 });
 const { publicPage } = require('./routes/public-pages.cjs');
-const webAddressRoutes = require('./routes/web-address.cjs').createWebAddressRoutes({ auth: authService, json, readBody: (req) => readJson(req) });
+const webAddressRoutes = require('./routes/web-address.cjs').createWebAddressRoutes({ auth: authService, json });
 const davConfig = require('./dav-settings.cjs').configuration(process.env, authService.origin);
 const davSettings = require('./dav-settings.cjs').createDavSettings({ auth: authService, config: davConfig });
 if (process.env.LEMONADE_BASE_URL && !process.env.INFERENCE_BASE_URL) console.warn('LEMONADE_BASE_URL is deprecated; use INFERENCE_BASE_URL');
@@ -1255,7 +1255,7 @@ async function handleRequestScoped(req, res) {
     if (require('./rust-auth.cjs').refuseOwned(req, res, p, json)) return;
     // So are the M4 project routes (#1071): Node refuses them whoever asks.
     if (require('./rust-projects.cjs').refuseOwnedRoute(req, res, p, json)) return;
-    if (require('./rust-web-address.cjs').refuseOwnedRead(req, res, p, json)) return;
+    if (require('./rust-web-address.cjs').refuseOwned(req, res, p, json)) return;
     if (await diaryRoutes.connector(req, res, { path: p })) return;
     if ((p === '/api/instance' || p === '/.well-known/webauthn') && await webAddressRoutes(req, res, { path: p, authn: null })) return;
     if (await deviceRoutes.open(req, res, { path: p })) return;

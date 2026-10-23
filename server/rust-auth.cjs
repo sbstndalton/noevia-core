@@ -30,7 +30,7 @@ const OWNED_TABLES = Object.freeze(new Set([
   'sessions', 'users', 'user_features', 'user_appearance', 'passkeys', 'challenges', 'invitations', 'recoveries',
   'device_authorizations', 'device_grants', 'device_tokens', 'app_passwords',
 ]));
-const OWNED_SETTING_KEYS = Object.freeze(new Set(['setup_code_hash', 'public_origin', 'public_origin_admin', 'passkey_decoy_key']));
+const OWNED_SETTING_KEYS = Object.freeze(new Set(['setup_code_hash', 'public_origin', 'public_origin_admin', 'previous_origins', 'passkey_decoy_key']));
 
 // An identifier, bare or quoted ("x", `x`, [x]); a schema qualifier (main.users, "main"."users") is
 // allowed in front and ignored.
@@ -144,6 +144,8 @@ function singleSettingKey(sql, args) {
 // switch are written only by the Rust front (their routes left Node). This connection refuses those
 // keys too, even inside exempt(), with their own codes.
 const FRONT_SETTING_KEYS = Object.freeze({
+  public_origin_admin: ['Web address changes are owned by the Rust front.', 'RUST_WEB_ADDRESS_WRITE_OWNED'],
+  previous_origins: ['Web address changes are owned by the Rust front.', 'RUST_WEB_ADDRESS_WRITE_OWNED'],
   routing_modes_allowed: ['Routing settings are owned by the Rust front.', 'RUST_ROUTING_MODE_OWNED'],
   reasoning_effort_default: ['Reasoning settings are written by the Rust front', 'RUST_REASONING_SETTINGS_OWNED'],
   auto_sampling_presets_enabled: ['Sampling settings are written by the Rust front', 'RUST_SAMPLING_SETTINGS_OWNED'],

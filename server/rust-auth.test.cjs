@@ -126,13 +126,12 @@ test('while on, owned writes throw 503 when they run; reads and other tables do 
 
 test('settings: only the owned keys, literal or bound', () => {
   const db = on().install(fakeDb());
-  for (const key of ['setup_code_hash', 'public_origin', 'public_origin_admin', 'passkey_decoy_key']) {
+  for (const key of ['setup_code_hash', 'public_origin', 'passkey_decoy_key']) {
     assert.throws(() => db.prepare(`INSERT OR REPLACE INTO settings(key,value) VALUES('${key}',?)`).run('v'), (e) => e.code === 'RUST_AUTH_OWNED', key);
     assert.throws(() => db.prepare('INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)').run(key, 'v'), (e) => e.code === 'RUST_AUTH_OWNED', key);
     assert.throws(() => db.prepare('INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)').run([key, 'v']), (e) => e.code === 'RUST_AUTH_OWNED', key);
   }
   db.prepare('INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)').run('feature:nativeClientAuth', 'false');
-  db.prepare("INSERT OR REPLACE INTO settings(key,value) VALUES('previous_origins',?)").run('[]');
   // The front's own keys (#1071) are refused with their own codes.
   for (const [key, [, code]] of Object.entries(FRONT_SETTING_KEYS)) {
     assert.throws(() => db.prepare(`INSERT OR REPLACE INTO settings(key,value) VALUES('${key}',?)`).run('v'), (e) => e.code === code, key);
