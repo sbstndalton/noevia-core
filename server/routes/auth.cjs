@@ -1,11 +1,11 @@
 'use strict';
 // The account's HTTP surface over auth.cjs that is still Node's. Sign-in, the session, sign-out,
 // appearance, profile, app passwords, the Diary preference, onboarding, passkeys, session
-// revocation, invitations, recovery and the user list/disable/recovery admin routes are the Rust
+// revocation, invitations, recovery, Settings -> Sharing and the user list/disable/recovery admin routes are the Rust
 // front's (sbstndalton/noevia#1071; rust-auth.cjs OWNED_ROUTES refuses them before this module
 // runs). What stays:
 // (The signed-out "open" mount went with them: every signed-out route here is the front's.)
-//   account   Settings -> Sharing (DAV), and /api/admin/*: refused to members before its own
+//   account   /api/admin/*: refused to members before its own
 //             routes are looked at; the secrets rotation and deleting an account (its clean-up
 //             spans Node's own stores, a rust-auth.cjs exemption) are Node's.
 //
@@ -21,7 +21,6 @@ const PASS = Symbol('unhandled');
  * @param {(res, status, body) => any} deps.json
  * @param {(req) => Promise<any>} deps.readJson
  * @param {object} deps.authService
- * @param {object} deps.davSettings
  * @param {{ remove: (userId:string) => void }} deps.workspaceStore
  * @param {{ removeUser: (userId:string) => Promise<any> }} deps.driveAccounts
  * @param {(url:string, init:object, timeoutMs?:number) => Promise<any>} deps.fetchJson
@@ -33,15 +32,10 @@ const PASS = Symbol('unhandled');
  * @param {{ forgetUser: (userId:string) => void }} [deps.chatgptOAuth]  Sign in with ChatGPT tokens, keyed per user
  * @param {(actorId:string) => object} [deps.rotateSecrets]  re-encrypts stored credentials under the current key
  */
-function createAuthRoutes({ json, readJson: readAnyJson, authService, davSettings, workspaceStore, driveAccounts, fetchJson, DIARY_BASE, DIARY_TOKEN, diaryTenantHeaders = null, mcpOAuth, directoryMcp, chatgptOAuth = null, rotateSecrets }) {
+function createAuthRoutes({ json, readJson: readAnyJson, authService, workspaceStore, driveAccounts, fetchJson, DIARY_BASE, DIARY_TOKEN, diaryTenantHeaders = null, mcpOAuth, directoryMcp, chatgptOAuth = null, rotateSecrets }) {
   // Every body these routes read is a JSON object; `null`, an array or a number is a 400 (#786).
   const readJson = requireJsonObject(readAnyJson);
   async function account(req, res, { path: p, authn }) {
-    if (p === '/api/profile/sharing' && req.method === 'GET') return json(res, 200, davSettings.get(authn.user));
-    if (p === '/api/profile/sharing' && req.method === 'PUT') {
-      try { return json(res, 200, davSettings.save(authn.user, await readJson(req))); }
-      catch (e) { return json(res, 400, { error: e.message }); }
-    }
     if (p.startsWith('/api/admin/')) {
       if (authn.user.role !== 'admin') return json(res, 403, { error: 'administrator required' });
       if (p === '/api/admin/secrets/rotate' && req.method === 'POST') {

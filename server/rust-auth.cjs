@@ -29,6 +29,9 @@
 const OWNED_TABLES = Object.freeze(new Set([
   'sessions', 'users', 'user_features', 'user_appearance', 'passkeys', 'challenges', 'invitations', 'recoveries',
   'device_authorizations', 'device_grants', 'device_tokens', 'app_passwords',
+  // The Settings -> Sharing opt-in (#1071): dav-settings.cjs creates the table at boot (before the
+  // guard) and the DAV listener only reads it.
+  'dav_settings',
 ]));
 const OWNED_SETTING_KEYS = Object.freeze(new Set(['setup_code_hash', 'public_origin', 'public_origin_admin', 'passkey_decoy_key']));
 
@@ -81,6 +84,7 @@ const OWNED_ROUTES = Object.freeze([
   [/^\/api\/profile\/appearance$/, ALL],
   [/^\/api\/profile\/features$/, ['PUT']],
   [/^\/api\/profile\/onboarding$/, ['POST']],
+  [/^\/api\/profile\/sharing$/, ['GET', 'PUT']],
   [/^\/api\/setup\/complete$/, ['POST']],
   [/^\/api\/setup\/status$/, ['GET']],
 ]);

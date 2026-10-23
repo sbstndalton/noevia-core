@@ -66,20 +66,20 @@ const RUST_ROUTES = [
   ['/api/auth/passkeys/k1', ['DELETE', 'PATCH']], ['/api/auth/recovery/complete', ['POST']], ['/api/auth/session', ['GET']],
   ['/api/auth/sessions/s1', ['DELETE']], ['/api/profile', ['GET', 'PATCH']], ['/api/profile/app-passwords', ['GET', 'POST']],
   ['/api/profile/app-passwords/0123456789abcdef0123456789abcdef', ['DELETE']], ['/api/profile/appearance', null],
-  ['/api/profile/features', ['PUT']], ['/api/profile/onboarding', ['POST']], ['/api/setup/complete', ['POST']], ['/api/setup/status', ['GET']],
+  ['/api/profile/features', ['PUT']], ['/api/profile/onboarding', ['POST']], ['/api/profile/sharing', ['GET', 'PUT']], ['/api/setup/complete', ['POST']], ['/api/setup/status', ['GET']],
 ];
 const METHODS = ['GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'];
 
 test('#1071: Node refuses exactly the sign-in and account routes the Rust front answers', () => {
-  assert.equal(OWNED_ROUTES.length, 23);
+  assert.equal(OWNED_ROUTES.length, 24);
   for (const [p, methods] of RUST_ROUTES) {
     for (const m of METHODS) assert.equal(ownedRoute(m, p), methods === null || methods.includes(m), `${m} ${p}`);
   }
-  // What stays Node's: account deletion, Settings -> Web address and Sharing, the Diary connectors,
+  // What stays Node's: account deletion, Settings -> Web address, the Diary connectors,
   // retention, the feature switches, the device approval page, and look-alike paths.
   for (const [m, p] of [
     ['DELETE', '/api/admin/users/u1'], ['GET', '/api/admin/web-address'], ['POST', '/api/admin/web-address'], ['POST', '/api/admin/secrets/rotate'],
-    ['GET', '/api/admin/features'], ['GET', '/api/profile/sharing'], ['PUT', '/api/profile/sharing'], ['GET', '/api/profile/diary-connectors'],
+    ['GET', '/api/admin/features'], ['POST', '/api/profile/sharing'], ['GET', '/api/profile/diary-connectors'],
     ['GET', '/api/account/retention'], ['PUT', '/api/account/retention'], ['GET', '/device'], ['GET', '/api/auth/sessionx'], ['GET', '/api/profile/'],
     ['GET', '/api/auth/session/x'], ['DELETE', '/api/auth/passkeys/a/b'], ['GET', '/api/workspace'], ['GET', '/api/auth/status'],
   ]) assert.equal(ownedRoute(m, p), false, `${m} ${p}`);

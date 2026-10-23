@@ -141,7 +141,7 @@ test('POST /api/admin/secrets/rotate is administrator-only and runs the rotation
   const sent = []; const ran = [];
   const routes = createAuthRoutes({
     json: (_res, status, body) => sent.push({ status, body }), readJson: async () => ({}),
-    authService: {}, davSettings: {}, workspaceStore: {}, driveAccounts: {},
+    authService: {}, workspaceStore: {}, driveAccounts: {},
     fetchJson: async () => ({}), DIARY_BASE: '', DIARY_TOKEN: '',
     rotateSecrets: (actor) => { ran.push(actor); return { totals: { rotated: 1 } }; },
   });
