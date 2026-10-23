@@ -219,7 +219,7 @@ function harness(t, { provenancePolicy, chatWide = true, decision = 'approve' } 
     lastLoadedModel: () => null, classifyFastOrSmart: async () => 'fast', servedCatalogue: async () => [], modelsInstalled: async () => [], missingRoles: () => [], staleRolesError: () => null,
     allToolboxes: () => [],
     executeToolCall: async (_p, name, args) => { state.executed.push({ name, args }); return name === 'web_fetch' ? PAGE : 'Posted.'; },
-    chatWideApproved: () => chatWide,
+    grantContext: async raw => require('../tests/server/chat-grant-fixture.cjs').context(raw, { holder: { kind: 'absent' } }), chatWideApproved: () => chatWide,
     awaitApproval: async (opts) => { state.asked.push(opts.id); return decision; },
     recordUsage() {}, recordToolUse() {},
     ...(provenancePolicy !== undefined ? { provenancePolicy } : {}),

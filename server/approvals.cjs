@@ -4,6 +4,8 @@
 // "allow for this chat" grants. Both live in memory on purpose (see below). The HTTP
 // decision route and the chat loop in index.cjs call in; nothing here touches a request.
 
+const contexts = require('./chat-grant-context.cjs');
+
 function createApprovals({ now = Date.now, timeoutMs = 5 * 60 * 1000, ttlMs = 60 * 60 * 1000 } = {}) {
 // Pending approvals, keyed by a single-use id. In memory on purpose: an
 // approval that outlives the request it belongs to is not useful, and a
@@ -12,6 +14,7 @@ function createApprovals({ now = Date.now, timeoutMs = 5 * 60 * 1000, ttlMs = 60
 const pendingApprovals = new Map();
 const APPROVAL_TIMEOUT_MS = timeoutMs;
 
+// Grants additionally bind canonical identity, tagged holder, persisted generation and start.
 // "Approve everything in this chat" — the escape hatch. Scoped to one chat for
 // one user and held only in memory, so it expires with the process. A global
 // "never ask" default is deliberately NOT offered: the whole point of the gate
@@ -26,16 +29,16 @@ const CHAT_APPROVAL_TTL_MS = ttlMs;
 
 // No chat id means no chat to scope a grant to: id-less requests would otherwise all share
 // one `${userId}:-` key, so "approve all" in one would silently cover every other.
-function chatApprovalKey(userId, chatId) { return userId && chatId ? `${userId}:${chatId}` : null; }
+function chatApprovalKey(userId, chatId) { return contexts.key(userId, chatId); }
 
-function chatWideApproved(userId, chatId, scope) {
+function chatWideApproved(userId, chatId, scope, binding) {
   if (!chatApprovalKey(userId, chatId)) return false;
   const grant = chatWideApprovals.get(chatApprovalKey(userId, chatId));
   if (!grant) return false;
-  if (now() > grant.until) { chatWideApprovals.delete(chatApprovalKey(userId, chatId)); return false; }
+  if (now() >= grant.until) { chatWideApprovals.delete(chatApprovalKey(userId, chatId)); return false; }
   // Fails closed: a check without a scope never matches, and no unscoped grant is ever stored.
   const s = grantScope(scope);
-  return s !== null && grant.scope === s;
+  return s !== null && grant.scope === s && binding?.user === userId && binding?.canonicalChatId === contexts.safeId(chatId) && contexts.matches(grant.binding, binding);
 }
 
 // #814: a chat's "Allow for this chat" grant was given for the project it was in. Moving the chat
@@ -49,7 +52,7 @@ function revokeChatGrant(userId, chatId) {
 // Ask the human. Resolves to 'approve' | 'deny', never rejects: the caller
 // turns a denial into a tool result the model can read, so a refused call is
 // a normal conversational turn rather than a broken stream.
-function awaitApproval({ id, userId, chatId, scope, abortSignal, onDecision = () => {} }) {
+function awaitApproval({ id, userId, chatId, scope, binding = null, abortSignal, onDecision = () => {} }) {
   return new Promise((resolve) => {
     // Already stopped before the question was asked: nothing to wait for, nothing approved.
     if (abortSignal.aborted) { resolve('aborted'); return; }
@@ -77,7 +80,9 @@ function awaitApproval({ id, userId, chatId, scope, abortSignal, onDecision = ()
           // Without a chat id or a scope (#917) this approves this one call only; the grant has
           // nowhere safe to live, so the next write asks again.
           const key = chatApprovalKey(userId, chatId);
-          if (key && grantScope(scope)) chatWideApprovals.set(key, { until: now() + CHAT_APPROVAL_TTL_MS, scope: grantScope(scope) });
+          if (key && grantScope(scope) && binding?.user === userId && binding?.scope === grantScope(scope) &&
+              binding?.canonicalChatId === contexts.safeId(chatId) && binding.context?.holder?.kind !== 'absent' &&
+              contexts.matches(binding, binding)) chatWideApprovals.set(key, { until: now() + CHAT_APPROVAL_TTL_MS, scope: grantScope(scope), binding });
           finish('approve');
           return true;
         }

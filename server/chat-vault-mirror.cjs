@@ -112,7 +112,7 @@ const noteName = (path) => path.slice(path.lastIndexOf('/') + 1).replace(/\.md$/
 function mirrorTrigger(method, path) {
   if (!method || ['GET', 'HEAD', 'OPTIONS'].includes(method)) return null;
   const move = /^\/api\/chats\/([^/]+)\/move$/.exec(path || '');
-  if (move) { try { return { chatId: decodeURIComponent(move[1]) }; } catch { return { chatId: null }; } }
+  if (move) return null; // Rust's move journal is the notification authority.
   return /^\/api\/(freechats(\/|$)|projects(\/|$)|import(\/|$))/.test(path || '') ? { chatId: null } : null;
 }
 

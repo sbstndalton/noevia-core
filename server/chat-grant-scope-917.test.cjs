@@ -10,6 +10,7 @@ const { createChatHandler } = require('./chat.cjs');
 const { createToolboxes } = require('./toolboxes.cjs');
 const { createDriveTools } = require('./gdrive-tools.cjs');
 const { createToolExchange } = require('./tool-exchange.cjs');
+const { binding: permissionBinding } = require('../tests/server/chat-grant-fixture.cjs');
 const { createApprovals } = require('./approvals.cjs');
 
 const WRITE = 'drive_trash_file';
@@ -58,7 +59,11 @@ function harness(t, { holder = () => undefined } = {}) {
       visionProbe: async () => ({ supported: false, reason: 'none' }), visionDescriptions: new Map(), skillsIndexFor: () => [],
       chatSkillRouter: { select: async () => ({ loaded: [] }) }, chatToolRouter: { select: async (ids) => ({ ids, routed: false }) },
       ...toolbox, oauthServerIds: () => new Set(), accountReady: () => true,
-      chatWideApproved: gate.chatWideApproved,
+      grantContext: async raw => {
+        const actual = state.holder(raw);
+        const owner = actual === undefined ? (projectId || 'free') : actual;
+        return require('../tests/server/chat-grant-fixture.cjs').context(raw, { holder: owner === null ? { kind:'absent' } : owner === 'free' ? { kind:'free' } : {kind:'project',id:owner} });
+      }, chatWideApproved: gate.chatWideApproved,
       // The card's button press, through the real gate: approve | deny | approve_all.
       awaitApproval: (request) => {
         cards.push(request);
@@ -95,19 +100,19 @@ test('a chat id another list holds gets no chat-wide grant: approve_all approves
   // chat-x lives in project A; requests naming it under project B are a stale tab or hand-made.
   const h = harness(t, { holder: (id) => (id === 'chat-x' ? 'proj-a' : null) });
   const first = await h.turn({ projectId: 'proj-b', chatId: 'chat-x', decision: 'approve_all' });
-  assert.equal(first.carded, true);
-  assert.deepEqual(first.executions, [WRITE], 'Allow for this chat still runs the call it answered');
-  assert.equal(first.cards[0].chatId, null, 'no grant is created for a chat this project does not hold');
+  assert.equal(first.carded, false, 'foreign authoritative holder refuses before asking');
+  assert.deepEqual(first.executions, [], 'a stale foreign scope cannot execute even Allow once');
   const again = await h.turn({ projectId: 'proj-b', chatId: 'chat-x', decision: 'deny' });
-  assert.equal(again.carded, true, 'the next write in B asks again');
+  assert.equal(again.carded, false, 'foreign holder still refuses before the card');
+  assert.deepEqual(again.executions, []);
   // In its own project the chat keeps the normal behaviour; a chat no list holds yet (first turn) too.
   await h.turn({ projectId: 'proj-a', chatId: 'chat-x', decision: 'approve_all' });
   assert.equal((await h.turn({ projectId: 'proj-a', chatId: 'chat-x', decision: 'deny' })).carded, false);
   await h.turn({ projectId: 'proj-b', chatId: 'chat-new', decision: 'approve_all' });
-  assert.equal((await h.turn({ projectId: 'proj-b', chatId: 'chat-new', decision: 'deny' })).carded, false);
+  assert.equal((await h.turn({ projectId: 'proj-b', chatId: 'chat-new', decision: 'deny' })).carded, true, 'absent first-turn chats never receive reusable grants');
   // A holder lookup that throws fails closed: no chat-wide grant is honoured.
   h.state.holder = () => { throw new Error('synthetic list failure'); };
-  assert.equal((await h.turn({ projectId: 'proj-a', chatId: 'chat-x', decision: 'deny' })).carded, true);
+  assert.equal((await h.turn({ projectId: 'proj-a', chatId: 'chat-x', decision: 'deny' })).carded, false, 'failed authority refuses before asking');
 });
 
 test('a genuine move from A to B still revokes the grant; B can then be granted on its own (#814, #917)', async (t) => {
@@ -121,7 +126,7 @@ test('a genuine move from A to B still revokes the grant; B can then be granted 
   const moved = await h.turn({ projectId: 'proj-b', chatId: 'chat-x', decision: 'approve_all' });
   assert.equal(moved.carded, true, 'after the move the next write asks again');
   assert.equal((await h.turn({ projectId: 'proj-b', chatId: 'chat-x', decision: 'deny' })).carded, false, 'granted again in B');
-  assert.equal((await h.turn({ projectId: 'proj-a', chatId: 'chat-x', decision: 'deny' })).carded, true, 'a stale A tab is asked');
+  assert.equal((await h.turn({ projectId: 'proj-a', chatId: 'chat-x', decision: 'deny' })).carded, false, 'stale A holder refuses before asking');
 });
 
 test('Decline and Allow once are unaffected and never create a grant (#917)', async (t) => {
@@ -141,18 +146,18 @@ test('the gate honours a grant only in the scope it was given in; revoke ignores
   const gate = createApprovals();
   const grant = async (scope) => {
     const ctl = new AbortController();
-    const waiting = gate.awaitApproval({ id: 'g', userId: 'u1', chatId: 'c1', scope, abortSignal: ctl.signal });
+    const waiting = gate.awaitApproval({ id: 'g', userId: 'u1', chatId: 'c1', scope, binding: permissionBinding('u1','c1',scope), abortSignal: ctl.signal });
     assert.equal(gate.pendingApprovals.get('g').decide('approve_all'), true);
     assert.equal(await waiting, 'approve');
   };
   await grant('project:a');
-  assert.equal(gate.chatWideApproved('u1', 'c1', 'project:a'), true);
-  assert.equal(gate.chatWideApproved('u1', 'c1', 'project:b'), false);
-  assert.equal(gate.chatWideApproved('u1', 'c1', 'context:a'), false);
+  assert.equal(gate.chatWideApproved('u1', 'c1', 'project:a', permissionBinding('u1', 'c1', 'project:a')), true);
+  assert.equal(gate.chatWideApproved('u1', 'c1', 'project:b', permissionBinding('u1', 'c1', 'project:b')), false);
+  assert.equal(gate.chatWideApproved('u1', 'c1', 'context:a', permissionBinding('u1', 'c1', 'context:a')), false);
   assert.equal(gate.chatWideApproved('u1', 'c1'), false, 'a scoped grant is not honoured without a scope');
-  assert.equal(gate.chatWideApproved('u2', 'c1', 'project:a'), false, 'another user still asks');
+  assert.equal(gate.chatWideApproved('u2', 'c1', 'project:a', permissionBinding('u2', 'c1', 'project:a')), false, 'another user still asks');
   assert.equal(gate.revokeChatGrant('u1', 'c1'), true);
-  assert.equal(gate.chatWideApproved('u1', 'c1', 'project:a'), false);
+  assert.equal(gate.chatWideApproved('u1', 'c1', 'project:a', permissionBinding('u1', 'c1', 'project:a')), false);
 });
 
 test('a free chat granted under its context project is asked when the same chat id names a project explicitly (#917)', async (t) => {
@@ -164,9 +169,9 @@ test('a free chat granted under its context project is asked when the same chat 
   assert.equal((await h.turn({ chatId: 'chat-x', decision: 'deny' })).carded, false, 'same free chat: still auto-approved');
   // The very same project id, but named explicitly: another scope, and the free list holds the chat.
   const explicit = await h.turn({ projectId: 'cowork-chat-context-chat-x', chatId: 'chat-x', decision: 'deny' });
-  assert.equal(explicit.carded, true, 'explicit projectId with the same chat id asks');
+  assert.equal(explicit.carded, false, 'foreign authoritative holder refuses before asking');
   assert.deepEqual(explicit.executions, []);
-  assert.equal((await h.turn({ projectId: 'proj-a', chatId: 'chat-x', decision: 'deny' })).carded, true, 'another project asks');
+  assert.equal((await h.turn({ projectId: 'proj-a', chatId: 'chat-x', decision: 'deny' })).carded, false, 'another project holder refuses');
   // Even with no list lookup at all, the scope alone keeps the context grant out of the explicit request.
   h.state.holder = () => undefined;
   assert.equal((await h.turn({ projectId: 'cowork-chat-context-chat-x', chatId: 'chat-x', decision: 'deny' })).carded, true);

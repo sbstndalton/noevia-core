@@ -56,7 +56,7 @@ const crypto = require('node:crypto');
 const { spawnSync } = require('node:child_process');
 
 const FILES = new Set(['projects.json', 'free-chats.json']);
-const HISTORY_OPS = new Set(['/v1/history/read', '/v1/history/write', '/v1/history/append-if-last', '/v1/history/remove-if', '/v1/changes/read', '/v1/chat/delete']);
+const HISTORY_OPS = new Set(['/v1/history/read', '/v1/history/write', '/v1/history/append-if-last', '/v1/history/remove-if', '/v1/changes/read', '/v1/chat/delete', '/v1/chat/move', '/v1/chat/grant-context']);
 const ORIGINS = new Set(['history', 'import', 'turn', 'remove', 'other']);
 const JOURNAL = 'chat-changes.jsonl';
 const STORE_START = crypto.randomBytes(16).toString('hex');
@@ -152,9 +152,56 @@ function chatDeleteOp(body, dir) {
   return [200, { deleted: false, swept: false, leftovers: 0 }];
 }
 
+/** Slice7 protocol double ONLY. Real locking/intent/fsync/recovery proofs live in Rust.
+ * Reads the latest account files, preserves metadata/attachments, never creates an account. */
+function chatMoveOp(body, dir, moving = true) {
+  if (!fs.existsSync(dir)) return [410, { error: 'account no longer exists' }];
+  const lists = server('chat-lists.cjs'), safe = lists.safeChatId(body.chat);
+  if (!safe) return [400, { error: 'invalid chat id' }];
+  const read = (name, fallback) => { try { return JSON.parse(fs.readFileSync(path.join(dir,name),'utf8')); } catch(e) { if(e.code==='ENOENT')return fallback;throw e; } };
+  const projectsDoc=read('projects.json',{projects:[]}), free=read('free-chats.json',[]);
+  if(!Array.isArray(projectsDoc.projects)||!Array.isArray(free))return[500,{error:'Internal error'}];
+  const projects=projectsDoc.projects, found=[];
+  for(const c of free)if(c&&lists.safeChatId(c.id)===safe)found.push({holder:{kind:'free'},meta:c,list:free});
+  for(const p of projects)for(const c of p.chats||[])if(c&&lists.safeChatId(c.id)===safe)found.push({holder:{kind:'project',id:p.id},meta:c,list:p.chats,project:p});
+  if(found.length>1)return[409,{error:'ambiguous canonical chat identity',code:'CHAT_ID_AMBIGUOUS'}];
+  const state=read('chat-move-state.json',{version:1,generations:{},pending:null,completed:null});
+  const generation=state.generations[safe]||'0', from=found[0]?.holder||{kind:'absent'};
+  const tombstoned=[...lists.readTombstones(dir)].some(id=>lists.safeChatId(id)===safe);
+  if(!moving)return[200,{canonicalChatId:safe,holder:from,generation,start:server('chat-partial.cjs').START_ID,tombstoned}];
+  if(!(body.projectId===null||typeof body.projectId==='string'))return[400,{error:'projectId (or null) required'}];
+  const owner=found[0], target=body.projectId===null?null:projects.find(p=>p.id===body.projectId);
+  const internal=p=>p&&(p.id==='cowork-diary-extras'||p.id.startsWith('cowork-chat-context-'));
+  if(tombstoned||!owner||owner.meta.id!==body.chat||internal(owner.project)||(body.projectId!==null&&(!target||internal(target)))||
+    (target&&target!==owner.project&&target.archived))return[404,{error:'no such chat or project'}];
+  const to=target?{kind:'project',id:target.id}:{kind:'free'}, destination=target?(target.chats||[]):free;
+  let meta={...owner.meta};
+  if(Object.hasOwn(body,'frame')){
+    if(body.frame!==null&&!server('chat-framing.cjs').normalizeFrame(body.frame))return[400,{error:'invalid frame'}];
+    meta.frame=body.frame===null?null:server('chat-framing.cjs').normalizeFrame(body.frame);
+  }
+  const same=JSON.stringify(from)===JSON.stringify(to);
+  if(!same&&destination.length>=1000)return[409,{error:'the move would evict chat metadata',code:'CHAT_DESTINATION_FULL'}];
+  const merged=lists.mergeChats(destination,[meta]);
+  if(merged.length<destination.filter(c=>c&&c.id!==body.chat).length+1)return[409,{error:'the move would evict chat metadata',code:'CHAT_DESTINATION_FULL'}];
+  if(same&&JSON.stringify(meta)===JSON.stringify(owner.meta))return[200,{from,to,generation}];
+  if(!same&&BigInt(generation)>=18446744073709551615n)return[500,{error:'Internal error'}];
+  const next=same?generation:(BigInt(generation)+1n).toString();
+  const write=(name,value)=>{const file=path.join(dir,name),tmp=file+'.move-stub.tmp';fs.writeFileSync(tmp,JSON.stringify(value,null,2),{mode:0o600});fs.renameSync(tmp,file);};
+  owner.list.splice(0,owner.list.length,...owner.list.filter(c=>c.id!==body.chat));
+  if(target)target.chats=merged;else free.splice(0,free.length,...merged);
+  state.generations[safe]=next;write('chat-move-state.json',state);
+  if(to.kind==='free'){write('free-chats.json',free);write('projects.json',projectsDoc);}
+  else{write('projects.json',projectsDoc);write('free-chats.json',free);}
+  const seq=(journalEntries(dir).at(-1)?.seq||0)+1;
+  fs.appendFileSync(path.join(dir,JOURNAL),JSON.stringify({seq,chatId:safe,rawChatId:body.chat,revision:null,op:'move',origin:'other',eventId:crypto.randomBytes(16).toString('hex'),generation:next,delivery:'live',start:server('chat-partial.cjs').START_ID,at:Date.now()})+'\n');
+  return[200,{from,to,generation:next}];
+}
+
 /** The transcript ops (see the header) for a user directory that exists. */
 function historyOp(url, body, dir) {
   if (url === '/v1/chat/delete') return chatDeleteOp(body, dir);
+  if (url === '/v1/chat/move' || url === '/v1/chat/grant-context') return chatMoveOp(body,dir,url === '/v1/chat/move');
   const chat = typeof body.chat === 'string' ? body.chat.replace(/[^a-zA-Z0-9_-]/g, '') : '';
   if (url === '/v1/changes/read') {
     const after = body.after === undefined || body.after === null ? 0 : body.after;
@@ -390,4 +437,4 @@ function rustChatDelete(dataDir, user, projectId, rawChatId) {
   return out.deleted ? answer(200, { ok: true }) : answer(404, { error: 'no such chat' });
 }
 
-module.exports = { startProjectStore, installProjectStore, createHandler, freePortSync, localTranscripts, historyOp, rustHistorySave, rustChatDelete };
+module.exports = { chatMoveOp, startProjectStore, installProjectStore, createHandler, freePortSync, localTranscripts, historyOp, rustHistorySave, rustChatDelete };

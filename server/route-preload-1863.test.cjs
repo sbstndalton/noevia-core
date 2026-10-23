@@ -110,7 +110,7 @@ async function turn(t, { roles, states, project = { routing: 'auto' }, routingMo
     classifyFastOrSmart: async () => { await sleep(decisionMs); if (stopDuringDecision) res.emit('close'); return route; }, codeTasksFor: () => codeTasks,
     servedCatalogue: async () => rows, modelsInstalled: async () => rows,
     missingRoles: require('./auto-roles-check.cjs').missingRoles, staleRolesError: require('./auto-roles-check.cjs').staleRolesError,
-    allToolboxes: () => [{ id: 'core', tools: [] }], chatWideApproved: () => false, recordUsage() {}, recordToolUse() {},
+    allToolboxes: () => [{ id: 'core', tools: [] }], grantContext: async raw => require('../tests/server/chat-grant-fixture.cjs').context(raw, { holder: { kind: 'absent' } }), chatWideApproved: () => false, recordUsage() {}, recordToolUse() {},
     executeToolCall: async () => 'synthetic result', awaitApproval: async () => 'approve',
   });
   await handleChat({}, res, { projectId: 'fixture-project', chatId: 'fixture-chat', message, ...(mode ? { mode } : {}) });

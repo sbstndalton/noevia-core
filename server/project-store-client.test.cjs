@@ -405,3 +405,46 @@ test('#1071 slice 6: a chat\'s delete is one store call, bound to one account; i
   assert.equal(psc.CHAT_DELETE_CLIENT_MARKER, 'noevia-chat-delete-client/1');
   assert.ok(fs.readFileSync(path.join(__dirname, 'project-store-client.cjs'), 'utf8').includes(`'${psc.CHAT_DELETE_CLIENT_MARKER}'`));
 });
+
+test('slice7 workspace context/move methods bind the actual account and refuse a revoked view',async t=>{
+ const root=fs.mkdtempSync(path.join(os.tmpdir(),'qa-move-client-'));t.after(()=>fs.rmSync(root,{recursive:true,force:true}));
+ const calls=[],stub=require('../tests/server/project-store-stub.cjs').createStubStore(root);
+ stub.grantContext=async(user,chat)=>{calls.push({op:'context',user,chat});return require('../tests/server/chat-grant-fixture.cjs').context(chat);};
+ stub.chatMove=async(user,chat,projectId,patch)=>{calls.push({op:'move',user,chat,projectId,patch});return{status:200,from:null};};
+ const store=createWorkspaceStore(root,{id:'default'},null,{projectStore:stub});
+ const other='99999999-2222-4333-8444-555555555555',mine=store.get(USER),theirs=store.get(other);
+ await mine.chatPermissions.context('qa c!');await theirs.chatPermissions.move('qa c!',null,{frame:null,user:USER});
+ assert.deepEqual(calls,[{op:'context',user:USER,chat:'qa c!'},{op:'move',user:other,chat:'qa c!',projectId:null,patch:{frame:null,user:USER}}]);
+ mine.revoked=true;assert.throws(()=>mine.chatPermissions.context('qa'),e=>e.status===410);assert.throws(()=>mine.chatPermissions.move('qa',null),e=>e.status===410);
+ assert.equal(calls.length,2);
+});
+
+test('slice7 real loopback authority double preserves latest metadata, CAS, tenant and attachment boundaries',async t=>{
+ const root=fs.mkdtempSync(path.join(os.tmpdir(),'qa-move-protocol-'));t.after(()=>fs.rmSync(root,{recursive:true,force:true}));
+ const other='99999999-2222-4333-8444-555555555555';
+ for(const user of [USER,other]){
+  const dir=path.join(root,'users',user);fs.mkdirSync(dir,{recursive:true});
+  fs.writeFileSync(path.join(dir,'free-chats.json'),JSON.stringify([{id:'qa raw!',title:user,updatedAt:1},{id:'qa-unrelated',updatedAt:2}]));
+  fs.writeFileSync(path.join(dir,'projects.json'),JSON.stringify({projects:[{id:'qa-p',chats:[]}]}));
+  fs.writeFileSync(path.join(dir,'history-qaraw.json'),'sentinel transcript');
+ }
+ const standin=await require('../tests/server/project-store-server.cjs').startProjectStore(root,{token:TOKEN,changes:true});t.after(()=>standin.close());
+ const client=psc.createClient({port:standin.port,token:TOKEN});
+ const before=await client.read(USER,'free-chats.json');
+ assert.equal((await client.grantContext(USER,'qa raw!')).generation,'0');
+ const moved=await client.chatMove(USER,'qa raw!','qa-p',{frame:null});
+ assert.equal(moved.from,null);assert.equal(moved.generation,'1');
+ const projects=JSON.parse((await client.read(USER,'projects.json')).text).projects;
+ assert.equal(projects[0].chats[0].title,USER);assert.equal(projects[0].chats[0].frame,null);
+ assert.deepEqual(JSON.parse((await client.read(USER,'free-chats.json')).text).map(c=>c.id),['qa-unrelated']);
+ assert.equal((await client.write(USER,'free-chats.json',before.version,before.text)).conflict,true,'stale CAS cannot undo move');
+ assert.equal((await client.grantContext(other,'qa raw!')).generation,'0','other tenant unchanged');
+ assert.equal(fs.readFileSync(path.join(root,'users',USER,'history-qaraw.json'),'utf8'),'sentinel transcript');
+ assert.equal((await client.chatMove(USER,'qa raw!',null)).generation,'2');
+ const notices=await client.changesRead(USER);
+ assert.equal(notices.entries.filter(e=>e.op==='move').length,2);
+ assert.ok(notices.entries.every(e=>e.delivery==='live'&&e.rawChatId==='qa raw!'&&e.chatId==='qaraw'));
+ const bad=psc.createClient({port:standin.port,token:'wrong-token'});
+ await assert.rejects(bad.chatMove(USER,'qa raw!','qa-p'));
+ await assert.rejects(client.chatMove('88888888-2222-4333-8444-555555555555','qa raw!',null),e=>e.status===410);
+});

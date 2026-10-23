@@ -363,88 +363,46 @@ test('saveChats skips ids held by another list of the workspace (#755)', async (
   assert.deepEqual([...f.store.chatIdsElsewhere(null)].sort(), ['in-b', 'new-a']);
 });
 
-test('moveChat takes a meta out of one list and into another without a tombstone (#738)', async () => {
-  const f = fixture();
-  const a = await f.store.createProject({ name: 'A' }), b = await f.store.createProject({ name: 'B' });
-  f.workspace.freeChats.push({ id: 'f1', title: 'Free one', updatedAt: 1 }, { id: 'f2', title: 'Other', updatedAt: 2 });
-  const frame = { projectId: a.id, kind: 'search', tags: ['#trip plans'], links: ['f2'], confirmed: true, source: 'user' };
-  assert.deepEqual(f.store.moveChat('f1', a.id, { frame }), { status: 200, from: null });
-  assert.deepEqual(f.workspace.freeChats.map((c) => c.id), ['f2'], 'only the moved chat left the free list');
-  assert.equal(a.chats[0].id, 'f1');
-  assert.equal(a.chats[0].title, 'Free one');
-  assert.deepEqual(a.chats[0].frame, { ...frame, tags: ['trip-plans'] }, 'the frame is normalized as a list save would');
-  assert.deepEqual(f.store.moveChat('f1', b.id), { status: 200, from: a.id }, 'project to project');
-  assert.deepEqual(a.chats, []);
-  assert.equal(b.chats[0].frame.kind, 'search', 'a move without a frame keeps the stored one');
-  assert.deepEqual(f.store.moveChat('f1', b.id, { frame: { ...frame, kind: 'idea' } }), { status: 200, from: b.id }, 'in place');
-  assert.equal(b.chats.length, 1);
-  assert.equal(b.chats[0].frame.kind, 'idea');
-  assert.ok(!require('./chat-lists.cjs').readTombstones(f.dir).has('f1'), 'never tombstoned');
-});
-
-test('moveChat out of a project writes the free list before the project (#1410)', async () => {
-  const f = fixture();
-  const order = [];
-  f.workspace.saveProjects = () => order.push('projects');
-  f.workspace.saveFreeChats = () => order.push('free');
-  const a = await f.store.createProject({ name: 'A' }), b = await f.store.createProject({ name: 'B' });
-  f.workspace.freeChats.push({ id: 'f1', title: 'Free one', updatedAt: 1 });
-  order.length = 0;
-  assert.equal(f.store.moveChat('f1', a.id).status, 200);
-  assert.deepEqual(order, ['projects', 'free'], 'into a project: the project first, never in neither list');
-  order.length = 0;
-  assert.equal(f.store.moveChat('f1', b.id).status, 200);
-  assert.deepEqual(order, ['projects'], 'project to project: one write');
-  order.length = 0;
-  assert.equal(f.store.moveChat('f1', null).status, 200);
-  assert.deepEqual(order, ['free', 'projects'], 'out of a project: the free list first');
-  assert.deepEqual(b.chats, []);
-  assert.deepEqual(f.workspace.freeChats.map((c) => c.id), ['f1']);
-  order.length = 0;
-  assert.equal(f.store.moveChat('f1', null, { frame: null }).status, 200);
-  assert.deepEqual(order, ['free'], 'free in place: the free list only');
-});
-
-test('moveChat refuses unknown chats and projects, deleted chats and disallowed projects, changing nothing (#738)', async () => {
-  const f = fixture();
-  const a = await f.store.createProject({ name: 'A' });
-  const internal = await f.store.createProject({ name: 'Internal' });
-  internal.chats = [{ id: 'i1', title: 'inside' }];
-  f.workspace.freeChats.push({ id: 'f1', title: 'Free', updatedAt: 1 });
-  const before = f.workspace.saved;
-  assert.equal(f.store.moveChat('f1', 'missing').status, 404);
-  assert.equal(f.store.moveChat('nope', a.id).status, 404);
-  assert.equal(f.store.moveChat('', null).status, 404);
-  const allowed = (p) => p.id !== internal.id;
-  assert.equal(f.store.moveChat('f1', internal.id, {}, allowed).status, 404, 'not into a project the caller may not use');
-  assert.equal(f.store.moveChat('i1', a.id, {}, allowed).status, 404, 'not out of one either');
-  assert.deepEqual(f.workspace.freeChats.map((c) => c.id), ['f1']);
-  assert.deepEqual(internal.chats.map((c) => c.id), ['i1']);
-  assert.equal(f.workspace.saved, before, 'nothing was saved');
-  assert.equal(await f.store.deleteFreeChat('f1'), true);
-  f.workspace.freeChats.push({ id: 'f1', title: 'stale copy' });
-  assert.equal(f.store.moveChat('f1', a.id).status, 404, 'a tombstoned chat is never moved back to life');
-});
-
-test('moveChat never moves a chat into an archived project, but a once Code-only one now takes it; in place and out still work (#810, #1576)', async () => {
-  const f = fixture();
-  const { chatDestination } = require('./project-modes.cjs');
-  const chat = await f.store.createProject({ name: 'Chat' });
-  const code = await f.store.createProject({ name: 'Code only', modes: ['code'] });
-  const old = await f.store.createProject({ name: 'Archived' });
-  old.archived = true;
-  old.chats = [{ id: 'in-old', title: 'Kept', updatedAt: 1 }];
-  f.workspace.freeChats.push({ id: 'f1', title: 'Free', updatedAt: 1 });
+// Move/list parity, tombstone/archived/internal/full-cap behavior and write ordering now belong
+// to Rust's chat_move tests. Here assert the Node boundary uses ONE authoritative call, no saves.
+test('moveChat delegates once and refreshes only after durable success; Node writes neither list', async () => {
+  const f = fixture(), calls = [];
+  f.workspace.chatPermissions = { move: async (...args) => { calls.push(args); return { status: 200, from: 'old', generation: '2' }; } };
+  f.workspace.refreshChatLists = () => calls.push('refresh');
+  f.workspace.saveProjects = f.workspace.saveFreeChats = () => { throw Error('Node local writer must never run'); };
   const frame = { kind: 'idea', tags: [], links: [], confirmed: true, source: 'user' };
-  const before = f.workspace.saved;
-  assert.equal(f.store.moveChat('f1', old.id, { frame }, () => true, chatDestination).status, 404, 'not into an archived project');
-  assert.deepEqual(f.workspace.freeChats.map((c) => c.id), ['f1']);
-  assert.equal(f.workspace.saved, before, 'nothing was saved');
-  assert.equal(f.store.moveChat('in-old', old.id, { frame }, () => true, chatDestination).status, 200, 'a frame is still saved in place');
-  assert.equal(old.chats[0].frame.kind, 'idea');
-  assert.deepEqual(f.store.moveChat('in-old', chat.id, {}, () => true, chatDestination), { status: 200, from: old.id }, 'and the chat can be moved out');
-  assert.deepEqual(f.store.moveChat('f1', chat.id, {}, () => true, chatDestination), { status: 200, from: null });
-  assert.deepEqual(f.store.moveChat('f1', code.id, {}, () => true, chatDestination), { status: 200, from: chat.id }, '#1576: every project takes chats');
+  assert.deepEqual(await f.store.moveChat('qa raw!', 'new', { frame }), { status: 200, from: 'old', generation: '2' });
+  assert.deepEqual(calls, [['qa raw!', 'new', { frame }], 'refresh']);
+});
+test('moveChat waits for prior saves before calling Rust, and store failure prevents a move', async () => {
+  const f = fixture(), order = [];
+  f.workspace.pendingStoreWrites = () => Promise.resolve().then(() => order.push('saved'));
+  f.workspace.chatPermissions = { move: async () => { order.push('move'); return { status: 200, from: null }; } };
+  f.workspace.refreshChatLists = () => order.push('refresh');
+  await f.store.moveChat('qa', null, { frame: null });
+  assert.deepEqual(order, ['saved', 'move', 'refresh']);
+  f.workspace.storeFailed = () => Error('prior save failed');
+  await assert.rejects(f.store.moveChat('qa', null), /prior save failed/);
+  assert.deepEqual(order, ['saved', 'move', 'refresh', 'saved']);
+});
+test('moveChat never falls back to local metadata on missing capability, account removal or uncertain RPC', async () => {
+  const f = fixture();
+  await assert.rejects(f.store.moveChat('qa', null), e => e.code === 'CHAT_PERMISSION_CONTEXT');
+  f.workspace.chatPermissions = { move: async () => { throw Object.assign(Error('busy'), { status: 503 }); } };
+  f.workspace.refreshChatLists = () => { throw Error('must not refresh a failed move'); };
+  await assert.rejects(f.store.moveChat('qa', null), e => e.status === 503);
+  f.workspace.assertActive = () => { throw Object.assign(Error('gone'), { status: 410 }); };
+  await assert.rejects(f.store.moveChat('qa', null), e => e.status === 410);
+});
+test('moveChat preserves store refusal and refresh failure, never falsely acknowledging success', async () => {
+  const f = fixture();
+  for (const status of [400,404,409,410,503]) {
+    f.workspace.chatPermissions = { move: async () => { throw Object.assign(Error('refused'), { status }); } };
+    await assert.rejects(f.store.moveChat('qa', 'new'), e => e.status === status);
+  }
+  f.workspace.chatPermissions = { move: async () => ({ status: 200, from: null }) };
+  f.workspace.refreshChatLists = () => { throw Error('refresh failed'); };
+  await assert.rejects(f.store.moveChat('qa', 'new'), /refresh failed/);
 });
 
 test('#1522: a new project starts on Automatic tools unless the request chose Manual', async () => {

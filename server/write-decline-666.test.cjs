@@ -54,7 +54,7 @@ function harness(t, { decisions = [], readResult = 'Zahl: 1' } = {}) {
     lastLoadedModel: () => null, classifyFastOrSmart: async () => 'fast', servedCatalogue: async () => [], modelsInstalled: async () => [], missingRoles: () => [], staleRolesError: () => null,
     allToolboxes: () => [],
     executeToolCall: async (_p, name, args) => { state.executed.push({ name, args: JSON.parse(args) }); return name === 'synthetic_read' ? readResult : `Appended 10 chars to "${TARGET}".`; },
-    chatWideApproved: () => false,
+    grantContext: async raw => require('../tests/server/chat-grant-fixture.cjs').context(raw, { holder: { kind: 'absent' } }), chatWideApproved: () => false,
     awaitApproval: async (card) => { state.asked.push(card.id); return decisions.shift() || 'deny'; },
     recordUsage() {}, recordToolUse() {},
     writeTargetFor: async (name) => (name === 'synthetic_append' ? { target: TARGET } : null),

@@ -17,7 +17,7 @@ const { createChatHandler } = require('./chat.cjs');
 const contextDir=fs.mkdtempSync(require('node:path').join(require('node:os').tmpdir(),'chat-handler-test-'));
 test.after(()=>fs.rmSync(contextDir,{recursive:true,force:true}));
 
-function fixture({ rounds, decision = 'approve', execute, fallback = false, cancel = false, effort, reasoningOnly = false, skills = [], native = false, preambleText = '', routedIds = null, contextLimit = 32768, usageRounds = [], sameFrameUsage = false, splitTimings = false } = {}) {
+function fixture({ rounds, decision = 'approve', execute, fallback = false, cancel = false, effort, reasoningOnly = false, skills = [], native = false, preambleText = '', routedIds = null, contextLimit = 32768, usageRounds = [], sameFrameUsage = false, splitTimings = false, configure = () => {} } = {}) {
   const resolvedFor = [];
   const events = [], executions = [], approvals = [], requests = [], audits = [], toolCounts = [];
   let round = 0, allApproved = false;
@@ -45,7 +45,7 @@ function fixture({ rounds, decision = 'approve', execute, fallback = false, canc
     CONNECTOR_BOXES: new Set(['gdrive']), connectedBoxes: () => [], toolPolicy: { mode: (_user, _name, write) => (write ? 'ask' : 'allow') },
     resolveTools: (project) => { resolvedFor.push(project.toolboxes); return { tools: ['read', 'write'].map(name => ({ function: { name } })), dropped: [] }; },
     isWriteTool: name => name !== 'read',
-    chatWideApproved: () => allApproved,
+    grantContext: async raw => require('../tests/server/chat-grant-fixture.cjs').context(raw, { holder: { kind: 'absent' } }), chatWideApproved: () => allApproved,
     awaitApproval: async (request) => {
       approvals.push(request);
       if (cancel) res.emit('close');
@@ -98,6 +98,7 @@ function fixture({ rounds, decision = 'approve', execute, fallback = false, canc
       return {ok:true,status:200,body:url.includes('/props?')?{default_generation_settings:{n_ctx:32768},total_slots:1,build_info:'synthetic-native'}:{data:[{id:'synthetic-model',status:{value:loaded?'loaded':'unloaded'}}]}};
     }});
   }
+  configure(context);
   const { handleChat } = createChatHandler({
     fs, path: require('node:path'), rag: { filesContext: async () => null }, prefill: { recordSample() {} }, diaryExtras: require('./diary-extras.cjs'),
     DIARY_BASE: 'http://fixture.invalid', json: () => {}, saveChats() {}, endpointApproved: () => true, diaryHeaders: () => ({}),
@@ -393,4 +394,69 @@ test('the real handler compacts again before an oversized tool continuation', as
   assert.match(continuation.messages.find(message=>message.content?.startsWith('Earlier conversation and completed-step summary'))?.content||'',/Earlier synthetic constraints/);
   assert.deepEqual(continuation.messages.slice(-3).map(message=>message.role),['user','assistant','tool']);
   assert.ok(f.events.some(event=>event.type==='status'&&/Compacting context before the next tool step/.test(event.text)));
+});
+
+// #1071 slice7: actual complete handler, real approval gate, synthetic authoritative store.
+const grantFixture = require('../tests/server/chat-grant-fixture.cjs');
+const grantContexts = require('./chat-grant-context.cjs');
+const { createApprovals } = require('./approvals.cjs');
+for (const action of ['approve','approve_all','deny']) test('move-away-and-back invalidates pending '+action+' without executing', async()=>{
+  const gate=createApprovals();let generation='0',asked=0;
+  const f=fixture({rounds:[[call('qa-move')],[]],configure:c=>{
+    c.grantContext=async raw=>grantFixture.context(raw,{holder:{kind:'project',id:'synthetic-project'},generation});
+    c.chatWideApproved=gate.chatWideApproved;c.revokeChatGrant=gate.revokeChatGrant;
+    c.awaitApproval=req=>{asked++;const p=gate.awaitApproval(req);gate.pendingApprovals.get(req.id).decide(action);generation='2';return p;};
+  }});
+  await f.run();assert.equal(asked,1);assert.equal(f.executions.length,0);
+  const old=grantFixture.binding('synthetic-user','synthetic-chat','project:synthetic-project',{holder:{kind:'project',id:'synthetic-project'}});
+  assert.equal(gate.chatWideApproved('synthetic-user','synthetic-chat','project:synthetic-project',old),false);
+});
+for (const fault of ['busy','gone','unsupported','ambiguous','start','tombstone','holder','alias']) test('final authority '+fault+' refuses Allow once',async()=>{
+  let reads=0;
+  const f=fixture({rounds:[[call('qa-refuse')],[]],configure:c=>{
+    c.grantContext=async raw=>{
+      reads++;
+      const value=grantFixture.context(raw,{holder:{kind:'project',id:'synthetic-project'}});
+      if(reads===2){
+        if(['busy','gone','unsupported','ambiguous'].includes(fault))throw Object.assign(Error(fault),{status:{busy:503,gone:410,unsupported:404,ambiguous:409}[fault]});
+        if(fault==='start')value.start='f'.repeat(32);
+        if(fault==='tombstone')value.tombstoned=true;
+        if(fault==='holder')value.holder={kind:'project',id:'free'};
+        if(fault==='alias')value.canonicalChatId='another';
+      }return value;
+    };
+  }});
+  await f.run();assert.equal(reads,2);assert.equal(f.executions.length,0);
+});
+test('TTL expiring during the final awaited read prevents reused grant dispatch',async()=>{
+  let time=1,reads=0;const gate=createApprovals({now:()=>time,ttlMs:10});
+  const b=grantFixture.binding('synthetic-user','synthetic-chat','project:synthetic-project',{holder:{kind:'project',id:'synthetic-project'}});
+  const p=gate.awaitApproval({id:'qa',userId:b.user,chatId:b.canonicalChatId,scope:b.scope,binding:b,abortSignal:new AbortController().signal});
+  gate.pendingApprovals.get('qa').decide('approve_all');await p;
+  const f=fixture({rounds:[[call('qa-ttl')],[]],configure:c=>{
+    c.chatWideApproved=gate.chatWideApproved;c.revokeChatGrant=gate.revokeChatGrant;
+    c.grantContext=async raw=>{if(++reads===2)time=12;return grantFixture.context(raw,{holder:{kind:'project',id:'synthetic-project'}});};
+  }});await f.run();assert.equal(f.executions.length,0);assert.equal(f.approvals.length,0);
+});
+test('move during asynchronous target re-resolution prevents dispatch; unchanged target executes',async()=>{
+  for(const change of [false,true]){
+    let reads=0,targets=0,generation='0';
+    const f=fixture({rounds:[[call('qa-target')],[]],configure:c=>{
+      c.grantContext=async raw=>{reads++;return grantFixture.context(raw,{holder:{kind:'project',id:'synthetic-project'},generation});};
+      c.writeTargetFor=async()=>{if(++targets===2&&change)generation='2';return{target:'synthetic-drive-id',kind:'file'};};
+    }});await f.run();assert.equal(targets,2);assert.equal(reads,2);assert.equal(f.executions.length,change?0:1);
+  }
+});
+test('target changing after its card refuses execution independently of unchanged generation',async()=>{
+ let targets=0;
+ const f=fixture({rounds:[[call('qa-target-change')],[]],configure:c=>{
+  c.grantContext=async raw=>grantFixture.context(raw,{holder:{kind:'project',id:'synthetic-project'}});
+  c.writeTargetFor=async()=>({target:++targets===1?'first':'second',kind:'file'});
+ }});await f.run();assert.equal(f.executions.length,0);
+});
+test('a move ordered after the accepted final read is the documented dispatch boundary',async()=>{
+ let reads=0,generation='0';
+ const f=fixture({rounds:[[call('qa-linearize')],[]],configure:c=>{
+  c.grantContext=async raw=>{const value=grantFixture.context(raw,{holder:{kind:'project',id:'synthetic-project'},generation});if(++reads===2)generation='2';return value;};
+ }});await f.run();assert.equal(f.executions.length,1);
 });

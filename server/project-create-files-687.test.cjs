@@ -163,7 +163,7 @@ async function chat(t, w, p, { rounds, onApproval, chatWide = false, router = nu
     endpointApproved: () => true, diaryHeaders: () => ({}), lastLoadedModel: () => null, classifyFastOrSmart: async () => 'fast', servedCatalogue: async () => [],
     modelsInstalled: async () => [], missingRoles: () => [], staleRolesError: () => null, allToolboxes: () => [{ id: 'core' }],
     executeToolCall: async (...args) => { executed.push(args[1]); return w.executeToolCall(...args); },
-    chatWideApproved: () => chatWide,
+    grantContext: async raw => require('../tests/server/chat-grant-fixture.cjs').context(raw, { holder: { kind: 'absent' } }), chatWideApproved: () => chatWide,
     editStorageAccount: (userId) => (userId === 'user-a' ? w.storage.account() : null),
     awaitApproval: async (a) => { approvals.push(a.id); await onApproval?.(); return 'approve'; }, recordUsage() {}, recordToolUse() {},
   });

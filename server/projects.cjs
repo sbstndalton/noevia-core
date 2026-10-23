@@ -233,33 +233,18 @@ function createProjectStore({
   // it is not asked of the project the chat is already in, so a frame can still be saved in place
   // and a chat can still be moved out. Returns { status, from } — 200 moved (or already there,
   // patch applied), 404 unknown chat or project.
-  function moveChat(chatId, toProjectId, patch = {}, allowed = () => true, receives = () => true) {
-    const id = typeof chatId === 'string' ? chatId : '';
-    if (!id) return { status: 404 };
-    const lists = require('./chat-lists.cjs');
-    if (lists.readTombstones(currentWorkspace().dir).has(id)) return { status: 404 };
-    const target = toProjectId === null ? null : getProject(toProjectId);
-    if (toProjectId !== null && (!target || !allowed(target))) return { status: 404 };
-    const owner = PROJECTS.find((p) => Array.isArray(p.chats) && p.chats.some((c) => c && c.id === id)) || null;
-    const meta = owner ? owner.chats.find((c) => c && c.id === id) : FREE_CHATS.find((c) => c && c.id === id);
-    if (!meta || (owner && !allowed(owner))) return { status: 404 };
-    if (target && target !== owner && !receives(target)) return { status: 404 };
-    const from = owner ? owner.id : null;
-    const next = { ...meta, ...('frame' in patch ? { frame: patch.frame } : {}) };
-    if (owner) owner.chats = owner.chats.filter((c) => !(c && c.id === id));
-    else FREE_CHATS.splice(0, FREE_CHATS.length, ...FREE_CHATS.filter((c) => !(c && c.id === id)));
-    if (target) target.chats = lists.mergeChats(target.chats || [], [next]);
-    else FREE_CHATS.splice(0, FREE_CHATS.length, ...lists.mergeChats(Array.from(FREE_CHATS), [next]));
-    // Out of a project, the free list is written first (sbstndalton/noevia#1410): a chat-list
-    // save landing between the two writes (the Rust front's, M4) then sees the chat in the free
-    // list and leaves it out, and the project save that follows removes it from the project; in
-    // the other order that save would find the chat in neither list and keep it in the project,
-    // and it would stay in both for good. Into a project the project goes first, so the chat is
-    // never in neither list.
-    if (owner && !target) saveFreeChats(FREE_CHATS);
-    if (owner || target) saveProjects(PROJECTS);
-    if (!owner) saveFreeChats(FREE_CHATS);
-    return { status: 200, from };
+  async function moveChat(chatId, toProjectId, patch = {}) {
+    const workspace = currentWorkspace();
+    workspace.assertActive?.();
+    const pending = workspace.pendingStoreWrites?.();
+    if (pending) await pending;
+    if (workspace.storeFailed?.()) throw workspace.storeFailed();
+    workspace.assertActive?.();
+    if (!workspace.chatPermissions?.move) throw require('./chat-grant-context.cjs').invalid();
+    const moved = await workspace.chatPermissions.move(chatId, toProjectId, patch);
+    workspace.assertActive?.();
+    workspace.refreshChatLists();
+    return moved;
   }
 
   // Free (non-project) chat metas — persisted server-side so recent chats
