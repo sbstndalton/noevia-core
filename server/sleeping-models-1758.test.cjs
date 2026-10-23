@@ -8,6 +8,7 @@ const assert = require('node:assert/strict');
 const { createModelManager } = require('./model-manager.cjs');
 const { resolveRuntimeLimit } = require('./chat-context.cjs');
 const { createModelService } = require('./models.cjs');
+const { fakeGate } = require('./fixtures/fake-inference-gate.cjs');
 
 // A router whose rows are { id: status }. `loadReply` answers POST /models/load.
 function router(states, { loadReply } = {}) {
@@ -22,7 +23,7 @@ function router(states, { loadReply } = {}) {
     if (u.pathname === '/models/unload') { states[body.model] = 'unloaded'; return { ok: true, status: 200, body: { success: true } }; }
     return { ok: true, status: 200, body: {} };
   };
-  const manager = createModelManager({ kind: 'llamacpp', baseUrl: 'http://synthetic-router/v1', fetchJson, fetchStream: async () => ({ ok: false }) });
+  const manager = createModelManager({ kind: 'llamacpp', baseUrl: 'http://synthetic-router/v1', fetchJson, fetchStream: async () => ({ ok: false }), gate: fakeGate() });
   return { manager, calls, states };
 }
 const loads = (calls) => calls.filter((c) => c.startsWith('POST /models/load'));
@@ -59,7 +60,8 @@ test('#1758 load() skips the POST for a sleeping target while a different model 
   const r = await manager.load('syn-chat');
   assert.equal(r.ok, true);
   assert.deepEqual(loads(calls), [], 'no POST /models/load for the sleeping target');
-  assert.deepEqual(calls.filter((c) => c.startsWith('POST /models/unload')), ['POST /models/unload syn-other'], 'the other chat model still makes room');
+  // noevia#2115: the other chat model is switched away by the inference gate once it is idle, never from here.
+  assert.deepEqual(calls.filter((c) => c.startsWith('POST /models/unload')), []);
   assert.equal(states['syn-chat'], 'sleeping');
 });
 
@@ -95,8 +97,6 @@ test('#1758 the budget and eviction treat a sleeping model as not resident', asy
   const { manager, calls } = router({ 'syn-sleeper': 'sleeping', 'syn-next': 'unloaded' });
   const r = await manager.load('syn-next');
   assert.equal(r.ok, true);
-  assert.deepEqual(calls.filter((c) => c.startsWith('POST /models/unload')), []);
-  await manager.makeRoomFor('syn-next', []);
   assert.deepEqual(calls.filter((c) => c.startsWith('POST /models/unload')), []);
   // The memory watchdog's resident list leaves it out, and the estimates do not show it loaded.
   const { loadedFromListing } = require('./inference-budget-watch.cjs');

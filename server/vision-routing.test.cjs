@@ -16,7 +16,7 @@ const contextDir=fs.mkdtempSync(require('node:path').join(require('node:os').tmp
 test.after(()=>fs.rmSync(contextDir,{recursive:true,force:true}));
 
 async function run({ visionModel, probeStatus = 200, descriptionStatus = 200, missingAsset = false, finishReason = 'stop', cache = new Map(), headers = {}, replacementBytes, userId = 'synthetic-user', projectId = 'fixture-project', native = false,
-  assets = [{ id: 'image-a', name: 'statement.png', mime: 'image/png' }, { id: 'image-b', name: 'copy.png', mime: 'image/png' }], files = [], turnImageIds, expectImages = true, message = 'Read the synthetic total', projectProviderId, history, describeHang = false, stageMs, makeRoomFor } = {}) {
+  assets = [{ id: 'image-a', name: 'statement.png', mime: 'image/png' }, { id: 'image-b', name: 'copy.png', mime: 'image/png' }], files = [], turnImageIds, expectImages = true, message = 'Read the synthetic total', projectProviderId, history, describeHang = false, stageMs, acquireLease } = {}) {
   const events = [], requests = [], urls = [], nativeCalls=[];let nativeLoaded=null;
   const res = new EventEmitter();
   res.writeHead = () => {};
@@ -51,8 +51,8 @@ async function run({ visionModel, probeStatus = 200, descriptionStatus = 200, mi
     CONNECTOR_BOXES: new Set(['gdrive']), connectedBoxes: () => [], toolPolicy: { mode: (_user, _name, write) => (write ? 'ask' : 'allow') }, requestScope: { getStore: () => ({}) },
     resolveTools: () => ({ tools: [], dropped: [] }), isWriteTool: () => true,
   };
-  if (makeRoomFor) context.modelManager = { ...context.modelManager, makeRoomFor };
-  if(native)context.modelManager=require('./model-manager.cjs').createModelManager({kind:'llamacpp',baseUrl:'http://fixture.invalid',fetchJson:async(url,options)=>{
+  if (acquireLease) context.modelManager = { ...context.modelManager, acquireLease };
+  if(native)context.modelManager=require('./model-manager.cjs').createModelManager({kind:'llamacpp',baseUrl:'http://fixture.invalid',gate:require('./fixtures/fake-inference-gate.cjs').fakeGate(),fetchJson:async(url,options)=>{
     nativeCalls.push(url);
     if(url.endsWith('/models/load'))nativeLoaded=JSON.parse(options.body).model;
     if(url.endsWith('/models/unload'))nativeLoaded=null;
@@ -128,6 +128,11 @@ test('description cache reuses exact inputs but isolates credential, content, us
 
 test('native one-model router can switch from vision description to answer context',async()=>{
  const out=await run({native:true,visionModel:'vision-model'});
+ // noevia#2115: the description and the answer each run under their own lease from the inference gate.
+ const leaseOf=(u)=>{const h=u.headers||{};return typeof h.get==='function'?h.get('X-Noevia-Lease'):h['X-Noevia-Lease'];};
+ const describe=out.urls.find(u=>u.model==='vision-model'),answer=out.urls.find(u=>u.model==='answer-model');
+ assert.match(String(leaseOf(describe)),/^[0-9a-f]{32}$/);assert.match(String(leaseOf(answer)),/^[0-9a-f]{32}$/);
+ assert.notEqual(leaseOf(describe),leaseOf(answer));
  assert.match(out.answer.messages[0].content,/INV-2042 total 34.95/);assert.equal(out.answer.model,'answer-model');assert.ok(out.nativeCalls.some(url=>url.endsWith('/models/load')));assert.equal(out.events.find(e=>e.type==='context').limit,32768);
 });
 
@@ -254,9 +259,10 @@ test('#1790: a describe that never answers ends at the stage deadline, says so, 
 });
 
 test('#1790: a model swap that never completes is bounded by the same deadline', async () => {
-  const makeRoomFor = (model, _keep, signal) => model !== 'vision-model' ? Promise.resolve()
+  // noevia#2115: the swap is a wait for a lease on the vision model in the inference gate's queue.
+  const acquireLease = (model, { signal } = {}) => model !== 'vision-model' ? Promise.resolve(null)
     : new Promise((_, reject) => { signal.addEventListener('abort', () => reject(signal.reason), { once: true }); });
-  const out = await run({ visionModel: 'vision-model', stageMs: 50, makeRoomFor });
+  const out = await run({ visionModel: 'vision-model', stageMs: 50, acquireLease });
   assert.ok(out.answer);
   assert.match(out.events.find((e) => e.type === 'warning').text, /did not finish within/);
 });

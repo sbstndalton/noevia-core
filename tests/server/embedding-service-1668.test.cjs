@@ -283,7 +283,7 @@ test('service actions need a managed service', async () => {
 test('a chat model load only ever talks to the chat engine, never to the embedding service', async () => {
   const urls = [];
   const state = { 'chat-a': 'loaded', 'chat-b': 'unloaded' };
-  const manager = require('../../server/llamacpp-manager.cjs').createLlamaCppManager({ unloadWait: { timeoutMs: 0 }, baseUrl: 'http://llama:8080', fetchJson: async (url, options = {}) => {
+  const manager = require('../../server/llamacpp-manager.cjs').createLlamaCppManager({ gate: require('../../server/fixtures/fake-inference-gate.cjs').fakeGate(), baseUrl: 'http://llama:8080', fetchJson: async (url, options = {}) => {
     urls.push(url);
     const route = new URL(url).pathname, body = options.body ? JSON.parse(options.body) : {};
     if (route === '/models') return { ok: true, status: 200, body: { data: Object.entries(state).map(([id, value]) => ({ id, status: { value } })) } };

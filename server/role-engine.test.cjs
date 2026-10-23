@@ -481,7 +481,7 @@ test('role budgets are configurable per role, and an explicit call value wins', 
 test('admission: the residency check and the send run inside one admission, released before the answer streams', async () => {
   const events = [];
   let held = false;
-  // A serialising lock like the model manager's withAdmission.
+  // A serialising lock (the model manager had one before the inference gate, noevia#2115).
   let tail = Promise.resolve();
   const admission = async (work) => {
     const prev = tail; let release; tail = new Promise((r) => { release = r; });

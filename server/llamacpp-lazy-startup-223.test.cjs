@@ -66,7 +66,7 @@ function synthetic(t, { autoconfig = {}, inferenceBudget, native, autotuneOption
   const ini = path.join(dir, 'models.ini');
   fs.writeFileSync(ini, INI);
   const calls = [], state = { small: 'unloaded' };
-  const m = createModelManager({ kind: 'llamacpp', baseUrl: 'http://synthetic', presetPath: ini, calibrationStatePath: path.join(dir, 'cal.json'), autotuneStatePath: path.join(dir, 'tune.json'),
+  const m = createModelManager({ kind: 'llamacpp', baseUrl: 'http://synthetic', presetPath: ini, calibrationStatePath: path.join(dir, 'cal.json'), autotuneStatePath: path.join(dir, 'tune.json'), gate: require('./fixtures/fake-inference-gate.cjs').fakeGate(),
     autoconfig: { modelsPath: dir, cacheRamMaxMib: 1024, ...autoconfig }, ...(inferenceBudget ? { inferenceBudget } : {}),
     calibrationOptions: { sleep: async () => {}, readMemory: () => 20 }, ...(autotuneOptions ? { autotuneOptions } : {}),
     fetchJson: async (url, options = {}) => {

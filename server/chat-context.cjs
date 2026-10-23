@@ -44,13 +44,18 @@ function loadingStatus(model, role, seconds) {
   const who = role ? `${model} for the ${role} role` : model;
   return `Loading the selected model ${who} and checking its context allocation…${seconds ? ` Expected wait about ${seconds} s.` : ''}`;
 }
-async function resolveRuntimeLimit({manager,model,dir,scope,onStatus=()=>{},signal,assertActive,hosted=null,role=null}) {
+// noevia#2115: the turn waits in the inference gate's queue while another chat uses the local model.
+function waitingStatus(model, role, position, seconds) {
+  const who = role ? `${model} for the ${role} role` : model;
+  return `Waiting for another chat to finish with the local model before ${who} can answer (position ${position}${seconds ? `, ${seconds} s so far` : ''})…`;
+}
+async function resolveRuntimeLimit({manager,model,dir,scope,onStatus=()=>{},signal,assertActive,hosted=null,role=null,lease=null}) {
   assertActive?.();
-  if (manager?.enabled) return resolveManagedLimit({manager,model,dir,scope,onStatus,signal,assertActive,role});
+  if (manager?.enabled) return resolveManagedLimit({manager,model,dir,scope,onStatus,signal,assertActive,role,lease});
   if (hosted) return hostedLimit(hosted);
   return runtimeLimit(null,model);
 }
-async function resolveManagedLimit({manager,model,dir,scope,onStatus,signal,assertActive,role=null}) {
+async function resolveManagedLimit({manager,model,dir,scope,onStatus,signal,assertActive,role=null,lease=null}) {
   signal?.throwIfAborted();
   let response=await manager.health();
   assertActive?.();
@@ -61,7 +66,7 @@ async function resolveManagedLimit({manager,model,dir,scope,onStatus,signal,asse
     onStatus(loadingStatus(model,role,seconds),'loadingModel',{model,...(role?{role}:{}),...(seconds?{expectedSeconds:seconds}:{})});
     signal?.throwIfAborted();
     const started=Date.now();
-    const loaded=await manager.load(model,{},signal);
+    const loaded=lease?await manager.load(model,{},signal,{lease}):await manager.load(model,{},signal);
     assertActive?.();
     if (!loaded.ok) throw Error('The selected model could not load. Its context allocation was not changed.');
     recordLoad(model,Date.now()-started);
@@ -278,4 +283,4 @@ async function prepare(options){const key=stateFile(options.dir,options.id);if(b
 // R1 measurement, opt-in with CONTEXT_LOG=1; never breaks a chat.
 function logRound({dir,assertActive,...entry}){if(process.env.CONTEXT_LOG!=='1')return;try{const log=require('./context-log.cjs');const record=log.record(entry);assertActive?.();log.append(dir,record);}catch(e){console.warn('[context-log] write failed:',e.message);}}
 function remove(dir,id){fs.rmSync(stateFile(dir,id),{force:true});}
-module.exports={IMAGE_TOKENS,logRound,remove,tokens,read,save,runtimeLimit,resolveRuntimeLimit,recordLoad,expectedLoadSeconds,loadingStatus,HOSTED_DEFAULT_LIMIT,applySummary,measure,prepare,compactContinuation,providerError,CONTEXT_FULL_TEXT,STREAM_FAILED_TEXT,STREAM_FAILED_PARTIAL_TEXT};
+module.exports={IMAGE_TOKENS,logRound,remove,tokens,read,save,runtimeLimit,resolveRuntimeLimit,recordLoad,expectedLoadSeconds,loadingStatus,waitingStatus,HOSTED_DEFAULT_LIMIT,applySummary,measure,prepare,compactContinuation,providerError,CONTEXT_FULL_TEXT,STREAM_FAILED_TEXT,STREAM_FAILED_PARTIAL_TEXT};

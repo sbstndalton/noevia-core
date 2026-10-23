@@ -80,7 +80,7 @@ async function turn(t, { chatMachines = null, route = 'fast', roles = ROLES, row
   process.env.MODEL_MANAGER_KIND = 'llamacpp'; process.env.INFERENCE_BASE_URL = 'http://default.invalid';
   t.after(() => { for (const [k, v] of [['MODEL_MANAGER_KIND', saved.kind], ['INFERENCE_BASE_URL', saved.base]]) if (v === undefined) delete process.env[k]; else process.env[k] = v; });
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'noevia-1840-')); t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
-  const events = [], localRequests = [], engine = { makeRoomFor: [], health: 0, props: 0 };
+  const events = [], localRequests = [], engine = { leases: [], health: 0, props: 0 };
   let replied = null;
   const res = new EventEmitter(); res.writeHead = () => {}; res.end = () => { res.writableEnded = true; res.emit('finish'); };
   res.write = (chunk) => { for (const line of String(chunk).split('\n')) if (line.startsWith('data:')) { try { events.push(JSON.parse(line.slice(5))); } catch { /* not json */ } } };
@@ -93,7 +93,7 @@ async function turn(t, { chatMachines = null, route = 'fast', roles = ROLES, row
   const executed = [];
   const { handleChat } = createChatHandler({
     chatMachines,
-    modelManager: { enabled: true, makeRoomFor: async (m) => { engine.makeRoomFor.push(m); },
+    modelManager: { enabled: true, acquireLease: async (m) => { engine.leases.push(m); return null; },
       health: async () => { engine.health++; return { ok: true, body: { all_models_loaded: catalogue.map((m) => ({ model_name: m.name, loaded: true, recipe_options: { ctx_size: 32768 } })) } }; } },
     reasoningEffort, crypto: require('node:crypto'), path, fs, fetch,
     authService: { audit() {}, db: { prepare: () => ({ get: () => undefined }) } },
@@ -156,7 +156,7 @@ test('#1840 a Fast turn on a machine streams its reply from that machine, same r
   assert.match(JSON.stringify(out.events), /Remote /);
   assert.match(JSON.stringify(out.events), /hello\./);
   // Budget and residency: no load, unload or local context read for a role on a machine.
-  assert.deepEqual(out.engine.makeRoomFor, []);
+  assert.deepEqual(out.engine.leases, []);
   assert.equal(out.engine.health, 0);
   const ctx = out.events.find((e) => e.type === 'context');
   assert.equal(ctx.limit, 16384, 'the context comes from the machine\'s /props, not this machine\'s engine');
@@ -189,7 +189,7 @@ test('#1840 an unreachable machine fails the turn clearly; it never falls back t
   assert.equal(out.replied.body.code, 'machineUnreachable');
   assert.match(out.replied.body.error, /^Fast model’s machine \(Synthetic Pi\) is unreachable/);
   assert.equal(out.localRequests.length, 0, 'no fallback to the local engine');
-  assert.deepEqual(out.engine.makeRoomFor, []);
+  assert.deepEqual(out.engine.leases, []);
 });
 
 test('#1840 a machine whose name now resolves to a public or link-local address is refused at connect time', async (t) => {
@@ -238,7 +238,7 @@ test('#1840 a role on this machine is unaffected while another role is on a mach
   assert.deepEqual(out.errors, []);
   assert.equal(fake.chats().length, 0);
   assert.equal(out.localRequests.filter((r) => r.url.includes('/chat/completions'))[0].body.model, 'synthetic-smart');
-  assert.deepEqual(out.engine.makeRoomFor, ['synthetic-smart'], 'the local role is admitted as before');
+  assert.deepEqual(out.engine.leases, ['synthetic-smart'], 'the local role is admitted as before');
 });
 
 test('#1840 a local Fast model that is gone does not fail a turn while Fast runs on a machine', async (t) => {
@@ -258,7 +258,7 @@ test('#1816/#1840 Creative on a machine: the move costs no local swap, so it hap
   const out = await turn(t, { chatMachines: createChatMachines({ machines, health: createMachineHealth() }), route: 'smart', message: CREATIVE, rows });
   assert.equal(out.meta.route, 'creative');
   assert.equal(fake.chats()[0].body.model, 'synthetic-remote-creative');
-  assert.deepEqual(out.engine.makeRoomFor, []);
+  assert.deepEqual(out.engine.leases, []);
 });
 
 test('#1816/#1840 Creative on an unreachable machine is optional: the router pick stands, locally', async (t) => {
@@ -281,7 +281,7 @@ test('#1816/#1840 a local Creative with Fast on a machine moves only when it cos
   assert.equal(fake.chats().length, 1);
   const idle = await turn(t, { chatMachines: cm, roles, route: 'fast', message: CREATIVE, rows: catalogue.map((m) => ({ ...m, loaded: false })) });
   assert.equal(idle.meta.route, 'creative');
-  assert.deepEqual(idle.engine.makeRoomFor, ['synthetic-creative']);
+  assert.deepEqual(idle.engine.leases, ['synthetic-creative']);
 });
 
 test('#1840 ensureRolesLoaded never warms a role that runs on a machine; a local role still warms', async () => {

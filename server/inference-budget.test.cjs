@@ -11,6 +11,7 @@ const { createModelManager } = require('./model-manager.cjs');
 const { createInferenceBudgetWatch, gpuMemoryFiles, readGpuMemory, engineReaderFromModelLoader, isEngineContainer } = require('./inference-budget-watch.cjs');
 const { rerankTarget } = require('./rerank-target.cjs');
 const { keepAlongside } = require('./llamacpp-manager.cjs');
+const { fakeGate } = require('./fixtures/fake-inference-gate.cjs');
 
 const GIB = 1024 ** 3;
 const meminfo = gib => () => `MemTotal:       ${Math.round(gib * 1048576)} kB\nMemAvailable:   1 kB\n`;
@@ -163,7 +164,8 @@ function fixture(t, { section, budget = 2, state = { big: 'unloaded', small: 'un
   fs.writeFileSync(ini, `version = 1\n\n[big]\nmodel = /models/q.gguf\nctx-size = 262144\ncache-type-k = q8_0\ncache-type-v = q8_0\ncache-ram = 1024\n\n[small]\nmodel = /models/q.gguf\nctx-size = 4096\ncache-ram = 0\n\n[chat]\nmodel = /models/q.gguf\nctx-size = 4096\ncache-ram = 0\n${section || ''}`);
   const calls = [];
   let budgetGib = budget;
-  const manager = createModelManager({ kind: 'llamacpp', baseUrl: 'http://synthetic', presetPath: ini, autoconfig: { modelsPath: dir },
+  const gate = fakeGate();
+  const manager = createModelManager({ kind: 'llamacpp', baseUrl: 'http://synthetic', presetPath: ini, autoconfig: { modelsPath: dir }, gate,
     inferenceBudget: { budgetGib: () => budgetGib },
     fetchJson: async (url, options = {}) => {
       const p = new URL(url).pathname, body = options.body ? JSON.parse(options.body) : {};
@@ -172,7 +174,7 @@ function fixture(t, { section, budget = 2, state = { big: 'unloaded', small: 'un
       if (p === '/models/load') state[body.model] = 'loaded';
       return { ok: true, status: 200, body: p === '/models' ? { data: Object.entries(state).map(([id, value]) => ({ id, status: { value } })) } : { success: true } };
     } });
-  return { manager, calls, state, setBudget: v => { budgetGib = v; } };
+  return { manager, calls, state, gate, setBudget: v => { budgetGib = v; } };
 }
 
 test('a load above the budget is refused before anything is evicted, with a clear error', async t => {
@@ -185,10 +187,12 @@ test('a load above the budget is refused before anything is evicted, with a clea
   assert.ok(!calls.some(c => c.startsWith('POST /models/')), calls.join('\n'));
 });
 
-test('the chat path refuses an over-budget model in makeRoomFor, leaving the current one loaded', async t => {
-  const { manager, calls, state } = fixture(t, {});
-  await assert.rejects(manager.makeRoomFor('big'), e => e.status === 409 && /inference memory budget/.test(e.publicMessage) && e.code === 'inference_budget');
-  assert.equal(state.chat, 'loaded'); assert.ok(!calls.some(c => c.includes('/models/unload')));
+test('the chat path refuses an over-budget model before it asks the gate for a lease, leaving the current one loaded', async t => {
+  const { manager, calls, state, gate } = fixture(t, {});
+  await assert.rejects(manager.acquireLease('big'), e => e.status === 409 && /inference memory budget/.test(e.publicMessage) && e.code === 'inference_budget');
+  await assert.rejects(manager.prepareLoad('big'), e => e.code === 'inference_budget');
+  assert.equal(state.chat, 'loaded'); assert.ok(!calls.some(c => c.startsWith('POST /models/')));
+  assert.deepEqual(gate.log.acquired, [], 'no lease is asked for a model that cannot load (noevia#2115)');
 });
 
 test('calibration and auto-tune loads (the shared request helper) pass the same guard', async t => {
@@ -202,7 +206,8 @@ test('calibration and auto-tune loads (the shared request helper) pass the same 
 
 test('a model that fits loads normally, and raising the budget lets the large one through', async t => {
   const { manager, state, setBudget } = fixture(t, {});
-  assert.equal((await manager.load('small')).ok, true); assert.equal(state.small, 'loaded'); assert.equal(state.chat, 'unloaded');
+  // noevia#2115: the switch away from the loaded model is the inference gate's; this fake router stands in for it.
+  assert.equal((await manager.load('small')).ok, true); assert.equal(state.small, 'loaded');
   setBudget(64);
   assert.equal((await manager.load('big')).ok, true);
 });
@@ -442,7 +447,7 @@ test('a preset change releases a quarantined model', async t => {
   const file = path.join(dir, 'models.ini');
   fs.writeFileSync(file, 'version = 1\n\n[small]\nmodel = /models/q.gguf\nctx-size = 4096\ncache-ram = 0\n');
   const state = { small: 'unloaded' };
-  const manager = createModelManager({ kind: 'llamacpp', baseUrl: 'http://synthetic', presetPath: file, autoconfig: { modelsPath: dir }, inferenceBudget: { budgetGib: () => 64 },
+  const manager = createModelManager({ kind: 'llamacpp', baseUrl: 'http://synthetic', presetPath: file, autoconfig: { modelsPath: dir }, inferenceBudget: { budgetGib: () => 64 }, gate: fakeGate(),
     fetchJson: async (url, o = {}) => { const p = new URL(url).pathname, b = o.body ? JSON.parse(o.body) : {}; if (p === '/models/load') state[b.model] = 'loaded';
       return { ok: true, status: 200, body: p === '/models' ? { data: Object.entries(state).map(([id, value]) => ({ id, status: { value } })) } : { success: true } }; } });
   manager.quarantine('small', 64);
