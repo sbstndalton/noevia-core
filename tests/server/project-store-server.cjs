@@ -27,7 +27,9 @@
 //
 //   POST /v1/changes/read { user, after? }   -> 200 { entries, oldestSeq, latestSeq, more, start }
 //
-// answers (no rotation here).
+// answers (no rotation here) when the store is started with `{ changes: true }`; otherwise that op
+// is 404, as an older front answers it, so a Node loaded against the stand-in leaves its journal
+// reader idle (the default for every test that only needs the store).
 //
 // What is written is the last 5,000 entries through core's own sanitizeHistory, as the Rust store
 // does; a client save (`supersedePartial`) removes the chat's saved partial unless its running
@@ -150,13 +152,14 @@ function valid(file, text) {
 }
 
 /** The request handler over `<dataDir>/users/<user>/<file>`; `writes` lists the files written. */
-function createHandler(dataDir, token, writes = [], failures = []) {
+function createHandler(dataDir, token, writes = [], failures = [], { changes = false } = {}) {
   return (req, res) => {
     const chunks = [];
     req.on('data', (c) => chunks.push(c));
     req.on('end', () => {
       try {
         if (req.method !== 'POST' || !(['/v1/read', '/v1/write'].includes(req.url) || HISTORY_OPS.has(req.url))) return send(res, 404, { error: 'not found' });
+        if (req.url === '/v1/changes/read' && !changes) return send(res, 404, { error: 'not found' });
         if (req.headers['x-noevia-store-token'] !== token) return send(res, 401, { error: 'unauthorised' });
         const planned = failures.find((f) => f.url === req.url && f.times > 0);
         if (planned) { planned.times -= 1; return send(res, planned.status, planned.body); }
@@ -191,10 +194,10 @@ function createHandler(dataDir, token, writes = [], failures = []) {
 }
 
 /** Starts the store on 127.0.0.1 (port 0 by default); resolves { port, token, server, writes, close }. */
-async function startProjectStore(dataDir, { port = 0, token = crypto.randomBytes(32).toString('hex') } = {}) {
+async function startProjectStore(dataDir, { port = 0, token = crypto.randomBytes(32).toString('hex'), changes = false } = {}) {
   const writes = [];
   const failures = [];
-  const server = http.createServer(createHandler(dataDir, token, writes, failures));
+  const server = http.createServer(createHandler(dataDir, token, writes, failures, { changes }));
   await new Promise((resolve, reject) => { server.once('error', reject); server.listen(port, '127.0.0.1', resolve); });
   const failNext = (status, body, { url = '/v1/write', times = 1 } = {}) => { failures.push({ status, body, url, times }); };
   const clearFailures = () => { failures.length = 0; };

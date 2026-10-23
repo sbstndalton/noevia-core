@@ -142,7 +142,7 @@ test('#2153: an import publishes with origin import and takes back with origin r
 
 test('#2153 end to end: over the store journal a history save queues exactly one brain build and an import none',async t=>{
  const root=temporary(t);
- const standin=await startProjectStore(root);t.after(()=>standin.close());
+ const standin=await startProjectStore(root,{changes:true});t.after(()=>standin.close());
  const client=psc.createClient({port:standin.port,token:standin.token,timeoutMs:5000});
  const f=fixture(root,uid,client);await f.store.createProject({name:'Existing',toolboxes:[]});
  const {createChangeJournalReader,scheduleMirrorAndBrain}=require('../chat-change-journal.cjs');
