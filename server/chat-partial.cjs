@@ -11,6 +11,14 @@
 // reply completed, failed or was left by its client. A client that leaves has its partial kept in the
 // transcript by the #679 path (chat-interrupted-turn.cjs), so this file is never the only copy then.
 // A partial is only exposed while no reply runs for that chat in this process.
+//
+// sbstndalton/noevia#1071 (slice 1 of moving this state to Rust): every save also records which
+// container start wrote it, `running: { start }`, with the per-start id the web supervisor hands
+// both processes (NOEVIA_START_ID). A reader in another process (the Rust front's history route,
+// later) can then tell a reply still running (marker from this start) from one a crash or restart
+// cut off (no marker, or another start's): the file is cleared when a reply ends, so a marker from
+// the current start means it is still running. The marker is internal: partialFor strips it, and
+// this process still decides with its own Set.
 
 const fs = require('node:fs');
 const path = require('node:path');
@@ -20,6 +28,10 @@ const PARTIAL_SAVE_MS = 4000;
 const PARTIAL_CAP_CHARS = 64 * 1024; // per text field, the newest characters are kept
 const DIR = 'chat-partials';
 const active = new Set();
+// The supervisor's id for this container start (32 lowercase hex). Without one (tests, a Node run
+// by hand) this process makes its own, so its markers never match another process's start.
+const START_ID_RE = /^[0-9a-f]{32}$/;
+const START_ID = START_ID_RE.test(process.env.NOEVIA_START_ID || '') ? process.env.NOEVIA_START_ID : crypto.randomBytes(16).toString('hex');
 
 function fileFor(dir, chatId) {
   return path.join(dir, DIR, crypto.createHash('sha256').update(String(chatId)).digest('hex') + '.json');
@@ -37,7 +49,7 @@ function writePartial(dir, chatId, entry) {
   const file = fileFor(dir, chatId);
   fs.mkdirSync(path.dirname(file), { recursive: true });
   const tmp = `${file}.${process.pid}.tmp`;
-  fs.writeFileSync(tmp, JSON.stringify({ ...bounded(entry), interrupted: true }));
+  fs.writeFileSync(tmp, JSON.stringify({ ...bounded(entry), interrupted: true, running: { start: START_ID } }));
   fs.renameSync(tmp, file);
 }
 
@@ -58,7 +70,10 @@ function clearPartial(dir, chatId) {
 /** What the history route adds: the saved partial, unless a reply for the chat is still running. */
 function partialFor(dir, chatId) {
   if (active.has(String(chatId))) return null;
-  return readPartial(dir, chatId);
+  const value = readPartial(dir, chatId);
+  if (!value) return null;
+  const { running: _running, ...offered } = value;
+  return offered;
 }
 
 /**
@@ -96,4 +111,4 @@ function supersedePartial(dir, chatId) {
   try { clearPartial(dir, chatId); } catch { /* best effort */ }
 }
 
-module.exports = { PARTIAL_SAVE_MS, PARTIAL_CAP_CHARS, startPartialSaves, readPartial, partialFor, supersedePartial, fileFor };
+module.exports = { START_ID, PARTIAL_SAVE_MS, PARTIAL_CAP_CHARS, startPartialSaves, readPartial, partialFor, supersedePartial, fileFor };

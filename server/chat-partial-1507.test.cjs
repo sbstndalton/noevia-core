@@ -115,3 +115,47 @@ test('a transcript save supersedes a stored partial, except while a reply runs',
   partial.supersedePartial(dir, 'c-6');
   assert.equal(partial.readPartial(dir, 'c-6'), null, 'a saved transcript supersedes the old partial');
 });
+
+// sbstndalton/noevia#1071: each save records which container start wrote it, so another process can
+// tell a running reply from one a crash cut off. The marker never reaches the client.
+test('a running reply\'s partial carries this start\'s marker, which the history never shows', async () => {
+  const dir = temp();
+  const record = createTurnRecord();
+  record.observe({ type: 'delta', text: 'streaming' });
+  const saves = partial.startPartialSaves({ dir, chatId: 'qa-marker', record, everyMs: 5 });
+  await wait(30);
+  const stored = partial.readPartial(dir, 'qa-marker');
+  assert.match(partial.START_ID, /^[0-9a-f]{32}$/);
+  assert.deepEqual(stored.running, { start: partial.START_ID }, 'the file says which start is running it');
+  assert.equal(stored.interrupted, true);
+  assert.equal(partial.partialFor(dir, 'qa-marker'), null, 'this process still hides it with its own set');
+  saves.finish();
+  assert.equal(fs.existsSync(partial.fileFor(dir, 'qa-marker')), false, 'an ended reply leaves no marker behind');
+});
+
+test('after a crash the partial is offered as interrupted, without the dead start\'s marker', () => {
+  const dir = temp();
+  fs.mkdirSync(path.join(dir, 'chat-partials'), { recursive: true });
+  // Left by the previous container start, which died mid-reply (no finish()).
+  const before = 'f'.repeat(32);
+  assert.notEqual(before, partial.START_ID);
+  fs.writeFileSync(partial.fileFor(dir, 'qa-crash'), JSON.stringify({ role: 'assistant', content: 'cut off', interrupted: true, running: { start: before } }));
+  const offered = partial.partialFor(dir, 'qa-crash');
+  assert.deepEqual(offered, { role: 'assistant', content: 'cut off', interrupted: true });
+  assert.equal('running' in offered, false);
+  assert.deepEqual(partial.readPartial(dir, 'qa-crash').running, { start: before }, 'the file itself is left as it was');
+});
+
+test('the start id comes from the supervisor when it is well formed', () => {
+  const { execFileSync } = require('node:child_process');
+  const read = (value) => execFileSync(process.execPath, ['-e', 'process.stdout.write(require(process.argv[1]).START_ID)', require.resolve('./chat-partial.cjs')],
+    { env: { ...process.env, NOEVIA_START_ID: value }, encoding: 'utf8' });
+  const given = '0123456789abcdef0123456789abcdef';
+  assert.equal(read(given), given);
+  for (const bad of ['', 'short', given.toUpperCase(), `${given}0`, `../${given}`]) {
+    const made = read(bad);
+    assert.match(made, /^[0-9a-f]{32}$/, bad);
+    assert.notEqual(made, bad);
+  }
+  assert.notEqual(read(''), read(''), 'each process without one makes its own');
+});
