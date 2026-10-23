@@ -124,6 +124,15 @@ function createChangeJournalReader({ read, onChange, stamp = () => null, log = (
     }
   }
 
+  /** The store answered 410 (the account no longer exists): stop reading that user. Nothing of
+   *  theirs is kept; a later request start from them (they authenticated again) begins afresh. */
+  function forget(user) {
+    cursors.delete(user); stamps.delete(user); seen.delete(user); failing.delete(user); again.delete(user);
+    const prefix = `${user}\n`;
+    for (const key of [...recent.keys()]) if (key.startsWith(prefix)) recent.delete(key);
+    log('chat-change-journal: account removed, no longer reading', user);
+  }
+
   /** Reads `user`'s new entries now (one poll at a time per user; asked again meanwhile, it reads
    *  once more after). Never rejects. */
   function poll(user) {
@@ -134,6 +143,7 @@ function createChangeJournalReader({ read, onChange, stamp = () => null, log = (
         await pollOnce(user);
         if (failing.delete(user)) log('chat-change-journal: reading again for', user);
       } catch (error) {
+        if (error?.status === 410) { forget(user); return; } // the account was removed: terminal
         stamps.delete(user); // the next tick reads again whatever the stamp says
         if (!failing.has(user)) { failing.add(user); log('chat-change-journal: read failed, retrying', user, error?.message || String(error)); }
       } finally {
@@ -181,6 +191,7 @@ function createChangeJournalReader({ read, onChange, stamp = () => null, log = (
     start() { if (!timer) { timer = setTimer(() => { tick(); }, intervalMs); timer?.unref?.(); } return this; },
     stop() { if (timer) { clearTimer(timer); timer = null; } },
     cursor: (user) => cursors.get(user) || null,
+    tracked: (user) => seen.has(user) || cursors.has(user) || stamps.has(user) || failing.has(user),
   };
 }
 

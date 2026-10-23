@@ -220,6 +220,42 @@ test('the timer reads active users only; a request start reads that user at once
   r.stop();
 });
 
+test('a 410 (account removed) is terminal: the user is untracked, no further reads, a new touch starts fresh', async () => {
+  let t = 1_000_000;
+  const reads = [];
+  const logs = [];
+  let gone = true;
+  let timerFn = null;
+  const timer = { unref() { this.unrefd = true; } };
+  const r = createChangeJournalReader({
+    read: async (u, after) => {
+      reads.push(`${u}@${after}`);
+      if (gone) throw Object.assign(new Error('account no longer exists'), { status: 410 });
+      return { entries: [], oldestSeq: null, latestSeq: null, more: false, start: START_A };
+    },
+    onChange: () => {}, log: (...a) => logs.push(a.join(' ')), now: () => t, activeMs: 60_000, intervalMs: 2000,
+    setTimer: (fn) => { timerFn = fn; return timer; }, clearTimer: () => {} });
+  r.start();
+  assert.equal(timer.unrefd, true, 'the timer never keeps the process alive');
+  r.touch(USER);
+  await r.poll(USER);
+  assert.equal(reads.length >= 1, true);
+  const k = reads.length;
+  assert.equal(r.tracked(USER), false);
+  assert.equal(r.cursor(USER), null);
+  assert.equal(logs.filter((l) => l.includes('account removed')).length, 1);
+  assert.equal(logs.some((l) => l.includes('read failed')), false);
+  t += 2000; await r.tick(); t += 2000; await r.tick();
+  assert.equal(reads.length, k, 'no read after the 410');
+  // They authenticate again (the account exists): a request start reads afresh.
+  gone = false;
+  r.touch(USER);
+  await r.poll(USER);
+  assert.ok(reads.length > k);
+  assert.equal(r.tracked(USER), true);
+  r.stop();
+});
+
 test('asked again while a read runs, it reads once more after (a save landing mid-read is not missed)', async () => {
   let release;
   const gate = new Promise((res) => { release = res; });
