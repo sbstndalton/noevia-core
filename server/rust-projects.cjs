@@ -73,6 +73,8 @@ const OWNED_ROUTES = Object.freeze(new Set([
   'POST /api/freechats',
   'GET /api/chats/{chatId}/context',
   'POST /api/chats/{chatId}/context',
+  'GET /api/chats/{chatId}/context-window',
+  'GET /api/chats/{chatId}/history',
 ]));
 
 // OWNED_ROUTES as Node's own handlers matched them (one path segment per parameter).
@@ -82,6 +84,8 @@ const OWNED_ROUTE_PATTERNS = Object.freeze([
   [/^\/api\/projects\/[^/]+\/chats$/, ['GET', 'POST']],
   [/^\/api\/freechats$/, ['GET', 'POST']],
   [/^\/api\/chats\/[^/]+\/context$/, ['GET', 'POST']],
+  [/^\/api\/chats\/[^/]+\/context-window$/, ['GET']],
+  [/^\/api\/chats\/[^/]+\/history$/, ['GET']],
 ]);
 
 const ROUTE_REFUSAL = Object.freeze({ error: 'This route is served by the Rust front.', code: 'RUST_PROJECTS_OWNED' });
