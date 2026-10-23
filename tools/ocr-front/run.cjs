@@ -210,7 +210,7 @@ async function main() {
     assert.equal(textLayer.status, 0, 'Poppler is required');
     assert.equal(textLayer.stdout.trim(), '', 'synthetic scan must have no native text layer');
     const workerPort = await port(); const workerBase = `http://127.0.0.1:${workerPort}`;
-    native = child(worker, [], { PATH: process.env.PATH, NOEVIA_OCR_IMPL: 'rust', NOEVIA_OCR_LISTEN: `127.0.0.1:${workerPort}` });
+    native = child(worker, [], { PATH: process.env.PATH, NOEVIA_OCR_LISTEN: `127.0.0.1:${workerPort}` });
     await ready(workerBase, '/health', native);
     // Run controls first so a later front forwarding gap still records proof
     // that failures are detected; any failed positive keeps the job red.
