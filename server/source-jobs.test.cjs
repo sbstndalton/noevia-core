@@ -88,6 +88,62 @@ test('two lost start replies are reconciled after store recovery without a Node 
   assert.deepEqual([...committed.values()].map((j) => j.state).sort(), ['completed', 'interrupted']);
 });
 
+test('lost terminal replies reconcile without a Node restart and preserve any committed result', async () => {
+  const crypto = require('node:crypto');
+  for (const committedTerminal of [false, true]) {
+    const jobs = fresh(), rows = new Map(), tombstones = new Set();
+    const user = 'finish-recovery-' + committedTerminal;
+    let currentOwner = null, finishCalls = 0, abandonNetwork = false;
+    const reply = (body, status = 200) => new Response(JSON.stringify(body), { status });
+    const fetchImpl = async (url, init) => {
+      const op = url.split('/').pop(), body = JSON.parse(init.body);
+      if (op === 'recover') { currentOwner = body.owner; return reply({ count: 0 }); }
+      if (['start', 'finish', 'abandon'].includes(op) && body.owner !== currentOwner) return reply({}, 409);
+      if (op === 'start') {
+        if (tombstones.has(body.request)) return reply({}, 409);
+        if ([...rows.values()].filter((row) => row.state === 'running').length >= 2) return reply({}, 429);
+        const row = { id: crypto.randomUUID(), run: crypto.randomUUID(), request: body.request, state: 'running' };
+        rows.set(row.request, row);
+        return reply({ id: row.id, run: row.run });
+      }
+      if (op === 'finish') {
+        finishCalls += 1;
+        const row = [...rows.values()].find((item) => item.id === body.id);
+        if (committedTerminal && body.ok && row.state === 'running') {
+          row.state = 'completed';
+          row.result = body.result;
+        }
+        throw Error('terminal reply lost after an uncertain write');
+      }
+      if (op === 'abandon') {
+        if (!abandonNetwork) throw Error('store temporarily unavailable');
+        tombstones.add(body.request);
+        const row = rows.get(body.request);
+        if (row?.state === 'running') row.state = 'interrupted';
+        return reply({ ok: true });
+      }
+      return reply({ ok: true });
+    };
+    const client = require('./project-store-client.cjs').createClient({ port: 1, token: 'synthetic-source-secret-0123456789', fetchImpl });
+    const ws = { userId: user, sourceJobs: client.sourceJobsFor(user) };
+    for (let i = 0; i < 2; i++) await jobs.start(ws, 'p1', async () => ({ status: 200, body: { index: i } }));
+    for (let i = 0; i < 100 && finishCalls < 8; i++) await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(finishCalls, 8, 'both true and fallback terminal writes exhausted their exact retries');
+    assert.equal([...rows.values()].filter((row) => row.state === 'running').length, committedTerminal ? 0 : 2);
+    abandonNetwork = true;
+    await jobs.start(ws, 'p1', () => new Promise(() => {}));
+    assert.equal(tombstones.size, 2, 'later source start drains both uncertain terminal requests');
+    assert.deepEqual([...rows.values()].slice(0, 2).map((row) => row.state),
+      committedTerminal ? ['completed', 'completed'] : ['interrupted', 'interrupted']);
+    if (committedTerminal) assert.deepEqual([...rows.values()].slice(0, 2).map((row) => row.result?.status), [200, 200]);
+    const old = [...rows.values()][0];
+    await assert.rejects(client.sourceJobsFor(user).start({ owner: currentOwner }, 'p1', old.request), (e) => e.status === 409,
+      'a tombstoned request cannot start a stale executor');
+    await assert.rejects(client.sourceJobsFor(user).abandon({ owner: crypto.randomUUID() }, old.request), (e) => e.status === 409,
+      'an old owner cannot reconcile a newer process');
+  }
+});
+
 test('a poll after a restart reports interruption instead of a missing job', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'noevia-source-restart-'));
   try {

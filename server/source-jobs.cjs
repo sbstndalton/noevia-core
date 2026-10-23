@@ -118,7 +118,14 @@ async function start(workspace, projectId, operation, { name = null } = {}) {
       const failure = Object.assign(new Error('Source processing failed; refresh or re-upload to retry.'),
         { result: { status: progressFailure ? 503 : (err?.status || 500) } });
       try { workspace.assertActive?.(); await jobs.finish(OWNER, id, run, false, failure.result, failure.message); }
-      catch { /* a refused or uncertain finish is recovered on the next process start */ }
+      catch {
+        // Both terminal answers may be lost while this Node stays alive. Reconcile by the
+        // original request key: Rust leaves a committed terminal row intact, or interrupts
+        // an uncommitted active row and frees its source slot once the store returns.
+        queueAbandon(key, jobs, request);
+        Promise.resolve().then(() => drainAbandons(key)).finally(scheduleCleanup).catch(() => undefined);
+        scheduleCleanup();
+      }
     }
   })();
   if (typeof name === 'string' && name) {
