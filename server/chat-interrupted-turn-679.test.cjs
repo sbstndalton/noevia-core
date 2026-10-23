@@ -291,6 +291,27 @@ test('the interrupted reply goes through the transcript store and fails closed w
   assert.equal(fs.readFileSync(unavailable.a.historyPath('chat-679'), 'utf8'), before, 'no local fallback write');
   assert.ok(warned.some((w) => /could not keep an interrupted reply/.test(w)), warned.join('\n'));
   assert.deepEqual(fs.readdirSync(unavailable.a.dir).filter((n) => n.endsWith('.tmp')), [], 'no temp file left');
+  // S1: the transcript did not take the reply, so its partial is kept (unmarked) as the only copy.
+  const { partialFor, readPartial } = require('./chat-partial.cjs');
+  const kept = partialFor(unavailable.a.dir, 'chat-679');
+  assert.equal(kept?.content, 'Steam', JSON.stringify(kept));
+  assert.equal(kept.interrupted, true);
+  assert.equal('running' in readPartial(unavailable.a.dir, 'chat-679'), false, 'no running marker after the turn ended');
+
+  // S1: the store has no user message to append after ('no-user-message'): the partial is kept too.
+  const missing = harness(t, { workspaces: (_n, a) => ({ ...a, transcripts: { appendIfLast: async () => 'no-user-message' } }) });
+  t.mock.method(console, 'log', () => {});
+  missing.state.turns.push([say('Steam rises'), DISCONNECT]);
+  await missing.send({ message: USER.content });
+  assert.equal(partialFor(missing.a.dir, 'chat-679')?.content, 'Steam rises');
+  assert.equal('running' in readPartial(missing.a.dir, 'chat-679'), false);
+
+  // The success path still clears it.
+  const fine = harness(t);
+  store(fine.a, 'chat-679', [USER]);
+  fine.state.turns.push([say('Steam'), DISCONNECT]);
+  await fine.send({ message: USER.content });
+  assert.equal(partialFor(fine.a.dir, 'chat-679'), null, 'a kept reply clears its partial');
 
   const ws = workspaceAt(fs.mkdtempSync(path.join(os.tmpdir(), 'noevia-679-store-')), 'synthetic-user-c');
   t.after(() => fs.rmSync(ws.dir, { recursive: true, force: true }));

@@ -89,8 +89,13 @@ function endPartial(dir, chatId) {
   const value = readPartial(dir, chatId);
   if (!value || !('running' in value)) return 'kept';
   const { running: _running, ...ended } = value;
-  const text = JSON.stringify(ended);
+  return writeUnmarked(file, JSON.stringify(ended));
+}
+
+// Writes a partial without the running marker: atomically when the folder allows it, else in place.
+function writeUnmarked(file, text) {
   try {
+    fs.mkdirSync(path.dirname(file), { recursive: true });
     const tmp = `${file}.${process.pid}.tmp`;
     try {
       fs.writeFileSync(tmp, text);
@@ -134,11 +139,18 @@ function startPartialSaves({ dir, chatId, record, everyMs = PARTIAL_SAVE_MS }) {
   const timer = setInterval(save, everyMs);
   timer.unref?.();
   return {
-    finish() {
+    // `keep`: the reply's final partial entry when the transcript did not take it (store failure,
+    // no user message to append after). The file is then rewritten with it, without the running
+    // marker, so the reply is still offered as an interrupted turn instead of lost.
+    finish({ keep } = {}) {
       if (done) return;
       done = true;
       clearInterval(timer);
       active.delete(id);
+      if (keep) {
+        const outcome = writeUnmarked(fileFor(dir, id), JSON.stringify({ ...bounded(keep), interrupted: true }));
+        if (outcome === 'unmarked') return;
+      }
       endPartial(dir, id);
     },
   };

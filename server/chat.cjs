@@ -337,15 +337,22 @@ function createChatHandler({
       preparation?.finish();
       // #679: the client went away mid-reply (reload, closed tab). Keep the reply as stopped, with
       // any write that ran, after the user message the client saved as the turn started.
+      let keep;
       if (execution.record && execution.aborted?.()) {
+        const entry = execution.record.partialEntry() || execution.record.assistantEntry();
         try {
           const outcome = await require('./chat-interrupted-turn.cjs').saveInterruptedTurn({ workspace: execution.workspace, chatId: body.chatId,
-            message: body.message, entry: execution.record.partialEntry() || execution.record.assistantEntry() });
+            message: body.message, entry });
           if (outcome !== 'saved' && outcome !== 'not-last') console.log(`[chat] interrupted reply not kept: ${outcome}`);
-        } catch (error) { console.warn('[chat] could not keep an interrupted reply:', error?.message || error); }
+          if (outcome === 'no-user-message') keep = entry;
+        } catch (error) {
+          console.warn('[chat] could not keep an interrupted reply:', error?.message || error);
+          keep = entry;
+        }
       }
       // #1507: the reply has ended (completed, failed, or kept above), so its saved partial is cleared.
-      execution.partials?.finish();
+      // A reply the transcript did not take keeps its partial (unmarked) as the only copy.
+      execution.partials?.finish(keep ? { keep } : undefined);
       // A chat deleted while this reply ran leaves no context state (summaries hold conversation text).
       const id=typeof body?.chatId==='string'?require('./chat-lists.cjs').safeChatId(body.chatId):null;
       try{const dir=currentWorkspace().dir;if(id&&require('./chat-lists.cjs').readTombstones(dir).has(id))require('./chat-context.cjs').remove(dir,id);}catch{/* best effort */}
