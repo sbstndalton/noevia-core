@@ -95,20 +95,11 @@ test('transcripts carry a revision; a stale save gets the current copy back; a d
   assert.equal(await f.call('PUT', '/api/chats/c1/history'), false);
 });
 
-test('the context meter reads null when nothing was recorded', async () => {
+test('#1071: a chat\'s context meter is no longer answered here (the Rust front owns it)', async () => {
   const f = fixture();
-  await f.call('GET', '/api/chats/c1/context-window');
-  assert.deepEqual(f.sent.pop(), { status: 200, body: { meter: null } });
-});
-
-test('a deleted chat reads the same as one that never existed, even with state written back late (#554)', async () => {
-  const f = fixture();
-  require('../chat-context.cjs').save(f.dir, 'c-gone', { meter: { model: 'synthetic', used: 5 } });
-  await f.call('GET', '/api/chats/c-gone/context-window');
-  assert.equal(f.sent.pop().body.meter.used, 5);
-  require('../chat-lists.cjs').addTombstone(f.dir, 'c-gone');
-  await f.call('GET', '/api/chats/c-gone/context-window');
-  assert.deepEqual(f.sent.pop(), { status: 200, body: { meter: null } });
+  require('../chat-context.cjs').save(f.dir, 'c1', { meter: { model: 'synthetic', used: 5 } });
+  assert.equal(await f.call('GET', '/api/chats/c1/context-window'), false);
+  assert.equal(f.sent.length, 0);
 });
 
 test('POST /api/chats/:id/move validates, scopes to the caller and maps the store outcome (#738)', async () => {

@@ -2,7 +2,6 @@
 // The chat lists and transcripts (the store is projects.cjs):
 //   GET  /api/workspace                    the projects and free chats, chats[] sanitized, after the
 //                                          delete-old-chats sweep has had its hourly chance to run
-//   GET  /api/chats/:id/context-window     the last context meter recorded for a chat
 //   GET  /api/chats/:id/export             one chat as a Markdown file (#1471)
 //   GET  /api/chats/search?q=              the chat ids whose message text holds q (#1450)
 //   GET/POST /api/freechats                the free-chat metas, merged against tombstones
@@ -94,14 +93,8 @@ function createChatListRoutes({ json, readBody, currentWorkspace, PROJECTS, FREE
       });
     }
 
-    const windowMatch=p.match(/^\/api\/chats\/([^/]+)\/context-window$/);
-    if(windowMatch && req.method==='GET') {
-      const dir=currentWorkspace().dir,lists=require('../chat-lists.cjs'),id=decodeChatId(windowMatch[1]);
-      if(id===null) return badChatId(res);
-      // A deleted chat answers exactly like one that never existed (#554), even if state was written back late.
-      if(lists.readTombstones(dir).has(lists.safeChatId(id)||id)) return json(res,200,{meter:null});
-      return json(res,200,{meter:require('../chat-context.cjs').read(dir,id).meter||null});
-    }
+    // GET /api/chats/:id/context-window (a chat's last context meter) is the Rust front's
+    // (sbstndalton/noevia#1071): index.cjs refuses it before this mount (rust-projects.cjs refuseOwnedRoute).
 
     // #1471: one chat as a Markdown file, from the same writer as the conversation export (chat-export.cjs).
     // Only a chat in this person's own lists can be read; a deleted or unknown id answers 404.
