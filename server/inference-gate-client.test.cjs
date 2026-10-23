@@ -4,7 +4,7 @@
 // Synthetic model ids and tokens only; no model, no router, no request content.
 const test = require('node:test'), assert = require('node:assert/strict');
 const http = require('node:http');
-const { createGateClient, GateError, LEASE_HEADER } = require('./inference-gate-client.cjs');
+const { createGateClient, GateError, LEASE_HEADER, adminTokenWarning } = require('./inference-gate-client.cjs');
 
 const TOKEN_A = 'a'.repeat(32), TOKEN_B = 'b'.repeat(32);
 const gateError = (code, message, retryable) => JSON.stringify({ error: { code, message, type: 'gate_error', retryable } });
@@ -145,4 +145,148 @@ test('admin headers only with a configured token', () => {
   assert.equal(admin.hasAdmin(), true);
   assert.equal(admin.refusal(409, JSON.parse(gateError('model_in_use', 'busy', true))).code, 'model_in_use');
   assert.equal(admin.refusal(409, { error: 'busy' }), null, 'not the gate\'s shape');
+});
+
+// A synthetic gate in memory that ends a lease idle for longer than its limit (the test ends them by hand), so
+// the real client can be driven through a tool turn with long pauses. No network.
+function memoryGate({ refuseGrantsAfter = Infinity } = {}) {
+  const live = new Set(), grants = [], released = [], requests = [];
+  let issued = 0;
+  const sseBody = (text) => new Response(text, { status: 200, headers: { 'content-type': 'text/event-stream' } });
+  const fetch = async (url, init = {}) => {
+    const u = new URL(url);
+    if (u.pathname === '/gate/v1/leases' && init.method === 'POST') {
+      if (grants.length >= refuseGrantsAfter) return sseBody(`event: error\ndata: ${JSON.stringify({ code: 'inference_queue_full', message: 'Too many requests are waiting for the local model. Try again shortly.', retryable: true })}\n\n`);
+      const token = (++issued).toString(16).padStart(32, '0'); live.add(token); grants.push(token);
+      return sseBody(`event: granted\ndata: ${JSON.stringify({ lease: token, model: 'route-smart', waited_ms: 0 })}\n\n`);
+    }
+    if (u.pathname.startsWith('/gate/v1/leases/') && init.method === 'DELETE') { const token = u.pathname.split('/').pop(); live.delete(token); released.push(token); return new Response(null, { status: 204 }); }
+    const token = new Headers(init.headers).get(LEASE_HEADER);
+    requests.push(token);
+    if (!live.has(token)) return new Response(gateError('lease_unknown', 'The turn on the local model has ended. Start the request again.', true), { status: 409, headers: { 'x-noevia-gate-refusal': 'lease_unknown', 'content-type': 'application/json' } });
+    return new Response('{}', { status: 200 });
+  };
+  return { fetch, live, grants, released, requests, idle: () => live.clear() };
+}
+const GATE_URL = 'http://gate.invalid:8080';
+const completion = (send) => send(`${GATE_URL}/v1/chat/completions`, { method: 'POST', body: '{}' });
+
+test('a tool turn survives two idle gaps longer than the gate lease limit: every round is answered, a new lease for each gap', async () => {
+  const gate = memoryGate();
+  const client = createGateClient({ baseUrl: GATE_URL, fetch: gate.fetch, log: () => {} });
+  const lease = await client.acquire('route-smart');
+  const send = lease.fetch(gate.fetch);
+  assert.equal((await completion(send)).status, 200, 'round 1');
+  gate.idle(); // a long approval or a slow tool between rounds
+  assert.equal((await completion(send)).status, 200, 'round 2, after the first lapse');
+  gate.idle();
+  assert.equal((await completion(send)).status, 200, 'round 3, after the second lapse');
+  gate.idle();
+  assert.equal((await completion(send)).status, 200, 'round 4, after the third lapse');
+  assert.equal(gate.grants.length, 4, 'one lease at the start, one more per lapse');
+  assert.equal(lease.token, gate.grants[3]);
+  await lease.release();
+  assert.deepEqual(gate.released, [gate.grants[3]], 'the lease in hand at the end is the one given back');
+});
+
+test('requests that hit the same ended lease together share one renewal; a later one finds the lease renewed', async () => {
+  const gate = memoryGate();
+  const client = createGateClient({ baseUrl: GATE_URL, fetch: gate.fetch, log: () => {} });
+  const lease = await client.acquire('route-smart');
+  const send = lease.fetch(gate.fetch);
+  gate.idle();
+  const statuses = (await Promise.all([completion(send), completion(send), completion(send)])).map((r) => r.status);
+  assert.deepEqual(statuses, [200, 200, 200]);
+  assert.equal(gate.grants.length, 2, 'one renewal for all three');
+  gate.idle();
+  assert.deepEqual((await Promise.all([completion(send), completion(send)])).map((r) => r.status), [200, 200]);
+  assert.equal(gate.grants.length, 3, 'one renewal for the second lapse');
+});
+
+test('a renewal the gate refuses ends the request with its refusal; no loop, and the next request may try again', async () => {
+  const gate = memoryGate({ refuseGrantsAfter: 1 });
+  const client = createGateClient({ baseUrl: GATE_URL, fetch: gate.fetch, log: () => {} });
+  const lease = await client.acquire('route-smart');
+  const send = lease.fetch(gate.fetch);
+  assert.equal((await completion(send)).status, 200);
+  gate.idle();
+  const before = gate.requests.length;
+  await assert.rejects(completion(send), (e) => e instanceof GateError && e.code === 'inference_queue_full' && e.retryable === true);
+  assert.equal(gate.requests.length, before + 1, 'the request was sent once, never again after the refused renewal');
+  assert.equal(gate.grants.length, 1, 'one lease was ever granted; the refused renewal is not a lease');
+  await assert.rejects(completion(send), (e) => e.code === 'inference_queue_full', 'a later request asks again and is refused again');
+  await lease.release();
+});
+
+test('a request is sent again once only: a lease still unknown after its renewal is passed on, not renewed again', async () => {
+  let grants = 0;
+  const seen = [];
+  const baseFetch = async (url, init = {}) => {
+    const path = new URL(url).pathname;
+    if (path === '/gate/v1/leases') return new Response(`event: granted\ndata: ${JSON.stringify({ lease: (++grants).toString(16).padStart(32, '0') })}\n\n`, { status: 200, headers: { 'content-type': 'text/event-stream' } });
+    if (init.method === 'DELETE') return new Response(null, { status: 204 });
+    seen.push(new Headers(init.headers).get(LEASE_HEADER));
+    return new Response(gateError('lease_unknown', 'ended', true), { status: 409, headers: { 'x-noevia-gate-refusal': 'lease_unknown' } });
+  };
+  const client = createGateClient({ baseUrl: GATE_URL, fetch: baseFetch, log: () => {} });
+  const lease = await client.acquire('route-smart');
+  const r = await completion(lease.fetch(baseFetch));
+  assert.equal(r.status, 409);
+  assert.equal(seen.length, 2, 'sent, then sent once more');
+  assert.equal(grants, 2, 'one renewal');
+});
+
+test('stopped at the moment of the grant: the lease is given back and the stop reason is thrown', async () => {
+  const gate = memoryGate();
+  const controller = new AbortController();
+  const grantThenStop = async (url, init) => { const r = await gate.fetch(url, init); if (init?.method === 'POST') controller.abort(new Error('stopped by the user')); return r; };
+  const client = createGateClient({ baseUrl: GATE_URL, fetch: grantThenStop, log: () => {} });
+  await assert.rejects(client.acquire('route-smart', { signal: controller.signal }), /stopped by the user/);
+  assert.equal(gate.grants.length, 1);
+  assert.deepEqual(gate.released, gate.grants, 'the lease that arrived after the stop was released');
+  assert.equal(client.waiting(), 0);
+});
+
+test('releaseAll gives back every lease still held, once, and does not wait on a gate that does not answer', async () => {
+  const gate = memoryGate();
+  const client = createGateClient({ baseUrl: GATE_URL, fetch: gate.fetch, log: () => {} });
+  const a = await client.acquire('route-smart'), b = await client.acquire('route-code');
+  await b.release();
+  assert.equal(await client.releaseAll(), 1);
+  assert.deepEqual(gate.released.sort(), [a.token, b.token].sort());
+  assert.equal(await client.releaseAll(), 0, 'nothing is left to give back');
+  let calls = 0;
+  const silent = async (url, init = {}) => {
+    if (init.method === 'DELETE') { calls++; return new Promise(() => {}); }
+    return gate.fetch(url, init);
+  };
+  const stuck = createGateClient({ baseUrl: GATE_URL, fetch: silent, log: () => {} });
+  await stuck.acquire('route-smart');
+  const started = Date.now();
+  assert.equal(await stuck.releaseAll({ timeoutMs: 50 }), 1);
+  assert.equal(calls, 1);
+  assert.ok(Date.now() - started < 2000, 'bounded by the timeout');
+});
+
+test('a request to another address than the gate goes without a lease, said once per address', async () => {
+  const lines = [], sent = [];
+  const gate = memoryGate();
+  const client = createGateClient({ baseUrl: GATE_URL, fetch: gate.fetch, log: (l) => lines.push(l) });
+  const lease = await client.acquire('route-smart');
+  const send = lease.fetch(async (url, init) => { sent.push({ url, init }); return new Response('{}'); });
+  await send('http://other.invalid:9000/v1/chat/completions?x=secret', { method: 'POST', body: '{}' });
+  await send('http://other.invalid:9000/v1/models', { method: 'POST', body: '{}' });
+  await send('http://third.invalid:9000/v1/models', { method: 'POST', body: '{}' });
+  assert.equal(sent.length, 3);
+  const notes = lines.filter((l) => l.includes('lease-not-attached'));
+  assert.equal(notes.length, 2, 'once for each address');
+  assert.ok(notes.every((l) => !l.includes('secret') && !l.includes('/v1/')), 'the address only: no path, no query');
+});
+
+test('the warning for a missing admin token names the key, says what stops working, and holds no value', () => {
+  const text = adminTokenWarning();
+  assert.match(text, /INFERENCE_GATE_ADMIN_TOKEN is not set/);
+  assert.match(text, /memory watchdog/);
+  assert.match(text, /unload anyway/);
+  assert.equal(/[0-9a-f]{16,}/i.test(text), false);
 });

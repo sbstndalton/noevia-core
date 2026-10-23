@@ -822,7 +822,7 @@ function createChatHandler({
         if (onMachine && !stageTimeout.aborted) describeUnreachable = chatMachines.connectError(onMachine, err);
         console.warn(`[vision] describe failed: ${stageTimeout.aborted ? `no description within ${VISION_STAGE_TIMEOUT_MS / 1000} s` : String((err && err.message) || err)}`);
         return null;
-      } finally { void stageLease?.release(); }
+      } finally { await stageLease?.release(); }
     };
 
     // A project's image sources ride along with the latest user turn, as image
@@ -1541,7 +1541,7 @@ function createChatHandler({
               catch (err) { console.warn(`[vision] ${visionModel} not admitted for a caption: ${String(err?.code || err?.status || 'error')}`); return null; }
             }
             let bytes;
-            try { bytes = image.bytes(); } catch { void captionLease?.release(); return null; }
+            try { bytes = image.bytes(); } catch { await captionLease?.release(); return null; }
             // #1880: a caption on the Vision role's machine counts as a turn there while it runs.
             const releaseCaption = captionRemote && typeof chatMachines?.beginTurn === 'function' ? chatMachines.beginTurn(captionRemote.machine.id) : () => {};
             try {
@@ -1558,7 +1558,7 @@ function createChatHandler({
               if (!text || out?.choices?.[0]?.finish_reason === 'length') return null;
               return { caption: text, model: visionModel };
             } catch (err) { console.warn(`[vision] caption failed: ${String((err && err.message) || err)}`); return null; }
-            finally { releaseCaption(); void captionLease?.release(); }
+            finally { releaseCaption(); await captionLease?.release(); }
           },
         });
       };
@@ -1738,7 +1738,8 @@ function createChatHandler({
     const notApprovedResults = new Set(), notRunResults = new Set();
     let paused = false;
     let prepared,limit,limitSource,summarizeContext,requestStartedAt=Date.now();
-    let turnLease=null;
+    let turnLease=null,turnEnded=false;
+    const endTurn=()=>{turnEnded=true;if(turnLease)void turnLease.release();};
     try {
       // #1863: a pre-load for another model (the turn moved after all) is not needed; one for this model is
       // awaited here with the usual loading status.
@@ -1754,15 +1755,18 @@ function createChatHandler({
       // and no lease is using it, so no other chat's answer is cut. Every request of the turn (each round, retry,
       // compaction and the title) carries the lease, so the model stays between them. Released when the turn ends.
       if(provider.id===DEFAULT_PROVIDER_ID&&typeof modelManager.acquireLease==='function'){
+        // Attached before the wait: a stop that lands as the lease is granted must still find something to release it.
+        res.once('finish',endTurn);res.once('close',endTurn);
         turnLease=await modelManager.acquireLease(model,{signal:chatSignal.signal,onQueued:({position,waitedMs})=>{
           const seconds=Math.round(waitedMs/1000);
           send({type:'status',text:context.waitingStatus(model,routedRole||null,position,seconds),id:'waitingForModel',
             detail:{model,...(routedRole?{role:routedRole}:{}),position,waitedSeconds:seconds}});
         }});
         if(turnLease){
-          const lease=turnLease,end=()=>{void lease.release();};
-          res.once('finish',end);res.once('close',end);
-          providerFetch=lease.fetch(providerFetch);
+          // The response may have ended while the grant was on its way (Stop at that moment): the listeners above
+          // ran with no lease to give back, so it is given back here and the turn ends as a stopped one.
+          if(turnEnded){await turnLease.release();throw chatSignal.signal.reason||Object.assign(Error('The request was stopped.'),{name:'AbortError'});}
+          providerFetch=turnLease.fetch(providerFetch);
         }
       }
       ({limit,limitSource}=await context.resolveRuntimeLimit({

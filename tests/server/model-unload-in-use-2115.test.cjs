@@ -25,10 +25,10 @@ function routes(manager, role = 'admin') {
       servedCatalogue: async () => [], modelsInstalled: async () => [], modelsInstalledNow: async () => [], deriveUserModelName: (c) => c,
       lastLoadedModel: () => null, clearLastLoadedModel: () => {}, clearRoleReferences: () => [] },
   });
-  const call = (p, body) => {
+  const call = (p, body, res = { setHeader() {} }) => {
     const req = Readable.from([Buffer.from(JSON.stringify(body))]);
     req.method = 'POST';
-    return handle(req, { setHeader() {} }, { path: p, authn: { user: { id: 'u1', role } }, url: new URL('http://localhost' + p) });
+    return handle(req, res, { path: p, authn: { user: { id: 'u1', role } }, url: new URL('http://localhost' + p) });
   };
   return { call, sent };
 }
@@ -74,4 +74,27 @@ test('a load the gate or the budget refuses keeps its status, code and text', as
   const g = routes({ load: async () => ({ ok: false, status: 500, body: { error: 'synthetic' } }) });
   await g.call('/api/models/load', { name: 'route-smart' });
   assert.deepEqual(g.sent.pop(), { status: 502, body: { error: 'load failed: 500' } });
+});
+
+test('a Models page load that waits for the gate is cancelled when the request is closed: nothing is answered', async () => {
+  const { EventEmitter } = require('node:events');
+  let seen = null;
+  const f = routes({ load: (name, options, signal) => new Promise((resolve, reject) => { seen = signal; signal.addEventListener('abort', () => reject(signal.reason), { once: true }); }) });
+  const res = Object.assign(new EventEmitter(), { setHeader() {}, writableEnded: false });
+  const pending = f.call('/api/models/load', { name: 'route-smart' }, res);
+  for (let i = 0; i < 50 && !seen; i++) await new Promise((r) => setImmediate(r));
+  assert.ok(seen, 'the load got the abort signal of the request');
+  assert.equal(seen.aborted, false);
+  res.emit('close'); // the admin left before the gate granted the lease
+  await pending;
+  assert.equal(seen.aborted, true, 'the wait ended');
+  assert.deepEqual(f.sent, [], 'no answer to a closed request');
+  assert.equal(res.listenerCount('close'), 0, 'the listener is gone');
+  // A request that is answered normally is not aborted by the close that follows.
+  const g = routes({ load: async (name, options, signal) => { seen = signal; return { ok: true }; } });
+  const done = Object.assign(new EventEmitter(), { setHeader() {}, writableEnded: false });
+  await g.call('/api/models/load', { name: 'route-smart' }, done);
+  done.writableEnded = true; done.emit('close');
+  assert.equal(seen.aborted, false);
+  assert.deepEqual(g.sent.pop(), { status: 200, body: { ok: true } });
 });

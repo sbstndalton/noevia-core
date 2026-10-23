@@ -228,7 +228,6 @@ test('noevia#2115: a load waits for its own lease, carries it and gives it back;
  assert.ok(!calls.some(c=>c.route==='/models/unload'),'the switch is the gate\'s; nothing here unloads the other model');
  assert.deepEqual(gate.log.acquired,['chat-b']);assert.deepEqual(gate.log.released,['chat-b'],'the load\'s own lease is given back');
  assert.equal(manager.inferenceBusy(0),false);
- assert.equal(typeof manager.makeRoomFor,'undefined');assert.equal(typeof manager.withAdmission,'undefined');
 });
 
 test('noevia#2115: a turn\'s explicit load runs under the turn\'s lease and leaves it held',async()=>{
@@ -288,8 +287,30 @@ test('noevia#2115: the gate\'s refusal to unload a model in use reaches the call
  assert.deepEqual(adminCalls.at(-1).body,{model:'alpha',force:true});assert.equal(adminCalls.at(-1).admin,'synthetic-admin-0001');
 });
 
-test('noevia#2115: the admission queue, the eviction and their helpers are deleted from the manager',()=>{
- const source=require('node:fs').readFileSync(require.resolve('./llamacpp-manager.cjs'),'utf8');
- for(const gone of ['makeRoomFor','makeRoomForUnlocked','settleLoadingEvictee','withAdmission','admissionsPending','still unloading after','could not be unloaded'])
-  assert.equal(source.includes(gone),false,gone);
+test('noevia#2115: nothing here evicts: a switch with another model loaded sends no unload, and a refused load disturbs nothing',async()=>{
+ // The deleted local eviction unloaded the loaded model to make room. Now the router sees a load of the new model
+ // under a lease and nothing else; the gate decides when the old one goes.
+ const gate=fakeGate(),calls=[],state={'chat-a':'loaded','chat-b':'unloaded','chat-big':'unloaded'};
+ const manager=createModelManager({gate,kind:'llamacpp',baseUrl:'http://synthetic',inferenceBudget:{budgetGib:()=>64},fetchJson:routerFake(state,calls)});
+ manager.quarantine('chat-big',64);
+ const refused=await manager.load('chat-big');
+ assert.equal(refused.ok,false);assert.equal(refused.status,409);assert.equal(refused.body.code,'inference_budget_unloaded');
+ await assert.rejects(manager.acquireLease('chat-big'),e=>e.status===409&&e.code==='inference_budget_unloaded');
+ assert.deepEqual(gate.log.acquired,[],'a model over the budget never takes a lease');
+ assert.deepEqual(calls.filter(c=>c.route==='/models/load'||c.route==='/models/unload'),[],'nothing was loaded or unloaded');
+ assert.equal(state['chat-a'],'loaded','the model in use stays');
+ assert.equal((await manager.load('chat-b')).ok,true);
+ assert.deepEqual(calls.filter(c=>c.route==='/models/unload'),[],'a switch asks the router to load only');
+ assert.deepEqual(calls.filter(c=>c.route==='/models/load').map(c=>c.body.model),['chat-b']);
+});
+
+test('noevia#2115: a shutdown gives back the gate leases still held, with the options it was given',async()=>{
+ const asked=[];
+ const gate={...fakeGate(),releaseAll:async options=>{asked.push(options);return 2;}};
+ const manager=createModelManager({gate,kind:'llamacpp',baseUrl:'http://synthetic',fetchJson:routerFake({},[])});
+ assert.equal(await manager.releaseLeases({timeoutMs:2000}),2);
+ assert.deepEqual(asked,[{timeoutMs:2000}]);
+ // A gate without the call (a test double) has nothing to give back.
+ const bare=createModelManager({gate:fakeGate(),kind:'llamacpp',baseUrl:'http://synthetic',fetchJson:routerFake({},[])});
+ assert.equal(await bare.releaseLeases(),0);
 });

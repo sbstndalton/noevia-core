@@ -747,6 +747,8 @@ function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloa
       ? mutate(()=>forcedUnload(model, 60000))
       : Promise.resolve({ ok: false, status: 403, body: { error: 'Unloading a model in use is not set up on this server.', code: 'admin_required' } }),
     gateAdmin: () => gateClient.hasAdmin(),
+    // A shutdown: every lease still held is given back (best effort; the gate ends the rest by idle time).
+    releaseLeases: options => typeof gateClient.releaseAll === 'function' ? gateClient.releaseAll(options) : Promise.resolve(0),
     // #697 watchdog: unload without waiting behind maintenance; memory is running out. With the admin
     // token it ends a model in use (the gate logs it); without one the gate unloads only an idle model.
     emergencyUnload: model => gateClient.hasAdmin() ? forcedUnload(model, 60000) : post('/models/unload', { model }, 60000),

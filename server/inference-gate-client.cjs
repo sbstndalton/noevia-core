@@ -9,8 +9,9 @@
 // until the lease is `granted`, or an `error`. Every request of the turn then carries the lease in
 // `X-Noevia-Lease`, so the gate never switches the model away between the turn's rounds, retries,
 // compaction and title. The lease is released when the turn ends; the gate also ends it on its own
-// after an idle time. A gate that restarted has forgotten its leases: a request answered 409
-// `lease_unknown` takes a new lease once and is sent again.
+// after an idle time (a turn that waits minutes for an approval or a slow tool loses its lease, and
+// a gate that restarted has forgotten its leases): a request answered 409 `lease_unknown` takes a
+// new lease and is sent again, once per request, however often that happens in one turn.
 //
 // Without a gate in front of the router (a development setup: the router answers the lease request
 // 404 with its own error), turns run without a lease and the router's own queue decides; this is
@@ -81,6 +82,8 @@ function createGateClient({ baseUrl, fetch = (url, init) => globalThis.fetch(url
   const token = typeof adminToken === 'string' && adminToken.trim() ? adminToken.trim() : null;
   let waiting = 0;
   let absentLogged = false;
+  const held = new Set(); // leases not yet given back, for a shutdown
+  const detachedLogged = new Set(); // addresses a lease was not attached to, said once each
 
   /**
    * Waits for a lease on `model`. Resolves to a lease, or to null when no gate is in front of the
@@ -94,7 +97,10 @@ function createGateClient({ baseUrl, fetch = (url, init) => globalThis.fetch(url
     waiting++;
     try {
       const raw = await take(model, { signal, maxWaitMs, onQueued });
-      return raw === null ? null : makeLease(model, raw, { signal, maxWaitMs, onQueued });
+      if (raw === null) return null;
+      // Stopped at the moment of the grant: nobody will use the lease, so give it back at once.
+      if (signal?.aborted) { await release(raw); throw signal.reason; }
+      return makeLease(model, raw, { signal, maxWaitMs, onQueued });
     } finally { waiting--; }
   }
 
@@ -151,7 +157,7 @@ function createGateClient({ baseUrl, fetch = (url, init) => globalThis.fetch(url
   }
 
   function makeLease(model, first, retake) {
-    let current = first, released = false, again = null;
+    let current = first, released = false, renewing = null;
     const lease = {
       model,
       get token() { return current; },
@@ -160,31 +166,55 @@ function createGateClient({ baseUrl, fetch = (url, init) => globalThis.fetch(url
       release: async () => {
         if (released) return;
         released = true;
-        if (again) await again.catch(() => {});
+        held.delete(lease);
+        if (renewing) await renewing.catch(() => {});
         await release(current);
       },
-      /** A new lease after the gate forgot this one (it restarted). Once per lease. */
-      renew: async () => {
+      /**
+       * A new lease after the gate forgot the one a request was sent with (`stale`): it ended while
+       * the turn was idle, or the gate restarted. Callers that hit the same ended lease share one
+       * renewal, and one that finds the lease already renewed gets the new token without another.
+       * Every ended lease may be renewed: this is not limited to once per lease.
+       */
+      renew: async (stale = current) => {
         if (released) throw unavailable();
-        if (!again) again = take(model, retake).then((t) => { if (t) current = t; return t; });
-        return again;
+        if (current !== stale) return current;
+        if (!renewing) {
+          const flight = renewing = take(model, retake)
+            .then((t) => { if (t) current = t; return t; })
+            .finally(() => { if (renewing === flight) renewing = null; });
+        }
+        return renewing;
       },
       /**
-       * `baseFetch` with this lease on every request to the gate (never to another host), sent
-       * again once under a new lease when the gate answers `lease_unknown`.
+       * `baseFetch` with this lease on every request to the gate (never to another host). A request
+       * answered `lease_unknown` takes a new lease and is sent again once; a second refusal, or a
+       * renewal the gate refuses (a GateError), goes back to the caller as it is.
        */
       fetch: (baseFetch) => async (url, init = {}) => {
-        if (!sameOrigin(url)) return baseFetch(url, init);
+        if (!sameOrigin(url)) { noteDetached(url); return baseFetch(url, init); }
+        const sentWith = current;
         const send = () => baseFetch(url, { ...init, headers: withHeader(init.headers, LEASE_HEADER, current) });
         const response = await send();
         if (response.status !== 409 || response.headers?.get?.(REFUSAL_HEADER) !== 'lease_unknown' || released || !replayable(init.body)) return response;
         await response.body?.cancel?.().catch(() => {});
         log(`[inference-gate] ${JSON.stringify({ event: 'lease-renew', model })}`);
-        await lease.renew();
+        await lease.renew(sentWith);
         return send();
       },
     };
+    held.add(lease);
     return lease;
+  }
+
+  // A request that would have carried a lease went to another address than the gate's: the turn runs
+  // without one. Said once per address (the origin only: no path, no query).
+  function noteDetached(url) {
+    let other;
+    try { other = new URL(String(url)).origin; } catch { return; }
+    if (detachedLogged.has(other)) return;
+    detachedLogged.add(other);
+    log(`[inference-gate] ${JSON.stringify({ event: 'lease-not-attached', address: other, reason: 'differs from the gate address' })}`);
   }
 
   function sameOrigin(url) {
@@ -194,6 +224,15 @@ function createGateClient({ baseUrl, fetch = (url, init) => globalThis.fetch(url
 
   return {
     acquire,
+    /** Gives back every lease still held (a shutdown); best effort, bounded by `timeoutMs`. Never throws. */
+    releaseAll: async ({ timeoutMs = 2000 } = {}) => {
+      const open = [...held];
+      if (!open.length) return open.length;
+      let timer;
+      await Promise.race([Promise.allSettled(open.map((l) => l.release())), new Promise((resolve) => { timer = setTimeout(resolve, timeoutMs); })]);
+      clearTimeout(timer);
+      return open.length;
+    },
     /** Leases this process is waiting for now (read-only, for "is the engine busy"). */
     waiting: () => waiting,
     /** The admin header for an unload of a model in use, or null when no admin token is set. */
@@ -218,4 +257,7 @@ function withHeader(headers, name, value) {
 // A body that can be sent a second time unchanged.
 const replayable = (body) => body === undefined || body === null || typeof body === 'string' || body instanceof Uint8Array || body instanceof ArrayBuffer || body instanceof URLSearchParams;
 
-module.exports = { createGateClient, GateError, LEASE_HEADER, ADMIN_HEADER, REFUSAL_HEADER, sseEvents };
+// The boot warning when the gate's admin token is not set (the key name only, never a value).
+const adminTokenWarning = () => '[inference-gate] INFERENCE_GATE_ADMIN_TOKEN is not set: the memory watchdog cannot unload a model that is answering a request, and "unload anyway" on the Models page is unavailable. Set it to the admin token of the gate.';
+
+module.exports = { adminTokenWarning, createGateClient, GateError, LEASE_HEADER, ADMIN_HEADER, REFUSAL_HEADER, sseEvents };

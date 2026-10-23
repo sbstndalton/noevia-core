@@ -258,6 +258,11 @@ if (process.env.MODEL_LOADER_URL) { embeddingService.refresh(); setInterval(() =
 // A re-index under way also covers files indexed meanwhile; with none under way nothing runs.
 rag.onIndexed(() => { if (embeddingConfig.next()) embeddingMigration.kick(); });
 if (embeddingConfig.next()) setTimeout(() => embeddingMigration.kick(), 30000).unref();
+// What runs when the process is told to stop (shutdown-hooks.cjs): the sweeps below, and the inference gate leases
+// further down. One handler runs them all, bounded, and then lets the process end.
+const shutdownHooks = require('./shutdown-hooks.cjs').createShutdownHooks();
+shutdownHooks.install();
+
 // #1726: multimodal RAG (NOEVIA_MULTIMODAL_RAG, off by default). On, the rate-limited media pass embeds
 // every project's images into its own index, starting shortly after boot (the backfill) and again after
 // each source change (projects.cjs) and every half hour (a model switch leaves the new slot without image
@@ -293,11 +298,8 @@ if (embeddingConfig.next()) setTimeout(() => embeddingMigration.kick(), 30000).u
     setTimeout(() => figureSweep.kick(), 60000).unref();
     setInterval(() => figureSweep.kick(), 30 * 60 * 1000).unref();
   }
-  // #1770 review: on shutdown no new document or image is started. The once-listener is gone after it
-  // runs, so the re-sent signal ends the process the default way.
-  for (const signal of ['SIGTERM', 'SIGINT']) {
-    process.once(signal, () => { figureSweep.stop(); mediaBackfill.stop(); process.kill(process.pid, signal); });
-  }
+  // #1770 review: on shutdown no new document or image is started.
+  shutdownHooks.add(() => { figureSweep.stop(); mediaBackfill.stop(); });
 }
 
 // #1868/#1869: long documents gain their text past the 200,000-character head in the search index, and
@@ -387,6 +389,14 @@ const modelManager = createModelManager({
   // noevia#2115: the inference gate's admin token, for an admin's "unload anyway" and the memory watchdog.
   gateAdminToken: process.env.INFERENCE_GATE_ADMIN_TOKEN || null,
 });
+// noevia#2115: leases still held when the process is told to stop are given back (best effort, a short wait); the
+// gate would otherwise end them only after its idle time, holding its queue for that long.
+if (typeof modelManager.releaseLeases === 'function') shutdownHooks.add(() => modelManager.releaseLeases({ timeoutMs: 2000 }));
+// Without the admin token the memory watchdog and "unload anyway" cannot end a model that is answering a request.
+{
+  const warning = typeof modelManager.gateAdmin === 'function' && !modelManager.gateAdmin() ? require('./inference-gate-client.cjs').adminTokenWarning() : null;
+  if (warning) console.warn(warning);
+}
 // #697 runtime safety net: unload the engine's models when measured inference memory stays
 // above the budget by more than INFERENCE_BUDGET_OVERSHOOT_PCT (default 10). Native engine only.
 // noevia#1863: the chat-model idle unload time (admin setting, stored by the model manager).

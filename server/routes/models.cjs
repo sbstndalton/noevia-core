@@ -826,7 +826,15 @@ function createModelRoutes({ servedEmbeddingModels = (target) => require('../rag
           const refusal = refusalOf(forced);
           return refusal ? json(res, refusal.status, { error: refusal.error, code: refusal.code, retryable: refusal.retryable }) : json(res, 502, { error: `unload failed: ${forced.status}` });
         }
-        const r = await modelManager[verb](body.name);
+        // noevia#2115: a load waits in the gate's queue, up to the gate's limit. An admin who closes the page or
+        // cancels leaves that queue and starts no switch: the request's abort signal goes to the load.
+        const gone = new AbortController();
+        const onClose = () => { if (!res.writableEnded) gone.abort(); };
+        res.once?.('close', onClose);
+        let r;
+        try { r = verb === 'load' ? await modelManager.load(body.name, {}, gone.signal) : await modelManager[verb](body.name); }
+        catch (error) { if (gone.signal.aborted) return true; throw error; }
+        finally { res.off?.('close', onClose); }
         if (r.ok) return json(res, 200, { ok: true });
         const refusal = refusalOf(r);
         if (refusal) return json(res, refusal.status, { error: refusal.error, code: refusal.code, retryable: refusal.retryable,

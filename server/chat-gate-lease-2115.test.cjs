@@ -21,10 +21,10 @@ const frame = (f) => Buffer.from('data: ' + JSON.stringify(f) + '\n\n');
 const stream = (...frames) => ({ ok: true, status: 200, body: (async function* () { for (const f of frames) yield frame(f); })() });
 const leaseOf = (init) => { const h = init?.headers || {}; return typeof h.get === 'function' ? h.get('X-Noevia-Lease') : h['X-Noevia-Lease']; };
 
-async function turn(t, { gate = fakeGate(), toolRound = false, history = [], compactOnly = false, titles = true, stopWhileQueued = false, onQueued } = {}) {
+async function turn(t, { gate = fakeGate(), toolRound = false, history = [], compactOnly = false, titles = true, stopWhileQueued = false, stopAtGrant = false, onQueued } = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'noevia-2115-')); t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
   const events = [], requests = [];
-  const res = new EventEmitter(); res.writeHead = () => {}; res.end = () => { res.writableEnded = true; res.emit('finish'); };
+  const res = new EventEmitter(); res.writeHead = () => {}; res.end = () => { res.writableEnded = true; if (!res.destroyed) res.emit('finish'); }; // a destroyed socket never finishes
   res.write = (chunk) => { for (const line of String(chunk).split('\n')) if (line.startsWith('data:')) { try { events.push(JSON.parse(line.slice(5))); } catch { /* not json */ } } };
   const fetch = async (url, init) => {
     const body = JSON.parse(init.body);
@@ -38,7 +38,7 @@ async function turn(t, { gate = fakeGate(), toolRound = false, history = [], com
     enabled: true,
     health: async () => ({ ok: true, body: { all_models_loaded: [{ model_name: MODEL, loaded: true, recipe_options: { ctx_size: 32768 } }] } }),
     inferenceBusy: () => gate.waiting() > 0,
-    acquireLease: (model, options) => gate.acquire(model, { ...options, onQueued: (q) => { options.onQueued?.(q); onQueued?.(q); if (stopWhileQueued) { controller.aborted = true; res.emit('close'); } } }),
+    acquireLease: stopAtGrant ? async (model, options) => { const granted = await gate.acquire(model, options); controller.aborted = true; res.destroyed = true; res.emit('close'); return granted; } : (model, options) => gate.acquire(model, { ...options, onQueued: (q) => { options.onQueued?.(q); onQueued?.(q); if (stopWhileQueued) { controller.aborted = true; res.emit('close'); } } }),
   };
   const { handleChat } = createChatHandler({
     modelManager: manager, reasoningEffort: require('./reasoning-effort.cjs'), authService: { audit() {} }, crypto: require('node:crypto'), path, fs, fetch,
@@ -126,4 +126,11 @@ test('noevia#2115: a provider without a lease (no gate in front of the engine) r
   assert.deepEqual(out.errors, []);
   assert.ok(out.requests.length >= 1);
   for (const r of out.requests) assert.equal(r.lease, null);
+});
+
+test('noevia#2115: Stop at the moment the lease is granted gives the lease back; nothing is sent', async (t) => {
+  const out = await turn(t, { stopAtGrant: true });
+  assert.deepEqual(out.requests, [], 'a stopped turn sends nothing to the engine');
+  assert.deepEqual(out.gate.log.acquired, [MODEL]);
+  assert.deepEqual(out.gate.log.released, [MODEL], 'the lease that arrived after the disconnect was given back');
 });
