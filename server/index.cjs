@@ -961,6 +961,13 @@ const chatBrains = chatBrainLib.createBrainScheduler({
   built: (userId, chatId) => chatVaultMirror.schedule(userId, chatId),
   log: (...args) => console.warn(...args),
 });
+// #2153: transcripts are written by the Rust store alone; its per-user change journal tells Node
+// which chats changed, including history saves Node never sees, so the mirror and brain follow.
+const changeJournal = require('./chat-change-journal.cjs').createChangeJournalReader({
+  read: (userId, after) => PROJECT_STORE.changesRead(userId, after),
+  onChange: require('./chat-change-journal.cjs').scheduleMirrorAndBrain({ chatVaultMirror, chatBrains }),
+  stamp: (userId) => require('./chat-change-journal.cjs').fileStamp(DATA_DIR, userId),
+}).start();
 const chatVaultMirrorRoutes = require('./routes/chat-vault-mirror.cjs').createChatVaultMirrorRoutes({ json, readJson,
   preferences: { get: () => vaultMirrorLib.readPreferences(currentWorkspace().dir), save: (value) => vaultMirrorLib.writePreferences(currentWorkspace().dir, value) },
   available: vaultMirrorAvailable, schedule: chatVaultMirror.schedule, audit: (action, actor, detail) => authService.audit(action, actor, actor, detail) });
@@ -1265,7 +1272,10 @@ async function handleRequestScoped(req, res) {
     if (authn && await chatVaultMirrorRoutes(req, res, { path: p, authn })) return;
     // #741: a successful change to the user's chats nudges their mirror (debounced; a no-op unless opted in).
     const mirrorNudge = authn ? vaultMirrorLib.mirrorTrigger(req.method, p) : null;
-    if (mirrorNudge && typeof res.once === 'function') res.once('finish', () => { if (res.statusCode >= 200 && res.statusCode < 300) { chatVaultMirror.schedule(authn.user.id, mirrorNudge.chatId); if (mirrorNudge.chatId) chatBrains.schedule(authn.user.id, mirrorNudge.chatId); } });
+    // #2153: a history save the change journal covers is scheduled from the journal (read at once), not twice.
+    if (authn) changeJournal.touch(authn.user.id);
+    const nudgeViaJournal = mirrorNudge && require('./chat-change-journal.cjs').journalCovers(changeJournal, req.method, p);
+    if (mirrorNudge && typeof res.once === 'function') res.once('finish', () => { if (res.statusCode >= 200 && res.statusCode < 300) { if (nudgeViaJournal) return void changeJournal.poll(authn.user.id); chatVaultMirror.schedule(authn.user.id, mirrorNudge.chatId); if (mirrorNudge.chatId) chatBrains.schedule(authn.user.id, mirrorNudge.chatId); } });
     if (authn && await exportRoutes(req, res, { path: p, authn })) return;
     if (authn && await importRoutes(req, res, { path: p, authn })) return;
     if (authn && await accountRoutes(req, res, { path: p, authn })) return;

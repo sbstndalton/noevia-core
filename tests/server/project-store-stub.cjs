@@ -38,8 +38,8 @@ function createStubStore(root, { flat = false } = {}) {
     // answers them (the account's directory; flat: `root`).
     historyRead: (user, chat) => transcripts(user).read(chat),
     historyWrite: (user, chat, history, options) => transcripts(user).write(chat, history, options),
-    historyAppendIfLast: (user, chat, message, entry) => transcripts(user).appendIfLast(chat, message, entry),
-    historyRemoveIf: (user, chat, history) => transcripts(user).removeIf(chat, history),
+    historyAppendIfLast: (user, chat, message, entry, options) => transcripts(user).appendIfLast(chat, message, entry, options),
+    historyRemoveIf: (user, chat, history, options) => transcripts(user).removeIf(chat, history, options),
   };
 }
 

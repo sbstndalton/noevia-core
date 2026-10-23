@@ -196,7 +196,7 @@ function createChatListRoutes({ json, readBody, currentWorkspace, PROJECTS, FREE
         // still runs (#1507; the running marker, per account).
         let saved;
         try {
-          saved = await currentWorkspace().transcripts.write(spaceId, body.history, { baseRevision: typeof body.baseRevision === 'string' ? body.baseRevision : undefined, supersedePartial: true });
+          saved = await currentWorkspace().transcripts.write(spaceId, body.history, { baseRevision: typeof body.baseRevision === 'string' ? body.baseRevision : undefined, supersedePartial: true, origin: 'history' });
         } catch (err) {
           if (err && err.status === 400) return json(res, 400, { error: 'invalid JSON' });
           const f = require('../project-store-client.cjs').failureReply(err);
