@@ -74,75 +74,14 @@ test('the free-chat list is not this mount\'s any more; a free chat is deleted w
   assert.deepEqual(f.sent.pop(), { status: 404, body: { error: 'no such chat' } });
 });
 
-test('transcripts carry a revision; a stale save gets the current copy back; a deleted chat is gone', async () => {
+test('#1071 slice 5: a chat\'s transcript is no longer answered here, read or save (the Rust front owns both)', async () => {
   const f = fixture();
-  // #1071: the GET is the Rust front's; its revision of an empty chat is this, byte for byte.
-  assert.equal(await f.call('GET', '/api/chats/c1/history'), false);
+  for (const method of ['GET', 'POST', 'PUT']) {
+    assert.equal(await f.call(method, '/api/chats/c1/history', method === 'GET' ? undefined : { history: [1] }), false, method);
+  }
   assert.equal(f.sent.length, 0);
-  const emptyRevision = require('node:crypto').createHash('sha256').update('[]').digest('hex');
-  await f.call('POST', '/api/chats/c1/history', { history: [1, 2, 3], baseRevision: emptyRevision });
-  const saved = f.sent.pop();
-  assert.equal(saved.status, 200);
-  assert.deepEqual(f.stored('c1'), [1, 2, 3]);
-  assert.equal(saved.body.revision, require('node:crypto').createHash('sha256').update('[1,2,3]').digest('hex'));
-  await f.call('POST', '/api/chats/c1/history', { history: [9], baseRevision: emptyRevision });
-  const stale = f.sent.pop();
-  assert.equal(stale.status, 409);
-  assert.equal(stale.body.error, 'This chat changed on another device.');
-  assert.deepEqual(stale.body.history, [1, 2, 3]);
-  assert.equal(stale.body.revision, saved.body.revision);
-  assert.deepEqual(Object.keys(stale.body), ['error', 'history', 'revision'], 'Node\'s conflict shape');
-  await f.call('POST', '/api/chats/c1/history', { history: [9] });
-  assert.equal(f.sent.pop().status, 200, 'a save without a base revision is accepted as before');
-  await f.call('POST', '/api/chats/c1/history', { history: ['x'.repeat(300)] });
-  assert.deepEqual(f.sent.pop(), { status: 413, body: { error: 'This chat is too large to save; start a new chat to keep going.' } });
-  require('../chat-lists.cjs').addTombstone(f.dir, 'c1');
-  await f.call('POST', '/api/chats/c1/history', { history: [] });
-  assert.deepEqual(f.sent.pop(), { status: 410, body: { error: 'This chat was deleted.' } });
-  assert.equal(await f.call('PUT', '/api/chats/c1/history'), false);
-  // Every write went through the store, with the reduced id and the client's own supersede.
-  assert.deepEqual(f.storeCalls.map((c) => [c.url, c.body.chat, c.body.supersedePartial]),
-    [['/v1/history/write', 'c1', true], ['/v1/history/write', 'c1', true], ['/v1/history/write', 'c1', true]]);
-});
-
-test('#1071 slice 4: a body without a list is refused instead of erasing the chat; store failures answer as such', async () => {
-  const f = fixture();
-  await f.call('POST', '/api/chats/c2/history', { history: [1] });
-  assert.equal(f.sent.pop().status, 200);
-  for (const body of [{}, { history: null }, { history: { 0: 1 } }]) {
-    await f.call('POST', '/api/chats/c2/history', body);
-    assert.deepEqual(f.sent.pop(), { status: 400, body: { error: 'history must be a list' } }, JSON.stringify(body));
-  }
-  assert.deepEqual(f.stored('c2'), [1], 'still there');
-  for (const body of ['nope', '[]', 'null']) {
-    await f.call('POST', '/api/chats/c2/history', body);
-    assert.equal(f.sent.pop().status, 400, body);
-  }
-  // Core's sanitiser throws on this (String() of an own toString): Node's answer, invalid JSON.
-  await f.call('POST', '/api/chats/c2/history', '{"history":[{"role":"assistant","sources":[{"file":"f","snippet":{"toString":1}}]}]}');
-  assert.deepEqual(f.sent.pop(), { status: 400, body: { error: 'invalid JSON' } });
-  // The store unreachable or busy: 503 with Retry-After, and nothing written here instead.
-  const errors = [];
-  const realError = console.error;
-  console.error = (...a) => errors.push(a.join(' '));
-  try {
-    f.setTranscripts({ write: async () => { throw require('../project-store-client.cjs').busy(); } });
-    await f.call('POST', '/api/chats/c2/history', { history: [2] });
-    assert.deepEqual(f.sent.pop(), { status: 503, body: { error: 'The project store is busy. Try again shortly.', code: 'PROJECTS_BUSY' } });
-    assert.equal(f.headers['Retry-After'], '1');
-    f.setTranscripts({ write: async () => { throw Object.assign(new Error('account no longer exists'), { status: 410 }); } });
-    await f.call('POST', '/api/chats/c2/history', { history: [2] });
-    assert.deepEqual(f.sent.pop(), { status: 410, body: { error: 'account no longer exists' } });
-    f.setTranscripts({ write: async () => { throw Object.assign(new Error('project store answered 401'), { status: 500, code: 'PROJECT_STORE_FAILED' }); } });
-    await f.call('POST', '/api/chats/c2/history', { history: [2] });
-    assert.deepEqual(f.sent.pop(), { status: 500, body: { error: 'Internal error' } });
-    // No store at all: refused, never a local write.
-    f.setTranscripts(undefined);
-    await f.call('POST', '/api/chats/c2/history', { history: [2] });
-    assert.equal(f.sent.pop().status, 500);
-  } finally { console.error = realError; }
-  assert.deepEqual(f.stored('c2'), [1], 'no fallback write');
-  assert.deepEqual(fs.readdirSync(f.dir).filter((n) => n.endsWith('.tmp')), []);
+  assert.deepEqual(f.storeCalls, [], 'no store write from Node');
+  assert.equal(f.stored('c1'), undefined, 'nothing saved');
 });
 
 test('#1071: a chat\'s context meter is no longer answered here (the Rust front owns it)', async () => {
@@ -316,7 +255,9 @@ test('#1507: a saved transcript supersedes a saved partial reply (which the Rust
   fs.mkdirSync(path.join(f.dir, 'chat-partials'), { recursive: true });
   fs.writeFileSync(partial.fileFor(f.dir, 'c1'), JSON.stringify({ role: 'assistant', content: 'half a rep', interrupted: true }));
   assert.equal(await f.call('GET', '/api/chats/c1/history'), false, 'the GET is not this mount\'s');
-  await f.call('POST', '/api/chats/c1/history', { history: [{ role: 'user', content: 'next' }] });
-  assert.equal(f.sent.pop().status, 200);
+  assert.equal(await f.call('POST', '/api/chats/c1/history', { history: [{ role: 'user', content: 'next' }] }), false, 'nor the save (#1071 slice 5)');
+  assert.equal(fs.existsSync(partial.fileFor(f.dir, 'c1')), true, 'Node supersedes nothing itself');
+  // The Rust front's save (here its in-process stand-in) supersedes it.
+  await require('../../tests/server/project-store-server.cjs').localTranscripts(f.dir).write('c1', [{ role: 'user', content: 'next' }], { supersedePartial: true, origin: 'history' });
   assert.equal(fs.existsSync(partial.fileFor(f.dir, 'c1')), false, 'the saved transcript supersedes the partial');
 });

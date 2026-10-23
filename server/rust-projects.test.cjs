@@ -59,6 +59,7 @@ test('#1071: every Rust-owned project route is refused here unconditionally, bef
     ['POST', '/api/chats/c1/context'],
     ['GET', '/api/chats/c1/context-window'],
     ['GET', '/api/chats/c1/history'],
+    ['POST', '/api/chats/c1/history'],
   ];
   for (const [method, p] of owned) {
     calls.length = 0;
@@ -73,7 +74,7 @@ test('#1071: every Rust-owned project route is refused here unconditionally, bef
     ['PUT', '/api/projects/p1/chats'], ['DELETE', '/api/projects/p1/chats'], ['GET', '/api/projects/p1/chats/c1'], ['DELETE', '/api/projects/p1/chats/c1'],
     ['DELETE', '/api/freechats/c1'], ['PUT', '/api/freechats'], ['GET', '/api/freechats/c1'], ['GET', '/api/freechatsx'],
     ['DELETE', '/api/chats/c1/context'], ['GET', '/api/chats/c1/context/extra'], ['POST', '/api/chats/c1/move'], ['POST', '/api/chats/c1/context-window'], ['GET', '/api/chats/c1/context-window/x'],
-    ['POST', '/api/chats/c1/history'], ['PUT', '/api/chats/c1/history'], ['GET', '/api/chats/c1/history/x'], ['POST', '/api/projects'], ['GET', '/api/workspace'],
+    ['PUT', '/api/chats/c1/history'], ['DELETE', '/api/chats/c1/history'], ['GET', '/api/chats/c1/history/x'], ['POST', '/api/projects'], ['GET', '/api/workspace'],
     ['POST', '/api/projects/p1/uploads'], ['GET', '/api/projects/p1/assets/img-1/extra'],
   ]) {
     calls.length = 0;

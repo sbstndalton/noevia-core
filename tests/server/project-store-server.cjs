@@ -256,4 +256,30 @@ function localTranscripts(dir, calls = []) {
   };
 }
 
-module.exports = { startProjectStore, installProjectStore, createHandler, freePortSync, localTranscripts, historyOp };
+/** The Rust front's `POST /api/chats/{chatId}/history` (noevia-rs crates/server-projects
+ *  history.rs, sbstndalton/noevia#1071 slice 5), in process over `<dataDir>/users/<user>`, for
+ *  tests that need a chat saved the way a browser saves it now that Node refuses that route
+ *  (rust-projects.cjs OWNED_ROUTES). Same answers: 410 for a tombstoned chat, 400 for a body that
+ *  is not an object with a `history` list, else the store's write with `supersedePartial` and
+ *  origin `history` -> 200 { ok, revision } | 409 { error, history, revision } | 410.
+ *  Resolves { status, text } like the tests' request helpers. */
+function rustHistorySave(dataDir, user, rawChatId, body) {
+  const lists = require('../../server/chat-lists.cjs');
+  const answer = (status, value) => ({ status, text: JSON.stringify(value) });
+  const chat = lists.safeChatId(String(rawChatId));
+  if (!chat) return answer(400, { error: 'invalid chat id' });
+  const dir = path.join(dataDir, 'users', user);
+  if (!fs.existsSync(dir)) return answer(410, { error: 'account no longer exists' });
+  if (lists.readTombstones(dir).has(chat)) return answer(410, { error: 'This chat was deleted.' });
+  const parsed = typeof body === 'string' ? (() => { try { return JSON.parse(body); } catch { return undefined; } })() : body;
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return answer(400, { error: 'request body must be a JSON object' });
+  if (!Array.isArray(parsed.history)) return answer(400, { error: 'history must be a list' });
+  const baseRevision = typeof parsed.baseRevision === 'string' ? parsed.baseRevision : undefined;
+  const [status, out] = historyOp('/v1/history/write', { chat, history: parsed.history, baseRevision, supersedePartial: true, origin: 'history' }, dir);
+  if (status === 200) return answer(200, { ok: true, revision: out.revision });
+  if (status === 409) return answer(409, { error: 'This chat changed on another device.', history: out.history, revision: out.revision });
+  if (status === 410) return answer(410, { error: 'This chat was deleted.' });
+  return answer(status, out);
+}
+
+module.exports = { startProjectStore, installProjectStore, createHandler, freePortSync, localTranscripts, historyOp, rustHistorySave };

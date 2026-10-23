@@ -394,8 +394,10 @@ test('#758 a taken: entry is pruned once the foreign note is gone', async () => 
   assert.equal(state.index.notes.a.path, 'Chats/Inbox/A (2).md', 'the chat keeps its note name');
 });
 
-test('mirrorTrigger: only writes to chats, transcripts, moves, projects and imports', () => {
-  assert.deepEqual(mirrorTrigger('POST', '/api/chats/c%201/history'), { chatId: 'c 1' });
+test('mirrorTrigger: only writes to chats, moves, projects and imports', () => {
+  // The transcript save is the Rust front's (#1071 slice 5); the change journal schedules it.
+  assert.equal(mirrorTrigger('POST', '/api/chats/c%201/history'), null);
+  assert.deepEqual(mirrorTrigger('POST', '/api/chats/c%201/move'), { chatId: 'c 1' });
   assert.deepEqual(mirrorTrigger('POST', '/api/chats/c1/move'), { chatId: 'c1' });
   assert.deepEqual(mirrorTrigger('POST', '/api/freechats'), { chatId: null });
   assert.deepEqual(mirrorTrigger('DELETE', '/api/freechats/c1'), { chatId: null });

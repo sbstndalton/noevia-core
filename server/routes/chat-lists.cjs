@@ -6,9 +6,6 @@
 //   GET  /api/chats/search?q=              the chat ids whose message text holds q (#1450)
 //   GET/POST /api/freechats                the free-chat metas, merged against tombstones
 //   DELETE /api/freechats/:id
-//   POST /api/chats/:id/history            saves the transcript through the Rust store (its only writer),
-//                                          with a revision for optimistic saves (the GET is the Rust
-//                                          front's, sbstndalton/noevia#1071)
 //   POST /api/chats/:id/move               { projectId: string|null, frame? } moves the meta between
 //                                          the caller's own lists (#738); the transcript stays put
 //
@@ -167,48 +164,9 @@ function createChatListRoutes({ json, readBody, currentWorkspace, PROJECTS, FREE
       return json(res, moved.status, moved.status === 200 ? { ok: true, from: moved.from, projectId: body.projectId } : { error: 'no such chat or project' });
     }
 
-    const historyMatch = p.match(/^\/api\/chats\/([^/]+)\/history$/);
-    if (historyMatch) {
-      // Sanitized here, exactly as storage does, so the tombstone check sees the stored id.
-      const rawId = decodeChatId(historyMatch[1]);
-      if (rawId === null) return badChatId(res);
-      const spaceId = require('../chat-lists.cjs').safeChatId(rawId);
-      if (!spaceId) return json(res, 400, { error: 'invalid chat id' });
-      // GET (the transcript and #1507's interrupted `partial`) is the Rust front's (sbstndalton/noevia#1071):
-      // index.cjs refuses it before this mount (rust-projects.cjs refuseOwnedRoute).
-      if (req.method === 'POST') {
-        // A reply that finishes after its chat was deleted must not write the transcript back. Checked
-        // here first (before the body is read, as before) and again by the store under its lock.
-        if (require('../chat-lists.cjs').readTombstones(currentWorkspace().dir).has(spaceId)) return json(res, 410, { error: 'This chat was deleted.' });
-        let raw;
-        try { raw = await readBody(req, STORED_HISTORY_BYTES); }
-        catch (e) { return json(res, e.status || 400, { error: e.status === 413 ? 'This chat is too large to save; start a new chat to keep going.' : 'could not read the chat' }); }
-        let body;
-        try { body = JSON.parse(raw); } catch { return json(res, 400, { error: 'invalid JSON' }); }
-        if (!body || typeof body !== 'object' || Array.isArray(body)) return json(res, 400, { error: 'request body must be a JSON object' });
-        // sbstndalton/noevia#1071 slice 4: saving a body without a list erased the chat (it saved []).
-        if (!Array.isArray(body.history)) return json(res, 400, { error: 'history must be a list' });
-        // sbstndalton/noevia#1071 slice 4: the Rust store writes the transcript (Node never does). It
-        // keeps the last STORED_HISTORY_CAP entries, sanitised as chat-sources.cjs sanitizeHistory does,
-        // and applies the optimistic concurrency in one hold of its lock: a save based on an older copy
-        // (another device saved meanwhile) gets the current copy back to merge; a save without a base
-        // revision is accepted as before. It also supersedes the saved partial reply unless that reply
-        // still runs (#1507; the running marker, per account).
-        let saved;
-        try {
-          saved = await currentWorkspace().transcripts.write(spaceId, body.history, { baseRevision: typeof body.baseRevision === 'string' ? body.baseRevision : undefined, supersedePartial: true, origin: 'history' });
-        } catch (err) {
-          if (err && err.status === 400) return json(res, 400, { error: 'invalid JSON' });
-          const f = require('../project-store-client.cjs').failureReply(err);
-          if (f.status === 500) console.error('[chat] could not save a transcript through the store:', err?.message || err);
-          for (const [k, v] of Object.entries(f.headers)) res.setHeader?.(k, v);
-          return json(res, f.status, f.body);
-        }
-        if (saved.deleted) return json(res, 410, { error: 'This chat was deleted.' });
-        if (saved.conflict) return json(res, 409, { error: 'This chat changed on another device.', history: saved.history, revision: saved.revision });
-        return json(res, 200, { ok: true, revision: saved.revision });
-      }
-    }
+    // GET and POST /api/chats/:id/history are the Rust front's (sbstndalton/noevia#1071 slices 4
+    // and 5): index.cjs refuses both before this mount (rust-projects.cjs refuseOwnedRoute). The
+    // Rust store journals each save and chat-change-journal.cjs schedules the mirror and brain.
     return PASS;
   }
 
