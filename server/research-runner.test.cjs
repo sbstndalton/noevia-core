@@ -196,3 +196,21 @@ test('footnote IDs keep counting across sections', async (t) => {
   assert.equal((md.match(/\[\^u2\]:/g) || []).length, 1);
   assert.match(md.split('## Zephyr cell energy density')[1], /cures colds\.\[\^u2\]/);
 });
+
+test('a real runner carries its finished partial report through a failed checkpoint flush', async (t) => {
+  const id = '11111111-1111-4111-8111-111111111111';
+  const jobs = {
+    create: async () => id,
+    append: async () => {},
+    run: (created, work) => work({
+      id: created, signal: new AbortController().signal,
+      progress() {}, checkpoint() {},
+      flush: async () => { throw Error('journal unavailable'); },
+    }).then(() => assert.fail('flush should fail'), (error) => ({ status: 'failed', result: error.result, error: error.message })),
+  };
+  const { runner } = setup(t, { jobs });
+  const job = await (await runner.start({ question: 'Zephyr cell energy per kilogram', projectId: 'p1', finish: async () => {} })).done;
+  assert.equal(job.status, 'failed');
+  assert.match(job.result.markdown, /410 Wh/);
+  assert.equal(job.result.sections, 1);
+});

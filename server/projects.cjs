@@ -630,13 +630,57 @@ function createProjectStore({
   // PUT is create-only with If-None-Match, so a file appearing in between is not overwritten).
   // `adoptAccount` is the storage account (project-edit-target.storageAccount) the move was approved
   // for; with any other account connected now the write is refused.
-  function writeProjectTextFile(project, name, text, { expectName, expectContent, expectAttachment, adoptTo, adoptAccount } = {}) {
+  // A configured Nextcloud kind is not evidence that its remote honours conditional PUT.
+  // Probe only a private random file in this project's Text folder. No user file is touched.
+  // The report PUT starts only after 412 and byte-for-byte preservation have been observed.
+  async function verifyResearchCreateOnly(connection, folder) {
+    const probe = `${folder}/Text/noevia-research-create-probe-${require('node:crypto').randomUUID()}.tmp`;
+    const first = Buffer.from(require('node:crypto').randomUUID());
+    const second = Buffer.from(require('node:crypto').randomUUID());
+    let cleaned = false;
+    try {
+      await storageClient.createFolder(connection, `${folder}/Text`);
+      const receipt = await storageClient.writeFile(connection, probe, first, { ifNoneMatch: '*' });
+      if (receipt?.created !== true) throw Error('the storage server did not confirm a new conditional file');
+      let refused = false;
+      try { await storageClient.writeFile(connection, probe, second, { ifNoneMatch: '*' }); }
+      catch (error) { if (error?.code === 'changed') refused = true; else throw error; }
+      if (!refused) throw Error('the storage server accepted a second create-only write');
+      const bytes = await storageClient.readBinaryFile(connection, probe, { cap: 64 });
+      if (!Buffer.from(bytes).equals(first)) throw Error('the storage server changed a create-only file');
+      const version = await storageClient.fileVersion(connection, probe);
+      if (!version.exists || !version.etag) throw Error('the storage server did not return a version for safe probe cleanup');
+      cleaned = (await storageClient.discardWritten(connection, probe, version.etag)).deleted;
+      if (!cleaned) throw Error('the storage server could not clean up the conditional-write probe');
+    } catch (cause) {
+      if (!cleaned) {
+        // Best effort only for our exact random bytes and an exact current ETag. Never
+        // delete a file whose content changed after this process last observed it.
+        try {
+          const bytes = await storageClient.readBinaryFile(connection, probe, { cap: 64 });
+          if (Buffer.from(bytes).equals(first) || Buffer.from(bytes).equals(second)) {
+            const version = await storageClient.fileVersion(connection, probe);
+            if (version.exists && version.etag) cleaned = (await storageClient.discardWritten(connection, probe, version.etag)).deleted;
+          }
+        } catch { /* leave the private probe for review if its outcome is unknown */ }
+      }
+      const leftover = cleaned ? '' : ` A private probe may remain at "${probe}"; review it before removing it.`;
+      throw Object.assign(new Error(`Storage did not verify create-only report writes; no report file was written.${leftover}`), { status: 503, definitelyNotWritten: true, cause });
+    }
+  }
+  function writeProjectTextFile(project, name, text, { expectName, expectContent, expectAttachment, adoptTo, adoptAccount, createOnly = false } = {}) {
     return withSourceLock(project, async () => {
       if (getProject(project.id) !== project) throw new Error('the project changed while writing; nothing was saved');
       const uploads = require('./uploads.cjs');
       const bytes = Buffer.from(text, 'utf8');
       uploads.validate(name, bytes);
       const edit = expectName !== undefined;
+      if (createOnly) {
+        if (edit || adoptTo !== undefined) throw Object.assign(new Error('create-only write cannot edit an existing file'), { status: 400, definitelyNotWritten: true });
+        if ((project.files || []).some((f) => f && String(f.name).split('/').pop() === name)) {
+          throw Object.assign(new Error(`"${name}" already exists in this project; no report file was overwritten`), { status: 409, code: 'changed', definitelyNotWritten: true });
+        }
+      }
       let current = null;
       if (edit) {
         if (typeof expectName !== 'string' || !expectName) throw new Error('an edit must name the stored file it changes; nothing was saved');
@@ -652,6 +696,12 @@ function createProjectStore({
       }
       const connection = authService.getStorage(currentWorkspace().userId, true);
       const remote = storageClient.isBrowsable(connection) ? connection : null;
+      // Research reports are new files only. Nextcloud enforces If-None-Match: * atomically;
+      // generic WebDAV may ignore it, and S3 writes are not supported here. Refuse those
+      // backends before any PUT instead of claiming create-only safety they cannot provide.
+      if (createOnly && remote && connection.kind !== 'nextcloud') {
+        throw Object.assign(new Error('Research report auto-save needs local or Nextcloud storage; no file was written.'), { status: 409, definitelyNotWritten: true });
+      }
       let ifMatch, ifNoneMatch;
       const adopt = edit && adoptTo !== undefined;
       if (adopt) {
@@ -684,11 +734,37 @@ function createProjectStore({
         }
         if (remote) ifMatch = await confirmStoredVersion(remote, expectName, current);
       } else if (remote && !project.projectFolder) project.projectFolder = await ensureProjectFolder(project);
+      let writeStorage = storageClient;
+      if (createOnly && remote) {
+        if (!project.projectFolder) throw Object.assign(new Error('The research report folder is unavailable; no report file was written.'), { status: 503, definitelyNotWritten: true });
+        const selectedUser = currentWorkspace().userId;
+        const selectedFolder = project.projectFolder;
+        const selectedConnection = JSON.stringify(remote);
+        const selectedPath = uploads.destinationFor(project, name, { connection: remote });
+        await verifyResearchCreateOnly(remote, selectedFolder);
+        ifNoneMatch = '*';
+        // Check again at the actual report PUT, after uploads.ingest's awaits. The probe
+        // applies only to this account, project folder, storage connection and target.
+        writeStorage = { ...storageClient, writeFile: (conn, path, content, options) => {
+          const active = currentWorkspace();
+          if (active.userId !== selectedUser || getProject(project.id) !== project
+            || project.projectFolder !== selectedFolder || conn !== remote || path !== selectedPath
+            || options?.ifNoneMatch !== '*'
+            || JSON.stringify(authService.getStorage(selectedUser, true)) !== selectedConnection) {
+            throw Object.assign(new Error('The research report target changed after its storage check; no file was written.'), { status: 409, definitelyNotWritten: true });
+          }
+          active.assertActive?.();
+          return storageClient.writeFile(conn, path, content, options);
+        } };
+      }
       let file;
       try {
-        file = await uploads.ingest(currentWorkspace(), project, name, bytes, { connection: remote, storageImpl: storageClient, ...(adopt ? { ifNoneMatch } : edit && remote ? { ifMatch } : {}) });
+        file = await uploads.ingest(currentWorkspace(), project, name, bytes, { connection: remote, storageImpl: writeStorage, ...(adopt || createOnly && remote ? { ifNoneMatch } : edit && remote ? { ifMatch } : {}) });
       } catch (err) {
         if (adopt && err && err.code === 'changed') throw new Error(`"${adoptTo}" appeared in storage while this edit was being saved, so it was not overwritten. Nothing was saved. Sync this project's Sources, then edit that file.`);
+        if (createOnly && err && err.code === 'changed') {
+          throw Object.assign(new Error(`"${name}" already exists in storage; the report was not written. Sync this project's Sources and review the file.`), { status: 409, code: 'changed', definitelyNotWritten: true });
+        }
         if (err && err.code === 'changed') throw new Error(changedInStorage(expectName));
         if (edit && err && err.code === 'unknown') throw new Error(`The connection to storage failed while saving "${adopt ? adoptTo : expectName}", so noevia cannot tell whether the edit landed. Outcome unknown: sync this project's Sources to check whether it was saved before trying again.`);
         throw err;

@@ -28,15 +28,15 @@ function createResearchRoutes({ service, features, getProject, workspace, availa
         return send(200, { subQuestions: await service.plan(ws, project, body?.question) });
       }
       if (!target) {
-        if (req.method === 'GET') return send(200, { budget: service.budget, available: !available(project), reason: available(project) || null, jobs: service.list(ws, project) });
+        if (req.method === 'GET') return send(200, { budget: service.budget, available: !available(project), reason: available(project) || null, jobs: await service.list(ws, project) });
         if (req.method !== 'POST') return send(405, { error: 'method not allowed' });
         const reason = available(project);
         if (reason) return send(409, { error: reason });
         return send(202, await service.start(ws, project, await readJson(req)));
       }
-      if (!action) return req.method === 'GET' ? send(200, service.get(ws, project, target)) : send(405, { error: 'method not allowed' });
+      if (!action) return req.method === 'GET' ? send(200, await service.get(ws, project, target)) : send(405, { error: 'method not allowed' });
       if (req.method !== 'POST') return send(405, { error: 'method not allowed' });
-      if (action === 'cancel') return send(200, service.cancel(ws, project, target));
+      if (action === 'cancel') return send(200, await service.cancel(ws, project, target));
       return send(200, await service.savePartial(ws, project, target));
     } catch (error) {
       if (error instanceof SyntaxError) return send(400, { error: 'invalid JSON' });

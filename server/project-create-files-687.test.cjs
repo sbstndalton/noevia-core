@@ -35,7 +35,7 @@ function world(t) {
   // Fake WebDAV storage with ETags. `put(p, text)` is a change made in storage by someone else;
   // `beforePut` runs just before a PUT lands (a change racing the edit); `noEtag` models a server
   // that reports none. `writeCalls` counts every writeFile call, including refused ones.
-  const storage = { folderCreations: [], takenFolders: new Set(), folderFails: false, failWrites: false, connected: true, objects: new Map(), etags: new Map(), writes: [], writeCalls: [], versionChecks: [], reads: [], serial: 0, noEtag: false, beforePut: null };
+  const storage = { folderCreations: [], takenFolders: new Set(), folderFails: false, failWrites: false, connected: true, objects: new Map(), etags: new Map(), writes: [], writeCalls: [], versionChecks: [], reads: [], serial: 0, noEtag: false, ignoreConditional: false, lieChanged: false, probeLoseReply: false, discardFails: false, onCreateFolder: null, beforePut: null, afterPut: null };
   // Case-insensitive storage (as many Nextcloud/SMB-backed servers are) when `caseInsensitive`.
   const fold = (k) => (storage.caseInsensitive && typeof k === 'string' ? k.toLowerCase() : k);
   for (const m of [storage.objects, storage.etags]) for (const op of ['get', 'set', 'has', 'delete']) { const f = m[op].bind(m); m[op] = (k, ...rest) => f(fold(k), ...rest); }
@@ -46,7 +46,7 @@ function world(t) {
   const indexed = [], unindexed = [];
   const storageClient = {
     isBrowsable: () => storage.connected,
-    createFolder: async () => {},
+    createFolder: async (_conn, folder) => { storage.onCreateFolder?.(folder); },
     fileVersion: async (_conn, p) => { storage.versionChecks.push(p); return storage.objects.has(p) ? { exists: true, etag: storage.noEtag ? '' : storage.etags.get(p) } : { exists: false }; },
     readBinaryFile: async (_conn, p) => {
       storage.reads.push(p);
@@ -57,10 +57,21 @@ function world(t) {
       storage.writeCalls.push({ path: p, ifMatch: opts.ifMatch, ifNoneMatch: opts.ifNoneMatch });
       if (storage.beforePut) { const hook = storage.beforePut; storage.beforePut = null; hook(p); }
       if (opts.ifMatch !== undefined && storage.etags.get(p) !== opts.ifMatch) throw Object.assign(new Error(`"${p}" changed in storage before it could be written (412)`), { status: 409, code: 'changed' });
-      if (opts.ifNoneMatch === '*' && storage.objects.has(p)) throw Object.assign(new Error(`"${p}" already exists in storage, so it was not overwritten (412)`), { status: 409, code: 'changed' });
+      if (opts.ifNoneMatch === '*' && storage.objects.has(p) && !storage.ignoreConditional) {
+        if (storage.lieChanged) storage.put(p, Buffer.from(bytes).toString('utf8'));
+        throw Object.assign(new Error(`"${p}" already exists in storage, so it was not overwritten (412)`), { status: 409, code: 'changed' });
+      }
       if (storage.failWrites) throw Object.assign(new Error('could not write (503)'), { status: 502 });
       storage.writes.push(p);
       storage.put(p, Buffer.from(bytes).toString('utf8'));
+      if (storage.probeLoseReply && p.includes('noevia-research-create-probe-')) { storage.probeLoseReply = false; throw Object.assign(Error('probe reply lost'), { status: 502, code: 'unknown' }); }
+      if (storage.afterPut && !p.includes('noevia-research-create-probe-')) { const hook = storage.afterPut; storage.afterPut = null; hook(p); }
+      return { created: true, etag: storage.etags.get(p) };
+    },
+    discardWritten: async (_conn, p, etag) => {
+      if (storage.discardFails) return { deleted: false, reason: 'uncertain' };
+      if (storage.etags.get(p) !== etag) return { deleted: false, reason: 'changed' };
+      storage.objects.delete(p); storage.etags.delete(p); return { deleted: true };
     },
   };
   const store = createProjectStore({
@@ -424,4 +435,84 @@ test('create-time storing makes no folder when no file will be stored (#589)', a
   assert.equal(q.projectFolder, `${ROOT}/${q.id}`);
   assert.deepEqual(w.storage.writeCalls.map((c) => c.path), [`${ROOT}/${q.id}/Text/ok.md`]);
   assert.deepEqual(q.files.map((f) => f.name), ['empty.md', `${ROOT}/${q.id}/Text/ok.md`]);
+});
+
+test('research-only createOnly project write forwards conditional PUT and refuses existing or unsupported storage', async (t) => {
+  const w = world(t);
+  const p = await w.project('Research report');
+  const originalConn = w.storage.conn;
+  w.storage.conn = () => ({ ...originalConn(), kind: 'nextcloud' });
+  const name = 'Research report.md';
+  w.storage.afterPut = () => { throw Object.assign(Error('response lost after conditional PUT'), { status: 502, code: 'unknown' }); };
+  await assert.rejects(() => w.store.writeProjectTextFile(p, name, '# report', { createOnly: true }), (e) => e.code === 'unknown');
+  const dest = `${p.projectFolder}/Text/${name}`;
+  assert.deepEqual(w.storage.writeCalls.filter((c) => c.path === dest).map((c) => c.ifNoneMatch), ['*']);
+  assert.equal(w.storage.writeCalls.filter((c) => c.path.includes('noevia-research-create-probe-')).length, 2, 'live backend probe tests a second conditional create');
+  assert.equal(w.storage.objects.get(dest), '# report');
+  assert.deepEqual(p.files, [], 'unknown outcome is not recorded as a project artifact');
+  // Another writer can replace the remote object before a caller reconciles the intent.
+  w.storage.put(dest, '# concurrent replacement');
+  await assert.rejects(() => w.store.writeProjectTextFile(p, name, '# report', { createOnly: true }),
+    (e) => e.code === 'changed' && e.definitelyNotWritten === true);
+  assert.equal(w.storage.objects.get(dest), '# concurrent replacement');
+  assert.equal(w.storage.writeCalls.filter((c) => c.path === dest).length, 2);
+  w.storage.conn = originalConn;
+  const before = w.storage.writeCalls.length;
+  await assert.rejects(() => w.store.writeProjectTextFile(p, 'Other report.md', '# report', { createOnly: true }),
+    (e) => e.definitelyNotWritten === true && /Nextcloud storage/.test(e.message));
+  assert.equal(w.storage.writeCalls.length, before, 'generic WebDAV is refused before any PUT');
+});
+
+test('research createOnly refuses a labelled Nextcloud endpoint that ignores If-None-Match', async (t) => {
+  const w = world(t);
+  const p = await w.project('Probe refusal');
+  const originalConn = w.storage.conn;
+  w.storage.conn = () => ({ ...originalConn(), kind: 'nextcloud' });
+  w.storage.ignoreConditional = true;
+  await assert.rejects(() => w.store.writeProjectTextFile(p, 'Research.md', '# report', { createOnly: true }),
+    (e) => e.definitelyNotWritten === true && /did not verify create-only/.test(e.message));
+  assert.equal(w.storage.writeCalls.filter((c) => c.path.endsWith('/Research.md')).length, 0, 'the report PUT never starts');
+  assert.deepEqual(p.files, [], 'no phantom project artifact');
+  assert.equal([...w.storage.objects.keys()].filter((name) => name.includes('noevia-research-create-probe-')).length, 0, 'the private probe is removed by exact ETag');
+});
+
+test('research createOnly refuses a server that lies with 412 after overwriting the probe', async (t) => {
+  const w = world(t);
+  const p = await w.project('Probe lie');
+  const originalConn = w.storage.conn;
+  w.storage.conn = () => ({ ...originalConn(), kind: 'nextcloud' });
+  w.storage.lieChanged = true;
+  await assert.rejects(() => w.store.writeProjectTextFile(p, 'Research.md', '# report', { createOnly: true }),
+    (e) => e.definitelyNotWritten === true && /did not verify create-only/.test(e.message));
+  assert.equal(w.storage.writeCalls.filter((c) => c.path.endsWith('/Research.md')).length, 0);
+  assert.deepEqual(p.files, []);
+});
+
+test('research createOnly refuses an uncertain probe reply or cleanup before report PUT', async (t) => {
+  for (const mode of ['reply', 'cleanup']) {
+    const w = world(t);
+    const p = await w.project(`Probe ${mode}`);
+    const originalConn = w.storage.conn;
+    w.storage.conn = () => ({ ...originalConn(), kind: 'nextcloud' });
+    if (mode === 'reply') w.storage.probeLoseReply = true;
+    else w.storage.discardFails = true;
+    await assert.rejects(() => w.store.writeProjectTextFile(p, 'Research.md', '# report', { createOnly: true }),
+      (e) => e.definitelyNotWritten === true && /did not verify create-only/.test(e.message)
+        && (mode !== 'cleanup' || /private probe may remain/.test(e.message)));
+    assert.equal(w.storage.writeCalls.filter((c) => c.path.endsWith('/Research.md')).length, 0);
+    assert.deepEqual(p.files, []);
+  }
+});
+
+test('research createOnly rechecks the exact project folder at report dispatch', async (t) => {
+  const w = world(t);
+  const p = await w.project('Target race');
+  const originalConn = w.storage.conn;
+  w.storage.conn = () => ({ ...originalConn(), kind: 'nextcloud' });
+  let folders = 0;
+  w.storage.onCreateFolder = () => { if (++folders === 2) p.projectFolder += '-changed'; };
+  await assert.rejects(() => w.store.writeProjectTextFile(p, 'Research.md', '# report', { createOnly: true }),
+    (e) => e.definitelyNotWritten === true && /target changed/.test(e.message));
+  assert.equal(w.storage.writeCalls.filter((c) => c.path.endsWith('/Research.md')).length, 0);
+  assert.deepEqual(p.files, []);
 });

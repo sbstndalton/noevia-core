@@ -747,7 +747,7 @@ const researchRoutes = require('./routes/research.cjs').createResearchRoutes({
     return null;
   },
   service: require('./research-service.cjs').createResearchService({
-    saveFile: (project, name, text) => writeProjectTextFile(project, name, text),
+    saveFile: (project, name, text) => writeProjectTextFile(project, name, text, { createOnly: true }),
     getProject,
     tools: (workspace, project) => ({
       complete: (messages, options) => researchEngine.complete(project, messages, options),
