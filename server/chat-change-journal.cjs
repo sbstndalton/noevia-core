@@ -4,8 +4,11 @@
 // `chat-changes.jsonl`, one entry per transcript mutation under the transcript lock). Once Rust
 // answers POST /api/chats/{id}/history (noevia-rs#291), Node never sees that request, so its
 // mirrorTrigger nudge (chat-vault-mirror.cjs) cannot fire. This reader replaces that nudge for
-// transcript changes: for each new entry it schedules the chat's Diary mirror and its brain,
-// exactly as mirrorTrigger did after a successful history POST.
+// transcript changes: for each new entry it schedules the chat's Diary mirror. The chat's brain
+// (a model call) is scheduled only for a history save, as mirrorTrigger did: an entry with
+// `op: "write"` and `origin: "history"` read in order. Imports, interrupted-turn appends,
+// removals, entries without an `origin` (an older store) and every rescan schedule the mirror
+// only (owner decision: no brain builds on import or restart).
 //
 // - The cursor is kept per user, in memory. The store answers `{ entries, oldestSeq, latestSeq,
 //   more, start }` (POST /v1/changes/read, behind the per-start secret and bound to the user).
@@ -59,14 +62,14 @@ function createChangeJournalReader({ read, onChange, stamp = () => null, log = (
   let supported = null; // null: not known yet; true: the store journals; false: it has no op
   let timer = null;
 
-  function schedule(user, chatId, revision) {
+  function schedule(user, chatId, revision, brain = false) {
     if (typeof chatId !== 'string' || !chatId) return false;
     const key = `${user}\n${chatId}`;
     if (typeof revision === 'string' && recent.get(key) === revision) return false;
     recent.delete(key);
     recent.set(key, typeof revision === 'string' ? revision : null);
     if (recent.size > RECENT_CAP) recent.delete(recent.keys().next().value);
-    try { onChange(user, chatId); } catch (error) { log('chat-change-journal: scheduling failed', error?.message || String(error)); }
+    try { onChange(user, chatId, { brain: brain === true }); } catch (error) { log('chat-change-journal: scheduling failed', error?.message || String(error)); }
     return true;
   }
 
@@ -112,7 +115,7 @@ function createChangeJournalReader({ read, onChange, stamp = () => null, log = (
         const s = Number(e?.seq) || 0;
         if (s <= seq) continue;
         seq = s;
-        schedule(user, e.chatId, e.revision);
+        schedule(user, e.chatId, e.revision, isHistorySave(e));
       }
       cursors.set(user, { seq, start: cursor.start });
       if (!body.more || pages + 1 >= MAX_PAGES) break;
@@ -142,10 +145,15 @@ function createChangeJournalReader({ read, onChange, stamp = () => null, log = (
     return p;
   }
 
-  /** A request from `user` started: they are active, and their journal is read now. */
+  /** A request from `user` started: they are active, and their journal is read now unless its
+   *  stamp shows nothing changed since the last good read (a stat, not a store call). */
   function touch(user) {
     if (typeof user !== 'string' || !user) return;
     seen.set(user, now());
+    let st = null;
+    try { st = stamp(user); } catch { st = null; }
+    if (st !== null && cursors.has(user) && stamps.get(user) === st && !failing.has(user)) return;
+    if (st !== null) stamps.set(user, st); else stamps.delete(user);
     poll(user);
   }
 
@@ -176,6 +184,12 @@ function createChangeJournalReader({ read, onChange, stamp = () => null, log = (
   };
 }
 
+/** A history POST's save: the only entry that schedules the chat's brain. The Rust store sets
+ *  `origin` from the op's caller; without it (an older store) the entry is mirror-only. */
+function isHistorySave(e) {
+  return !!e && e.op === 'write' && e.origin === 'history';
+}
+
 /** The stamp of `<dataDir>/users/<user>/chat-changes.jsonl` (null: no such file yet, or not a
  *  user id), from one stat: size, mtime and inode (a rotation renames a new file in). */
 function fileStamp(dataDir, user, fs = require('node:fs'), path = require('node:path')) {
@@ -186,9 +200,9 @@ function fileStamp(dataDir, user, fs = require('node:fs'), path = require('node:
   } catch { return 'absent'; }
 }
 
-/** The change handler index.cjs wires: the same two schedules as mirrorTrigger's history nudge. */
+/** The change handler index.cjs wires: the mirror always; the brain only for a history save. */
 function scheduleMirrorAndBrain({ chatVaultMirror, chatBrains }) {
-  return (user, chatId) => { chatVaultMirror.schedule(user, chatId); chatBrains.schedule(user, chatId); };
+  return (user, chatId, { brain = false } = {}) => { chatVaultMirror.schedule(user, chatId); if (brain) chatBrains.schedule(user, chatId); };
 }
 
 /** Whether a nudge from mirrorTrigger is a transcript save the journal already covers. */
@@ -196,4 +210,4 @@ function journalCovers(reader, method, path) {
   return method === 'POST' && /^\/api\/chats\/[^/]+\/history$/.test(path || '') && reader.active();
 }
 
-module.exports = { createChangeJournalReader, scheduleMirrorAndBrain, journalCovers, fileStamp, JOURNAL_READER_MARKER, INTERVAL_MS, ACTIVE_MS };
+module.exports = { createChangeJournalReader, isHistorySave, scheduleMirrorAndBrain, journalCovers, fileStamp, JOURNAL_READER_MARKER, INTERVAL_MS, ACTIVE_MS };

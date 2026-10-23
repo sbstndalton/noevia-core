@@ -45,13 +45,13 @@ async function fakeStore(root, { start = START_A, missingOp = false } = {}) {
 }
 
 /** Appends entries as the Rust store does (seq from the last line). */
-function journalWrite(root, user, chatId, revision, { start = START_A } = {}) {
+function journalWrite(root, user, chatId, revision, { start = START_A, op = 'write', origin = 'history' } = {}) {
   const dir = path.join(root, 'users', user);
   fs.mkdirSync(dir, { recursive: true });
   const file = path.join(dir, 'chat-changes.jsonl');
   const lines = fs.existsSync(file) ? fs.readFileSync(file, 'utf8').split('\n').filter(Boolean) : [];
   const seq = lines.length ? JSON.parse(lines.at(-1)).seq + 1 : 1;
-  fs.appendFileSync(file, `${JSON.stringify({ seq, chatId, revision, op: 'write', start, at: Date.now() })}\n`);
+  fs.appendFileSync(file, `${JSON.stringify({ seq, chatId, revision, op, ...(origin ? { origin } : {}), start, at: Date.now() })}\n`);
   return seq;
 }
 
@@ -278,12 +278,11 @@ test('the timer calls the store only when the journal file changed, and not at a
     stamp: () => st, setTimer: () => null });
   r.touch(USER); await r.poll(USER);
   const k = reads.length;
-  await r.tick(); // first timer read for this stamp
-  await r.tick(); await r.tick(); // unchanged file: no store call
-  assert.equal(reads.length, k + 1);
+  await r.tick(); await r.tick(); await r.tick(); // the request start read this stamp: no store call
+  assert.equal(reads.length, k);
   st = 'b';
   await r.tick();
-  assert.equal(reads.length, k + 2);
+  assert.equal(reads.length, k + 1);
   // Older front (404): the timer stops calling; a request start still probes.
   const probes = [];
   const old = createChangeJournalReader({ read: async () => { probes.push(1); return { unsupported: true }; }, onChange: () => {}, log: () => {}, stamp: () => null, setTimer: () => null });
@@ -304,4 +303,60 @@ test('fileStamp changes with the journal and refuses a path that is not a user i
     journalWrite(root, USER, 'qa-c', 'r2');
     assert.notEqual(fileStamp(root, USER), one);
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test('a request start reads the store only when the journal stamp changed (or the last read failed)', async () => {
+  const reads = [];
+  let st = 's1', fail = false;
+  const body = { entries: [], oldestSeq: null, latestSeq: null, more: false, start: START_A };
+  const r = createChangeJournalReader({ read: async (u, after) => { reads.push(after); if (fail) throw new Error('down'); return body; }, onChange: () => {}, log: () => {},
+    stamp: () => st, setTimer: () => null });
+  r.touch(USER); await r.poll(USER); // no cursor yet: reads
+  const k = reads.length;
+  for (let i = 0; i < 5; i++) { r.touch(USER); await r.poll; }
+  await new Promise((res) => setImmediate(res));
+  assert.equal(reads.length, k, 'unchanged stamp: five request starts make no store read');
+  st = 's2';
+  r.touch(USER); await new Promise((res) => setImmediate(res));
+  r.touch(USER); r.touch(USER); await new Promise((res) => setImmediate(res));
+  assert.equal(reads.length, k + 1, 'a changed stamp: exactly one read');
+  // A failing user is read again at the next request start whatever the stamp says.
+  fail = true; st = 's3';
+  r.touch(USER); await new Promise((res) => setTimeout(res, 5));
+  const f = reads.length;
+  fail = false;
+  r.touch(USER); await new Promise((res) => setTimeout(res, 5));
+  assert.equal(reads.length, f + 1);
+});
+
+test('owner decision: only a history save queues a brain build; imports, appends, older entries and rescans mirror only', async () => {
+  const h = await harness();
+  try {
+    await h.reader.poll(USER); // empty journal: cursor set
+    // An import of three chats.
+    for (const c of ['qa-imp-1', 'qa-imp-2', 'qa-imp-3']) journalWrite(h.root, USER, c, 'r1', { origin: 'import' });
+    await h.reader.poll(USER);
+    assert.deepEqual(h.brain, []);
+    assert.deepEqual(h.mirror.sort(), ['qa-imp-1', 'qa-imp-2', 'qa-imp-3'].map((c) => `${USER}:${c}`));
+    // An interrupted-turn append, and a write from a store that sends no origin.
+    journalWrite(h.root, USER, 'qa-turn', 'r1', { op: 'append', origin: 'history' });
+    journalWrite(h.root, USER, 'qa-old', 'r1', { origin: null });
+    await h.reader.poll(USER);
+    assert.deepEqual(h.brain, []);
+    assert.equal(h.mirror.length, 5);
+    // A history POST save: exactly one brain build.
+    journalWrite(h.root, USER, 'qa-saved', 'r1');
+    await h.reader.poll(USER);
+    assert.deepEqual(h.brain, [`${USER}:qa-saved`]);
+    // Restart (a fresh reader, then a store restart): the rescans mirror every chat, no brain.
+    const brain = [], mirror = [];
+    const fresh = createChangeJournalReader({ read: (u, a) => h.client.changesRead(u, a),
+      onChange: scheduleMirrorAndBrain({ chatVaultMirror: { schedule: (u, c) => mirror.push(c) }, chatBrains: { schedule: (u, c) => brain.push(c) } }),
+      log: () => {}, setTimer: () => null });
+    await fresh.poll(USER);
+    h.store.state.start = START_B;
+    await fresh.poll(USER);
+    assert.deepEqual(brain, []);
+    assert.equal(mirror.length, 12);
+  } finally { await h.done(); }
 });
