@@ -31,6 +31,16 @@
 // is 404, as an older front answers it, so a Node loaded against the stand-in leaves its journal
 // reader idle (the default for every test that only needs the store).
 //
+// and a chat's whole delete (sbstndalton/noevia#1071 slice 6; noevia-rs chat_delete.rs):
+//
+//   POST /v1/chat/delete { user, chat, kind: free|project|unlisted, projectId?, origin? }
+//        -> 200 { deleted, swept, leftovers } | 409 { error, code: 'CHAT_LISTED' }
+//
+// the tombstone (raw and reduced id), the list without the chat (`c.id === chat`), then the
+// transcript, context meter, brain note and saved partial (raw and reduced id); a failed list
+// write takes back the tombstone ids it added. A chat in no list that is already tombstoned is
+// swept (its files removed). Journalled as op `remove`, origin default `remove`.
+//
 // What is written is the last 5,000 entries through core's own sanitizeHistory, as the Rust store
 // does; a client save (`supersedePartial`) removes the chat's saved partial unless its running
 // marker names this process's start (chat-partial.cjs START_ID).
@@ -46,7 +56,7 @@ const crypto = require('node:crypto');
 const { spawnSync } = require('node:child_process');
 
 const FILES = new Set(['projects.json', 'free-chats.json']);
-const HISTORY_OPS = new Set(['/v1/history/read', '/v1/history/write', '/v1/history/append-if-last', '/v1/history/remove-if', '/v1/changes/read']);
+const HISTORY_OPS = new Set(['/v1/history/read', '/v1/history/write', '/v1/history/append-if-last', '/v1/history/remove-if', '/v1/changes/read', '/v1/chat/delete']);
 const ORIGINS = new Set(['history', 'import', 'turn', 'remove', 'other']);
 const JOURNAL = 'chat-changes.jsonl';
 const STORE_START = crypto.randomBytes(16).toString('hex');
@@ -66,8 +76,85 @@ const server = (m) => require(path.join(__dirname, '..', '..', 'server', m));
 const revisionOf = (history) => sha(JSON.stringify(history));
 let tmpSeq = 0;
 
+/** `/v1/chat/delete` (see the header) for a user directory that exists. */
+function chatDeleteOp(body, dir) {
+  const raw = typeof body.chat === 'string' ? body.chat : null;
+  if (raw === null) return [400, { error: 'user and chat required' }];
+  if (!raw) return [400, { error: 'invalid chat id' }];
+  const kind = body.kind;
+  const pid = body.projectId;
+  const ok = (kind === 'free' && pid == null) || (kind === 'unlisted' && pid == null) || (kind === 'project' && typeof pid === 'string');
+  if (!ok) return [400, { error: 'kind must be free, unlisted, or project with a projectId' }];
+  const origin = body.origin === undefined || body.origin === null ? 'remove' : body.origin;
+  if (!ORIGINS.has(origin)) return [400, { error: 'origin must be one of history, import, turn, remove, other' }];
+  const lists = server('chat-lists.cjs');
+  const safe = lists.safeChatId(raw);
+  const ids = [...new Set([raw, safe].filter(Boolean))];
+  const tombFile = path.join(dir, 'deleted-chats.json');
+  const readTomb = () => [...lists.readTombstones(dir)];
+  const writeTomb = (list) => { const tmp = `${tombFile}.${process.pid}.${tmpSeq++}.tmp`; fs.writeFileSync(tmp, JSON.stringify(list.slice(-5000)), { mode: 0o600 }); fs.renameSync(tmp, tombFile); };
+  const readJson = (f) => { try { return JSON.parse(fs.readFileSync(f, 'utf8')); } catch { return undefined; } };
+  const freeFile = path.join(dir, 'free-chats.json'), projFile = path.join(dir, 'projects.json');
+  const isChat = (c, set) => !!c && typeof c === 'object' && typeof c.id === 'string' && set.includes(c.id);
+  const listedAnywhere = () => {
+    const free = readJson(freeFile);
+    if (Array.isArray(free) && free.some((c) => isChat(c, ids))) return true;
+    const projects = readJson(projFile)?.projects;
+    return Array.isArray(projects) && projects.some((p) => p && Array.isArray(p.chats) && p.chats.some((c) => isChat(c, ids)));
+  };
+  const tombstoned = () => ids.some((i) => lists.readTombstones(dir).has(i));
+  const addTomb = () => { const before = readTomb(); const fresh = ids.filter((i) => !before.includes(i)); writeTomb([...before.filter((x) => !ids.includes(x)), ...ids]); return fresh; };
+  const removeFiles = () => {
+    let had = false;
+    if (safe) { const h = path.join(dir, `history-${safe}.json`); had = fs.existsSync(h); fs.rmSync(h, { force: true }); }
+    const fp = (sub, id) => path.join(dir, sub, `${sha(String(id))}.json`);
+    for (const id of ids) {
+      fs.rmSync(path.join(dir, `context-${sha(JSON.stringify(String(id)))}.json`), { force: true });
+      fs.rmSync(fp('chat-brains', id), { force: true });
+      fs.rmSync(fp('chat-partials', id), { force: true });
+    }
+    return had;
+  };
+  const note = () => journalAppend(dir, safe || raw, null, 'remove', origin);
+  const writeAtomic = (file, text) => { const tmp = `${file}.store-stub.tmp`; fs.writeFileSync(tmp, text, { mode: 0o600 }); fs.renameSync(tmp, file); };
+  let removed = false;
+  if (kind === 'unlisted') {
+    if (listedAnywhere()) return [409, { error: 'a list still holds this chat', code: 'CHAT_LISTED' }];
+    addTomb();
+    removed = true;
+  } else if (kind === 'free') {
+    const list = readJson(freeFile);
+    const items = Array.isArray(list) ? list : [];
+    const kept = items.filter((c) => !isChat(c, [raw]));
+    if (kept.length !== items.length) {
+      const fresh = addTomb();
+      try { writeAtomic(freeFile, JSON.stringify(kept, null, 2)); }
+      catch { writeTomb(readTomb().filter((x) => !fresh.includes(x))); return [500, { error: 'Internal error' }]; }
+      removed = true;
+    }
+  } else {
+    const file = readJson(projFile);
+    const projects = Array.isArray(file?.projects) ? file.projects : [];
+    const project = projects.find((p) => p && p.id === pid);
+    const chats = project && Array.isArray(project.chats) ? project.chats : [];
+    const kept = chats.filter((c) => !isChat(c, [raw]));
+    if (project && kept.length !== chats.length) {
+      const fresh = addTomb();
+      project.chats = kept;
+      for (const p of projects) server('instruction-skills.cjs').reconcile(p);
+      try { writeAtomic(projFile, JSON.stringify({ projects }, null, 2)); }
+      catch { writeTomb(readTomb().filter((x) => !fresh.includes(x))); return [500, { error: 'Internal error' }]; }
+      removed = true;
+    }
+  }
+  if (removed) { removeFiles(); note(); return [200, { deleted: true, swept: false, leftovers: 0 }]; }
+  if (tombstoned() && !listedAnywhere()) { if (removeFiles()) note(); return [200, { deleted: false, swept: true, leftovers: 0 }]; }
+  return [200, { deleted: false, swept: false, leftovers: 0 }];
+}
+
 /** The transcript ops (see the header) for a user directory that exists. */
 function historyOp(url, body, dir) {
+  if (url === '/v1/chat/delete') return chatDeleteOp(body, dir);
   const chat = typeof body.chat === 'string' ? body.chat.replace(/[^a-zA-Z0-9_-]/g, '') : '';
   if (url === '/v1/changes/read') {
     const after = body.after === undefined || body.after === null ? 0 : body.after;
@@ -253,6 +340,12 @@ function localTranscripts(dir, calls = []) {
     },
     appendIfLast: async (chat, message, entry, { origin } = {}) => run('/v1/history/append-if-last', { chat, message, entry, origin }).answer.outcome,
     removeIf: async (chat, history, { origin } = {}) => run('/v1/history/remove-if', { chat, history, origin }).answer.removed,
+    deleteChat: async (chat, { kind, projectId, origin } = {}) => {
+      const { status, answer } = run('/v1/chat/delete', { chat, kind, projectId, origin });
+      if (status === 409) return { deleted: false, swept: false, leftovers: 0, listed: true };
+      if (status !== 200) throw Object.assign(new Error(answer.error || 'store failed'), { status: 500 });
+      return answer;
+    },
   };
 }
 
@@ -282,4 +375,19 @@ function rustHistorySave(dataDir, user, rawChatId, body) {
   return answer(status, out);
 }
 
-module.exports = { startProjectStore, installProjectStore, createHandler, freePortSync, localTranscripts, historyOp, rustHistorySave };
+/** The Rust front's `DELETE /api/freechats/{id}` and `DELETE /api/projects/{p}/chats/{c}`
+ *  (noevia-rs crates/server-projects chat_delete.rs, sbstndalton/noevia#1071 slice 6), in process
+ *  over `<dataDir>/users/<user>`, for tests that delete a chat the way a browser does now that Node
+ *  refuses those routes. 200 { ok: true } | 404 { error: 'no such chat' } | 410. Resolves
+ *  { status, text } like the tests' request helpers. `projectId` null: the free list. */
+function rustChatDelete(dataDir, user, projectId, rawChatId) {
+  const answer = (status, value) => ({ status, text: JSON.stringify(value) });
+  const dir = path.join(dataDir, 'users', user);
+  if (!fs.existsSync(dir)) return answer(410, { error: 'account no longer exists' });
+  const body = projectId == null ? { chat: String(rawChatId), kind: 'free' } : { chat: String(rawChatId), kind: 'project', projectId: String(projectId) };
+  const [status, out] = chatDeleteOp(body, dir);
+  if (status !== 200) return answer(status, out);
+  return out.deleted ? answer(200, { ok: true }) : answer(404, { error: 'no such chat' });
+}
+
+module.exports = { startProjectStore, installProjectStore, createHandler, freePortSync, localTranscripts, historyOp, rustHistorySave, rustChatDelete };

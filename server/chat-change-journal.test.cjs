@@ -395,3 +395,17 @@ test('owner decision: only a history save queues a brain build; imports, appends
     assert.equal(mirror.length, 12);
   } finally { await h.done(); }
 });
+
+test('#2167 recovery notices may repeat removal without queuing brain work', async () => {
+  const h = await harness();
+  try {
+    await h.reader.poll(USER);
+    for (let i = 0; i < 2; i++) {
+      journalWrite(h.root, USER, 'qa-delete-retry', null, { op: 'remove', origin: 'remove' });
+      await h.reader.poll(USER);
+    }
+    assert.deepEqual(h.mirror, [USER + ':qa-delete-retry', USER + ':qa-delete-retry']);
+    assert.deepEqual(h.brain, []);
+    assert.equal(h.reader.cursor(USER).seq, 2);
+  } finally { await h.done(); }
+});

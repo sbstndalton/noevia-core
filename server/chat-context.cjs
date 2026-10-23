@@ -282,5 +282,4 @@ const busy=new Set();
 async function prepare(options){const key=stateFile(options.dir,options.id);if(busy.has(key))throw Error('This chat is already preparing context. Wait for that request to finish.');busy.add(key);try{return await prepareUnlocked(options);}finally{busy.delete(key);}}
 // R1 measurement, opt-in with CONTEXT_LOG=1; never breaks a chat.
 function logRound({dir,assertActive,...entry}){if(process.env.CONTEXT_LOG!=='1')return;try{const log=require('./context-log.cjs');const record=log.record(entry);assertActive?.();log.append(dir,record);}catch(e){console.warn('[context-log] write failed:',e.message);}}
-function remove(dir,id){fs.rmSync(stateFile(dir,id),{force:true});}
-module.exports={IMAGE_TOKENS,logRound,remove,tokens,read,save,runtimeLimit,resolveRuntimeLimit,recordLoad,expectedLoadSeconds,loadingStatus,waitingStatus,HOSTED_DEFAULT_LIMIT,applySummary,measure,prepare,compactContinuation,providerError,CONTEXT_FULL_TEXT,STREAM_FAILED_TEXT,STREAM_FAILED_PARTIAL_TEXT};
+module.exports={IMAGE_TOKENS,logRound,tokens,read,save,runtimeLimit,resolveRuntimeLimit,recordLoad,expectedLoadSeconds,loadingStatus,waitingStatus,HOSTED_DEFAULT_LIMIT,applySummary,measure,prepare,compactContinuation,providerError,CONTEXT_FULL_TEXT,STREAM_FAILED_TEXT,STREAM_FAILED_PARTIAL_TEXT};

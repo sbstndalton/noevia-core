@@ -355,7 +355,9 @@ function createChatHandler({
       execution.partials?.finish(keep ? { keep } : undefined);
       // A chat deleted while this reply ran leaves no context state (summaries hold conversation text).
       const id=typeof body?.chatId==='string'?require('./chat-lists.cjs').safeChatId(body.chatId):null;
-      try{const dir=currentWorkspace().dir;if(id&&require('./chat-lists.cjs').readTombstones(dir).has(id))require('./chat-context.cjs').remove(dir,id);}catch{/* best effort */}
+      // #1071 slice 6: through the store's delete (a chat in no list, already tombstoned), which removes
+      // the meter, transcript, brain note and partial under the transcript lock; Node removes none itself.
+      try{const ws=currentWorkspace();if(id&&require('./chat-lists.cjs').readTombstones(ws.dir).has(id))Promise.resolve(ws.transcripts.deleteChat(id,{kind:'unlisted',origin:'turn'})).catch(()=>{});}catch{/* best effort */}
     }
   }
 

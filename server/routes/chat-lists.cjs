@@ -4,8 +4,7 @@
 //                                          delete-old-chats sweep has had its hourly chance to run
 //   GET  /api/chats/:id/export             one chat as a Markdown file (#1471)
 //   GET  /api/chats/search?q=              the chat ids whose message text holds q (#1450)
-//   GET/POST /api/freechats                the free-chat metas, merged against tombstones
-//   DELETE /api/freechats/:id
+//   (GET/POST /api/freechats and DELETE /api/freechats/:id are the Rust front's, #1071)
 //   POST /api/chats/:id/move               { projectId: string|null, frame? } moves the meta between
 //                                          the caller's own lists (#738); the transcript stays put
 //
@@ -13,7 +12,6 @@
 // Blocks keep their original order and an unmatched method falls through as it did inline.
 
 const PASS = Symbol('unhandled');
-const { saveFailureReply } = require('../http.cjs');
 // #1450: the transcript search's bounds (one query reads at most this many chats).
 const SEARCH_MIN_QUERY = 2, SEARCH_MAX_QUERY = 200, SEARCH_MAX_CHATS = 500, SEARCH_MAX_RESULTS = 100;
 
@@ -28,11 +26,11 @@ const SEARCH_MIN_QUERY = 2, SEARCH_MAX_QUERY = 200, SEARCH_MAX_CHATS = 500, SEAR
  * @param {number} deps.STORED_HISTORY_BYTES
  * @param {() => { freeChats:object[], projects:object[] }} deps.chatLists   what the retention sweep may delete from
  * @param {(chat:{ projectId?:string, id:string }) => boolean} deps.removeChat
- * @param {object} deps.store   projects.cjs: sanitizeChats, deleteFreeChat, readHistory, moveChat
+ * @param {object} deps.store   projects.cjs: sanitizeChats, readHistory, moveChat
  * @param {(userId:string, chatId:string) => boolean} [deps.revokeChatGrant]  approvals.cjs: drops a chat's "Allow for this chat" grant
  */
 function createChatListRoutes({ json, readBody, currentWorkspace, PROJECTS, FREE_CHATS, diaryExtras, STORED_HISTORY_BYTES, chatLists, removeChat, store, revokeChatGrant = () => false }) {
-  const { sanitizeChats, deleteFreeChat, moveChat } = store;
+  const { sanitizeChats, moveChat } = store;
   // #812: a malformed percent-escape in the URL is the caller's mistake (400), not a server error.
   const decodeChatId = require('../http.cjs').decodePathPart;
   const badChatId = (res) => json(res, 400, { error: 'invalid chat id' });
@@ -127,18 +125,9 @@ function createChatListRoutes({ json, readBody, currentWorkspace, PROJECTS, FREE
       return true;
     }
 
-    // GET and POST /api/freechats are the Rust front's (sbstndalton/noevia#1071): index.cjs refuses
-    // them before this mount (rust-projects.cjs refuseOwnedRoute). A free chat's delete stays here.
-    const freeDel = p.match(/^\/api\/freechats\/([^/]+)$/);
-    if (freeDel && req.method === 'DELETE') {
-      const id = decodeChatId(freeDel[1]);
-      if (id === null) return badChatId(res);
-      // #1914: awaited, so a failed save answers its error and the transcript is kept.
-      let removed;
-      try { removed = await deleteFreeChat(id); }
-      catch (e) { if (e && e.status && e.status < 500 && e.status !== 410) throw e; return saveFailureReply(json, res, e, 'could not delete the chat; nothing was changed'); }
-      return json(res, removed ? 200 : 404, removed ? { ok: true } : { error: 'no such chat' });
-    }
+    // GET and POST /api/freechats and DELETE /api/freechats/{id} are the Rust front's
+    // (sbstndalton/noevia#1071; the delete is slice 6, one store operation): index.cjs refuses them
+    // before this mount (rust-projects.cjs refuseOwnedRoute).
 
     const moveMatch = p.match(/^\/api\/chats\/([^/]+)\/move$/);
     if (moveMatch && req.method === 'POST' && moveChat) {

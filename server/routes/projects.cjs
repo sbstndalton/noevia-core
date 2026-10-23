@@ -85,7 +85,6 @@ function createProjectRoutes({
 }) {
   const {
     getProject, saveProjects, createProject, deleteProject, whenSaved = (fn) => fn(), pruneDocuments, withSourceLock, ensureProjectFolder, indexSource, ownsFile,
-    deleteChat,
   } = store;
   // #849: a rejected storage login is its own answer, not "could not create the folder". The
   // wording is the one the refresh toast and the Settings save already use (#770); `code` lets the
@@ -1046,18 +1045,8 @@ function createProjectRoutes({
       })).catch((err) => { stats.errors += 1; logSync('error'); throw err; });
     }
 
-    const chatDel = p.match(/^\/api\/projects\/([^/]+)\/chats\/([^/]+)$/);
-    if (chatDel && req.method === 'DELETE') {
-      // #812: a malformed escape is a 400, not a server error.
-      const { decodePathPart } = require('../http.cjs');
-      const projectId = decodePathPart(chatDel[1]), chatId = decodePathPart(chatDel[2]);
-      if (projectId === null || chatId === null) return json(res, 400, { error: 'invalid chat id' });
-      // #1914: awaited, so a failed save answers its error and the transcript is kept.
-      let removed;
-      try { removed = await deleteChat(projectId, chatId); }
-      catch (e) { if (e && e.status && e.status < 500 && e.status !== 410) throw e; return saveFailureReply(json, res, e, 'could not delete the chat; nothing was changed'); }
-      return json(res, removed ? 200 : 404, removed ? { ok: true } : { error: 'no such chat' });
-    }
+    // DELETE /api/projects/{id}/chats/{chatId} is the Rust front's (sbstndalton/noevia#1071 slice 6):
+    // index.cjs refuses it before this mount (rust-projects.cjs refuseOwnedRoute).
 
     return PASS;
   }

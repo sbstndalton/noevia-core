@@ -124,19 +124,39 @@ function createProjectStore({
     return ids;
   }
 
-  // Best effort (#756): a deleted chat's brain note goes with it; never throws into the delete.
-  function removeChatBrain(dir, chatId) {
-    try { require('./chat-brain.cjs').removeBrain(dir, chatId); } catch { /* best effort */ }
+  // sbstndalton/noevia#1071 slice 6: a chat's delete is one Rust store operation (noevia-rs
+  // crates/server-projects chat_delete, through project-store-client.cjs chatDelete), run under the
+  // per-user transcript lock: the tombstone (#554), the list without the chat written by the store,
+  // and only then (#1914) the transcript, context meter, brain note and saved partial reply
+  // (#2147). A failed list save takes the tombstone back and removes nothing; the store's error is
+  // thrown (http.cjs saveFailureReply answers it). Node never removes those files itself, so a
+  // running reply's late write can no longer bring a transcript back (#2154). What Node still owns
+  // is the attachments project (#788: its RAG index files, which Node's indexer writes), removed
+  // here once the chat is gone. Returns a promise for whether a chat was deleted.
+  function deleteChat(projectId, chatId) {
+    return deleteThroughStore(chatId, { kind: 'project', projectId });
   }
 
-  function deleteChat(projectId, chatId) {
-    const p = getProject(projectId);
-    if (!p) return false;
-    const before = (p.chats || []).length;
-    p.chats = (p.chats || []).filter((c) => c.id !== chatId);
-    if (p.chats.length === before) return false;
-    // A chat that started free and was moved here (#738) keeps its attachments project (#788).
-    return removeChatAfterSave(chatId, () => saveProjects(PROJECTS));
+  async function deleteThroughStore(chatId, { kind, projectId }) {
+    const workspace = currentWorkspace();
+    if (workspace.revoked) return false;
+    workspace.assertActive?.();
+    const done = await workspace.transcripts.deleteChat(chatId, { kind, projectId, origin: 'remove' });
+    if (!done.deleted) return false;
+    refreshLists(workspace);
+    const attachments = removeChatAttachments(chatId);
+    if (attachments && typeof attachments.then === 'function') await attachments.then(() => true, () => true);
+    return true;
+  }
+
+  // The lists as the store left them (as applyChatMeta reads them again), so this request's view
+  // no longer holds the deleted chat. A save still in flight keeps its base; its merge takes the
+  // store's removal (rust-projects.cjs mergeIdList: a removal on either side wins).
+  function refreshLists(workspace) {
+    const view = typeof workspace.current === 'function' ? workspace.current() : workspace;
+    const projectsChanged = view.projectsFile ? view.projectsFile.refresh(view.projects) : false;
+    const freeChanged = view.freeChatsFile ? view.freeChatsFile.refresh(view) : false;
+    if (projectsChanged || freeChanged) onProjectsChanged(view.userId);
   }
 
   // ── A free chat's hidden attachments project (#788) ──────────────────────
@@ -182,17 +202,24 @@ function createProjectStore({
     return removed;
   }
 
-  // Deleting a project deletes its chats too (#554): tombstone each so a late reply cannot write
-  // it back, and drop the per-chat context meter and transcript. Tenant-scoped via currentWorkspace().
-  function purgeProjectChats(project) {
-    const workspace = currentWorkspace(), lists = require('./chat-lists.cjs'), context = require('./chat-context.cjs');
+  // Deleting a project deletes its chats too (#554): each one through the store's delete as a chat
+  // no list holds any more (kind 'unlisted', #1071 slice 6: tombstone, transcript, context meter,
+  // brain note, partial reply, under the transcript lock), then its attachments project. A chat
+  // that another list holds by now (moved meanwhile) is refused by the store and keeps its files.
+  // Best effort, one chat at a time; tenant-scoped (the workspace's own store client).
+  async function purgeProjectChats(project) {
+    const workspace = currentWorkspace();
     for (const chat of project?.chats || []) {
       if (!chat || typeof chat.id !== 'string') continue;
-      try { lists.addTombstone(workspace.dir, chat.id); } catch { /* best effort */ }
-      try { context.remove(workspace.dir, chat.id); } catch { /* best effort */ }
-      removeChatBrain(workspace.dir, chat.id);
-      try { fs.unlinkSync(workspace.historyPath(chat.id)); } catch { /* no history file - fine */ }
-      removeChatAttachments(chat.id);
+      try {
+        const done = await workspace.transcripts.deleteChat(chat.id, { kind: 'unlisted', origin: 'remove' });
+        if (done.listed) continue;
+      } catch (err) {
+        console.warn(`[projects] could not delete chat ${chat.id} of a deleted project: ${String((err && err.message) || err)}`);
+        continue;
+      }
+      const attachments = removeChatAttachments(chat.id);
+      if (attachments && typeof attachments.then === 'function') await attachments.catch(() => false);
     }
   }
 
@@ -303,38 +330,7 @@ function createProjectStore({
   }
 
   function deleteFreeChat(chatId) {
-    const before = FREE_CHATS.length;
-    const filtered = Array.from(FREE_CHATS).filter((c) => c.id !== chatId);
-    FREE_CHATS.splice(0, FREE_CHATS.length, ...filtered);
-    if (FREE_CHATS.length === before) return false;
-    return removeChatAfterSave(chatId, () => saveFreeChats(FREE_CHATS));
-  }
-
-  // A chat delete: tombstone first (#554: a stale tab cannot bring it back meanwhile), then the list
-  // save, and only once that is written (#1914) the transcript, context meter, brain note and
-  // attachments project. A failed save takes the tombstone back, removes nothing and rejects.
-  // Returns true, or a promise for it through the Rust project store.
-  function removeChatAfterSave(chatId, save) {
-    const workspace = currentWorkspace();
-    const lists = require('./chat-lists.cjs');
-    lists.addTombstone(workspace.dir, chatId);
-    // A synchronous failure is the flock path's (or assertActive): the tombstone stays, as it always
-    // did there (#1919). Only a failed store save, below, takes it back.
-    save();
-    const done = whenSaved(() => {
-      removeChatBrain(workspace.dir, chatId);
-      try {
-        require('./chat-context.cjs').remove(workspace.dir, chatId);
-        fs.unlinkSync(workspace.historyPath(chatId));
-      } catch {
-        /* no history file — fine */
-      }
-      const attachments = removeChatAttachments(chatId);
-      if (attachments && typeof attachments.then === 'function') return attachments.then(() => true, () => true);
-      return true;
-    });
-    if (!done || typeof done.then !== 'function') return done;
-    return done.catch((err) => { try { lists.removeTombstone(workspace.dir, chatId); } catch { /* best effort */ } throw err; });
+    return deleteThroughStore(chatId, { kind: 'free' });
   }
 
   // Project DELETE (moved here from routes/projects.cjs so a chat's attachments project, #788, is
@@ -363,8 +359,9 @@ function createProjectStore({
           fs.rmSync(path.join(workspace.ragDir(), `${id}${suffix}`), { force: true });
         }
       } catch { /* best effort */ }
-      if (removedProject) { if (purgeChats) purgeProjectChats(removedProject); sweepDeletedProject(removedProject); }
-      return true;
+      if (!removedProject) return true;
+      sweepDeletedProject(removedProject);
+      return purgeChats ? purgeProjectChats(removedProject).then(() => true) : true;
     });
   }
 

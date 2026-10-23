@@ -21,7 +21,6 @@ function fixture() {
   const store = {
     sanitizeChats: (chats) => (chats || []).filter((c) => c && typeof c === 'object' && typeof c.id === 'string'),
     saveFreeChats: (list) => { store.savedFree = Array.from(list); },
-    deleteFreeChat: (id) => { const i = freeChats.findIndex((c) => c.id === id); if (i < 0) return false; freeChats.splice(i, 1); removed.push(id); return true; },
     readHistory: (id) => histories.get(id) || [],
   };
   // sbstndalton/noevia#1071 slice 4: the transcript is written through the Rust store (its in-process
@@ -63,15 +62,13 @@ test('the workspace view hides the internal project and sanitizes chat metas', a
 
 // GET and POST /api/freechats are the Rust front's (#1071): this mount no longer has them, and
 // index.cjs refuses them first (rust-projects.test.cjs). A free chat's delete stays here.
-test('the free-chat list is not this mount\'s any more; a free chat is deleted with the original answers', async () => {
+test('the free-chat list and a free chat\'s delete are not this mount\'s any more (#1071 slice 6)', async () => {
   const f = fixture();
   for (const m of ['GET', 'POST', 'PUT']) assert.equal(await f.call(m, '/api/freechats', m === 'POST' ? { chats: [{ id: 'f2' }] } : undefined), false, m);
+  assert.equal(await f.call('DELETE', '/api/freechats/f1'), false, 'the Rust front answers the delete');
   assert.equal(f.sent.length, 0);
   assert.equal(f.store.savedFree, undefined, 'nothing saved');
-  await f.call('DELETE', '/api/freechats/f1');
-  assert.deepEqual(f.sent.pop(), { status: 200, body: { ok: true } });
-  await f.call('DELETE', '/api/freechats/f1');
-  assert.deepEqual(f.sent.pop(), { status: 404, body: { error: 'no such chat' } });
+  assert.deepEqual(f.freeChats.map((c) => c.id), ['f1'], 'nothing deleted');
 });
 
 test('#1071 slice 5: a chat\'s transcript is no longer answered here, read or save (the Rust front owns both)', async () => {

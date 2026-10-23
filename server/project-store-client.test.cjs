@@ -374,3 +374,34 @@ test('#1071 slice 4: transcripts are read and written through the store, bound t
   await assert.rejects(mine.write('c4', ['qa']), (e) => e.status === 503 && e.code === 'PROJECTS_BUSY');
   assert.equal(fs.existsSync(path.join(root, 'users', USER, 'history-c4.json')), false);
 });
+
+test('#1071 slice 6: a chat\'s delete is one store call, bound to one account; its answers and failures', async () => {
+  const sent = [];
+  const answers = [];
+  const fetchImpl = async (url, init) => { sent.push({ url, body: JSON.parse(init.body), token: init.headers['x-noevia-store-token'] }); const a = answers.shift(); if (a instanceof Error) throw a; return { status: a.status, json: async () => a.body }; };
+  const client = psc.createClient({ port: 1, token: TOKEN, fetchImpl });
+  const mine = psc.transcriptsFor(client, USER);
+  answers.push({ status: 200, body: { deleted: true, swept: false, leftovers: 0 } });
+  assert.deepEqual(await mine.deleteChat('qa-c1', { kind: 'project', projectId: 'qa-p' }), { deleted: true, swept: false, leftovers: 0 });
+  assert.deepEqual(sent.pop(), { url: 'http://127.0.0.1:1/v1/chat/delete', token: TOKEN, body: { user: USER, chat: 'qa-c1', kind: 'project', origin: 'remove', projectId: 'qa-p' } });
+  answers.push({ status: 200, body: { deleted: false, swept: true, leftovers: 1 } });
+  assert.deepEqual(await mine.deleteChat('qa-c1', { kind: 'free', projectId: 'ignored', origin: 'turn' }), { deleted: false, swept: true, leftovers: 1 });
+  assert.deepEqual(sent.pop().body, { user: USER, chat: 'qa-c1', kind: 'free', origin: 'turn' }, 'no projectId for the free list');
+  answers.push({ status: 409, body: { error: 'a list still holds this chat', code: 'CHAT_LISTED' } });
+  assert.equal((await mine.deleteChat('qa-c1', { kind: 'unlisted', origin: 'bogus' })).listed, true);
+  assert.equal(sent.pop().body.origin, 'other', 'an unknown origin is sent as other');
+  answers.push({ status: 503, body: { error: 'busy', code: 'PROJECTS_BUSY' } });
+  await assert.rejects(mine.deleteChat('qa-c1', { kind: 'free' }), (e) => e.status === 503 && e.code === 'PROJECTS_BUSY');
+  answers.push({ status: 410, body: { error: 'account no longer exists' } });
+  await assert.rejects(mine.deleteChat('qa-c1', { kind: 'free' }), (e) => e.status === 410);
+  answers.push({ status: 400, body: { error: 'invalid chat id' } });
+  await assert.rejects(mine.deleteChat('', { kind: 'free' }), (e) => e.status === 400);
+  answers.push({ status: 500, body: { error: 'Internal error' } });
+  await assert.rejects(mine.deleteChat('qa-c1', { kind: 'free' }), (e) => e.status === 500 && e.code === 'PROJECT_STORE_FAILED');
+  answers.push(new Error('ECONNREFUSED'));
+  await assert.rejects(mine.deleteChat('qa-c1', { kind: 'free' }), (e) => e.code === 'PROJECTS_BUSY');
+  assert.ok(sent.every((s) => s.body.user === USER), 'every call names the bound account only');
+  // The release pairing marker (noevia assemble-release.sh reads the quoted literal, #2161).
+  assert.equal(psc.CHAT_DELETE_CLIENT_MARKER, 'noevia-chat-delete-client/1');
+  assert.ok(fs.readFileSync(path.join(__dirname, 'project-store-client.cjs'), 'utf8').includes(`'${psc.CHAT_DELETE_CLIENT_MARKER}'`));
+});

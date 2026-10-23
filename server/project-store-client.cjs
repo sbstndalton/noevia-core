@@ -16,6 +16,11 @@
 // index.cjs refuses to start without them; Node has no other way to save either file.
 
 const MAX_ATTEMPTS = 8;
+// sbstndalton/noevia#1071 slice 6 (and #2161's explicit markers): this core deletes chats only
+// through the store's chat/delete. noevia deploy/tools/assemble-release.sh pairs it with a front
+// whose store carries "noevia-chat-delete-store/1" (and refuses the reverse pairings). Keep the
+// quoted literal: the release check reads it from this file.
+const CHAT_DELETE_CLIENT_MARKER = 'noevia-chat-delete-client/1';
 const TIMEOUT_MS = 10000;
 const REPLY_CAP = 2 * 32 * 1024 * 1024 + 64 * 1024;
 const FILES = new Set(['projects.json', 'free-chats.json']);
@@ -116,6 +121,23 @@ function createClient({ port, token, fetchImpl = globalThis.fetch, timeoutMs = T
       if (status === 200 && body && typeof body.removed === 'boolean') return body.removed;
       throw historyFailure(status, body);
     },
+    /** sbstndalton/noevia#1071 slice 6: a chat's whole delete, one store operation under the
+     *  transcript lock (noevia-rs crates/server-projects chat_delete): the tombstone, the list
+     *  without the chat (written by the store), then the transcript, context meter, brain note and
+     *  saved partial reply. `kind`: 'free', 'project' (with `projectId`) or 'unlisted' (a deleted
+     *  project's chat, which no list holds any more). { deleted, swept, leftovers }: `deleted`
+     *  taken out of its list now; `swept` already deleted and in no list, its leftover files
+     *  removed; neither: no such chat. A failed list save takes the tombstone back and removes
+     *  nothing (failure()); 'unlisted' for a chat a list still holds is { listed: true }. Node
+     *  never removes those files itself. */
+    async chatDelete(user, chat, { kind, projectId, origin = 'remove' } = {}) {
+      const payload = { user, chat, kind, origin: originOf(origin) };
+      if (kind === 'project') payload.projectId = projectId;
+      const { status, body } = await call('chat/delete', payload);
+      if (status === 200 && body && typeof body.deleted === 'boolean') return { deleted: body.deleted, swept: body.swept === true, leftovers: Number(body.leftovers) || 0 };
+      if (status === 409 && body && body.code === 'CHAT_LISTED') return { deleted: false, swept: false, leftovers: 0, listed: true };
+      throw historyFailure(status, body);
+    },
     /** sbstndalton/noevia#2153: the user's chat change journal after `after` (chat-change-journal.cjs):
      *  { entries, oldestSeq, latestSeq, more, start }, or { unsupported: true } from a store
      *  without the op (404: an older Rust front). */
@@ -152,6 +174,8 @@ function transcriptsFor(client, user) {
     write: (chat, history, options) => client.historyWrite(user, chat, history, options),
     appendIfLast: (chat, message, entry, options) => client.historyAppendIfLast(user, chat, message, entry, options),
     removeIf: (chat, history, options) => client.historyRemoveIf(user, chat, history, options),
+    // sbstndalton/noevia#1071 slice 6: the chat's whole delete (project-store-client chatDelete).
+    deleteChat: (chat, options) => client.chatDelete(user, chat, options),
   };
 }
 
@@ -228,4 +252,4 @@ function holdForStoreSaves(res, saves) {
   };
 }
 
-module.exports = { HISTORY_ORIGINS, enabledFrom, createClient, clientFromEnv, createQueue, busy, failureReply, holdForStoreSaves, transcriptsFor, MAX_ATTEMPTS, TIMEOUT_MS };
+module.exports = { CHAT_DELETE_CLIENT_MARKER, HISTORY_ORIGINS, enabledFrom, createClient, clientFromEnv, createQueue, busy, failureReply, holdForStoreSaves, transcriptsFor, MAX_ATTEMPTS, TIMEOUT_MS };

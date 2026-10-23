@@ -40,6 +40,8 @@ function createStubStore(root, { flat = false } = {}) {
     historyWrite: (user, chat, history, options) => transcripts(user).write(chat, history, options),
     historyAppendIfLast: (user, chat, message, entry, options) => transcripts(user).appendIfLast(chat, message, entry, options),
     historyRemoveIf: (user, chat, history, options) => transcripts(user).removeIf(chat, history, options),
+    // #1071 slice 6: a chat's whole delete, as the stand-in answers it.
+    chatDelete: (user, chat, options) => transcripts(user).deleteChat(chat, options),
   };
 }
 
