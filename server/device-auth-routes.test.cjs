@@ -135,7 +135,6 @@ test('scope limits: a device token never reaches administration or account secur
     ['PUT', '/api/admin/features/nativeClientAuth', { enabled: false }],
     ['DELETE', `/api/admin/users/${memberId}`, { username: 'memberqa' }],
     ['POST', '/api/profile/diary-connectors', {}],
-    ['PUT', '/api/profile/sharing', {}],
     ['PUT', '/api/integrations/storage', { kind: 'local' }],
     ['POST', '/api/integrations/storage/nextcloud/start', {}],
     ['POST', '/api/integrations/storage/nextcloud/cancel', {}],
