@@ -22,34 +22,17 @@ function persistedChatIds(dir) {
   const free = readJson(path.join(dir, 'free-chats.json'), []);
   return new Set([...free, ...projects.flatMap(p => p.chats || [])].map(c => c.id));
 }
-function sameFile(a, b) {
-  const x = fs.statSync(a), y = fs.statSync(b);
-  return x.dev === y.dev && x.ino === y.ino;
-}
-function requireHardLinks(directory) {
-  const token = `.conversation-import-link-${process.pid}-${crypto.randomBytes(6).toString('hex')}`;
-  const source = path.join(directory, token), target = source + '.linked';
-  try {
-    fs.writeFileSync(source, token, { flag: 'wx', mode: 0o600 });
-    fs.linkSync(source, target);
-  } catch (error) {
-    if (['EPERM', 'ENOTSUP', 'EXDEV'].includes(error.code)) {
-      throw Object.assign(Error('Conversation imports require hard-link support'), {
-        status: 503,
-        publicMessage: 'Conversation imports are unavailable because this storage does not support safe file promotion.',
-      });
-    }
-    throw error;
-  } finally {
-    try { fs.unlinkSync(target); } catch {}
-    try { fs.unlinkSync(source); } catch {}
-  }
-}
-function publishStaged(staged, target) {
-  try { fs.linkSync(staged, target); }
-  catch (error) {
-    if (error.code !== 'EEXIST' || !sameFile(staged, target)) throw error;
-  }
+// sbstndalton/noevia#1071 slice 4: a staged transcript is published through the Rust store (its only
+// writer; ctx.transcripts, the account's own), never by linking or writing the file here. The store
+// writes it only if no transcript is there (`ifAbsent`), under its lock, and answers what is there
+// otherwise: the same transcript (`revision === proposedRevision`: this import's own, published before
+// a crash) counts as published; anything else keeps its file and the chat gets a new id. Taking one
+// back (a chat deleted, or over the list cap, meanwhile) removes it only while it is still exactly what
+// this import published (`removeIf`), never a transcript saved since.
+const MAX_ID_ATTEMPTS = 100;
+function stagedHistory(directory, file) {
+  const value = readJson(path.join(directory, file.stage), null);
+  return Array.isArray(value?.history) ? value.history : [];
 }
 function resultFor(record) {
   const capped = record.capped || [];
@@ -86,15 +69,17 @@ async function applyRecord(directory, record, ctx, newId) {
     active = active.filter(c => !visible.has(c.id) && !deleted.has(c.id));
     for (const chat of active) {
       const file = record.files.find(f => f.id === chat.id);
-      const staged = path.join(directory, file.stage);
-      let target = ctx.historyPath(chat.id);
-      if (fs.existsSync(target) && !sameFile(staged, target)) {
+      const history = stagedHistory(directory, file);
+      let published = await ctx.transcripts.write(chat.id, history, { ifAbsent: true });
+      for (let attempt = 0; published.conflict && published.revision !== published.proposedRevision; attempt++) {
         // Never overwrite a pre-existing unlisted transcript or a concurrent file.
+        if (attempt >= MAX_ID_ATTEMPTS) throw Error('Could not find a free conversation id');
         let id;
-        do { id = newId(); } while (visible.has(id) || deleted.has(id) || record.files.some(f => f.id === id) || fs.existsSync(ctx.historyPath(id)));
-        file.id = id; chat.id = id; target = ctx.historyPath(id); save();
+        do { id = newId(); } while (visible.has(id) || deleted.has(id) || record.files.some(f => f.id === id));
+        file.id = id; chat.id = id; save();
+        published = await ctx.transcripts.write(id, history, { ifAbsent: true });
       }
-      publishStaged(staged, target);
+      // `deleted`: tombstoned meanwhile; nothing was written, and the final pass reports it.
     }
     // Merge-only collaborators preserve unrelated edits. Repeating these writes
     // after a crash is safe; durable membership is checked on every recovery.
@@ -118,17 +103,14 @@ async function applyRecord(directory, record, ctx, newId) {
     }
   }
   // A deleted imported chat may have left a file when its own unlink failed.
-  // Remove only our inode, only if tombstoned and still absent from durable lists.
+  // Remove only what this import published, only if tombstoned and still absent from durable lists.
   const visible = ctx.persistedChatIds(), deleted = ctx.tombstones();
   for (const file of record.files) {
-    const target = ctx.historyPath(file.id), staged = path.join(directory, file.stage);
-    if (deleted.has(file.id) && !visible.has(file.id) && fs.existsSync(target) && sameFile(staged, target)) fs.unlinkSync(target);
+    if (deleted.has(file.id) && !visible.has(file.id)) await ctx.transcripts.removeIf(file.id, stagedHistory(directory, file));
   }
   const capped = new Set((record.capped || []).map(c => c.id));
   for (const file of record.files) {
-    if (!capped.has(file.id)) continue;
-    const target = ctx.historyPath(file.id), staged = path.join(directory, file.stage);
-    if (fs.existsSync(target) && sameFile(staged, target)) fs.unlinkSync(target);
+    if (capped.has(file.id)) await ctx.transcripts.removeIf(file.id, stagedHistory(directory, file));
   }
   if (record.files.some(f => !visible.has(f.id) && !deleted.has(f.id) && !capped.has(f.id))) throw Error('Import metadata was not committed');
   const result = resultFor(record);
@@ -144,7 +126,7 @@ async function importConversations(data, ctx, newId, onComplete = () => {}) {
   const work = previous.catch(() => {}).then(async () => {
     const planning = () => planImport(data, { existingChatIds: ctx.existingChatIds(), tombstones: ctx.tombstones(), projects: ctx.projects(), newId });
     planning(); // Reject invalid input before recovering or writing anything.
-    requireHardLinks(ctx.directory); // Fail before creating/recovering a journal on unsupported storage.
+    if (typeof ctx.transcripts?.write !== 'function') throw Error('the transcript store is not available: nothing is imported (Node never writes a transcript itself)');
     const fingerprint = crypto.createHash('sha256').update(JSON.stringify(data)).digest('hex');
     const root = path.join(ctx.directory, 'conversation-imports');
     fs.mkdirSync(root, { recursive: true, mode: 0o700 });

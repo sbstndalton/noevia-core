@@ -167,7 +167,8 @@ const importRoutes = require('./routes/import.cjs').createImportRoutes({
       existingChatIds: () => new Set([...Array.from(FREE_CHATS), ...PROJECTS.flatMap((proj) => proj.chats || [])].map((c) => c.id)),
       tombstones: () => lists.readTombstones(currentWorkspace().dir),
       directory: currentWorkspace().dir,
-      historyPath: (id) => currentWorkspace().historyPath(id),
+      // sbstndalton/noevia#1071 slice 4: transcripts are published through the Rust store only.
+      transcripts: currentWorkspace().transcripts,
       persistedChatIds: () => require('./conversation-import.cjs').persistedChatIds(currentWorkspace().dir),
       addFreeChats: (chats) => { FREE_CHATS.splice(0, FREE_CHATS.length, ...lists.mergeChats(Array.from(FREE_CHATS), chats, lists.readTombstones(currentWorkspace().dir))); saveFreeChats(FREE_CHATS); },
       addProjectChats: (projectId, chats) => saveChats(projectId, chats),
@@ -582,7 +583,7 @@ const projectStore = require('./projects.cjs').createProjectStore({
 });
 const {
   saveProjects, getProject, sanitizeChats, loadChats, saveChats, deleteChat, saveFreeChats, deleteFreeChat, createProject,
-  readHistory, writeHistory, ownsFile, ensureProjectFolder, withSourceLock, pruneDocuments, writeProjectTextFile, sweepDeletedProject, indexSource,
+  readHistory, ownsFile, ensureProjectFolder, withSourceLock, pruneDocuments, writeProjectTextFile, sweepDeletedProject, indexSource,
 } = projectStore;
 // ── MCP toolboxes (master step 15): curated in mcp-toolbox-manifest.cjs ─────────
 const MCP_TOOLBOX_MANIFEST = require('./mcp-toolbox-manifest.cjs').buildToolboxManifest({ features });

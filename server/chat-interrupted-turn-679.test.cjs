@@ -27,8 +27,11 @@ const toolCall = (name, args, id) => sse({ choices: [{ delta: { tool_calls: [{ i
 const DISCONNECT = Symbol('disconnect');
 const tick = () => new Promise((r) => setImmediate(r));
 
+// sbstndalton/noevia#1071 slice 4: the transcript is written by the Rust store; here its in-process
+// stand-in (tests/server/project-store-server.cjs), with the same append-if-last rule.
+const { localTranscripts } = require('../tests/server/project-store-server.cjs');
 function workspaceAt(dir, userId) {
-  return { userId, dir, assetDir: () => '/synthetic-only', historyPath: (id) => path.join(dir, `history-${String(id).replace(/[^a-zA-Z0-9_-]/g, '')}.json`) };
+  return { userId, dir, assetDir: () => '/synthetic-only', historyPath: (id) => path.join(dir, `history-${String(id).replace(/[^a-zA-Z0-9_-]/g, '')}.json`), transcripts: localTranscripts(dir) };
 }
 const readStored = (ws, id) => { try { return JSON.parse(fs.readFileSync(ws.historyPath(id), 'utf8')).history; } catch { return null; } };
 const store = (ws, id, history) => fs.writeFileSync(ws.historyPath(id), JSON.stringify({ history }));
@@ -222,7 +225,7 @@ test('an error caused by the disconnect (an aborted round-2 compaction) does not
   assert.equal(history[1].paused, undefined);
 });
 
-test('the record follows the stream the way the client does', () => {
+test('the record follows the stream the way the client does', async () => {
   const r = createTurnRecord();
   r.observe({ type: 'meta', route: 'smart', routingDecision: { role: 'smart' } });
   r.observe({ type: 'delta', text: 'I will check first.' });
@@ -253,7 +256,7 @@ test('the record follows the stream the way the client does', () => {
   const declined = createTurnRecord();
   declined.observe({ type: 'paused', reason: 'declined', applied: 0, declined: ['synthetic_append', 'bad name"'] });
   assert.deepEqual(declined.assistantEntry().paused, { reason: 'declined', applied: 0, declined: ['synthetic_append'] });
-  assert.equal(saveInterruptedTurn({ fs, workspace: null, chatId: 'x', message: 'm', entry: {} }), 'no-chat');
+  assert.equal(await saveInterruptedTurn({ workspace: null, chatId: 'x', message: 'm', entry: {} }), 'no-chat');
 });
 
 test('#1438: a saved interrupted turn keeps the cause of a check that could not answer, and nothing else', () => {
@@ -273,4 +276,51 @@ test('#1438: a saved interrupted turn keeps the cause of a check that could not 
   malformed.observe({ type: 'meta', route: 'local', routing: { route: 'local', reason: 'check-unavailable', detail: 'Bad Cause!' } });
   malformed.observe({ type: 'delta', text: 'Answer.' });
   assert.deepEqual(malformed.assistantEntry().routeTarget, { route: 'local', reason: 'check-unavailable' });
+});
+
+// sbstndalton/noevia#1071 slice 4: the store is the only writer of the transcript. Without it, or when it
+// refuses, the interrupted reply is not kept and nothing writes the file itself.
+test('the interrupted reply goes through the transcript store and fails closed without it', async (t) => {
+  const unavailable = harness(t, { workspaces: (_n, a) => ({ ...a, transcripts: { appendIfLast: async () => { throw Object.assign(new Error('The project store is busy. Try again shortly.'), { status: 503 }); } } }) });
+  store(unavailable.a, 'chat-679', [USER]);
+  const before = fs.readFileSync(unavailable.a.historyPath('chat-679'), 'utf8');
+  const warned = [];
+  t.mock.method(console, 'warn', (...args) => { warned.push(args.join(' ')); });
+  unavailable.state.turns.push([say('Steam'), DISCONNECT]);
+  await unavailable.send({ message: USER.content });
+  assert.equal(fs.readFileSync(unavailable.a.historyPath('chat-679'), 'utf8'), before, 'no local fallback write');
+  assert.ok(warned.some((w) => /could not keep an interrupted reply/.test(w)), warned.join('\n'));
+  assert.deepEqual(fs.readdirSync(unavailable.a.dir).filter((n) => n.endsWith('.tmp')), [], 'no temp file left');
+  // S1: the transcript did not take the reply, so its partial is kept (unmarked) as the only copy.
+  const { partialFor, readPartial } = require('./chat-partial.cjs');
+  const kept = partialFor(unavailable.a.dir, 'chat-679');
+  assert.equal(kept?.content, 'Steam', JSON.stringify(kept));
+  assert.equal(kept.interrupted, true);
+  assert.equal('running' in readPartial(unavailable.a.dir, 'chat-679'), false, 'no running marker after the turn ended');
+
+  // S1: the store has no user message to append after ('no-user-message'): the partial is kept too.
+  const missing = harness(t, { workspaces: (_n, a) => ({ ...a, transcripts: { appendIfLast: async () => 'no-user-message' } }) });
+  t.mock.method(console, 'log', () => {});
+  missing.state.turns.push([say('Steam rises'), DISCONNECT]);
+  await missing.send({ message: USER.content });
+  assert.equal(partialFor(missing.a.dir, 'chat-679')?.content, 'Steam rises');
+  assert.equal('running' in readPartial(missing.a.dir, 'chat-679'), false);
+
+  // The success path still clears it.
+  const fine = harness(t);
+  store(fine.a, 'chat-679', [USER]);
+  fine.state.turns.push([say('Steam'), DISCONNECT]);
+  await fine.send({ message: USER.content });
+  assert.equal(partialFor(fine.a.dir, 'chat-679'), null, 'a kept reply clears its partial');
+
+  const ws = workspaceAt(fs.mkdtempSync(path.join(os.tmpdir(), 'noevia-679-store-')), 'synthetic-user-c');
+  t.after(() => fs.rmSync(ws.dir, { recursive: true, force: true }));
+  store(ws, 'c1', [USER]);
+  await assert.rejects(saveInterruptedTurn({ workspace: { ...ws, transcripts: undefined }, chatId: 'c1', message: USER.content, entry: { role: 'assistant', content: 'x' } }), /transcript store is not available/);
+  assert.deepEqual(readStored(ws, 'c1'), [USER]);
+  const calls = [];
+  const recorded = { ...ws, transcripts: require('../tests/server/project-store-server.cjs').localTranscripts(ws.dir, calls) };
+  assert.equal(await saveInterruptedTurn({ workspace: recorded, chatId: 'c1!', message: USER.content, entry: { role: 'assistant', content: 'qa kept' } }), 'saved');
+  assert.deepEqual(calls.map((c) => [c.url, c.body.chat]), [['/v1/history/append-if-last', 'c1']], 'the reduced id, one store op');
+  assert.equal(await saveInterruptedTurn({ workspace: recorded, chatId: 'c1', message: USER.content, entry: { role: 'assistant', content: 'qa again' } }), 'not-last', 'a retry finds its reply already kept');
 });

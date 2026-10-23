@@ -6,8 +6,9 @@
 //   GET  /api/chats/search?q=              the chat ids whose message text holds q (#1450)
 //   GET/POST /api/freechats                the free-chat metas, merged against tombstones
 //   DELETE /api/freechats/:id
-//   POST /api/chats/:id/history            saves the transcript, with a revision for optimistic saves
-//                                          (the GET is the Rust front's, sbstndalton/noevia#1071)
+//   POST /api/chats/:id/history            saves the transcript through the Rust store (its only writer),
+//                                          with a revision for optimistic saves (the GET is the Rust
+//                                          front's, sbstndalton/noevia#1071)
 //   POST /api/chats/:id/move               { projectId: string|null, frame? } moves the meta between
 //                                          the caller's own lists (#738); the transcript stays put
 //
@@ -27,16 +28,14 @@ const SEARCH_MIN_QUERY = 2, SEARCH_MAX_QUERY = 200, SEARCH_MAX_CHATS = 500, SEAR
  * @param {object[]} deps.PROJECTS
  * @param {object[]} deps.FREE_CHATS
  * @param {object} deps.diaryExtras
- * @param {object} deps.crypto
  * @param {number} deps.STORED_HISTORY_BYTES
- * @param {number} deps.STORED_HISTORY_CAP
  * @param {() => { freeChats:object[], projects:object[] }} deps.chatLists   what the retention sweep may delete from
  * @param {(chat:{ projectId?:string, id:string }) => boolean} deps.removeChat
- * @param {object} deps.store   projects.cjs: sanitizeChats, deleteFreeChat, readHistory, writeHistory, moveChat
+ * @param {object} deps.store   projects.cjs: sanitizeChats, deleteFreeChat, readHistory, moveChat
  * @param {(userId:string, chatId:string) => boolean} [deps.revokeChatGrant]  approvals.cjs: drops a chat's "Allow for this chat" grant
  */
-function createChatListRoutes({ json, readBody, currentWorkspace, PROJECTS, FREE_CHATS, diaryExtras, crypto, STORED_HISTORY_BYTES, STORED_HISTORY_CAP, chatLists, removeChat, store, revokeChatGrant = () => false }) {
-  const { sanitizeChats, deleteFreeChat, readHistory, writeHistory, moveChat } = store;
+function createChatListRoutes({ json, readBody, currentWorkspace, PROJECTS, FREE_CHATS, diaryExtras, STORED_HISTORY_BYTES, chatLists, removeChat, store, revokeChatGrant = () => false }) {
+  const { sanitizeChats, deleteFreeChat, moveChat } = store;
   // #812: a malformed percent-escape in the URL is the caller's mistake (400), not a server error.
   const decodeChatId = require('../http.cjs').decodePathPart;
   const badChatId = (res) => json(res, 400, { error: 'invalid chat id' });
@@ -175,35 +174,39 @@ function createChatListRoutes({ json, readBody, currentWorkspace, PROJECTS, FREE
       if (rawId === null) return badChatId(res);
       const spaceId = require('../chat-lists.cjs').safeChatId(rawId);
       if (!spaceId) return json(res, 400, { error: 'invalid chat id' });
-      // The revision must stay byte for byte what the Rust front's GET answers (noevia-rs
-      // crates/server-projects history: sha256 hex of JSON.stringify(history)).
-      const revisionOf = (history) => crypto.createHash('sha256').update(JSON.stringify(history)).digest('hex');
       // GET (the transcript and #1507's interrupted `partial`) is the Rust front's (sbstndalton/noevia#1071):
       // index.cjs refuses it before this mount (rust-projects.cjs refuseOwnedRoute).
       if (req.method === 'POST') {
-        // A reply that finishes after its chat was deleted must not write the transcript back.
+        // A reply that finishes after its chat was deleted must not write the transcript back. Checked
+        // here first (before the body is read, as before) and again by the store under its lock.
         if (require('../chat-lists.cjs').readTombstones(currentWorkspace().dir).has(spaceId)) return json(res, 410, { error: 'This chat was deleted.' });
         let raw;
         try { raw = await readBody(req, STORED_HISTORY_BYTES); }
         catch (e) { return json(res, e.status || 400, { error: e.status === 413 ? 'This chat is too large to save; start a new chat to keep going.' : 'could not read the chat' }); }
+        let body;
+        try { body = JSON.parse(raw); } catch { return json(res, 400, { error: 'invalid JSON' }); }
+        if (!body || typeof body !== 'object' || Array.isArray(body)) return json(res, 400, { error: 'request body must be a JSON object' });
+        // sbstndalton/noevia#1071 slice 4: saving a body without a list erased the chat (it saved []).
+        if (!Array.isArray(body.history)) return json(res, 400, { error: 'history must be a list' });
+        // sbstndalton/noevia#1071 slice 4: the Rust store writes the transcript (Node never does). It
+        // keeps the last STORED_HISTORY_CAP entries, sanitised as chat-sources.cjs sanitizeHistory does,
+        // and applies the optimistic concurrency in one hold of its lock: a save based on an older copy
+        // (another device saved meanwhile) gets the current copy back to merge; a save without a base
+        // revision is accepted as before. It also supersedes the saved partial reply unless that reply
+        // still runs (#1507; the running marker, per account).
+        let saved;
         try {
-          const body = JSON.parse(raw);
-          if (!body || typeof body !== 'object' || Array.isArray(body)) return json(res, 400, { error: 'request body must be a JSON object' });
-          // Optimistic concurrency: a save based on an older copy (another device saved meanwhile)
-          // gets the current copy back to merge. Saves without a base revision are accepted as before.
-          if (typeof body.baseRevision === 'string') {
-            const current = readHistory(spaceId);
-            const revision = revisionOf(current);
-            if (body.baseRevision !== revision) return json(res, 409, { error: 'This chat changed on another device.', history: current, revision });
-          }
-          const next = Array.isArray(body.history) ? require('../chat-sources.cjs').sanitizeHistory(body.history.slice(-STORED_HISTORY_CAP)) : [];
-          writeHistory(spaceId, next);
-          // #1507: a transcript saved by the client (not by a running reply) supersedes a saved partial.
-          require('../chat-partial.cjs').supersedePartial(currentWorkspace().dir, spaceId);
-          return json(res, 200, { ok: true, revision: revisionOf(next) });
-        } catch {
-          return json(res, 400, { error: 'invalid JSON' });
+          saved = await currentWorkspace().transcripts.write(spaceId, body.history, { baseRevision: typeof body.baseRevision === 'string' ? body.baseRevision : undefined, supersedePartial: true });
+        } catch (err) {
+          if (err && err.status === 400) return json(res, 400, { error: 'invalid JSON' });
+          const f = require('../project-store-client.cjs').failureReply(err);
+          if (f.status === 500) console.error('[chat] could not save a transcript through the store:', err?.message || err);
+          for (const [k, v] of Object.entries(f.headers)) res.setHeader?.(k, v);
+          return json(res, f.status, f.body);
         }
+        if (saved.deleted) return json(res, 410, { error: 'This chat was deleted.' });
+        if (saved.conflict) return json(res, 409, { error: 'This chat changed on another device.', history: saved.history, revision: saved.revision });
+        return json(res, 200, { ok: true, revision: saved.revision });
       }
     }
     return PASS;

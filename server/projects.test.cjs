@@ -87,7 +87,8 @@ test('chat metas are sanitized on read and deleting one leaves a tombstone and r
   project.chats = [{ id: 'c1', title: 'one' }, 'orphan-id'];
   assert.deepEqual(f.store.loadChats(project.id).map((c) => c.id), ['c1']);
   assert.deepEqual(f.store.loadChats('missing'), []);
-  f.store.writeHistory('c1', [{ role: 'user', content: 'hi' }]);
+  // The transcript as the Rust store wrote it (#1071 slice 4: Node never writes it).
+  fs.writeFileSync(f.workspace.historyPath('c1'), JSON.stringify({ history: [{ role: 'user', content: 'hi' }] }));
   assert.deepEqual(f.store.readHistory('c1'), [{ role: 'user', content: 'hi' }]);
   assert.equal(f.store.deleteChat(project.id, 'c1'), true);
   assert.equal(f.store.deleteChat(project.id, 'c1'), false);
@@ -99,8 +100,9 @@ test('chat metas are sanitized on read and deleting one leaves a tombstone and r
 test('free chats delete the same way and history keys are sanitized', () => {
   const f = fixture();
   f.workspace.freeChats.push({ id: 'f1' }, { id: 'f2' });
-  f.store.writeHistory('f1/../x', []);
-  assert.ok(fs.existsSync(path.join(f.dir, 'f1x.json')), 'path characters are stripped from the history key');
+  fs.writeFileSync(path.join(f.dir, 'f1x.json'), JSON.stringify({ history: ['qa'] }));
+  assert.deepEqual(f.store.readHistory('f1/../x'), ['qa'], 'path characters are stripped from the history key');
+  assert.equal(f.store.writeHistory, undefined, '#1071 slice 4: no local transcript writer');
   assert.equal(f.store.deleteFreeChat('f1'), true);
   assert.deepEqual(f.workspace.freeChats.map((c) => c.id), ['f2']);
   assert.equal(f.store.deleteFreeChat('f1'), false);

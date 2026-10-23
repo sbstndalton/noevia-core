@@ -331,3 +331,46 @@ test('the queue: a save that settled is no longer pending for the code awaiting 
   await Promise.all([gate, one]);
   assert.equal(runs, 1);
 });
+
+// sbstndalton/noevia#1071 slice 4: the transcript ops over HTTP (the loopback stand-in of the Rust store,
+// tests/server/project-store-server.cjs, same protocol as noevia-rs src/project_store.rs /v1/history/*).
+test('#1071 slice 4: transcripts are read and written through the store, bound to one account, fail closed', async (t) => {
+  const { startProjectStore } = require('../tests/server/project-store-server.cjs');
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'noevia-history-store-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const OTHER = '99999999-2222-4333-8444-555555555555';
+  for (const u of [USER, OTHER]) fs.mkdirSync(path.join(root, 'users', u), { recursive: true });
+  const store = await startProjectStore(root);
+  t.after(() => store.close());
+  const client = psc.createClient({ port: store.port, token: store.token, timeoutMs: 2000 });
+  const mine = psc.transcriptsFor(client, USER), theirs = psc.transcriptsFor(client, OTHER);
+  const empty = await mine.read('c1');
+  assert.deepEqual(empty, { history: [], revision: sha('[]'), exists: false });
+  const saved = await mine.write('c1', [{ role: 'user', content: 'qa mine' }], { baseRevision: empty.revision });
+  assert.deepEqual(saved, { ok: true, revision: sha(JSON.stringify([{ role: 'user', content: 'qa mine' }])) });
+  const stale = await mine.write('c1', ['qa other'], { baseRevision: empty.revision });
+  assert.equal(stale.conflict, true);
+  assert.deepEqual(stale.history, [{ role: 'user', content: 'qa mine' }]);
+  assert.equal(stale.revision, saved.revision);
+  assert.deepEqual(await theirs.read('c1'), empty, 'another account never sees it');
+  assert.equal(await theirs.appendIfLast('c1', 'qa mine', { role: 'assistant', content: 'x' }), 'no-user-message');
+  assert.equal(await mine.appendIfLast('c1', 'qa mine', { role: 'assistant', content: 'qa kept' }), 'saved');
+  assert.equal((await mine.read('c1')).history.length, 2);
+  assert.equal(await mine.removeIf('c1', ['nope']), false);
+  require('./chat-lists.cjs').addTombstone(path.join(root, 'users', USER), 'c1');
+  assert.deepEqual(await mine.write('c1', []), { deleted: true });
+  assert.equal(await mine.appendIfLast('c1', 'qa mine', { role: 'assistant' }), 'deleted');
+  await assert.rejects(mine.write('c2', { not: 'a list' }), (e) => e.status === 400);
+  // A removed account: 410, and its directory is not made again.
+  const gone = psc.transcriptsFor(client, '22222222-2222-4333-8444-555555555555');
+  await assert.rejects(gone.write('c1', []), (e) => e.status === 410);
+  assert.equal(fs.existsSync(path.join(root, 'users', '22222222-2222-4333-8444-555555555555')), false);
+  // Another start's secret, or none: refused as a store failure, nothing written.
+  const wrong = psc.transcriptsFor(psc.createClient({ port: store.port, token: 'synthetic-previous-start-token-0123456789' }), USER);
+  await assert.rejects(wrong.write('c3', ['qa']), (e) => e.status === 500 && e.code === 'PROJECT_STORE_FAILED');
+  assert.equal(fs.existsSync(path.join(root, 'users', USER, 'history-c3.json')), false);
+  // The store unreachable: busy (503), never a local write.
+  await store.close();
+  await assert.rejects(mine.write('c4', ['qa']), (e) => e.status === 503 && e.code === 'PROJECTS_BUSY');
+  assert.equal(fs.existsSync(path.join(root, 'users', USER, 'history-c4.json')), false);
+});

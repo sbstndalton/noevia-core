@@ -60,9 +60,10 @@ test('S3/S4: history route sanitizes ids like storage, honours tombstones, rejec
     const writes = [];
     const route = createChatListRoutes({
       json: (_r, status, body) => { captured.push({ status, body }); return true; },
-      readBody: async (req) => req.body, currentWorkspace: () => ({ dir }), PROJECTS: [], FREE_CHATS: [], diaryExtras: {}, crypto,
-      STORED_HISTORY_BYTES: 1e6, STORED_HISTORY_CAP: 100, chatLists: () => ({ freeChats: [], projects: [] }), removeChat: () => true,
-      store: { sanitizeChats: (c) => c, saveFreeChats() {}, deleteFreeChat() {}, readHistory: () => [], writeHistory: (id) => writes.push(id) },
+      // #1071 slice 4: the transcript is written through the store (its stand-in here), never by the route.
+      readBody: async (req) => req.body, currentWorkspace: () => ({ dir, transcripts: { write: async (id) => { writes.push(id); return { ok: true, revision: 'r' }; } } }), PROJECTS: [], FREE_CHATS: [], diaryExtras: {},
+      STORED_HISTORY_BYTES: 1e6, chatLists: () => ({ freeChats: [], projects: [] }), removeChat: () => true,
+      store: { sanitizeChats: (c) => c, saveFreeChats() {}, deleteFreeChat() {}, readHistory: () => [] },
     });
     const send = (rawId, body = '{"history":[]}') => route({ method: 'POST', body }, {}, { path: `/api/chats/${encodeURIComponent(rawId)}/history` }).then(() => captured.at(-1));
     assert.equal((await send('chat-a1..')).status, 410);
