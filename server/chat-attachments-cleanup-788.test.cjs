@@ -18,18 +18,39 @@ const lists = require('./chat-lists.cjs');
 const CONTEXT = (chatId) => `cowork-chat-context-${chatId}`;
 const tick = () => new Promise((r) => setImmediate(r));
 
+function storeDelete(ws, chatId, kind, projectId) {
+  const none = { deleted: false, swept: false, leftovers: 0 };
+  const held = (list) => Array.isArray(list) && list.some((c) => c && c.id === chatId);
+  if (kind === 'unlisted') {
+    if (held(ws.freeChats) || ws.projects.some((p) => held(p.chats))) return { ...none, listed: true };
+    lists.addTombstone(ws.dir, chatId);
+    return { ...none, deleted: true };
+  }
+  const owner = kind === 'free' ? ws : ws.projects.find((p) => p.id === projectId);
+  const key = kind === 'free' ? 'freeChats' : 'chats';
+  if (!owner || !held(owner[key])) return none;
+  lists.addTombstone(ws.dir, chatId);
+  owner[key] = owner[key].filter((c) => !(c && c.id === chatId));
+  return { ...none, deleted: true };
+}
+
 function fixture() {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'noevia-788-'));
   const make = (userId) => {
     const dir = path.join(root, userId);
     fs.mkdirSync(dir, { recursive: true });
-    return {
+    const ws = {
       dir, userId, projects: [], freeChats: [], saved: 0,
       saveProjects() { this.saved += 1; }, saveFreeChats() {},
+      // #1071 slice 6: a double of the Rust store's chat delete over this fake workspace's
+      // in-memory lists (the real one writes the files under the transcript lock): the tombstone,
+      // the list without the chat; the transcript and the other per-chat files are the store's.
+      transcripts: { deleteChat: async (chatId, { kind, projectId } = {}) => storeDelete(ws, chatId, kind, projectId) },
       historyPath: (id) => path.join(dir, `history-${String(id).replace(/[^a-zA-Z0-9_-]/g, '')}.json`),
       ragDir: () => path.join(dir, 'rag'),
       assetDir: (id) => path.join(dir, 'project-assets', String(id).replace(/[^a-zA-Z0-9_-]/g, '')),
     };
+    return ws;
   };
   const alice = make('alice'), bob = make('bob');
   let active = alice;
@@ -56,7 +77,8 @@ function fixture() {
     createProjectFolder: async () => null,
     projectSweep: createProjectSweep({ storage }),
   });
-  const as = (workspace, fn) => { const prev = active; active = workspace; try { return fn(); } finally { active = prev; } };
+  // Request-scoped in index.cjs (AsyncLocalStorage); here held until the async delete settles.
+  const as = async (workspace, fn) => { const prev = active; active = workspace; try { return await fn(); } finally { active = prev; } };
   return { store, alice, bob, as, remoteRemovals, cleanup: () => fs.rmSync(root, { recursive: true, force: true }) };
 }
 
@@ -90,7 +112,7 @@ test('deleting a free chat removes its attachments project: record, local files,
     const neighbour = seedProject(f.alice, CONTEXT('c2'));
     const regular = seedProject(f.alice, 'proj-regular', { chats: [{ id: 'p-chat' }] });
 
-    assert.equal(f.store.deleteFreeChat('c1'), true);
+    assert.equal(await f.store.deleteFreeChat('c1'), true);
     await tick();
 
     assert.deepEqual(f.alice.projects.map((p) => p.id), [CONTEXT('c2'), 'proj-regular'], 'only the deleted chat\'s project is gone');
@@ -104,7 +126,7 @@ test('deleting a free chat removes its attachments project: record, local files,
     for (const target of f.remoteRemovals) assert.ok(target.startsWith(`noevia projects/${CONTEXT('c1')}`), target);
     assert.ok(!f.remoteRemovals.some((t) => t.startsWith('Shared/')), 'a manually attached folder is never touched');
     assert.ok(lists.readTombstones(f.alice.dir).has('c1'));
-    assert.equal(f.store.deleteFreeChat('c1'), false, 'a second delete is a 404, nothing more is removed');
+    assert.equal(await f.store.deleteFreeChat('c1'), false, 'a second delete is a 404, nothing more is removed');
   } finally { f.cleanup(); }
 });
 
@@ -115,7 +137,7 @@ test("another user's attachments project for the same chat id is untouched (#788
     f.bob.freeChats.push({ id: 'shared-id' });
     const mine = seedProject(f.alice, CONTEXT('shared-id'));
     const theirs = seedProject(f.bob, CONTEXT('shared-id'));
-    assert.equal(f.as(f.alice, () => f.store.deleteFreeChat('shared-id')), true);
+    assert.equal(await f.as(f.alice, () => f.store.deleteFreeChat('shared-id')), true);
     await tick();
     assert.ok(noneExist(mine.paths));
     assert.deepEqual(f.bob.projects.map((p) => p.id), [CONTEXT('shared-id')], "bob's record stays");
@@ -125,13 +147,13 @@ test("another user's attachments project for the same chat id is untouched (#788
   } finally { f.cleanup(); }
 });
 
-test('a chat that never had an attachments project deletes as before, touching no project (#788)', () => {
+test('a chat that never had an attachments project deletes as before, touching no project (#788)', async () => {
   const f = fixture();
   try {
     f.alice.freeChats.push({ id: 'bare' });
     seedProject(f.alice, 'proj-regular');
     const savedBefore = f.alice.saved;
-    assert.equal(f.store.deleteFreeChat('bare'), true);
+    assert.equal(await f.store.deleteFreeChat('bare'), true);
     assert.deepEqual(f.alice.projects.map((p) => p.id), ['proj-regular']);
     assert.equal(f.alice.saved, savedBefore, 'projects.json is not rewritten');
     assert.equal(f.store.removeChatAttachments('bare'), false);
@@ -146,7 +168,7 @@ test('an archived chat keeps its attachments project; only deleting it removes t
     const { paths } = seedProject(f.alice, CONTEXT('old'));
     assert.equal(f.store.removeOrphanChatContexts(), 0, 'archived is not deleted');
     assert.ok(allExist(paths));
-    assert.equal(f.store.deleteFreeChat('old'), true);
+    assert.equal(await f.store.deleteFreeChat('old'), true);
     await tick();
     assert.ok(noneExist(paths));
   } finally { f.cleanup(); }
@@ -160,16 +182,16 @@ test('a chat moved into a project, or deleted with its project, takes its attach
     const moved = seedProject(f.alice, CONTEXT('moved'));
     const inner = seedProject(f.alice, CONTEXT('inner'));
     const kept = seedProject(f.alice, CONTEXT('kept'));
-    assert.equal(f.store.deleteChat('proj-host', 'moved'), true);
+    assert.equal(await f.store.deleteChat('proj-host', 'moved'), true);
     await tick();
     assert.ok(noneExist(moved.paths));
-    assert.equal(f.store.deleteProject('proj-host'), true);
+    assert.equal(await f.store.deleteProject('proj-host'), true);
     await tick();
     assert.ok(noneExist(host.paths), 'the project itself is cleaned as before');
     assert.ok(noneExist(inner.paths), "its chats' attachments projects go with their chats");
     assert.deepEqual(f.alice.projects.map((p) => p.id).sort(), [CONTEXT('kept'), 'proj-other']);
     assert.ok(allExist(other.paths) && allExist(kept.paths));
-    assert.equal(f.store.deleteProject('proj-host'), false, 'a second delete reports nothing removed');
+    assert.equal(await f.store.deleteProject('proj-host'), false, 'a second delete reports nothing removed');
   } finally { f.cleanup(); }
 });
 
@@ -179,7 +201,7 @@ test("removing an attachments project never purges chats filed under it (#788)",
     f.alice.freeChats.push({ id: 'host' });
     seedProject(f.alice, CONTEXT('host'), { chats: [{ id: 'stray' }] });
     fs.writeFileSync(f.alice.historyPath('stray'), '{"history":[]}');
-    assert.equal(f.store.deleteFreeChat('host'), true);
+    assert.equal(await f.store.deleteFreeChat('host'), true);
     assert.equal(fs.existsSync(f.alice.historyPath('stray')), true, "another chat's transcript is not this delete's to remove");
     assert.equal(lists.readTombstones(f.alice.dir).has('stray'), false);
   } finally { f.cleanup(); }
@@ -227,7 +249,7 @@ test('Delete old chats (retention) removes expired chats\' attachments projects 
     // As index.cjs wires it: the visible lists, removed through deleteChat / deleteFreeChat.
     const visible = { freeChats: Array.from(f.alice.freeChats), projects: f.alice.projects.filter((p) => !p.id.startsWith('cowork-')) };
     for (const chat of retention.expired({ ...visible, days: 90, now })) {
-      assert.equal(chat.projectId ? f.store.deleteChat(chat.projectId, chat.id) : f.store.deleteFreeChat(chat.id), true);
+      assert.equal(await (chat.projectId ? f.store.deleteChat(chat.projectId, chat.id) : f.store.deleteFreeChat(chat.id)), true);
     }
     await tick();
     assert.ok(noneExist(stale.paths) && noneExist(staleInProject.paths));
@@ -260,7 +282,7 @@ test('a context cleanup failure still lets deleteFreeChat succeed and the chat i
     // different method and has already committed by then).
     let calls = 0;
     f.alice.saveProjects = function () { calls += 1; if (calls === 1) throw new Error('disk full (synthetic)'); this.saved += 1; };
-    assert.equal(f.store.deleteFreeChat('c1'), true, 'the chat delete succeeds');
+    assert.equal(await f.store.deleteFreeChat('c1'), true, 'the chat delete succeeds');
     assert.equal(calls, 1, 'the context delete did try to save');
     assert.deepEqual(f.alice.freeChats.map((c) => c.id), ['c2'], 'the chat is gone');
     assert.ok(lists.readTombstones(f.alice.dir).has('c1'), 'and tombstoned');

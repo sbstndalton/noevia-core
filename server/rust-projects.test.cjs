@@ -60,6 +60,9 @@ test('#1071: every Rust-owned project route is refused here unconditionally, bef
     ['GET', '/api/chats/c1/context-window'],
     ['GET', '/api/chats/c1/history'],
     ['POST', '/api/chats/c1/history'],
+    // #1071 slice 6: a chat's delete.
+    ['DELETE', '/api/freechats/c1'],
+    ['DELETE', '/api/projects/p1/chats/c1'],
   ];
   for (const [method, p] of owned) {
     calls.length = 0;
@@ -71,8 +74,9 @@ test('#1071: every Rust-owned project route is refused here unconditionally, bef
   assert.deepEqual(owned.map(([m, p]) => `${m} ${p.replace(/p1|img-1|c1/g, 'x')}`).sort(), [...rp.OWNED_ROUTES].map((r) => norm(r)).sort());
   for (const [method, p] of [
     ['PUT', '/api/projects/p1/assets'], ['GET', '/api/projects/p1/assets'], ['POST', '/api/projects/p1/assets/img-1'],
-    ['PUT', '/api/projects/p1/chats'], ['DELETE', '/api/projects/p1/chats'], ['GET', '/api/projects/p1/chats/c1'], ['DELETE', '/api/projects/p1/chats/c1'],
-    ['DELETE', '/api/freechats/c1'], ['PUT', '/api/freechats'], ['GET', '/api/freechats/c1'], ['GET', '/api/freechatsx'],
+    ['PUT', '/api/projects/p1/chats'], ['DELETE', '/api/projects/p1/chats'], ['GET', '/api/projects/p1/chats/c1'], ['PATCH', '/api/projects/p1/chats/c1'],
+    ['DELETE', '/api/projects/p1/chats/c1/x'], ['DELETE', '/api/freechats/c1/x'], ['DELETE', '/api/freechats/'],
+    ['PUT', '/api/freechats'], ['GET', '/api/freechats/c1'], ['GET', '/api/freechatsx'],
     ['DELETE', '/api/chats/c1/context'], ['GET', '/api/chats/c1/context/extra'], ['POST', '/api/chats/c1/move'], ['POST', '/api/chats/c1/context-window'], ['GET', '/api/chats/c1/context-window/x'],
     ['PUT', '/api/chats/c1/history'], ['DELETE', '/api/chats/c1/history'], ['GET', '/api/chats/c1/history/x'], ['POST', '/api/projects'], ['GET', '/api/workspace'],
     ['POST', '/api/projects/p1/uploads'], ['GET', '/api/projects/p1/assets/img-1/extra'],
@@ -81,7 +85,6 @@ test('#1071: every Rust-owned project route is refused here unconditionally, bef
     assert.equal(rp.refuseOwnedRoute({ method }, {}, p, json), false, `${method} ${p}`);
     assert.equal(calls.length, 0);
   }
-  assert.ok(![...rp.OWNED_ROUTES].some((r) => r.startsWith('DELETE /api/freechats')), "a free chat's delete stays Node's");
 });
 
 test('#1264/#1071: retired context switches only warn; free-chat store limits stay unchanged', () => {

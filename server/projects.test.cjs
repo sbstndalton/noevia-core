@@ -18,6 +18,31 @@ function fixture({ browsable = false, folderError = null } = {}) {
     historyPath: (id) => path.join(dir, `${id}.json`),
     assetDir: (id) => path.join(dir, 'assets', id),
   };
+  // #1071 slice 6: a double of the Rust store's chat delete (project-store-client chatDelete) over
+  // this fake workspace's in-memory lists: it records each call, tombstones and takes the meta out
+  // as the store does on disk. It removes no file: the transcript, meter, brain note and partial
+  // are the real store's (noevia-rs chat_delete tests), so a file still there after a delete here
+  // proves Node removed nothing itself.
+  const storeCalls = [];
+  workspace.transcripts = {
+    deleteChat: async (chatId, options = {}) => {
+      storeCalls.push({ chatId, ...options });
+      const none = { deleted: false, swept: false, leftovers: 0 };
+      const held = (list) => Array.isArray(list) && list.some((c) => c && c.id === chatId);
+      if (options.kind === 'unlisted') {
+        if (held(workspace.freeChats) || workspace.projects.some((p) => held(p.chats))) return { ...none, listed: true };
+        require('./chat-lists.cjs').addTombstone(dir, chatId);
+        return { ...none, deleted: true };
+      }
+      const owner = options.kind === 'free' ? null : workspace.projects.find((p) => p.id === options.projectId);
+      const list = options.kind === 'free' ? workspace.freeChats : owner?.chats;
+      if (!held(list)) return none;
+      require('./chat-lists.cjs').addTombstone(dir, chatId);
+      if (owner) owner.chats = owner.chats.filter((c) => !(c && c.id === chatId));
+      else workspace.freeChats.splice(0, workspace.freeChats.length, ...workspace.freeChats.filter((c) => !(c && c.id === chatId)));
+      return { ...none, deleted: true };
+    },
+  };
   const indexed = [], deleted = [], swept = [];
   const store = createProjectStore({
     fs, path,
@@ -35,7 +60,7 @@ function fixture({ browsable = false, folderError = null } = {}) {
     createProjectFolder: async (_storage, _connection, root, project) => { if (folderError) throw folderError; return `${root}/${project.name}`; },
     projectSweep: { afterDelete: async (args) => { swept.push(args); } },
   });
-  return { store, workspace, indexed, deleted, swept, dir };
+  return { store, workspace, indexed, deleted, swept, dir, storeCalls };
 }
 
 test('createProject validates, defaults and indexes its files', async () => {
@@ -81,7 +106,7 @@ test('#849: ensureProjectFolderDetailed says when storage refused the login, and
   assert.deepEqual(await ok.store.ensureProjectFolderDetailed(await ok.store.createProject({ name: 'Trip' })), { folder: 'noevia projects/Trip', loginRejected: false, failure: null });
 });
 
-test('chat metas are sanitized on read and deleting one leaves a tombstone and removes its transcript', async () => {
+test('chat metas are sanitized on read; deleting one is the store\'s operation, Node removes no file (#1071 slice 6)', async () => {
   const f = fixture();
   const project = await f.store.createProject({ name: 'P' });
   project.chats = [{ id: 'c1', title: 'one' }, 'orphan-id'];
@@ -90,23 +115,35 @@ test('chat metas are sanitized on read and deleting one leaves a tombstone and r
   // The transcript as the Rust store wrote it (#1071 slice 4: Node never writes it).
   fs.writeFileSync(f.workspace.historyPath('c1'), JSON.stringify({ history: [{ role: 'user', content: 'hi' }] }));
   assert.deepEqual(f.store.readHistory('c1'), [{ role: 'user', content: 'hi' }]);
-  assert.equal(f.store.deleteChat(project.id, 'c1'), true);
-  assert.equal(f.store.deleteChat(project.id, 'c1'), false);
-  assert.equal(f.store.deleteChat('missing', 'c1'), false);
-  assert.deepEqual(f.store.readHistory('c1'), [], 'the transcript file is gone');
+  assert.equal(await f.store.deleteChat(project.id, 'c1'), true);
+  assert.equal(await f.store.deleteChat(project.id, 'c1'), false);
+  assert.equal(await f.store.deleteChat('missing', 'c1'), false);
+  assert.deepEqual(f.storeCalls.map((c) => [c.chatId, c.kind, c.projectId, c.origin]), [
+    ['c1', 'project', project.id, 'remove'], ['c1', 'project', project.id, 'remove'], ['c1', 'project', 'missing', 'remove']]);
+  assert.ok(fs.existsSync(f.workspace.historyPath('c1')), 'Node itself removes no transcript (the store does, under its lock)');
   assert.ok(require('./chat-lists.cjs').readTombstones(f.dir).has('c1'));
 });
 
-test('free chats delete the same way and history keys are sanitized', () => {
+test('free chats delete through the store the same way and history keys are sanitized', async () => {
   const f = fixture();
   f.workspace.freeChats.push({ id: 'f1' }, { id: 'f2' });
   fs.writeFileSync(path.join(f.dir, 'f1x.json'), JSON.stringify({ history: ['qa'] }));
   assert.deepEqual(f.store.readHistory('f1/../x'), ['qa'], 'path characters are stripped from the history key');
   assert.equal(f.store.writeHistory, undefined, '#1071 slice 4: no local transcript writer');
-  assert.equal(f.store.deleteFreeChat('f1'), true);
+  assert.equal(await f.store.deleteFreeChat('f1'), true);
   assert.deepEqual(f.workspace.freeChats.map((c) => c.id), ['f2']);
-  assert.equal(f.store.deleteFreeChat('f1'), false);
-  assert.equal(f.workspace.savedFree, 1);
+  assert.equal(await f.store.deleteFreeChat('f1'), false);
+  assert.equal(f.workspace.savedFree, 0, 'the store writes the list, not Node');
+  assert.deepEqual(f.storeCalls.map((c) => [c.chatId, c.kind]), [['f1', 'free'], ['f1', 'free']]);
+});
+
+test('a store failure rejects the delete and Node changes nothing (#1914, #1071 slice 6)', async () => {
+  const f = fixture();
+  f.workspace.freeChats.push({ id: 'f1' });
+  f.workspace.transcripts.deleteChat = async () => { throw Object.assign(new Error('The project store is busy. Try again shortly.'), { status: 503, code: 'PROJECTS_BUSY' }); };
+  await assert.rejects(f.store.deleteFreeChat('f1'), (e) => e.status === 503);
+  assert.deepEqual(f.workspace.freeChats.map((c) => c.id), ['f1']);
+  assert.equal(require('./chat-lists.cjs').readTombstones(f.dir).has('f1'), false);
 });
 
 test('ownsFile allows only files directly inside an attached folder', () => {
@@ -269,54 +306,49 @@ test('withSourceLock keys differ per tenant: the same project id in another work
   release(); await held;
 });
 
-test('deleting a chat or a project removes its context meter, tenant-scoped (#554)', async () => {
+test('every delete path goes through the store\'s delete; Node removes no meter, brain or transcript itself (#554, #756, #1071 slice 6)', async () => {
   const context = require('./chat-context.cjs');
+  const brain = require('./chat-brain.cjs');
   const lists = require('./chat-lists.cjs');
   const f = fixture();
-  const other = fs.mkdtempSync(path.join(os.tmpdir(), 'noevia-projects-other-'));
   try {
     const meter = { meter: { model: 'synthetic', used: 10 } };
     const project = await f.store.createProject({ name: 'Doomed' });
     const keep = await f.store.createProject({ name: 'Kept' });
-    project.chats = [{ id: 'c-a' }, { id: 'c-b' }];
+    project.chats = [{ id: 'c-a' }, { id: 'c-b' }, 'not-a-meta'];
     keep.chats = [{ id: 'c-keep' }];
-    for (const id of ['c-a', 'c-b', 'c-keep', 'c-free']) { context.save(f.dir, id, meter); fs.writeFileSync(f.workspace.historyPath(id), '[]'); }
     f.workspace.freeChats.push({ id: 'c-free' });
-    context.save(other, 'c-a', meter); // another user's chat that happens to share an id
-    assert.equal(f.store.deleteChat(keep.id, 'c-keep'), true);
-    assert.deepEqual(context.read(f.dir, 'c-keep'), {});
-    assert.equal(f.store.deleteFreeChat('c-free'), true);
-    assert.deepEqual(context.read(f.dir, 'c-free'), {});
-    f.store.purgeProjectChats(project);
-    for (const id of ['c-a', 'c-b']) {
-      assert.deepEqual(context.read(f.dir, id), {}, id);
-      assert.equal(fs.existsSync(f.workspace.historyPath(id)), false, id);
+    for (const id of ['c-a', 'c-b', 'c-keep', 'c-free']) {
+      context.save(f.dir, id, meter);
+      fs.writeFileSync(f.workspace.historyPath(id), '[]');
+      brain.writeBrain(f.dir, id, { brain: { brain_schema: 1, summary: 'qa', decisions: [], facts: [], open_questions: [], entities: [] } });
+    }
+    assert.equal(await f.store.deleteChat(keep.id, 'c-keep'), true);
+    assert.equal(await f.store.deleteFreeChat('c-free'), true);
+    // A deleted project's chats: in no list any more, so asked as unlisted, one at a time.
+    f.workspace.projects.splice(f.workspace.projects.indexOf(project), 1);
+    await f.store.purgeProjectChats(project);
+    assert.deepEqual(f.storeCalls.map((c) => [c.chatId, c.kind]), [['c-keep', 'project'], ['c-free', 'free'], ['c-a', 'unlisted'], ['c-b', 'unlisted']]);
+    for (const id of ['c-a', 'c-b', 'c-keep', 'c-free']) {
+      assert.deepEqual(context.read(f.dir, id), meter, `${id}: the meter is the store's to remove`);
+      assert.ok(fs.existsSync(f.workspace.historyPath(id)), id);
+      assert.ok(brain.readBrain(f.dir, id), id);
       assert.ok(lists.readTombstones(f.dir).has(id), id);
     }
-    assert.deepEqual(context.read(other, 'c-a'), meter, "another user's meter is untouched");
   } finally {
     fs.rmSync(f.dir, { recursive: true, force: true });
-    fs.rmSync(other, { recursive: true, force: true });
   }
 });
 
-test('every delete path removes the chat brain, best effort (#756)', async () => {
-  const brain = require('./chat-brain.cjs');
+test('a deleted project\'s chat that another list holds by now is left alone (#1071 slice 6)', async () => {
   const f = fixture();
-  const file = (id) => path.join(f.dir, brain.BRAIN_DIR, `${require('node:crypto').createHash('sha256').update(id).digest('hex')}.json`);
-  const write = (id) => { fs.mkdirSync(path.dirname(file(id)), { recursive: true }); fs.writeFileSync(file(id), '{}'); };
-  const project = await f.store.createProject({ name: 'Brains' });
-  project.chats = [{ id: 'b-proj' }, { id: 'b-purge' }];
-  f.workspace.freeChats.push({ id: 'b-free' });
-  for (const id of ['b-proj', 'b-purge', 'b-free']) write(id);
-  assert.equal(f.store.deleteChat(project.id, 'b-proj'), true);
-  assert.equal(fs.existsSync(file('b-proj')), false);
-  assert.equal(f.store.deleteFreeChat('b-free'), true);
-  assert.equal(fs.existsSync(file('b-free')), false);
-  f.store.purgeProjectChats(project);
-  assert.equal(fs.existsSync(file('b-purge')), false);
-  project.chats = [{ id: 'b-none' }];
-  assert.equal(f.store.deleteChat(project.id, 'b-none'), true, 'no brain file is fine');
+  const project = await f.store.createProject({ name: 'Gone' });
+  project.chats = [{ id: 'moved' }];
+  f.workspace.projects.splice(f.workspace.projects.indexOf(project), 1);
+  f.workspace.freeChats.push({ id: 'moved' });
+  await f.store.purgeProjectChats(project);
+  assert.equal(require('./chat-lists.cjs').readTombstones(f.dir).has('moved'), false);
+  assert.deepEqual(f.workspace.freeChats.map((c) => c.id), ['moved']);
 });
 
 test('saveChats skips ids held by another list of the workspace (#755)', async () => {
@@ -389,7 +421,7 @@ test('moveChat refuses unknown chats and projects, deleted chats and disallowed 
   assert.deepEqual(f.workspace.freeChats.map((c) => c.id), ['f1']);
   assert.deepEqual(internal.chats.map((c) => c.id), ['i1']);
   assert.equal(f.workspace.saved, before, 'nothing was saved');
-  assert.equal(f.store.deleteFreeChat('f1'), true);
+  assert.equal(await f.store.deleteFreeChat('f1'), true);
   f.workspace.freeChats.push({ id: 'f1', title: 'stale copy' });
   assert.equal(f.store.moveChat('f1', a.id).status, 404, 'a tombstoned chat is never moved back to life');
 });

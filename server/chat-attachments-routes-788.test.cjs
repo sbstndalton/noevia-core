@@ -103,6 +103,9 @@ function frontSaveFree(metas) {
   frontWrite(file, list);
 }
 
+// The Rust front's chat delete (#1071 slice 6), in process over this account's directory.
+const frontDelete = (projectId, chatId) => require('../tests/server/project-store-server.cjs').rustChatDelete(testDataDir, path.basename(workspaceDir()), projectId, chatId);
+
 async function openWithImage(chatId) {
   await request('/api/workspace', { headers: { cookie } });
   const file = path.join(workspaceDir(), 'projects.json');
@@ -125,8 +128,14 @@ test('deleting a free chat removes its attachments project, and a stale tab cann
   const doomed = await openWithImage('c788-delete');
   frontSaveFree([{ id: 'c788-delete', title: 'a' }, { id: 'c788-keep', title: 'b', archived: true }]);
 
-  const deleted = await request('/api/freechats/c788-delete', { method: 'DELETE', headers: mutationHeaders() });
+  // #1071 slice 6: the delete is the Rust front's (Node refuses it); the front's store operation
+  // tombstones the chat and Node's reaper frees its attachments project on the next workspace load.
+  const refused = await request('/api/freechats/c788-delete', { method: 'DELETE', headers: mutationHeaders() });
+  assert.equal(refused.status, 503);
+  assert.equal(JSON.parse(refused.text).code, 'RUST_PROJECTS_OWNED');
+  const deleted = frontDelete(null, 'c788-delete');
   assert.equal(deleted.status, 200);
+  assert.equal((await request('/api/workspace', { headers: { cookie } })).status, 200);
   assert.ok(await gone(doomed), 'local assets and RAG index are gone');
   assert.ok(!projectIds().includes(ctx('c788-delete')), 'the record is gone from projects.json');
   assert.ok(projectIds().includes(ctx('c788-keep')), 'an archived chat keeps its attachments');
@@ -146,7 +155,9 @@ test('a moved chat and Delete old chats take their attachments projects along (#
   const moved = await openWithImage('c788-moved');
   frontSaveFree([{ id: 'c788-moved', title: 'm' }]);
   assert.equal((await post('/api/chats/c788-moved/move', { projectId: host.id })).status, 200);
-  assert.equal((await request(`/api/projects/${host.id}/chats/c788-moved`, { method: 'DELETE', headers: mutationHeaders() })).status, 200);
+  assert.equal((await request(`/api/projects/${host.id}/chats/c788-moved`, { method: 'DELETE', headers: mutationHeaders() })).status, 503);
+  assert.equal(frontDelete(host.id, 'c788-moved').status, 200);
+  assert.equal((await request('/api/workspace', { headers: { cookie } })).status, 200);
   assert.ok(await gone(moved));
   assert.ok(!projectIds().includes(ctx('c788-moved')));
 

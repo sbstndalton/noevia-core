@@ -192,7 +192,12 @@ test('nothing is written when the reply finishes, when someone already saved pas
   require('./chat-lists.cjs').addTombstone(deleted.a.dir, 'chat-679');
   deleted.state.turns.push([say('Steam'), DISCONNECT]);
   await deleted.send({ message: USER.content });
-  assert.deepEqual(readStored(deleted.a, 'chat-679'), [USER], 'a deleted chat is not written back');
+  const after = readStored(deleted.a, 'chat-679') || [];
+  assert.ok(!after.some((e) => e && e.role === 'assistant'), 'a deleted chat is not written back');
+  // #1071 slice 6: the turn's end asks the store to sweep a deleted chat (tombstoned, in no list):
+  // its leftover transcript goes too, under the store's lock; Node removes nothing itself.
+  await tick();
+  assert.equal(fs.existsSync(path.join(deleted.a.dir, 'history-chat-679.json')), false);
 });
 
 test('the reply is kept in the requesting account\'s workspace only', async (t) => {

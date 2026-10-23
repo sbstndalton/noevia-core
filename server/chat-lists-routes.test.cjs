@@ -67,6 +67,8 @@ const mutationHeaders = () => ({ origin: 'http://localhost', cookie, 'content-ty
 const post = (url, body, headers = mutationHeaders()) => request(url, { method: 'POST', headers, body: JSON.stringify(body) });
 // #1071 slice 5: a history save is the Rust front's (Node refuses it), in process over the same store.
 const saveHistory = (chatId, body) => require('../tests/server/project-store-server.cjs').rustHistorySave(testDataDir, userId, chatId, body);
+// #1071 slice 6: a chat's delete is the Rust front's too (Node refuses it), in process over the same store.
+const frontDelete = (projectId, chatId) => require('../tests/server/project-store-server.cjs').rustChatDelete(testDataDir, userId, projectId, chatId);
 const realFetch = global.fetch;
 
 const meta = (id, title = id, updatedAt = 1000) => ({ id, title, updatedAt, preview: '' });
@@ -88,8 +90,9 @@ const freeChats = async () => (await workspace()).freeChats.map((c) => c.id).sor
 const freeMeta = async (id) => (await workspace()).freeChats.find((c) => c.id === id);
 const projectChats = async (projectId) => (await workspace()).projects.find((p) => p.id === projectId).chats;
 
-test('Node refuses the list saves the front owns; it follows the front\'s free-chat list and a delete here sticks', async () => {
-  for (const [method, url] of [['GET', '/api/freechats'], ['POST', '/api/freechats'], ['GET', '/api/projects/p1/chats'], ['POST', '/api/projects/p1/chats']]) {
+test('Node refuses the list saves and the deletes the front owns; it follows the front\'s free-chat list and a front delete sticks', async () => {
+  for (const [method, url] of [['GET', '/api/freechats'], ['POST', '/api/freechats'], ['GET', '/api/projects/p1/chats'], ['POST', '/api/projects/p1/chats'],
+    ['DELETE', '/api/freechats/c-alpha'], ['DELETE', '/api/projects/p1/chats/c1']]) {
     const r = await request(url, { method, headers: mutationHeaders(), body: method === 'POST' ? JSON.stringify({ chats: [meta('c-refused')] }) : '' });
     assert.equal(r.status, 503, `${method} ${url}`);
     assert.equal(JSON.parse(r.text).code, 'RUST_PROJECTS_OWNED');
@@ -97,18 +100,20 @@ test('Node refuses the list saves the front owns; it follows the front\'s free-c
   await frontSaveFree([meta('c-alpha'), meta('c-bravo')]);
   assert.deepEqual(await freeChats(), ['c-alpha', 'c-bravo']);
   assert.ok(!(await freeChats()).includes('c-refused'));
-  assert.equal((await request('/api/freechats/c-alpha', { method: 'DELETE', headers: mutationHeaders() })).status, 200);
+  assert.equal((await request('/api/freechats/c-alpha', { method: 'DELETE', headers: mutationHeaders() })).status, 503);
+  assert.deepEqual(await freeChats(), ['c-alpha', 'c-bravo'], 'the refused delete changed nothing');
+  assert.equal(frontDelete(null, 'c-alpha').status, 200);
   assert.deepEqual(await freeChats(), ['c-bravo']);
   assert.deepEqual(JSON.parse(fs.readFileSync(userFile('free-chats.json'), 'utf8')).map((c) => c.id), ['c-bravo'], 'saved through the store');
 });
 
-test('a chat deleted from a project here is gone from the project on disk', async () => {
+test('a chat the front deleted from a project is gone from Node\'s view and from the project on disk', async () => {
   const project = JSON.parse((await post('/api/projects', { name: 'Synthetic lists' })).text);
   const file = JSON.parse(fs.readFileSync(userFile('projects.json'), 'utf8'));
   file.projects.find((p) => p.id === project.id).chats = [meta('p-one'), meta('p-two')];
   frontWrite(userFile('projects.json'), file);
   assert.deepEqual((await projectChats(project.id)).map((c) => c.id), ['p-one', 'p-two']);
-  assert.equal((await request(`/api/projects/${project.id}/chats/p-one`, { method: 'DELETE', headers: mutationHeaders() })).status, 200);
+  assert.equal(frontDelete(project.id, 'p-one').status, 200);
   assert.deepEqual((await projectChats(project.id)).map((c) => c.id), ['p-two']);
   const onDisk = JSON.parse(fs.readFileSync(userFile('projects.json'), 'utf8')).projects.find((p) => p.id === project.id).chats.map((c) => c.id);
   assert.deepEqual(onDisk, ['p-two']);
@@ -117,7 +122,7 @@ test('a chat deleted from a project here is gone from the project on disk', asyn
 test('a late history save for a deleted chat does not write the transcript back', async () => {
   await frontSaveFree([meta('c-deleted-while-streaming')]);
   assert.equal(saveHistory('c-deleted-while-streaming', { history: [{ role: 'user', content: 'first' }] }).status, 200);
-  assert.equal((await request('/api/freechats/c-deleted-while-streaming', { method: 'DELETE', headers: mutationHeaders() })).status, 200);
+  assert.equal(frontDelete(null, 'c-deleted-while-streaming').status, 200);
   const late = saveHistory('c-deleted-while-streaming', { history: [{ role: 'user', content: 'first' }, { role: 'assistant', content: 'late reply' }] });
   assert.equal(late.status, 410);
   // #1071: the GET is the Rust front's; the transcript file is what it would read.
@@ -155,7 +160,7 @@ test('the move refuses unknown, deleted and malformed targets without changing a
   assert.equal((await post('/api/chats/no-such-chat/move', { projectId: null })).status, 404);
   assert.equal((await post('/api/chats/c-stays/move', { projectId: 7 })).status, 400);
   assert.equal((await post('/api/chats/c-stays/move', {})).status, 400);
-  assert.equal((await request('/api/freechats/c-stays', { method: 'DELETE', headers: mutationHeaders() })).status, 200);
+  assert.equal(frontDelete(null, 'c-stays').status, 200);
   assert.equal((await post('/api/chats/c-stays/move', { projectId: null })).status, 404, 'a deleted chat cannot be moved back to life');
   assert.equal((await request('/api/chats/c-stays/move', { method: 'POST', headers: { origin: 'http://localhost', 'content-type': 'application/json' }, body: JSON.stringify({ projectId: null }) })).status >= 401, true, 'signed out (no session, no CSRF) is refused');
 });
@@ -206,15 +211,14 @@ test('the move never puts a chat into an archived project; a once Code-only proj
 });
 
 test('a malformed chat id in the URL is a 400, not a server error (#812)', async () => {
-  for (const [method, url] of [['POST', '/api/chats/%E0%A4/move'],
-    ['DELETE', '/api/freechats/%E0%A4'], ['DELETE', '/api/projects/%E0%A4/chats/c1'],
-    ['DELETE', '/api/projects/p1/chats/%E0%A4']]) {
+  for (const [method, url] of [['POST', '/api/chats/%E0%A4/move']]) {
     const r = await request(url, { method, headers: mutationHeaders(), body: method === 'GET' || method === 'DELETE' ? '' : JSON.stringify({ projectId: null, history: [] }) });
     assert.equal(r.status, 400, `${method} ${url}`);
     assert.deepEqual(JSON.parse(r.text), { error: 'invalid chat id' });
   }
   // #1071: the context meter is the Rust front's; Node refuses it before reading the id.
-  for (const [method, url] of [['GET', '/api/chats/%E0%A4/context-window'], ['GET', '/api/chats/%E0%A4/history'], ['POST', '/api/chats/%E0%A4/history']]) {
+  for (const [method, url] of [['GET', '/api/chats/%E0%A4/context-window'], ['GET', '/api/chats/%E0%A4/history'], ['POST', '/api/chats/%E0%A4/history'],
+    ['DELETE', '/api/freechats/%E0%A4'], ['DELETE', '/api/projects/%E0%A4/chats/c1'], ['DELETE', '/api/projects/p1/chats/%E0%A4']]) {
     const owned = await request(url, { method, headers: mutationHeaders(), body: method === 'POST' ? JSON.stringify({ history: [] }) : '' });
     assert.equal(owned.status, 503, `${method} ${url}`);
     assert.equal(JSON.parse(owned.text).code, 'RUST_PROJECTS_OWNED', `${method} ${url}`);

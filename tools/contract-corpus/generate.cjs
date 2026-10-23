@@ -106,7 +106,8 @@ const WRITE_PROBES = [
   ['POST', '/api/models/presets/reload', {}], ['POST', '/api/models/autotune/cancel', {}], ['POST', '/api/models/calibration/cancel', {}],
   ['POST', '/api/providers/test', {}],
   ['GET', '/api/diary/today'],
-  ['DELETE', '/api/freechats/missing-free-chat'],
+  // A free chat's delete (DELETE /api/freechats/{id}) is the Rust front's since #1071 slice 6: its
+  // exchanges stay in the noevia-rs corpus recorded at its core.ref.
 ];
 
 async function main() {
@@ -205,8 +206,8 @@ async function main() {
 
     for (const [method, p, body] of WRITE_PROBES) await step(admin, method, p, body);
 
-    // Clean-up is part of the contract too.
-    if (chatId) await step(admin, 'DELETE', `/api/projects/${encodeURIComponent(projectId)}/chats/${encodeURIComponent(chatId)}`);
+    // Clean-up is part of the contract too. A chat's delete is the Rust front's (#1071 slice 6; its
+    // exchange stays in the noevia-rs corpus): the project delete below removes the chat with it.
     await step(admin, 'DELETE', `/api/projects/${encodeURIComponent(projectId)}`);
     await step(admin, 'GET', '/api/workspace', undefined, [200]);
     if (memberId) await step(admin, 'DELETE', `/api/admin/users/${encodeURIComponent(memberId)}`, { username: MEMBER.username });
