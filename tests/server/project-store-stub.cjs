@@ -34,6 +34,16 @@ function createStubStore(root, { flat = false } = {}) {
       writes.push(file);
       return { ok: true, version: sha(text) };
     },
+    async grantContext(user, chat) {
+      const [status,body]=require('./project-store-server.cjs').chatMoveOp({chat},path.dirname(fileOf(user,'projects.json')),false);
+      if(status!==200)throw Object.assign(Error(body.error),{status,code:body.code});
+      return body;
+    },
+    async chatMove(user, chat, projectId, patch={}) {
+      const [status,body]=require('./project-store-server.cjs').chatMoveOp({chat,projectId,...patch},path.dirname(fileOf(user,'projects.json')));
+      if(status!==200)throw Object.assign(Error(body.error),{status,code:body.code});
+      return{status:200,from:body.from.kind==='free'?null:body.from.id,generation:body.generation};
+    },
     // sbstndalton/noevia#1071 slice 4: the transcript ops, as tests/server/project-store-server.cjs
     // answers them (the account's directory; flat: `root`).
     historyRead: (user, chat) => transcripts(user).read(chat),

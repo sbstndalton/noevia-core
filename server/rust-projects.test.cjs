@@ -422,7 +422,7 @@ test('moveChat and deleteFreeChat through the coordinated free list keep a meta 
   const file = freeFile(ws.dir);
   // The front saves a new free chat after this request started; the request moves f1 into p1.
   atomicJson(file, [meta('front', 5), ...readFree(file)]);
-  assert.equal(projects.moveChat('f1', 'p1').status, 200);
+  assert.equal((await projects.moveChat('f1', 'p1')).status, 200);
   await ws.pendingStoreWrites();
   assert.deepEqual(readFree(file).map((c) => c.id), ['front', 'f2']);
   assert.deepEqual(read(path.join(ws.dir, 'projects.json'))[0].chats.map((c) => c.id), ['f1']);
