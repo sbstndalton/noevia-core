@@ -57,9 +57,9 @@ const DIARY_BASE = process.env.DIARY_BASE_URL || 'http://cowork-diary-companion:
 // Per-request Diary tenant assertion key (M2, docs/spec-managed-diary.md). Deploy the sidecar first.
 const DIARY_TENANT_KEY = (process.env.DIARY_TENANT_KEY || '').trim();
 const DIARY_SOURCE = process.env.DIARY_SOURCE || 'sidecar';
-// #996, #1071: dav-parse.wasm is always required (the retired switches' Rust paths have no JS twin),
-// and so is any *_IMPL=wasm switch's: a missing or tampered module refuses to start, rather than
-// failing closed on every request (for SECRET_ENVELOPE_IMPL: every stored credential). Checked
+// #996, #1071: dav-parse.wasm is always required (the retired switches' Rust paths have no JS twin):
+// a missing or tampered module refuses to start, rather than failing closed on every request (the
+// storage path rules and every stored credential's envelope, among others). Checked
 // first, before the auth tokens (decided in Rust since POLICY_LEAVES_IMPL was retired) and the code
 // network guard below read the module, so a missing module stops startup with this one clear line.
 if (require.main === module) {

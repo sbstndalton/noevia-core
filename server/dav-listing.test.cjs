@@ -74,9 +74,12 @@ test('wasm path fails closed when the module is missing', () => withEnv(
       assert.throws(() => davListing.listingEntries(BODY, T), (e) => e.reason === 'missing' && e.status === 502 && e.message === davListing.PUBLIC_FAILURE);
       await withFetch(BODY, async () => {
         // The message is what routes/storage.cjs puts in the browse 502 and routes/projects.cjs
-        // stores as the folder's failure reason: no path, no checksum, no refusal code.
+        // stores as the folder's failure reason: no path, no checksum, no refusal code. Since #1071
+        // the path rule (Rust too) runs first, so it is the one that fails closed, with its own
+        // fixed message.
         const err = await storageClient.listFiles({ kind: 'webdav', baseUrl: 'https://dav.example.test/remote.php/dav/files/alice' }, 'Notes').then(() => null, (e) => e);
-        assert.equal(err?.message, 'storage listing could not be read');
+        assert.equal(err?.message, 'storage path could not be checked');
+        assert.equal(err.code, 'storage_path_failed');
         assert.doesNotMatch(err.message, /no-such-dav-parse|sha256|wasm|missing/);
       });
       assert.match(String(warn.mock.calls[0].arguments[0]), /dav-parse failed \(missing\): .*no-such-dav-parse\.wasm/);

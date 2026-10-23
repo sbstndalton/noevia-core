@@ -108,7 +108,7 @@ test('M4_ENTRY/complete_original_index', { concurrency: false }, async t => {
     ...OWNER, UI_DATA_DIR: dir, PUBLIC_ORIGIN: 'http://localhost', LEGACY_AUTH_COMPAT: 'false',
     DIARY_AUTH_TOKEN: 'synthetic-sidecar-token', UI_AUTH_TOKEN: '', MODEL_MANAGER_KIND: 'none',
     MODEL_LOADER_URL: '', CODE_EGRESS_PORT: '0', COWORK_CODE_NET_ADDR: '',
-    MCP_INTERNAL_PORT: '0', MCP_SERVERS: '', SECRET_ENVELOPE_IMPL: 'js',
+    MCP_INTERNAL_PORT: '0', MCP_SERVERS: '',
     SECRETS_KEY_PREVIOUS: '', CORPUS_BACKEND: 'webdav', WEBDAV_BASE_URL: 'https://synthetic.invalid/dav',
     WEBDAV_USERNAME: 'synthetic', WEBDAV_PASSWORD: 'synthetic-migration-secret', CORPUS_ROOT: 'synthetic',
   };

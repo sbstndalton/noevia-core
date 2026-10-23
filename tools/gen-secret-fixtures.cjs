@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 'use strict';
 // Regenerates the shared differential fixtures for the credential envelopes (#979). Every
-// expectation comes from the CURRENT JS implementation (server/secret-envelope.cjs openJs and
-// encryptJs). The same file is committed byte-for-byte in sbstndalton/noevia-rs
+// expectation comes from the JS reference (tests/server/oracle/secret-envelope.cjs openJs and
+// encryptJs, moved there unchanged from server/secret-envelope.cjs in #1071). The same file is committed byte-for-byte in sbstndalton/noevia-rs
 // (crates/secret-envelope/tests/fixtures/secret-envelope.v1.json); noevia-core CI compares them.
 //   node tools/gen-secret-fixtures.cjs > tests/fixtures/secret-envelope.v1.json
 // The keys are fixed synthetic test keys (sha256 of a label) and every plaintext is synthetic:
@@ -20,7 +20,7 @@
 //         wrote with that nonce (randomBytes is replaced by the listed nonce while generating).
 
 const crypto = require('crypto');
-const { openJs, encryptJs } = require('../server/secret-envelope.cjs');
+const { openJs, encryptJs } = require('../tests/server/oracle/secret-envelope.cjs');
 
 let seed = 0x979;
 const rand = () => { seed = (seed * 1103515245 + 12345) >>> 0; return seed / 2 ** 32; };
