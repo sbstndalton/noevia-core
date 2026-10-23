@@ -279,7 +279,7 @@ test('#1880 the real chat handler counts a turn on the machine while it streams,
   const roles = { fast: 'synthetic-fast', smart: 'synthetic-smart', code: 'synthetic-code' };
   const catalogue = Object.values(roles).map((name) => ({ name }));
   const { handleChat } = createChatHandler({
-    chatMachines: s.chatMachines, modelManager: { enabled: true, makeRoomFor: async () => {}, props: async () => ({ ok: false, status: 404 }), health: async () => ({ ok: true, body: { all_models_loaded: [] } }) },
+    chatMachines: s.chatMachines, modelManager: { enabled: true, acquireLease: async () => null, props: async () => ({ ok: false, status: 404 }), health: async () => ({ ok: true, body: { all_models_loaded: [] } }) },
     templateToolsGate: require('./chat-template-caps.cjs').createToolsGate(), toolGate: null,
     reasoningEffort: require('./reasoning-effort.cjs'), crypto: require('node:crypto'), path, fs, fetch: async () => { throw Error('nothing local in this test'); },
     authService: { audit() {}, db: { prepare: () => ({ get: () => undefined }) } },

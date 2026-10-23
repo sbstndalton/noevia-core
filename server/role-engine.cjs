@@ -9,13 +9,11 @@
 // router swap. Models on the keep-list (the embedding/reranking sidecars, keepAlongside) and
 // non-chat rows (embedding/rerank argv, the Laya system model) never count as "different".
 //
-// Residency check and send are one admission: both run inside `admission(work, signal)` — in
-// production the model manager's withAdmission lock, the same lock chat's makeRoomFor and every
-// load/unload take — and the lock is held until the engine has answered the request's headers
-// (i.e. the router has routed it). So no load or eviction from this web process can slip between
-// the check and the send. A client outside this process talking to the router directly can still
-// race it; that is not prevented here. The lock is released before the answer streams, so long
-// generations never block chat admission.
+// Residency check and send run inside `admission(work, signal)` when one is given (tests); in
+// production there is none (noevia#2115). The inference gate in front of the router is the only
+// process that unloads a model, and it unloads one only once no request and no lease is using it: a
+// call for the pinned model that races another client's switch waits in the gate's queue, and no
+// running answer is ever cut by it. The lock, when given, is released before the answer streams.
 //
 // Pinning does not load anything. If no chat model is resident, the pin is "cold" and the first
 // call LOADS the pinned model (router autoload on the request), inside that same admission lock —
@@ -219,8 +217,8 @@ async function* sseDeltas(response, m, now) {
  *           log?: (entry: object) => void, now?: () => number }} deps
  * `loadedModels` answers which chat models the router has resident; by default the router's
  * `/models` list is read. `keep` names models that may stay resident beside the pinned one (the
- * embedding/reranking sidecars). `admission` serialises the residency check with the send (the
- * model manager's withAdmission); without one, they run back to back unlocked.
+ * embedding/reranking sidecars). `admission` serialises the residency check with the send (tests);
+ * without one, they run back to back and the inference gate keeps the switch safe (noevia#2115).
  */
 function createRoleEngine({ engine, fetch = (url, init) => globalThis.fetch(url, init), loadedModels = null, keep = () => [], admission = null, budgetRefusal = null, roleDefaults = {}, log = () => {}, now = () => Date.now(), machines = null }) {
   if (typeof engine !== 'function') throw Error('createRoleEngine needs engine()');

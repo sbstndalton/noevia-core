@@ -6,7 +6,7 @@
 // The backend is a provider-shaped row the chat handler uses like the local one: the same
 // /v1/chat/completions request, streaming and tool calls. What differs, on purpose:
 //  - its id is `machine:<id>`, never the default provider's, so nothing that manages this machine's engine
-//    runs for it: no makeRoomFor (load/unload), no inference memory budget, no model-manager props,
+//    runs for it: no lease from this machine's inference gate (load/unload), no inference memory budget, no model-manager props,
 //    evidence or prefill measurements (#697); a role on a machine is not resident here;
 //  - it carries `machine`, which chat.cjs reads as "still on this network": the turn is not off-box
 //    (#815/#1703), since the owner put the role on one of their own machines;

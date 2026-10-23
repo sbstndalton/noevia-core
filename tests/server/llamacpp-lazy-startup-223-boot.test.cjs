@@ -59,6 +59,8 @@ function fakeRouter() {
     req.on('data', (c) => chunks.push(c));
     req.on('end', () => {
       calls.push(`${req.method} ${p}`);
+      // No inference gate in front of this router (noevia#2115): like the router, it answers its endpoints 404.
+      if (p.startsWith('/gate/')) { res.writeHead(404, { 'content-type': 'application/json' }); res.end(JSON.stringify({ error: { code: 404, message: 'File Not Found', type: 'not_found_error' } })); return; }
       if (p === '/models/load') state.small = 'loaded';
       if (p === '/models/unload') state.small = 'unloaded';
       const body = p === '/models' ? { data: [{ id: 'small', status: { value: state.small }, meta: { n_ctx_train: 8192 } }] } : {};

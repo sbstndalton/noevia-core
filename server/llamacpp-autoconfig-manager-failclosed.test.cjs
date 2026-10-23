@@ -29,7 +29,7 @@ function manager(t, budget = 64) {
   const ini = path.join(dir, 'models.ini');
   fs.writeFileSync(ini, 'version = 1\n\n[small]\nmodel = /models/q.gguf\nctx-size = 4096\ncache-ram = 0\n');
   const calls = [], state = { small: 'unloaded' };
-  const m = createModelManager({ kind: 'llamacpp', baseUrl: 'http://synthetic', presetPath: ini, autoconfig: { modelsPath: dir, cacheRamMaxMib: 1024 },
+  const m = createModelManager({ kind: 'llamacpp', baseUrl: 'http://synthetic', presetPath: ini, autoconfig: { modelsPath: dir, cacheRamMaxMib: 1024 }, gate: require('./fixtures/fake-inference-gate.cjs').fakeGate(),
     inferenceBudget: { budgetGib: () => budget },
     fetchJson: async (url, options = {}) => {
       const p = new URL(url).pathname;

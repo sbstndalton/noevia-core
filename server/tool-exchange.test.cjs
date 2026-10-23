@@ -93,7 +93,7 @@ function fixture({ rounds, decision = 'approve', execute, fallback = false, canc
   };
   if(native){
     let loaded=false;
-    context.modelManager=require('./model-manager.cjs').createModelManager({kind:'llamacpp',baseUrl:'http://fixture.invalid',fetchJson:async url=>{
+    context.modelManager=require('./model-manager.cjs').createModelManager({kind:'llamacpp',baseUrl:'http://fixture.invalid',gate:require('./fixtures/fake-inference-gate.cjs').fakeGate(),fetchJson:async url=>{
       if(url.endsWith('/models/load'))loaded=true;
       return {ok:true,status:200,body:url.includes('/props?')?{default_generation_settings:{n_ctx:32768},total_slots:1,build_info:'synthetic-native'}:{data:[{id:'synthetic-model',status:{value:loaded?'loaded':'unloaded'}}]}};
     }});

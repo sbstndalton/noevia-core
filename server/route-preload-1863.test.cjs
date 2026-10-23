@@ -16,6 +16,7 @@ const { createVisionProbe } = require('./vision.cjs');
 const { createModelManager } = require('./model-manager.cjs');
 const { preloadTarget, startPreload } = require('./route-preload.cjs');
 const reasoningEffort = require('./reasoning-effort.cjs');
+const { fakeGate } = require('./fixtures/fake-inference-gate.cjs');
 
 const LOAD_MS = 600, DECISION_MS = 500;
 const ONE = { fast: 'synthetic-one', smart: 'synthetic-one' };
@@ -43,8 +44,32 @@ function router(states) {
     }
     return { ok: true, status: 200, body: {} };
   };
-  const manager = createModelManager({ kind: 'llamacpp', baseUrl: 'http://synthetic-router/v1', fetchJson, fetchStream: async () => ({ ok: false }) });
+  const manager = createModelManager({ kind: 'llamacpp', baseUrl: 'http://synthetic-router/v1', fetchJson, fetchStream: async () => ({ ok: false }), gate: switchingGate(fetchJson) });
   return { manager, calls, states, unloads, loads: () => calls.filter((c) => c.startsWith('POST /models/load')) };
+}
+
+// noevia#2115: the inference gate in front of the router. A lease waits while a lease on another model is held; then
+// the gate unloads every other chat model (idle by then), waits until the router lists it gone, and grants. Those
+// unloads reach this router, so they are recorded with the state the model was in.
+function switchingGate(fetchJson) {
+  const held = new Map(), base = fakeGate();
+  let waiting = 0, issued = 0;
+  const others = async (model) => (await fetchJson('http://synthetic-router/models', {})).body.data.filter((r) => r.id !== model && ['loaded', 'loading'].includes(r.status.value));
+  return { ...base, waiting: () => waiting,
+    async acquire(model, { signal } = {}) {
+      waiting++;
+      try {
+        for (;;) { signal?.throwIfAborted(); if (![...held].some(([m, n]) => m !== model && n > 0)) break; await sleep(5); }
+        for (const row of await others(model)) await fetchJson('http://synthetic-router/models/unload', { method: 'POST', body: JSON.stringify({ model: row.id }) });
+        for (const deadline = Date.now() + 5000; (await others(model)).length && Date.now() < deadline;) await sleep(10);
+      } finally { waiting--; }
+      held.set(model, (held.get(model) || 0) + 1);
+      const token = (++issued).toString(16).padStart(32, '0');
+      let given = false;
+      return { model, token, headers: () => ({ 'X-Noevia-Lease': token }),
+        fetch: (f) => (url, init = {}) => f(url, { ...init, headers: { ...(init.headers || {}), 'X-Noevia-Lease': token } }),
+        release: async () => { if (!given) { given = true; held.set(model, held.get(model) - 1); } } };
+    } };
 }
 
 async function turn(t, { roles, states, project = { routing: 'auto' }, routingModes = null, chatMachines = null, decisionMs = DECISION_MS, route = 'fast', message = 'QA-SYNTH-1863 Say hello.', codeTasks = [], mode, stopDuringDecision = false }) {
@@ -245,57 +270,8 @@ test('#1863 owner shape, wrong guess with a fast decision: the pre-load is cance
   console.log(`[1863] wrong-guess (fast decision) TTFT ${out.firstToken} ms (today ${100 + LOAD_MS} ms)`);
 });
 
-test('#1863 D1 makeRoomFor: a loading evictee the engine accepts (force-kill) or refuses never fails the turn', async () => {
-  // Accepts while loading (b11610's real answer): the model leaves; the Code model's room is made.
-  {
-    const engine = router({ 'synthetic-shared-12b': 'loading', 'synthetic-coder-9b': 'unloaded' });
-    await engine.manager.makeRoomFor('synthetic-coder-9b', []);
-    assert.deepEqual(engine.unloads, [{ model: 'synthetic-shared-12b', was: 'loading' }]);
-    assert.equal(engine.states['synthetic-shared-12b'], 'unloaded');
-  }
-  // Refuses while loading (defensive): wait until it is loaded, then unload it.
-  {
-    const states = { 'synthetic-shared-12b': 'loading', 'synthetic-coder-9b': 'unloaded' };
-    const calls = [];
-    const fetchJson = async (url, options = {}) => {
-      const u = new URL(url), method = String(options.method || 'GET').toUpperCase(), body = options.body ? JSON.parse(options.body) : {};
-      if (u.pathname === '/models' && method === 'GET') return { ok: true, status: 200, body: { data: Object.entries(states).map(([id, value]) => ({ id, status: { value } })) } };
-      if (u.pathname === '/models/unload') {
-        calls.push(states[body.model]);
-        if (states[body.model] === 'loading') { setTimeout(() => { states[body.model] = 'loaded'; }, 150); return { ok: false, status: 409, body: { error: 'still loading' } }; }
-        states[body.model] = 'unloaded'; return { ok: true, status: 200, body: { success: true } };
-      }
-      return { ok: true, status: 200, body: {} };
-    };
-    const manager = createModelManager({ kind: 'llamacpp', baseUrl: 'http://synthetic-router/v1', fetchJson, fetchStream: async () => ({ ok: false }) });
-    await manager.makeRoomFor('synthetic-coder-9b', []);
-    assert.deepEqual(calls, ['loading', 'loaded'], 'refused while loading, unloaded once loaded');
-    assert.equal(states['synthetic-shared-12b'], 'unloaded');
-  }
-  // Refused and gone (400 "not running" after it died): room is made, nothing else is asked.
-  {
-    const states = { 'synthetic-shared-12b': 'loading', 'synthetic-coder-9b': 'unloaded' };
-    const fetchJson = async (url, options = {}) => {
-      const u = new URL(url), method = String(options.method || 'GET').toUpperCase();
-      if (u.pathname === '/models' && method === 'GET') return { ok: true, status: 200, body: { data: Object.entries(states).map(([id, value]) => ({ id, status: { value } })) } };
-      if (u.pathname === '/models/unload') { states['synthetic-shared-12b'] = 'unloaded'; return { ok: false, status: 400, body: { error: { message: 'model is not running' } } }; }
-      return { ok: true, status: 200, body: {} };
-    };
-    const manager = createModelManager({ kind: 'llamacpp', baseUrl: 'http://synthetic-router/v1', fetchJson, fetchStream: async () => ({ ok: false }) });
-    await manager.makeRoomFor('synthetic-coder-9b', []);
-  }
-  // A loaded (possibly in use) model that refuses still fails as before: only a loading evictee is waited for.
-  {
-    const fetchJson = async (url, options = {}) => {
-      const u = new URL(url), method = String(options.method || 'GET').toUpperCase();
-      if (u.pathname === '/models' && method === 'GET') return { ok: true, status: 200, body: { data: [{ id: 'synthetic-shared-12b', status: { value: 'loaded' } }, { id: 'synthetic-coder-9b', status: { value: 'unloaded' } }] } };
-      if (u.pathname === '/models/unload') return { ok: false, status: 409, body: {} };
-      return { ok: true, status: 200, body: {} };
-    };
-    const manager = createModelManager({ kind: 'llamacpp', baseUrl: 'http://synthetic-router/v1', fetchJson, fetchStream: async () => ({ ok: false }) });
-    await assert.rejects(manager.makeRoomFor('synthetic-coder-9b', []), /could not be unloaded/);
-  }
-});
+// #1863 D1 (a loading pre-load the engine must unload before the Code model loads) is the inference gate's since
+// noevia#2115: it unloads the idle pre-load when the turn's lease on the Code model waits (the wrong-guess tests above).
 
 test('#1863 D2 a turn stopped during the decision unloads its unused pre-load once loaded', async (t) => {
   const out = await turn(t, { roles: OWNER, states: ownerStates(), stopDuringDecision: true });
