@@ -17,6 +17,8 @@ function fixture({ projects = [], diary = true, catalogue = null, onToolboxesCha
   const dispatched = [];
   const requestScope = new AsyncLocalStorage();
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'noevia-project-routes-'));
+  const sourceJobs = require('../../tests/server/project-store-stub.cjs').createStubStore(dir, { flat: true }).sourceJobsFor('stub');
+  const workspace = { dir, userId: 'u1', ragDir: () => path.join(dir, 'rag'), assetDir: () => path.join(dir, 'assets'), sourceJobs };
   const providers = [{ id: 'default' }, { id: 'prov-cloud' }];
   // Use production fallback semantics: an unknown ID resolves to default.
   const { getProvider } = createProviderRegistry({ currentWorkspace: () => ({}), PROVIDERS: providers, DEFAULT_PROVIDER_ID: 'default' });
@@ -36,7 +38,7 @@ function fixture({ projects = [], diary = true, catalogue = null, onToolboxesCha
     readJson: require('../http.cjs').readJson,
     requestScope,
     dispatch: async (req, res) => { dispatched.push({ url: req.url, method: req.method, headers: req.headers, progress: requestScope.getStore()?.sourceProgress }); res.writeHead(200); res.end('{"ok":true}'); },
-    currentWorkspace: () => ({ dir, userId: 'u1', ragDir: () => path.join(dir, 'rag'), assetDir: () => path.join(dir, 'assets') }),
+    currentWorkspace: () => workspace,
     authService: { diaryEnabled: () => diary, getStorage: () => ({ kind: 'local' }) },
     storageClient: { isBrowsable: () => false, TEXT_EXTENSIONS: new Set(['.txt']), safeRelativePath: (f) => f },
     documents: { isDocument: (name) => /\.pdf$/i.test(name) },

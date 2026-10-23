@@ -340,6 +340,7 @@ function createWorkspaceStore(rootDir, defaultProvider, secrets, { projectStore 
         freeChatsFile.refresh(this);
       },
       transcripts: require('./project-store-client.cjs').transcriptsFor(projectStore, userId),
+      sourceJobs: projectStore.sourceJobsFor?.(userId) || null,
       usagePath() { return path.join(dir, 'usage.json'); },
       ragDir() { return path.join(dir, 'rag'); },
       // Image sources live on disk, not in projects.json: base64 in the
