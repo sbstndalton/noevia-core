@@ -58,9 +58,10 @@ async function request(url, { method = 'GET', headers = {}, body = '' } = {}) {
 
 let cookie = '';
 let csrf = '';
+let userId = '';
 test.before(async () => {
   // Sign-in is the Rust front's (#1071): the account and its session are seeded directly.
-  ({ cookie, csrf } = require('../tests/server/seed-account.cjs').seedAccount(testDataDir, { username: 'admin', displayName: 'Admin', publicOrigin: 'http://localhost' }));
+  ({ cookie, csrf, id: userId } = require('../tests/server/seed-account.cjs').seedAccount(testDataDir, { username: 'admin', displayName: 'Admin', publicOrigin: 'http://localhost' }));
 });
 
 const mutationHeaders = () => ({ origin: 'http://localhost', cookie, 'content-type': 'application/json', 'x-csrf-token': csrf });
@@ -82,7 +83,19 @@ function storedHistory(chatId) {
   return { history, revision: crypto.createHash('sha256').update(JSON.stringify(history)).digest('hex') };
 }
 
-const post = (url, body, headers = mutationHeaders()) => request(url, { method: 'POST', headers, body: JSON.stringify(body) });
+// #1071 slice 5: POST /api/chats/:id/history is the Rust front's too (Node refuses it, below), so a
+// save here is the front's, in process over the same store (tests/server/project-store-server.cjs).
+const post = async (url, body) => {
+  const id = /^\/api\/chats\/([^/]+)\/history$/.exec(url)[1];
+  return require('../tests/server/project-store-server.cjs').rustHistorySave(testDataDir, userId, decodeURIComponent(id), body);
+};
+
+test('#1071 slice 5: Node refuses a history save (503 RUST_PROJECTS_OWNED) and writes nothing', async () => {
+  const r = await request('/api/chats/c-node-refused/history', { method: 'POST', headers: mutationHeaders(), body: JSON.stringify({ history: [{ role: 'user', content: 'qa' }] }) });
+  assert.equal(r.status, 503, r.text);
+  assert.equal(JSON.parse(r.text).code, 'RUST_PROJECTS_OWNED');
+  assert.deepEqual(storedHistory('c-node-refused').history, []);
+});
 const realFetch = global.fetch;
 
 test('saving a long chat keeps every message, not just the last 40', async () => {

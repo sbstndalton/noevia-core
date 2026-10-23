@@ -153,11 +153,9 @@ test('#2153 end to end: over the store journal a history save queues exactly one
  await reader.poll(uid);
  assert.deepEqual(mirror.slice().sort(),['c-existing','c-free','c-new'],'the import is mirrored');
  assert.deepEqual(brain,[],'an import builds no brain');
- const sent=[];
- const routes=require('./chat-lists.cjs').createChatListRoutes({json:(res,status,body)=>{sent.push({status,body});},readBody:async req=>{let s='';for await(const c of req)s+=c;return s;},currentWorkspace:()=>f.w,PROJECTS:[],FREE_CHATS:[],diaryExtras:{internalProject:()=>false},STORED_HISTORY_BYTES:100000,chatLists:()=>({freeChats:[],projects:[]}),removeChat:()=>{},store:{sanitizeChats:c=>c||[],saveFreeChats(){},deleteFreeChat:()=>false,readHistory:()=>[]}});
- const req=require('node:stream').Readable.from([Buffer.from(JSON.stringify({history:[{role:'user',content:'Synthetic new'},{role:'assistant',content:'Synthetic reply'}]}))]);req.method='POST';
- await routes(req,{setHeader(){}},{path:'/api/chats/c-new/history',authn:{user:{id:uid,role:'member'}}});
- assert.equal(sent.pop().status,200);
+ // #1071 slice 5: the history POST is the Rust front's; its save (in process over the same store) journals origin history.
+ const saved=require('../../tests/server/project-store-server.cjs').rustHistorySave(root,uid,'c-new',{history:[{role:'user',content:'Synthetic new'},{role:'assistant',content:'Synthetic reply'}]});
+ assert.equal(saved.status,200,saved.text);
  await reader.poll(uid);
  assert.deepEqual(brain,['c-new'],'one history save, one brain build');
  const {entries}=await client.changesRead(uid,0);

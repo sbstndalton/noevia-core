@@ -10,7 +10,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const psc = require('./project-store-client.cjs');
-const { createChangeJournalReader, scheduleMirrorAndBrain, journalCovers, JOURNAL_READER_MARKER } = require('./chat-change-journal.cjs');
+const { createChangeJournalReader, scheduleMirrorAndBrain, JOURNAL_READER_MARKER } = require('./chat-change-journal.cjs');
 const { createChatVaultMirror } = require('./chat-vault-mirror.cjs');
 const { createBrainScheduler } = require('./chat-brain.cjs');
 
@@ -115,22 +115,21 @@ test('the same chat and revision is scheduled once; a new revision again', async
   } finally { await h.done(); }
 });
 
-test('the journal replaces the Node nudge only while the store journals', async () => {
+test('the reader is active only while the store journals; the history POST is never a Node nudge', async () => {
   const h = await harness();
   const old = await harness({ missingOp: true });
   try {
-    assert.equal(journalCovers(h.reader, 'POST', '/api/chats/qa-c/history'), false, 'unknown until the first read');
+    assert.equal(h.reader.active(), false, 'unknown until the first read');
     await h.reader.poll(USER);
-    assert.equal(journalCovers(h.reader, 'POST', '/api/chats/qa-c/history'), true);
-    // A move, a project change or another method is still mirrorTrigger's.
-    assert.equal(journalCovers(h.reader, 'POST', '/api/chats/qa-c/move'), false);
-    assert.equal(journalCovers(h.reader, 'POST', '/api/projects'), false);
-    assert.equal(journalCovers(h.reader, 'DELETE', '/api/chats/qa-c/history'), false);
+    assert.equal(h.reader.active(), true);
+    // #1071 slice 5: Node refuses POST history (Rust owns it), so mirrorTrigger leaves it alone.
+    const { mirrorTrigger } = require('./chat-vault-mirror.cjs');
+    assert.equal(mirrorTrigger('POST', '/api/chats/qa-c/history'), null);
+    assert.equal(require('./rust-projects.cjs').ownedRoute('POST', '/api/chats/qa-c/history'), true);
     // An older Rust front without the op: inactive, nothing scheduled, nothing logged as a failure.
     journalWrite(old.root, USER, 'qa-c', 'r1');
     await old.reader.poll(USER);
     assert.equal(old.reader.active(), false);
-    assert.equal(journalCovers(old.reader, 'POST', '/api/chats/qa-c/history'), false);
     assert.deepEqual([old.mirror, old.logs], [[], []]);
   } finally { await h.done(); await old.done(); }
 });

@@ -1272,10 +1272,9 @@ async function handleRequestScoped(req, res) {
     if (authn && await chatVaultMirrorRoutes(req, res, { path: p, authn })) return;
     // #741: a successful change to the user's chats nudges their mirror (debounced; a no-op unless opted in).
     const mirrorNudge = authn ? vaultMirrorLib.mirrorTrigger(req.method, p) : null;
-    // #2153: a history save the change journal covers is scheduled from the journal (read at once), not twice.
+    // #2153: a history save is the Rust front's; the change journal schedules it (touch: read this user).
     if (authn) changeJournal.touch(authn.user.id);
-    const nudgeViaJournal = mirrorNudge && require('./chat-change-journal.cjs').journalCovers(changeJournal, req.method, p);
-    if (mirrorNudge && typeof res.once === 'function') res.once('finish', () => { if (res.statusCode >= 200 && res.statusCode < 300) { if (nudgeViaJournal) return void changeJournal.poll(authn.user.id); chatVaultMirror.schedule(authn.user.id, mirrorNudge.chatId); if (mirrorNudge.chatId) chatBrains.schedule(authn.user.id, mirrorNudge.chatId); } });
+    if (mirrorNudge && typeof res.once === 'function') res.once('finish', () => { if (res.statusCode >= 200 && res.statusCode < 300) { chatVaultMirror.schedule(authn.user.id, mirrorNudge.chatId); if (mirrorNudge.chatId) chatBrains.schedule(authn.user.id, mirrorNudge.chatId); } });
     if (authn && await exportRoutes(req, res, { path: p, authn })) return;
     if (authn && await importRoutes(req, res, { path: p, authn })) return;
     if (authn && await accountRoutes(req, res, { path: p, authn })) return;

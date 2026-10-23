@@ -105,12 +105,14 @@ function renderNote({ chat, projectName, history, linkNames = [], brain = null }
 const hash = (text) => crypto.createHash('sha256').update(text).digest('hex');
 const noteName = (path) => path.slice(path.lastIndexOf('/') + 1).replace(/\.md$/, '');
 
-/** Should a finished request make this user's mirror look again? Writes to chat lists, transcripts,
- *  moves, project changes (a renamed project moves its notes) and imports. */
+/** Should a finished request make this user's mirror look again? Writes to chat lists, moves,
+ *  project changes (a renamed project moves its notes) and imports. A transcript save is the Rust
+ *  front's (POST /api/chats/{id}/history, sbstndalton/noevia#1071 slice 5): Node never answers it,
+ *  and chat-change-journal.cjs schedules the mirror (and the brain) from the store's journal. */
 function mirrorTrigger(method, path) {
   if (!method || ['GET', 'HEAD', 'OPTIONS'].includes(method)) return null;
-  const history = /^\/api\/chats\/([^/]+)\/(history|move)$/.exec(path || '');
-  if (history) { try { return { chatId: decodeURIComponent(history[1]) }; } catch { return { chatId: null }; } }
+  const move = /^\/api\/chats\/([^/]+)\/move$/.exec(path || '');
+  if (move) { try { return { chatId: decodeURIComponent(move[1]) }; } catch { return { chatId: null }; } }
   return /^\/api\/(freechats(\/|$)|projects(\/|$)|import(\/|$))/.test(path || '') ? { chatId: null } : null;
 }
 

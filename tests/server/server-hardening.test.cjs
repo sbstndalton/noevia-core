@@ -52,7 +52,7 @@ test('S2: chat with a null or array body is a 400 and never reaches the loop', a
   }
 });
 
-test('S3/S4: history route sanitizes ids like storage, honours tombstones, rejects empty ids', async () => {
+test('S3/S4: the history route (read and save) is the Rust front\'s; Node handles no spelling of it (#1071 slice 5)', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'noevia-hardening-'));
   try {
     lists.addTombstone(dir, 'chat-a1');
@@ -60,21 +60,19 @@ test('S3/S4: history route sanitizes ids like storage, honours tombstones, rejec
     const writes = [];
     const route = createChatListRoutes({
       json: (_r, status, body) => { captured.push({ status, body }); return true; },
-      // #1071 slice 4: the transcript is written through the store (its stand-in here), never by the route.
       readBody: async (req) => req.body, currentWorkspace: () => ({ dir, transcripts: { write: async (id) => { writes.push(id); return { ok: true, revision: 'r' }; } } }), PROJECTS: [], FREE_CHATS: [], diaryExtras: {},
       STORED_HISTORY_BYTES: 1e6, chatLists: () => ({ freeChats: [], projects: [] }), removeChat: () => true,
       store: { sanitizeChats: (c) => c, saveFreeChats() {}, deleteFreeChat() {}, readHistory: () => [] },
     });
-    const send = (rawId, body = '{"history":[]}') => route({ method: 'POST', body }, {}, { path: `/api/chats/${encodeURIComponent(rawId)}/history` }).then(() => captured.at(-1));
-    assert.equal((await send('chat-a1..')).status, 410);
-    assert.equal((await send('chat-a1!')).status, 410, 'a raw id that sanitizes to a deleted chat cannot resurrect it');
-    assert.equal((await send('chat-a1..')).status, 410);
-    assert.equal((await send('!!!')).status, 400, 'an id that sanitizes to nothing is rejected');
-    assert.equal((await send('chat-b2', 'null')).status, 400);
-    assert.equal((await send('chat-b2')).status, 200);
-    assert.deepEqual(writes, ['chat-b2']);
-    await route({ method: 'GET' }, {}, { path: '/api/chats/%21%21/history' });
-    assert.equal(captured.at(-1).status, 400);
+    const { ownedRoute } = require('../../server/rust-projects.cjs');
+    for (const rawId of ['chat-a1..', 'chat-a1!', '!!!', 'chat-b2']) {
+      const p = `/api/chats/${encodeURIComponent(rawId)}/history`;
+      for (const method of ['GET', 'POST']) {
+        assert.equal(ownedRoute(method, p), true, `${method} ${rawId}: refused before any mount`);
+        assert.equal(await route({ method, body: '{"history":[]}' }, {}, { path: p }), false, `${method} ${rawId}`);
+      }
+    }
+    assert.deepEqual([captured, writes], [[], []]);
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
 
@@ -85,16 +83,10 @@ test('S3: deleting a raw id with stripped characters blocks its history under bo
     assert.ok(lists.readTombstones(dir).has('chat.1') && lists.readTombstones(dir).has('chat1'));
     lists.addTombstone(dir, 'chat.1');
     assert.equal([...lists.readTombstones(dir)].length, 2, 'deduped');
-    const captured = [];
-    const route = createChatListRoutes({
-      json: (_r, status, body) => { captured.push({ status, body }); return true; },
-      readBody: async (req) => req.body, currentWorkspace: () => ({ dir }), PROJECTS: [], FREE_CHATS: [], diaryExtras: {}, crypto,
-      STORED_HISTORY_BYTES: 1e6, STORED_HISTORY_CAP: 100, chatLists: () => ({ freeChats: [], projects: [] }), removeChat: () => true,
-      store: { sanitizeChats: (c) => c, saveFreeChats() {}, deleteFreeChat() {}, readHistory: () => [], writeHistory: () => { throw new Error('wrote'); } },
-    });
+    // The save itself is the Rust front's (#1071 slice 5); its store refuses a tombstoned chat (stand-in here).
+    const { localTranscripts } = require('./project-store-server.cjs');
     for (const id of ['chat.1', 'chat1']) {
-      await route({ method: 'POST', body: '{"history":[]}' }, {}, { path: `/api/chats/${id}/history` });
-      assert.equal(captured.at(-1).status, 410, id);
+      assert.deepEqual(await localTranscripts(dir).write(id, [], { supersedePartial: true, origin: 'history' }), { deleted: true }, id);
     }
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });

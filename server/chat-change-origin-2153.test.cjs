@@ -54,9 +54,11 @@ test('the client sends the origin it is given on all three ops, and `other` when
   assert.deepEqual([...psc.HISTORY_ORIGINS].sort(), ['history', 'import', 'other', 'remove', 'turn']);
 });
 
-test('the Node-served history POST saves with origin history', async () => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'qa-origin-lists-'));
+test('#1071 slice 5: Node no longer serves the history POST; the Rust front\'s save journals origin history', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'qa-origin-lists-'));
   try {
+    const dir = path.join(root, 'users', USER);
+    fs.mkdirSync(dir, { recursive: true });
     const calls = [];
     const transcripts = localTranscripts(dir, calls);
     const sent = [];
@@ -70,12 +72,14 @@ test('the Node-served history POST saves with origin history', async () => {
     });
     const req = Readable.from([Buffer.from(JSON.stringify({ history: [{ role: 'user', content: 'qa' }] }))]);
     req.method = 'POST';
-    await routes(req, { setHeader() {} }, { path: '/api/chats/qa-c1/history', authn: { user: { id: 'u1', role: 'member' } } });
-    assert.equal(sent.pop().status, 200);
-    assert.deepEqual(calls.map((c) => [c.url, c.body.origin]), [['/v1/history/write', 'history']]);
+    assert.equal(await routes(req, { setHeader() {} }, { path: '/api/chats/qa-c1/history', authn: { user: { id: USER, role: 'member' } } }), false);
+    assert.deepEqual([sent, calls], [[], []], 'Node answers and writes nothing');
+    assert.equal(require('./rust-projects.cjs').ownedRoute('POST', '/api/chats/qa-c1/history'), true, 'refused before any mount');
+    const saved = require('../tests/server/project-store-server.cjs').rustHistorySave(root, USER, 'qa-c1', { history: [{ role: 'user', content: 'qa' }] });
+    assert.equal(saved.status, 200, saved.text);
     const journal = fs.readFileSync(path.join(dir, 'chat-changes.jsonl'), 'utf8').trim().split('\n').map((l) => JSON.parse(l));
     assert.deepEqual(journal.map((e) => [e.chatId, e.op, e.origin]), [['qa-c1', 'write', 'history']]);
-  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 
 test('an interrupted reply is appended with origin turn', async () => {

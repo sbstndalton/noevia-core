@@ -27,11 +27,11 @@
 //   journal every 2 s would cost a store call per account with nothing to gain. The timer calls the
 //   store only when the journal file's stamp (size, mtime, inode: `stamp`, a local stat) changed
 //   since the last read, so an idle user costs one stat per tick and no socket is kept busy.
-// - Dedupe: an entry whose chat and revision were already scheduled is skipped. While this reader
-//   works (the store answers the op), index.cjs leaves a Node-served history POST to the journal
-//   and does not nudge it as well (see `active()`). Against a store without the op (404), the
-//   reader stays inactive and mirrorTrigger keeps nudging. Either deploy order is safe; only
-//   "Rust owns POST history, Node lacks this reader" is not, and assemble-release refuses it.
+// - Dedupe: an entry whose chat and revision were already scheduled is skipped. The history POST is
+//   the Rust front's (rust-projects.cjs OWNED_ROUTES), so mirrorTrigger no longer nudges it and
+//   this reader is the only path from a save to the mirror and the brain. Against a store without
+//   the op (404) the reader stays inactive; assemble-release refuses a release pairing a front
+//   that owns POST history with a core that lacks this reader.
 // - Failures are logged once per run of failures and retried on the next tick. They never throw
 //   into a request or crash the process.
 
@@ -185,8 +185,7 @@ function createChangeJournalReader({ read, onChange, stamp = () => null, log = (
 
   return {
     touch, poll, tick,
-    /** Whether the store journals transcript changes (its op answered): a history POST that Node
-     *  serves is then left to the journal instead of nudged a second time. */
+    /** Whether the store journals transcript changes (its op answered). */
     active: () => supported === true,
     start() { if (!timer) { timer = setTimer(() => { tick(); }, intervalMs); timer?.unref?.(); } return this; },
     stop() { if (timer) { clearTimer(timer); timer = null; } },
@@ -216,9 +215,4 @@ function scheduleMirrorAndBrain({ chatVaultMirror, chatBrains }) {
   return (user, chatId, { brain = false } = {}) => { chatVaultMirror.schedule(user, chatId); if (brain) chatBrains.schedule(user, chatId); };
 }
 
-/** Whether a nudge from mirrorTrigger is a transcript save the journal already covers. */
-function journalCovers(reader, method, path) {
-  return method === 'POST' && /^\/api\/chats\/[^/]+\/history$/.test(path || '') && reader.active();
-}
-
-module.exports = { createChangeJournalReader, isHistorySave, scheduleMirrorAndBrain, journalCovers, fileStamp, JOURNAL_READER_MARKER, INTERVAL_MS, ACTIVE_MS };
+module.exports = { createChangeJournalReader, isHistorySave, scheduleMirrorAndBrain, fileStamp, JOURNAL_READER_MARKER, INTERVAL_MS, ACTIVE_MS };

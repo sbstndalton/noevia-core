@@ -65,6 +65,8 @@ test.before(async () => {
 const mutationHeaders = () => ({ origin: 'http://localhost', cookie, 'content-type': 'application/json', 'x-csrf-token': csrf });
 
 const post = (url, body, headers = mutationHeaders()) => request(url, { method: 'POST', headers, body: JSON.stringify(body) });
+// #1071 slice 5: a history save is the Rust front's (Node refuses it), in process over the same store.
+const saveHistory = (chatId, body) => require('../tests/server/project-store-server.cjs').rustHistorySave(testDataDir, userId, chatId, body);
 const realFetch = global.fetch;
 
 const meta = (id, title = id, updatedAt = 1000) => ({ id, title, updatedAt, preview: '' });
@@ -114,9 +116,9 @@ test('a chat deleted from a project here is gone from the project on disk', asyn
 
 test('a late history save for a deleted chat does not write the transcript back', async () => {
   await frontSaveFree([meta('c-deleted-while-streaming')]);
-  await post('/api/chats/c-deleted-while-streaming/history', { history: [{ role: 'user', content: 'first' }] });
+  assert.equal(saveHistory('c-deleted-while-streaming', { history: [{ role: 'user', content: 'first' }] }).status, 200);
   assert.equal((await request('/api/freechats/c-deleted-while-streaming', { method: 'DELETE', headers: mutationHeaders() })).status, 200);
-  const late = await post('/api/chats/c-deleted-while-streaming/history', { history: [{ role: 'user', content: 'first' }, { role: 'assistant', content: 'late reply' }] });
+  const late = saveHistory('c-deleted-while-streaming', { history: [{ role: 'user', content: 'first' }, { role: 'assistant', content: 'late reply' }] });
   assert.equal(late.status, 410);
   // #1071: the GET is the Rust front's; the transcript file is what it would read.
   assert.equal(fs.existsSync(userFile('history-c-deleted-while-streaming.json')), false);
@@ -128,7 +130,7 @@ const frame = (extra = {}) => ({ projectId: null, kind: 'idea', tags: ['plans'],
 test('accepting a frame moves the chat into the project with its frame; the transcript stays readable (#738)', async () => {
   const project = JSON.parse((await post('/api/projects', { name: 'Synthetic destination' })).text);
   await frontSaveFree([meta('c-moving', 'Moving chat')]);
-  await post('/api/chats/c-moving/history', { history: [{ role: 'user', content: 'synthetic first message' }] });
+  assert.equal(saveHistory('c-moving', { history: [{ role: 'user', content: 'synthetic first message' }] }).status, 200);
   const moved = await post('/api/chats/c-moving/move', { projectId: project.id, frame: frame({ projectId: project.id }) });
   assert.equal(moved.status, 200);
   assert.deepEqual(JSON.parse(moved.text), { ok: true, from: null, projectId: project.id });
@@ -204,7 +206,7 @@ test('the move never puts a chat into an archived project; a once Code-only proj
 });
 
 test('a malformed chat id in the URL is a 400, not a server error (#812)', async () => {
-  for (const [method, url] of [['POST', '/api/chats/%E0%A4/move'], ['POST', '/api/chats/%E0%A4/history'],
+  for (const [method, url] of [['POST', '/api/chats/%E0%A4/move'],
     ['DELETE', '/api/freechats/%E0%A4'], ['DELETE', '/api/projects/%E0%A4/chats/c1'],
     ['DELETE', '/api/projects/p1/chats/%E0%A4']]) {
     const r = await request(url, { method, headers: mutationHeaders(), body: method === 'GET' || method === 'DELETE' ? '' : JSON.stringify({ projectId: null, history: [] }) });
@@ -212,9 +214,9 @@ test('a malformed chat id in the URL is a 400, not a server error (#812)', async
     assert.deepEqual(JSON.parse(r.text), { error: 'invalid chat id' });
   }
   // #1071: the context meter is the Rust front's; Node refuses it before reading the id.
-  for (const url of ['/api/chats/%E0%A4/context-window', '/api/chats/%E0%A4/history']) {
-    const owned = await request(url, { method: 'GET', headers: mutationHeaders() });
-    assert.equal(owned.status, 503, url);
-    assert.equal(JSON.parse(owned.text).code, 'RUST_PROJECTS_OWNED', url);
+  for (const [method, url] of [['GET', '/api/chats/%E0%A4/context-window'], ['GET', '/api/chats/%E0%A4/history'], ['POST', '/api/chats/%E0%A4/history']]) {
+    const owned = await request(url, { method, headers: mutationHeaders(), body: method === 'POST' ? JSON.stringify({ history: [] }) : '' });
+    assert.equal(owned.status, 503, `${method} ${url}`);
+    assert.equal(JSON.parse(owned.text).code, 'RUST_PROJECTS_OWNED', `${method} ${url}`);
   }
 });
