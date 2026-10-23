@@ -138,7 +138,7 @@ function createClient({ port, token, fetchImpl = globalThis.fetch, timeoutMs = T
         cancel: (owner, projectId, id, run) => researchCall('cancel', user, { ...owner, projectId, id, run }),
         finish: (owner, id, run, ok, result, error) => researchCall('finish', user, { ...owner, id, run, ok, result, error }),
         report: (owner, id, run, result) => researchCall('report', user, { ...owner, id, run, result }),
-        prepare: (owner, projectId, id, run, name, hash, bytes) => researchCall('prepare', user, { ...owner, projectId, id, run, name, hash, bytes }),
+        prepare: (owner, projectId, id, run, name, hash, bytes, target) => researchCall('prepare', user, { ...owner, projectId, id, run, name, hash, bytes, target }),
         artifact: (owner, projectId, id, run, name, hash, bytes) => researchCall('artifact', user, { ...owner, projectId, id, run, name, hash, bytes }),
         clear: (owner, projectId, id, run, name, hash) => researchCall('clear', user, { ...owner, projectId, id, run, name, hash }),
         read: (projectId, id) => researchCall('read', user, { projectId, id }),

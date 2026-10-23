@@ -444,7 +444,7 @@ test('research-only createOnly project write forwards conditional PUT and refuse
   w.storage.conn = () => ({ ...originalConn(), kind: 'nextcloud' });
   const name = 'Research report.md';
   w.storage.afterPut = () => { throw Object.assign(Error('response lost after conditional PUT'), { status: 502, code: 'unknown' }); };
-  await assert.rejects(() => w.store.writeProjectTextFile(p, name, '# report', { createOnly: true }), (e) => e.code === 'unknown');
+  await assert.rejects(() => w.store.writeProjectTextFile(p, name, '# report', { createOnly: true }), (e) => e.code === 'unknown' && e.definitelyNotWritten !== true);
   const dest = `${p.projectFolder}/Text/${name}`;
   assert.deepEqual(w.storage.writeCalls.filter((c) => c.path === dest).map((c) => c.ifNoneMatch), ['*']);
   assert.equal(w.storage.writeCalls.filter((c) => c.path.includes('noevia-research-create-probe-')).length, 2, 'live backend probe tests a second conditional create');
@@ -461,6 +461,27 @@ test('research-only createOnly project write forwards conditional PUT and refuse
   await assert.rejects(() => w.store.writeProjectTextFile(p, 'Other report.md', '# report', { createOnly: true }),
     (e) => e.definitelyNotWritten === true && /Nextcloud storage/.test(e.message));
   assert.equal(w.storage.writeCalls.length, before, 'generic WebDAV is refused before any PUT');
+});
+
+test('research createOnly refuses a local same-name collision and a changed durable target', async (t) => {
+  const w = world(t);
+  const p = await w.project('Research target');
+  const originalConn = w.storage.conn;
+  w.storage.conn = () => null;
+  p.files.push({ name: 'Research.md', attachment: { id: 'a'.repeat(64), bytes: 1 } });
+  await assert.rejects(() => w.store.writeProjectTextFile(p, 'Research.md', '# new', { createOnly: true }),
+    (e) => e.code === 'changed' && e.definitelyNotWritten === true);
+  assert.equal(p.files.length, 1, 'the existing local project file is not replaced');
+  p.files.length = 0;
+  w.storage.conn = () => ({ ...originalConn(), kind: 'nextcloud' });
+  const target = await w.store.researchReportTarget(p, 'Research.md');
+  p.projectFolder += '-changed';
+  const before = w.storage.writeCalls.length;
+  await assert.rejects(() => w.store.writeProjectTextFile(p, 'Research.md', '# new', { createOnly: true, expectedTarget: target }),
+    (e) => e.definitelyNotWritten === true && /target changed/.test(e.message));
+  assert.equal(w.storage.writeCalls.length, before, 'no report or probe PUT follows a changed target');
+  await assert.rejects(() => w.store.writeProjectTextFile(p, '../invalid', '# new', { createOnly: true }),
+    (e) => e.definitelyNotWritten === true, 'validation before any PUT is a proven refusal');
 });
 
 test('research createOnly refuses a labelled Nextcloud endpoint that ignores If-None-Match', async (t) => {

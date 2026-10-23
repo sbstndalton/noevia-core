@@ -175,9 +175,9 @@ function createResearchJobs(workspace) {
       const jobs = await store();
       return jobs.report(OWNER, id, runFor(id), result);
     },
-    async prepareFile(id, projectId, name, hash, bytes) {
+    async prepareFile(id, projectId, name, hash, bytes, target) {
       const jobs = await store();
-      return jobs.prepare(OWNER, projectId, id, runFor(id), name, hash, bytes);
+      return jobs.prepare(OWNER, projectId, id, runFor(id), name, hash, bytes, target);
     },
     async artifact(id, projectId, name, hash, bytes) {
       const jobs = await store();

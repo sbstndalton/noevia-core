@@ -4,6 +4,7 @@ const fs = require('node:fs'), os = require('node:os'), path = require('node:pat
 const { createResearchService, reportFiles, slug } = require('./research-service.cjs');
 const { sanitizePlan, parsePlan, createPlanner } = require('./research-plan.cjs');
 const { createJobs } = require('./jobs.cjs');
+const testReportTarget = async (project, name) => crypto.createHash('sha256').update(JSON.stringify(['local', project.id, name])).digest('hex');
 // The service tests exercise report behavior against the legacy event-shaped in-memory oracle.
 // Production injects workspace.researchJobs and has no local journal fallback.
 function testJobsFactory(workspace) {
@@ -17,8 +18,8 @@ function testJobsFactory(workspace) {
     list: async (options) => jobs.list(options),
     cancel: async (id) => jobs.cancel(id),
     report: async () => {},
-    prepareFile: async (id, project, name, hash, bytes) => {
-      const intent = { name, hash, bytes };
+    prepareFile: async (id, project, name, hash, bytes, target) => {
+      const intent = { name, hash, bytes, target };
       const old = pending.get(id);
       if (old && JSON.stringify(old) !== JSON.stringify(intent)) throw Error('conflicting pending file');
       if (!old) pending.set(id, intent);
@@ -52,7 +53,7 @@ function setup(t, opts = {}) {
   const projects = new Map([[project.id, project], [other.id, other]]);
   const saved = [], calls = [];
   const service = createResearchService({
-    jobsFactory: testJobsFactory,
+    jobsFactory: testJobsFactory, reportTarget: testReportTarget,
     now: () => Date.parse('2026-09-17T10:00:00Z') + calls.length,
     saveFile: async (p, name, text) => { saved.push({ project: p.id, name, text }); },
     getProject: (id) => projects.get(id) || null,
@@ -171,7 +172,7 @@ test('a raced double savePartial does not write the same report twice', async (t
   const workspace = { dir }, project = { id: 'p1', files: [] };
   const saved = [], calls = [];
   const service = createResearchService({
-    jobsFactory: testJobsFactory,
+    jobsFactory: testJobsFactory, reportTarget: testReportTarget,
     now: () => Date.parse('2026-09-17T10:00:00Z') + calls.length,
     // A slow write widens the window a real race (double-click, retried request) would hit.
     saveFile: async (p, name, text) => { await new Promise((r) => setTimeout(r, 5)); saved.push({ project: p.id, name, text }); },
@@ -197,7 +198,7 @@ test('a failed report write keeps the result on the job, records no phantom arti
   const saved = [], calls = [];
   let failNext = 1;
   const service = createResearchService({
-    jobsFactory: testJobsFactory,
+    jobsFactory: testJobsFactory, reportTarget: testReportTarget,
     now: () => Date.parse('2026-09-17T10:00:00Z') + calls.length,
     // The first write succeeds, the sources.json write throws once, then the disk recovers.
     saveFile: async (p, name, text) => {
@@ -229,7 +230,7 @@ test('a report whose first write fails records nothing and the retry saves both 
   const saved = [], calls = [];
   let down = true;
   const service = createResearchService({
-    jobsFactory: testJobsFactory,
+    jobsFactory: testJobsFactory, reportTarget: testReportTarget,
     now: () => Date.parse('2026-09-17T10:00:00Z') + calls.length,
     saveFile: async (p, name, text) => { if (down) throw Object.assign(new Error('storage offline'), { definitelyNotWritten: true }); saved.push(name); },
     getProject: () => project,
@@ -246,35 +247,49 @@ test('a report whose first write fails records nothing and the retry saves both 
   assert.deepEqual(retried.artifacts, saved);
 });
 
-test('an ambiguous completed first PUT is never retried until exact indexed content is reconciled', async (t) => {
+test('an ambiguous completed PUT permits only an explicit anchored create-only retry, then exact indexed reconciliation', async (t) => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'noevia-research-ambiguous-'));
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
-  const workspace = { dir }, project = { id: 'p1', files: [] }, writes = [], calls = [];
-  let failAfterPut = true;
-  const service = createResearchService({
-    jobsFactory: testJobsFactory,
+  const workspace = { dir }, project = { id: 'p1', files: [] }, writes = [], attempts = [], remote = new Map(), calls = [];
+  let failAfterPut = true, destination = 'local';
+  const sharedJobs = testJobsFactory(workspace);
+  const targetFor = async (p, name) => crypto.createHash('sha256').update(JSON.stringify([destination, p.id, name])).digest('hex');
+  const makeService = () => createResearchService({
+    jobsFactory: () => sharedJobs, reportTarget: targetFor,
     now: () => Date.parse('2026-09-17T10:00:00Z'),
     getProject: () => project,
-    saveFile: async (p, name, text) => {
+    saveFile: async (p, name, text, target) => {
+      assert.equal(target, await targetFor(p, name));
+      attempts.push({ name, text });
+      if (remote.has(name)) throw Object.assign(Error('create-only file already exists'), { code: 'changed', definitelyNotWritten: true });
+      remote.set(name, text);
       writes.push({ name, text });
-      if (failAfterPut) { failAfterPut = false; throw Error('reply lost after PUT'); }
+      if (failAfterPut) { failAfterPut = false; throw Error('reply lost after conditional PUT'); }
     },
     tools: () => ({ search: async () => [{ url: 'https://fixture.test/z', title: 'Zephyr' }],
       extract: async () => PAGE, projectRetrieve: async () => [], complete: model(calls) }),
   });
+  let service = makeService();
   const started = await service.start(workspace, project, { question: 'Zephyr energy?' });
   const failed = await settle(service, workspace, project, started.id);
   assert.equal(failed.status, 'failed');
   assert.equal(failed.canSavePartial, false, 'unresolved file intent hides the retry affordance');
-  assert.equal(failed.saveUncertain.canReconcile, false, 'missing indexed bytes cannot be retried from the view');
+  assert.equal(failed.saveUncertain.canReconcile, false, 'missing indexed bytes cannot be reconciled');
+  assert.equal(failed.saveUncertain.canRetryCreateOnly, true, 'explicit retry is available through the create-only writer');
   assert.deepEqual(failed.artifacts, []);
   assert.equal(writes.length, 1);
-  await assert.rejects(() => service.savePartial(workspace, project, started.id), /unknown outcome/);
-  assert.equal(writes.length, 1, 'a missing index is not proof the PUT failed');
+  service = makeService(); // a new service view still sees the durable prepared intent
+  destination = 'another-storage-target';
+  await assert.rejects(() => service.savePartial(workspace, project, started.id), /target.*changed/);
+  assert.equal(attempts.length, 1, 'a changed target sends no PUT');
+  destination = 'local';
+  await assert.rejects(() => service.savePartial(workspace, project, started.id), (e) => /uncertain/.test(e.publicMessage));
+  assert.equal(writes.length, 1, 'a conditional 412 cannot overwrite the first PUT');
+  assert.equal(attempts.length, 2, 'only the explicit retry sends another conditional attempt');
   const first = writes[0];
   project.files.push({ name: first.name, attachment: { id: 'f'.repeat(64), bytes: 999 } });
   assert.equal((await service.get(workspace, project, started.id)).saveUncertain.canReconcile, false, 'concurrent replacement is not a safe reconciliation');
-  await assert.rejects(() => service.savePartial(workspace, project, started.id), /unknown outcome/);
+  await assert.rejects(() => service.savePartial(workspace, project, started.id), (e) => /uncertain/.test(e.publicMessage));
   assert.equal(writes.length, 1, 'a concurrent replacement cannot clear the unknown intent');
   project.files.length = 0;
   const bytes = Buffer.from(first.text, 'utf8');
@@ -288,13 +303,48 @@ test('an ambiguous completed first PUT is never retried until exact indexed cont
   assert.equal(writes[1].name, first.name.replace(/\.md$/, '.sources.json'));
 });
 
+test('an unresolved pre-PUT timeout can be recovered after service reconstruction by an exact create-only retry', async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'noevia-research-pending-retry-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const workspace = { dir }, project = { id: 'p1', files: [] }, writes = [], calls = [];
+  const sharedJobs = testJobsFactory(workspace);
+  let failBeforePut = true;
+  const makeService = () => createResearchService({
+    jobsFactory: () => sharedJobs, reportTarget: testReportTarget,
+    now: () => Date.parse('2026-09-17T10:00:00Z'),
+    getProject: () => project,
+    saveFile: async (p, name, text, target) => {
+      assert.equal(target, await testReportTarget(p, name));
+      if (failBeforePut) { failBeforePut = false; throw Error('timeout before conditional PUT, outcome not proven'); }
+      assert.equal((project.files || []).some((f) => String(f.name).split('/').pop() === name), false, 'local create-only name is unclaimed');
+      writes.push(name);
+      const bytes = Buffer.from(text, 'utf8');
+      project.files.push({ name, attachment: { id: crypto.createHash('sha256').update(bytes).digest('hex'), bytes: bytes.length } });
+    },
+    tools: () => ({ search: async () => [{ url: 'https://fixture.test/z', title: 'Zephyr' }],
+      extract: async () => PAGE, projectRetrieve: async () => [], complete: model(calls) }),
+  });
+  let service = makeService();
+  const started = await service.start(workspace, project, { question: 'Zephyr energy?' });
+  const failed = await settle(service, workspace, project, started.id);
+  assert.equal(failed.status, 'failed');
+  assert.deepEqual(failed.artifacts, []);
+  assert.equal(writes.length, 0);
+  assert.equal(failed.saveUncertain.canRetryCreateOnly, true);
+  service = makeService();
+  const recovered = await service.savePartial(workspace, project, started.id);
+  assert.equal(writes.length, 2);
+  assert.deepEqual(recovered.artifacts, writes);
+  assert.equal(recovered.saveUncertain, null);
+});
+
 test('#796 F3: a failed job whose result is not a finished report cannot be "saved"', async (t) => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'noevia-research-junk-'));
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
   const workspace = { dir }, project = { id: 'p1', files: [] };
   const saved = [];
   const service = createResearchService({
-    jobsFactory: testJobsFactory,
+    jobsFactory: testJobsFactory, reportTarget: testReportTarget,
     saveFile: async (p, name) => { saved.push(name); },
     getProject: () => project,
     tools: () => ({ search: async () => [], extract: async () => '', projectRetrieve: async () => [], complete: async () => '' }),

@@ -668,7 +668,38 @@ function createProjectStore({
       throw Object.assign(new Error(`Storage did not verify create-only report writes; no report file was written.${leftover}`), { status: 503, definitelyNotWritten: true, cause });
     }
   }
-  function writeProjectTextFile(project, name, text, { expectName, expectContent, expectAttachment, adoptTo, adoptAccount, createOnly = false } = {}) {
+  // A nonsecret, durable identity for the exact account/project destination. The journal stores
+  // this digest with the report intent, so a later explicit retry cannot silently move to a new
+  // storage connection, project folder, or local fallback after a disconnect.
+  function researchTargetKey(workspace, project, name, remote) {
+    const uploads = require('./uploads.cjs');
+    const account = remote ? require('./project-edit-target.cjs').storageAccount(remote) : null;
+    const destination = uploads.destinationFor(project, name, { connection: remote });
+    return require('node:crypto').createHash('sha256').update(JSON.stringify([
+      'research-report-target-v1', workspace.userId, project.id, remote ? 'remote' : 'local', account, destination,
+    ])).digest('hex');
+  }
+  async function researchReportTarget(project, name) {
+    return withSourceLock(project, async () => {
+      const workspace = currentWorkspace();
+      if (getProject(project.id) !== project) throw Object.assign(Error('The research project changed before its report write.'), { status: 409, definitelyNotWritten: true });
+      const connection = authService.getStorage(workspace.userId, true);
+      const remote = storageClient.isBrowsable(connection) ? connection : null;
+      if (remote && !project.projectFolder) {
+        const folder = await ensureProjectFolder(project);
+        if (!folder) throw Object.assign(Error('The research report folder is unavailable; no report file was written.'), { status: 503, definitelyNotWritten: true });
+        if (getProject(project.id) !== project) throw Object.assign(Error('The research project changed before its report write.'), { status: 409, definitelyNotWritten: true });
+        project.projectFolder = folder;
+        project.sourceFolders = [...new Set([...(project.sourceFolders || []), folder])];
+        await saveProjects(PROJECTS);
+      }
+      workspace.assertActive?.();
+      if (getProject(project.id) !== project) throw Object.assign(Error('The research project changed before its report write.'), { status: 409, definitelyNotWritten: true });
+      return researchTargetKey(workspace, project, name, remote);
+    });
+  }
+  function writeProjectTextFile(project, name, text, { expectName, expectContent, expectAttachment, adoptTo, adoptAccount, createOnly = false, expectedTarget } = {}) {
+    let remoteMode = false, remotePutStarted = false, localIngestStarted = false;
     return withSourceLock(project, async () => {
       if (getProject(project.id) !== project) throw new Error('the project changed while writing; nothing was saved');
       const uploads = require('./uploads.cjs');
@@ -696,6 +727,10 @@ function createProjectStore({
       }
       const connection = authService.getStorage(currentWorkspace().userId, true);
       const remote = storageClient.isBrowsable(connection) ? connection : null;
+      remoteMode = !!remote;
+      if (createOnly && expectedTarget && researchTargetKey(currentWorkspace(), project, name, remote) !== expectedTarget) {
+        throw Object.assign(Error('The research report target changed before the write; no report file was written.'), { status: 409, definitelyNotWritten: true });
+      }
       // Research reports are new files only. Nextcloud enforces If-None-Match: * atomically;
       // generic WebDAV may ignore it, and S3 writes are not supported here. Refuse those
       // backends before any PUT instead of claiming create-only safety they cannot provide.
@@ -750,15 +785,18 @@ function createProjectStore({
           if (active.userId !== selectedUser || getProject(project.id) !== project
             || project.projectFolder !== selectedFolder || conn !== remote || path !== selectedPath
             || options?.ifNoneMatch !== '*'
+            || expectedTarget && researchTargetKey(active, project, name, remote) !== expectedTarget
             || JSON.stringify(authService.getStorage(selectedUser, true)) !== selectedConnection) {
             throw Object.assign(new Error('The research report target changed after its storage check; no file was written.'), { status: 409, definitelyNotWritten: true });
           }
           active.assertActive?.();
+          remotePutStarted = true;
           return storageClient.writeFile(conn, path, content, options);
         } };
       }
       let file;
       try {
+        if (createOnly && !remote) localIngestStarted = true;
         file = await uploads.ingest(currentWorkspace(), project, name, bytes, { connection: remote, storageImpl: writeStorage, ...(adopt || createOnly && remote ? { ifNoneMatch } : edit && remote ? { ifMatch } : {}) });
       } catch (err) {
         if (adopt && err && err.code === 'changed') throw new Error(`"${adoptTo}" appeared in storage while this edit was being saved, so it was not overwritten. Nothing was saved. Sync this project's Sources, then edit that file.`);
@@ -785,6 +823,11 @@ function createProjectStore({
         afterSaved(() => { if (!(getProject(project.id)?.files || []).some((f) => f && f.name === expectName)) rag.deleteProjectFile(project.id, expectName, userId); }, 'index cleanup');
       }
       return file;
+    }).catch((error) => {
+      // Before a remote report PUT, no report file can have landed. Local ingestion may have
+      // written a content-addressed blob, so only classify errors before it starts.
+      if (createOnly && (remoteMode ? !remotePutStarted : !localIngestStarted)) error.definitelyNotWritten = true;
+      throw error;
     });
   }
   // D8: runs after the delete is saved; empty-only, tenant-scoped, never recursive.
@@ -950,7 +993,7 @@ function createProjectStore({
     saveProjects, whenSaved, getProject, sanitizeChats, loadChats, saveChats, chatIdsElsewhere, deleteChat, purgeProjectChats, saveFreeChats, deleteFreeChat, setChatFlags, setChatTitle, chatAutoNamed, createProject,
     deleteProject, removeChatAttachments, removeOrphanChatContexts,
     historyPath, readHistory,
-    ownsFile, ensureProjectFolder, ensureProjectFolderDetailed, withSourceLock, pruneDocuments, writeProjectTextFile, sweepDeletedProject, indexSource,
+    ownsFile, ensureProjectFolder, ensureProjectFolderDetailed, withSourceLock, pruneDocuments, researchReportTarget, writeProjectTextFile, sweepDeletedProject, indexSource,
   };
 }
 

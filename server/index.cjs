@@ -583,7 +583,7 @@ const projectStore = require('./projects.cjs').createProjectStore({
 });
 const {
   saveProjects, getProject, sanitizeChats, loadChats, saveChats, deleteChat, saveFreeChats, deleteFreeChat, createProject,
-  readHistory, ownsFile, ensureProjectFolder, withSourceLock, pruneDocuments, writeProjectTextFile, sweepDeletedProject, indexSource,
+  readHistory, ownsFile, ensureProjectFolder, withSourceLock, pruneDocuments, researchReportTarget, writeProjectTextFile, sweepDeletedProject, indexSource,
 } = projectStore;
 // ── MCP toolboxes (master step 15): curated in mcp-toolbox-manifest.cjs ─────────
 const MCP_TOOLBOX_MANIFEST = require('./mcp-toolbox-manifest.cjs').buildToolboxManifest({ features });
@@ -747,7 +747,8 @@ const researchRoutes = require('./routes/research.cjs').createResearchRoutes({
     return null;
   },
   service: require('./research-service.cjs').createResearchService({
-    saveFile: (project, name, text) => writeProjectTextFile(project, name, text, { createOnly: true }),
+    saveFile: (project, name, text, target) => writeProjectTextFile(project, name, text, { createOnly: true, expectedTarget: target }),
+    reportTarget: (project, name) => researchReportTarget(project, name),
     getProject,
     tools: (workspace, project) => ({
       complete: (messages, options) => researchEngine.complete(project, messages, options),

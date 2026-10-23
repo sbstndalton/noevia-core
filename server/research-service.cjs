@@ -38,6 +38,18 @@ function reportFiles(result, when, taken = () => false) {
 // its sources) can be written out again.
 const hasReport = (r) => typeof r.markdown === 'string' && Array.isArray(r.sources);
 
+// A pending file can only be retried from the durable result if these are the exact bytes that
+// were prepared. Its old filename anchors the report pair even across a date change/restart.
+function pendingReportFile(result, pending) {
+  if (!hasReport(result) || !pending || typeof pending.name !== 'string') return null;
+  const first = pending.name.endsWith('.sources.json') ? false : pending.name.endsWith('.md') ? true : null;
+  if (first === null) return null;
+  const file = reportFiles(result, 0)[first ? 0 : 1];
+  file.name = pending.name;
+  const bytes = Buffer.from(file.text, 'utf8');
+  return bytes.length === pending.bytes && crypto.createHash('sha256').update(bytes).digest('hex') === pending.hash ? file : null;
+}
+
 /** Public view of a job: no excerpts, bounded markdown. */
 function view(job, project) {
   if (!job) return null;
@@ -52,17 +64,20 @@ function view(job, project) {
     // A cancelled job with finished sections, or a failed job that still holds its report (the save
     // threw), until the sources file, which is always written last, has been saved.
     canSavePartial: !!r && !job.pendingFile && ((job.status === 'cancelled' && r.sections > 0) || (job.status === 'failed' && hasReport(r))) && !job.artifacts.some((a) => a.name.endsWith('.sources.json')),
-    // The same savePartial endpoint first reconciles an indexed exact file, then writes only
-    // missing files. Keep canSavePartial false until reconciliation succeeds; expose the safe
-    // retry action only after the index has the intended SHA-256 and byte length.
-    saveUncertain: pending ? { name: pending.name, canReconcile: indexedPending } : null };
+    // The same savePartial endpoint reconciles exact indexed bytes or makes an explicit
+    // target-bound create-only attempt for the identical prepared bytes. Keep the ordinary
+    // save button false while the external outcome is unresolved.
+    saveUncertain: pending ? { name: pending.name, canReconcile: indexedPending,
+      canRetryCreateOnly: !indexedPending && !!project && !!pendingReportFile(r, pending) } : null };
 }
 
 /**
  * @param {{ jobsDir:(workspace)=>string, tools:(workspace, project)=>{search, extract, projectRetrieve, complete, windowTokens?},
- *           saveFile:(project, name, text)=>Promise<void>, getProject?:(id)=>object|null, now?:()=>number }} deps
+ *           saveFile:(project, name, text, target)=>Promise<void>, reportTarget:(project, name)=>Promise<string>,
+ *           getProject?:(id)=>object|null, now?:()=>number }} deps
  */
-function createResearchService({ tools, saveFile, getProject, now = Date.now, jobsFactory = createResearchJobs }) {
+function createResearchService({ tools, saveFile, reportTarget, getProject, now = Date.now, jobsFactory = createResearchJobs }) {
+  if (typeof reportTarget !== 'function') throw new Error('A bound research report target is required.');
   const stores = new WeakMap();
   const currentProject = (project) => getProject ? getProject(project.id) : project;
   const publicView = (job, project) => view(job, currentProject(project));
@@ -84,7 +99,7 @@ function createResearchService({ tools, saveFile, getProject, now = Date.now, jo
   // not the journal, is what stops two concurrent callers (natural finish, a double-clicked or
   // retried save) from writing the same report twice.
   const saving = new Set();
-  async function save(workspace, project, id, result) {
+  async function save(workspace, project, id, result, { retryPending = false } = {}) {
     const jobs = storeFor(workspace);
     if (saving.has(id)) throw fail(409, 'This report is already being saved.');
     saving.add(id);
@@ -103,7 +118,20 @@ function createResearchService({ tools, saveFile, getProject, now = Date.now, jo
         // that remote storage has no file. Never reissue an ordinary PUT on that assumption.
         const indexed = (current.files || []).find((f) => String(f.name).split('/').pop() === pending.name
           && f.attachment?.id === pending.hash && f.attachment?.bytes === pending.bytes);
-        if (!indexed) throw fail(409, `The save of "${pending.name}" has an unknown outcome. Sync this project's Sources and review that file before trying again.`);
+        if (!indexed) {
+          const file = retryPending ? pendingReportFile(result, pending) : null;
+          if (!file) throw fail(409, `The save of "${pending.name}" has an unknown outcome. Sync this project's Sources and review that file before trying again.`);
+          const target = await reportTarget(current, pending.name);
+          if (target !== pending.target) throw fail(409, `The storage target for "${pending.name}" changed. Review the original storage location before retrying.`);
+          // This is an explicit retry through the research-only create-only writer. A prior PUT
+          // that landed gets 412; it never becomes a second ordinary overwrite. Keep the intent
+          // on 412 or an uncertain answer, including after a process restart.
+          try { await saveFile(current, pending.name, file.text, target); }
+          catch (error) {
+            error.publicMessage = `The save of "${pending.name}" remains uncertain. Sync this project's Sources and review that file before trying again.`;
+            throw error;
+          }
+        }
         await jobs.artifact(id, project.id, pending.name, pending.hash, pending.bytes);
         job = await jobs.get(id, project.id);
       }
@@ -118,8 +146,9 @@ function createResearchService({ tools, saveFile, getProject, now = Date.now, jo
         const hash = crypto.createHash('sha256').update(bytes).digest('hex');
         // This intent must be durable before invoking writeProjectTextFile: it can fail after
         // a remote PUT, a project-list save, or an indexing side effect.
-        await jobs.prepareFile(id, project.id, file.name, hash, bytes.length);
-        try { await saveFile(current, file.name, file.text); }
+        const target = await reportTarget(current, file.name);
+        await jobs.prepareFile(id, project.id, file.name, hash, bytes.length, target);
+        try { await saveFile(current, file.name, file.text, target); }
         catch (error) {
           // Only a proven pre-write refusal may clear the intent. The production file API does
           // not give that guarantee for a generic failure, even if it reports ENOSPC.
@@ -172,7 +201,7 @@ function createResearchService({ tools, saveFile, getProject, now = Date.now, jo
       const eligible = !!job.result && ((job.status === 'cancelled' && job.result.sections > 0) || (job.status === 'failed' && hasReport(job.result)))
         && !job.artifacts.some((a) => a.name.endsWith('.sources.json'));
       if (!eligible) throw fail(409, job.artifacts.length ? 'This report is already saved.' : 'Only a cancelled job with finished sections, or a report that failed to save, can be saved.');
-      await save(workspace, project, id, job.result);
+      await save(workspace, project, id, job.result, { retryPending: true });
       return publicView(await storeFor(workspace).get(id, project.id), project);
     },
   };
