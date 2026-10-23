@@ -61,6 +61,8 @@ const unquote = (id) => id.replace(/^["`[]|["`\]]$/g, '').toLowerCase();
 const ALL = null;
 const OWNED_ROUTES = Object.freeze([
   [/^\/api\/account\/(?:instructions|memory|preferences)$/, ALL],
+  // Settings -> Data -> Delete old chats: its preview (sbstndalton/noevia#1071). PUT stays Node's.
+  [/^\/api\/account\/retention$/, ['GET']],
   [/^\/api\/admin\/invitations$/, ['POST']],
   [/^\/api\/admin\/users$/, ['GET']],
   [/^\/api\/admin\/users\/[^/]+\/disabled$/, ['PUT']],

@@ -101,7 +101,10 @@ test('the account routes Node still answers keep working', async () => {
   const admin = seedAccount(dataDir, { username: 'routes-owner', publicOrigin: 'http://localhost' });
   const member = seedAccount(dataDir, { username: 'routes-member', role: 'member' });
   assert.equal((await request('/api/profile/sharing', { headers: { cookie: admin.cookie } })).status, 200);
-  assert.equal((await request('/api/account/retention', { headers: { cookie: admin.cookie } })).status, 200);
+  // sbstndalton/noevia#1071: the retention preview (GET) is the Rust front's; its PUT is Node's.
+  const preview = await request('/api/account/retention', { headers: { cookie: admin.cookie } });
+  assert.equal(preview.status, 503);
+  assert.deepEqual(preview.json, ROUTE_REFUSAL);
   assert.equal((await request('/api/admin/web-address', { headers: { cookie: admin.cookie } })).status, 200);
   assert.equal((await request('/api/workspace', { headers: { cookie: admin.cookie } })).status, 200, 'the seeded session signs in (read-only gate)');
   assert.equal((await request('/api/workspace')).status, 401);

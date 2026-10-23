@@ -58,6 +58,7 @@ test('#1071: the guard is unconditional: no option or environment turns it off',
 // methods Rust answers (a method not listed stays Node's).
 const RUST_ROUTES = [
   ['/api/account/instructions', null], ['/api/account/memory', null], ['/api/account/preferences', null],
+  ['/api/account/retention', ['GET']],
   ['/api/admin/invitations', ['POST']], ['/api/admin/users', ['GET']], ['/api/admin/users/u1/disabled', ['PUT']], ['/api/admin/users/u1/recovery', ['POST']],
   ['/api/auth/device/approve', null], ['/api/auth/device/code', null], ['/api/auth/device/token', null], ['/api/auth/device/lookup', null],
   ['/api/auth/devices', null], ['/api/auth/devices/g1', null], ['/api/auth/invitations/accept', ['POST']],
@@ -71,16 +72,16 @@ const RUST_ROUTES = [
 const METHODS = ['GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'];
 
 test('#1071: Node refuses exactly the sign-in and account routes the Rust front answers', () => {
-  assert.equal(OWNED_ROUTES.length, 23);
+  assert.equal(OWNED_ROUTES.length, 24);
   for (const [p, methods] of RUST_ROUTES) {
     for (const m of METHODS) assert.equal(ownedRoute(m, p), methods === null || methods.includes(m), `${m} ${p}`);
   }
   // What stays Node's: account deletion, Settings -> Web address and Sharing, the Diary connectors,
-  // retention, the feature switches, the device approval page, and look-alike paths.
+  // retention's PUT, the feature switches, the device approval page, and look-alike paths.
   for (const [m, p] of [
     ['DELETE', '/api/admin/users/u1'], ['GET', '/api/admin/web-address'], ['POST', '/api/admin/web-address'], ['POST', '/api/admin/secrets/rotate'],
     ['GET', '/api/admin/features'], ['GET', '/api/profile/sharing'], ['PUT', '/api/profile/sharing'], ['GET', '/api/profile/diary-connectors'],
-    ['GET', '/api/account/retention'], ['PUT', '/api/account/retention'], ['GET', '/device'], ['GET', '/api/auth/sessionx'], ['GET', '/api/profile/'],
+    ['PUT', '/api/account/retention'], ['GET', '/device'], ['GET', '/api/auth/sessionx'], ['GET', '/api/profile/'],
     ['GET', '/api/auth/session/x'], ['DELETE', '/api/auth/passkeys/a/b'], ['GET', '/api/workspace'], ['GET', '/api/auth/status'],
   ]) assert.equal(ownedRoute(m, p), false, `${m} ${p}`);
   const sent = [];
