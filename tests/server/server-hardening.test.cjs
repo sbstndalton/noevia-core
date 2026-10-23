@@ -13,6 +13,7 @@ const test = require('node:test');
 
 const { errorResponse, isJsonObject } = require('../../server/http.cjs');
 const { createApprovals } = require('../../server/approvals.cjs');
+const { binding: permissionBinding } = require('./chat-grant-fixture.cjs');
 const { createApprovalRoutes } = require('../../server/routes/approvals.cjs');
 const { createChatRoutes } = require('../../server/routes/chat.cjs');
 const { createChatListRoutes } = require('../../server/routes/chat-lists.cjs');
@@ -111,12 +112,15 @@ test('S-P1: approve_all without a chat id approves only that call and grants not
   assert.equal(await p, 'approve');
   assert.equal(gate.chatWideApproved('u1', null, 'project:p1'), false, 'another id-less chat is still asked');
   assert.equal(gate.chatWideApproved('u1', '', 'project:p1'), false);
-  const q = gate.awaitApproval({ id: 'b', userId: 'u1', chatId: 'c1', scope: 'project:p1', abortSignal: ctrl.signal });
+  const binding = permissionBinding('u1', 'c1', 'project:p1');
+  const q = gate.awaitApproval({ id: 'b', userId: 'u1', chatId: 'c1', scope: 'project:p1', binding, abortSignal: ctrl.signal });
   gate.pendingApprovals.get('b').decide('approve_all');
   assert.equal(await q, 'approve');
-  assert.equal(gate.chatWideApproved('u1', 'c1', 'project:p1'), true, 'a real chat still gets its grant');
-  assert.equal(gate.chatWideApproved('u1', 'c2', 'project:p1'), false);
-  assert.equal(gate.chatWideApproved('u2', 'c1', 'project:p1'), false);
+  assert.equal(gate.chatWideApproved('u1', 'c1', 'project:p1', binding), true, 'a real chat with current authoritative binding still gets its grant');
+  assert.equal(gate.chatWideApproved('u1', 'c1', 'project:p1'), false, 'scope and cached chat id alone are not authoritative');
+  assert.equal(gate.chatWideApproved('u1', null, 'project:p1', binding), false, 'even a valid different binding cannot grant id-less requests');
+  assert.equal(gate.chatWideApproved('u1', 'c2', 'project:p1', permissionBinding('u1', 'c2', 'project:p1')), false);
+  assert.equal(gate.chatWideApproved('u2', 'c1', 'project:p1', permissionBinding('u2', 'c1', 'project:p1')), false);
 });
 
 test('S-P2: an already-aborted request resolves at once and parks nothing', async () => {
