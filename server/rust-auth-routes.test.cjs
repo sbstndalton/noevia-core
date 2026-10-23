@@ -111,7 +111,13 @@ test('the account routes Node still answers keep working', async () => {
     }
   }
   assert.equal((await request('/api/admin/web-address', { method: 'HEAD', headers: { cookie: admin.cookie } })).status, 405);
-  assert.equal((await request('/api/admin/web-address', { method: 'POST', body: { origin: 'bad' }, headers: admin.headers('http://localhost') })).status, 400, 'Node still owns address changes');
+  assert.equal((await request('/api/admin/web-address', { method: 'POST', body: { origin: 'bad' }, headers: admin.headers('http://localhost') })).status, 503, 'Rust now owns address changes');
+  assert.equal((await request('/api/admin/web-address/remove', { method: 'POST', body: { origin: 'bad' }, headers: admin.headers('http://localhost') })).status, 503, 'Rust now owns earlier-address removal');
+  for (const headers of [{}, { cookie: member.cookie }]) {
+    for (const url of ['/api/admin/web-address', '/api/admin/web-address/remove']) {
+      assert.equal((await request(url, { method: 'POST', body: { origin: 'bad' }, headers })).status, 503, 'direct Node POST is refused before auth');
+    }
+  }
   assert.equal((await request('/api/workspace', { headers: { cookie: admin.cookie } })).status, 200, 'the seeded session signs in (read-only gate)');
   assert.equal((await request('/api/workspace')).status, 401);
   // Deleting an account stays Node's (its clean-up spans Node's own stores).

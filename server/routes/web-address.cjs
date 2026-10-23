@@ -1,27 +1,7 @@
 'use strict';
-// Settings → Web address: the https name people reach noevia at.
-// GET  /api/instance                 -> { id } (public; lets a new address prove it reaches this server)
-// GET  /api/admin/web-address        -> current address, where it came from, earlier addresses
-// POST /api/admin/web-address        -> { origin, force? } check that it reaches this server, then save
-// POST /api/admin/web-address/remove -> { origin } drop one earlier address (#1460). 200 with the
-//   refreshed view plus { removed, passkeysAffected }; 400 for the current address or a bad body;
-//   404 when the address is not an earlier one. Admin only; the session/CSRF gate in index.cjs
-//   covers every non-GET request before this route runs. Passkeys made under the removed host must
-//   be registered again.
-const { isJsonObject, readCappedJson } = require('../http.cjs');
-
-function createWebAddressRoutes({ auth, json, readBody, fetchImpl = fetch, timeoutMs = 8000 }) {
-  /** Asks the new address for its instance id. Same id = the name routes here. */
-  async function reaches(origin) {
-    try {
-      const r = await fetchImpl(`${origin}/api/instance`, { signal: AbortSignal.timeout(timeoutMs), redirect: 'manual' });
-      if (!r.ok) return `${new URL(origin).host} answered ${r.status}, not noevia.`;
-      const body = await readCappedJson(r, 64 * 1024).catch(() => ({}));
-      return body.id === auth.instanceId ? null : `${new URL(origin).host} reaches a different server, not this noevia.`;
-    } catch {
-      return `${new URL(origin).host} can’t be reached yet. Check its DNS or tunnel route, then try again.`;
-    }
-  }
+// Read-only Node oracle for the Rust-owned GET views. The Rust front owns both
+// administrator POST writers and the direct Node guard refuses them before this factory.
+function createWebAddressRoutes({ auth, json }) {
   const view = () => ({ origin: auth.origin, source: auth.originSource, previous: auth.previousOrigins, rpId: auth.rpId });
 
   return async function webAddressRoutes(req, res, { path, authn }) {
@@ -29,30 +9,14 @@ function createWebAddressRoutes({ auth, json, readBody, fetchImpl = fetch, timeo
     // Related Origin Requests: lets a renamed site keep using passkeys made under the old name.
     if (path === '/.well-known/webauthn' && req.method === 'GET') return json(res, 200, { origins: auth.relatedOrigins() }), true;
     if (path === '/api/admin/web-address/remove') {
+      if (req.method === 'POST') return false; // The early owner guard refuses this writer.
       if (!authn || authn.user.role !== 'admin') return json(res, 403, { error: 'Administrator required' }), true;
-      if (req.method !== 'POST') return json(res, 405, { error: 'method not allowed' }), true;
-      const body = await readBody(req).catch(() => ({}));
-      if (!isJsonObject(body) || typeof body.origin !== 'string') return json(res, 400, { error: 'Choose an earlier address to remove.' }), true;
-      const result = auth.removeEarlierOrigin(body.origin, authn.user.id);
-      if (result.error) return json(res, result.status || 400, { error: result.error }), true;
-      return json(res, 200, { ...view(), removed: result.removed, passkeysAffected: result.passkeysAffected }), true;
+      return json(res, 405, { error: 'method not allowed' }), true;
     }
     if (path !== '/api/admin/web-address') return false;
     if (!authn || authn.user.role !== 'admin') return json(res, 403, { error: 'Administrator required' }), true;
     if (req.method === 'GET') return json(res, 200, view()), true;
-    if (req.method !== 'POST') return json(res, 405, { error: 'method not allowed' }), true;
-    const body = await readBody(req).catch(() => ({}));
-    // `null` (or a number, or an array) parses fine and used to throw on `body.origin`: a 500.
-    if (!isJsonObject(body)) return json(res, 400, { error: 'Enter a full address, such as https://noevia.example.com.' }), true;
-    const next = String(body.origin || '').trim().replace(/\/+$/, '');
-    let parsed; try { parsed = new URL(next); } catch { return json(res, 400, { error: 'Enter a full address, such as https://noevia.example.com.' }), true; }
-    if (!body.force && parsed.origin !== auth.origin) {
-      const problem = await reaches(parsed.origin);
-      if (problem) return json(res, 409, { error: problem, unreachable: true }), true;
-    }
-    const error = auth.changeOrigin(next, authn.user.id);
-    if (error) return json(res, 400, { error }), true;
-    return json(res, 200, view()), true;
+    return json(res, 405, { error: 'method not allowed' }), true;
   };
 }
 module.exports = { createWebAddressRoutes };

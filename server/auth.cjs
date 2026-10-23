@@ -393,47 +393,6 @@ function createAuth({ dataDir, publicOrigin, rpId, legacyToken = '', legacyCompa
       .run(actor || null, target || null, action, JSON.stringify(detail), Date.now());
   }
 
-  /** Settings -> Web address. Returns an error message, or null once saved. */
-  function changeOriginNow(next, actorId) {
-    const clean = String(next || '').trim().replace(/\/+$/, '');
-    let u; try { u = new URL(clean); } catch { return 'Enter a full address, such as https://noevia.example.com.'; }
-    if (u.origin !== clean) return 'Enter just the address, without a path, such as https://noevia.example.com.';
-    if (!isAcceptablePublicOrigin(clean)) return 'Use https://, or a private-network address over http://.';
-    if (clean === origin) return null;
-    const before = origin;
-    previousOrigins = [...new Set([...(before ? [before] : []), ...previousOrigins])].filter((o) => o !== clean).slice(0, 5);
-    db.transaction(() => {
-      db.prepare("INSERT OR REPLACE INTO settings(key,value) VALUES('public_origin_admin',?)").run(clean);
-      db.prepare("INSERT OR REPLACE INTO settings(key,value) VALUES('previous_origins',?)").run(JSON.stringify(previousOrigins));
-    })();
-    for (const o of previousOrigins) trustedOrigins.add(o);
-    trustedOrigins.delete(clean);
-    origin = clean; originSource = 'settings';
-    // Existing passkeys keep the name they were made under; new ones use the new address.
-    db.prepare('UPDATE passkeys SET rp_id=? WHERE rp_id IS NULL').run(relyingPartyId);
-    relyingPartyId = rpFor(clean);
-    audit('settings.public_origin', actorId, actorId);
-    return null;
-  }
-
-  /** Settings -> Web address -> Earlier addresses (#1460). Drops one earlier address from sign-in,
-   *  the trusted origins and /.well-known/webauthn. Passkeys made under its host keep their RP ID,
-   *  so they stop working from the current address and their owners must register them again.
-   *  Returns { error, status } on refusal, or { error: null, removed, passkeysAffected } once saved. */
-  function removeEarlierOriginNow(next, actorId) {
-    const clean = String(next || '').trim().replace(/\/+$/, '');
-    if (clean && clean === origin) return { error: 'The current address cannot be removed from the earlier addresses.', status: 400 };
-    if (!clean || !previousOrigins.includes(clean)) return { error: 'That address is not one of the earlier addresses.', status: 404 };
-    previousOrigins = previousOrigins.filter((o) => o !== clean);
-    db.prepare("INSERT OR REPLACE INTO settings(key,value) VALUES('previous_origins',?)").run(JSON.stringify(previousOrigins));
-    // An address also listed by the environment keeps signing in; only the saved entry goes.
-    if (!additionalOrigins.includes(clean)) trustedOrigins.delete(clean);
-    let host = ''; try { host = new URL(clean).hostname; } catch { /* a stored entry that is not a URL matches no passkey */ }
-    const passkeysAffected = host ? db.prepare('SELECT count(*) AS n FROM passkeys WHERE rp_id=?').get(host).n : 0;
-    audit('settings.public_origin.earlier_removed', actorId, actorId, { origin: clean, passkeysAffected });
-    return { error: null, removed: clean, passkeysAffected };
-  }
-
   return {
     appPasswords: require('./app-passwords.cjs').createAppPasswords({ db, guard }),
     /** The M3 single-writer guard (rust-auth.cjs), for the modules wired to this database. */
@@ -442,12 +401,6 @@ function createAuth({ dataDir, publicOrigin, rpId, legacyToken = '', legacyCompa
     get previousOrigins() { refreshOrigin(); return [...previousOrigins]; },
     /** WebAuthn related origins, served at /.well-known/webauthn on the passkey name's host. */
     relatedOrigins: () => passkeyOrigins(),
-    /** Settings → Web address. Returns an error message, or null once saved. It stays Node's
-     *  while the Rust front owns sign-in: it writes the address settings and freezes the
-     *  passkeys' RP ID (rust-auth.cjs exemption). */
-    changeOrigin(next, actorId) { refreshOrigin(); return guard.exempt(() => changeOriginNow(next, actorId)); },
-    /** Settings -> Web address -> remove an earlier address (#1460). Same Node-owned write as changeOrigin. */
-    removeEarlierOrigin(next, actorId) { refreshOrigin(); return guard.exempt(() => removeEarlierOriginNow(next, actorId)); },
     userCount, authenticate, csrfValid, originValid, publicUser,
     // Exposed for the tool permission gate (step 16): every write tool call is
     // recorded here, so "what did the model actually do on my behalf" is
