@@ -269,3 +269,39 @@ test('the reader carries the marker assemble-release looks for', () => {
   assert.match(index, /createChangeJournalReader\(/);
   assert.match(index, /changeJournal\.touch\(authn\.user\.id\)/);
 });
+
+test('the timer calls the store only when the journal file changed, and not at all against a store without the op', async () => {
+  const reads = [];
+  let st = 'a';
+  const body = { entries: [], oldestSeq: null, latestSeq: null, more: false, start: START_A };
+  const r = createChangeJournalReader({ read: async (u, after) => { reads.push(after); return body; }, onChange: () => {}, log: () => {},
+    stamp: () => st, setTimer: () => null });
+  r.touch(USER); await r.poll(USER);
+  const k = reads.length;
+  await r.tick(); // first timer read for this stamp
+  await r.tick(); await r.tick(); // unchanged file: no store call
+  assert.equal(reads.length, k + 1);
+  st = 'b';
+  await r.tick();
+  assert.equal(reads.length, k + 2);
+  // Older front (404): the timer stops calling; a request start still probes.
+  const probes = [];
+  const old = createChangeJournalReader({ read: async () => { probes.push(1); return { unsupported: true }; }, onChange: () => {}, log: () => {}, stamp: () => null, setTimer: () => null });
+  old.touch(USER); await old.poll(USER);
+  const p = probes.length;
+  await old.tick(); await old.tick();
+  assert.equal(probes.length, p);
+});
+
+test('fileStamp changes with the journal and refuses a path that is not a user id', () => {
+  const { fileStamp } = require('./chat-change-journal.cjs');
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'qa-change-journal-stamp-'));
+  try {
+    assert.equal(fileStamp(root, '../../etc'), null);
+    assert.equal(fileStamp(root, USER), 'absent');
+    journalWrite(root, USER, 'qa-c', 'r1');
+    const one = fileStamp(root, USER);
+    journalWrite(root, USER, 'qa-c', 'r2');
+    assert.notEqual(fileStamp(root, USER), one);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});

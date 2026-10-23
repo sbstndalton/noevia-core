@@ -966,6 +966,7 @@ const chatBrains = chatBrainLib.createBrainScheduler({
 const changeJournal = require('./chat-change-journal.cjs').createChangeJournalReader({
   read: (userId, after) => PROJECT_STORE.changesRead(userId, after),
   onChange: require('./chat-change-journal.cjs').scheduleMirrorAndBrain({ chatVaultMirror, chatBrains }),
+  stamp: (userId) => require('./chat-change-journal.cjs').fileStamp(DATA_DIR, userId),
 }).start();
 const chatVaultMirrorRoutes = require('./routes/chat-vault-mirror.cjs').createChatVaultMirrorRoutes({ json, readJson,
   preferences: { get: () => vaultMirrorLib.readPreferences(currentWorkspace().dir), save: (value) => vaultMirrorLib.writePreferences(currentWorkspace().dir, value) },

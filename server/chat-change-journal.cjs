@@ -21,7 +21,9 @@
 //   A history save comes from a signed-in browser that keeps calling Node (chat turns, lists,
 //   framing). A user who goes quiet is caught up when they come back: the journal keeps the
 //   entries, and a rotation in between is detected and rescanned. Reading every account's
-//   journal every 2 s would cost a store call per account with nothing to gain.
+//   journal every 2 s would cost a store call per account with nothing to gain. The timer calls the
+//   store only when the journal file's stamp (size, mtime, inode: `stamp`, a local stat) changed
+//   since the last read, so an idle user costs one stat per tick and no socket is kept busy.
 // - Dedupe: an entry whose chat and revision were already scheduled is skipped. While this reader
 //   works (the store answers the op), index.cjs leaves a Node-served history POST to the journal
 //   and does not nudge it as well (see `active()`). Against a store without the op (404), the
@@ -43,14 +45,16 @@ const RECENT_CAP = 5000;
  * @param {(user:string, after:number) => Promise<object>} deps.read  the store's changes read: its
  *   body, or `{ unsupported: true }` when the store has no such op (404)
  * @param {(user:string, chatId:string) => void} deps.onChange  schedules the chat's mirror and brain
+ * @param {(user:string) => string|null} [deps.stamp]  the journal file's stamp (null: unknown, read)
  */
-function createChangeJournalReader({ read, onChange, log = (...a) => console.warn(...a), intervalMs = INTERVAL_MS, activeMs = ACTIVE_MS,
+function createChangeJournalReader({ read, onChange, stamp = () => null, log = (...a) => console.warn(...a), intervalMs = INTERVAL_MS, activeMs = ACTIVE_MS,
   now = Date.now, setTimer = setInterval, clearTimer = clearInterval }) {
   const cursors = new Map(); // user -> { seq, start }
   const seen = new Map(); // user -> last request time
   const running = new Map(); // user -> promise
   const again = new Set(); // users asked for again while a poll ran (it may have read too early)
   const failing = new Set(); // users whose last poll failed (logged once)
+  const stamps = new Map(); // user -> the journal stamp at their last good timer read
   const recent = new Map(); // `${user}\n${chatId}` -> revision last scheduled
   let supported = null; // null: not known yet; true: the store journals; false: it has no op
   let timer = null;
@@ -127,6 +131,7 @@ function createChangeJournalReader({ read, onChange, log = (...a) => console.war
         await pollOnce(user);
         if (failing.delete(user)) log('chat-change-journal: reading again for', user);
       } catch (error) {
+        stamps.delete(user); // the next tick reads again whatever the stamp says
         if (!failing.has(user)) { failing.add(user); log('chat-change-journal: read failed, retrying', user, error?.message || String(error)); }
       } finally {
         running.delete(user);
@@ -145,10 +150,16 @@ function createChangeJournalReader({ read, onChange, log = (...a) => console.war
   }
 
   function tick() {
+    // A store without the op (an older front): nothing to tail; request starts still probe it.
+    if (supported === false) return Promise.resolve([]);
     const cutoff = now() - activeMs;
     const polls = [];
     for (const [user, at] of seen) {
       if (at < cutoff) { seen.delete(user); continue; }
+      let now = null;
+      try { now = stamp(user); } catch { now = null; }
+      if (now !== null && cursors.has(user) && stamps.get(user) === now && !failing.has(user)) continue;
+      if (now !== null) stamps.set(user, now); else stamps.delete(user);
       polls.push(poll(user));
     }
     return Promise.all(polls);
@@ -165,6 +176,16 @@ function createChangeJournalReader({ read, onChange, log = (...a) => console.war
   };
 }
 
+/** The stamp of `<dataDir>/users/<user>/chat-changes.jsonl` (null: no such file yet, or not a
+ *  user id), from one stat: size, mtime and inode (a rotation renames a new file in). */
+function fileStamp(dataDir, user, fs = require('node:fs'), path = require('node:path')) {
+  if (typeof user !== 'string' || !/^[0-9a-f-]{36}$/i.test(user)) return null;
+  try {
+    const st = fs.statSync(path.join(dataDir, 'users', user, 'chat-changes.jsonl'));
+    return `${st.size}:${st.mtimeMs}:${st.ino}`;
+  } catch { return 'absent'; }
+}
+
 /** The change handler index.cjs wires: the same two schedules as mirrorTrigger's history nudge. */
 function scheduleMirrorAndBrain({ chatVaultMirror, chatBrains }) {
   return (user, chatId) => { chatVaultMirror.schedule(user, chatId); chatBrains.schedule(user, chatId); };
@@ -175,4 +196,4 @@ function journalCovers(reader, method, path) {
   return method === 'POST' && /^\/api\/chats\/[^/]+\/history$/.test(path || '') && reader.active();
 }
 
-module.exports = { createChangeJournalReader, scheduleMirrorAndBrain, journalCovers, JOURNAL_READER_MARKER, INTERVAL_MS, ACTIVE_MS };
+module.exports = { createChangeJournalReader, scheduleMirrorAndBrain, journalCovers, fileStamp, JOURNAL_READER_MARKER, INTERVAL_MS, ACTIVE_MS };
