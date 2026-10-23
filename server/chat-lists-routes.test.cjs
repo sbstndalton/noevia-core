@@ -118,8 +118,8 @@ test('a late history save for a deleted chat does not write the transcript back'
   assert.equal((await request('/api/freechats/c-deleted-while-streaming', { method: 'DELETE', headers: mutationHeaders() })).status, 200);
   const late = await post('/api/chats/c-deleted-while-streaming/history', { history: [{ role: 'user', content: 'first' }, { role: 'assistant', content: 'late reply' }] });
   assert.equal(late.status, 410);
-  const read = JSON.parse((await request('/api/chats/c-deleted-while-streaming/history', { headers: mutationHeaders() })).text).history;
-  assert.deepEqual(read, []);
+  // #1071: the GET is the Rust front's; the transcript file is what it would read.
+  assert.equal(fs.existsSync(userFile('history-c-deleted-while-streaming.json')), false);
 });
 
 // Chat framing, phase 2 (#738): the move path.
@@ -136,7 +136,8 @@ test('accepting a frame moves the chat into the project with its frame; the tran
   const inProject = (await projectChats(project.id)).find((c) => c.id === 'c-moving');
   assert.equal(inProject.title, 'Moving chat');
   assert.deepEqual(inProject.frame, frame({ projectId: project.id }));
-  const history = JSON.parse((await request('/api/chats/c-moving/history', { headers: mutationHeaders() })).text).history;
+  // #1071: the GET is the Rust front's; the transcript file is what it reads, and the move leaves it.
+  const history = JSON.parse(fs.readFileSync(userFile('history-c-moving.json'), 'utf8')).history;
   assert.deepEqual(history, [{ role: 'user', content: 'synthetic first message' }]);
   // Moving it back out, and accepting in place (same list), both work without a tombstone.
   assert.equal((await post('/api/chats/c-moving/move', { projectId: null })).status, 200);
@@ -203,7 +204,7 @@ test('the move never puts a chat into an archived project; a once Code-only proj
 });
 
 test('a malformed chat id in the URL is a 400, not a server error (#812)', async () => {
-  for (const [method, url] of [['POST', '/api/chats/%E0%A4/move'], ['GET', '/api/chats/%E0%A4/history'], ['POST', '/api/chats/%E0%A4/history'],
+  for (const [method, url] of [['POST', '/api/chats/%E0%A4/move'], ['POST', '/api/chats/%E0%A4/history'],
     ['DELETE', '/api/freechats/%E0%A4'], ['DELETE', '/api/projects/%E0%A4/chats/c1'],
     ['DELETE', '/api/projects/p1/chats/%E0%A4']]) {
     const r = await request(url, { method, headers: mutationHeaders(), body: method === 'GET' || method === 'DELETE' ? '' : JSON.stringify({ projectId: null, history: [] }) });
@@ -211,7 +212,9 @@ test('a malformed chat id in the URL is a 400, not a server error (#812)', async
     assert.deepEqual(JSON.parse(r.text), { error: 'invalid chat id' });
   }
   // #1071: the context meter is the Rust front's; Node refuses it before reading the id.
-  const owned = await request('/api/chats/%E0%A4/context-window', { method: 'GET', headers: mutationHeaders() });
-  assert.equal(owned.status, 503);
-  assert.equal(JSON.parse(owned.text).code, 'RUST_PROJECTS_OWNED');
+  for (const url of ['/api/chats/%E0%A4/context-window', '/api/chats/%E0%A4/history']) {
+    const owned = await request(url, { method: 'GET', headers: mutationHeaders() });
+    assert.equal(owned.status, 503, url);
+    assert.equal(JSON.parse(owned.text).code, 'RUST_PROJECTS_OWNED', url);
+  }
 });

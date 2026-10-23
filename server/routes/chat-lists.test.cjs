@@ -71,10 +71,10 @@ test('the free-chat list is not this mount\'s any more; a free chat is deleted w
 
 test('transcripts carry a revision; a stale save gets the current copy back; a deleted chat is gone', async () => {
   const f = fixture();
-  await f.call('GET', '/api/chats/c1/history');
-  const empty = f.sent.pop();
-  assert.deepEqual(empty.body.history, []);
-  const emptyRevision = empty.body.revision;
+  // #1071: the GET is the Rust front's; its revision of an empty chat is this, byte for byte.
+  assert.equal(await f.call('GET', '/api/chats/c1/history'), false);
+  assert.equal(f.sent.length, 0);
+  const emptyRevision = require('node:crypto').createHash('sha256').update('[]').digest('hex');
   await f.call('POST', '/api/chats/c1/history', { history: [1, 2, 3, 4, 5], baseRevision: emptyRevision });
   const saved = f.sent.pop();
   assert.equal(saved.status, 200);
@@ -260,19 +260,13 @@ test('#1450 search reads only the chats that are still in the lists', async () =
   assert.deepEqual((await search('findme')).body.chats, [], 'a chat no longer in the lists is not reported');
 });
 
-test('#1507: a saved partial reply comes with the transcript, and a saved transcript supersedes it', async () => {
+test('#1507: a saved transcript supersedes a saved partial reply (which the Rust front\'s GET offers, #1071)', async () => {
   const f = fixture();
   const partial = require('../chat-partial.cjs');
   fs.mkdirSync(path.join(f.dir, 'chat-partials'), { recursive: true });
   fs.writeFileSync(partial.fileFor(f.dir, 'c1'), JSON.stringify({ role: 'assistant', content: 'half a rep', interrupted: true }));
-  await f.call('GET', '/api/chats/c1/history');
-  const got = f.sent.pop();
-  assert.equal(got.status, 200);
-  assert.deepEqual(got.body.partial, { role: 'assistant', content: 'half a rep', interrupted: true });
-  assert.deepEqual(got.body.history, [], 'the transcript itself is unchanged by the partial');
+  assert.equal(await f.call('GET', '/api/chats/c1/history'), false, 'the GET is not this mount\'s');
   await f.call('POST', '/api/chats/c1/history', { history: [{ role: 'user', content: 'next' }] });
   assert.equal(f.sent.pop().status, 200);
   assert.equal(fs.existsSync(partial.fileFor(f.dir, 'c1')), false, 'the saved transcript supersedes the partial');
-  await f.call('GET', '/api/chats/c1/history');
-  assert.equal(f.sent.pop().body.partial, undefined);
 });

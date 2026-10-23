@@ -6,7 +6,8 @@
 //   GET  /api/chats/search?q=              the chat ids whose message text holds q (#1450)
 //   GET/POST /api/freechats                the free-chat metas, merged against tombstones
 //   DELETE /api/freechats/:id
-//   GET/POST /api/chats/:id/history        the transcript, with a revision for optimistic saves
+//   POST /api/chats/:id/history            saves the transcript, with a revision for optimistic saves
+//                                          (the GET is the Rust front's, sbstndalton/noevia#1071)
 //   POST /api/chats/:id/move               { projectId: string|null, frame? } moves the meta between
 //                                          the caller's own lists (#738); the transcript stays put
 //
@@ -174,13 +175,11 @@ function createChatListRoutes({ json, readBody, currentWorkspace, PROJECTS, FREE
       if (rawId === null) return badChatId(res);
       const spaceId = require('../chat-lists.cjs').safeChatId(rawId);
       if (!spaceId) return json(res, 400, { error: 'invalid chat id' });
+      // The revision must stay byte for byte what the Rust front's GET answers (noevia-rs
+      // crates/server-projects history: sha256 hex of JSON.stringify(history)).
       const revisionOf = (history) => crypto.createHash('sha256').update(JSON.stringify(history)).digest('hex');
-      // #1507: a reply the client lost (reload, restart) is offered as `partial`, an interrupted turn.
-      if (req.method === 'GET') {
-        const history = readHistory(spaceId);
-        const partial = require('../chat-partial.cjs').partialFor(currentWorkspace().dir, spaceId);
-        return json(res, 200, { history, revision: revisionOf(history), ...(partial ? { partial } : {}) });
-      }
+      // GET (the transcript and #1507's interrupted `partial`) is the Rust front's (sbstndalton/noevia#1071):
+      // index.cjs refuses it before this mount (rust-projects.cjs refuseOwnedRoute).
       if (req.method === 'POST') {
         // A reply that finishes after its chat was deleted must not write the transcript back.
         if (require('../chat-lists.cjs').readTombstones(currentWorkspace().dir).has(spaceId)) return json(res, 410, { error: 'This chat was deleted.' });
