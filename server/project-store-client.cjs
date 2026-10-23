@@ -16,6 +16,11 @@
 // index.cjs refuses to start without them; Node has no other way to save either file.
 
 const MAX_ATTEMPTS = 8;
+// sbstndalton/noevia#1071 slice 6 (and #2161's explicit markers): this core deletes chats only
+// through the store's chat/delete. noevia deploy/tools/assemble-release.sh pairs it with a front
+// whose store carries "noevia-chat-delete-store/1" (and refuses the reverse pairings). Keep the
+// quoted literal: the release check reads it from this file.
+const CHAT_DELETE_CLIENT_MARKER = 'noevia-chat-delete-client/1';
 const TIMEOUT_MS = 10000;
 const REPLY_CAP = 2 * 32 * 1024 * 1024 + 64 * 1024;
 const FILES = new Set(['projects.json', 'free-chats.json']);
@@ -247,4 +252,4 @@ function holdForStoreSaves(res, saves) {
   };
 }
 
-module.exports = { HISTORY_ORIGINS, enabledFrom, createClient, clientFromEnv, createQueue, busy, failureReply, holdForStoreSaves, transcriptsFor, MAX_ATTEMPTS, TIMEOUT_MS };
+module.exports = { CHAT_DELETE_CLIENT_MARKER, HISTORY_ORIGINS, enabledFrom, createClient, clientFromEnv, createQueue, busy, failureReply, holdForStoreSaves, transcriptsFor, MAX_ATTEMPTS, TIMEOUT_MS };

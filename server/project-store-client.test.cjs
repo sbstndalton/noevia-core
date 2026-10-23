@@ -401,4 +401,7 @@ test('#1071 slice 6: a chat\'s delete is one store call, bound to one account; i
   answers.push(new Error('ECONNREFUSED'));
   await assert.rejects(mine.deleteChat('qa-c1', { kind: 'free' }), (e) => e.code === 'PROJECTS_BUSY');
   assert.ok(sent.every((s) => s.body.user === USER), 'every call names the bound account only');
+  // The release pairing marker (noevia assemble-release.sh reads the quoted literal, #2161).
+  assert.equal(psc.CHAT_DELETE_CLIENT_MARKER, 'noevia-chat-delete-client/1');
+  assert.ok(fs.readFileSync(path.join(__dirname, 'project-store-client.cjs'), 'utf8').includes(`'${psc.CHAT_DELETE_CLIENT_MARKER}'`));
 });
