@@ -1,0 +1,178 @@
+'use strict';
+// sbstndalton/noevia#2153 (#1071 slice 5a, decision D9): Node reads the per-user chat change
+// journal that the Rust store writes (noevia-rs crates/server-projects journal.rs,
+// `chat-changes.jsonl`, one entry per transcript mutation under the transcript lock). Once Rust
+// answers POST /api/chats/{id}/history (noevia-rs#291), Node never sees that request, so its
+// mirrorTrigger nudge (chat-vault-mirror.cjs) cannot fire. This reader replaces that nudge for
+// transcript changes: for each new entry it schedules the chat's Diary mirror and its brain,
+// exactly as mirrorTrigger did after a successful history POST.
+//
+// - The cursor is kept per user, in memory. The store answers `{ entries, oldestSeq, latestSeq,
+//   more, start }` (POST /v1/changes/read, behind the per-start secret and bound to the user).
+// - Rescan: this process has not read the user's journal yet (Node restarted, so its debounced
+//   nudges were lost), the store's `start` changed (it restarted), the cursor fell behind a
+//   rotation (`after < oldestSeq - 1`) or is past the end (the journal was reset). A rescan
+//   schedules every chat still in the journal once. Both subsystems are idempotent, so this is
+//   safe: the mirror keeps one dirty set per user and rewrites a note from the current transcript;
+//   the brain keeps one timer per chat and skips a chat whose stored brain matches the chat's
+//   updatedAt ('current').
+// - Which users are read: those seen by an authenticated request in this process within
+//   ACTIVE_MS, on a short timer (INTERVAL_MS), plus the requesting user at every request start.
+//   A history save comes from a signed-in browser that keeps calling Node (chat turns, lists,
+//   framing). A user who goes quiet is caught up when they come back: the journal keeps the
+//   entries, and a rotation in between is detected and rescanned. Reading every account's
+//   journal every 2 s would cost a store call per account with nothing to gain.
+// - Dedupe: an entry whose chat and revision were already scheduled is skipped. While this reader
+//   works (the store answers the op), index.cjs leaves a Node-served history POST to the journal
+//   and does not nudge it as well (see `active()`). Against a store without the op (404), the
+//   reader stays inactive and mirrorTrigger keeps nudging. Either deploy order is safe; only
+//   "Rust owns POST history, Node lacks this reader" is not, and assemble-release refuses it.
+// - Failures are logged once per run of failures and retried on the next tick. They never throw
+//   into a request or crash the process.
+
+/** Grep marker for noevia deploy/tools/assemble-release.sh: this core tails the chat change journal. */
+const JOURNAL_READER_MARKER = 'noevia-chat-change-journal-reader/1';
+const INTERVAL_MS = 2000;
+const ACTIVE_MS = 15 * 60 * 1000;
+/** The most reads in one poll (1,000 entries each) before the next tick goes on. */
+const MAX_PAGES = 20;
+const RECENT_CAP = 5000;
+
+/**
+ * @param {object} deps
+ * @param {(user:string, after:number) => Promise<object>} deps.read  the store's changes read: its
+ *   body, or `{ unsupported: true }` when the store has no such op (404)
+ * @param {(user:string, chatId:string) => void} deps.onChange  schedules the chat's mirror and brain
+ */
+function createChangeJournalReader({ read, onChange, log = (...a) => console.warn(...a), intervalMs = INTERVAL_MS, activeMs = ACTIVE_MS,
+  now = Date.now, setTimer = setInterval, clearTimer = clearInterval }) {
+  const cursors = new Map(); // user -> { seq, start }
+  const seen = new Map(); // user -> last request time
+  const running = new Map(); // user -> promise
+  const again = new Set(); // users asked for again while a poll ran (it may have read too early)
+  const failing = new Set(); // users whose last poll failed (logged once)
+  const recent = new Map(); // `${user}\n${chatId}` -> revision last scheduled
+  let supported = null; // null: not known yet; true: the store journals; false: it has no op
+  let timer = null;
+
+  function schedule(user, chatId, revision) {
+    if (typeof chatId !== 'string' || !chatId) return false;
+    const key = `${user}\n${chatId}`;
+    if (typeof revision === 'string' && recent.get(key) === revision) return false;
+    recent.delete(key);
+    recent.set(key, typeof revision === 'string' ? revision : null);
+    if (recent.size > RECENT_CAP) recent.delete(recent.keys().next().value);
+    try { onChange(user, chatId); } catch (error) { log('chat-change-journal: scheduling failed', error?.message || String(error)); }
+    return true;
+  }
+
+  function needsRescan(cursor, body) {
+    if (!cursor) return true;
+    if (body.start !== cursor.start) return true;
+    const oldest = Number.isInteger(body.oldestSeq) ? body.oldestSeq : null;
+    const latest = Number.isInteger(body.latestSeq) ? body.latestSeq : null;
+    if (oldest !== null && cursor.seq < oldest - 1) return true;
+    if (latest === null ? cursor.seq > 0 : cursor.seq > latest) return true;
+    return false;
+  }
+
+  /** Every chat still in the journal, once each; the cursor moves to the end. */
+  async function rescan(user, first) {
+    let body = first, after = 0, pages = 0;
+    const chats = new Map();
+    for (;;) {
+      for (const e of body.entries || []) { if (e && typeof e.chatId === 'string') { chats.delete(e.chatId); chats.set(e.chatId, e.revision); } after = Math.max(after, Number(e?.seq) || 0); }
+      if (!body.more || ++pages >= MAX_PAGES) break;
+      body = await read(user, after);
+      if (!body || body.unsupported) return;
+    }
+    // A rescan schedules even a revision already scheduled: what was pending may have been lost.
+    for (const [chatId, revision] of chats) { recent.delete(`${user}\n${chatId}`); schedule(user, chatId, revision); }
+    cursors.set(user, { seq: after, start: first.start });
+  }
+
+  async function pollOnce(user) {
+    const cursor = cursors.get(user);
+    let body = await read(user, cursor ? cursor.seq : 0);
+    if (!body || body.unsupported) { supported = false; return; }
+    supported = true;
+    if (needsRescan(cursor, body)) {
+      // Read from the start of what is kept (the first read may have begun past it).
+      if (cursor) body = await read(user, 0);
+      if (!body || body.unsupported) return;
+      return rescan(user, body);
+    }
+    let seq = cursor.seq;
+    for (let pages = 0; ; pages++) {
+      for (const e of body.entries || []) {
+        const s = Number(e?.seq) || 0;
+        if (s <= seq) continue;
+        seq = s;
+        schedule(user, e.chatId, e.revision);
+      }
+      cursors.set(user, { seq, start: cursor.start });
+      if (!body.more || pages + 1 >= MAX_PAGES) break;
+      body = await read(user, seq);
+      if (!body || body.unsupported) break;
+    }
+  }
+
+  /** Reads `user`'s new entries now (one poll at a time per user; asked again meanwhile, it reads
+   *  once more after). Never rejects. */
+  function poll(user) {
+    if (typeof user !== 'string' || !user) return Promise.resolve();
+    if (running.has(user)) { again.add(user); return running.get(user).then(() => running.get(user)); }
+    const p = (async () => {
+      try {
+        await pollOnce(user);
+        if (failing.delete(user)) log('chat-change-journal: reading again for', user);
+      } catch (error) {
+        if (!failing.has(user)) { failing.add(user); log('chat-change-journal: read failed, retrying', user, error?.message || String(error)); }
+      } finally {
+        running.delete(user);
+        if (again.delete(user)) poll(user);
+      }
+    })();
+    running.set(user, p);
+    return p;
+  }
+
+  /** A request from `user` started: they are active, and their journal is read now. */
+  function touch(user) {
+    if (typeof user !== 'string' || !user) return;
+    seen.set(user, now());
+    poll(user);
+  }
+
+  function tick() {
+    const cutoff = now() - activeMs;
+    const polls = [];
+    for (const [user, at] of seen) {
+      if (at < cutoff) { seen.delete(user); continue; }
+      polls.push(poll(user));
+    }
+    return Promise.all(polls);
+  }
+
+  return {
+    touch, poll, tick,
+    /** Whether the store journals transcript changes (its op answered): a history POST that Node
+     *  serves is then left to the journal instead of nudged a second time. */
+    active: () => supported === true,
+    start() { if (!timer) { timer = setTimer(() => { tick(); }, intervalMs); timer?.unref?.(); } return this; },
+    stop() { if (timer) { clearTimer(timer); timer = null; } },
+    cursor: (user) => cursors.get(user) || null,
+  };
+}
+
+/** The change handler index.cjs wires: the same two schedules as mirrorTrigger's history nudge. */
+function scheduleMirrorAndBrain({ chatVaultMirror, chatBrains }) {
+  return (user, chatId) => { chatVaultMirror.schedule(user, chatId); chatBrains.schedule(user, chatId); };
+}
+
+/** Whether a nudge from mirrorTrigger is a transcript save the journal already covers. */
+function journalCovers(reader, method, path) {
+  return method === 'POST' && /^\/api\/chats\/[^/]+\/history$/.test(path || '') && reader.active();
+}
+
+module.exports = { createChangeJournalReader, scheduleMirrorAndBrain, journalCovers, JOURNAL_READER_MARKER, INTERVAL_MS, ACTIVE_MS };

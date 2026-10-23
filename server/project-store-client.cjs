@@ -116,6 +116,15 @@ function createClient({ port, token, fetchImpl = globalThis.fetch, timeoutMs = T
       if (status === 200 && body && typeof body.removed === 'boolean') return body.removed;
       throw historyFailure(status, body);
     },
+    /** sbstndalton/noevia#2153: the user's chat change journal after `after` (chat-change-journal.cjs):
+     *  { entries, oldestSeq, latestSeq, more, start }, or { unsupported: true } from a store
+     *  without the op (404: an older Rust front). */
+    async changesRead(user, after = 0) {
+      const { status, body } = await call('changes/read', { user, after });
+      if (status === 200 && body && Array.isArray(body.entries)) return body;
+      if (status === 404) return { unsupported: true };
+      throw historyFailure(status, body);
+    },
   };
 }
 
