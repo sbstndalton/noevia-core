@@ -437,4 +437,15 @@ function rustChatDelete(dataDir, user, projectId, rawChatId) {
   return out.deleted ? answer(200, { ok: true }) : answer(404, { error: 'no such chat' });
 }
 
-module.exports = { chatMoveOp, startProjectStore, installProjectStore, createHandler, freePortSync, localTranscripts, historyOp, rustHistorySave, rustChatDelete };
+/** Synthetic public-front move adapter for Node lifecycle fixtures; real HTTP/auth is Rust-tested. */
+function rustChatMove(dataDir,user,encodedChat,body) {
+  const answer=(status,value)=>({status,text:JSON.stringify(value)});
+  let chat;try{chat=decodeURIComponent(encodedChat);}catch{return answer(400,{error:'invalid chat id'});}
+  let parsed=body;try{if(typeof body==='string')parsed=JSON.parse(body);}catch{return answer(400,{error:'invalid JSON'});}
+  if(!parsed||typeof parsed!=='object'||Array.isArray(parsed)||!(parsed.projectId===null||typeof parsed.projectId==='string'))return answer(400,{error:'projectId (or null) required'});
+  const [status,out]=chatMoveOp({chat,projectId:parsed.projectId,...(Object.hasOwn(parsed,'frame')?{frame:parsed.frame}:{})},path.join(dataDir,'users',user));
+  if(status!==200)return answer(status,out);
+  return answer(200,{ok:true,from:out.from.kind==='free'?null:out.from.id,projectId:out.to.kind==='free'?null:out.to.id});
+}
+
+module.exports = { rustChatMove, chatMoveOp, startProjectStore, installProjectStore, createHandler, freePortSync, localTranscripts, historyOp, rustHistorySave, rustChatDelete };

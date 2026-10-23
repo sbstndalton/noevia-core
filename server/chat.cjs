@@ -5,6 +5,7 @@ const { frameUntrusted } = require('./prompt-framing.cjs');
 const { quoteName, quotedNames } = require('./quoted-name.cjs');
 const provenance = require('./provenance-policy.cjs');
 const grantContexts = require('./chat-grant-context.cjs');
+const CHAT_MOVE_ENFORCEMENT_MARKER = 'noevia-chat-move-enforcement/1';
 const { isChatGenerationModel } = require('./chat-model-kind.cjs');
 const { isInAppBox } = require('./toolbox-flags.cjs');
 const editTargets = require('./project-edit-target.cjs');
@@ -2621,4 +2622,4 @@ function createChatHandler({
   return { handleChat, handleChatInner };
 }
 
-module.exports = { createChatHandler, normalizeReplayHistory, withIdleLimit, CODE_ROUTE_NOTE, FAILED_REPLY_TOOLS_NOTE };
+module.exports = { CHAT_MOVE_ENFORCEMENT_MARKER, createChatHandler, normalizeReplayHistory, withIdleLimit, CODE_ROUTE_NOTE, FAILED_REPLY_TOOLS_NOTE };

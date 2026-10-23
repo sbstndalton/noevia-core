@@ -363,48 +363,10 @@ test('saveChats skips ids held by another list of the workspace (#755)', async (
   assert.deepEqual([...f.store.chatIdsElsewhere(null)].sort(), ['in-b', 'new-a']);
 });
 
-// Move/list parity, tombstone/archived/internal/full-cap behavior and write ordering now belong
-// to Rust's chat_move tests. Here assert the Node boundary uses ONE authoritative call, no saves.
-test('moveChat delegates once and refreshes only after durable success; Node writes neither list', async () => {
-  const f = fixture(), calls = [];
-  f.workspace.chatPermissions = { move: async (...args) => { calls.push(args); return { status: 200, from: 'old', generation: '2' }; } };
-  f.workspace.refreshChatLists = () => calls.push('refresh');
-  f.workspace.saveProjects = f.workspace.saveFreeChats = () => { throw Error('Node local writer must never run'); };
-  const frame = { kind: 'idea', tags: [], links: [], confirmed: true, source: 'user' };
-  assert.deepEqual(await f.store.moveChat('qa raw!', 'new', { frame }), { status: 200, from: 'old', generation: '2' });
-  assert.deepEqual(calls, [['qa raw!', 'new', { frame }], 'refresh']);
+// Public moves and wrapper retired; Rust owns metadata/transaction tests.
+test('Node project store exports no duplicate move writer or delegate',()=>{
+ const f=fixture();assert.equal(f.store.moveChat,undefined);
 });
-test('moveChat waits for prior saves before calling Rust, and store failure prevents a move', async () => {
-  const f = fixture(), order = [];
-  f.workspace.pendingStoreWrites = () => Promise.resolve().then(() => order.push('saved'));
-  f.workspace.chatPermissions = { move: async () => { order.push('move'); return { status: 200, from: null }; } };
-  f.workspace.refreshChatLists = () => order.push('refresh');
-  await f.store.moveChat('qa', null, { frame: null });
-  assert.deepEqual(order, ['saved', 'move', 'refresh']);
-  f.workspace.storeFailed = () => Error('prior save failed');
-  await assert.rejects(f.store.moveChat('qa', null), /prior save failed/);
-  assert.deepEqual(order, ['saved', 'move', 'refresh', 'saved']);
-});
-test('moveChat never falls back to local metadata on missing capability, account removal or uncertain RPC', async () => {
-  const f = fixture();
-  await assert.rejects(f.store.moveChat('qa', null), e => e.code === 'CHAT_PERMISSION_CONTEXT');
-  f.workspace.chatPermissions = { move: async () => { throw Object.assign(Error('busy'), { status: 503 }); } };
-  f.workspace.refreshChatLists = () => { throw Error('must not refresh a failed move'); };
-  await assert.rejects(f.store.moveChat('qa', null), e => e.status === 503);
-  f.workspace.assertActive = () => { throw Object.assign(Error('gone'), { status: 410 }); };
-  await assert.rejects(f.store.moveChat('qa', null), e => e.status === 410);
-});
-test('moveChat preserves store refusal and refresh failure, never falsely acknowledging success', async () => {
-  const f = fixture();
-  for (const status of [400,404,409,410,503]) {
-    f.workspace.chatPermissions = { move: async () => { throw Object.assign(Error('refused'), { status }); } };
-    await assert.rejects(f.store.moveChat('qa', 'new'), e => e.status === status);
-  }
-  f.workspace.chatPermissions = { move: async () => ({ status: 200, from: null }) };
-  f.workspace.refreshChatLists = () => { throw Error('refresh failed'); };
-  await assert.rejects(f.store.moveChat('qa', 'new'), /refresh failed/);
-});
-
 test('#1522: a new project starts on Automatic tools unless the request chose Manual', async () => {
   const f = fixture();
   const auto = await f.store.createProject({ name: 'Plan' });

@@ -60,6 +60,7 @@
 // above still run here through the Rust store; they are not part of this removal.
 
 const fs = require('fs');
+const CHAT_MOVE_PUBLIC_OWNER = 'rust';
 
 
 /** The project routes the Rust front always answers and Node always refuses (refuseOwnedRoute):
@@ -67,6 +68,7 @@ const fs = require('fs');
  *  #1071) is the other half; noevia's deploy/tools/assemble-release.sh refuses a release whose
  *  front owns a project route missing here. */
 const OWNED_ROUTES = Object.freeze(new Set([
+  'POST /api/chats/{chatId}/move',
   'POST /api/projects/{id}/assets',
   'GET /api/projects/{id}/assets/{assetId}',
   'DELETE /api/projects/{id}/assets/{assetId}',
@@ -86,6 +88,7 @@ const OWNED_ROUTES = Object.freeze(new Set([
 
 // OWNED_ROUTES as Node's own handlers matched them (one path segment per parameter).
 const OWNED_ROUTE_PATTERNS = Object.freeze([
+  [/^\/api\/chats\/[^/]+\/move$/, ['POST']],
   [/^\/api\/projects\/[^/]+\/assets$/, ['POST']],
   [/^\/api\/projects\/[^/]+\/assets\/[^/]+$/, ['GET', 'DELETE']],
   [/^\/api\/projects\/[^/]+\/chats$/, ['GET', 'POST']],
@@ -517,6 +520,7 @@ function createFreeChatsFile(file, { warn = console.warn, remote } = {}) {
 }
 
 module.exports = {
+  CHAT_MOVE_PUBLIC_OWNER,
   ownedRoute, refuseOwnedRoute, warnRetired, RETIRED_SWITCHES, ROUTE_REFUSAL, merge, mergeFields, mergeIdList, createProjectsFile, readProjectsFile, replaceContents,
   createFreeChatsFile, readFreeChatsFile, mergeFreeChats,
   OWNED_ROUTES, FREE_LIST_CAP,

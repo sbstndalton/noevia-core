@@ -64,6 +64,8 @@ test.before(async () => {
 const mutationHeaders = () => ({ origin: 'http://localhost', cookie, 'content-type': 'application/json', 'x-csrf-token': csrf });
 
 const post = (url, body, headers = mutationHeaders()) => request(url, { method: 'POST', headers, body: JSON.stringify(body) });
+// Public moves are the Rust front's; adapter preserves metadata/lifecycle assertions.
+const frontMove=(url,body)=>require('../tests/server/project-store-server.cjs').rustChatMove(testDataDir,path.basename(workspaceDir()),url.split('/')[3],body);
 const realFetch = global.fetch;
 
 
@@ -154,7 +156,7 @@ test('a moved chat and Delete old chats take their attachments projects along (#
   const host = JSON.parse((await post('/api/projects', { name: 'Synthetic host' })).text);
   const moved = await openWithImage('c788-moved');
   frontSaveFree([{ id: 'c788-moved', title: 'm' }]);
-  assert.equal((await post('/api/chats/c788-moved/move', { projectId: host.id })).status, 200);
+  assert.equal((await frontMove('/api/chats/c788-moved/move', { projectId: host.id })).status, 200);
   assert.equal((await request(`/api/projects/${host.id}/chats/c788-moved`, { method: 'DELETE', headers: mutationHeaders() })).status, 503);
   assert.equal(frontDelete(host.id, 'c788-moved').status, 200);
   assert.equal((await request('/api/workspace', { headers: { cookie } })).status, 200);
