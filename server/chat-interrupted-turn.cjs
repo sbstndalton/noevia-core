@@ -184,7 +184,7 @@ async function saveInterruptedTurn({ workspace, chatId, message, entry }) {
   if (typeof message !== 'string') return 'not-last';
   workspace.assertActive?.();
   if (typeof workspace.transcripts?.appendIfLast !== 'function') throw new Error('the transcript store is not available: the interrupted reply is not kept (Node never writes a transcript itself)');
-  return workspace.transcripts.appendIfLast(id, message, entry);
+  return workspace.transcripts.appendIfLast(id, message, entry, { origin: 'turn' });
 }
 
 module.exports = { createTurnRecord, saveInterruptedTurn, STOPPED_SENDER };

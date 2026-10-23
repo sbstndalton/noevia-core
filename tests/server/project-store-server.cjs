@@ -20,6 +20,15 @@
 //   POST /v1/history/append-if-last { user, chat, message, entry } -> 200 { outcome, revision? }
 //   POST /v1/history/remove-if { user, chat, history }    -> 200 { removed }
 //
+// and its chat change journal (sbstndalton/noevia#2153; noevia-rs journal.rs): each mutation above
+// takes an optional `origin` (history|import|turn|remove|other; absent/null: other; else 400,
+// nothing changed) and appends `{ seq, chatId, revision, op, origin, start, at }` to the user's
+// chat-changes.jsonl, which
+//
+//   POST /v1/changes/read { user, after? }   -> 200 { entries, oldestSeq, latestSeq, more, start }
+//
+// answers (no rotation here).
+//
 // What is written is the last 5,000 entries through core's own sanitizeHistory, as the Rust store
 // does; a client save (`supersedePartial`) removes the chat's saved partial unless its running
 // marker names this process's start (chat-partial.cjs START_ID).
@@ -35,7 +44,21 @@ const crypto = require('node:crypto');
 const { spawnSync } = require('node:child_process');
 
 const FILES = new Set(['projects.json', 'free-chats.json']);
-const HISTORY_OPS = new Set(['/v1/history/read', '/v1/history/write', '/v1/history/append-if-last', '/v1/history/remove-if']);
+const HISTORY_OPS = new Set(['/v1/history/read', '/v1/history/write', '/v1/history/append-if-last', '/v1/history/remove-if', '/v1/changes/read']);
+const ORIGINS = new Set(['history', 'import', 'turn', 'remove', 'other']);
+const JOURNAL = 'chat-changes.jsonl';
+const STORE_START = crypto.randomBytes(16).toString('hex');
+
+function journalEntries(dir) {
+  let text = '';
+  try { text = fs.readFileSync(path.join(dir, JOURNAL), 'utf8'); } catch { /* none yet */ }
+  return text.split('\n').slice(0, -1).map((l) => { try { return JSON.parse(l); } catch { return null; } }).filter((e) => e && e.seq > 0);
+}
+
+function journalAppend(dir, chatId, revision, op, origin) {
+  const seq = (journalEntries(dir).at(-1)?.seq || 0) + 1;
+  fs.appendFileSync(path.join(dir, JOURNAL), `${JSON.stringify({ seq, chatId, revision, op, origin, start: STORE_START, at: Date.now() })}\n`, { mode: 0o600 });
+}
 const HISTORY_CAP = 5000;
 const server = (m) => require(path.join(__dirname, '..', '..', 'server', m));
 const revisionOf = (history) => sha(JSON.stringify(history));
@@ -44,7 +67,16 @@ let tmpSeq = 0;
 /** The transcript ops (see the header) for a user directory that exists. */
 function historyOp(url, body, dir) {
   const chat = typeof body.chat === 'string' ? body.chat.replace(/[^a-zA-Z0-9_-]/g, '') : '';
+  if (url === '/v1/changes/read') {
+    const after = body.after === undefined || body.after === null ? 0 : body.after;
+    if (!Number.isInteger(after) || after < 0) return [400, { error: 'after must be a non-negative integer' }];
+    const all = journalEntries(dir);
+    const newer = all.filter((e) => e.seq > after);
+    return [200, { entries: newer.slice(0, 1000), oldestSeq: all[0]?.seq ?? null, latestSeq: all.at(-1)?.seq ?? null, more: newer.length > 1000, start: STORE_START }];
+  }
   if (!chat) return [400, { error: typeof body.chat === 'string' ? 'invalid chat id' : 'user and chat required' }];
+  const origin = body.origin === undefined || body.origin === null ? 'other' : body.origin;
+  if (url !== '/v1/history/read' && !ORIGINS.has(origin)) return [400, { error: 'origin must be one of history, import, turn, remove, other' }];
   const file = path.join(dir, `history-${chat}.json`);
   const parsed = () => { try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch { return undefined; } };
   const current = () => {
@@ -69,6 +101,7 @@ function historyOp(url, body, dir) {
     if (!last || last.role !== 'user' || last.content !== body.message) return [200, { outcome: 'not-last' }];
     const next = bounded([...history, body.entry]);
     write(next);
+    journalAppend(dir, chat, revisionOf(next), 'append', origin);
     return [200, { outcome: 'saved', revision: revisionOf(next) }];
   }
   if (!Array.isArray(body.history)) return [400, { error: 'history must be a list' }];
@@ -79,6 +112,7 @@ function historyOp(url, body, dir) {
     const now = current();
     if (!now.exists || now.revision !== proposed) return [200, { removed: false }];
     fs.rmSync(file, { force: true });
+    journalAppend(dir, chat, null, 'remove', origin);
     return [200, { removed: true }];
   }
   if (tombstoned()) return [410, { error: 'This chat was deleted.', code: 'CHAT_DELETED' }];
@@ -91,6 +125,7 @@ function historyOp(url, body, dir) {
     const saved = partial.readPartial(dir, chat);
     if (!(saved && saved.running && saved.running.start === partial.START_ID)) fs.rmSync(partial.fileFor(dir, chat), { force: true });
   }
+  journalAppend(dir, chat, proposed, 'write', origin);
   return [200, { revision: proposed }];
 }
 const USER = /^[0-9a-f-]{36}$/i;
@@ -207,14 +242,14 @@ function localTranscripts(dir, calls = []) {
   return {
     calls,
     read: async (chat) => run('/v1/history/read', { chat }).answer,
-    write: async (chat, history, { baseRevision, ifAbsent = false, supersedePartial = false } = {}) => {
-      const { status, answer } = run('/v1/history/write', { chat, history, baseRevision, ifAbsent, supersedePartial });
+    write: async (chat, history, { baseRevision, ifAbsent = false, supersedePartial = false, origin } = {}) => {
+      const { status, answer } = run('/v1/history/write', { chat, history, baseRevision, ifAbsent, supersedePartial, origin });
       if (status === 200) return { ok: true, revision: answer.revision };
       if (status === 409) return { conflict: true, ...answer };
       return { deleted: true };
     },
-    appendIfLast: async (chat, message, entry) => run('/v1/history/append-if-last', { chat, message, entry }).answer.outcome,
-    removeIf: async (chat, history) => run('/v1/history/remove-if', { chat, history }).answer.removed,
+    appendIfLast: async (chat, message, entry, { origin } = {}) => run('/v1/history/append-if-last', { chat, message, entry, origin }).answer.outcome,
+    removeIf: async (chat, history, { origin } = {}) => run('/v1/history/remove-if', { chat, history, origin }).answer.removed,
   };
 }
 

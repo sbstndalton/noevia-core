@@ -86,7 +86,7 @@ test('#1071 slice 4: transcripts are published through the store, which needs no
  const calls=[];const transcripts=f.w.transcripts;f.w.transcripts={...transcripts,write:(...a)=>{calls.push(a);return transcripts.write(...a);}};
  const r=await f.request({format:FORMAT,chats:[{id:'c-copy',title:'Copied',history:[{role:'user',content:'Synthetic'}]}]});
  assert.equal(r.status,200);assert.equal(r.body.imported,1);assert.equal(f.store.readHistory('c-copy')[0].content,'Synthetic');
- assert.deepEqual(calls.map(([id,,o])=>[id,o]),[['c-copy',{ifAbsent:true}]]);
+ assert.deepEqual(calls.map(([id,,o])=>[id,o]),[['c-copy',{ifAbsent:true,origin:'import'}]]);
  fs.linkSync=link;
 });
 test('#1071 slice 4: without the transcript store nothing is imported and no transcript is written',async t=>{
@@ -128,4 +128,41 @@ test('an import against a busy project store fails, unlinks nothing and keeps tr
  store.clearFailures();
  // The store recovers; after a restart a retry of the same file completes it.
  const ok=await fixture(root,uid,psc.createClient({port:store.port,token:store.token})).request();assert.equal(ok.status,200);assert.equal(ok.body.imported,3);
+});
+
+test('#2153: an import publishes with origin import and takes back with origin remove',async t=>{
+ const f=fixture(temporary(t));await f.store.createProject({name:'Existing',toolboxes:[]});
+ f.hooks.afterSaved=()=>{f.hooks.afterSaved=null;f.store.deleteFreeChat('c-free');};
+ const transcripts=f.w.transcripts,origins=[];
+ f.w.transcripts={...transcripts,write:async(id,h,o)=>{origins.push(['write',id,o&&o.origin]);return transcripts.write(id,h,o);},removeIf:async(id,h,o)=>{origins.push(['removeIf',id,o&&o.origin]);return transcripts.removeIf(id,h,o);}};
+ const r=await f.request();assert.equal(r.status,200);
+ assert.deepEqual(origins.filter(o=>o[0]==='write').map(o=>o[2]),['import','import','import']);
+ assert.deepEqual(origins.filter(o=>o[0]==='removeIf'),[['removeIf','c-free','remove']]);
+});
+
+test('#2153 end to end: over the store journal a history save queues exactly one brain build and an import none',async t=>{
+ const root=temporary(t);
+ const standin=await startProjectStore(root);t.after(()=>standin.close());
+ const client=psc.createClient({port:standin.port,token:standin.token,timeoutMs:5000});
+ const f=fixture(root,uid,client);await f.store.createProject({name:'Existing',toolboxes:[]});
+ const {createChangeJournalReader,scheduleMirrorAndBrain}=require('../chat-change-journal.cjs');
+ const mirror=[],brain=[];
+ const reader=createChangeJournalReader({read:(u,a)=>client.changesRead(u,a),onChange:scheduleMirrorAndBrain({chatVaultMirror:{schedule:(u,c)=>mirror.push(c)},chatBrains:{schedule:(u,c)=>brain.push(c)}}),log:()=>{},setTimer:()=>null,clearTimer:()=>{}});
+ await reader.poll(uid);// the first read takes the (empty) journal's start
+ const r=await f.request();assert.equal(r.status,200);
+ await reader.poll(uid);
+ assert.deepEqual(mirror.slice().sort(),['c-existing','c-free','c-new'],'the import is mirrored');
+ assert.deepEqual(brain,[],'an import builds no brain');
+ const sent=[];
+ const routes=require('./chat-lists.cjs').createChatListRoutes({json:(res,status,body)=>{sent.push({status,body});},readBody:async req=>{let s='';for await(const c of req)s+=c;return s;},currentWorkspace:()=>f.w,PROJECTS:[],FREE_CHATS:[],diaryExtras:{internalProject:()=>false},STORED_HISTORY_BYTES:100000,chatLists:()=>({freeChats:[],projects:[]}),removeChat:()=>{},store:{sanitizeChats:c=>c||[],saveFreeChats(){},deleteFreeChat:()=>false,readHistory:()=>[]}});
+ const req=require('node:stream').Readable.from([Buffer.from(JSON.stringify({history:[{role:'user',content:'Synthetic new'},{role:'assistant',content:'Synthetic reply'}]}))]);req.method='POST';
+ await routes(req,{setHeader(){}},{path:'/api/chats/c-new/history',authn:{user:{id:uid,role:'member'}}});
+ assert.equal(sent.pop().status,200);
+ await reader.poll(uid);
+ assert.deepEqual(brain,['c-new'],'one history save, one brain build');
+ const {entries}=await client.changesRead(uid,0);
+ assert.deepEqual(entries.at(-1),{...entries.at(-1),chatId:'c-new',op:'write',origin:'history'});
+ assert.ok(entries.slice(0,-1).every(e=>e.op==='write'&&e.origin==='import'),JSON.stringify(entries));
+ assert.equal(entries.filter(e=>e.origin==='history').length,1);
+ assert.equal(entries.filter(e=>e.origin==='import').length,3);
 });

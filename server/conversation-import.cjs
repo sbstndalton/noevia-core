@@ -70,14 +70,14 @@ async function applyRecord(directory, record, ctx, newId) {
     for (const chat of active) {
       const file = record.files.find(f => f.id === chat.id);
       const history = stagedHistory(directory, file);
-      let published = await ctx.transcripts.write(chat.id, history, { ifAbsent: true });
+      let published = await ctx.transcripts.write(chat.id, history, { ifAbsent: true, origin: 'import' });
       for (let attempt = 0; published.conflict && published.revision !== published.proposedRevision; attempt++) {
         // Never overwrite a pre-existing unlisted transcript or a concurrent file.
         if (attempt >= MAX_ID_ATTEMPTS) throw Error('Could not find a free conversation id');
         let id;
         do { id = newId(); } while (visible.has(id) || deleted.has(id) || record.files.some(f => f.id === id));
         file.id = id; chat.id = id; save();
-        published = await ctx.transcripts.write(id, history, { ifAbsent: true });
+        published = await ctx.transcripts.write(id, history, { ifAbsent: true, origin: 'import' });
       }
       // `deleted`: tombstoned meanwhile; nothing was written, and the final pass reports it.
     }
@@ -106,11 +106,11 @@ async function applyRecord(directory, record, ctx, newId) {
   // Remove only what this import published, only if tombstoned and still absent from durable lists.
   const visible = ctx.persistedChatIds(), deleted = ctx.tombstones();
   for (const file of record.files) {
-    if (deleted.has(file.id) && !visible.has(file.id)) await ctx.transcripts.removeIf(file.id, stagedHistory(directory, file));
+    if (deleted.has(file.id) && !visible.has(file.id)) await ctx.transcripts.removeIf(file.id, stagedHistory(directory, file), { origin: 'remove' });
   }
   const capped = new Set((record.capped || []).map(c => c.id));
   for (const file of record.files) {
-    if (capped.has(file.id)) await ctx.transcripts.removeIf(file.id, stagedHistory(directory, file));
+    if (capped.has(file.id)) await ctx.transcripts.removeIf(file.id, stagedHistory(directory, file), { origin: 'remove' });
   }
   if (record.files.some(f => !visible.has(f.id) && !deleted.has(f.id) && !capped.has(f.id))) throw Error('Import metadata was not committed');
   const result = resultFor(record);
