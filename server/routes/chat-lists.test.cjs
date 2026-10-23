@@ -89,87 +89,11 @@ test('#1071: a chat\'s context meter is no longer answered here (the Rust front 
   assert.equal(f.sent.length, 0);
 });
 
-test('POST /api/chats/:id/move validates, scopes to the caller and maps the store outcome (#738)', async () => {
-  const f = fixture();
-  const moves = [];
-  f.store.moveChat = async (id, projectId, patch) => {
-    moves.push({ id, projectId, patch });
-    return id === 'f1' ? { status: 200, from: null } : { status: 404 };
-  };
-  // The routes destructure the store once, so build them again with the move in place.
-  const routes = createChatListRoutes({
-    json: (res, status, body) => { f.sent.push({ status, body }); },
-    readBody: async (req) => { let s = ''; for await (const c of req) s += c; return s; },
-    currentWorkspace: () => ({ dir: f.dir }), PROJECTS: f.projects, FREE_CHATS: f.freeChats,
-    diaryExtras: { internalProject: (p) => p.id === 'diary-extras' }, STORED_HISTORY_BYTES: 200,
-    chatLists: () => ({ freeChats: [], projects: [] }), removeChat() {}, store: f.store,
-  });
-  const call = (method, p, body) => { const req = Readable.from(body === undefined ? [] : [Buffer.from(typeof body === 'string' ? body : JSON.stringify(body))]); req.method = method; return routes(req, {}, { path: p, authn: { user: { id: 'u1', role: 'member' } } }); };
-  const frame = { kind: 'idea', tags: [], links: [], confirmed: true, source: 'user' };
-  assert.equal(await call('POST', '/api/chats/f1/move', { projectId: 'p1', frame }), true);
-  assert.deepEqual(f.sent.pop(), { status: 200, body: { ok: true, from: null, projectId: 'p1' } });
-  assert.deepEqual(moves.pop(), { id: 'f1', projectId: 'p1', patch: { frame } });
-  await call('POST', '/api/chats/f1/move', { projectId: null });
-  f.sent.pop();
-  assert.deepEqual(moves.pop().patch, {}, 'no frame in the body leaves the frame alone');
-  await call('POST', '/api/chats/zz/move', { projectId: null });
-  assert.deepEqual(f.sent.pop(), { status: 404, body: { error: 'no such chat or project' } });
-  moves.length = 0;
-  for (const bad of [{}, { projectId: 3 }, [], 'not json']) {
-    await call('POST', '/api/chats/f1/move', bad);
-    assert.equal(f.sent.pop().status, 400);
-  }
-  await call('POST', '/api/chats/f1/move', { projectId: 'p1', frame: { kind: 'bogus' } });
-  assert.deepEqual(f.sent.pop(), { status: 400, body: { error: 'invalid frame' } }, 'an invalid frame is refused (#759)');
-  assert.equal(moves.length, 0, 'malformed bodies never reach the store');
-  assert.equal(await call('GET', '/api/chats/f1/move'), false, 'other methods fall through');
+test('Node list mount has no move handler even if an injected store offers one',async()=>{
+ const f=fixture();f.store.moveChat=()=>{throw Error('duplicate handler invoked');};
+ const route=createChatListRoutes({json:()=>{throw Error('duplicate reply');},readBody:async()=>{throw Error('body read behind front');},currentWorkspace:()=>({}),store:f.store});
+ assert.equal(await route({method:'POST'},{},{path:'/api/chats/qa/move'}),false);
 });
-
-// Grants "Allow for this chat" the way the card does: a pending write answered with approve_all.
-async function grantAllowForChat(gate, userId, chatId) {
-  const ctl = new AbortController();
-  const waiting = gate.awaitApproval({ id: `grant-${userId}-${chatId}`, userId, chatId, scope: 'space:free', binding: permissionBinding(userId, chatId, 'space:free', { holder: { kind: 'free' } }), abortSignal: ctl.signal });
-  assert.equal(gate.pendingApprovals.get(`grant-${userId}-${chatId}`).decide('approve_all'), true);
-  assert.equal(await waiting, 'approve');
-}
-
-test('moving a chat to another list revokes its "Allow for this chat" grant; a frame saved in place keeps it (#814)', async () => {
-  const gate = require('../approvals.cjs').createApprovals();
-  const f = fixture();
-  const lists = { f1: null, f2: null };
-  f.store.moveChat = (id, projectId) => {
-    if (!(id in lists)) return { status: 404 };
-    const from = lists[id]; lists[id] = projectId; return { status: 200, from };
-  };
-  const sent = [];
-  const routes = createChatListRoutes({
-    json: (res, status, body) => { sent.push({ status, body }); },
-    readBody: async (req) => { let s = ''; for await (const c of req) s += c; return s; },
-    currentWorkspace: () => ({ dir: f.dir, userId: 'u1' }), PROJECTS: f.projects, FREE_CHATS: f.freeChats,
-    diaryExtras: { internalProject: (p) => p.id === 'diary-extras' }, STORED_HISTORY_BYTES: 200,
-    chatLists: () => ({ freeChats: [], projects: [] }), removeChat() {}, store: f.store, revokeChatGrant: gate.revokeChatGrant,
-  });
-  const move = (id, body) => { const req = Readable.from([Buffer.from(JSON.stringify(body))]); req.method = 'POST'; return routes(req, {}, { path: `/api/chats/${id}/move`, authn: { user: { id: 'u1', role: 'member' } } }); };
-  await grantAllowForChat(gate, 'u1', 'f1');
-  await grantAllowForChat(gate, 'u1', 'f2');
-  await grantAllowForChat(gate, 'u2', 'f1');
-  // In place (no list change): the next write in that chat is still not asked.
-  await move('f1', { projectId: null, frame: { kind: 'idea', tags: [], links: [], confirmed: true, source: 'user' } });
-  assert.equal(sent.pop().status, 200);
-  assert.equal(gate.chatWideApproved('u1', 'f1', 'space:free', permissionBinding('u1', 'f1', 'space:free', { holder: { kind: 'free' } })), true, 'no move: still suppressed');
-  // Into a project: the next write asks again. Other chats and other users keep theirs.
-  await move('f1', { projectId: 'p1' });
-  assert.deepEqual(sent.pop(), { status: 200, body: { ok: true, from: null, projectId: 'p1' } });
-  assert.equal(gate.chatWideApproved('u1', 'f1', 'space:free', permissionBinding('u1', 'f1', 'space:free', { holder: { kind: 'free' } })), false, 'moved: the next write asks again');
-  assert.equal(gate.chatWideApproved('u1', 'f2', 'space:free', permissionBinding('u1', 'f2', 'space:free', { holder: { kind: 'free' } })), true, 'another chat keeps its grant');
-  assert.equal(gate.chatWideApproved('u2', 'f1', 'space:free', permissionBinding('u2', 'f1', 'space:free', { holder: { kind: 'free' } })), true, 'another user keeps theirs');
-  // A refused move changes nothing.
-  await grantAllowForChat(gate, 'u1', 'f1');
-  await move('zz', { projectId: null });
-  assert.equal(sent.pop().status, 404);
-  assert.equal(gate.chatWideApproved('u1', 'f1', 'space:free', permissionBinding('u1', 'f1', 'space:free', { holder: { kind: 'free' } })), true);
-});
-
 test('#1471 a chat exports as one Markdown file from its own lists; unknown, deleted and other-list ids answer 404', async () => {
   const f = fixture();
   f.histories.set('f1', [{ role: 'user', content: 'What is 12 times 3?' }, { role: 'assistant', content: 'Thirty-six.' }]);
@@ -258,17 +182,4 @@ test('#1507: a saved transcript supersedes a saved partial reply (which the Rust
   // The Rust front's save (here its in-process stand-in) supersedes it.
   await require('../../tests/server/project-store-server.cjs').localTranscripts(f.dir).write('c1', [{ role: 'user', content: 'next' }], { supersedePartial: true, origin: 'history' });
   assert.equal(fs.existsSync(partial.fileFor(f.dir, 'c1')), false, 'the saved transcript supersedes the partial');
-});
-
-test('move forwards durable RPC refusals without false success and includes busy retry header',async()=>{
- const replies=[],headers={};let error;
- const routes=createChatListRoutes({json:(_r,status,body)=>replies.push({status,body}),readBody:async()=>JSON.stringify({projectId:null}),
-  currentWorkspace:()=>({userId:'qa'}),store:{moveChat:async()=>{throw error;}},PROJECTS:[],FREE_CHATS:[],diaryExtras:{},chatLists:()=>({freeChats:[],projects:[]})});
- for(const status of [404,409,410,503,500]){
-  error=Object.assign(Error('refused'),{status,code:status===503?'PROJECTS_BUSY':status===409?'CHAT_DESTINATION_FULL':undefined});
-  await routes({method:'POST'},{setHeader:(k,v)=>headers[k]=v},{path:'/api/chats/qa/move',authn:{user:{id:'qa'}}});
-  assert.equal(replies.at(-1).status,status);
-  if(status===404)assert.deepEqual(replies.at(-1).body,{error:'no such chat or project'});
- }
- assert.equal(headers['Retry-After'],'1');
 });

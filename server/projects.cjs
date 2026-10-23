@@ -223,30 +223,6 @@ function createProjectStore({
     }
   }
 
-  // Moves one chat between lists (#738): free <-> project, or project -> project. The chat-list
-  // POSTs merge (an entry only on the server stays), so a list save can never take a chat OUT of
-  // a list, and a DELETE tombstones the id, so delete-then-add would lose it. This is the one
-  // place a meta leaves a list without a tombstone. The transcript is keyed by chat id and does
-  // not move. `patch` may carry a frame (or null), normalized by the same merge as a list save.
-  // `allowed(project)` refuses projects the caller may not use (Diary's internal one).
-  // `receives(project)` refuses a destination a chat cannot live in (#810: no Chat mode, archived);
-  // it is not asked of the project the chat is already in, so a frame can still be saved in place
-  // and a chat can still be moved out. Returns { status, from } — 200 moved (or already there,
-  // patch applied), 404 unknown chat or project.
-  async function moveChat(chatId, toProjectId, patch = {}) {
-    const workspace = currentWorkspace();
-    workspace.assertActive?.();
-    const pending = workspace.pendingStoreWrites?.();
-    if (pending) await pending;
-    if (workspace.storeFailed?.()) throw workspace.storeFailed();
-    workspace.assertActive?.();
-    if (!workspace.chatPermissions?.move) throw require('./chat-grant-context.cjs').invalid();
-    const moved = await workspace.chatPermissions.move(chatId, toProjectId, patch);
-    workspace.assertActive?.();
-    workspace.refreshChatLists();
-    return moved;
-  }
-
   // Free (non-project) chat metas — persisted server-side so recent chats
   // survive across browsers/devices (localStorage was the only home before).
   // #778 routing flags on a chat's meta, set by a chat turn after its route choice (which can
@@ -895,7 +871,7 @@ function createProjectStore({
 
   return {
     refreshDocumentFigures, completeUploadedDocument,
-    saveProjects, whenSaved, getProject, sanitizeChats, loadChats, saveChats, chatIdsElsewhere, deleteChat, moveChat, purgeProjectChats, saveFreeChats, deleteFreeChat, setChatFlags, setChatTitle, chatAutoNamed, createProject,
+    saveProjects, whenSaved, getProject, sanitizeChats, loadChats, saveChats, chatIdsElsewhere, deleteChat, purgeProjectChats, saveFreeChats, deleteFreeChat, setChatFlags, setChatTitle, chatAutoNamed, createProject,
     deleteProject, removeChatAttachments, removeOrphanChatContexts,
     historyPath, readHistory,
     ownsFile, ensureProjectFolder, ensureProjectFolderDetailed, withSourceLock, pruneDocuments, writeProjectTextFile, sweepDeletedProject, indexSource,

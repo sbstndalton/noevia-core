@@ -26,11 +26,11 @@ const SEARCH_MIN_QUERY = 2, SEARCH_MAX_QUERY = 200, SEARCH_MAX_CHATS = 500, SEAR
  * @param {number} deps.STORED_HISTORY_BYTES
  * @param {() => { freeChats:object[], projects:object[] }} deps.chatLists   what the retention sweep may delete from
  * @param {(chat:{ projectId?:string, id:string }) => boolean} deps.removeChat
- * @param {object} deps.store   projects.cjs: sanitizeChats, readHistory, moveChat
+ * @param {object} deps.store   projects.cjs: sanitizeChats, readHistory
  * @param {(userId:string, chatId:string) => boolean} [deps.revokeChatGrant]  approvals.cjs: drops a chat's "Allow for this chat" grant
  */
-function createChatListRoutes({ json, readBody, currentWorkspace, PROJECTS, FREE_CHATS, diaryExtras, STORED_HISTORY_BYTES, chatLists, removeChat, store, revokeChatGrant = () => false }) {
-  const { sanitizeChats, moveChat } = store;
+function createChatListRoutes({ json, readBody, currentWorkspace, PROJECTS, FREE_CHATS, diaryExtras, STORED_HISTORY_BYTES, chatLists, removeChat, store }) {
+  const { sanitizeChats } = store;
   // #812: a malformed percent-escape in the URL is the caller's mistake (400), not a server error.
   const decodeChatId = require('../http.cjs').decodePathPart;
   const badChatId = (res) => json(res, 400, { error: 'invalid chat id' });
@@ -129,36 +129,7 @@ function createChatListRoutes({ json, readBody, currentWorkspace, PROJECTS, FREE
     // (sbstndalton/noevia#1071; the delete is slice 6, one store operation): index.cjs refuses them
     // before this mount (rust-projects.cjs refuseOwnedRoute).
 
-    const moveMatch = p.match(/^\/api\/chats\/([^/]+)\/move$/);
-    if (moveMatch && req.method === 'POST' && moveChat) {
-      const chatId = decodeChatId(moveMatch[1]);
-      if (chatId === null) return badChatId(res);
-      let body;
-      try { body = JSON.parse(await readBody(req)); } catch { return json(res, 400, { error: 'invalid JSON' }); }
-      if (!body || typeof body !== 'object' || Array.isArray(body) || !(body.projectId === null || typeof body.projectId === 'string')) return json(res, 400, { error: 'projectId (or null) required' });
-      let patch = {};
-      if ('frame' in body) {
-        // An invalid frame is refused outright (#759); the merge would otherwise drop the stored one.
-        // The store's merge normalizes it again, so the body's frame is passed on as before.
-        if (body.frame !== null && !require('../chat-framing.cjs').normalizeFrame(body.frame)) return json(res, 400, { error: 'invalid frame' });
-        patch = { frame: body.frame };
-      }
-      // Only the caller's own lists (the request-scoped workspace); Diary's internal project is not a
-      // destination, and neither is a project without Chat mode or an archived one (#810).
-      let moved;
-      try { moved = await moveChat(chatId, body.projectId, patch); }
-      catch (error) {
-        if (error?.status === 404) return json(res, 404, { error: 'no such chat or project' });
-        const refusal = require('../project-store-client.cjs').failureReply(error);
-        for (const [key, value] of Object.entries(refusal.headers)) res.setHeader?.(key, value);
-        return json(res, refusal.status, refusal.body);
-      }
-      // #814: a chat that changed lists loses its "Allow for this chat" grant; a frame saved in place keeps it.
-      if (moved.status === 200 && moved.from !== body.projectId) {
-        for (const userId of new Set([currentWorkspace().userId, authn?.user?.id])) if (userId) revokeChatGrant(userId, chatId);
-      }
-      return json(res, moved.status, moved.status === 200 ? { ok: true, from: moved.from, projectId: body.projectId } : { error: 'no such chat or project' });
-    }
+    // POST /api/chats/{chatId}/move is Rust-owned; index.cjs refuses it before this mount.
 
     // GET and POST /api/chats/:id/history are the Rust front's (sbstndalton/noevia#1071 slices 4
     // and 5): index.cjs refuses both before this mount (rust-projects.cjs refuseOwnedRoute). The

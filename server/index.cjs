@@ -1139,7 +1139,7 @@ const approvalRoutes = require('./routes/approvals.cjs').createApprovalRoutes({ 
 // runs the delete-old-chats sweep as the workspace loads, at most hourly.
 const chatListRoutes = require('./routes/chat-lists.cjs').createChatListRoutes({
   json, readBody, currentWorkspace, PROJECTS, FREE_CHATS, diaryExtras, crypto, STORED_HISTORY_BYTES, STORED_HISTORY_CAP,
-  chatLists: retentionLists, removeChat: removeRetainedChat, store: projectStore, revokeChatGrant,
+  chatLists: retentionLists, removeChat: removeRetainedChat, store: projectStore,
 });
 // The routing configuration and the sampling-presets switch are the Rust front's (#1071): these
 // mounts only refuse a bypass. Chat still reads both settings (routing-modes.cjs, chat.cjs).

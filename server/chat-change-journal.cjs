@@ -37,6 +37,7 @@
 
 /** Grep marker for noevia deploy/tools/assemble-release.sh: this core tails the chat change journal. */
 const JOURNAL_READER_MARKER = 'noevia-chat-change-journal-reader/1';
+const CHAT_MOVE_READER_MARKER = 'noevia-chat-move-reader/1';
 const INTERVAL_MS = 2000;
 const ACTIVE_MS = 15 * 60 * 1000;
 /** The most reads in one poll (1,000 entries each) before the next tick goes on. */
@@ -240,4 +241,4 @@ function scheduleMirrorAndBrain({ chatVaultMirror, chatBrains }) {
   return (user, chatId, { brain = false, brainChatId = chatId } = {}) => { chatVaultMirror.schedule(user, chatId); if (brain) chatBrains.schedule(user, brainChatId); };
 }
 
-module.exports = { createChangeJournalReader, isHistorySave, scheduleMirrorAndBrain, fileStamp, JOURNAL_READER_MARKER, INTERVAL_MS, ACTIVE_MS };
+module.exports = { CHAT_MOVE_READER_MARKER, createChangeJournalReader, isHistorySave, scheduleMirrorAndBrain, fileStamp, JOURNAL_READER_MARKER, INTERVAL_MS, ACTIVE_MS };
