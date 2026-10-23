@@ -339,8 +339,8 @@ function createChatHandler({
       // any write that ran, after the user message the client saved as the turn started.
       if (execution.record && execution.aborted?.()) {
         try {
-          const outcome = require('./chat-interrupted-turn.cjs').saveInterruptedTurn({ fs, workspace: execution.workspace, chatId: body.chatId,
-            message: body.message, entry: execution.record.partialEntry() || execution.record.assistantEntry(), cap: STORED_HISTORY_CAP });
+          const outcome = await require('./chat-interrupted-turn.cjs').saveInterruptedTurn({ workspace: execution.workspace, chatId: body.chatId,
+            message: body.message, entry: execution.record.partialEntry() || execution.record.assistantEntry() });
           if (outcome !== 'saved' && outcome !== 'not-last') console.log(`[chat] interrupted reply not kept: ${outcome}`);
         } catch (error) { console.warn('[chat] could not keep an interrupted reply:', error?.message || error); }
       }

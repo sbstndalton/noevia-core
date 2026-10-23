@@ -160,34 +160,31 @@ function createTurnRecord({ now = Date.now } = {}) {
 /**
  * Append an interrupted reply after its user message in the requesting account's stored transcript.
  * Returns what happened: 'saved', or the reason nothing was written.
+ *
+ * sbstndalton/noevia#1071 slice 4: the Rust store makes the append (workspace.transcripts, the
+ * account's own; noevia-rs crates/server-projects transcript append_if_last): the tombstone check,
+ * the "is the user message still last" check, the cap, the sanitising and the write happen in one
+ * hold of its lock. This process read, checked and wrote through a fixed `<file>.tmp` with nothing
+ * held, so a client save landing meanwhile was lost, or two writers' temp files collided. There is
+ * no local fallback: without the store the call fails, and nothing is written.
  * @param {object} o
- * @param {typeof import('node:fs')} o.fs
- * @param {{ dir:string, historyPath:(id:string)=>string, assertActive?:()=>void }} o.workspace  the request's own workspace
+ * @param {{ dir:string, transcripts:{ appendIfLast:(chat:string, message:string, entry:object)=>Promise<string> }, assertActive?:()=>void }} o.workspace  the request's own workspace
  * @param {string} o.chatId
  * @param {string} o.message  the user message this request answered
  * @param {object|null} o.entry  createTurnRecord().assistantEntry()
- * @param {number} [o.cap]  stored history cap (STORED_HISTORY_CAP)
+ * @returns {Promise<string>}
  */
-function saveInterruptedTurn({ fs, workspace, chatId, message, entry, cap = 5000 }) {
+async function saveInterruptedTurn({ workspace, chatId, message, entry }) {
   const lists = require('./chat-lists.cjs');
   const id = lists.safeChatId(chatId);
-  if (!id || !workspace?.dir || typeof workspace.historyPath !== 'function') return 'no-chat';
+  if (!id || !workspace?.dir) return 'no-chat';
   if (!entry) return 'nothing-to-keep';
+  // Checked again under the store's lock; this one only spares the call.
   if (lists.readTombstones(workspace.dir).has(id)) return 'deleted';
+  if (typeof message !== 'string') return 'not-last';
   workspace.assertActive?.();
-  const file = workspace.historyPath(id);
-  let history;
-  try { history = JSON.parse(fs.readFileSync(file, 'utf8')).history; } catch { return 'no-user-message'; }
-  if (!Array.isArray(history)) return 'no-user-message';
-  const last = history[history.length - 1];
-  // Someone already saved past this turn (the client after Stop, another tab), or the user
-  // message never reached storage: leave the transcript as it is.
-  if (!last || last.role !== 'user' || last.content !== message) return 'not-last';
-  const next = require('./chat-sources.cjs').sanitizeHistory([...history, entry].slice(-cap));
-  const tmp = `${file}.tmp`;
-  fs.writeFileSync(tmp, JSON.stringify({ history: next }, null, 2));
-  fs.renameSync(tmp, file);
-  return 'saved';
+  if (typeof workspace.transcripts?.appendIfLast !== 'function') throw new Error('the transcript store is not available: the interrupted reply is not kept (Node never writes a transcript itself)');
+  return workspace.transcripts.appendIfLast(id, message, entry);
 }
 
 module.exports = { createTurnRecord, saveInterruptedTurn, STOPPED_SENDER };

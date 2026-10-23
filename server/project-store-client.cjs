@@ -76,6 +76,65 @@ function createClient({ port, token, fetchImpl = globalThis.fetch, timeoutMs = T
       if (status === 409 && body && typeof body.version === 'string') return { conflict: true, version: body.version, text: typeof body.text === 'string' ? body.text : null };
       throw failure(status, body);
     },
+    // sbstndalton/noevia#1071 slice 4: a chat's transcript (history-<id>.json), which the Rust store
+    // alone writes (noevia-rs crates/server-projects transcript). Node never writes the file and has
+    // no fallback: an unreachable or refusing store is an error here, never a local write.
+    /** { history, revision, exists }. */
+    async historyRead(user, chat) {
+      const { status, body } = await call('history/read', { user, chat });
+      if (status === 200 && body && typeof body.revision === 'string') return { history: body.history, revision: body.revision, exists: body.exists === true };
+      throw historyFailure(status, body);
+    },
+    /** Saves `history` (the store keeps the last 5,000 entries, sanitised) if the transcript is at
+     *  `baseRevision` (or absent, `ifAbsent`; neither: unconditionally). `supersedePartial`: the
+     *  client's own save, which replaces a saved partial reply unless its reply still runs.
+     *  { ok: true, revision } | { conflict: true, history, revision, exists, proposedRevision } |
+     *  { deleted: true } (the chat is tombstoned: nothing written). */
+    async historyWrite(user, chat, history, { baseRevision, ifAbsent = false, supersedePartial = false } = {}) {
+      const payload = { user, chat, history };
+      if (typeof baseRevision === 'string') payload.baseRevision = baseRevision;
+      if (ifAbsent) payload.ifAbsent = true;
+      if (supersedePartial) payload.supersedePartial = true;
+      const { status, body } = await call('history/write', payload);
+      if (status === 200 && body && typeof body.revision === 'string') return { ok: true, revision: body.revision };
+      if (status === 409 && body && typeof body.revision === 'string') {
+        return { conflict: true, history: body.history, revision: body.revision, exists: body.exists === true, proposedRevision: body.proposedRevision };
+      }
+      if (status === 410 && body && body.code === 'CHAT_DELETED') return { deleted: true };
+      throw historyFailure(status, body);
+    },
+    /** chat-interrupted-turn.cjs: `entry` after the user message `message` if that is still last, in
+     *  one hold of the store's lock. 'saved' | 'not-last' | 'no-user-message' | 'deleted'. */
+    async historyAppendIfLast(user, chat, message, entry) {
+      const { status, body } = await call('history/append-if-last', { user, chat, message, entry });
+      if (status === 200 && body && HISTORY_OUTCOMES.has(body.outcome)) return body.outcome;
+      throw historyFailure(status, body);
+    },
+    /** Removes the transcript only if it is exactly what saving `history` would have written. */
+    async historyRemoveIf(user, chat, history) {
+      const { status, body } = await call('history/remove-if', { user, chat, history });
+      if (status === 200 && body && typeof body.removed === 'boolean') return body.removed;
+      throw historyFailure(status, body);
+    },
+  };
+}
+
+const HISTORY_OUTCOMES = new Set(['saved', 'not-last', 'no-user-message', 'deleted']);
+
+/** A transcript op's refusal: a bad request stays a 400 (the caller's input), the rest as failure(). */
+function historyFailure(status, body) {
+  if (status === 400) return Object.assign(new Error(body && body.error ? String(body.error).slice(0, 200) : 'bad request'), { status: 400 });
+  return failure(status, body);
+}
+
+/** One account's transcripts through `client`, the user bound here (the request's own workspace
+ *  makes it, workspace.cjs), so no caller names another account's. */
+function transcriptsFor(client, user) {
+  return {
+    read: (chat) => client.historyRead(user, chat),
+    write: (chat, history, options) => client.historyWrite(user, chat, history, options),
+    appendIfLast: (chat, message, entry) => client.historyAppendIfLast(user, chat, message, entry),
+    removeIf: (chat, history) => client.historyRemoveIf(user, chat, history),
   };
 }
 
@@ -152,4 +211,4 @@ function holdForStoreSaves(res, saves) {
   };
 }
 
-module.exports = { enabledFrom, createClient, clientFromEnv, createQueue, busy, failureReply, holdForStoreSaves, MAX_ATTEMPTS, TIMEOUT_MS };
+module.exports = { enabledFrom, createClient, clientFromEnv, createQueue, busy, failureReply, holdForStoreSaves, transcriptsFor, MAX_ATTEMPTS, TIMEOUT_MS };

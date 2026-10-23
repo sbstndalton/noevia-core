@@ -23,25 +23,30 @@ function fixture() {
     saveFreeChats: (list) => { store.savedFree = Array.from(list); },
     deleteFreeChat: (id) => { const i = freeChats.findIndex((c) => c.id === id); if (i < 0) return false; freeChats.splice(i, 1); removed.push(id); return true; },
     readHistory: (id) => histories.get(id) || [],
-    writeHistory: (id, history) => histories.set(id, history),
   };
+  // sbstndalton/noevia#1071 slice 4: the transcript is written through the Rust store (its in-process
+  // stand-in here, tests/server/project-store-server.cjs), never by this route.
+  const storeCalls = [];
+  let transcripts = require('../../tests/server/project-store-server.cjs').localTranscripts(dir, storeCalls);
   const routes = createChatListRoutes({
     json: (res, status, body) => { sent.push({ status, body }); },
     readBody: async (req, limit) => { let s = ''; for await (const c of req) s += c; if (limit && s.length > limit) throw Object.assign(new Error('too big'), { status: 413 }); return s; },
-    currentWorkspace: () => ({ dir }),
+    currentWorkspace: () => ({ dir, transcripts }),
     PROJECTS: projects, FREE_CHATS: freeChats,
     diaryExtras: { internalProject: (p) => p.id === 'diary-extras' },
-    crypto, STORED_HISTORY_BYTES: 200, STORED_HISTORY_CAP: 3,
+    STORED_HISTORY_BYTES: 200,
     chatLists: () => ({ freeChats: Array.from(freeChats), projects }),
     removeChat: (chat) => removed.push(chat),
     store,
   });
+  const headers = {};
   const call = (method, path, body, role = 'member') => {
     const req = Readable.from(body === undefined ? [] : [Buffer.from(typeof body === 'string' ? body : JSON.stringify(body))]);
     req.method = method;
-    return routes(req, {}, { path, authn: { user: { id: 'u1', role } } });
+    return routes(req, { setHeader: (k, v) => { headers[k] = v; } }, { path, authn: { user: { id: 'u1', role } } });
   };
-  return { call, routes, sent, removed, projects, freeChats, histories, store, dir };
+  const stored = (id) => { try { return JSON.parse(fs.readFileSync(path.join(dir, `history-${id}.json`), 'utf8')).history; } catch { return undefined; } };
+  return { call, routes, sent, removed, projects, freeChats, histories, store, dir, storeCalls, stored, headers, setTranscripts: (t) => { transcripts = t; } };
 }
 
 test('the workspace view hides the internal project and sanitizes chat metas', async () => {
@@ -75,16 +80,18 @@ test('transcripts carry a revision; a stale save gets the current copy back; a d
   assert.equal(await f.call('GET', '/api/chats/c1/history'), false);
   assert.equal(f.sent.length, 0);
   const emptyRevision = require('node:crypto').createHash('sha256').update('[]').digest('hex');
-  await f.call('POST', '/api/chats/c1/history', { history: [1, 2, 3, 4, 5], baseRevision: emptyRevision });
+  await f.call('POST', '/api/chats/c1/history', { history: [1, 2, 3], baseRevision: emptyRevision });
   const saved = f.sent.pop();
   assert.equal(saved.status, 200);
-  assert.deepEqual(f.histories.get('c1'), [3, 4, 5], 'the stored transcript is capped from the end');
+  assert.deepEqual(f.stored('c1'), [1, 2, 3]);
+  assert.equal(saved.body.revision, require('node:crypto').createHash('sha256').update('[1,2,3]').digest('hex'));
   await f.call('POST', '/api/chats/c1/history', { history: [9], baseRevision: emptyRevision });
   const stale = f.sent.pop();
   assert.equal(stale.status, 409);
   assert.equal(stale.body.error, 'This chat changed on another device.');
-  assert.deepEqual(stale.body.history, [3, 4, 5]);
+  assert.deepEqual(stale.body.history, [1, 2, 3]);
   assert.equal(stale.body.revision, saved.body.revision);
+  assert.deepEqual(Object.keys(stale.body), ['error', 'history', 'revision'], 'Node\'s conflict shape');
   await f.call('POST', '/api/chats/c1/history', { history: [9] });
   assert.equal(f.sent.pop().status, 200, 'a save without a base revision is accepted as before');
   await f.call('POST', '/api/chats/c1/history', { history: ['x'.repeat(300)] });
@@ -93,6 +100,49 @@ test('transcripts carry a revision; a stale save gets the current copy back; a d
   await f.call('POST', '/api/chats/c1/history', { history: [] });
   assert.deepEqual(f.sent.pop(), { status: 410, body: { error: 'This chat was deleted.' } });
   assert.equal(await f.call('PUT', '/api/chats/c1/history'), false);
+  // Every write went through the store, with the reduced id and the client's own supersede.
+  assert.deepEqual(f.storeCalls.map((c) => [c.url, c.body.chat, c.body.supersedePartial]),
+    [['/v1/history/write', 'c1', true], ['/v1/history/write', 'c1', true], ['/v1/history/write', 'c1', true]]);
+});
+
+test('#1071 slice 4: a body without a list is refused instead of erasing the chat; store failures answer as such', async () => {
+  const f = fixture();
+  await f.call('POST', '/api/chats/c2/history', { history: [1] });
+  assert.equal(f.sent.pop().status, 200);
+  for (const body of [{}, { history: null }, { history: { 0: 1 } }]) {
+    await f.call('POST', '/api/chats/c2/history', body);
+    assert.deepEqual(f.sent.pop(), { status: 400, body: { error: 'history must be a list' } }, JSON.stringify(body));
+  }
+  assert.deepEqual(f.stored('c2'), [1], 'still there');
+  for (const body of ['nope', '[]', 'null']) {
+    await f.call('POST', '/api/chats/c2/history', body);
+    assert.equal(f.sent.pop().status, 400, body);
+  }
+  // Core's sanitiser throws on this (String() of an own toString): Node's answer, invalid JSON.
+  await f.call('POST', '/api/chats/c2/history', '{"history":[{"role":"assistant","sources":[{"file":"f","snippet":{"toString":1}}]}]}');
+  assert.deepEqual(f.sent.pop(), { status: 400, body: { error: 'invalid JSON' } });
+  // The store unreachable or busy: 503 with Retry-After, and nothing written here instead.
+  const errors = [];
+  const realError = console.error;
+  console.error = (...a) => errors.push(a.join(' '));
+  try {
+    f.setTranscripts({ write: async () => { throw require('../project-store-client.cjs').busy(); } });
+    await f.call('POST', '/api/chats/c2/history', { history: [2] });
+    assert.deepEqual(f.sent.pop(), { status: 503, body: { error: 'The project store is busy. Try again shortly.', code: 'PROJECTS_BUSY' } });
+    assert.equal(f.headers['Retry-After'], '1');
+    f.setTranscripts({ write: async () => { throw Object.assign(new Error('account no longer exists'), { status: 410 }); } });
+    await f.call('POST', '/api/chats/c2/history', { history: [2] });
+    assert.deepEqual(f.sent.pop(), { status: 410, body: { error: 'account no longer exists' } });
+    f.setTranscripts({ write: async () => { throw Object.assign(new Error('project store answered 401'), { status: 500, code: 'PROJECT_STORE_FAILED' }); } });
+    await f.call('POST', '/api/chats/c2/history', { history: [2] });
+    assert.deepEqual(f.sent.pop(), { status: 500, body: { error: 'Internal error' } });
+    // No store at all: refused, never a local write.
+    f.setTranscripts(undefined);
+    await f.call('POST', '/api/chats/c2/history', { history: [2] });
+    assert.equal(f.sent.pop().status, 500);
+  } finally { console.error = realError; }
+  assert.deepEqual(f.stored('c2'), [1], 'no fallback write');
+  assert.deepEqual(fs.readdirSync(f.dir).filter((n) => n.endsWith('.tmp')), []);
 });
 
 test('#1071: a chat\'s context meter is no longer answered here (the Rust front owns it)', async () => {
@@ -114,7 +164,7 @@ test('POST /api/chats/:id/move validates, scopes to the caller and maps the stor
     json: (res, status, body) => { f.sent.push({ status, body }); },
     readBody: async (req) => { let s = ''; for await (const c of req) s += c; return s; },
     currentWorkspace: () => ({ dir: f.dir }), PROJECTS: f.projects, FREE_CHATS: f.freeChats,
-    diaryExtras: { internalProject: (p) => p.id === 'diary-extras' }, crypto, STORED_HISTORY_BYTES: 200, STORED_HISTORY_CAP: 3,
+    diaryExtras: { internalProject: (p) => p.id === 'diary-extras' }, STORED_HISTORY_BYTES: 200,
     chatLists: () => ({ freeChats: [], projects: [] }), removeChat() {}, store: f.store,
   });
   const call = (method, p, body) => { const req = Readable.from(body === undefined ? [] : [Buffer.from(typeof body === 'string' ? body : JSON.stringify(body))]); req.method = method; return routes(req, {}, { path: p, authn: { user: { id: 'u1', role: 'member' } } }); };
@@ -159,7 +209,7 @@ test('moving a chat to another list revokes its "Allow for this chat" grant; a f
     json: (res, status, body) => { sent.push({ status, body }); },
     readBody: async (req) => { let s = ''; for await (const c of req) s += c; return s; },
     currentWorkspace: () => ({ dir: f.dir, userId: 'u1' }), PROJECTS: f.projects, FREE_CHATS: f.freeChats,
-    diaryExtras: { internalProject: (p) => p.id === 'diary-extras' }, crypto, STORED_HISTORY_BYTES: 200, STORED_HISTORY_CAP: 3,
+    diaryExtras: { internalProject: (p) => p.id === 'diary-extras' }, STORED_HISTORY_BYTES: 200,
     chatLists: () => ({ freeChats: [], projects: [] }), removeChat() {}, store: f.store, revokeChatGrant: gate.revokeChatGrant,
   });
   const move = (id, body) => { const req = Readable.from([Buffer.from(JSON.stringify(body))]); req.method = 'POST'; return routes(req, {}, { path: `/api/chats/${id}/move`, authn: { user: { id: 'u1', role: 'member' } } }); };

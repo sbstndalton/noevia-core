@@ -15,6 +15,7 @@ function createStubStore(root, { flat = false } = {}) {
   const writes = [];
   const fileOf = (user, file) => (flat ? path.join(root, file) : path.join(root, 'users', user, file));
   const now = (f) => (fs.existsSync(f) ? fs.readFileSync(f, 'utf8') : null);
+  const transcripts = (user) => require('./project-store-server.cjs').localTranscripts(flat ? root : path.join(root, 'users', user));
   return {
     writes,
     async read(user, file) {
@@ -33,6 +34,12 @@ function createStubStore(root, { flat = false } = {}) {
       writes.push(file);
       return { ok: true, version: sha(text) };
     },
+    // sbstndalton/noevia#1071 slice 4: the transcript ops, as tests/server/project-store-server.cjs
+    // answers them (the account's directory; flat: `root`).
+    historyRead: (user, chat) => transcripts(user).read(chat),
+    historyWrite: (user, chat, history, options) => transcripts(user).write(chat, history, options),
+    historyAppendIfLast: (user, chat, message, entry) => transcripts(user).appendIfLast(chat, message, entry),
+    historyRemoveIf: (user, chat, history) => transcripts(user).removeIf(chat, history),
   };
 }
 

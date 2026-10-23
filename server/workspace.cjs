@@ -327,6 +327,9 @@ function createWorkspaceStore(rootDir, defaultProvider, secrets, { projectStore 
       savePreferences() { this.assertActive(); atomicJson(path.join(dir, 'preferences.json'), this.preferences); },
       saveAutoRoles() { this.assertActive(); atomicJson(path.join(dir, 'auto-roles.json'), this.autoRoles); },
       historyPath(id) { return path.join(dir, `history-${String(id).replace(/[^a-zA-Z0-9_-]/g, '')}.json`); },
+      // sbstndalton/noevia#1071 slice 4: the transcript is written by the Rust store only, for this
+      // account only (project-store-client.cjs transcriptsFor). historyPath is for reads.
+      transcripts: require('./project-store-client.cjs').transcriptsFor(projectStore, userId),
       usagePath() { return path.join(dir, 'usage.json'); },
       ragDir() { return path.join(dir, 'rag'); },
       // Image sources live on disk, not in projects.json: base64 in the

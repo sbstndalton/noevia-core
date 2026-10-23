@@ -481,7 +481,7 @@ function createProjectStore({
     }
   }
 
-  // ── History persistence (atomic write, JSON per space) ─────────────────────
+  // ── History reads (JSON per space; the Rust store writes it) ───────────────
 
   function historyPath(spaceId) {
     const safe = require('./chat-lists.cjs').safeChatId(spaceId);
@@ -498,14 +498,8 @@ function createProjectStore({
     }
   }
 
-  function writeHistory(spaceId, history) {
-    currentWorkspace().assertActive?.();
-    fs.mkdirSync(currentWorkspace().dir, { recursive: true });
-    const file = historyPath(spaceId);
-    const tmp = `${file}.tmp`;
-    fs.writeFileSync(tmp, JSON.stringify({ history }, null, 2));
-    fs.renameSync(tmp, file);
-  }
+  // sbstndalton/noevia#1071 slice 4: no writeHistory. The transcript is written by the Rust store
+  // only (workspace.transcripts, project-store-client.cjs transcriptsFor).
 
   /** Whether `target` is a file this project may delete: one sitting directly in
    *  a folder the project has attached, including its own.
@@ -921,7 +915,7 @@ function createProjectStore({
     refreshDocumentFigures, completeUploadedDocument,
     saveProjects, whenSaved, getProject, sanitizeChats, loadChats, saveChats, chatIdsElsewhere, deleteChat, moveChat, purgeProjectChats, saveFreeChats, deleteFreeChat, setChatFlags, setChatTitle, chatAutoNamed, createProject,
     deleteProject, removeChatAttachments, removeOrphanChatContexts,
-    historyPath, readHistory, writeHistory,
+    historyPath, readHistory,
     ownsFile, ensureProjectFolder, ensureProjectFolderDetailed, withSourceLock, pruneDocuments, writeProjectTextFile, sweepDeletedProject, indexSource,
   };
 }
