@@ -145,7 +145,14 @@ function createChatListRoutes({ json, readBody, currentWorkspace, PROJECTS, FREE
       }
       // Only the caller's own lists (the request-scoped workspace); Diary's internal project is not a
       // destination, and neither is a project without Chat mode or an archived one (#810).
-      const moved = moveChat(chatId, body.projectId, patch, (proj) => !diaryExtras.internalProject(proj), require('../project-modes.cjs').chatDestination);
+      let moved;
+      try { moved = await moveChat(chatId, body.projectId, patch); }
+      catch (error) {
+        if (error?.status === 404) return json(res, 404, { error: 'no such chat or project' });
+        const refusal = require('../project-store-client.cjs').failureReply(error);
+        for (const [key, value] of Object.entries(refusal.headers)) res.setHeader?.(key, value);
+        return json(res, refusal.status, refusal.body);
+      }
       // #814: a chat that changed lists loses its "Allow for this chat" grant; a frame saved in place keeps it.
       if (moved.status === 200 && moved.from !== body.projectId) {
         for (const userId of new Set([currentWorkspace().userId, authn?.user?.id])) if (userId) revokeChatGrant(userId, chatId);

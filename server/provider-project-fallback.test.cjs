@@ -79,7 +79,7 @@ test('removing a provider lets the next manual chat use the loaded default model
     visionProbe: async () => ({ supported: false, reason: 'none' }), visionDescriptions: new Map(), skillsIndexFor: () => [],
     chatSkillRouter: { select: async () => ({ loaded: [] }) }, chatToolRouter: { select: async ids => ({ ids, routed: false }) },
     ...toolbox, oauthServerIds: () => new Set(), accountReady: () => true,
-    chatWideApproved: () => false, awaitApproval: async () => 'approve', recordUsage() {}, recordToolUse() {},
+    grantContext: async raw => require('../tests/server/chat-grant-fixture.cjs').context(raw, { holder: { kind: 'absent' } }), chatWideApproved: () => false, awaitApproval: async () => 'approve', recordUsage() {}, recordToolUse() {},
   });
   await handler.handleChat({}, res, { message: 'Synthetic question', projectId: 'p1', chatId: 'synthetic-chat', history: [] }, { user: { id: workspace.userId, role: 'member' } });
   assert.deepEqual(errors, []);

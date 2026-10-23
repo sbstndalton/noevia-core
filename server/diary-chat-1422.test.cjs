@@ -52,7 +52,7 @@ function setup(t, { diary, health = { ok: true, model: 'configured-model' }, ser
       oauthServerIds: () => new Set(), accountReady: () => true, DEFAULT_TOOLBOXES: ['core'], CONNECTOR_BOXES: new Set(), connectedBoxes: () => [],
       toolPolicy: { mode: () => 'allow' }, allToolboxes: () => [], resolveTools: spy('resolveTools'), isWriteTool: () => false,
       rag: { filesContext: async () => null }, prefill: { recordSample() {} }, reduceToolResult: () => ({ text: 'reduced' }),
-      chatWideApproved: () => false, awaitApproval: async () => 'deny', recordUsage() {}, recordToolUse() {},
+      grantContext: async raw => require('../tests/server/chat-grant-fixture.cjs').context(raw, { holder: { kind: 'absent' } }), chatWideApproved: () => false, awaitApproval: async () => 'deny', recordUsage() {}, recordToolUse() {},
       routingModes: { enabled: spy('routingModes.enabled'), settings: spy('routingModes.settings'), sensitivity: spy('routingModes.sensitivity'), awaitChoice: spy('routingModes.awaitChoice'), setChatFlags: spy('routingModes.setChatFlags'), log() {} },
     });
     try {

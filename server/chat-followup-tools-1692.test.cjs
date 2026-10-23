@@ -95,7 +95,7 @@ async function run(t, { message, route = 'fast', project = AUTO_PROJECT, nextclo
     toolPolicy: { mode: (_user, _name, isWrite) => (isWrite ? 'ask' : 'allow') }, requestScope: { getStore: () => ({ authn: { user } }) },
     rag: { filesContext: async () => null }, prefill: { recordSample() {} }, reduceToolResult: (text) => ({ text: String(text) }), diaryExtras: require('./diary-extras.cjs'),
     DIARY_BASE: 'http://fixture.invalid', TOOL_RESULT_CAP: 8000, json: () => {}, saveChats() {}, endpointApproved: () => true, diaryHeaders: () => ({}),
-    chatWideApproved: () => chatWide, recordUsage() {}, recordToolUse() {},
+    grantContext: async raw => require('../tests/server/chat-grant-fixture.cjs').context(raw, { holder: { kind: 'absent' } }), chatWideApproved: () => chatWide, recordUsage() {}, recordToolUse() {},
     executeToolCall: async (_project, name, args) => { ran.push(name); return execute ? execute(name, args, ran.length) : `synthetic result of ${name}`; },
     awaitApproval: async (request) => { approvals.push(request); return 'decline'; },
   });

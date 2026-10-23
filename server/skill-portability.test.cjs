@@ -166,7 +166,7 @@ async function run(t, { reqBody = {}, fixture = project(), rounds = [], onExecut
     chatSkillRouter: { select: async (rows) => { routerInput = rows.map((s) => s.file); if (router) return router(rows); const hit = rows.find((s) => s.file === FILE); return { loaded: hit ? [hit] : [] }; } },
     oauthServerIds: () => new Set(), accountReady: () => true,
     chatToolRouter: { select: async (ids) => ({ ids, routed: false }) }, DEFAULT_TOOLBOXES: [], CONNECTOR_BOXES: new Set(), connectedBoxes: () => [],
-    toolPolicy: { mode: (_u, _n, write) => (write ? 'ask' : 'allow') }, requestScope: { getStore: () => (user ? { authn: { user } } : {}) },
+    toolPolicy: { mode: (_u, _n, write) => (write ? 'ask' : 'allow') }, requestScope: { getStore: () => (user ? { authn: { user }, workspace: { userId: user.id } } : { workspace: { userId: workspace.userId } }) },
     resolveTools: () => ({ tools: ['synthetic_write', 'read_project_file', 'project_read_file', 'synthetic_read'].map((name) => ({ type: 'function', function: { name, parameters: { type: 'object' } } })), dropped: [] }),
     isWriteTool: (name) => writes.has(name),
     rag: { filesContext: async () => null }, prefill: { recordSample() {} }, reduceToolResult: (text) => ({ text }), diaryExtras: require('./diary-extras.cjs'),
@@ -174,7 +174,7 @@ async function run(t, { reqBody = {}, fixture = project(), rounds = [], onExecut
     endpointApproved: () => true, diaryHeaders: () => ({}), lastLoadedModel: () => null, classifyFastOrSmart: async () => 'fast', servedCatalogue: async () => [],
     modelsInstalled: async () => [], missingRoles: () => [], staleRolesError: () => null, allToolboxes: () => known.map((id) => ({ id })), stepSupervision,
     executeToolCall: async (_p, name, args) => { executed.push(name); return (await onExecute?.(name, args)) ?? 'synthetic result'; },
-    chatWideApproved: () => false,
+    grantContext: async raw => require('../tests/server/chat-grant-fixture.cjs').context(raw, { holder: { kind: 'absent' } }), chatWideApproved: () => false,
     awaitApproval: async () => { approvals++; await onApproval?.(); return 'approve'; }, recordUsage() {}, recordToolUse() {},
   });
   await handleChat({}, res, { projectId: fixture.id, chatId: 'fixture-chat', message: 'synthetic question', ...reqBody }, { user: { id: 'user-a' } });

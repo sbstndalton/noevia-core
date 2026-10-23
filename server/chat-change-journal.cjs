@@ -50,8 +50,9 @@ const RECENT_CAP = 5000;
  * @param {(user:string, chatId:string) => void} deps.onChange  schedules the chat's mirror and brain
  * @param {(user:string) => string|null} [deps.stamp]  the journal file's stamp (null: unknown, read)
  */
-function createChangeJournalReader({ read, onChange, stamp = () => null, log = (...a) => console.warn(...a), intervalMs = INTERVAL_MS, activeMs = ACTIVE_MS,
+function createChangeJournalReader({ read, onChange, onRescan = () => {}, stamp = () => null, log = (...a) => console.warn(...a), intervalMs = INTERVAL_MS, activeMs = ACTIVE_MS,
   now = Date.now, setTimer = setInterval, clearTimer = clearInterval }) {
+  const moves = new Map(); // user -> bounded event identities + ordered live watermark
   const cursors = new Map(); // user -> { seq, start }
   const seen = new Map(); // user -> last request time
   const running = new Map(); // user -> promise
@@ -73,6 +74,27 @@ function createChangeJournalReader({ read, onChange, stamp = () => null, log = (
     return true;
   }
 
+  function moveNotice(user, entry, start, live) {
+    const grants = require('./chat-grant-context.cjs');
+    let mark = moves.get(user);
+    if (!mark) { mark = { seq: 0, ids: new Set(), full: false }; moves.set(user, mark); }
+    const valid = typeof entry.eventId === 'string' && /^[0-9a-f]{32}$/.test(entry.eventId) &&
+      grants.decimal(entry.generation) && grants.safeId(entry.chatId) === entry.chatId &&
+      entry.chatId && typeof entry.rawChatId === 'string' && grants.safeId(entry.rawChatId) === entry.chatId;
+    const known = valid && mark.ids.has(entry.eventId);
+    const fresh = Number.isSafeInteger(entry.seq) && entry.seq > mark.seq;
+    const brain = valid && !known && fresh && !mark.full && live && entry.delivery === 'live' && entry.start === start;
+    // Mark BEFORE any callback: partially delivered scheduling never starts a second brain.
+    mark.seq = Math.max(mark.seq, Number(entry.seq) || 0);
+    if (valid && !known) {
+      if (mark.ids.size >= RECENT_CAP) mark.full = true; // no evicted replay may become live
+      else mark.ids.add(entry.eventId);
+    }
+    if (!live) return;
+    try { onChange(user, entry.chatId, { brain: !!brain, brainChatId: valid ? entry.rawChatId : null }); }
+    catch (error) { log('chat-change-journal: move scheduling failed', error?.message || String(error)); }
+  }
+
   function needsRescan(cursor, body) {
     if (!cursor) return true;
     if (body.start !== cursor.start) return true;
@@ -88,13 +110,15 @@ function createChangeJournalReader({ read, onChange, stamp = () => null, log = (
     let body = first, after = 0, pages = 0;
     const chats = new Map();
     for (;;) {
-      for (const e of body.entries || []) { if (e && typeof e.chatId === 'string') { chats.delete(e.chatId); chats.set(e.chatId, e.revision); } after = Math.max(after, Number(e?.seq) || 0); }
+      for (const e of body.entries || []) { if (e?.op === 'move') moveNotice(user, e, first.start, false); if (e && typeof e.chatId === 'string') { chats.delete(e.chatId); chats.set(e.chatId, e.revision); } after = Math.max(after, Number(e?.seq) || 0); }
       if (!body.more || ++pages >= MAX_PAGES) break;
       body = await read(user, after);
       if (!body || body.unsupported) return;
     }
     // A rescan schedules even a revision already scheduled: what was pending may have been lost.
     for (const [chatId, revision] of chats) { recent.delete(`${user}\n${chatId}`); schedule(user, chatId, revision); }
+    if (moves.has(user)) moves.get(user).seq = after;
+    onRescan(user); // one full mirror scan also covers events already rotated away
     cursors.set(user, { seq: after, start: first.start });
   }
 
@@ -115,7 +139,8 @@ function createChangeJournalReader({ read, onChange, stamp = () => null, log = (
         const s = Number(e?.seq) || 0;
         if (s <= seq) continue;
         seq = s;
-        schedule(user, e.chatId, e.revision, isHistorySave(e));
+        if (e.op === 'move') moveNotice(user, e, cursor.start, true);
+        else schedule(user, e.chatId, e.revision, isHistorySave(e));
       }
       cursors.set(user, { seq, start: cursor.start });
       if (!body.more || pages + 1 >= MAX_PAGES) break;
@@ -127,7 +152,7 @@ function createChangeJournalReader({ read, onChange, stamp = () => null, log = (
   /** The store answered 410 (the account no longer exists): stop reading that user. Nothing of
    *  theirs is kept; a later request start from them (they authenticated again) begins afresh. */
   function forget(user) {
-    cursors.delete(user); stamps.delete(user); seen.delete(user); failing.delete(user); again.delete(user);
+    moves.delete(user); cursors.delete(user); stamps.delete(user); seen.delete(user); failing.delete(user); again.delete(user);
     const prefix = `${user}\n`;
     for (const key of [...recent.keys()]) if (key.startsWith(prefix)) recent.delete(key);
     log('chat-change-journal: account removed, no longer reading', user);
@@ -212,7 +237,7 @@ function fileStamp(dataDir, user, fs = require('node:fs'), path = require('node:
 
 /** The change handler index.cjs wires: the mirror always; the brain only for a history save. */
 function scheduleMirrorAndBrain({ chatVaultMirror, chatBrains }) {
-  return (user, chatId, { brain = false } = {}) => { chatVaultMirror.schedule(user, chatId); if (brain) chatBrains.schedule(user, chatId); };
+  return (user, chatId, { brain = false, brainChatId = chatId } = {}) => { chatVaultMirror.schedule(user, chatId); if (brain) chatBrains.schedule(user, brainChatId); };
 }
 
 module.exports = { createChangeJournalReader, isHistorySave, scheduleMirrorAndBrain, fileStamp, JOURNAL_READER_MARKER, INTERVAL_MS, ACTIVE_MS };

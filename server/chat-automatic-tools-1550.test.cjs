@@ -94,10 +94,10 @@ async function run(t, { message, route = 'fast', project = AUTO_PROJECT, nextclo
     allToolboxes: toolboxes.allToolboxes, resolveTools: toolboxes.resolveTools, isWriteTool: toolboxes.isWriteTool,
     automaticToolsReady: () => (box) => box.server !== 'nextcloud' || nextcloudReady,
     // As the real policy with nothing stored (tool-policy.cjs): a read runs, a write asks.
-    toolPolicy: { mode: (_user, _name, isWrite) => (isWrite ? 'ask' : 'allow') }, requestScope: { getStore: () => ({ authn: { user } }) },
+    toolPolicy: { mode: (_user, _name, isWrite) => (isWrite ? 'ask' : 'allow') }, requestScope: { getStore: () => ({ authn: { user }, workspace: { userId: user.id } }) },
     rag: { filesContext: async () => null }, prefill: { recordSample() {} }, reduceToolResult: (text) => ({ text: String(text) }), diaryExtras: require('./diary-extras.cjs'),
     DIARY_BASE: 'http://fixture.invalid', TOOL_RESULT_CAP: 8000, json: () => {}, saveChats() {}, endpointApproved: () => true, diaryHeaders: () => ({}),
-    chatWideApproved: () => chatWide, recordUsage() {}, recordToolUse() {},
+    grantContext: async raw => require('../tests/server/chat-grant-fixture.cjs').context(raw, { holder: { kind: 'absent' } }), chatWideApproved: () => chatWide, recordUsage() {}, recordToolUse() {},
     executeToolCall: async (_project, name) => { ran.push(name); return `synthetic result of ${name}`; },
     awaitApproval: async (request) => { approvals.push(request); return 'decline'; },
   });

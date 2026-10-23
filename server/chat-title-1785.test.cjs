@@ -70,7 +70,7 @@ async function turn(t, { history = [], provider = { id: 'default', baseUrl: 'htt
     rag: { filesContext: async () => null }, prefill: { recordSample() {} }, reduceToolResult: () => ({ text: 'reduced' }), diaryExtras: require('./diary-extras.cjs'),
     DIARY_BASE: 'http://fixture.invalid', TOOL_RESULT_CAP: 8000, json: () => {}, saveChats() {}, endpointApproved: () => true, diaryHeaders: () => ({}),
     lastLoadedModel: () => null, classifyFastOrSmart: async () => 'fast', servedCatalogue: async () => [], modelsInstalled: async () => [], missingRoles: () => [], staleRolesError: () => null,
-    allToolboxes: () => [{ id: 'core' }], chatWideApproved: () => false, recordUsage() {}, recordToolUse() {}, executeToolCall: async () => 'unused', awaitApproval: async () => 'approve',
+    allToolboxes: () => [{ id: 'core' }], grantContext: async raw => require('../tests/server/chat-grant-fixture.cjs').context(raw, { holder: { kind: 'absent' } }), chatWideApproved: () => false, recordUsage() {}, recordToolUse() {}, executeToolCall: async () => 'unused', awaitApproval: async () => 'approve',
     ...(wired ? { chatTitles: { save: (...args) => { saved.push(args); return true; },
       ...(autoNamed === undefined ? {} : { autoNamed: (...args) => { autoNamedCalls.push(args); return typeof autoNamed === 'function' ? autoNamed(...args) : autoNamed; } }) } } : {}),
   });

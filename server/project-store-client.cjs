@@ -21,6 +21,8 @@ const MAX_ATTEMPTS = 8;
 // whose store carries "noevia-chat-delete-store/1" (and refuses the reverse pairings). Keep the
 // quoted literal: the release check reads it from this file.
 const CHAT_DELETE_CLIENT_MARKER = 'noevia-chat-delete-client/1';
+// Release pairing requires foundation + generation-aware Node enforcement.
+const CHAT_MOVE_CLIENT_MARKER = 'noevia-chat-move-client/1';
 const TIMEOUT_MS = 10000;
 const REPLY_CAP = 2 * 32 * 1024 * 1024 + 64 * 1024;
 const FILES = new Set(['projects.json', 'free-chats.json']);
@@ -66,6 +68,22 @@ function createClient({ port, token, fetchImpl = globalThis.fetch, timeoutMs = T
     return { status: res.status, body };
   }
   return {
+    async grantContext(user, chat) {
+      const { status, body } = await call('chat/grant-context', { user, chat });
+      if (status !== 200) throw moveFailure(status, body);
+      return require('./chat-grant-context.cjs').validate(chat, body);
+    },
+    async chatMove(user, chat, projectId, patch = {}) {
+      const payload = { user, chat, projectId };
+      if (Object.hasOwn(patch, 'frame')) payload.frame = patch.frame;
+      const { status, body } = await call('chat/move', payload);
+      const grants = require('./chat-grant-context.cjs');
+      const from = grants.holder(body?.from), to = grants.holder(body?.to);
+      if (status !== 200) throw moveFailure(status, body);
+      if (!from || from.kind === 'absent' || !to || to.kind === 'absent' || !grants.decimal(body?.generation) ||
+          !grants.sameHolder(to, projectId === null ? { kind: 'free' } : { kind: 'project', id: projectId })) throw failure(500, null);
+      return { status: 200, from: from.kind === 'free' ? null : from.id, generation: body.generation };
+    },
     /** { version, text } (text null: no file). */
     async read(user, file) {
       if (!FILES.has(file)) throw new Error(`not a store file: ${file}`);
@@ -148,6 +166,11 @@ function createClient({ port, token, fetchImpl = globalThis.fetch, timeoutMs = T
       throw historyFailure(status, body);
     },
   };
+}
+
+function moveFailure(status, body) {
+  if ([400, 404, 409].includes(status)) return Object.assign(new Error(body?.error || 'The chat or destination is unavailable.'), { status, ...(typeof body?.code === 'string' ? { code: body.code } : {}) });
+  return failure(status, body);
 }
 
 const HISTORY_OUTCOMES = new Set(['saved', 'not-last', 'no-user-message', 'deleted']);
@@ -252,4 +275,4 @@ function holdForStoreSaves(res, saves) {
   };
 }
 
-module.exports = { CHAT_DELETE_CLIENT_MARKER, HISTORY_ORIGINS, enabledFrom, createClient, clientFromEnv, createQueue, busy, failureReply, holdForStoreSaves, transcriptsFor, MAX_ATTEMPTS, TIMEOUT_MS };
+module.exports = { CHAT_MOVE_CLIENT_MARKER, CHAT_DELETE_CLIENT_MARKER, HISTORY_ORIGINS, enabledFrom, createClient, clientFromEnv, createQueue, busy, failureReply, holdForStoreSaves, transcriptsFor, MAX_ATTEMPTS, TIMEOUT_MS };

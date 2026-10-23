@@ -405,3 +405,16 @@ test('#1071 slice 6: a chat\'s delete is one store call, bound to one account; i
   assert.equal(psc.CHAT_DELETE_CLIENT_MARKER, 'noevia-chat-delete-client/1');
   assert.ok(fs.readFileSync(path.join(__dirname, 'project-store-client.cjs'), 'utf8').includes(`'${psc.CHAT_DELETE_CLIENT_MARKER}'`));
 });
+
+test('slice7 workspace context/move methods bind the actual account and refuse a revoked view',async t=>{
+ const root=fs.mkdtempSync(path.join(os.tmpdir(),'qa-move-client-'));t.after(()=>fs.rmSync(root,{recursive:true,force:true}));
+ const calls=[],stub=require('../tests/server/project-store-stub.cjs').createStubStore(root);
+ stub.grantContext=async(user,chat)=>{calls.push({op:'context',user,chat});return require('../tests/server/chat-grant-fixture.cjs').context(chat);};
+ stub.chatMove=async(user,chat,projectId,patch)=>{calls.push({op:'move',user,chat,projectId,patch});return{status:200,from:null};};
+ const store=createWorkspaceStore(root,{id:'default'},null,{projectStore:stub});
+ const other='99999999-2222-4333-8444-555555555555',mine=store.get(USER),theirs=store.get(other);
+ await mine.chatPermissions.context('qa c!');await theirs.chatPermissions.move('qa c!',null,{frame:null,user:USER});
+ assert.deepEqual(calls,[{op:'context',user:USER,chat:'qa c!'},{op:'move',user:other,chat:'qa c!',projectId:null,patch:{frame:null,user:USER}}]);
+ mine.revoked=true;assert.throws(()=>mine.chatPermissions.context('qa'),e=>e.status===410);assert.throws(()=>mine.chatPermissions.move('qa',null),e=>e.status===410);
+ assert.equal(calls.length,2);
+});

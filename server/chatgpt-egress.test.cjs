@@ -87,7 +87,7 @@ async function setup(t, { flag = true, connected = true, refresh = 'ok', storage
       isWriteTool: () => false, rag: { filesContext: async () => null }, prefill: { recordSample() {} }, reduceToolResult: () => ({ text: 'reduced' }), diaryExtras: require('./diary-extras.cjs'),
       DIARY_BASE: 'http://fixture.invalid', TOOL_RESULT_CAP: 8000, json: (_res, status, b) => { refused = { status, body: b }; }, saveChats() {}, endpointApproved: () => false, diaryHeaders: () => ({}),
       lastLoadedModel: () => null, classifyFastOrSmart: async () => 'fast', servedCatalogue: async () => [], modelsInstalled: async () => [], missingRoles: () => [], staleRolesError: () => null,
-      allToolboxes: () => BOXES, executeToolCall: async (_p, name, args) => { executed.push({ name, args: JSON.parse(args) }); return 'synthetic file text'; }, chatWideApproved: () => false, awaitApproval: async () => 'deny', recordUsage() {}, recordToolUse() {},
+      allToolboxes: () => BOXES, executeToolCall: async (_p, name, args) => { executed.push({ name, args: JSON.parse(args) }); return 'synthetic file text'; }, grantContext: async raw => require('../tests/server/chat-grant-fixture.cjs').context(raw, { holder: { kind: 'absent' } }), chatWideApproved: () => false, awaitApproval: async () => 'deny', recordUsage() {}, recordToolUse() {},
     });
     // A thrown handler leaves the SSE heartbeat running; end the fake response so the test exits.
     try { await handleChat({}, res, { projectId: 'fixture-project', chatId: 'fixture-chat', message: 'synthetic question', ...body }, { user }); }

@@ -1,4 +1,5 @@
 'use strict';
+const { binding: permissionBinding } = require('../../tests/server/chat-grant-fixture.cjs');
 // The chat-list routes over a fake store: the workspace view with its sanitized chats and the
 // hourly sweep, a free chat's delete, and the transcript's revision check. The merge and
 // tombstones are chat-lists.test.cjs; the sweep's rules are chat-retention.test.cjs; the
@@ -91,8 +92,8 @@ test('#1071: a chat\'s context meter is no longer answered here (the Rust front 
 test('POST /api/chats/:id/move validates, scopes to the caller and maps the store outcome (#738)', async () => {
   const f = fixture();
   const moves = [];
-  f.store.moveChat = (id, projectId, patch, allowed) => {
-    moves.push({ id, projectId, patch, internalAllowed: allowed({ id: 'diary-extras' }), p1Allowed: allowed({ id: 'p1' }) });
+  f.store.moveChat = async (id, projectId, patch) => {
+    moves.push({ id, projectId, patch });
     return id === 'f1' ? { status: 200, from: null } : { status: 404 };
   };
   // The routes destructure the store once, so build them again with the move in place.
@@ -107,7 +108,7 @@ test('POST /api/chats/:id/move validates, scopes to the caller and maps the stor
   const frame = { kind: 'idea', tags: [], links: [], confirmed: true, source: 'user' };
   assert.equal(await call('POST', '/api/chats/f1/move', { projectId: 'p1', frame }), true);
   assert.deepEqual(f.sent.pop(), { status: 200, body: { ok: true, from: null, projectId: 'p1' } });
-  assert.deepEqual(moves.pop(), { id: 'f1', projectId: 'p1', patch: { frame }, internalAllowed: false, p1Allowed: true });
+  assert.deepEqual(moves.pop(), { id: 'f1', projectId: 'p1', patch: { frame } });
   await call('POST', '/api/chats/f1/move', { projectId: null });
   f.sent.pop();
   assert.deepEqual(moves.pop().patch, {}, 'no frame in the body leaves the frame alone');
@@ -127,7 +128,7 @@ test('POST /api/chats/:id/move validates, scopes to the caller and maps the stor
 // Grants "Allow for this chat" the way the card does: a pending write answered with approve_all.
 async function grantAllowForChat(gate, userId, chatId) {
   const ctl = new AbortController();
-  const waiting = gate.awaitApproval({ id: `grant-${userId}-${chatId}`, userId, chatId, scope: 'space:free', abortSignal: ctl.signal });
+  const waiting = gate.awaitApproval({ id: `grant-${userId}-${chatId}`, userId, chatId, scope: 'space:free', binding: permissionBinding(userId, chatId, 'space:free', { holder: { kind: 'free' } }), abortSignal: ctl.signal });
   assert.equal(gate.pendingApprovals.get(`grant-${userId}-${chatId}`).decide('approve_all'), true);
   assert.equal(await waiting, 'approve');
 }
@@ -155,18 +156,18 @@ test('moving a chat to another list revokes its "Allow for this chat" grant; a f
   // In place (no list change): the next write in that chat is still not asked.
   await move('f1', { projectId: null, frame: { kind: 'idea', tags: [], links: [], confirmed: true, source: 'user' } });
   assert.equal(sent.pop().status, 200);
-  assert.equal(gate.chatWideApproved('u1', 'f1', 'space:free'), true, 'no move: still suppressed');
+  assert.equal(gate.chatWideApproved('u1', 'f1', 'space:free', permissionBinding('u1', 'f1', 'space:free', { holder: { kind: 'free' } })), true, 'no move: still suppressed');
   // Into a project: the next write asks again. Other chats and other users keep theirs.
   await move('f1', { projectId: 'p1' });
   assert.deepEqual(sent.pop(), { status: 200, body: { ok: true, from: null, projectId: 'p1' } });
-  assert.equal(gate.chatWideApproved('u1', 'f1', 'space:free'), false, 'moved: the next write asks again');
-  assert.equal(gate.chatWideApproved('u1', 'f2', 'space:free'), true, 'another chat keeps its grant');
-  assert.equal(gate.chatWideApproved('u2', 'f1', 'space:free'), true, 'another user keeps theirs');
+  assert.equal(gate.chatWideApproved('u1', 'f1', 'space:free', permissionBinding('u1', 'f1', 'space:free', { holder: { kind: 'free' } })), false, 'moved: the next write asks again');
+  assert.equal(gate.chatWideApproved('u1', 'f2', 'space:free', permissionBinding('u1', 'f2', 'space:free', { holder: { kind: 'free' } })), true, 'another chat keeps its grant');
+  assert.equal(gate.chatWideApproved('u2', 'f1', 'space:free', permissionBinding('u2', 'f1', 'space:free', { holder: { kind: 'free' } })), true, 'another user keeps theirs');
   // A refused move changes nothing.
   await grantAllowForChat(gate, 'u1', 'f1');
   await move('zz', { projectId: null });
   assert.equal(sent.pop().status, 404);
-  assert.equal(gate.chatWideApproved('u1', 'f1', 'space:free'), true);
+  assert.equal(gate.chatWideApproved('u1', 'f1', 'space:free', permissionBinding('u1', 'f1', 'space:free', { holder: { kind: 'free' } })), true);
 });
 
 test('#1471 a chat exports as one Markdown file from its own lists; unknown, deleted and other-list ids answer 404', async () => {
@@ -257,4 +258,17 @@ test('#1507: a saved transcript supersedes a saved partial reply (which the Rust
   // The Rust front's save (here its in-process stand-in) supersedes it.
   await require('../../tests/server/project-store-server.cjs').localTranscripts(f.dir).write('c1', [{ role: 'user', content: 'next' }], { supersedePartial: true, origin: 'history' });
   assert.equal(fs.existsSync(partial.fileFor(f.dir, 'c1')), false, 'the saved transcript supersedes the partial');
+});
+
+test('move forwards durable RPC refusals without false success and includes busy retry header',async()=>{
+ const replies=[],headers={};let error;
+ const routes=createChatListRoutes({json:(_r,status,body)=>replies.push({status,body}),readBody:async()=>JSON.stringify({projectId:null}),
+  currentWorkspace:()=>({userId:'qa'}),store:{moveChat:async()=>{throw error;}},PROJECTS:[],FREE_CHATS:[],diaryExtras:{},chatLists:()=>({freeChats:[],projects:[]})});
+ for(const status of [404,409,410,503,500]){
+  error=Object.assign(Error('refused'),{status,code:status===503?'PROJECTS_BUSY':status===409?'CHAT_DESTINATION_FULL':undefined});
+  await routes({method:'POST'},{setHeader:(k,v)=>headers[k]=v},{path:'/api/chats/qa/move',authn:{user:{id:'qa'}}});
+  assert.equal(replies.at(-1).status,status);
+  if(status===404)assert.deepEqual(replies.at(-1).body,{error:'no such chat or project'});
+ }
+ assert.equal(headers['Retry-After'],'1');
 });

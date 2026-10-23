@@ -45,13 +45,13 @@ async function fakeStore(root, { start = START_A, missingOp = false } = {}) {
 }
 
 /** Appends entries as the Rust store does (seq from the last line). */
-function journalWrite(root, user, chatId, revision, { start = START_A, op = 'write', origin = 'history' } = {}) {
+function journalWrite(root, user, chatId, revision, { start = START_A, op = 'write', origin = 'history', ...extra } = {}) {
   const dir = path.join(root, 'users', user);
   fs.mkdirSync(dir, { recursive: true });
   const file = path.join(dir, 'chat-changes.jsonl');
   const lines = fs.existsSync(file) ? fs.readFileSync(file, 'utf8').split('\n').filter(Boolean) : [];
   const seq = lines.length ? JSON.parse(lines.at(-1)).seq + 1 : 1;
-  fs.appendFileSync(file, `${JSON.stringify({ seq, chatId, revision, op, ...(origin ? { origin } : {}), start, at: Date.now() })}\n`);
+  fs.appendFileSync(file, `${JSON.stringify({ seq, chatId, revision, op, ...(origin ? { origin } : {}), start, at: Date.now(), ...extra })}\n`);
   return seq;
 }
 
@@ -408,4 +408,65 @@ test('#2167 recovery notices may repeat removal without queuing brain work', asy
     assert.deepEqual(h.brain, []);
     assert.equal(h.reader.cursor(USER).seq, 2);
   } finally { await h.done(); }
+});
+
+const moveFields = (eventId='a'.repeat(32), extra={}) => ({op:'move',origin:'other',eventId,generation:'1',delivery:'live',rawChatId:'qa raw!',...extra});
+test('move event identity bypasses revision dedupe; recovery/duplicate/unknown and rescans never build', async () => {
+  const h=await harness();try {
+    await h.reader.poll(USER); // establish a live cursor without replay
+    journalWrite(h.root,USER,'qaraw',null,moveFields());await h.reader.poll(USER);
+    assert.deepEqual(h.brain,[USER+':qa raw!']);
+    journalWrite(h.root,USER,'qaraw',null,moveFields(undefined,{delivery:'recovery'}));await h.reader.poll(USER);
+    journalWrite(h.root,USER,'qaraw',null,moveFields());await h.reader.poll(USER);
+    assert.equal(h.brain.length,1);
+    journalWrite(h.root,USER,'qaraw',null,moveFields('b'.repeat(32)));await h.reader.poll(USER);
+    assert.equal(h.brain.length,2,'same-generation genuine frame event is distinct');
+    for (const [index,patch] of [{delivery:undefined},{delivery:'unknown'},{rawChatId:'other'},{generation:1},{start:START_B}].entries()) {
+      journalWrite(h.root,USER,'qaraw',null,moveFields(String(index+1).repeat(32),patch));await h.reader.poll(USER);
+    }
+    assert.equal(h.brain.length,2,'unknown provenance/identity never builds even without a current brain');
+    h.store.state.start=START_B;await h.reader.poll(USER);
+    assert.equal(h.brain.length,2,'restart is mirror only');
+    assert.ok(h.mirror.length>=8,'recovery remains a mirror nudge');
+  }finally{await h.done();}
+});
+test('first-scan and rotated live moves are mirror-only, partial delivery cannot build twice',async()=>{
+  const entries=[],brain=[],mirror=[],rescans=[];let fail=true;
+  const reader=createChangeJournalReader({
+    read:async(_u,after)=>({entries:entries.filter(e=>e.seq>after),oldestSeq:entries[0]?.seq??null,latestSeq:entries.at(-1)?.seq??null,start:START_A,more:false}),
+    onRescan:u=>rescans.push(u),onChange:(u,c,{brain:build,brainChatId}={})=>{mirror.push(c);if(build){brain.push(brainChatId);if(fail){fail=false;throw Error('after scheduling');}}},log:()=>{}
+  });
+  entries.push({seq:1,chatId:'qaraw',revision:null,start:START_A,...moveFields()});await reader.poll(USER);
+  assert.equal(brain.length,0);
+  entries.push({seq:2,chatId:'qaraw',revision:null,start:START_A,...moveFields('b'.repeat(32))});await reader.poll(USER);
+  entries.push({seq:3,chatId:'qaraw',revision:null,start:START_A,...moveFields('b'.repeat(32))});await reader.poll(USER);
+  assert.deepEqual(brain,['qa raw!'],'watermark is committed before a partially delivered callback');
+  entries.splice(0,entries.length,{seq:10,chatId:'qaraw',revision:null,start:START_A,...moveFields('c'.repeat(32))});await reader.poll(USER);
+  assert.equal(brain.length,1);assert.equal(rescans.length,2,'rescan refreshes whole mirror even for rotated-away moves');
+});
+
+test('live raw-id move lookup builds missing/stale brain once; partial replay never builds it again',async()=>{
+ for(const initial of ['missing','stale','current']){
+  const entries=[],pending=[];let builds=0,record=initial==='missing'?null:{sourceUpdatedAt:initial==='current'?42:1};
+  const brains=createBrainScheduler({
+   enabled:()=>true,chat:(_u,id)=>id==='qa raw!'?{id,updatedAt:42}:null,readHistory:()=>[{role:'user',content:'synthetic'}],
+   store:{read:()=>record,write:(_u,_c,value)=>{record=value;}},builder:{build:async()=>{builds++;return{ok:true,brain:{summary:'synthetic'}};}},
+   setTimer:fn=>{pending.push(fn);return{unref(){}};},clearTimer:()=>{}
+  });
+  const deliver=scheduleMirrorAndBrain({chatVaultMirror:{schedule(){}},chatBrains:brains});
+  let partial=true;
+  const reader=createChangeJournalReader({
+   read:async(_u,after)=>({entries:entries.filter(e=>e.seq>after),oldestSeq:entries[0]?.seq??null,latestSeq:entries.at(-1)?.seq??null,start:START_A,more:false}),
+   onChange:(u,c,options)=>{deliver(u,c,options);if(options.brain&&partial){partial=false;throw Error('after queued brain');}},log:()=>{}
+  });
+  await reader.poll(USER);
+  entries.push({seq:1,chatId:'qaraw',revision:null,start:START_A,...moveFields()});await reader.poll(USER);
+  for(const timer of pending.splice(0))await timer();
+  assert.equal(builds,initial==='current'?0:1,'exact raw metadata id reaches the actual scheduler');
+  const firstBuilds=builds;record=null; // A replay MUST NOT rely on updatedAt/current-brain short circuit.
+  entries.push({seq:2,chatId:'qaraw',revision:null,start:START_A,...moveFields()});
+  entries.push({seq:3,chatId:'qaraw',revision:null,start:START_A,...moveFields('b'.repeat(32),{delivery:'recovery'})});
+  await reader.poll(USER);for(const timer of pending.splice(0))await timer();
+  assert.equal(builds,firstBuilds,'duplicate/previously unseen recovery schedules no brain even if it is now missing');
+ }
 });
