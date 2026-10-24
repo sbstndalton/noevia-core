@@ -167,7 +167,11 @@ test('a moved chat and Delete old chats take their attachments projects along (#
   const fresh = await openWithImage('c788-fresh');
   const longAgo = Date.now() - 100 * 86400000;
   frontSaveFree([{ id: 'c788-old', title: 'o', updatedAt: longAgo }, { id: 'c788-fresh', title: 'f' }]);
-  const preview = JSON.parse((await request('/api/account/retention', { headers: { cookie } })).text).preview;
+  // The preview GET is the Rust front's (#1071); an unconfirmed PUT answers it too (409).
+  const unconfirmed = await request('/api/account/retention', { method: 'PUT', headers: mutationHeaders(), body: JSON.stringify({ days: 90 }) });
+  assert.equal(unconfirmed.status, 409);
+  const preview = JSON.parse(unconfirmed.text).preview;
+  assert.equal(preview[90], 1);
   const swept = await request('/api/account/retention', { method: 'PUT', headers: mutationHeaders(), body: JSON.stringify({ days: 90, confirmDeletes: preview[90] }) });
   assert.equal(swept.status, 200);
   assert.ok(await gone(old));

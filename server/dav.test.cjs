@@ -2,12 +2,14 @@
 const test=require('node:test'),assert=require('node:assert/strict'),http=require('node:http'),crypto=require('node:crypto');
 const {configuration,createDavSettings}=require('./dav-settings.cjs'),{createDavHandler,properties}=require('./dav.cjs');
 const Database=require('better-sqlite3');
+// Settings -> Sharing writes the opt-in in the Rust front (#1071); these tests seed the row directly.
+const optIn=(db,id,scope)=>db.prepare('INSERT INTO dav_settings VALUES(?,?,?,?) ON CONFLICT(user_id) DO UPDATE SET scope=excluded.scope').run(id,scope,null,1);
 const digest=s=>crypto.createHash('sha256').update(s).digest('hex');
 function fixture(t,config={available:true,scope:'lan',host:'localhost',origin:'http://localhost',cleartext:true}){
  const db=new Database(':memory:');db.exec("PRAGMA foreign_keys=ON;CREATE TABLE users(id TEXT PRIMARY KEY,disabled_at INTEGER);INSERT INTO users VALUES('alice',NULL),('bob',NULL);");t.after(()=>db.close());
  const corpus={alice:{'entry.md':'Synthetic alice'},bob:{'entry.md':'Synthetic bob'}},enabled={alice:true,bob:true},storage={alice:'local',bob:'local'},events=[];
  const auth={db,diaryEnabled:id=>enabled[id],getStorage:id=>({kind:storage[id]}),audit:(...args)=>events.push(args),appPasswords:{list:()=>[{id:'device'}],verifyDav:async(username,password,scope)=>password==='synthetic'&&corpus[username]&&scope===config.scope?{userId:username,credentialId:'device'}:null}};
- const settings=createDavSettings({auth,config});const user=id=>({id,username:id});
+ const settings=createDavSettings({auth});const user=id=>({id,username:id});
  const files={list:async(id,p)=>p?[]:Object.keys(corpus[id]).map(path=>({path,name:path,isDir:false})),read:async(id,p)=>({content:corpus[id][p]??null,version:corpus[id][p]===undefined?null:digest(corpus[id][p])}),write:async(id,b)=>{const old=corpus[id][b.path];if((old===undefined?null:digest(old))!==b.version)throw Object.assign(Error('Conflict'),{status:409});corpus[id][b.path]=b.content;return {version:digest(b.content)};}};
  return {config,db,auth,settings,user,files,corpus,enabled,storage,events};
 }
@@ -41,13 +43,9 @@ test('the DAV listener binds COWORK_DAV_HOST, else UI_HOST as before, and only a
  assert.throws(()=>configuration({...base,COWORK_DAV_HOST:'0.0.0.0 '}),/COWORK_DAV_HOST must be an IP address/);
  assert.equal(configuration({}).available,false);
 });
-test('sharing opt-in requires eligibility, matching endpoint and explicit cleartext acknowledgement',t=>{
- const f=fixture(t);assert.equal(f.settings.get(f.user('alice')).scope,'off');
- assert.throws(()=>f.settings.save(f.user('alice'),{scope:'lan'}),/Acknowledge/);
- assert.throws(()=>f.settings.save(f.user('alice'),{scope:'public'}),/not configured/);
- f.settings.save(f.user('alice'),{scope:'lan',acknowledgeCleartext:true});assert.equal(f.settings.scope('bob'),'off');
- f.storage.alice='webdav';assert.throws(()=>f.settings.save(f.user('alice'),{scope:'lan',acknowledgeCleartext:true}),/local storage/);
- f.settings.save(f.user('alice'),{scope:'off'});assert.equal(f.settings.scope('alice'),'off');
+test('Node keeps only the listener\'s read of the opt-in; saving it is the Rust front\'s (#1071)',t=>{
+ const f=fixture(t);assert.deepEqual(Object.keys(f.settings),['scope']);assert.equal(f.settings.scope('alice'),'off');
+ optIn(f.db,'alice','lan');assert.equal(f.settings.scope('alice'),'lan');assert.equal(f.settings.scope('bob'),'off');
 });
 test('property parser supports namespaces and refuses DTD, malformed XML and unsupported selectors',()=>{
  assert.equal(properties(''),null);assert.equal(properties('<D:propfind xmlns:D="DAV:"><D:allprop/></D:propfind>'),null);
@@ -56,7 +54,7 @@ test('property parser supports namespaces and refuses DTD, malformed XML and uns
 });
 test('DAV files stay tenant scoped, with HEAD/OPTIONS/property status and conditional writes',async t=>{
  const f=fixture(t),request=await server(t,f);assert.equal((await request('GET','entry.md')).status,403);
- f.settings.save(f.user('alice'),{scope:'lan',acknowledgeCleartext:true});
+ optIn(f.db,'alice','lan');
  let r=await request('GET','entry.md');assert.equal(await r.text(),'Synthetic alice');const tag=r.headers.get('etag');
  r=await request('HEAD','entry.md');assert.equal(await r.text(),'');assert.equal(r.headers.get('etag'),tag);assert.equal(r.headers.get('content-length'),'15');
  assert.equal((await request('GET','entry.md',undefined,{'If-None-Match':tag})).status,304);
@@ -80,13 +78,13 @@ test('DAV files stay tenant scoped, with HEAD/OPTIONS/property status and condit
 });
 test('DAV public transport refuses spoofed HTTPS without dedicated proxy secret and wrong authority',async t=>{
  const f=fixture(t,{available:true,scope:'public',host:'files.example',origin:'https://files.example',cleartext:false,proxyToken:'a'.repeat(64)}),request=await server(t,f);
- f.settings.save(f.user('alice'),{scope:'public'});
+ optIn(f.db,'alice','public');
  assert.equal((await request('GET','entry.md',undefined,{'x-forwarded-proto':'https'})).status,403);
  assert.equal((await request('GET','entry.md',undefined,{'x-forwarded-proto':'https','x-cowork-dav-proxy-token':'a'.repeat(64),host:'other.example'})).status,421);
  assert.equal((await request('GET','entry.md',undefined,{'x-forwarded-proto':'https','x-cowork-dav-proxy-token':'a'.repeat(64)})).status,200);
 });
 test('DAV rejects oversized writes and fails storage errors without leaking internals',async t=>{
- const f=fixture(t),request=await server(t,f);f.settings.save(f.user('alice'),{scope:'lan',acknowledgeCleartext:true});
+ const f=fixture(t),request=await server(t,f);optIn(f.db,'alice','lan');
  assert.equal((await request('PUT','large.md','x'.repeat(512*1024+1),{'If-None-Match':'*'})).status,413);
  f.files.list=async()=>{throw Error('private backend detail');};const r=await request('GET','entry.md');assert.equal(r.status,502);assert.equal(await r.text(),'Diary storage is unavailable');
 });
@@ -95,7 +93,7 @@ test('MKCOL is create-only, scoped and refuses bodies and unsupported conditions
  f.files.mkdir=async(id,path)=>{if(path==='missing/child')throw Object.assign(Error('Missing parent'),{status:409});if(made.includes(path)||path==='entry.md')throw Object.assign(Error('Exists'),{status:405});assert.equal(id,'alice');made.push(path);};
  const request=await server(t,f);
  assert.equal((await request('MKCOL','folder/')).status,403);
- f.settings.save(f.user('alice'),{scope:'lan',acknowledgeCleartext:true});
+ optIn(f.db,'alice','lan');
  assert.match((await request('OPTIONS')).headers.get('allow'),/MKCOL/);
  assert.equal((await request('MKCOL','folder/')).status,201);
  assert.equal((await request('MKCOL','folder/')).status,405);
@@ -107,18 +105,4 @@ test('MKCOL is create-only, scoped and refuses bodies and unsupported conditions
  assert.equal((await request('MKCOL','%2e%2e/escape')).status,400);
  f.storage.alice='webdav';assert.equal((await request('MKCOL','remote')).status,403);
  assert.deepEqual(made,['folder']);assert.equal(f.events.filter(e=>e[0]==='dav.mkdir').length,1);
-});
-
-// #652: the "not configured" reason travels as an id the client translates, with the English sentence beside it as a
-// fallback; an available endpoint sends no reason at all.
-test('DAV settings report why sharing is unavailable as a translatable id plus the English fallback',t=>{
- const off=fixture(t,configuration({}));
- const value=off.settings.get(off.user('alice'));
- assert.equal(value.available,false);
- assert.equal(value.reasonId,'not-configured');
- assert.equal(value.reason,'The operator has not configured a file-sharing endpoint.');
- const on=fixture(t);
- const ready=on.settings.get(on.user('alice'));
- assert.equal(ready.reasonId,undefined);
- assert.equal(ready.reason,undefined);
 });
