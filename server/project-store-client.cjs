@@ -23,6 +23,7 @@ const MAX_ATTEMPTS = 8;
 const CHAT_DELETE_CLIENT_MARKER = 'noevia-chat-delete-client/1';
 // Release pairing requires foundation + generation-aware Node enforcement.
 const CHAT_MOVE_CLIENT_MARKER = 'noevia-chat-move-client/1';
+const SOURCE_JOBS_CLIENT_MARKER = 'noevia-source-jobs-client/1';
 const TIMEOUT_MS = 10000;
 const REPLY_CAP = 2 * 32 * 1024 * 1024 + 64 * 1024;
 const FILES = new Set(['projects.json', 'free-chats.json']);
@@ -67,7 +68,48 @@ function createClient({ port, token, fetchImpl = globalThis.fetch, timeoutMs = T
     try { body = await require('./http.cjs').readCappedJson(res, REPLY_CAP); } catch { /* empty, non-JSON or over the cap */ }
     return { status: res.status, body };
   }
+  async function sourceCall(op, user, payload) {
+    const request = () => call(`source-jobs/${op}`, { user, ...payload });
+    const mutating = op === 'start' || op === 'abandon' || op === 'progress' || op === 'finish';
+    let response;
+    for (let attempt = 0; attempt < (mutating ? 2 : 1); attempt += 1) {
+      try { response = await request(); }
+      catch (error) {
+        // A lost answer after a write is ambiguous. Retrying carries the same request key or
+        // sequence, and Rust returns the already committed operation without repeating it.
+        if (!mutating || attempt > 0) throw error;
+        continue;
+      }
+      const { status, body } = response;
+      const valid = status === 200 && body && typeof body === 'object'
+        && (op !== 'start' || (typeof body.id === 'string' && typeof body.run === 'string'))
+        && ((op !== 'abandon' && op !== 'progress' && op !== 'finish') || body.ok === true);
+      if (valid) return body;
+      // A committed write can lose its reply body too. An internal 5xx may also be emitted
+      // after the commit; the exact retry is safe and avoids stranding an active source slot.
+      if (mutating && attempt === 0 && (status === 200 || status >= 500)) continue;
+      break;
+    }
+    const { status, body } = response;
+    if (status === 404 && op === 'read') return null;
+    const message = status === 429 ? 'Source processing is busy; wait for the current operation and retry.'
+      : status === 410 ? 'account no longer exists'
+      : status === 409 ? 'Source processing was interrupted by a newer server start.'
+      : status === 404 ? 'Source processing project no longer exists.'
+      : 'The source job store is unavailable; retry shortly.';
+    throw Object.assign(Error(message), { status: [404, 409, 410, 429].includes(status) ? status : 503 });
+  }
   return {
+    sourceJobsFor(user) {
+      return {
+        recover: (owner) => sourceCall('recover', user, owner),
+        start: (owner, projectId, request) => sourceCall('start', user, { ...owner, projectId, request }),
+        abandon: (owner, request) => sourceCall('abandon', user, { ...owner, request }),
+        progress: (owner, id, run, stage, n) => sourceCall('progress', user, { ...owner, id, run, stage, n }),
+        finish: (owner, id, run, ok, result, error) => sourceCall('finish', user, { ...owner, id, run, ok, result, error }),
+        read: (projectId, id) => sourceCall('read', user, { projectId, id }),
+      };
+    },
     async grantContext(user, chat) {
       const { status, body } = await call('chat/grant-context', { user, chat });
       if (status !== 200) throw moveFailure(status, body);
@@ -275,4 +317,4 @@ function holdForStoreSaves(res, saves) {
   };
 }
 
-module.exports = { CHAT_MOVE_CLIENT_MARKER, CHAT_DELETE_CLIENT_MARKER, HISTORY_ORIGINS, enabledFrom, createClient, clientFromEnv, createQueue, busy, failureReply, holdForStoreSaves, transcriptsFor, MAX_ATTEMPTS, TIMEOUT_MS };
+module.exports = { CHAT_MOVE_CLIENT_MARKER, CHAT_DELETE_CLIENT_MARKER, SOURCE_JOBS_CLIENT_MARKER, HISTORY_ORIGINS, enabledFrom, createClient, clientFromEnv, createQueue, busy, failureReply, holdForStoreSaves, transcriptsFor, MAX_ATTEMPTS, TIMEOUT_MS };

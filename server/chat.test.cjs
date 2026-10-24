@@ -19,7 +19,7 @@ async function runDriveCall(t, { name, files = [], ragOverride = null, savedMode
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'noevia-drive-chat-'));
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
   const user = { id: 'synthetic-user' }, project = { id: projectId || 'synthetic-project', model: 'synthetic-model', routing: autoDecision ? 'auto' : 'manual', toolboxes: ['core'], files, ...(sampling !== undefined ? { sampling } : {}) };
-  const workspace = { userId: user.id, dir };
+  const workspace = { userId: user.id, dir, sourceJobs: require('../tests/server/project-store-stub.cjs').createStubStore(dir, { flat: true }).sourceJobsFor(user.id) };
   const store = { workspace: { userId: user.id }, authn: { user } };
   const requestScope = { getStore: () => store, run: (_scope, fn) => fn() };
   const accounts = { forUser: () => ({ drive: { state: () => ({ state: connected ? 'connected' : 'disconnected' }) } }) };
@@ -77,7 +77,7 @@ async function runDriveCall(t, { name, files = [], ragOverride = null, savedMode
     },
     recordUsage() {}, recordToolUse() {}, ...(sourceWaitMs === undefined ? {} : { sourceWaitMs }),
   });
-  if (beforeChat) beforeChat({ project, workspace });
+  if (beforeChat) await beforeChat({ project, workspace });
   await handler.handleChat({}, res, { message, projectId: project.id, chatId: 'synthetic-chat', history });
   assert.equal(events.some((event) => event.type === 'error'), false, JSON.stringify(events.filter((event) => event.type === 'error')));
   return { executions, approvals, requests, events, audits, project };
@@ -405,8 +405,8 @@ test('an ordinary manual project model is unaffected by the #409 guard', async (
 });
 
 // #1441: a file attached to a new chat whose upload was accepted (202) but not yet ingested.
-const attachDuringTurn = ({ name, after = 40, fail = false, never = false }) => ({ project, workspace }) => {
-  require('./source-jobs.cjs').start(workspace, project.id, async () => {
+const attachDuringTurn = ({ name, after = 40, fail = false, never = false }) => async ({ project, workspace }) => {
+  await require('./source-jobs.cjs').start(workspace, project.id, async () => {
     if (never) return new Promise(() => {});
     await new Promise((r) => setTimeout(r, after));
     if (fail) throw Object.assign(new Error('ocr crashed at /secret/path with synthetic body'), { status: 422 });
