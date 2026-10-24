@@ -52,7 +52,7 @@ function harness(t, { supervisor = null, recentWrites = createRecentWrites(), ex
     lastLoadedModel: () => null, classifyFastOrSmart: async () => 'fast', servedCatalogue: async () => [], modelsInstalled: async () => [], missingRoles: () => [], staleRolesError: () => null,
     allToolboxes: () => [],
     executeToolCall: executeToolCall || (async (_p, name, args) => { state.executed.push({ name, args: JSON.parse(args) }); return `Appended 10 chars to "${TARGET}".`; }),
-    chatWideApproved: () => false,
+    grantContext: async raw => require('../tests/server/chat-grant-fixture.cjs').context(raw, { holder: { kind: 'absent' } }), chatWideApproved: () => false,
     awaitApproval: async () => 'approve',
     recordUsage() {}, recordToolUse() {},
     stepSupervision: supervisor,

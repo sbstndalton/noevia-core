@@ -57,6 +57,13 @@ test('#1071: every Rust-owned project route is refused here unconditionally, bef
     ['POST', '/api/freechats'],
     ['GET', '/api/chats/c1/context'],
     ['POST', '/api/chats/c1/context'],
+    ['GET', '/api/chats/c1/context-window'],
+    ['GET', '/api/chats/c1/history'],
+    ['POST', '/api/chats/c1/history'],
+    ['POST', '/api/chats/c1/move'],
+    // #1071 slice 6: a chat's delete.
+    ['DELETE', '/api/freechats/c1'],
+    ['DELETE', '/api/projects/p1/chats/c1'],
   ];
   for (const [method, p] of owned) {
     calls.length = 0;
@@ -68,16 +75,17 @@ test('#1071: every Rust-owned project route is refused here unconditionally, bef
   assert.deepEqual(owned.map(([m, p]) => `${m} ${p.replace(/p1|img-1|c1/g, 'x')}`).sort(), [...rp.OWNED_ROUTES].map((r) => norm(r)).sort());
   for (const [method, p] of [
     ['PUT', '/api/projects/p1/assets'], ['GET', '/api/projects/p1/assets'], ['POST', '/api/projects/p1/assets/img-1'],
-    ['PUT', '/api/projects/p1/chats'], ['DELETE', '/api/projects/p1/chats'], ['GET', '/api/projects/p1/chats/c1'], ['DELETE', '/api/projects/p1/chats/c1'],
-    ['DELETE', '/api/freechats/c1'], ['PUT', '/api/freechats'], ['GET', '/api/freechats/c1'], ['GET', '/api/freechatsx'],
-    ['DELETE', '/api/chats/c1/context'], ['GET', '/api/chats/c1/context/extra'], ['POST', '/api/chats/c1/move'], ['POST', '/api/projects'], ['GET', '/api/workspace'],
+    ['PUT', '/api/projects/p1/chats'], ['DELETE', '/api/projects/p1/chats'], ['GET', '/api/projects/p1/chats/c1'], ['PATCH', '/api/projects/p1/chats/c1'],
+    ['DELETE', '/api/projects/p1/chats/c1/x'], ['DELETE', '/api/freechats/c1/x'], ['DELETE', '/api/freechats/'],
+    ['PUT', '/api/freechats'], ['GET', '/api/freechats/c1'], ['GET', '/api/freechatsx'],
+    ['DELETE', '/api/chats/c1/context'], ['GET', '/api/chats/c1/context/extra'], ['GET', '/api/chats/c1/move'], ['POST', '/api/chats/c1/context-window'], ['GET', '/api/chats/c1/context-window/x'],
+    ['PUT', '/api/chats/c1/history'], ['DELETE', '/api/chats/c1/history'], ['GET', '/api/chats/c1/history/x'], ['POST', '/api/projects'], ['GET', '/api/workspace'],
     ['POST', '/api/projects/p1/uploads'], ['GET', '/api/projects/p1/assets/img-1/extra'],
   ]) {
     calls.length = 0;
     assert.equal(rp.refuseOwnedRoute({ method }, {}, p, json), false, `${method} ${p}`);
     assert.equal(calls.length, 0);
   }
-  assert.ok(![...rp.OWNED_ROUTES].some((r) => r.startsWith('DELETE /api/freechats')), "a free chat's delete stays Node's");
 });
 
 test('#1264/#1071: retired context switches only warn; free-chat store limits stay unchanged', () => {
@@ -415,7 +423,8 @@ test('moveChat and deleteFreeChat through the coordinated free list keep a meta 
   const file = freeFile(ws.dir);
   // The front saves a new free chat after this request started; the request moves f1 into p1.
   atomicJson(file, [meta('front', 5), ...readFree(file)]);
-  assert.equal(projects.moveChat('f1', 'p1').status, 200);
+  assert.equal((await ws.chatPermissions.move('f1', 'p1')).status, 200);
+  ws.refreshChatLists();
   await ws.pendingStoreWrites();
   assert.deepEqual(readFree(file).map((c) => c.id), ['front', 'f2']);
   assert.deepEqual(read(path.join(ws.dir, 'projects.json'))[0].chats.map((c) => c.id), ['f1']);
@@ -462,4 +471,19 @@ test('setChatFlags reads both lists again first: a meta the front retitled durin
   assert.deepEqual(changed, [USER, USER], 'each refresh that took in the front nudged the mirror once');
   assert.equal(projects.setChatFlags(null, 'missing', { forceLocal: true }), false);
   await ws.pendingStoreWrites();
+});
+
+test('slice7: public move is Rust-owned POST only, explicit owner, direct Node refusal',()=>{
+ assert.equal(rp.CHAT_MOVE_PUBLIC_OWNER,'rust');assert.equal(rp.ownedRoute('POST','/api/chats/qa/move'),true);
+ for(const m of ['GET','HEAD','PUT','PATCH','DELETE'])assert.equal(rp.ownedRoute(m,'/api/chats/qa/move'),false);
+ for(const p of ['/api/chats//move','/api/chats/qa/move/','/api/chats/qa/move/extra'])assert.equal(rp.ownedRoute('POST',p),false);
+ const replies=[];assert.equal(rp.refuseOwnedRoute({method:'POST'},{},'/api/chats/qa/move',(_r,status,body)=>replies.push({status,body})),true);
+ assert.equal(replies[0].status,503);assert.equal(replies[0].body.code,'RUST_PROJECTS_OWNED');
+});
+
+
+test('slice7 capabilities are exported by the actual client, dispatcher and journal reader', () => {
+  assert.equal(require('./project-store-client.cjs').CHAT_MOVE_CLIENT_MARKER, 'noevia-chat-move-client/1');
+  assert.equal(require('./chat.cjs').CHAT_MOVE_ENFORCEMENT_MARKER, 'noevia-chat-move-enforcement/1');
+  assert.equal(require('./chat-change-journal.cjs').CHAT_MOVE_READER_MARKER, 'noevia-chat-move-reader/1');
 });

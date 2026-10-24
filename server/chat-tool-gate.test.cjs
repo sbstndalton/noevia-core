@@ -55,7 +55,7 @@ async function run(t, { message, replies, gate, policy = () => 'allow', execute 
     rag: { filesContext: async () => null }, prefill: { recordSample() {} }, reduceToolResult: (r) => ({ text: String(r) }), diaryExtras: require('./diary-extras.cjs'),
     DIARY_BASE: 'http://fixture.invalid', TOOL_RESULT_CAP: 8000, json: () => {}, saveChats() {}, endpointApproved: () => true, diaryHeaders: () => ({}),
     lastLoadedModel: () => null, classifyFastOrSmart: async () => 'fast', servedCatalogue: async () => [], modelsInstalled: async () => [], missingRoles: () => [], staleRolesError: () => null,
-    allToolboxes: () => boxes, chatWideApproved: () => false, awaitApproval: async () => 'deny', recordUsage() {}, recordToolUse() {},
+    allToolboxes: () => boxes, grantContext: async raw => require('../tests/server/chat-grant-fixture.cjs').context(raw, { holder: { kind: 'absent' } }), chatWideApproved: () => false, awaitApproval: async () => 'deny', recordUsage() {}, recordToolUse() {},
     executeToolCall: async (_p, name, args, _allowed, _signal, outcome) => { executed.push({ name, args: JSON.parse(args) }); return execute(name, outcome); },
     ...(gate === undefined ? {} : { toolGate: gate }),
   });

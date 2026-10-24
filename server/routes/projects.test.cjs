@@ -29,7 +29,6 @@ function fixture({ projects = [], diary = true, catalogue = null, onToolboxesCha
     deleteProject: (id) => { const i = projects.findIndex((p) => p.id === id); if (i < 0) return false; projects.splice(i, 1); store.deleted = id; return true; },
     withSourceLock: (_p, op) => op(), ensureProjectFolder: async () => null, indexSource() {},
     ownsFile: () => false, loadChats: (id) => (store.getProject(id) || { chats: [] }).chats || [], saveChats: (id, chats) => { store.savedChats = [id, chats]; },
-    deleteChat: (id, chatId) => id === 'p1' && chatId === 'c1',
   };
   const routes = createProjectRoutes({
     json: (res, status, body) => { sent.push({ status, body }); },
@@ -189,15 +188,12 @@ test('rejected config patches do not clear the active sampling override', async 
 // A project's chat list (GET and POST /api/projects/{id}/chats) is the Rust front's (#1071): this
 // mount no longer has it, and index.cjs refuses it first (rust-projects.test.cjs). Deleting one chat
 // stays here.
-test('chat metas: the list is not this mount\'s any more; deleting one chat keeps its answers', async () => {
+test('chat metas: the list and one chat\'s delete are not this mount\'s any more (#1071 slice 6)', async () => {
   const f = fixture({ projects: [{ id: 'p1', chats: [{ id: 'c1', title: 'one' }] }] });
   for (const m of ['GET', 'POST']) assert.equal(await f.call(m, '/api/projects/p1/chats', m === 'POST' ? { chats: [{ id: 'c2' }] } : undefined), false, m);
+  assert.equal(await f.call('DELETE', '/api/projects/p1/chats/c1'), false, 'the Rust front answers the delete');
   assert.equal(f.sent.length, 0);
   assert.equal(f.store.savedChats, undefined, 'nothing saved');
-  await f.call('DELETE', '/api/projects/p1/chats/c1');
-  assert.deepEqual(f.sent.pop(), { status: 200, body: { ok: true } });
-  await f.call('DELETE', '/api/projects/p1/chats/c9');
-  assert.deepEqual(f.sent.pop(), { status: 404, body: { error: 'no such chat' } });
 });
 test('uploads refuse what they always refused', async () => {
   const f = fixture({ projects: [{ id: 'p1', files: [] }] });

@@ -1,4 +1,5 @@
 'use strict';
+const { binding: permissionBinding } = require('../tests/server/chat-grant-fixture.cjs');
 
 const assert = require('node:assert/strict');
 const test = require('node:test');
@@ -10,14 +11,15 @@ const { createApprovals } = require('./approvals.cjs');
 
 function pending(gate, overrides = {}) {
   const ctrl = new AbortController();
-  const p = gate.awaitApproval({ id: overrides.id || 'ap-1', userId: overrides.userId || 'u1', chatId: overrides.chatId || 'c1', scope: overrides.scope === undefined ? 'project:p1' : overrides.scope, abortSignal: ctrl.signal });
+  const binding = permissionBinding(overrides.userId || 'u1', overrides.chatId || 'c1', overrides.scope === undefined ? 'project:p1' : overrides.scope);
+  const p = gate.awaitApproval({ binding, id: overrides.id || 'ap-1', userId: overrides.userId || 'u1', chatId: overrides.chatId || 'c1', scope: overrides.scope === undefined ? 'project:p1' : overrides.scope, abortSignal: ctrl.signal });
   return { promise: p, ctrl };
 }
 
 test('a fresh gate has nothing pending and no chat-wide grant', () => {
   const gate = createApprovals();
   assert.equal(gate.pendingApprovals.size, 0);
-  assert.equal(gate.chatWideApproved('u1', 'c1', 'project:p1'), false);
+  assert.equal(gate.chatWideApproved('u1', 'c1', 'project:p1', permissionBinding('u1', 'c1', 'project:p1')), false);
   assert.equal(gate.chatWideApproved(null, null), false);
 });
 
@@ -32,7 +34,7 @@ test('approve and deny resolve the waiting call once and clear the id', async ()
   const b = pending(gate, { id: 'b' });
   assert.equal(gate.pendingApprovals.get('b').decide('deny'), true);
   assert.equal(await b.promise, 'deny');
-  assert.equal(gate.chatWideApproved('u1', 'c1', 'project:p1'), false, 'a single approval never widens');
+  assert.equal(gate.chatWideApproved('u1', 'c1', 'project:p1', permissionBinding('u1', 'c1', 'project:p1')), false, 'a single approval never widens');
 });
 
 test('only the three decisions are accepted', () => {
@@ -51,11 +53,11 @@ test('approve_all grants this chat for this user only, and expires', async () =>
   const a = pending(gate, { id: 'a', userId: 'u1', chatId: 'c1' });
   gate.pendingApprovals.get('a').decide('approve_all');
   assert.equal(await a.promise, 'approve');
-  assert.equal(gate.chatWideApproved('u1', 'c1', 'project:p1'), true);
-  assert.equal(gate.chatWideApproved('u1', 'c2', 'project:p1'), false, 'another chat still asks');
-  assert.equal(gate.chatWideApproved('u2', 'c1', 'project:p1'), false, 'another user still asks');
+  assert.equal(gate.chatWideApproved('u1', 'c1', 'project:p1', permissionBinding('u1', 'c1', 'project:p1')), true);
+  assert.equal(gate.chatWideApproved('u1', 'c2', 'project:p1', permissionBinding('u1', 'c2', 'project:p1')), false, 'another chat still asks');
+  assert.equal(gate.chatWideApproved('u2', 'c1', 'project:p1', permissionBinding('u2', 'c1', 'project:p1')), false, 'another user still asks');
   t += 60_001;
-  assert.equal(gate.chatWideApproved('u1', 'c1', 'project:p1'), false, 'the grant expires with the process TTL');
+  assert.equal(gate.chatWideApproved('u1', 'c1', 'project:p1', permissionBinding('u1', 'c1', 'project:p1')), false, 'the grant expires with the process TTL');
 });
 
 test('a closed tab or stop is not an approval', async () => {
@@ -71,7 +73,7 @@ test('waiting too long is a denial, never an approval', async () => {
   const a = pending(gate, { id: 'a' });
   assert.equal(await a.promise, 'timeout');
   assert.equal(gate.pendingApprovals.size, 0);
-  assert.equal(gate.chatWideApproved('u1', 'c1', 'project:p1'), false);
+  assert.equal(gate.chatWideApproved('u1', 'c1', 'project:p1', permissionBinding('u1', 'c1', 'project:p1')), false);
 });
 
 for (const action of ['approve','deny','approve_all']) test(`records original ${action} before granting`,async()=>{
@@ -94,7 +96,7 @@ test('a check or a grant without a scope never auto-approves (#917)', async () =
   const scoped = pending(gate, { id: 'a' });
   gate.pendingApprovals.get('a').decide('approve_all');
   assert.equal(await scoped.promise, 'approve');
-  assert.equal(gate.chatWideApproved('u1', 'c1', 'project:p1'), true);
+  assert.equal(gate.chatWideApproved('u1', 'c1', 'project:p1', permissionBinding('u1', 'c1', 'project:p1')), true);
   for (const missing of [undefined, null, '', 42]) assert.equal(gate.chatWideApproved('u1', 'c1', missing), false, `scope ${String(missing)} asks`);
   const unscoped = pending(gate, { id: 'b', chatId: 'c2', scope: null });
   assert.equal(gate.pendingApprovals.get('b').decide('approve_all'), true);

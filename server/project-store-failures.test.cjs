@@ -86,33 +86,44 @@ function harness({ projects = [], free = [], rag = {} } = {}) {
 const history = (h, id) => path.join(h.dir, `history-${id}.json`);
 const tombstones = (h) => { try { return JSON.parse(fs.readFileSync(path.join(h.dir, 'deleted-chats.json'), 'utf8')); } catch { return []; } };
 
-test('#1914: store busy -> DELETE a project chat answers 503, keeps its transcript and takes the tombstone back', async () => {
-  const h = harness({ projects: [{ id: 'p1', name: 'P', chats: [{ id: 'c1', title: 'T' }], instructionSkills: {} }] });
+// #1071 slice 6: a chat's delete is the Rust store's one operation (its own tests cover the list
+// save failing after the tombstone, which takes it back). Node's own deletes (the retention sweep)
+// call it and keep its error; Node's routes no longer answer the delete.
+const asUser = (h, fn) => h.scope.run({ workspace: h.wsStore.get(USER) }, fn);
+
+test('#1914/#1071: a busy store rejects Node\'s chat delete with PROJECTS_BUSY and Node changes nothing', async () => {
+  const h = harness({ projects: [{ id: 'p1', name: 'P', chats: [{ id: 'c1', title: 'T' }], instructionSkills: {} }], free: [{ id: 'f1', title: 'F', updatedAt: 1 }] });
   fs.writeFileSync(history(h, 'c1'), '[{"role":"user","content":"synthetic"}]');
-  h.state.fail = () => true;
-  const r = await h.call('DELETE', '/api/projects/p1/chats/c1');
-  assert.equal(r.status, 503);
-  assert.equal(r.body.code, 'PROJECTS_BUSY');
-  assert.ok(fs.existsSync(history(h, 'c1')), 'the transcript is still there');
-  assert.ok(!tombstones(h).includes('c1'), 'the tombstone was taken back');
-  assert.deepEqual(h.wsStore.get(USER).projects[0].chats.map((c) => c.id), ['c1'], 'a fresh read shows the chat');
-  // The control: with the store answering, the delete removes the transcript.
-  h.state.fail = () => false;
-  const ok = await h.call('DELETE', '/api/projects/p1/chats/c1');
-  assert.equal(ok.status, 200);
-  assert.ok(!fs.existsSync(history(h, 'c1')));
-  assert.ok(tombstones(h).includes('c1'));
+  fs.writeFileSync(history(h, 'f1'), '[]');
+  const real = h.stub.chatDelete;
+  h.stub.chatDelete = async () => { throw psc.busy(); };
+  await assert.rejects(asUser(h, () => h.store.deleteChat('p1', 'c1')), (e) => e.code === 'PROJECTS_BUSY' && e.status === 503);
+  await assert.rejects(asUser(h, () => h.store.deleteFreeChat('f1')), (e) => e.code === 'PROJECTS_BUSY');
+  assert.ok(fs.existsSync(history(h, 'c1')) && fs.existsSync(history(h, 'f1')), 'the transcripts are still there');
+  assert.deepEqual(tombstones(h), []);
+  assert.deepEqual(h.wsStore.get(USER).projects[0].chats.map((c) => c.id), ['c1']);
+  assert.deepEqual(h.wsStore.get(USER).freeChats.map((c) => c.id), ['f1']);
+  // The control: with the store answering, the store removes it all and Node's view follows.
+  h.stub.chatDelete = real;
+  const writesBefore = [...h.stub.writes];
+  assert.equal(await asUser(h, () => h.store.deleteChat('p1', 'c1')), true);
+  assert.equal(await asUser(h, () => h.store.deleteFreeChat('f1')), true);
+  assert.ok(!fs.existsSync(history(h, 'c1')) && !fs.existsSync(history(h, 'f1')));
+  assert.deepEqual(tombstones(h), ['c1', 'f1']);
+  assert.deepEqual(h.wsStore.get(USER).projects[0].chats, []);
+  assert.deepEqual(h.wsStore.get(USER).freeChats, []);
+  assert.deepEqual(h.stub.writes, writesBefore, 'Node wrote neither list itself: the store did');
 });
 
-test('#1914: store busy -> DELETE a free chat answers 503 and keeps its transcript', async () => {
-  const h = harness({ free: [{ id: 'f1', title: 'F', updatedAt: 1 }] });
-  fs.writeFileSync(history(h, 'f1'), '[]');
-  h.state.fail = (file) => file === 'free-chats.json';
-  const r = await h.call('DELETE', '/api/freechats/f1');
-  assert.equal(r.status, 503);
-  assert.ok(fs.existsSync(history(h, 'f1')));
-  assert.ok(!tombstones(h).includes('f1'));
-  assert.deepEqual(h.wsStore.get(USER).freeChats.map((c) => c.id), ['f1']);
+test('#1071 slice 6: Node\'s routes no longer answer a chat\'s delete', async () => {
+  const h = harness({ projects: [{ id: 'p1', name: 'P', chats: [{ id: 'c1', title: 'T' }], instructionSkills: {} }], free: [{ id: 'f1', title: 'F', updatedAt: 1 }] });
+  fs.writeFileSync(history(h, 'c1'), '[]');
+  for (const p of ['/api/projects/p1/chats/c1', '/api/freechats/f1']) {
+    const r = await h.call('DELETE', p);
+    assert.equal(r.status, 500, `${p}: not handled by these mounts (index.cjs refuses it first, 503)`);
+  }
+  assert.ok(fs.existsSync(history(h, 'c1')));
+  assert.deepEqual(tombstones(h), []);
 });
 
 test('#1914: store busy -> DELETE a project answers 503 and keeps its RAG index and chats', async () => {
@@ -208,18 +219,6 @@ test('#1917: a chat turn\'s generated title is applied again to the view read af
   await new Promise((r) => setTimeout(r, 50));
   await h.wsStore.get(USER).pendingStoreWrites();
   assert.equal(JSON.parse(fs.readFileSync(path.join(h.dir, 'free-chats.json'), 'utf8'))[0].forceLocal, true);
-});
-
-test('#1919: a failed save on the flock path keeps the tombstone it wrote, as before the store', () => {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'flock-busy-'));
-  const dir = path.join(root, 'users', USER);
-  fs.mkdirSync(dir, { recursive: true });
-  const ws = { dir, userId: USER, projects: [{ id: 'p1', chats: [{ id: 'c1' }] }], freeChats: [], historyPath: (id) => path.join(dir, `history-${id}.json`),
-    saveProjects() { throw psc.busy(); }, saveFreeChats() {} };
-  const store = createProjectStore({ fs, path, currentWorkspace: () => ws, PROJECTS: ws.projects, FREE_CHATS: ws.freeChats, sanitizeToolboxes: () => null, defaultToolboxes: () => ['core'],
-    reasoningEffort: {}, projectAppearance: () => ({}), rag: {}, storageClient: {}, documentSources: {}, authService: {}, PROJECT_ROOT_FOLDER: 'P', createProjectFolder: async () => null, projectSweep: { afterDelete: async () => [] } });
-  assert.throws(() => store.deleteChat('p1', 'c1'), (e) => e.code === 'PROJECTS_BUSY');
-  assert.ok(require('./chat-lists.cjs').readTombstones(dir).has('c1'), 'unchanged from the flock path');
 });
 
 test('#1919: a deferred index removal spares a source of the same name uploaded again meanwhile', async () => {

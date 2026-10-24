@@ -46,7 +46,7 @@ async function run(t, { replies = [],second = 'text', toolThrows = false, stepSu
     rag: { filesContext: async () => null }, prefill: { recordSample() {} }, reduceToolResult: (text) => ({ text: passThrough ? String(text) : 'reduced' }), diaryExtras: require('./diary-extras.cjs'),
     DIARY_BASE: 'http://fixture.invalid', TOOL_RESULT_CAP: 8000, json: () => {}, saveChats() {}, endpointApproved: () => true, diaryHeaders: () => ({}),
     lastLoadedModel: () => null, classifyFastOrSmart: async () => 'fast', servedCatalogue: async () => [], modelsInstalled: async () => [], missingRoles: () => [], staleRolesError: () => null,
-    allToolboxes: () => [], chatWideApproved: () => false, recordUsage() {}, recordToolUse() {},
+    allToolboxes: () => [], grantContext: async raw => require('../tests/server/chat-grant-fixture.cjs').context(raw, { holder: { kind: 'absent' } }), chatWideApproved: () => false, recordUsage() {}, recordToolUse() {},
     executeToolCall: async () => { executions++; if (toolThrows) throw Error('connection lost after write'); return toolResult; },
     awaitApproval: async (args) => { decisions.push(Object.keys(args).sort()); return decision === 'approve_all' ? 'approve' : decision; },
     stepSupervision,

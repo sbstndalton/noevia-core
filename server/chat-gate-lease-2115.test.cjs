@@ -54,7 +54,7 @@ async function turn(t, { gate = fakeGate(), toolRound = false, history = [], com
     rag: { filesContext: async () => null }, prefill: { recordSample() {} }, reduceToolResult: (text) => ({ text: String(text) }), diaryExtras: require('./diary-extras.cjs'),
     DIARY_BASE: 'http://fixture.invalid', TOOL_RESULT_CAP: 8000, json: () => {}, saveChats() {}, endpointApproved: () => true, diaryHeaders: () => ({}),
     lastLoadedModel: () => null, classifyFastOrSmart: async () => 'fast', servedCatalogue: async () => [], modelsInstalled: async () => [], missingRoles: () => [], staleRolesError: () => null,
-    allToolboxes: () => [], chatWideApproved: () => false, recordUsage() {}, recordToolUse() {},
+    allToolboxes: () => [], grantContext: async raw => require('../tests/server/chat-grant-fixture.cjs').context(raw, { holder: { kind: 'absent' } }), chatWideApproved: () => false, recordUsage() {}, recordToolUse() {},
     executeToolCall: async () => 'synthetic result', awaitApproval: async () => 'approve', stepSupervision: null,
     ...(titles ? { chatTitles: { save: () => true } } : {}),
   });

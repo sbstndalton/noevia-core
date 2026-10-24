@@ -111,7 +111,7 @@ async function turn(t, { chatMachines = null, route = 'fast', roles = ROLES, row
     DIARY_BASE: 'http://fixture.invalid', TOOL_RESULT_CAP: 8000, json: (_res, status, body) => { replied = { status, body }; }, saveChats() {}, endpointApproved: () => true, diaryHeaders: () => ({}),
     lastLoadedModel: () => null, classifyFastOrSmart: async () => route, servedCatalogue: async () => rows, modelsInstalled: async () => rows,
     missingRoles: require('./auto-roles-check.cjs').missingRoles, staleRolesError: require('./auto-roles-check.cjs').staleRolesError,
-    allToolboxes: () => [{ id: 'core', tools: toolDefs }], chatWideApproved: () => false, recordUsage() {}, recordToolUse() {},
+    allToolboxes: () => [{ id: 'core', tools: toolDefs }], grantContext: async raw => require('../tests/server/chat-grant-fixture.cjs').context(raw, { holder: { kind: 'absent' } }), chatWideApproved: () => false, recordUsage() {}, recordToolUse() {},
     executeToolCall: async (...args) => { executed.push(args); return 'synthetic result'; }, awaitApproval: async () => 'approve',
   });
   await handleChat({}, res, { projectId: 'fixture-project', chatId: 'fixture-chat', message });

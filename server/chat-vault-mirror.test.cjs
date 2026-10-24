@@ -394,9 +394,11 @@ test('#758 a taken: entry is pruned once the foreign note is gone', async () => 
   assert.equal(state.index.notes.a.path, 'Chats/Inbox/A (2).md', 'the chat keeps its note name');
 });
 
-test('mirrorTrigger: only writes to chats, transcripts, moves, projects and imports', () => {
-  assert.deepEqual(mirrorTrigger('POST', '/api/chats/c%201/history'), { chatId: 'c 1' });
-  assert.deepEqual(mirrorTrigger('POST', '/api/chats/c1/move'), { chatId: 'c1' });
+test('mirrorTrigger: only writes to chats, moves, projects and imports', () => {
+  // The transcript save is the Rust front's (#1071 slice 5); the change journal schedules it.
+  assert.equal(mirrorTrigger('POST', '/api/chats/c%201/history'), null);
+  assert.equal(mirrorTrigger('POST', '/api/chats/c%201/move'), null);
+  assert.equal(mirrorTrigger('POST', '/api/chats/c1/move'), null);
   assert.deepEqual(mirrorTrigger('POST', '/api/freechats'), { chatId: null });
   assert.deepEqual(mirrorTrigger('DELETE', '/api/freechats/c1'), { chatId: null });
   assert.deepEqual(mirrorTrigger('POST', '/api/projects/p/chats'), { chatId: null });
@@ -436,4 +438,19 @@ test('route: signed-in only, own setting, turning on starts a sync at once', asy
   assert.equal((await call('POST', {})).status, 405);
   await call('PUT', { enabled: true }, { user: { id: 'u2' } });
   assert.equal(scheduled.length, 1, 'no sync where the mirror is not available');
+});
+
+test('#2167 repeated remove-triggered mirror passes preserve survivors and trash once', async () => {
+  const { mirror, vault, state } = setup({ freeChats: [chat('qa-keep', 'Keep'), chat('qa-gone', 'Gone')] });
+  await mirror.sync('u1', new Set());
+  state.freeChats = [chat('qa-keep', 'Keep')];
+  state.deleted = new Set(['qa-gone']);
+  await mirror.sync('u1', new Set(['qa-gone']));
+  const writes = vault.writes().length;
+  const survivor = vault.files.get('Chats/Inbox/Keep.md');
+  await mirror.sync('u1', new Set(['qa-gone']));
+  assert.equal(vault.trash.length, 1);
+  assert.equal(vault.writes().length, writes);
+  assert.equal(vault.files.get('Chats/Inbox/Keep.md'), survivor);
+  assert.equal(state.index.notes['qa-gone'], undefined);
 });

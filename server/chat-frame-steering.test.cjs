@@ -119,7 +119,7 @@ async function run(t, { flag, chats, freeChats = [], body = {}, gateCalls }) {
     rag: { filesContext: async () => null }, prefill: { recordSample() {} }, reduceToolResult: (r) => ({ text: String(r) }), diaryExtras: require('./diary-extras.cjs'),
     DIARY_BASE: 'http://fixture.invalid', TOOL_RESULT_CAP: 8000, json: () => {}, saveChats() {}, endpointApproved: () => true, diaryHeaders: () => ({}),
     lastLoadedModel: () => null, classifyFastOrSmart: async () => 'fast', servedCatalogue: async () => [], modelsInstalled: async () => [], missingRoles: () => [], staleRolesError: () => null,
-    allToolboxes: () => [{ id: 'web', tools: [tool] }], chatWideApproved: () => false, awaitApproval: async () => 'deny', recordUsage() {}, recordToolUse() {},
+    allToolboxes: () => [{ id: 'web', tools: [tool] }], grantContext: async raw => require('../tests/server/chat-grant-fixture.cjs').context(raw, { holder: { kind: 'absent' } }), chatWideApproved: () => false, awaitApproval: async () => 'deny', recordUsage() {}, recordToolUse() {},
     executeToolCall: async () => 'SYNTHETIC', toolGate: { evaluate: async (...args) => { gateCalls?.push(args); return { decision: 'none', source: 'none' }; }, record() {} },
     ...(flag === undefined ? {} : { chatFramingEnabled: () => flag, freeChats: () => freeChats }),
   });

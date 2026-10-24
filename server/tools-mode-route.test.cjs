@@ -62,7 +62,7 @@ async function run(t, { project, incapable = [], verdict = null, message = 'Synt
     resolveTools: (_project, m) => { resolvedFor.push(m); return { tools: [SYNTHETIC_TOOL], dropped: [], routes: [] }; }, isWriteTool: () => false, allToolboxes: () => [],
     rag: { filesContext: async () => null }, prefill: { recordSample() {} }, reduceToolResult: () => ({ text: 'reduced' }), diaryExtras: require('./diary-extras.cjs'),
     DIARY_BASE: 'http://fixture.invalid', TOOL_RESULT_CAP: 8000, json: () => {}, saveChats() {}, endpointApproved: () => true, diaryHeaders: () => ({}),
-    chatWideApproved: () => false, recordUsage() {}, recordToolUse() {}, executeToolCall: async () => 'unused', awaitApproval: async () => 'decline',
+    grantContext: async raw => require('../tests/server/chat-grant-fixture.cjs').context(raw, { holder: { kind: 'absent' } }), chatWideApproved: () => false, recordUsage() {}, recordToolUse() {}, executeToolCall: async () => 'unused', awaitApproval: async () => 'decline',
   });
   await handleChat({}, res, { projectId: 'fixture-project', chatId: 'fixture-chat', message });
   return {

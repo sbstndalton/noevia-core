@@ -4,6 +4,8 @@ const { frameUntrusted } = require('./prompt-framing.cjs');
 // so a quote, a newline or a Unicode line break or bidi control in it cannot start a line of its own in the system text.
 const { quoteName, quotedNames } = require('./quoted-name.cjs');
 const provenance = require('./provenance-policy.cjs');
+const grantContexts = require('./chat-grant-context.cjs');
+const CHAT_MOVE_ENFORCEMENT_MARKER = 'noevia-chat-move-enforcement/1';
 const { isChatGenerationModel } = require('./chat-model-kind.cjs');
 const { isInAppBox } = require('./toolbox-flags.cjs');
 const editTargets = require('./project-edit-target.cjs');
@@ -256,7 +258,7 @@ async function* withIdleLimit(iterable, ms, onIdle = null) {
 }
 
 function createChatHandler({
-  stepSupervision = null, chatMachines = null, fs, path, crypto, fetch, codeTasksFor = () => [], heuristicWantsCode = require('./auto-router.cjs').createAutoRouter({}).heuristicWantsCode, reasoningEffort, diaryExtras, createToolExchange, rag, prefill, reduceToolResult, HISTORY_CAP, DEFAULT_PROVIDER_ID, DIARY_BASE, TOOL_RESULT_CAP, authService, toolPolicy, modelManager, requestScope, currentWorkspace, json, getProject, getProvider, providerHeaders, saveChats, endpointApproved, diaryHeaders, diaryStorageRetry = (send) => send(true), autoRoles, lastLoadedModel, classifyFastOrSmart, servedCatalogue, modelsInstalled, missingRoles, staleRolesError, visionProbe, visionDescriptions, skillsIndexFor, chatSkillRouter, chatToolRouter, toolGate = null, chatFramingEnabled = () => false, freeChats = () => [], framingReasoner = null, reasoningTraces = null, brainContext = null, DEFAULT_TOOLBOXES, CONNECTOR_BOXES, connectedBoxes, allToolboxes, resolveTools, isWriteTool, executeToolCall, oauthServerIds, accountReady, chatWideApproved, awaitApproval, recordUsage, recordToolUse, chatListHolder = () => undefined,
+  stepSupervision = null, chatMachines = null, fs, path, crypto, fetch, codeTasksFor = () => [], heuristicWantsCode = require('./auto-router.cjs').createAutoRouter({}).heuristicWantsCode, reasoningEffort, diaryExtras, createToolExchange, rag, prefill, reduceToolResult, HISTORY_CAP, DEFAULT_PROVIDER_ID, DIARY_BASE, TOOL_RESULT_CAP, authService, toolPolicy, modelManager, requestScope, currentWorkspace, json, getProject, getProvider, providerHeaders, saveChats, endpointApproved, diaryHeaders, diaryStorageRetry = (send) => send(true), autoRoles, lastLoadedModel, classifyFastOrSmart, servedCatalogue, modelsInstalled, missingRoles, staleRolesError, visionProbe, visionDescriptions, skillsIndexFor, chatSkillRouter, chatToolRouter, toolGate = null, chatFramingEnabled = () => false, freeChats = () => [], framingReasoner = null, reasoningTraces = null, brainContext = null, DEFAULT_TOOLBOXES, CONNECTOR_BOXES, connectedBoxes, allToolboxes, resolveTools, isWriteTool, executeToolCall, oauthServerIds, accountReady, chatWideApproved, awaitApproval, recordUsage, recordToolUse, chatListHolder = () => undefined, revokeChatGrant = () => {}, grantContext = (chat) => currentWorkspace().chatPermissions.context(chat),
   // #1550: per request, whether a box Automatic may add is usable by this account (its Nextcloud connection, for one).
   automaticToolsReady = () => () => true,
   chatgptOAuth = null, chatgptEnabled = () => false, skillHistory = null,
@@ -337,18 +339,27 @@ function createChatHandler({
       preparation?.finish();
       // #679: the client went away mid-reply (reload, closed tab). Keep the reply as stopped, with
       // any write that ran, after the user message the client saved as the turn started.
+      let keep;
       if (execution.record && execution.aborted?.()) {
+        const entry = execution.record.partialEntry() || execution.record.assistantEntry();
         try {
-          const outcome = require('./chat-interrupted-turn.cjs').saveInterruptedTurn({ fs, workspace: execution.workspace, chatId: body.chatId,
-            message: body.message, entry: execution.record.partialEntry() || execution.record.assistantEntry(), cap: STORED_HISTORY_CAP });
+          const outcome = await require('./chat-interrupted-turn.cjs').saveInterruptedTurn({ workspace: execution.workspace, chatId: body.chatId,
+            message: body.message, entry });
           if (outcome !== 'saved' && outcome !== 'not-last') console.log(`[chat] interrupted reply not kept: ${outcome}`);
-        } catch (error) { console.warn('[chat] could not keep an interrupted reply:', error?.message || error); }
+          if (outcome === 'no-user-message') keep = entry;
+        } catch (error) {
+          console.warn('[chat] could not keep an interrupted reply:', error?.message || error);
+          keep = entry;
+        }
       }
       // #1507: the reply has ended (completed, failed, or kept above), so its saved partial is cleared.
-      execution.partials?.finish();
+      // A reply the transcript did not take keeps its partial (unmarked) as the only copy.
+      execution.partials?.finish(keep ? { keep } : undefined);
       // A chat deleted while this reply ran leaves no context state (summaries hold conversation text).
       const id=typeof body?.chatId==='string'?require('./chat-lists.cjs').safeChatId(body.chatId):null;
-      try{const dir=currentWorkspace().dir;if(id&&require('./chat-lists.cjs').readTombstones(dir).has(id))require('./chat-context.cjs').remove(dir,id);}catch{/* best effort */}
+      // #1071 slice 6: through the store's delete (a chat in no list, already tombstoned), which removes
+      // the meter, transcript, brain note and partial under the transcript lock; Node removes none itself.
+      try{const ws=currentWorkspace();if(id&&require('./chat-lists.cjs').readTombstones(ws.dir).has(id))Promise.resolve(ws.transcripts.deleteChat(id,{kind:'unlisted',origin:'turn'})).catch(()=>{});}catch{/* best effort */}
     }
   }
 
@@ -538,12 +549,14 @@ function createChatHandler({
     // neither honoured nor created, and "Allow for this chat" approves just that call. Read at gate
     // time, so a move during the turn is seen. Chats no list holds yet (a first turn) are unaffected.
     const writeGrantScope = project ? `${body.projectId ? 'project' : 'context'}:${project.id}` : `space:${typeof spaceId === 'string' && spaceId ? spaceId : 'free'}`;
-    const writeGrantChat = () => {
-      if (!chatId) return null;
-      const expected = project && body.projectId ? project.id : !body.projectId ? 'free' : undefined;
-      let holder;
-      try { holder = chatListHolder(chatId); } catch { return null; }
-      return typeof holder === 'string' && expected !== undefined && holder !== expected ? null : chatId;
+    const expectedGrantHolder = body.projectId ? { kind: 'project', id: project.id } : { kind: 'free' };
+    const permissionContext = async () => {
+      if (!chatId) return null; // No reusable identity for id-less requests.
+      const value = grantContexts.validate(chatId, await grantContext(chatId));
+      if (value.tombstoned || (value.holder.kind !== 'absent' && !grantContexts.sameHolder(value.holder, expectedGrantHolder))) throw grantContexts.invalid();
+      const user = requestScope.getStore()?.workspace?.userId;
+      if (!user || currentWorkspace().userId !== user) throw grantContexts.invalid();
+      return grantContexts.binding(user, chatId, writeGrantScope, value);
     };
     // Recorded once the chat id is known, so the ledger knows which chat loaded it (#546).
     if (pinnedSkill) rememberSkill(pinnedSkill.record.file, pinnedSkill.record.contentHash, pinnedSkill.record.name, pinnedSkill.content);
@@ -2338,8 +2351,23 @@ function createChatHandler({
               if (!Array.isArray(provenanceHits)) provenanceHits = unchecked;
             }
             if (provenanceHits.length) authService.audit('tool.provenance', userId, userId, { tool: tc.name, fields: provenanceHits.map((h) => h.field), unchecked: provenanceHits.some((h) => h.unchecked) || undefined });
-            const grantChat = writeGrantChat();
-            const askedPerCall = permission === 'ask' && (!chatWideApproved(userId, grantChat, writeGrantScope) || provenanceHits.length > 0 || automaticOnlyWrites.has(tc.name));
+            let permissionBinding = null, usedGrant = false;
+            const grantChat = chatId || null;
+            // The scope/user/tool/target seen by the person is immutable across all awaits below.
+            const approvalTarget = () => JSON.stringify([userId, chatId, writeGrantScope, tc.name, tc.args, cardTarget, targetKind, editTarget, editAccount, toolRoutes.get(tc.name) || null]);
+            const shownTarget = approvalTarget();
+            if (permission === 'ask') {
+              try {
+                const pending = currentWorkspace().pendingStoreWrites?.();
+                if (pending) await pending;
+                if (currentWorkspace().storeFailed?.()) throw currentWorkspace().storeFailed();
+                permissionBinding = await permissionContext();
+              } catch {
+                return 'ERROR: the chat permission context could not be verified; the tool was not run. Nothing was changed. Ask again.';
+              }
+              usedGrant = chatWideApproved(userId, grantChat, writeGrantScope, permissionBinding);
+            }
+            const askedPerCall = permission === 'ask' && (!usedGrant || provenanceHits.length > 0 || automaticOnlyWrites.has(tc.name));
             if (askedPerCall) {
               const approvalId = `ap-${crypto.randomUUID()}`;
               // #658: the same tool, target and arguments as a write that already succeeded in this
@@ -2358,7 +2386,7 @@ function createChatHandler({
                 ...(repeat ? { repeatOf: true } : {}),
                 ...(provenanceHits.length ? { provenance: provenanceHits } : {}),
               });
-              const decision = await awaitApproval({ id: approvalId, userId, chatId: grantChat, scope: writeGrantScope, abortSignal: chatSignal.signal });
+              const decision = await awaitApproval({ id: approvalId, userId, chatId: grantChat, scope: writeGrantScope, binding: permissionBinding, abortSignal: chatSignal.signal });
               if (decision !== 'approve') {
                 // A refusal is a normal conversational turn: the model is told
                 // plainly so it can offer an alternative, rather than the stream
@@ -2399,6 +2427,39 @@ function createChatHandler({
                 return `ERROR: the project's files changed after approval, so ${JSON.stringify(editTarget)} ${again.error ? 'can no longer be edited' : `is no longer the file this name refers to (it now means ${JSON.stringify(again.path)})`}. ${tc.name} was not run and nothing was changed. Ask again if the edit is still wanted.`;
               }
             }
+            // Finish asynchronous target re-resolution BEFORE the final authoritative read.
+            if (writeTargetFor && isWriteTool(tc.name) && editTarget === null) {
+              let targetNow;
+              try { targetNow = await writeTargetFor(tc.name, tc.args, { user: chatUser, chatKey }); } catch { targetNow = { error: true }; }
+              const target = typeof targetNow?.target === 'string' && targetNow.target ? targetNow.target : null;
+              const kind = typeof targetNow?.kind === 'string' ? targetNow.kind : null;
+              if (targetNow?.error || target !== cardTarget || kind !== (targetKind || null)) {
+                revokeChatGrant(userId, grantChat);
+                return 'ERROR: the write target changed after approval; the tool was not run. Ask again.';
+              }
+            }
+            if (permission === 'ask') {
+              try {
+                const finalBinding = await permissionContext(); // LAST await before dispatch.
+                if ((chatId && !grantContexts.matches(permissionBinding, finalBinding)) ||
+                    (usedGrant && !askedPerCall && !chatWideApproved(userId, grantChat, writeGrantScope, finalBinding)) ||
+                    approvalTarget() !== shownTarget || currentWorkspace().userId !== userId || currentWorkspace().revoked) throw grantContexts.invalid();
+              } catch {
+                // Even Allow once refuses a move-away-and-back, restart, deletion or failed read.
+                revokeChatGrant(userId, grantChat);
+                return 'ERROR: the chat or permission target changed after approval; the tool was not run. Nothing was changed. Ask again.';
+              }
+            }
+            // Synchronous targets may change during the final store await too.
+            if (editTarget !== null) {
+              const nowTarget = editTargets.resolveEditTarget(project ? getProject(project.id) : null, tc.args, { storageAccount: editStorageAccount(userId) });
+              if (nowTarget.path !== editTarget || (nowTarget.account || null) !== editAccount) {
+                revokeChatGrant(userId, grantChat);
+                return 'ERROR: the project target changed before dispatch; tool was not run. Ask again.';
+              }
+            }
+            if (chatSignal.signal.aborted) return 'ERROR: exchange cancelled; tool was not run.';
+            if (toolPolicy.mode(userId, tc.name, isWriteTool(tc.name)) === 'block' || (permission !== 'ask' && toolPolicy.mode(userId, tc.name, isWriteTool(tc.name)) === 'ask') || revokedSkills()) return 'ERROR: permission changed before dispatch; tool was not run.';
             markWriteAttempt();
             // Set before the call, so a write that throws still counts as a round that wrote (#1456).
             if (isWriteTool(tc.name)) roundWrote = true;
@@ -2561,4 +2622,4 @@ function createChatHandler({
   return { handleChat, handleChatInner };
 }
 
-module.exports = { createChatHandler, normalizeReplayHistory, withIdleLimit, CODE_ROUTE_NOTE, FAILED_REPLY_TOOLS_NOTE };
+module.exports = { CHAT_MOVE_ENFORCEMENT_MARKER, createChatHandler, normalizeReplayHistory, withIdleLimit, CODE_ROUTE_NOTE, FAILED_REPLY_TOOLS_NOTE };

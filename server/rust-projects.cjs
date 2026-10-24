@@ -4,7 +4,9 @@
 // project routes slice by slice. The first slice is a project's image assets
 // (POST /api/projects/{id}/assets, GET and DELETE /api/projects/{id}/assets/{assetId}); the second
 // its chat list (GET and POST /api/projects/{id}/chats); the third the free-chat list (GET and POST
-// /api/freechats; DELETE /api/freechats/{id} stays Node's, see "free-chats.json" below).
+// /api/freechats). A chat's delete (DELETE /api/freechats/{id}, DELETE /api/projects/{id}/chats/{c})
+// is the front's too since #1071 slice 6: one store operation (chat_delete) that Node's own
+// remaining deletes (the retention sweep, a project's purge) call as well.
 //
 // Permanent since sbstndalton/noevia#1071: the switch NOEVIA_RUST_PROJECTS and the supervisor's
 // confirmations of each slice (NOEVIA_RUST_PROJECTS_CONFIRMED, NOEVIA_RUST_PROJECT_CHATS_CONFIRMED,
@@ -15,7 +17,7 @@
 // requires at startup. A leftover NOEVIA_RUST_PROJECTS only earns a warning (warnRetired). The web
 // supervisor refuses to start without a front that serves every slice.
 //
-// Node's other routes (the chat turn, a chat's move or delete, the config route) still change
+// Node's other routes (the chat turn, a chat's move, the config route) still change
 // projects.json, but never from a stale copy and never by writing the file themselves:
 //
 //   - Rust is the only process that writes either file (sbstndalton/noevia#1264): Node saves
@@ -39,17 +41,18 @@
 //     back.
 //
 // free-chats.json (the free-chat slice) has the same problem and the same answer: Node's chat turn
-// (the routing flags), a chat's move, a free chat's delete, the retention sweep and an import still
-// write it. Rust writes it under its lock and re-reads it for every save. Node keeps its cached list,
+// (the routing flags), a chat's move and an import still write it (a chat's delete is the store's
+// own operation, #1071 slice 6). Rust writes it under its lock and re-reads it for every save. Node keeps its cached list,
 // re-reads it at each request start when its (ino, size, mtime) changed, and saves through the store:
 // when the file still holds what this process last read or wrote, its list as it is; otherwise
 // the chat metas are merged per item against that base (mergeIdList: additions from both sides,
 // removals since the base from either side, a meta both changed merged per field, #1801), newest first
 // as mergeChats orders them, at most LIST_CAP. A file that is not a JSON array on either side is
 // not merged: the other side's value is taken (refresh) or replaced (save), as before.
-// DELETE /api/freechats/{id} stays Node's: it also removes the chat's transcript, context meter,
-// brain note and attachments project (a whole project delete, with its RAG index and storage
-// sweep), which the front does not do yet.
+// A chat's delete is the store's operation (#1071 slice 6): it also removes the chat's transcript,
+// context meter, brain note and partial reply under the transcript lock. The attachments project
+// (a whole project delete, with its RAG index and storage sweep) stays Node's: the orphan reaper
+// (projects.cjs removeOrphanChatContexts) frees it once the chat is tombstoned and in no list.
 //
 // Chat attachments context (GET/POST /api/chats/{chatId}/context) is also permanently
 // Rust-owned after its verified live rollout (#1264, #1071). Node's copies and both
@@ -57,6 +60,7 @@
 // above still run here through the Rust store; they are not part of this removal.
 
 const fs = require('fs');
+const CHAT_MOVE_PUBLIC_OWNER = 'rust';
 
 
 /** The project routes the Rust front always answers and Node always refuses (refuseOwnedRoute):
@@ -64,6 +68,7 @@ const fs = require('fs');
  *  #1071) is the other half; noevia's deploy/tools/assemble-release.sh refuses a release whose
  *  front owns a project route missing here. */
 const OWNED_ROUTES = Object.freeze(new Set([
+  'POST /api/chats/{chatId}/move',
   'POST /api/projects/{id}/assets',
   'GET /api/projects/{id}/assets/{assetId}',
   'DELETE /api/projects/{id}/assets/{assetId}',
@@ -73,15 +78,26 @@ const OWNED_ROUTES = Object.freeze(new Set([
   'POST /api/freechats',
   'GET /api/chats/{chatId}/context',
   'POST /api/chats/{chatId}/context',
+  'GET /api/chats/{chatId}/context-window',
+  'GET /api/chats/{chatId}/history',
+  'POST /api/chats/{chatId}/history',
+  // sbstndalton/noevia#1071 slice 6: a chat's delete, one store operation (chat_delete).
+  'DELETE /api/freechats/{chatId}',
+  'DELETE /api/projects/{id}/chats/{chatId}',
 ]));
 
 // OWNED_ROUTES as Node's own handlers matched them (one path segment per parameter).
 const OWNED_ROUTE_PATTERNS = Object.freeze([
+  [/^\/api\/chats\/[^/]+\/move$/, ['POST']],
   [/^\/api\/projects\/[^/]+\/assets$/, ['POST']],
   [/^\/api\/projects\/[^/]+\/assets\/[^/]+$/, ['GET', 'DELETE']],
   [/^\/api\/projects\/[^/]+\/chats$/, ['GET', 'POST']],
   [/^\/api\/freechats$/, ['GET', 'POST']],
   [/^\/api\/chats\/[^/]+\/context$/, ['GET', 'POST']],
+  [/^\/api\/chats\/[^/]+\/context-window$/, ['GET']],
+  [/^\/api\/chats\/[^/]+\/history$/, ['GET', 'POST']],
+  [/^\/api\/freechats\/[^/]+$/, ['DELETE']],
+  [/^\/api\/projects\/[^/]+\/chats\/[^/]+$/, ['DELETE']],
 ]);
 
 const ROUTE_REFUSAL = Object.freeze({ error: 'This route is served by the Rust front.', code: 'RUST_PROJECTS_OWNED' });
@@ -504,6 +520,7 @@ function createFreeChatsFile(file, { warn = console.warn, remote } = {}) {
 }
 
 module.exports = {
+  CHAT_MOVE_PUBLIC_OWNER,
   ownedRoute, refuseOwnedRoute, warnRetired, RETIRED_SWITCHES, ROUTE_REFUSAL, merge, mergeFields, mergeIdList, createProjectsFile, readProjectsFile, replaceContents,
   createFreeChatsFile, readFreeChatsFile, mergeFreeChats,
   OWNED_ROUTES, FREE_LIST_CAP,

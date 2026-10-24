@@ -331,3 +331,120 @@ test('the queue: a save that settled is no longer pending for the code awaiting 
   await Promise.all([gate, one]);
   assert.equal(runs, 1);
 });
+
+// sbstndalton/noevia#1071 slice 4: the transcript ops over HTTP (the loopback stand-in of the Rust store,
+// tests/server/project-store-server.cjs, same protocol as noevia-rs src/project_store.rs /v1/history/*).
+test('#1071 slice 4: transcripts are read and written through the store, bound to one account, fail closed', async (t) => {
+  const { startProjectStore } = require('../tests/server/project-store-server.cjs');
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'noevia-history-store-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const OTHER = '99999999-2222-4333-8444-555555555555';
+  for (const u of [USER, OTHER]) fs.mkdirSync(path.join(root, 'users', u), { recursive: true });
+  const store = await startProjectStore(root);
+  t.after(() => store.close());
+  const client = psc.createClient({ port: store.port, token: store.token, timeoutMs: 2000 });
+  const mine = psc.transcriptsFor(client, USER), theirs = psc.transcriptsFor(client, OTHER);
+  const empty = await mine.read('c1');
+  assert.deepEqual(empty, { history: [], revision: sha('[]'), exists: false });
+  const saved = await mine.write('c1', [{ role: 'user', content: 'qa mine' }], { baseRevision: empty.revision });
+  assert.deepEqual(saved, { ok: true, revision: sha(JSON.stringify([{ role: 'user', content: 'qa mine' }])) });
+  const stale = await mine.write('c1', ['qa other'], { baseRevision: empty.revision });
+  assert.equal(stale.conflict, true);
+  assert.deepEqual(stale.history, [{ role: 'user', content: 'qa mine' }]);
+  assert.equal(stale.revision, saved.revision);
+  assert.deepEqual(await theirs.read('c1'), empty, 'another account never sees it');
+  assert.equal(await theirs.appendIfLast('c1', 'qa mine', { role: 'assistant', content: 'x' }), 'no-user-message');
+  assert.equal(await mine.appendIfLast('c1', 'qa mine', { role: 'assistant', content: 'qa kept' }), 'saved');
+  assert.equal((await mine.read('c1')).history.length, 2);
+  assert.equal(await mine.removeIf('c1', ['nope']), false);
+  require('./chat-lists.cjs').addTombstone(path.join(root, 'users', USER), 'c1');
+  assert.deepEqual(await mine.write('c1', []), { deleted: true });
+  assert.equal(await mine.appendIfLast('c1', 'qa mine', { role: 'assistant' }), 'deleted');
+  await assert.rejects(mine.write('c2', { not: 'a list' }), (e) => e.status === 400);
+  // A removed account: 410, and its directory is not made again.
+  const gone = psc.transcriptsFor(client, '22222222-2222-4333-8444-555555555555');
+  await assert.rejects(gone.write('c1', []), (e) => e.status === 410);
+  assert.equal(fs.existsSync(path.join(root, 'users', '22222222-2222-4333-8444-555555555555')), false);
+  // Another start's secret, or none: refused as a store failure, nothing written.
+  const wrong = psc.transcriptsFor(psc.createClient({ port: store.port, token: 'synthetic-previous-start-token-0123456789' }), USER);
+  await assert.rejects(wrong.write('c3', ['qa']), (e) => e.status === 500 && e.code === 'PROJECT_STORE_FAILED');
+  assert.equal(fs.existsSync(path.join(root, 'users', USER, 'history-c3.json')), false);
+  // The store unreachable: busy (503), never a local write.
+  await store.close();
+  await assert.rejects(mine.write('c4', ['qa']), (e) => e.status === 503 && e.code === 'PROJECTS_BUSY');
+  assert.equal(fs.existsSync(path.join(root, 'users', USER, 'history-c4.json')), false);
+});
+
+test('#1071 slice 6: a chat\'s delete is one store call, bound to one account; its answers and failures', async () => {
+  const sent = [];
+  const answers = [];
+  const fetchImpl = async (url, init) => { sent.push({ url, body: JSON.parse(init.body), token: init.headers['x-noevia-store-token'] }); const a = answers.shift(); if (a instanceof Error) throw a; return { status: a.status, json: async () => a.body }; };
+  const client = psc.createClient({ port: 1, token: TOKEN, fetchImpl });
+  const mine = psc.transcriptsFor(client, USER);
+  answers.push({ status: 200, body: { deleted: true, swept: false, leftovers: 0 } });
+  assert.deepEqual(await mine.deleteChat('qa-c1', { kind: 'project', projectId: 'qa-p' }), { deleted: true, swept: false, leftovers: 0 });
+  assert.deepEqual(sent.pop(), { url: 'http://127.0.0.1:1/v1/chat/delete', token: TOKEN, body: { user: USER, chat: 'qa-c1', kind: 'project', origin: 'remove', projectId: 'qa-p' } });
+  answers.push({ status: 200, body: { deleted: false, swept: true, leftovers: 1 } });
+  assert.deepEqual(await mine.deleteChat('qa-c1', { kind: 'free', projectId: 'ignored', origin: 'turn' }), { deleted: false, swept: true, leftovers: 1 });
+  assert.deepEqual(sent.pop().body, { user: USER, chat: 'qa-c1', kind: 'free', origin: 'turn' }, 'no projectId for the free list');
+  answers.push({ status: 409, body: { error: 'a list still holds this chat', code: 'CHAT_LISTED' } });
+  assert.equal((await mine.deleteChat('qa-c1', { kind: 'unlisted', origin: 'bogus' })).listed, true);
+  assert.equal(sent.pop().body.origin, 'other', 'an unknown origin is sent as other');
+  answers.push({ status: 503, body: { error: 'busy', code: 'PROJECTS_BUSY' } });
+  await assert.rejects(mine.deleteChat('qa-c1', { kind: 'free' }), (e) => e.status === 503 && e.code === 'PROJECTS_BUSY');
+  answers.push({ status: 410, body: { error: 'account no longer exists' } });
+  await assert.rejects(mine.deleteChat('qa-c1', { kind: 'free' }), (e) => e.status === 410);
+  answers.push({ status: 400, body: { error: 'invalid chat id' } });
+  await assert.rejects(mine.deleteChat('', { kind: 'free' }), (e) => e.status === 400);
+  answers.push({ status: 500, body: { error: 'Internal error' } });
+  await assert.rejects(mine.deleteChat('qa-c1', { kind: 'free' }), (e) => e.status === 500 && e.code === 'PROJECT_STORE_FAILED');
+  answers.push(new Error('ECONNREFUSED'));
+  await assert.rejects(mine.deleteChat('qa-c1', { kind: 'free' }), (e) => e.code === 'PROJECTS_BUSY');
+  assert.ok(sent.every((s) => s.body.user === USER), 'every call names the bound account only');
+  // The release pairing marker (noevia assemble-release.sh reads the quoted literal, #2161).
+  assert.equal(psc.CHAT_DELETE_CLIENT_MARKER, 'noevia-chat-delete-client/1');
+  assert.ok(fs.readFileSync(path.join(__dirname, 'project-store-client.cjs'), 'utf8').includes(`'${psc.CHAT_DELETE_CLIENT_MARKER}'`));
+});
+
+test('slice7 workspace context/move methods bind the actual account and refuse a revoked view',async t=>{
+ const root=fs.mkdtempSync(path.join(os.tmpdir(),'qa-move-client-'));t.after(()=>fs.rmSync(root,{recursive:true,force:true}));
+ const calls=[],stub=require('../tests/server/project-store-stub.cjs').createStubStore(root);
+ stub.grantContext=async(user,chat)=>{calls.push({op:'context',user,chat});return require('../tests/server/chat-grant-fixture.cjs').context(chat);};
+ stub.chatMove=async(user,chat,projectId,patch)=>{calls.push({op:'move',user,chat,projectId,patch});return{status:200,from:null};};
+ const store=createWorkspaceStore(root,{id:'default'},null,{projectStore:stub});
+ const other='99999999-2222-4333-8444-555555555555',mine=store.get(USER),theirs=store.get(other);
+ await mine.chatPermissions.context('qa c!');await theirs.chatPermissions.move('qa c!',null,{frame:null,user:USER});
+ assert.deepEqual(calls,[{op:'context',user:USER,chat:'qa c!'},{op:'move',user:other,chat:'qa c!',projectId:null,patch:{frame:null,user:USER}}]);
+ mine.revoked=true;assert.throws(()=>mine.chatPermissions.context('qa'),e=>e.status===410);assert.throws(()=>mine.chatPermissions.move('qa',null),e=>e.status===410);
+ assert.equal(calls.length,2);
+});
+
+test('slice7 real loopback authority double preserves latest metadata, CAS, tenant and attachment boundaries',async t=>{
+ const root=fs.mkdtempSync(path.join(os.tmpdir(),'qa-move-protocol-'));t.after(()=>fs.rmSync(root,{recursive:true,force:true}));
+ const other='99999999-2222-4333-8444-555555555555';
+ for(const user of [USER,other]){
+  const dir=path.join(root,'users',user);fs.mkdirSync(dir,{recursive:true});
+  fs.writeFileSync(path.join(dir,'free-chats.json'),JSON.stringify([{id:'qa raw!',title:user,updatedAt:1},{id:'qa-unrelated',updatedAt:2}]));
+  fs.writeFileSync(path.join(dir,'projects.json'),JSON.stringify({projects:[{id:'qa-p',chats:[]}]}));
+  fs.writeFileSync(path.join(dir,'history-qaraw.json'),'sentinel transcript');
+ }
+ const standin=await require('../tests/server/project-store-server.cjs').startProjectStore(root,{token:TOKEN,changes:true});t.after(()=>standin.close());
+ const client=psc.createClient({port:standin.port,token:TOKEN});
+ const before=await client.read(USER,'free-chats.json');
+ assert.equal((await client.grantContext(USER,'qa raw!')).generation,'0');
+ const moved=await client.chatMove(USER,'qa raw!','qa-p',{frame:null});
+ assert.equal(moved.from,null);assert.equal(moved.generation,'1');
+ const projects=JSON.parse((await client.read(USER,'projects.json')).text).projects;
+ assert.equal(projects[0].chats[0].title,USER);assert.equal(projects[0].chats[0].frame,null);
+ assert.deepEqual(JSON.parse((await client.read(USER,'free-chats.json')).text).map(c=>c.id),['qa-unrelated']);
+ assert.equal((await client.write(USER,'free-chats.json',before.version,before.text)).conflict,true,'stale CAS cannot undo move');
+ assert.equal((await client.grantContext(other,'qa raw!')).generation,'0','other tenant unchanged');
+ assert.equal(fs.readFileSync(path.join(root,'users',USER,'history-qaraw.json'),'utf8'),'sentinel transcript');
+ assert.equal((await client.chatMove(USER,'qa raw!',null)).generation,'2');
+ const notices=await client.changesRead(USER);
+ assert.equal(notices.entries.filter(e=>e.op==='move').length,2);
+ assert.ok(notices.entries.every(e=>e.delivery==='live'&&e.rawChatId==='qa raw!'&&e.chatId==='qaraw'));
+ const bad=psc.createClient({port:standin.port,token:'wrong-token'});
+ await assert.rejects(bad.chatMove(USER,'qa raw!','qa-p'));
+ await assert.rejects(client.chatMove('88888888-2222-4333-8444-555555555555','qa raw!',null),e=>e.status===410);
+});

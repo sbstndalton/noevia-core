@@ -1,6 +1,8 @@
 'use strict';
-// GET /api/account/retention               -> { days, periods, preview: { 30: n, 90: n, 365: n } }
-// PUT /api/account/retention { days }      -> { days, deleted }   deletes due chats right away
+// PUT /api/account/retention { days, confirmDeletes } -> { days, deleted }   deletes due chats right away
+//   (409 { error, preview: { 30: n, 90: n, 365: n } } when more chats are due than were confirmed)
+// GET /api/account/retention (the preview) is the Rust front's (noevia-rs crates/server-projects
+// `retention`, sbstndalton/noevia#1071); rust-auth.cjs refuses it before this module runs.
 // /api/account/instructions, /memory and /preferences are the Rust front's (sbstndalton/noevia#1071;
 // rust-auth.cjs refuses them before this module runs).
 const retention = require('../chat-retention.cjs');
@@ -9,10 +11,9 @@ function createAccountRoutes({ json, readJson, dir, chatLists = null, removeChat
   return async function accountRoutes(req, res, { path, authn }) {
     if (path === '/api/account/retention' && chatLists && removeChat) {
       if (!authn) return json(res, 401, { error: 'Sign in first' }), true;
+      if (req.method !== 'PUT') return json(res, 405, { error: 'method not allowed' }), true;
       const lists = chatLists();
       const preview = Object.fromEntries(retention.PERIODS.map((days) => [days, retention.expired({ ...lists, days, now: now() }).length]));
-      if (req.method === 'GET') return json(res, 200, { days: retention.read(dir()).days, periods: retention.PERIODS, preview }), true;
-      if (req.method !== 'PUT') return json(res, 405, { error: 'method not allowed' }), true;
       let body;
       try { body = await readJson(req); } catch { return json(res, 400, { error: 'invalid JSON' }), true; }
       // Never delete more than the person just confirmed: a stale preview must not become a silent delete.

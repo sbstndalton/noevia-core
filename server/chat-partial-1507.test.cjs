@@ -115,3 +115,109 @@ test('a transcript save supersedes a stored partial, except while a reply runs',
   partial.supersedePartial(dir, 'c-6');
   assert.equal(partial.readPartial(dir, 'c-6'), null, 'a saved transcript supersedes the old partial');
 });
+
+// sbstndalton/noevia#1071: each save records which container start wrote it, so another process can
+// tell a running reply from one a crash cut off. The marker never reaches the client.
+test('a running reply\'s partial carries this start\'s marker, which the history never shows', async () => {
+  const dir = temp();
+  const record = createTurnRecord();
+  record.observe({ type: 'delta', text: 'streaming' });
+  const saves = partial.startPartialSaves({ dir, chatId: 'qa-marker', record, everyMs: 5 });
+  await wait(30);
+  const stored = partial.readPartial(dir, 'qa-marker');
+  assert.match(partial.START_ID, /^[0-9a-f]{32}$/);
+  assert.deepEqual(stored.running, { start: partial.START_ID }, 'the file says which start is running it');
+  assert.equal(stored.interrupted, true);
+  assert.equal(partial.partialFor(dir, 'qa-marker'), null, 'this process still hides it with its own set');
+  saves.finish();
+  assert.equal(fs.existsSync(partial.fileFor(dir, 'qa-marker')), false, 'an ended reply leaves no marker behind');
+});
+
+test('after a crash the partial is offered as interrupted, without the dead start\'s marker', () => {
+  const dir = temp();
+  fs.mkdirSync(path.join(dir, 'chat-partials'), { recursive: true });
+  // Left by the previous container start, which died mid-reply (no finish()).
+  const before = 'f'.repeat(32);
+  assert.notEqual(before, partial.START_ID);
+  fs.writeFileSync(partial.fileFor(dir, 'qa-crash'), JSON.stringify({ role: 'assistant', content: 'cut off', interrupted: true, running: { start: before } }));
+  const offered = partial.partialFor(dir, 'qa-crash');
+  assert.deepEqual(offered, { role: 'assistant', content: 'cut off', interrupted: true });
+  assert.equal('running' in offered, false);
+  assert.deepEqual(partial.readPartial(dir, 'qa-crash').running, { start: before }, 'the file itself is left as it was');
+});
+
+// sbstndalton/noevia#2146: an unremovable partial (here: a folder that refuses the unlink) must not keep
+// this start's running marker once its reply has ended, or the Rust front's history hides it as running.
+const asRoot = typeof process.getuid === 'function' && process.getuid() === 0;
+const quietErrors = (fn) => {
+  const logged = [], original = console.error;
+  console.error = (...args) => { logged.push(args.join(' ')); };
+  try { return { result: fn(), logged }; } finally { console.error = original; }
+};
+
+test('#2146: a finished reply whose partial cannot be removed loses its running marker and is offered', { skip: asRoot && 'root ignores folder permissions' }, async () => {
+  const dir = temp();
+  const record = createTurnRecord();
+  record.observe({ type: 'delta', text: 'qa unremovable' });
+  const saves = partial.startPartialSaves({ dir, chatId: 'qa-stuck', record, everyMs: 5 });
+  await wait(30);
+  assert.deepEqual(partial.readPartial(dir, 'qa-stuck').running, { start: partial.START_ID });
+  const folder = path.join(dir, 'chat-partials');
+  fs.chmodSync(folder, 0o555);
+  try {
+    const { logged } = quietErrors(() => saves.finish());
+    assert.equal(fs.existsSync(partial.fileFor(dir, 'qa-stuck')), true, 'the folder refused the unlink');
+    const stored = partial.readPartial(dir, 'qa-stuck');
+    assert.equal('running' in stored, false, 'no marker for another process to take as a running reply');
+    assert.equal(stored.content, 'qa unremovable');
+    assert.equal(stored.interrupted, true);
+    assert.deepEqual(partial.partialFor(dir, 'qa-stuck'), stored, 'offered as an interrupted reply');
+    assert.ok(logged.some((line) => /could not remove a finished reply's partial/.test(line)), 'the failure is logged as an error');
+    assert.deepEqual(fs.readdirSync(folder).filter((f) => f.endsWith('.tmp')), [], 'no temp file left behind');
+  } finally {
+    fs.chmodSync(folder, 0o755);
+  }
+});
+
+test('#2146: endPartial says what it did, and logs loudly when even the rewrite fails', { skip: asRoot && 'root ignores file permissions' }, () => {
+  const dir = temp();
+  const folder = path.join(dir, 'chat-partials');
+  fs.mkdirSync(folder, { recursive: true });
+  const file = partial.fileFor(dir, 'qa-end');
+  const marked = JSON.stringify({ content: 'qa', interrupted: true, running: { start: partial.START_ID } });
+  fs.writeFileSync(file, marked);
+  assert.equal(quietErrors(() => partial.endPartial(dir, 'qa-end')).result, 'cleared');
+  assert.equal(fs.existsSync(file), false);
+  assert.equal(quietErrors(() => partial.endPartial(dir, 'qa-end')).result, 'cleared', 'nothing to remove is fine');
+
+  fs.writeFileSync(file, JSON.stringify({ content: 'qa', interrupted: true }));
+  fs.chmodSync(folder, 0o555);
+  try {
+    assert.equal(quietErrors(() => partial.endPartial(dir, 'qa-end')).result, 'kept', 'no marker: left as it is');
+    fs.chmodSync(folder, 0o755);
+    fs.writeFileSync(file, marked);
+    fs.chmodSync(file, 0o444);
+    fs.chmodSync(folder, 0o555);
+    const { result, logged } = quietErrors(() => partial.endPartial(dir, 'qa-end'));
+    assert.equal(result, 'stuck');
+    assert.ok(logged.some((line) => /could not rewrite a finished reply's partial/.test(line)), logged.join('\n'));
+    assert.deepEqual(partial.readPartial(dir, 'qa-end').running, { start: partial.START_ID });
+  } finally {
+    fs.chmodSync(folder, 0o755);
+    try { fs.chmodSync(file, 0o644); } catch { /* removed */ }
+  }
+});
+
+test('the start id comes from the supervisor when it is well formed', () => {
+  const { execFileSync } = require('node:child_process');
+  const read = (value) => execFileSync(process.execPath, ['-e', 'process.stdout.write(require(process.argv[1]).START_ID)', require.resolve('./chat-partial.cjs')],
+    { env: { ...process.env, NOEVIA_START_ID: value }, encoding: 'utf8' });
+  const given = '0123456789abcdef0123456789abcdef';
+  assert.equal(read(given), given);
+  for (const bad of ['', 'short', given.toUpperCase(), `${given}0`, `../${given}`]) {
+    const made = read(bad);
+    assert.match(made, /^[0-9a-f]{32}$/, bad);
+    assert.notEqual(made, bad);
+  }
+  assert.notEqual(read(''), read(''), 'each process without one makes its own');
+});

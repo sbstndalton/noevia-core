@@ -167,7 +167,8 @@ const importRoutes = require('./routes/import.cjs').createImportRoutes({
       existingChatIds: () => new Set([...Array.from(FREE_CHATS), ...PROJECTS.flatMap((proj) => proj.chats || [])].map((c) => c.id)),
       tombstones: () => lists.readTombstones(currentWorkspace().dir),
       directory: currentWorkspace().dir,
-      historyPath: (id) => currentWorkspace().historyPath(id),
+      // sbstndalton/noevia#1071 slice 4: transcripts are published through the Rust store only.
+      transcripts: currentWorkspace().transcripts,
       persistedChatIds: () => require('./conversation-import.cjs').persistedChatIds(currentWorkspace().dir),
       addFreeChats: (chats) => { FREE_CHATS.splice(0, FREE_CHATS.length, ...lists.mergeChats(Array.from(FREE_CHATS), chats, lists.readTombstones(currentWorkspace().dir))); saveFreeChats(FREE_CHATS); },
       addProjectChats: (projectId, chats) => saveChats(projectId, chats),
@@ -193,7 +194,7 @@ const driveAccounts = require('./drive-accounts.cjs').createDriveAccounts({
 const { publicPage } = require('./routes/public-pages.cjs');
 const webAddressRoutes = require('./routes/web-address.cjs').createWebAddressRoutes({ auth: authService, json, readBody: (req) => readJson(req) });
 const davConfig = require('./dav-settings.cjs').configuration(process.env, authService.origin);
-const davSettings = require('./dav-settings.cjs').createDavSettings({ auth: authService, config: davConfig });
+const davSettings = require('./dav-settings.cjs').createDavSettings({ auth: authService });
 if (process.env.LEMONADE_BASE_URL && !process.env.INFERENCE_BASE_URL) console.warn('LEMONADE_BASE_URL is deprecated; use INFERENCE_BASE_URL');
 if (process.env.LEMONADE_API_KEY && !process.env.INFERENCE_API_KEY) console.warn('LEMONADE_API_KEY is deprecated; use INFERENCE_API_KEY');
 // The default row's capabilities come from the engine kind the deployment declares (providers.cjs).
@@ -582,7 +583,7 @@ const projectStore = require('./projects.cjs').createProjectStore({
 });
 const {
   saveProjects, getProject, sanitizeChats, loadChats, saveChats, deleteChat, saveFreeChats, deleteFreeChat, createProject,
-  readHistory, writeHistory, ownsFile, ensureProjectFolder, withSourceLock, pruneDocuments, writeProjectTextFile, sweepDeletedProject, indexSource,
+  readHistory, ownsFile, ensureProjectFolder, withSourceLock, pruneDocuments, writeProjectTextFile, sweepDeletedProject, indexSource,
 } = projectStore;
 // ── MCP toolboxes (master step 15): curated in mcp-toolbox-manifest.cjs ─────────
 const MCP_TOOLBOX_MANIFEST = require('./mcp-toolbox-manifest.cjs').buildToolboxManifest({ features });
@@ -960,6 +961,14 @@ const chatBrains = chatBrainLib.createBrainScheduler({
   built: (userId, chatId) => chatVaultMirror.schedule(userId, chatId),
   log: (...args) => console.warn(...args),
 });
+// #2153: transcripts are written by the Rust store alone; its per-user change journal tells Node
+// which chats changed, including history saves Node never sees, so the mirror and brain follow.
+const changeJournal = require('./chat-change-journal.cjs').createChangeJournalReader({
+  read: (userId, after) => PROJECT_STORE.changesRead(userId, after),
+  onChange: require('./chat-change-journal.cjs').scheduleMirrorAndBrain({ chatVaultMirror, chatBrains }),
+  onRescan: (userId) => chatVaultMirror.schedule(userId),
+  stamp: (userId) => require('./chat-change-journal.cjs').fileStamp(DATA_DIR, userId),
+}).start();
 const chatVaultMirrorRoutes = require('./routes/chat-vault-mirror.cjs').createChatVaultMirrorRoutes({ json, readJson,
   preferences: { get: () => vaultMirrorLib.readPreferences(currentWorkspace().dir), save: (value) => vaultMirrorLib.writePreferences(currentWorkspace().dir, value) },
   available: vaultMirrorAvailable, schedule: chatVaultMirror.schedule, audit: (action, actor, detail) => authService.audit(action, actor, actor, detail) });
@@ -1038,7 +1047,7 @@ const { handleChat } = require('./chat.cjs').createChatHandler({
     chats: () => [...Array.from(FREE_CHATS), ...PROJECTS.filter((proj) => !diaryExtras.internalProject(proj)).flatMap((proj) => proj.chats || [])],
     read: (chatId) => chatBrainLib.readBrain(currentWorkspace().dir, chatId) },
   DEFAULT_TOOLBOXES, CONNECTOR_BOXES, connectedBoxes, allToolboxes, resolveTools, isWriteTool, executeToolCall,
-  oauthServerIds, accountReady, chatWideApproved, awaitApproval, recordUsage, recordToolUse, automaticToolsReady,
+  oauthServerIds, accountReady, chatWideApproved, awaitApproval, revokeChatGrant, recordUsage, recordToolUse, automaticToolsReady,
   // #917: which of the signed-in workspace's lists holds a chat id ('free', a project id, or null).
   chatListHolder,
   chatgptOAuth, chatgptEnabled: () => features.enabled('chatgptOAuth'),
@@ -1112,7 +1121,7 @@ if (!nativeClientAuth()) deviceAuth.revokeAll(null, 'feature-off');
 const requestAuth = require('./device-auth.cjs').createRequestAuth({ enabled: nativeClientAuth, deviceAuth, authService });
 const deviceRoutes = require('./routes/device-auth.cjs').createDeviceAuthRoutes({ json, enabled: nativeClientAuth });
 const authRoutes = require('./routes/auth.cjs').createAuthRoutes({
-  json, readJson, authService, davSettings, workspaceStore, driveAccounts, fetchJson, DIARY_BASE, DIARY_TOKEN, diaryTenantHeaders: diary.tenantHeaders,
+  json, readJson, authService, workspaceStore, driveAccounts, fetchJson, DIARY_BASE, DIARY_TOKEN, diaryTenantHeaders: diary.tenantHeaders,
   mcpOAuth, directoryMcp, chatgptOAuth,
   // POST /api/admin/secrets/rotate (CSRF-checked by the router like every signed-in POST).
   rotateSecrets: (actorId) => require('./secrets-rotate.cjs').runRotation({ secrets: secretStore, db: authService.db, dataDir: DATA_DIR, audit: authService.audit, actorId }),
@@ -1130,7 +1139,7 @@ const approvalRoutes = require('./routes/approvals.cjs').createApprovalRoutes({ 
 // runs the delete-old-chats sweep as the workspace loads, at most hourly.
 const chatListRoutes = require('./routes/chat-lists.cjs').createChatListRoutes({
   json, readBody, currentWorkspace, PROJECTS, FREE_CHATS, diaryExtras, crypto, STORED_HISTORY_BYTES, STORED_HISTORY_CAP,
-  chatLists: retentionLists, removeChat: removeRetainedChat, store: projectStore, revokeChatGrant,
+  chatLists: retentionLists, removeChat: removeRetainedChat, store: projectStore,
 });
 // The routing configuration and the sampling-presets switch are the Rust front's (#1071): these
 // mounts only refuse a bypass. Chat still reads both settings (routing-modes.cjs, chat.cjs).
@@ -1264,6 +1273,8 @@ async function handleRequestScoped(req, res) {
     if (authn && await chatVaultMirrorRoutes(req, res, { path: p, authn })) return;
     // #741: a successful change to the user's chats nudges their mirror (debounced; a no-op unless opted in).
     const mirrorNudge = authn ? vaultMirrorLib.mirrorTrigger(req.method, p) : null;
+    // #2153: a history save is the Rust front's; the change journal schedules it (touch: read this user).
+    if (authn) changeJournal.touch(authn.user.id);
     if (mirrorNudge && typeof res.once === 'function') res.once('finish', () => { if (res.statusCode >= 200 && res.statusCode < 300) { chatVaultMirror.schedule(authn.user.id, mirrorNudge.chatId); if (mirrorNudge.chatId) chatBrains.schedule(authn.user.id, mirrorNudge.chatId); } });
     if (authn && await exportRoutes(req, res, { path: p, authn })) return;
     if (authn && await importRoutes(req, res, { path: p, authn })) return;

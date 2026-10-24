@@ -292,7 +292,7 @@ async function run(t, { freeChatId = null, ragOverride = null, flag, settings = 
     rag: ragOverride || { filesContext: async () => null }, prefill: { recordSample() {} }, reduceToolResult: (r) => ({ text: String(r) }), diaryExtras: require('./diary-extras.cjs'),
     DIARY_BASE: 'http://diary.invalid', TOOL_RESULT_CAP: 8000, json: (r, status, body) => { errors.push({ status, body }); r.end(); }, saveChats() {}, endpointApproved: () => true, diaryHeaders: () => ({}),
     lastLoadedModel: () => null, classifyFastOrSmart: async () => 'smart', servedCatalogue: async () => [], modelsInstalled: async () => [], missingRoles: () => [], staleRolesError: () => null,
-    allToolboxes: () => (toolBoxes || []).map((b) => ({ id: b.id, label: b.id, tools: b.tools.map(fnTool) })), chatWideApproved: () => false, awaitApproval: async () => 'deny', recordUsage() {}, recordToolUse() {},
+    allToolboxes: () => (toolBoxes || []).map((b) => ({ id: b.id, label: b.id, tools: b.tools.map(fnTool) })), grantContext: async raw => require('../tests/server/chat-grant-fixture.cjs').context(raw, { holder: { kind: 'absent' } }), chatWideApproved: () => false, awaitApproval: async () => 'deny', recordUsage() {}, recordToolUse() {},
     executeToolCall: async () => (toolResult === null ? 'SYNTHETIC' : toolResult), freeChats: () => [],
     // #1646: a gate that, like the real one, picks only from the tools it is shown: `gateTool` when offered.
     ...(gateTool ? { toolGate: { record() {}, evaluate: async (_message, offered) => {

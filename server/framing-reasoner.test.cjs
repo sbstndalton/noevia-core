@@ -271,7 +271,7 @@ async function run(t, { framingReasoner, kind = 'search', reasoningTraces = null
     rag: { filesContext: async () => null }, prefill: { recordSample() {} }, reduceToolResult: (r) => ({ text: String(r) }), diaryExtras: require('./diary-extras.cjs'),
     DIARY_BASE: 'http://fixture.invalid', TOOL_RESULT_CAP: 8000, json: () => {}, saveChats() {}, endpointApproved: () => true, diaryHeaders: () => ({}),
     lastLoadedModel: () => null, classifyFastOrSmart: async () => 'fast', servedCatalogue: async () => [], modelsInstalled: async () => [], missingRoles: () => [], staleRolesError: () => null,
-    allToolboxes: () => [{ id: 'web', tools }], chatWideApproved: () => false,
+    allToolboxes: () => [{ id: 'web', tools }], grantContext: async raw => require('../tests/server/chat-grant-fixture.cjs').context(raw, { holder: { kind: 'absent' } }), chatWideApproved: () => false,
     awaitApproval: async (req) => { approvals.push(req); return 'deny'; }, recordUsage() {}, recordToolUse() {},
     executeToolCall: async (_p, name) => { executed.push(name); return 'RAW-SYNTHETIC-RESULT: museum hours page'; },
     toolGate: { evaluate: async () => ({ decision: { tool: 'synthetic_web_search', mode: 'prefetch', args: { query: 'museum hours' } }, source: 'rule' }), record() {} },

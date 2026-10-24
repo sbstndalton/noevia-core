@@ -2,12 +2,9 @@
 // The chat lists and transcripts (the store is projects.cjs):
 //   GET  /api/workspace                    the projects and free chats, chats[] sanitized, after the
 //                                          delete-old-chats sweep has had its hourly chance to run
-//   GET  /api/chats/:id/context-window     the last context meter recorded for a chat
 //   GET  /api/chats/:id/export             one chat as a Markdown file (#1471)
 //   GET  /api/chats/search?q=              the chat ids whose message text holds q (#1450)
-//   GET/POST /api/freechats                the free-chat metas, merged against tombstones
-//   DELETE /api/freechats/:id
-//   GET/POST /api/chats/:id/history        the transcript, with a revision for optimistic saves
+//   (GET/POST /api/freechats and DELETE /api/freechats/:id are the Rust front's, #1071)
 //   POST /api/chats/:id/move               { projectId: string|null, frame? } moves the meta between
 //                                          the caller's own lists (#738); the transcript stays put
 //
@@ -15,7 +12,6 @@
 // Blocks keep their original order and an unmatched method falls through as it did inline.
 
 const PASS = Symbol('unhandled');
-const { saveFailureReply } = require('../http.cjs');
 // #1450: the transcript search's bounds (one query reads at most this many chats).
 const SEARCH_MIN_QUERY = 2, SEARCH_MAX_QUERY = 200, SEARCH_MAX_CHATS = 500, SEARCH_MAX_RESULTS = 100;
 
@@ -27,16 +23,14 @@ const SEARCH_MIN_QUERY = 2, SEARCH_MAX_QUERY = 200, SEARCH_MAX_CHATS = 500, SEAR
  * @param {object[]} deps.PROJECTS
  * @param {object[]} deps.FREE_CHATS
  * @param {object} deps.diaryExtras
- * @param {object} deps.crypto
  * @param {number} deps.STORED_HISTORY_BYTES
- * @param {number} deps.STORED_HISTORY_CAP
  * @param {() => { freeChats:object[], projects:object[] }} deps.chatLists   what the retention sweep may delete from
  * @param {(chat:{ projectId?:string, id:string }) => boolean} deps.removeChat
- * @param {object} deps.store   projects.cjs: sanitizeChats, deleteFreeChat, readHistory, writeHistory, moveChat
+ * @param {object} deps.store   projects.cjs: sanitizeChats, readHistory
  * @param {(userId:string, chatId:string) => boolean} [deps.revokeChatGrant]  approvals.cjs: drops a chat's "Allow for this chat" grant
  */
-function createChatListRoutes({ json, readBody, currentWorkspace, PROJECTS, FREE_CHATS, diaryExtras, crypto, STORED_HISTORY_BYTES, STORED_HISTORY_CAP, chatLists, removeChat, store, revokeChatGrant = () => false }) {
-  const { sanitizeChats, deleteFreeChat, readHistory, writeHistory, moveChat } = store;
+function createChatListRoutes({ json, readBody, currentWorkspace, PROJECTS, FREE_CHATS, diaryExtras, STORED_HISTORY_BYTES, chatLists, removeChat, store }) {
+  const { sanitizeChats } = store;
   // #812: a malformed percent-escape in the URL is the caller's mistake (400), not a server error.
   const decodeChatId = require('../http.cjs').decodePathPart;
   const badChatId = (res) => json(res, 400, { error: 'invalid chat id' });
@@ -94,14 +88,8 @@ function createChatListRoutes({ json, readBody, currentWorkspace, PROJECTS, FREE
       });
     }
 
-    const windowMatch=p.match(/^\/api\/chats\/([^/]+)\/context-window$/);
-    if(windowMatch && req.method==='GET') {
-      const dir=currentWorkspace().dir,lists=require('../chat-lists.cjs'),id=decodeChatId(windowMatch[1]);
-      if(id===null) return badChatId(res);
-      // A deleted chat answers exactly like one that never existed (#554), even if state was written back late.
-      if(lists.readTombstones(dir).has(lists.safeChatId(id)||id)) return json(res,200,{meter:null});
-      return json(res,200,{meter:require('../chat-context.cjs').read(dir,id).meter||null});
-    }
+    // GET /api/chats/:id/context-window (a chat's last context meter) is the Rust front's
+    // (sbstndalton/noevia#1071): index.cjs refuses it before this mount (rust-projects.cjs refuseOwnedRoute).
 
     // #1471: one chat as a Markdown file, from the same writer as the conversation export (chat-export.cjs).
     // Only a chat in this person's own lists can be read; a deleted or unknown id answers 404.
@@ -137,83 +125,15 @@ function createChatListRoutes({ json, readBody, currentWorkspace, PROJECTS, FREE
       return true;
     }
 
-    // GET and POST /api/freechats are the Rust front's (sbstndalton/noevia#1071): index.cjs refuses
-    // them before this mount (rust-projects.cjs refuseOwnedRoute). A free chat's delete stays here.
-    const freeDel = p.match(/^\/api\/freechats\/([^/]+)$/);
-    if (freeDel && req.method === 'DELETE') {
-      const id = decodeChatId(freeDel[1]);
-      if (id === null) return badChatId(res);
-      // #1914: awaited, so a failed save answers its error and the transcript is kept.
-      let removed;
-      try { removed = await deleteFreeChat(id); }
-      catch (e) { if (e && e.status && e.status < 500 && e.status !== 410) throw e; return saveFailureReply(json, res, e, 'could not delete the chat; nothing was changed'); }
-      return json(res, removed ? 200 : 404, removed ? { ok: true } : { error: 'no such chat' });
-    }
+    // GET and POST /api/freechats and DELETE /api/freechats/{id} are the Rust front's
+    // (sbstndalton/noevia#1071; the delete is slice 6, one store operation): index.cjs refuses them
+    // before this mount (rust-projects.cjs refuseOwnedRoute).
 
-    const moveMatch = p.match(/^\/api\/chats\/([^/]+)\/move$/);
-    if (moveMatch && req.method === 'POST' && moveChat) {
-      const chatId = decodeChatId(moveMatch[1]);
-      if (chatId === null) return badChatId(res);
-      let body;
-      try { body = JSON.parse(await readBody(req)); } catch { return json(res, 400, { error: 'invalid JSON' }); }
-      if (!body || typeof body !== 'object' || Array.isArray(body) || !(body.projectId === null || typeof body.projectId === 'string')) return json(res, 400, { error: 'projectId (or null) required' });
-      let patch = {};
-      if ('frame' in body) {
-        // An invalid frame is refused outright (#759); the merge would otherwise drop the stored one.
-        // The store's merge normalizes it again, so the body's frame is passed on as before.
-        if (body.frame !== null && !require('../chat-framing.cjs').normalizeFrame(body.frame)) return json(res, 400, { error: 'invalid frame' });
-        patch = { frame: body.frame };
-      }
-      // Only the caller's own lists (the request-scoped workspace); Diary's internal project is not a
-      // destination, and neither is a project without Chat mode or an archived one (#810).
-      const moved = moveChat(chatId, body.projectId, patch, (proj) => !diaryExtras.internalProject(proj), require('../project-modes.cjs').chatDestination);
-      // #814: a chat that changed lists loses its "Allow for this chat" grant; a frame saved in place keeps it.
-      if (moved.status === 200 && moved.from !== body.projectId) {
-        for (const userId of new Set([currentWorkspace().userId, authn?.user?.id])) if (userId) revokeChatGrant(userId, chatId);
-      }
-      return json(res, moved.status, moved.status === 200 ? { ok: true, from: moved.from, projectId: body.projectId } : { error: 'no such chat or project' });
-    }
+    // POST /api/chats/{chatId}/move is Rust-owned; index.cjs refuses it before this mount.
 
-    const historyMatch = p.match(/^\/api\/chats\/([^/]+)\/history$/);
-    if (historyMatch) {
-      // Sanitized here, exactly as storage does, so the tombstone check sees the stored id.
-      const rawId = decodeChatId(historyMatch[1]);
-      if (rawId === null) return badChatId(res);
-      const spaceId = require('../chat-lists.cjs').safeChatId(rawId);
-      if (!spaceId) return json(res, 400, { error: 'invalid chat id' });
-      const revisionOf = (history) => crypto.createHash('sha256').update(JSON.stringify(history)).digest('hex');
-      // #1507: a reply the client lost (reload, restart) is offered as `partial`, an interrupted turn.
-      if (req.method === 'GET') {
-        const history = readHistory(spaceId);
-        const partial = require('../chat-partial.cjs').partialFor(currentWorkspace().dir, spaceId);
-        return json(res, 200, { history, revision: revisionOf(history), ...(partial ? { partial } : {}) });
-      }
-      if (req.method === 'POST') {
-        // A reply that finishes after its chat was deleted must not write the transcript back.
-        if (require('../chat-lists.cjs').readTombstones(currentWorkspace().dir).has(spaceId)) return json(res, 410, { error: 'This chat was deleted.' });
-        let raw;
-        try { raw = await readBody(req, STORED_HISTORY_BYTES); }
-        catch (e) { return json(res, e.status || 400, { error: e.status === 413 ? 'This chat is too large to save; start a new chat to keep going.' : 'could not read the chat' }); }
-        try {
-          const body = JSON.parse(raw);
-          if (!body || typeof body !== 'object' || Array.isArray(body)) return json(res, 400, { error: 'request body must be a JSON object' });
-          // Optimistic concurrency: a save based on an older copy (another device saved meanwhile)
-          // gets the current copy back to merge. Saves without a base revision are accepted as before.
-          if (typeof body.baseRevision === 'string') {
-            const current = readHistory(spaceId);
-            const revision = revisionOf(current);
-            if (body.baseRevision !== revision) return json(res, 409, { error: 'This chat changed on another device.', history: current, revision });
-          }
-          const next = Array.isArray(body.history) ? require('../chat-sources.cjs').sanitizeHistory(body.history.slice(-STORED_HISTORY_CAP)) : [];
-          writeHistory(spaceId, next);
-          // #1507: a transcript saved by the client (not by a running reply) supersedes a saved partial.
-          require('../chat-partial.cjs').supersedePartial(currentWorkspace().dir, spaceId);
-          return json(res, 200, { ok: true, revision: revisionOf(next) });
-        } catch {
-          return json(res, 400, { error: 'invalid JSON' });
-        }
-      }
-    }
+    // GET and POST /api/chats/:id/history are the Rust front's (sbstndalton/noevia#1071 slices 4
+    // and 5): index.cjs refuses both before this mount (rust-projects.cjs refuseOwnedRoute). The
+    // Rust store journals each save and chat-change-journal.cjs schedules the mirror and brain.
     return PASS;
   }
 

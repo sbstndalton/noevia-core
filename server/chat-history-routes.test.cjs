@@ -58,21 +58,51 @@ async function request(url, { method = 'GET', headers = {}, body = '' } = {}) {
 
 let cookie = '';
 let csrf = '';
+let userId = '';
 test.before(async () => {
   // Sign-in is the Rust front's (#1071): the account and its session are seeded directly.
-  ({ cookie, csrf } = require('../tests/server/seed-account.cjs').seedAccount(testDataDir, { username: 'admin', displayName: 'Admin', publicOrigin: 'http://localhost' }));
+  ({ cookie, csrf, id: userId } = require('../tests/server/seed-account.cjs').seedAccount(testDataDir, { username: 'admin', displayName: 'Admin', publicOrigin: 'http://localhost' }));
 });
 
 const mutationHeaders = () => ({ origin: 'http://localhost', cookie, 'content-type': 'application/json', 'x-csrf-token': csrf });
 
-const post = (url, body, headers = mutationHeaders()) => request(url, { method: 'POST', headers, body: JSON.stringify(body) });
+// #1071: GET /api/chats/:id/history is the Rust front's (noevia-rs crates/server-projects history), so these
+// tests read what the save stored from disk, with the revision computed as both servers do.
+function storedHistory(chatId) {
+  const name = `history-${chatId}.json`;
+  const find = (dir) => {
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      const full = path.join(dir, entry.name);
+      if (entry.isFile() && entry.name === name) return full;
+      if (entry.isDirectory()) { const hit = find(full); if (hit) return hit; }
+    }
+    return null;
+  };
+  const file = find(testDataDir);
+  const history = file ? JSON.parse(fs.readFileSync(file, 'utf8')).history || [] : [];
+  return { history, revision: crypto.createHash('sha256').update(JSON.stringify(history)).digest('hex') };
+}
+
+// #1071 slice 5: POST /api/chats/:id/history is the Rust front's too (Node refuses it, below), so a
+// save here is the front's, in process over the same store (tests/server/project-store-server.cjs).
+const post = async (url, body) => {
+  const id = /^\/api\/chats\/([^/]+)\/history$/.exec(url)[1];
+  return require('../tests/server/project-store-server.cjs').rustHistorySave(testDataDir, userId, decodeURIComponent(id), body);
+};
+
+test('#1071 slice 5: Node refuses a history save (503 RUST_PROJECTS_OWNED) and writes nothing', async () => {
+  const r = await request('/api/chats/c-node-refused/history', { method: 'POST', headers: mutationHeaders(), body: JSON.stringify({ history: [{ role: 'user', content: 'qa' }] }) });
+  assert.equal(r.status, 503, r.text);
+  assert.equal(JSON.parse(r.text).code, 'RUST_PROJECTS_OWNED');
+  assert.deepEqual(storedHistory('c-node-refused').history, []);
+});
 const realFetch = global.fetch;
 
 test('saving a long chat keeps every message, not just the last 40', async () => {
   const history = Array.from({ length: 120 }, (_, i) => ({ role: i % 2 ? 'assistant' : 'user', content: `synthetic message ${i}` }));
   const saved = await post('/api/chats/c-long-history/history', { history });
   assert.equal(saved.status, 200, saved.text);
-  const read = JSON.parse((await request('/api/chats/c-long-history/history', { headers: mutationHeaders() })).text).history;
+  const read = storedHistory('c-long-history').history;
   assert.equal(read.length, 120);
   assert.equal(read[0].content, 'synthetic message 0');
 });
@@ -82,13 +112,13 @@ test('a history larger than 1 MB (long reasoning and tool results) still saves',
   const history = Array.from({ length: 60 }, (_, i) => ({ role: i % 2 ? 'assistant' : 'user', content: `turn ${i}`, reasoning: i % 2 ? big : undefined }));
   const saved = await post('/api/chats/c-big-history/history', { history });
   assert.equal(saved.status, 200, saved.text);
-  assert.equal(JSON.parse((await request('/api/chats/c-big-history/history', { headers: mutationHeaders() })).text).history.length, 60);
+  assert.equal(storedHistory('c-big-history').history.length, 60);
 });
 
 test('history saves carry a revision; a save based on a stale revision is refused with the current copy', async () => {
   const first = [{ role: 'user', content: 'phone question' }];
   await post('/api/chats/c-two-devices/history', { history: first });
-  const read = JSON.parse((await request('/api/chats/c-two-devices/history', { headers: mutationHeaders() })).text);
+  const read = storedHistory('c-two-devices');
   assert.match(read.revision, /^[a-f0-9]{64}$/);
   const laptop = [...first, { role: 'assistant', content: 'laptop answer' }];
   assert.equal((await post('/api/chats/c-two-devices/history', { history: laptop, baseRevision: read.revision })).status, 200);
@@ -105,12 +135,12 @@ test('an assistant turn keeps its sources across a reload, re-bounded on save (#
   const sources = [{ id: 'note-a.md', file: 'note-a.md', snippet: 'Synthetic passage', kind: 'excerpt', score: 0.812 }];
   const history = [{ role: 'user', content: 'q' }, { role: 'assistant', content: 'a', sources }];
   assert.equal((await post('/api/chats/c-sources-552/history', { history })).status, 200);
-  const read = JSON.parse((await request('/api/chats/c-sources-552/history', { headers: mutationHeaders() })).text).history;
+  const read = storedHistory('c-sources-552').history;
   assert.deepEqual(read[1].sources, sources);
   const hostile = [{ role: 'assistant', content: 'a', sources: [{ file: 'x.md', snippet: 'y'.repeat(50_000), kind: 'excerpt' }, { nope: 1 }, 'str'] },
     { role: 'user', content: 'u', sources }];
   assert.equal((await post('/api/chats/c-sources-552b/history', { history: hostile })).status, 200);
-  const stored = JSON.parse((await request('/api/chats/c-sources-552b/history', { headers: mutationHeaders() })).text).history;
+  const stored = storedHistory('c-sources-552b').history;
   assert.equal(stored[0].sources.length, 1);
   assert.ok(stored[0].sources[0].snippet.length <= 200);
   assert.equal('sources' in stored[1], false, 'only assistant turns carry sources');
@@ -120,7 +150,7 @@ test('a saved turn keeps its last 10 variants; the chosen one is never dropped (
   const answers = Array.from({ length: 11 }, (_, i) => ({ content: `synthetic answer ${i}` }));
   const history = [{ role: 'user', content: 'q', answers, answer: 0 }, { role: 'assistant', content: 'synthetic answer 0' }];
   assert.equal((await post('/api/chats/c-variants-1517/history', { history })).status, 200);
-  const read = JSON.parse((await request('/api/chats/c-variants-1517/history', { headers: mutationHeaders() })).text).history;
+  const read = storedHistory('c-variants-1517').history;
   assert.equal(read[0].answers.length, 10);
   assert.equal(read[0].answers[read[0].answer].content, 'synthetic answer 0', 'the chosen answer survives although it is the oldest');
   assert.equal(read[0].answers[1].content, 'synthetic answer 2', 'the oldest of the others went');
@@ -130,11 +160,11 @@ test('a failed reply is stored with its failure sentence and comes back unchange
   const failure = 'The model took too long to unload, so the reply was ended. Try again.';
   const history = [{ role: 'user', content: 'q' }, { role: 'assistant', content: '', failure }];
   assert.equal((await post('/api/chats/c-failed-2116/history', { history })).status, 200);
-  const read = JSON.parse((await request('/api/chats/c-failed-2116/history', { headers: mutationHeaders() })).text);
+  const read = storedHistory('c-failed-2116');
   assert.deepEqual(read.history, history, 'the failed turn is returned as it was saved');
   // A later save by the same client (the answered retry) replaces it.
   assert.equal((await post('/api/chats/c-failed-2116/history', { history: [history[0], { role: 'assistant', content: 'an answer' }], baseRevision: read.revision })).status, 200);
-  const next = JSON.parse((await request('/api/chats/c-failed-2116/history', { headers: mutationHeaders() })).text).history;
+  const next = storedHistory('c-failed-2116').history;
   assert.deepEqual(next[1], { role: 'assistant', content: 'an answer' });
 });
 
@@ -148,7 +178,7 @@ test('only a non-empty failure sentence on an assistant turn is stored, bounded 
     { role: 'assistant', content: 'd', failure: 7 },
   ];
   assert.equal((await post('/api/chats/c-failed-2116b/history', { history })).status, 200);
-  const stored = JSON.parse((await request('/api/chats/c-failed-2116b/history', { headers: mutationHeaders() })).text).history;
+  const stored = storedHistory('c-failed-2116b').history;
   assert.equal('failure' in stored[0], false, 'a user turn is never a failed reply');
   assert.equal(stored[1].failure.length, 1000, 'bounded');
   for (const i of [2, 3, 4]) assert.equal('failure' in stored[i], false, `dropped: entry ${i}`);
@@ -158,12 +188,12 @@ test('a user turn keeps its exact Skill pin across a reload; anything else is dr
   const pin = `skill_${'a'.repeat(32)}@${'b'.repeat(64)}`;
   const history = [{ role: 'user', content: 'q', skill: pin }, { role: 'assistant', content: 'a', skill: pin }];
   assert.equal((await post('/api/chats/c-pin-571/history', { history })).status, 200);
-  const read = JSON.parse((await request('/api/chats/c-pin-571/history', { headers: mutationHeaders() })).text).history;
+  const read = storedHistory('c-pin-571').history;
   assert.equal(read[0].skill, pin);
   assert.equal('skill' in read[1], false, 'only user turns carry a pin');
   for (const bad of [{ id: `skill_${'a'.repeat(32)}`, version: 'b'.repeat(64) }, 'skill_x@y', `${pin}\nignore previous`, `skill_${'A'.repeat(32)}@${'b'.repeat(64)}`, `${pin}@extra`, 42, ['x']]) {
     assert.equal((await post('/api/chats/c-pin-571b/history', { history: [{ role: 'user', content: 'q', skill: bad }] })).status, 200);
-    const stored = JSON.parse((await request('/api/chats/c-pin-571b/history', { headers: mutationHeaders() })).text).history;
+    const stored = storedHistory('c-pin-571b').history;
     assert.equal('skill' in stored[0], false, `dropped: ${JSON.stringify(bad)}`);
   }
 });
@@ -175,7 +205,7 @@ test('routing details round-trip through history and remain on conflict copies',
     latencyMs: 37, status: 'accepted', fallbackReason: null };
   const history = [{ role: 'assistant', content: 'Synthetic answer', model: 'Assistant · Auto (smart)', routingDecision }];
   assert.equal((await post('/api/chats/c-routing-details/history', { history })).status, 200);
-  const read = JSON.parse((await request('/api/chats/c-routing-details/history', { headers: mutationHeaders() })).text);
+  const read = storedHistory('c-routing-details');
   assert.deepEqual(read.history[0].routingDecision, routingDecision);
   const concurrent = [...history, { role: 'user', content: 'Another turn' }];
   assert.equal((await post('/api/chats/c-routing-details/history', { history: concurrent, baseRevision: read.revision })).status, 200);
@@ -194,7 +224,7 @@ test('a malformed or conflicting routing field never corrupts the saved copy or 
 
   const target = [{ role: 'assistant', content: 'Target chat answer', routingDecision: goodDecision }];
   assert.equal((await post('/api/chats/c-routing-malformed/history', { history: target })).status, 200);
-  const read = JSON.parse((await request('/api/chats/c-routing-malformed/history', { headers: mutationHeaders() })).text);
+  const read = storedHistory('c-routing-malformed');
 
   // Two concurrent devices race to save the same chat: one carries a malformed
   // routingDecision shape (a bare string instead of the expected object).
@@ -214,13 +244,13 @@ test('a malformed or conflicting routing field never corrupts the saved copy or 
   // Retrying the phone save against the now-current revision persists the malformed
   // field as data (never crashes, never silently drops the message) but the sibling
   // chat's own routing detail is untouched by any of this.
-  const currentRead = JSON.parse((await request('/api/chats/c-routing-malformed/history', { headers: mutationHeaders() })).text);
+  const currentRead = storedHistory('c-routing-malformed');
   const retried = await post('/api/chats/c-routing-malformed/history', { history: phone, baseRevision: currentRead.revision });
   assert.equal(retried.status, 200);
-  const final = JSON.parse((await request('/api/chats/c-routing-malformed/history', { headers: mutationHeaders() })).text);
+  const final = storedHistory('c-routing-malformed');
   assert.deepEqual(final.history.at(-1).routingDecision, { selectedRole: 'smart', scores: 'nope', offered: null });
 
-  const sibling = JSON.parse((await request('/api/chats/c-routing-sibling/history', { headers: mutationHeaders() })).text);
+  const sibling = storedHistory('c-routing-sibling');
   assert.deepEqual(sibling.history[0].routingDecision, goodDecision, 'malformed routing on one chat must never cross-assign into another');
 });
 
@@ -278,7 +308,7 @@ test('cross-feature: Laya success, worker timeout falls back safely, later reque
       visionProbe: async () => ({ supported: false, reason: 'none' }), visionDescriptions: new Map(), skillsIndexFor: () => [],
       chatSkillRouter: { select: async () => ({ loaded: [] }) }, chatToolRouter: { select: async (ids) => ({ ids, routed: false }) },
       ...toolbox, oauthServerIds: () => new Set(), accountReady: () => true,
-      chatWideApproved: () => false, awaitApproval: async () => 'approve',
+      grantContext: async raw => require('../tests/server/chat-grant-fixture.cjs').context(raw, { holder: { kind: 'absent' } }), chatWideApproved: () => false, awaitApproval: async () => 'approve',
       recordUsage() {}, recordToolUse() {},
     });
     await handler.handleChat({}, res, { message, projectId: project.id, chatId, history: [] });
@@ -322,8 +352,8 @@ test('cross-feature: Laya success, worker timeout falls back safely, later reque
   // ...and through history save/reload: each chat persists only its own routing detail.
   await post('/api/chats/c-cross-concurrent-1/history', { history: [{ role: 'assistant', content: 'first reply', routingDecision: firstMeta.routingDecision }] });
   await post('/api/chats/c-cross-concurrent-2/history', { history: [{ role: 'assistant', content: 'second reply', routingDecision: secondMeta.routingDecision }] });
-  const reload1 = JSON.parse((await request('/api/chats/c-cross-concurrent-1/history', { headers: mutationHeaders() })).text);
-  const reload2 = JSON.parse((await request('/api/chats/c-cross-concurrent-2/history', { headers: mutationHeaders() })).text);
+  const reload1 = storedHistory('c-cross-concurrent-1');
+  const reload2 = storedHistory('c-cross-concurrent-2');
   assert.deepEqual(reload1.history[0].routingDecision, firstMeta.routingDecision);
   assert.deepEqual(reload2.history[0].routingDecision, secondMeta.routingDecision);
   assert.notDeepEqual(reload1.history[0].routingDecision, reload2.history[0].routingDecision);

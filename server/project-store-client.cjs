@@ -16,6 +16,13 @@
 // index.cjs refuses to start without them; Node has no other way to save either file.
 
 const MAX_ATTEMPTS = 8;
+// sbstndalton/noevia#1071 slice 6 (and #2161's explicit markers): this core deletes chats only
+// through the store's chat/delete. noevia deploy/tools/assemble-release.sh pairs it with a front
+// whose store carries "noevia-chat-delete-store/1" (and refuses the reverse pairings). Keep the
+// quoted literal: the release check reads it from this file.
+const CHAT_DELETE_CLIENT_MARKER = 'noevia-chat-delete-client/1';
+// Release pairing requires foundation + generation-aware Node enforcement.
+const CHAT_MOVE_CLIENT_MARKER = 'noevia-chat-move-client/1';
 const TIMEOUT_MS = 10000;
 const REPLY_CAP = 2 * 32 * 1024 * 1024 + 64 * 1024;
 const FILES = new Set(['projects.json', 'free-chats.json']);
@@ -61,6 +68,22 @@ function createClient({ port, token, fetchImpl = globalThis.fetch, timeoutMs = T
     return { status: res.status, body };
   }
   return {
+    async grantContext(user, chat) {
+      const { status, body } = await call('chat/grant-context', { user, chat });
+      if (status !== 200) throw moveFailure(status, body);
+      return require('./chat-grant-context.cjs').validate(chat, body);
+    },
+    async chatMove(user, chat, projectId, patch = {}) {
+      const payload = { user, chat, projectId };
+      if (Object.hasOwn(patch, 'frame')) payload.frame = patch.frame;
+      const { status, body } = await call('chat/move', payload);
+      const grants = require('./chat-grant-context.cjs');
+      const from = grants.holder(body?.from), to = grants.holder(body?.to);
+      if (status !== 200) throw moveFailure(status, body);
+      if (!from || from.kind === 'absent' || !to || to.kind === 'absent' || !grants.decimal(body?.generation) ||
+          !grants.sameHolder(to, projectId === null ? { kind: 'free' } : { kind: 'project', id: projectId })) throw failure(500, null);
+      return { status: 200, from: from.kind === 'free' ? null : from.id, generation: body.generation };
+    },
     /** { version, text } (text null: no file). */
     async read(user, file) {
       if (!FILES.has(file)) throw new Error(`not a store file: ${file}`);
@@ -76,6 +99,106 @@ function createClient({ port, token, fetchImpl = globalThis.fetch, timeoutMs = T
       if (status === 409 && body && typeof body.version === 'string') return { conflict: true, version: body.version, text: typeof body.text === 'string' ? body.text : null };
       throw failure(status, body);
     },
+    // sbstndalton/noevia#1071 slice 4: a chat's transcript (history-<id>.json), which the Rust store
+    // alone writes (noevia-rs crates/server-projects transcript). Node never writes the file and has
+    // no fallback: an unreachable or refusing store is an error here, never a local write.
+    /** { history, revision, exists }. */
+    async historyRead(user, chat) {
+      const { status, body } = await call('history/read', { user, chat });
+      if (status === 200 && body && typeof body.revision === 'string') return { history: body.history, revision: body.revision, exists: body.exists === true };
+      throw historyFailure(status, body);
+    },
+    /** Saves `history` (the store keeps the last 5,000 entries, sanitised) if the transcript is at
+     *  `baseRevision` (or absent, `ifAbsent`; neither: unconditionally). `supersedePartial`: the
+     *  client's own save, which replaces a saved partial reply unless its reply still runs.
+     *  { ok: true, revision } | { conflict: true, history, revision, exists, proposedRevision } |
+     *  { deleted: true } (the chat is tombstoned: nothing written). `origin`: who asks (originOf). */
+    async historyWrite(user, chat, history, { baseRevision, ifAbsent = false, supersedePartial = false, origin } = {}) {
+      const payload = { user, chat, history, origin: originOf(origin) };
+      if (typeof baseRevision === 'string') payload.baseRevision = baseRevision;
+      if (ifAbsent) payload.ifAbsent = true;
+      if (supersedePartial) payload.supersedePartial = true;
+      const { status, body } = await call('history/write', payload);
+      if (status === 200 && body && typeof body.revision === 'string') return { ok: true, revision: body.revision };
+      if (status === 409 && body && typeof body.revision === 'string') {
+        return { conflict: true, history: body.history, revision: body.revision, exists: body.exists === true, proposedRevision: body.proposedRevision };
+      }
+      if (status === 410 && body && body.code === 'CHAT_DELETED') return { deleted: true };
+      throw historyFailure(status, body);
+    },
+    /** chat-interrupted-turn.cjs: `entry` after the user message `message` if that is still last, in
+     *  one hold of the store's lock. 'saved' | 'not-last' | 'no-user-message' | 'deleted'. */
+    async historyAppendIfLast(user, chat, message, entry, { origin } = {}) {
+      const { status, body } = await call('history/append-if-last', { user, chat, message, entry, origin: originOf(origin) });
+      if (status === 200 && body && HISTORY_OUTCOMES.has(body.outcome)) return body.outcome;
+      throw historyFailure(status, body);
+    },
+    /** Removes the transcript only if it is exactly what saving `history` would have written. */
+    async historyRemoveIf(user, chat, history, { origin } = {}) {
+      const { status, body } = await call('history/remove-if', { user, chat, history, origin: originOf(origin) });
+      if (status === 200 && body && typeof body.removed === 'boolean') return body.removed;
+      throw historyFailure(status, body);
+    },
+    /** sbstndalton/noevia#1071 slice 6: a chat's whole delete, one store operation under the
+     *  transcript lock (noevia-rs crates/server-projects chat_delete): the tombstone, the list
+     *  without the chat (written by the store), then the transcript, context meter, brain note and
+     *  saved partial reply. `kind`: 'free', 'project' (with `projectId`) or 'unlisted' (a deleted
+     *  project's chat, which no list holds any more). { deleted, swept, leftovers }: `deleted`
+     *  taken out of its list now; `swept` already deleted and in no list, its leftover files
+     *  removed; neither: no such chat. A failed list save takes the tombstone back and removes
+     *  nothing (failure()); 'unlisted' for a chat a list still holds is { listed: true }. Node
+     *  never removes those files itself. */
+    async chatDelete(user, chat, { kind, projectId, origin = 'remove' } = {}) {
+      const payload = { user, chat, kind, origin: originOf(origin) };
+      if (kind === 'project') payload.projectId = projectId;
+      const { status, body } = await call('chat/delete', payload);
+      if (status === 200 && body && typeof body.deleted === 'boolean') return { deleted: body.deleted, swept: body.swept === true, leftovers: Number(body.leftovers) || 0 };
+      if (status === 409 && body && body.code === 'CHAT_LISTED') return { deleted: false, swept: false, leftovers: 0, listed: true };
+      throw historyFailure(status, body);
+    },
+    /** sbstndalton/noevia#2153: the user's chat change journal after `after` (chat-change-journal.cjs):
+     *  { entries, oldestSeq, latestSeq, more, start }, or { unsupported: true } from a store
+     *  without the op (404: an older Rust front). */
+    async changesRead(user, after = 0) {
+      const { status, body } = await call('changes/read', { user, after });
+      if (status === 200 && body && Array.isArray(body.entries)) return body;
+      if (status === 404) return { unsupported: true };
+      throw historyFailure(status, body);
+    },
+  };
+}
+
+function moveFailure(status, body) {
+  if ([400, 404, 409].includes(status)) return Object.assign(new Error(body?.error || 'The chat or destination is unavailable.'), { status, ...(typeof body?.code === 'string' ? { code: body.code } : {}) });
+  return failure(status, body);
+}
+
+const HISTORY_OUTCOMES = new Set(['saved', 'not-last', 'no-user-message', 'deleted']);
+
+/** sbstndalton/noevia#2153: who asks for a transcript change, journalled on its entry by the Rust
+ *  store (journal.rs Origin), which refuses any other value. The chat change journal builds a
+ *  chat's brain only for `history` (the user's own save, the history POST); `import` and `remove`
+ *  are the conversation import publishing and taking back, `turn` an interrupted reply's append.
+ *  Anything unnamed is sent as `other`. An older store ignores the field (mirror-only entries). */
+const HISTORY_ORIGINS = new Set(['history', 'import', 'turn', 'remove', 'other']);
+const originOf = (origin) => (HISTORY_ORIGINS.has(origin) ? origin : 'other');
+
+/** A transcript op's refusal: a bad request stays a 400 (the caller's input), the rest as failure(). */
+function historyFailure(status, body) {
+  if (status === 400) return Object.assign(new Error(body && body.error ? String(body.error).slice(0, 200) : 'bad request'), { status: 400 });
+  return failure(status, body);
+}
+
+/** One account's transcripts through `client`, the user bound here (the request's own workspace
+ *  makes it, workspace.cjs), so no caller names another account's. */
+function transcriptsFor(client, user) {
+  return {
+    read: (chat) => client.historyRead(user, chat),
+    write: (chat, history, options) => client.historyWrite(user, chat, history, options),
+    appendIfLast: (chat, message, entry, options) => client.historyAppendIfLast(user, chat, message, entry, options),
+    removeIf: (chat, history, options) => client.historyRemoveIf(user, chat, history, options),
+    // sbstndalton/noevia#1071 slice 6: the chat's whole delete (project-store-client chatDelete).
+    deleteChat: (chat, options) => client.chatDelete(user, chat, options),
   };
 }
 
@@ -152,4 +275,4 @@ function holdForStoreSaves(res, saves) {
   };
 }
 
-module.exports = { enabledFrom, createClient, clientFromEnv, createQueue, busy, failureReply, holdForStoreSaves, MAX_ATTEMPTS, TIMEOUT_MS };
+module.exports = { CHAT_MOVE_CLIENT_MARKER, CHAT_DELETE_CLIENT_MARKER, HISTORY_ORIGINS, enabledFrom, createClient, clientFromEnv, createQueue, busy, failureReply, holdForStoreSaves, transcriptsFor, MAX_ATTEMPTS, TIMEOUT_MS };

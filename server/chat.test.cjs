@@ -67,7 +67,7 @@ async function runDriveCall(t, { name, files = [], ragOverride = null, savedMode
     visionProbe: async () => ({ supported: false, reason: 'none' }), visionDescriptions: new Map(), skillsIndexFor: () => [],
     chatSkillRouter: { select: async () => ({ loaded: [] }) }, chatToolRouter: { select: async (ids) => ({ ids, routed: false }) },
     ...toolbox, oauthServerIds: () => new Set(), accountReady: () => true,
-    chatWideApproved: approvalGate.chatWideApproved, awaitApproval: async (request) => {
+    grantContext: async raw => require('../tests/server/chat-grant-fixture.cjs').context(raw, { holder: { kind: 'absent' } }), chatWideApproved: approvalGate.chatWideApproved, awaitApproval: async (request) => {
       approvals.push(request);
       if (!policyDuringApproval) return decision;
       const waiting = approvalGate.awaitApproval(request);
@@ -302,7 +302,7 @@ async function runFreeChat(t, { project = null, requestedProjectId = null, space
     visionProbe: async () => ({ supported: false, reason: 'none' }), visionDescriptions: new Map(), skillsIndexFor: () => [],
     chatSkillRouter: { select: async () => ({ loaded: [] }) }, chatToolRouter: { select: async (ids) => ({ ids, routed: false }) },
     ...toolbox, oauthServerIds: () => new Set(), accountReady: () => true,
-    chatWideApproved: () => false, awaitApproval: async () => 'approve',
+    grantContext: async raw => require('../tests/server/chat-grant-fixture.cjs').context(raw, { holder: { kind: 'absent' } }), chatWideApproved: () => false, awaitApproval: async () => 'approve',
     recordUsage() {}, recordToolUse() {},
   });
   await handler.handleChat({}, res, { message, projectId: requestedProjectId || (project ? project.id : null),

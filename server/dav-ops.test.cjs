@@ -11,7 +11,7 @@ async function setup(t,{ops}={}){
  const db=new Database(':memory:');db.exec("CREATE TABLE users(id TEXT PRIMARY KEY,disabled_at INTEGER);INSERT INTO users VALUES('alice',NULL);");t.after(()=>db.close());
  const events=[],calls=[];
  const auth={db,diaryEnabled:()=>true,getStorage:()=>({kind:'local'}),audit:(...a)=>events.push(a),appPasswords:{list:()=>[{id:'device'}],verifyDav:async(u,p)=>p==='synthetic'&&u==='alice'?{userId:'alice',credentialId:'device'}:null}};
- const settings=createDavSettings({auth,config});settings.save({id:'alice',username:'alice'},{scope:'lan',acknowledgeCleartext:true});
+ const settings=createDavSettings({auth});db.prepare("INSERT INTO dav_settings VALUES('alice','lan',1,1)").run();
  const files={list:async(id,p)=>p?[]:[{path:'notes',name:'notes',isDir:true},{path:'a.md',name:'a.md',isDir:false}],read:async()=>({content:'x',version:TAG}),write:async()=>({version:TAG}),
   ops:ops||(async(id,body)=>{calls.push([id,body]);if(body.op==='stat')return {isDir:body.path==='notes',version:DEST};return body.op==='delete'?{trash:['t']}:{replaced:!!body.destinationVersion};})};
  const s=http.createServer(createDavHandler({auth,settings,config,files}));await new Promise(r=>s.listen(0,'127.0.0.1',r));

@@ -11,10 +11,11 @@ function fixture(root,user=uid,projectStore=createStubStore(root)){
  const proxy=field=>new Proxy([],{get(_t,k){const v=w[field][k];return typeof v==='function'?v.bind(w[field]):v;},set(_t,k,v){w[field][k]=v;return true;}});
  const store=createProjectStore({fs,path,currentWorkspace:()=>w,PROJECTS:proxy('projects'),FREE_CHATS:proxy('freeChats'),reasoningEffort:{validEffort:()=>true},projectAppearance:()=>({}),rag:{},storageClient:{isBrowsable:()=>false},documentSources:{},authService:{getStorage:()=>({kind:'local'})},sanitizeToolboxes:x=>x,defaultToolboxes:()=>['core'],PROJECT_ROOT_FOLDER:'projects',createProjectFolder:async()=>'',projectSweep:{}});
  let serial=0;const audited=[],failures={};
- const context=()=>({directory:w.dir,historyPath:id=>w.historyPath(id),persistedChatIds:()=>persistedChatIds(w.dir),projects:()=>w.projects.map(p=>({id:p.id,name:p.name})),existingChatIds:()=>new Set([...w.freeChats,...w.projects.flatMap(p=>p.chats||[])].map(c=>c.id)),tombstones:()=>lists.readTombstones(w.dir),addFreeChats:chats=>store.saveFreeChats(lists.mergeChats(w.freeChats,chats,lists.readTombstones(w.dir))),addProjectChats:(id,chats)=>store.saveChats(id,chats),whenSaved:async()=>{await store.whenSaved(()=>{});if(hooks.afterSaved){hooks.afterSaved();await store.whenSaved(()=>{});}},createProject:body=>store.createProject(body)});
+ const context=()=>({directory:w.dir,transcripts:w.transcripts,persistedChatIds:()=>persistedChatIds(w.dir),projects:()=>w.projects.map(p=>({id:p.id,name:p.name})),existingChatIds:()=>new Set([...w.freeChats,...w.projects.flatMap(p=>p.chats||[])].map(c=>c.id)),tombstones:()=>lists.readTombstones(w.dir),addFreeChats:chats=>store.saveFreeChats(lists.mergeChats(w.freeChats,chats,lists.readTombstones(w.dir))),addProjectChats:(id,chats)=>store.saveChats(id,chats),whenSaved:async()=>{await store.whenSaved(()=>{});if(hooks.afterSaved){hooks.afterSaved();await store.whenSaved(()=>{});}},createProject:body=>store.createProject(body)});
  const route=createImportRoutes({json:(res,status,body)=>Object.assign(res,{status,body}),readBody:async req=>JSON.stringify(req.data),context,newId:()=>`c-generated-${++serial}`,audit:(...args)=>{if(failures.audit)throw Error('Synthetic audit interruption');audited.push(args);}});
  return {w,store,hooks,audited,failures,request:async(data=payload)=>{const res={};await route({method:'POST',data},res,{path:'/api/import/conversations',authn:{user:{id:user}}});return res;}};
 }
+function put(w,id,history){fs.writeFileSync(w.historyPath(id),JSON.stringify({history},null,2));}// a transcript as the Rust store wrote it
 function temporary(t){const root=fs.mkdtempSync(path.join(os.tmpdir(),'noevia-import-'));t.after(()=>fs.rmSync(root,{recursive:true,force:true}));return root;}
 function historyIds(w){return fs.readdirSync(w.dir).filter(n=>/^history-c-.*\.json$/.test(n)).map(n=>n.slice(8,-5)).sort();}
 function assertComplete(f){assert.deepEqual([...persistedChatIds(f.w.dir)].sort(),['c-existing','c-free','c-new']);assert.deepEqual(historyIds(f.w),['c-existing','c-free','c-new']);assert.deepEqual(fs.readdirSync(path.join(f.w.dir,'conversation-imports')),[]);}
@@ -32,9 +33,9 @@ test('same-process retry persists metadata already mutated in cache',async t=>{
  assert.equal((await f.request()).status,503);assert.equal(f.w.freeChats.length,1);assert.equal(persistedChatIds(f.w.dir).size,0);f.w.saveFreeChats=save;assert.equal((await f.request()).status,200);assertComplete(f);
 });
 test('retry preserves unrelated edits, tombstones and pre-existing transcript paths',async t=>{
- const root=temporary(t),f=fixture(root);await f.store.createProject({name:'Existing',toolboxes:[]});f.store.writeHistory('c-new',[{role:'user',content:'Pre-existing unlisted transcript'}]);
+ const root=temporary(t),f=fixture(root);await f.store.createProject({name:'Existing',toolboxes:[]});put(f.w,'c-new',[{role:'user',content:'Pre-existing unlisted transcript'}]);
  f.w.saveProjects=()=>{throw Error('disk');};assert.equal((await f.request()).status,503);
- const next=fixture(root);next.store.deleteFreeChat('c-free');next.store.writeHistory('c-other',[{role:'user',content:'Other concurrent conversation'}]);next.store.saveFreeChats([{id:'c-other',title:'Unrelated',updatedAt:1}]);
+ const next=fixture(root);next.store.deleteFreeChat('c-free');put(next.w,'c-other',[{role:'user',content:'Other concurrent conversation'}]);next.store.saveFreeChats([{id:'c-other',title:'Unrelated',updatedAt:1}]);
  const existing=next.w.projects.find(p=>p.name==='Existing');existing.goal='Concurrent edit';next.w.saveProjects();
  const r=await next.request();assert.equal(r.status,200);assert.equal(r.body.imported,2);assert.match(r.body.skipped[0].reason,/deleted/);assert.equal(next.w.projects.find(p=>p.name==='Existing').goal,'Concurrent edit');assert.ok(persistedChatIds(next.w.dir).has('c-other'));assert.ok(!persistedChatIds(next.w.dir).has('c-free'));
  assert.equal(next.store.readHistory('c-new')[0].content,'Pre-existing unlisted transcript');const generated=[...persistedChatIds(next.w.dir)].find(id=>id.startsWith('c-generated-'));assert.ok(generated);assert.equal(next.store.readHistory(generated)[0].content,'Synthetic new');
@@ -50,7 +51,7 @@ test('incomplete staging is discarded before promotion; invalid input makes no j
 test('restart after metadata commit preserves later transcript edits and finishes journal cleanup',async t=>{
  const root=temporary(t),f=fixture(root);f.failures.audit=true;assert.equal((await f.request()).status,503);
  assert.deepEqual([...persistedChatIds(f.w.dir)].sort(),['c-existing','c-free','c-new']);
- const next=fixture(root);next.store.writeHistory('c-free',[{role:'user',content:'Edited after partial response'}]);
+ const next=fixture(root);put(next.w,'c-free',[{role:'user',content:'Edited after partial response'}]);
  assert.equal((await next.request()).status,200);assertComplete(next);assert.equal(next.store.readHistory('c-free')[0].content,'Edited after partial response');
 });
 test('another valid import request recovers pending work before planning its own additions',async t=>{
@@ -78,17 +79,30 @@ test('project and free groups classify their own list-cap results independently'
  assert.match(result.body.skipped[0].reason,/list is full/);assert.ok(persistedChatIds(f.w.dir).has('c-free-room'));
  assert.equal(persistedChatIds(f.w.dir).has('c-project-overflow'),false);assert.equal(fs.existsSync(f.w.historyPath('c-project-overflow')),false);
 });
-test('unsupported hard links fail before journaling and do not block a later import',async t=>{
+test('#1071 slice 4: transcripts are published through the store, which needs no hard links and never overwrites',async t=>{
  const f=fixture(temporary(t)),link=fs.linkSync;
  fs.linkSync=()=>{const error=Error('synthetic unsupported hard link');error.code='EPERM';throw error;};
  t.after(()=>{fs.linkSync=link;});
- const failed=await f.request({format:FORMAT,chats:[{id:'c-copy',title:'Copied',history:[{role:'user',content:'Synthetic'}]}]});
- assert.equal(failed.status,503);assert.match(failed.body.error,/storage does not support safe file promotion/);
- assert.equal(fs.existsSync(path.join(f.w.dir,'conversation-imports')),false);assert.equal(fs.existsSync(f.w.historyPath('c-copy')),false);
- assert.equal(fs.readdirSync(f.w.dir).some(name=>name.startsWith('.conversation-import-link-')),false);
+ const calls=[];const transcripts=f.w.transcripts;f.w.transcripts={...transcripts,write:(...a)=>{calls.push(a);return transcripts.write(...a);}};
+ const r=await f.request({format:FORMAT,chats:[{id:'c-copy',title:'Copied',history:[{role:'user',content:'Synthetic'}]}]});
+ assert.equal(r.status,200);assert.equal(r.body.imported,1);assert.equal(f.store.readHistory('c-copy')[0].content,'Synthetic');
+ assert.deepEqual(calls.map(([id,,o])=>[id,o]),[['c-copy',{ifAbsent:true,origin:'import'}]]);
  fs.linkSync=link;
- const retry=await f.request({format:FORMAT,chats:[{id:'c-copy',title:'Copied',history:[{role:'user',content:'Synthetic'}]}]});
- assert.equal(retry.status,200);assert.equal(retry.body.imported,1);assert.equal(f.store.readHistory('c-copy')[0].content,'Synthetic');
+});
+test('#1071 slice 4: without the transcript store nothing is imported and no transcript is written',async t=>{
+ const f=fixture(temporary(t));f.w.transcripts=undefined;
+ const r=await f.request({format:FORMAT,chats:[{id:'c-none',title:'None',history:[{role:'user',content:'Synthetic'}]}]});
+ assert.notEqual(r.status,200);assert.equal(fs.existsSync(f.w.historyPath('c-none')),false);assert.equal(persistedChatIds(f.w.dir).size,0);
+});
+test('#1071 slice 4: a chat deleted after publishing is taken back only while it is still the imported transcript',async t=>{
+ const f=fixture(temporary(t));await f.store.createProject({name:'Existing',toolboxes:[]});
+ f.hooks.afterSaved=()=>{f.hooks.afterSaved=null;f.store.deleteFreeChat('c-free');};
+ // A late writer saves another transcript under the deleted id just before the import takes its own back.
+ const transcripts=f.w.transcripts,removed=[];
+ f.w.transcripts={...transcripts,removeIf:async(id,history)=>{put(f.w,id,[{role:'user',content:'Saved since'}]);const r=await transcripts.removeIf(id,history);removed.push([id,r]);return r;}};
+ const r=await f.request();assert.equal(r.status,200);
+ assert.deepEqual(removed,[['c-free',false]]);
+ assert.equal(f.store.readHistory('c-free')[0].content,'Saved since','a transcript saved since is never removed by the import');
 });
 
 test('a chat deleted while the import waits is reported as deleted, not as a full list',async t=>{
@@ -114,4 +128,39 @@ test('an import against a busy project store fails, unlinks nothing and keeps tr
  store.clearFailures();
  // The store recovers; after a restart a retry of the same file completes it.
  const ok=await fixture(root,uid,psc.createClient({port:store.port,token:store.token})).request();assert.equal(ok.status,200);assert.equal(ok.body.imported,3);
+});
+
+test('#2153: an import publishes with origin import and takes back with origin remove',async t=>{
+ const f=fixture(temporary(t));await f.store.createProject({name:'Existing',toolboxes:[]});
+ f.hooks.afterSaved=()=>{f.hooks.afterSaved=null;f.store.deleteFreeChat('c-free');};
+ const transcripts=f.w.transcripts,origins=[];
+ f.w.transcripts={...transcripts,write:async(id,h,o)=>{origins.push(['write',id,o&&o.origin]);return transcripts.write(id,h,o);},removeIf:async(id,h,o)=>{origins.push(['removeIf',id,o&&o.origin]);return transcripts.removeIf(id,h,o);}};
+ const r=await f.request();assert.equal(r.status,200);
+ assert.deepEqual(origins.filter(o=>o[0]==='write').map(o=>o[2]),['import','import','import']);
+ assert.deepEqual(origins.filter(o=>o[0]==='removeIf'),[['removeIf','c-free','remove']]);
+});
+
+test('#2153 end to end: over the store journal a history save queues exactly one brain build and an import none',async t=>{
+ const root=temporary(t);
+ const standin=await startProjectStore(root,{changes:true});t.after(()=>standin.close());
+ const client=psc.createClient({port:standin.port,token:standin.token,timeoutMs:5000});
+ const f=fixture(root,uid,client);await f.store.createProject({name:'Existing',toolboxes:[]});
+ const {createChangeJournalReader,scheduleMirrorAndBrain}=require('../chat-change-journal.cjs');
+ const mirror=[],brain=[];
+ const reader=createChangeJournalReader({read:(u,a)=>client.changesRead(u,a),onChange:scheduleMirrorAndBrain({chatVaultMirror:{schedule:(u,c)=>mirror.push(c)},chatBrains:{schedule:(u,c)=>brain.push(c)}}),log:()=>{},setTimer:()=>null,clearTimer:()=>{}});
+ await reader.poll(uid);// the first read takes the (empty) journal's start
+ const r=await f.request();assert.equal(r.status,200);
+ await reader.poll(uid);
+ assert.deepEqual(mirror.slice().sort(),['c-existing','c-free','c-new'],'the import is mirrored');
+ assert.deepEqual(brain,[],'an import builds no brain');
+ // #1071 slice 5: the history POST is the Rust front's; its save (in process over the same store) journals origin history.
+ const saved=require('../../tests/server/project-store-server.cjs').rustHistorySave(root,uid,'c-new',{history:[{role:'user',content:'Synthetic new'},{role:'assistant',content:'Synthetic reply'}]});
+ assert.equal(saved.status,200,saved.text);
+ await reader.poll(uid);
+ assert.deepEqual(brain,['c-new'],'one history save, one brain build');
+ const {entries}=await client.changesRead(uid,0);
+ assert.deepEqual(entries.at(-1),{...entries.at(-1),chatId:'c-new',op:'write',origin:'history'});
+ assert.ok(entries.slice(0,-1).every(e=>e.op==='write'&&e.origin==='import'),JSON.stringify(entries));
+ assert.equal(entries.filter(e=>e.origin==='history').length,1);
+ assert.equal(entries.filter(e=>e.origin==='import').length,3);
 });

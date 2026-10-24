@@ -64,6 +64,8 @@ test.before(async () => {
 const mutationHeaders = () => ({ origin: 'http://localhost', cookie, 'content-type': 'application/json', 'x-csrf-token': csrf });
 
 const post = (url, body, headers = mutationHeaders()) => request(url, { method: 'POST', headers, body: JSON.stringify(body) });
+// Public moves are the Rust front's; adapter preserves metadata/lifecycle assertions.
+const frontMove=(url,body)=>require('../tests/server/project-store-server.cjs').rustChatMove(testDataDir,path.basename(workspaceDir()),url.split('/')[3],body);
 const realFetch = global.fetch;
 
 
@@ -103,6 +105,9 @@ function frontSaveFree(metas) {
   frontWrite(file, list);
 }
 
+// The Rust front's chat delete (#1071 slice 6), in process over this account's directory.
+const frontDelete = (projectId, chatId) => require('../tests/server/project-store-server.cjs').rustChatDelete(testDataDir, path.basename(workspaceDir()), projectId, chatId);
+
 async function openWithImage(chatId) {
   await request('/api/workspace', { headers: { cookie } });
   const file = path.join(workspaceDir(), 'projects.json');
@@ -125,8 +130,14 @@ test('deleting a free chat removes its attachments project, and a stale tab cann
   const doomed = await openWithImage('c788-delete');
   frontSaveFree([{ id: 'c788-delete', title: 'a' }, { id: 'c788-keep', title: 'b', archived: true }]);
 
-  const deleted = await request('/api/freechats/c788-delete', { method: 'DELETE', headers: mutationHeaders() });
+  // #1071 slice 6: the delete is the Rust front's (Node refuses it); the front's store operation
+  // tombstones the chat and Node's reaper frees its attachments project on the next workspace load.
+  const refused = await request('/api/freechats/c788-delete', { method: 'DELETE', headers: mutationHeaders() });
+  assert.equal(refused.status, 503);
+  assert.equal(JSON.parse(refused.text).code, 'RUST_PROJECTS_OWNED');
+  const deleted = frontDelete(null, 'c788-delete');
   assert.equal(deleted.status, 200);
+  assert.equal((await request('/api/workspace', { headers: { cookie } })).status, 200);
   assert.ok(await gone(doomed), 'local assets and RAG index are gone');
   assert.ok(!projectIds().includes(ctx('c788-delete')), 'the record is gone from projects.json');
   assert.ok(projectIds().includes(ctx('c788-keep')), 'an archived chat keeps its attachments');
@@ -145,8 +156,10 @@ test('a moved chat and Delete old chats take their attachments projects along (#
   const host = JSON.parse((await post('/api/projects', { name: 'Synthetic host' })).text);
   const moved = await openWithImage('c788-moved');
   frontSaveFree([{ id: 'c788-moved', title: 'm' }]);
-  assert.equal((await post('/api/chats/c788-moved/move', { projectId: host.id })).status, 200);
-  assert.equal((await request(`/api/projects/${host.id}/chats/c788-moved`, { method: 'DELETE', headers: mutationHeaders() })).status, 200);
+  assert.equal((await frontMove('/api/chats/c788-moved/move', { projectId: host.id })).status, 200);
+  assert.equal((await request(`/api/projects/${host.id}/chats/c788-moved`, { method: 'DELETE', headers: mutationHeaders() })).status, 503);
+  assert.equal(frontDelete(host.id, 'c788-moved').status, 200);
+  assert.equal((await request('/api/workspace', { headers: { cookie } })).status, 200);
   assert.ok(await gone(moved));
   assert.ok(!projectIds().includes(ctx('c788-moved')));
 
@@ -154,7 +167,11 @@ test('a moved chat and Delete old chats take their attachments projects along (#
   const fresh = await openWithImage('c788-fresh');
   const longAgo = Date.now() - 100 * 86400000;
   frontSaveFree([{ id: 'c788-old', title: 'o', updatedAt: longAgo }, { id: 'c788-fresh', title: 'f' }]);
-  const preview = JSON.parse((await request('/api/account/retention', { headers: { cookie } })).text).preview;
+  // The preview GET is the Rust front's (#1071); an unconfirmed PUT answers it too (409).
+  const unconfirmed = await request('/api/account/retention', { method: 'PUT', headers: mutationHeaders(), body: JSON.stringify({ days: 90 }) });
+  assert.equal(unconfirmed.status, 409);
+  const preview = JSON.parse(unconfirmed.text).preview;
+  assert.equal(preview[90], 1);
   const swept = await request('/api/account/retention', { method: 'PUT', headers: mutationHeaders(), body: JSON.stringify({ days: 90, confirmDeletes: preview[90] }) });
   assert.equal(swept.status, 200);
   assert.ok(await gone(old));

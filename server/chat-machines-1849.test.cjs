@@ -123,7 +123,7 @@ async function turn(t, { chatMachines = null, project = { routing: 'manual', mod
     DIARY_BASE: 'http://fixture.invalid', TOOL_RESULT_CAP: 8000, json: (_res, status, body) => { replied = { status, body }; }, saveChats() {}, endpointApproved: () => true, diaryHeaders: () => ({}),
     lastLoadedModel: () => null, classifyFastOrSmart: async () => 'fast', servedCatalogue: async () => { catalogueReads++; return rows; }, modelsInstalled: async () => rows,
     missingRoles: require('./auto-roles-check.cjs').missingRoles, staleRolesError: require('./auto-roles-check.cjs').staleRolesError,
-    allToolboxes: () => [{ id: 'core', tools: toolDefs }], chatWideApproved: () => false, recordUsage() {}, recordToolUse() {},
+    allToolboxes: () => [{ id: 'core', tools: toolDefs }], grantContext: async raw => require('../tests/server/chat-grant-fixture.cjs').context(raw, { holder: { kind: 'absent' } }), chatWideApproved: () => false, recordUsage() {}, recordToolUse() {},
     executeToolCall: async () => 'synthetic result', awaitApproval: async () => 'approve',
   });
   await handleChat({}, res, { projectId: 'fixture-project', chatId: 'fixture-chat', message });

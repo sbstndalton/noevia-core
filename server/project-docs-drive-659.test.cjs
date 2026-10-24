@@ -235,7 +235,7 @@ test('the Drive approval card carries the resolved target through the chat gate;
     DIARY_BASE: 'http://fixture.invalid', TOOL_RESULT_CAP: 8000, json: () => {}, saveChats() {}, endpointApproved: () => true, diaryHeaders: () => ({}),
     lastLoadedModel: () => null, classifyFastOrSmart: async () => 'fast', servedCatalogue: async () => [], modelsInstalled: async () => [], missingRoles: () => [], staleRolesError: () => null,
     allToolboxes: () => [], executeToolCall: async (_p, name, args, _a, _s, outcome, options) => { executed.push({ name, options }); return tools.execute(member, name, JSON.parse(args), options); },
-    chatWideApproved: () => false, awaitApproval: async () => 'deny', recordUsage() {}, recordToolUse() {},
+    grantContext: async raw => require('../tests/server/chat-grant-fixture.cjs').context(raw, { holder: { kind: 'absent' } }), chatWideApproved: () => false, awaitApproval: async () => 'deny', recordUsage() {}, recordToolUse() {},
     writeTargetFor: (name, raw, { user }) => (tools.names.has(name) ? tools.describeTarget(user, name, raw) : null),
   });
   const run = async (body) => {
@@ -336,7 +336,7 @@ test('through the chat loop: read in one request, update in the next is refused;
     DIARY_BASE: 'http://fixture.invalid', TOOL_RESULT_CAP: 8000, json: () => {}, saveChats() {}, endpointApproved: () => true, diaryHeaders: () => ({}),
     lastLoadedModel: () => null, classifyFastOrSmart: async () => 'fast', servedCatalogue: async () => [], modelsInstalled: async () => [], missingRoles: () => [], staleRolesError: () => null,
     allToolboxes: () => [], executeToolCall: async (_p, name, args, _a, _s, _o, options) => tools.execute(member, name, JSON.parse(args), options),
-    chatWideApproved: () => false, awaitApproval: async () => 'approve', recordUsage() {}, recordToolUse() {},
+    grantContext: async raw => require('../tests/server/chat-grant-fixture.cjs').context(raw, { holder: { kind: 'absent' } }), chatWideApproved: () => false, awaitApproval: async () => 'approve', recordUsage() {}, recordToolUse() {},
     writeTargetFor: (name, raw, { user }) => (tools.names.has(name) ? tools.describeTarget(user, name, raw) : null),
   });
   const run = async (message) => {
