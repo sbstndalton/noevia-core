@@ -194,7 +194,7 @@ const driveAccounts = require('./drive-accounts.cjs').createDriveAccounts({
 const { publicPage } = require('./routes/public-pages.cjs');
 const webAddressRoutes = require('./routes/web-address.cjs').createWebAddressRoutes({ auth: authService, json, readBody: (req) => readJson(req) });
 const davConfig = require('./dav-settings.cjs').configuration(process.env, authService.origin);
-const davSettings = require('./dav-settings.cjs').createDavSettings({ auth: authService, config: davConfig });
+const davSettings = require('./dav-settings.cjs').createDavSettings({ auth: authService });
 if (process.env.LEMONADE_BASE_URL && !process.env.INFERENCE_BASE_URL) console.warn('LEMONADE_BASE_URL is deprecated; use INFERENCE_BASE_URL');
 if (process.env.LEMONADE_API_KEY && !process.env.INFERENCE_API_KEY) console.warn('LEMONADE_API_KEY is deprecated; use INFERENCE_API_KEY');
 // The default row's capabilities come from the engine kind the deployment declares (providers.cjs).
@@ -1121,7 +1121,7 @@ if (!nativeClientAuth()) deviceAuth.revokeAll(null, 'feature-off');
 const requestAuth = require('./device-auth.cjs').createRequestAuth({ enabled: nativeClientAuth, deviceAuth, authService });
 const deviceRoutes = require('./routes/device-auth.cjs').createDeviceAuthRoutes({ json, enabled: nativeClientAuth });
 const authRoutes = require('./routes/auth.cjs').createAuthRoutes({
-  json, readJson, authService, davSettings, workspaceStore, driveAccounts, fetchJson, DIARY_BASE, DIARY_TOKEN, diaryTenantHeaders: diary.tenantHeaders,
+  json, readJson, authService, workspaceStore, driveAccounts, fetchJson, DIARY_BASE, DIARY_TOKEN, diaryTenantHeaders: diary.tenantHeaders,
   mcpOAuth, directoryMcp, chatgptOAuth,
   // POST /api/admin/secrets/rotate (CSRF-checked by the router like every signed-in POST).
   rotateSecrets: (actorId) => require('./secrets-rotate.cjs').runRotation({ secrets: secretStore, db: authService.db, dataDir: DATA_DIR, audit: authService.audit, actorId }),
