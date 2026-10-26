@@ -92,10 +92,10 @@ function createResearchRunner({ jobs, search, extract, projectRetrieve = async (
   async function start({ question, projectId = null, subQuestions = null, plan = null, finish = null }) {
     const q = String(question || '').trim();
     if (!q) throw readable('Write a research question first.');
-    const id = jobs.create({ kind: 'deep_research', projectId, capabilities: ['web.read', 'project.sources.read'] });
     const questions = subQuestions?.length ? subQuestions : [q];
-    if (plan === 'proposed' || plan === 'edited') jobs.append(id, `plan.${plan}`, { question: q, subQuestions: questions });
-    else jobs.append(id, 'plan.skipped', { question: q });
+    const id = await jobs.create({ kind: 'deep_research', projectId, capabilities: ['web.read', 'project.sources.read'], question: q, plan, subQuestions: questions });
+    if (plan === 'proposed' || plan === 'edited') await jobs.append(id, `plan.${plan}`, { question: q, subQuestions: questions });
+    else await jobs.append(id, 'plan.skipped', { question: q });
     const done = jobs.run(id, async (ctx) => {
       const registry = rs.createRegistry();
       const budget = { webCalls: 0, deadline: now() + cfg.maxMs };
@@ -138,7 +138,10 @@ function createResearchRunner({ jobs, search, extract, projectRetrieve = async (
       const markdown = `# ${q}\n\n${note}${body || '_Nothing was researched._'}${removed}\n\n## Sources\n\n${rs.sourcesFooter(registry) || '_None._'}\n`;
       const result = { question: q, markdown, sources: registry.list(), citationValidity: total ? valid / total : 1, citations: total, claims, flagged, dropped, withheldSentences: budget.withheld || 0,
         webCalls: budget.webCalls, sections: researched, questions: questions.length, partial };
-      if (!ctx.signal.aborted && finish) await finish(result, ctx);
+      if (!ctx.signal.aborted && finish) {
+        try { await ctx.flush?.(); await finish(result, ctx); }
+        catch (error) { error.result ??= result; throw error; }
+      }
       return result;
     });
     return { id, done };

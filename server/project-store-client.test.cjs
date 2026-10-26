@@ -85,6 +85,79 @@ test('the store is permanent: used with a port and the secret alone; the retired
   assert.equal(/NOEVIA_RUST_PROJECT_STORE_CONFIRMED|NOEVIA_RUST_FREE_CHATS_CONFIRMED|NOEVIA_RUST_PROJECTS_CONFIRMED/.test(src), false, 'nor a retired confirmation');
 });
 
+test('source start retries a lost reply with the same request key and never creates a second job', async () => {
+  for (const lost of ['transport', 'empty-200']) {
+    const calls = [], committed = new Map();
+    const fetchImpl = async (url, init) => {
+      assert.match(url, /\/v1\/source-jobs\/start$/);
+      const body = JSON.parse(init.body);
+      calls.push(body);
+      if (!committed.has(body.request)) committed.set(body.request, { id: '11111111-1111-4111-8111-111111111111', run: '22222222-2222-4222-8222-222222222222' });
+      if (calls.length === 1 && lost === 'transport') throw Error('reply lost after commit');
+      return new Response(calls.length === 1 && lost === 'empty-200' ? '' : JSON.stringify(committed.get(body.request)), { status: 200 });
+    };
+    const client = psc.createClient({ port: 1, token: TOKEN, fetchImpl }).sourceJobsFor(USER);
+    const owner = { start: 'a'.repeat(32), born: '100', owner: '33333333-3333-4333-8333-333333333333' };
+    const request = '44444444-4444-4444-8444-444444444444';
+    const job = await client.start(owner, 'project', request);
+    assert.equal(job.id, committed.get(request).id);
+    assert.equal(committed.size, 1, lost);
+    assert.equal(calls.length, 2, lost);
+    assert.deepEqual(calls[0], calls[1], lost);
+  }
+});
+
+test('research report retries a malformed 200 acknowledgement with the exact result', async () => {
+  const calls = [];
+  const client = psc.createClient({ port: 1, token: TOKEN, fetchImpl: async (url, init) => {
+    assert.match(url, /\/v1\/research-jobs\/report$/);
+    calls.push(JSON.parse(init.body));
+    return new Response(JSON.stringify(calls.length === 1 ? {} : { ok: true }), { status: 200 });
+  } }).researchJobsFor(USER);
+  const owner = { start: 'a'.repeat(32), born: '100', owner: '33333333-3333-4333-8333-333333333333' };
+  const result = { markdown: '# Report', sources: [] };
+  assert.deepEqual(await client.report(owner, '11111111-1111-4111-8111-111111111111', '22222222-2222-4222-8222-222222222222', result), { ok: true });
+  assert.equal(calls.length, 2);
+  assert.deepEqual(calls[0], calls[1], 'the exact committed report is retried, never replaced');
+});
+
+test('research report and cancel refuse repeated malformed 200 replies', async () => {
+  const owner = { start: 'a'.repeat(32), born: '100', owner: '33333333-3333-4333-8333-333333333333' };
+  const id = '11111111-1111-4111-8111-111111111111';
+  const run = '22222222-2222-4222-8222-222222222222';
+  for (const op of ['report', 'cancel']) {
+    const calls = [];
+    const client = psc.createClient({ port: 1, token: TOKEN, fetchImpl: async (url, init) => {
+      assert.match(url, new RegExp(`/v1/research-jobs/${op}$`));
+      calls.push(JSON.parse(init.body));
+      return new Response('{}', { status: 200 });
+    } }).researchJobsFor(USER);
+    const action = op === 'report'
+      ? client.report(owner, id, run, { markdown: '# Report', sources: [] })
+      : client.cancel(owner, 'project-a', id, run);
+    await assert.rejects(action, (error) => error.status === 503);
+    assert.equal(calls.length, 2, op);
+    assert.deepEqual(calls[0], calls[1], op);
+  }
+});
+
+test('research cancel retries a malformed snapshot and accepts only the bound job', async () => {
+  const calls = [];
+  const owner = { start: 'a'.repeat(32), born: '100', owner: '33333333-3333-4333-8333-333333333333' };
+  const id = '11111111-1111-4111-8111-111111111111';
+  const run = '22222222-2222-4222-8222-222222222222';
+  const client = psc.createClient({ port: 1, token: TOKEN, fetchImpl: async (url, init) => {
+    assert.match(url, /\/v1\/research-jobs\/cancel$/);
+    calls.push(JSON.parse(init.body));
+    return new Response(JSON.stringify(calls.length === 1
+      ? { id, projectId: 'another-project', kind: 'deep_research', status: 'running' }
+      : { id, projectId: 'project-a', kind: 'deep_research', status: 'running' }), { status: 200 });
+  } }).researchJobsFor(USER);
+  assert.equal((await client.cancel(owner, 'project-a', id, run)).projectId, 'project-a');
+  assert.equal(calls.length, 2);
+  assert.deepEqual(calls[0], calls[1]);
+});
+
 test('no flock path is left: a coordinated file without the store is refused', () => {
   assert.throws(() => rp.createProjectsFile('/nonexistent/projects.json', {}), /Rust project store/);
   assert.throws(() => rp.createFreeChatsFile('/nonexistent/free-chats.json', {}), /Rust project store/);

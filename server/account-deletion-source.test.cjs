@@ -117,7 +117,7 @@ test('a detached source job cannot recreate its journal or extracted source afte
   documents.extractDocumentText = async () => { entered.resolve(); await release.promise; return extracted; };
   try {
     const jobs = require('./source-jobs.cjs');
-    jobs.start(f.workspace, 'p1', async () => {
+    await jobs.start(f.workspace, 'p1', async () => {
       try { await documentSources.ingest(f.workspace, 'p1', 'background.pdf', Buffer.from('%PDF synthetic background'), null); }
       finally { completed.resolve(); }
       return { status: 200, body: { ok: true } };

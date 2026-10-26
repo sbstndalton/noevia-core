@@ -630,13 +630,88 @@ function createProjectStore({
   // PUT is create-only with If-None-Match, so a file appearing in between is not overwritten).
   // `adoptAccount` is the storage account (project-edit-target.storageAccount) the move was approved
   // for; with any other account connected now the write is refused.
-  function writeProjectTextFile(project, name, text, { expectName, expectContent, expectAttachment, adoptTo, adoptAccount } = {}) {
+  // A configured Nextcloud kind is not evidence that its remote honours conditional PUT.
+  // Probe only a private random file in this project's Text folder. No user file is touched.
+  // The report PUT starts only after 412 and byte-for-byte preservation have been observed.
+  async function verifyResearchCreateOnly(connection, folder) {
+    const probe = `${folder}/Text/noevia-research-create-probe-${require('node:crypto').randomUUID()}.tmp`;
+    const first = Buffer.from(require('node:crypto').randomUUID());
+    const second = Buffer.from(require('node:crypto').randomUUID());
+    let cleaned = false;
+    try {
+      await storageClient.createFolder(connection, `${folder}/Text`);
+      const receipt = await storageClient.writeFile(connection, probe, first, { ifNoneMatch: '*' });
+      if (receipt?.created !== true) throw Error('the storage server did not confirm a new conditional file');
+      let refused = false;
+      try { await storageClient.writeFile(connection, probe, second, { ifNoneMatch: '*' }); }
+      catch (error) { if (error?.code === 'changed') refused = true; else throw error; }
+      if (!refused) throw Error('the storage server accepted a second create-only write');
+      const bytes = await storageClient.readBinaryFile(connection, probe, { cap: 64 });
+      if (!Buffer.from(bytes).equals(first)) throw Error('the storage server changed a create-only file');
+      const version = await storageClient.fileVersion(connection, probe);
+      if (!version.exists || !version.etag) throw Error('the storage server did not return a version for safe probe cleanup');
+      cleaned = (await storageClient.discardWritten(connection, probe, version.etag)).deleted;
+      if (!cleaned) throw Error('the storage server could not clean up the conditional-write probe');
+    } catch (cause) {
+      if (!cleaned) {
+        // Best effort only for our exact random bytes and an exact current ETag. Never
+        // delete a file whose content changed after this process last observed it.
+        try {
+          const bytes = await storageClient.readBinaryFile(connection, probe, { cap: 64 });
+          if (Buffer.from(bytes).equals(first) || Buffer.from(bytes).equals(second)) {
+            const version = await storageClient.fileVersion(connection, probe);
+            if (version.exists && version.etag) cleaned = (await storageClient.discardWritten(connection, probe, version.etag)).deleted;
+          }
+        } catch { /* leave the private probe for review if its outcome is unknown */ }
+      }
+      const leftover = cleaned ? '' : ` A private probe may remain at "${probe}"; review it before removing it.`;
+      throw Object.assign(new Error(`Storage did not verify create-only report writes; no report file was written.${leftover}`), { status: 503, definitelyNotWritten: true, cause });
+    }
+  }
+  // A nonsecret, durable identity for the exact account/project destination. The journal stores
+  // this digest with the report intent, so a later explicit retry cannot silently move to a new
+  // storage connection, project folder, or local fallback after a disconnect.
+  function researchTargetKey(workspace, project, name, remote) {
+    const uploads = require('./uploads.cjs');
+    const account = remote ? require('./project-edit-target.cjs').storageAccount(remote) : null;
+    const destination = uploads.destinationFor(project, name, { connection: remote });
+    return require('node:crypto').createHash('sha256').update(JSON.stringify([
+      'research-report-target-v1', workspace.userId, project.id, remote ? 'remote' : 'local', account, destination,
+    ])).digest('hex');
+  }
+  async function researchReportTarget(project, name) {
+    return withSourceLock(project, async () => {
+      const workspace = currentWorkspace();
+      if (getProject(project.id) !== project) throw Object.assign(Error('The research project changed before its report write.'), { status: 409, definitelyNotWritten: true });
+      const connection = authService.getStorage(workspace.userId, true);
+      const remote = storageClient.isBrowsable(connection) ? connection : null;
+      if (remote && !project.projectFolder) {
+        const folder = await ensureProjectFolder(project);
+        if (!folder) throw Object.assign(Error('The research report folder is unavailable; no report file was written.'), { status: 503, definitelyNotWritten: true });
+        if (getProject(project.id) !== project) throw Object.assign(Error('The research project changed before its report write.'), { status: 409, definitelyNotWritten: true });
+        project.projectFolder = folder;
+        project.sourceFolders = [...new Set([...(project.sourceFolders || []), folder])];
+        await saveProjects(PROJECTS);
+      }
+      workspace.assertActive?.();
+      if (getProject(project.id) !== project) throw Object.assign(Error('The research project changed before its report write.'), { status: 409, definitelyNotWritten: true });
+      return researchTargetKey(workspace, project, name, remote);
+    });
+  }
+  function writeProjectTextFile(project, name, text, { expectName, expectContent, expectAttachment, adoptTo, adoptAccount, createOnly = false, expectedTarget } = {}) {
+    let remoteMode = false, remotePutStarted = false, localIngestStarted = false;
     return withSourceLock(project, async () => {
       if (getProject(project.id) !== project) throw new Error('the project changed while writing; nothing was saved');
       const uploads = require('./uploads.cjs');
       const bytes = Buffer.from(text, 'utf8');
       uploads.validate(name, bytes);
       const edit = expectName !== undefined;
+      if (createOnly) {
+        if (edit || adoptTo !== undefined) throw Object.assign(new Error('create-only write cannot edit an existing file'), { status: 400, definitelyNotWritten: true });
+        if ((project.files || []).some((f) => f && String(f.name).split('/').pop() === name)) {
+          throw Object.assign(new Error(`"${name}" already exists in this project; no report file was overwritten`), { status: 409, code: 'changed', definitelyNotWritten: true });
+        }
+      }
       let current = null;
       if (edit) {
         if (typeof expectName !== 'string' || !expectName) throw new Error('an edit must name the stored file it changes; nothing was saved');
@@ -652,6 +727,16 @@ function createProjectStore({
       }
       const connection = authService.getStorage(currentWorkspace().userId, true);
       const remote = storageClient.isBrowsable(connection) ? connection : null;
+      remoteMode = !!remote;
+      if (createOnly && expectedTarget && researchTargetKey(currentWorkspace(), project, name, remote) !== expectedTarget) {
+        throw Object.assign(Error('The research report target changed before the write; no report file was written.'), { status: 409, definitelyNotWritten: true });
+      }
+      // Research reports are new files only. Nextcloud enforces If-None-Match: * atomically;
+      // generic WebDAV may ignore it, and S3 writes are not supported here. Refuse those
+      // backends before any PUT instead of claiming create-only safety they cannot provide.
+      if (createOnly && remote && connection.kind !== 'nextcloud') {
+        throw Object.assign(new Error('Research report auto-save needs local or Nextcloud storage; no file was written.'), { status: 409, definitelyNotWritten: true });
+      }
       let ifMatch, ifNoneMatch;
       const adopt = edit && adoptTo !== undefined;
       if (adopt) {
@@ -684,11 +769,40 @@ function createProjectStore({
         }
         if (remote) ifMatch = await confirmStoredVersion(remote, expectName, current);
       } else if (remote && !project.projectFolder) project.projectFolder = await ensureProjectFolder(project);
+      let writeStorage = storageClient;
+      if (createOnly && remote) {
+        if (!project.projectFolder) throw Object.assign(new Error('The research report folder is unavailable; no report file was written.'), { status: 503, definitelyNotWritten: true });
+        const selectedUser = currentWorkspace().userId;
+        const selectedFolder = project.projectFolder;
+        const selectedConnection = JSON.stringify(remote);
+        const selectedPath = uploads.destinationFor(project, name, { connection: remote });
+        await verifyResearchCreateOnly(remote, selectedFolder);
+        ifNoneMatch = '*';
+        // Check again at the actual report PUT, after uploads.ingest's awaits. The probe
+        // applies only to this account, project folder, storage connection and target.
+        writeStorage = { ...storageClient, writeFile: (conn, path, content, options) => {
+          const active = currentWorkspace();
+          if (active.userId !== selectedUser || getProject(project.id) !== project
+            || project.projectFolder !== selectedFolder || conn !== remote || path !== selectedPath
+            || options?.ifNoneMatch !== '*'
+            || expectedTarget && researchTargetKey(active, project, name, remote) !== expectedTarget
+            || JSON.stringify(authService.getStorage(selectedUser, true)) !== selectedConnection) {
+            throw Object.assign(new Error('The research report target changed after its storage check; no file was written.'), { status: 409, definitelyNotWritten: true });
+          }
+          active.assertActive?.();
+          remotePutStarted = true;
+          return storageClient.writeFile(conn, path, content, options);
+        } };
+      }
       let file;
       try {
-        file = await uploads.ingest(currentWorkspace(), project, name, bytes, { connection: remote, storageImpl: storageClient, ...(adopt ? { ifNoneMatch } : edit && remote ? { ifMatch } : {}) });
+        if (createOnly && !remote) localIngestStarted = true;
+        file = await uploads.ingest(currentWorkspace(), project, name, bytes, { connection: remote, storageImpl: writeStorage, ...(adopt || createOnly && remote ? { ifNoneMatch } : edit && remote ? { ifMatch } : {}) });
       } catch (err) {
         if (adopt && err && err.code === 'changed') throw new Error(`"${adoptTo}" appeared in storage while this edit was being saved, so it was not overwritten. Nothing was saved. Sync this project's Sources, then edit that file.`);
+        if (createOnly && err && err.code === 'changed') {
+          throw Object.assign(new Error(`"${name}" already exists in storage; the report was not written. Sync this project's Sources and review the file.`), { status: 409, code: 'changed', definitelyNotWritten: true });
+        }
         if (err && err.code === 'changed') throw new Error(changedInStorage(expectName));
         if (edit && err && err.code === 'unknown') throw new Error(`The connection to storage failed while saving "${adopt ? adoptTo : expectName}", so noevia cannot tell whether the edit landed. Outcome unknown: sync this project's Sources to check whether it was saved before trying again.`);
         throw err;
@@ -709,6 +823,11 @@ function createProjectStore({
         afterSaved(() => { if (!(getProject(project.id)?.files || []).some((f) => f && f.name === expectName)) rag.deleteProjectFile(project.id, expectName, userId); }, 'index cleanup');
       }
       return file;
+    }).catch((error) => {
+      // Before a remote report PUT, no report file can have landed. Local ingestion may have
+      // written a content-addressed blob, so only classify errors before it starts.
+      if (createOnly && (remoteMode ? !remotePutStarted : !localIngestStarted)) error.definitelyNotWritten = true;
+      throw error;
     });
   }
   // D8: runs after the delete is saved; empty-only, tenant-scoped, never recursive.
@@ -874,7 +993,7 @@ function createProjectStore({
     saveProjects, whenSaved, getProject, sanitizeChats, loadChats, saveChats, chatIdsElsewhere, deleteChat, purgeProjectChats, saveFreeChats, deleteFreeChat, setChatFlags, setChatTitle, chatAutoNamed, createProject,
     deleteProject, removeChatAttachments, removeOrphanChatContexts,
     historyPath, readHistory,
-    ownsFile, ensureProjectFolder, ensureProjectFolderDetailed, withSourceLock, pruneDocuments, writeProjectTextFile, sweepDeletedProject, indexSource,
+    ownsFile, ensureProjectFolder, ensureProjectFolderDetailed, withSourceLock, pruneDocuments, researchReportTarget, writeProjectTextFile, sweepDeletedProject, indexSource,
   };
 }
 
