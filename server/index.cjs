@@ -1256,6 +1256,7 @@ async function handleRequestScoped(req, res) {
     if (require('./rust-auth.cjs').refuseOwned(req, res, p, json)) return;
     // So are the M4 project routes (#1071): Node refuses them whoever asks.
     if (require('./rust-projects.cjs').refuseOwnedRoute(req, res, p, json)) return;
+    if (require('./rust-web-address.cjs').refuseOwnedRead(req, res, p, json)) return;
     if (await diaryRoutes.connector(req, res, { path: p })) return;
     if ((p === '/api/instance' || p === '/.well-known/webauthn') && await webAddressRoutes(req, res, { path: p, authn: null })) return;
     if (await deviceRoutes.open(req, res, { path: p })) return;
