@@ -8,6 +8,7 @@ const path = require('node:path');
 const crypto = require('node:crypto');
 const { createQueue } = require('../../server/project-store-client.cjs');
 
+const sourceOwners = new Map();
 const sha = (t) => crypto.createHash('sha256').update(t, 'utf8').digest('hex');
 
 /** A client for files `<root>/users/<user>/<file>`; with `flat`, `<root>/<file>` (a bare dir). */
@@ -18,6 +19,43 @@ function createStubStore(root, { flat = false } = {}) {
   const transcripts = (user) => require('./project-store-server.cjs').localTranscripts(flat ? root : path.join(root, 'users', user));
   return {
     writes,
+    // Source-job stand-in for Node route tests. Production has no local journal fallback;
+    // Rust integration tests verify the actual writer and Node-readable JSONL format.
+    sourceJobsFor(user) {
+      const dir = flat ? root : path.join(root, 'users', user);
+      const jobs = require('../../server/jobs.cjs').createJobs({ dir, kinds: ['source'], retainMs: 15 * 60000, maxJobs: 16 });
+      const requests = new Map();
+      return {
+        async recover(owner) {
+          const previous = sourceOwners.get(dir);
+          if (previous !== owner.owner) { sourceOwners.set(dir, owner.owner); jobs.recover(); }
+          return { count: 0 };
+        },
+        async start(_owner, projectId, request) {
+          if (requests.has(request)) return requests.get(request);
+          if (jobs.list({ kind: 'source', active: true }).length >= 2) throw Object.assign(Error('busy'), { status: 429 });
+          const id = jobs.create({ kind: 'source', projectId, capabilities: ['project.sources.write'] });
+          jobs.append(id, 'job.started');
+          const started = { id, run: crypto.randomUUID() };
+          requests.set(request, started);
+          return started;
+        },
+        async abandon(_owner, request) {
+          const started = requests.get(request), job = started && jobs.get(started.id);
+          if (job && !['completed', 'failed', 'cancelled', 'interrupted'].includes(job.status)) jobs.append(started.id, 'job.interrupted', { reason: 'Source processing was not confirmed.' });
+          return { ok: true };
+        },
+        async progress(_owner, id, _run, stage, n) { jobs.append(id, 'progress', { stage, n }); return { ok: true }; },
+        async finish(_owner, id, _run, ok, result, error) {
+          jobs.append(id, ok ? 'job.completed' : 'job.failed', ok ? { result } : { error, result });
+          return { ok: true };
+        },
+        async read(projectId, id) {
+          let job; try { job = jobs.get(id); } catch { return null; }
+          return job?.kind === 'source' && job.projectId === projectId ? job : null;
+        },
+      };
+    },
     async read(user, file) {
       if (!fs.existsSync(path.dirname(fileOf(user, file)))) throw Object.assign(new Error('account no longer exists'), { status: 410 });
       const text = now(fileOf(user, file)); return { version: text === null ? '' : sha(text), text };

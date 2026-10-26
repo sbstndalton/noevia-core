@@ -73,6 +73,8 @@ test('every sign-in and account route is refused, signed in or not, and nothing 
     ['PUT', '/api/profile/appearance', { theme: 'dark' }],
     ['PUT', '/api/profile/features', { diaryEnabled: true }],
     ['POST', '/api/profile/onboarding', {}],
+    ['GET', '/api/profile/sharing'],
+    ['PUT', '/api/profile/sharing', { scope: 'off' }],
     ['GET', '/api/profile/app-passwords'],
     ['POST', '/api/profile/app-passwords', { name: 'Phone', scope: 'lan' }],
     ['DELETE', `/api/profile/app-passwords/${'a'.repeat(32)}`],
@@ -101,8 +103,10 @@ test('every sign-in and account route is refused, signed in or not, and nothing 
 test('the account routes Node still answers keep working', async () => {
   const admin = seedAccount(dataDir, { username: 'routes-owner', publicOrigin: 'http://localhost' });
   const member = seedAccount(dataDir, { username: 'routes-member', role: 'member' });
-  assert.equal((await request('/api/profile/sharing', { headers: { cookie: admin.cookie } })).status, 200);
-  assert.equal((await request('/api/account/retention', { headers: { cookie: admin.cookie } })).status, 200);
+  // sbstndalton/noevia#1071: the retention preview (GET) is the Rust front's; its PUT is Node's.
+  const preview = await request('/api/account/retention', { headers: { cookie: admin.cookie } });
+  assert.equal(preview.status, 503);
+  assert.deepEqual(preview.json, ROUTE_REFUSAL);
   for (const url of ['/api/instance', '/.well-known/webauthn', '/api/admin/web-address']) {
     for (const headers of [{}, { cookie: admin.cookie }]) {
       const read = await request(url, { headers });

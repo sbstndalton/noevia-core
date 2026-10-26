@@ -16,9 +16,12 @@ test('retention PUT refuses to delete more chats than were confirmed', async () 
   const url = `http://127.0.0.1:${server.address().port}/api/account/retention`;
   const put = (body) => fetch(url, { method: 'PUT', body: JSON.stringify(body) }).then(async (r) => ({ status: r.status, body: await r.json() }));
   try {
-    assert.equal((await fetch(url).then((r) => r.json())).preview['90'], 1);
+    // #1071: the preview GET is the Rust front's; were one to reach this module it is not answered.
+    const got = await fetch(url);
+    assert.equal(got.status, 405); assert.deepEqual(await got.json(), { error: 'method not allowed' });
     let r = await put({ days: 90 });
     assert.equal(r.status, 409); assert.deepEqual(removed, []);
+    assert.deepEqual(r.body.preview, { 30: 1, 90: 1, 365: 0 }, 'the refusal carries the preview the GET used to');
     assert.equal(fs.existsSync(path.join(dir, 'chat-retention.json')), false, 'nothing saved');
     r = await put({ days: 90, confirmDeletes: 1 });
     assert.equal(r.status, 200); assert.equal(r.body.deleted, 1); assert.deepEqual(removed, ['old']);

@@ -1,0 +1,35 @@
+name: Generated feature catalog
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  feature-catalog:
+    name: Canonical Rust catalog matches production Node mirror
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 22.23.3
+      - name: Read the pinned canonical Rust commit
+        id: catalog
+        run: |
+          set -euo pipefail
+          ref=$(node -e "const l=require('./server/feature-catalog.lock.json'); if(!/^[0-9a-f]{40}$/.test(l.canonicalRef)) process.exit(1); process.stdout.write(l.canonicalRef)")
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: sbstndalton/noevia-rs
+          ref: ${{ steps.catalog.outputs.ref }}
+          path: canonical-rs
+      - name: Generated mirror and Rust code match canonical bytes
+        run: |
+          set -euo pipefail
+          cmp server/feature-catalog.json canonical-rs/contracts/features/catalog.json
+          python3 canonical-rs/tools/features/generate_catalog.py --check --core-output "$PWD/server/feature-catalog.json"
+          node canonical-rs/tools/features/check_generated_core.cjs "$PWD"
+      - run: npm ci --prefix server --no-fund --no-audit
+      - run: node --test server/feature-catalog.test.cjs server/features.test.cjs server/routes/features.test.cjs

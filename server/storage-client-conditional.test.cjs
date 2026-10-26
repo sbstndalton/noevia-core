@@ -10,6 +10,7 @@ const { fileVersion, writeFile } = require('./storage-client.cjs');
 function startDav(t) {
   const files = new Map([['Docs/notes.md', { body: 'v1', etag: '"e1"' }], ['Docs/bare.md', { body: 'b', etag: '' }]]);
   const seen = [];
+  let dropNextPutReply = false;
   const server = http.createServer((req, res) => {
     const p = decodeURIComponent(req.url).replace(/^\/dav\//, '').replace(/\/+$/, '');
     let raw = '';
@@ -28,6 +29,7 @@ function startDav(t) {
         if (req.headers['if-match'] && (!f || f.etag !== req.headers['if-match'])) { res.writeHead(412); return res.end(); }
         if (req.headers['if-none-match'] === '*' && f) { res.writeHead(412); return res.end(); }
         files.set(p, { body: raw, etag: `"w${seen.length}"` });
+        if (dropNextPutReply) { dropNextPutReply = false; return res.destroy(); }
         res.writeHead(201); return res.end();
       }
       res.writeHead(405); res.end();
@@ -35,7 +37,7 @@ function startDav(t) {
   });
   return new Promise((resolve) => server.listen(0, '127.0.0.1', () => {
     t.after(() => new Promise((r) => server.close(r)));
-    resolve({ conn: { kind: 'webdav', baseUrl: `http://127.0.0.1:${server.address().port}/dav`, username: 'u', secret: 's' }, files, seen });
+    resolve({ dropNextPutReply: () => { dropNextPutReply = true; }, conn: { kind: 'webdav', baseUrl: `http://127.0.0.1:${server.address().port}/dav`, username: 'u', secret: 's' }, files, seen });
   }));
 }
 
@@ -81,4 +83,19 @@ test('#687: writeFile with ifNoneMatch creates only; an existing file is a chang
   await assert.rejects(() => writeFile(conn, 'Docs/x.md', Buffer.from('x'), { ifNoneMatch: '"e1"' }), /invalid If-None-Match/);
   await assert.rejects(() => writeFile(conn, 'Docs/x.md', Buffer.from('x'), { ifNoneMatch: '*', ifMatch: '"e1"' }), /cannot be combined/);
   assert.equal(seen.length, count, 'refused before any request');
+});
+
+test('create-only PUT sends one request on lost reply and refuses concurrent replacement', async (t) => {
+  const { conn, files, seen, dropNextPutReply } = await startDav(t);
+  const selected = { ...conn, kind: 'nextcloud' };
+  dropNextPutReply();
+  await assert.rejects(() => writeFile(selected, 'Docs/research.md', Buffer.from('first'), { ifNoneMatch: '*' }),
+    (e) => e.code === 'unknown');
+  assert.equal(seen.filter((r) => r.method === 'PUT' && r.path === 'Docs/research.md').length, 1, 'conditional write is never internally retried');
+  assert.equal(files.get('Docs/research.md').body, 'first');
+  files.set('Docs/research.md', { body: 'concurrent replacement', etag: '"other"' });
+  await assert.rejects(() => writeFile(selected, 'Docs/research.md', Buffer.from('first'), { ifNoneMatch: '*' }),
+    (e) => e.code === 'changed');
+  assert.equal(files.get('Docs/research.md').body, 'concurrent replacement');
+  assert.deepEqual(seen.filter((r) => r.method === 'PUT' && r.path === 'Docs/research.md').map((r) => r.ifNoneMatch), ['*', '*']);
 });

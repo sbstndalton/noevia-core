@@ -22,28 +22,13 @@ function configuration(env = process.env, publicOrigin = '') {
   const bindHost = env.COWORK_DAV_HOST || env.UI_HOST || '0.0.0.0';
   return { available: true, port, scope, origin: url.origin, host: url.host, bindHost, cleartext: url.protocol === 'http:', proxyToken };
 }
-function createDavSettings({ auth, config }) {
+// Settings -> Sharing (GET/PUT /api/profile/sharing) is the Rust front's (sbstndalton/noevia#1071,
+// noevia-rs crates/server-account `sharing`): it writes dav_settings, rust-auth.cjs refuses Node's
+// writes to it. This module creates the table at boot and the DAV listener reads the opt-in.
+function createDavSettings({ auth }) {
   auth.db.exec(`CREATE TABLE IF NOT EXISTS dav_settings(user_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
     scope TEXT NOT NULL CHECK(scope IN ('off','lan','public')), acknowledged_at INTEGER, updated_at INTEGER NOT NULL);`);
   const scope = userId => auth.db.prepare('SELECT scope FROM dav_settings WHERE user_id=?').get(userId)?.scope || 'off';
-  return {
-    scope,
-    get(user) {
-      return { available: config.available, reasonId: config.reasonId, reason: config.reason, scope: scope(user.id), endpointScope: config.scope,
-        cleartext: config.cleartext || false, port: config.port,
-        url: config.available ? `${config.origin}/dav/${encodeURIComponent(user.username)}/` : '',
-        eligible: auth.diaryEnabled(user.id) && auth.getStorage(user.id).kind === 'local' };
-    },
-    save(user, value) {
-      if (!['off','lan','public'].includes(value.scope)) throw Error('Choose a sharing scope.');
-      if (value.scope !== 'off' && (!config.available || value.scope !== config.scope)) throw Error('This sharing scope is not configured by the operator.');
-      if (value.scope !== 'off' && (!auth.diaryEnabled(user.id) || auth.getStorage(user.id).kind !== 'local')) throw Error('Sharing requires enabled Diary with server-held local storage.');
-      if (value.scope !== 'off' && config.cleartext && value.acknowledgeCleartext !== true) throw Error('Acknowledge that plain HTTP sends device credentials unencrypted.');
-      auth.db.prepare(`INSERT INTO dav_settings VALUES(?,?,?,?) ON CONFLICT(user_id) DO UPDATE SET scope=excluded.scope,acknowledged_at=excluded.acknowledged_at,updated_at=excluded.updated_at`)
-        .run(user.id,value.scope,value.acknowledgeCleartext === true ? Date.now() : null,Date.now());
-      auth.audit('dav.sharing',user.id,user.id,{ scope:value.scope });
-      return this.get(user);
-    },
-  };
+  return { scope };
 }
 module.exports = { configuration, createDavSettings };
