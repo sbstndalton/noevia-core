@@ -2,8 +2,8 @@
 // M3 (rust-auth.cjs) on createAuth's real database, permanent since sbstndalton/noevia#1071: the
 // account tables are written by the Rust front only. Node's sign-in and account writers are gone,
 // any write to those tables on its connection is refused (503), its request gate is read-only, the
-// address follows settings, and the writers that stay Node's (account deletion, Settings -> Web
-// address, the DAV listener, revoking every device grant) still work. The accounts are written
+// address follows settings, and the writers that stay Node's (account deletion, the DAV
+// listener, revoking every device grant) still work. The accounts are written
 // through a separate connection, as the front writes them. Synthetic accounts in a throwaway data dir.
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
@@ -87,7 +87,8 @@ test('the address follows settings the Rust front writes', async (t) => {
   const f = await fixture(t);
   assert.equal(f.auth.origin, ORIGIN);
   const NEXT = 'https://next.example.test';
-  f.guard.exempt(() => f.auth.db.prepare("INSERT OR REPLACE INTO settings(key,value) VALUES('public_origin_admin',?)").run(NEXT));
+  const front = new Database(path.join(f.dir, 'cowork.db'));
+  try { front.prepare("INSERT OR REPLACE INTO settings(key,value) VALUES('public_origin_admin',?)").run(NEXT); } finally { front.close(); }
   assert.equal(f.auth.origin, NEXT);
   assert.equal(f.auth.rpId, 'next.example.test');
   assert.equal(f.auth.originSource, 'settings');
@@ -97,11 +98,6 @@ test('the address follows settings the Rust front writes', async (t) => {
 
 test('the writers that stay Node\'s still work', async (t) => {
   const f = await fixture(t);
-  // Settings -> Web address.
-  assert.equal(f.auth.changeOrigin('https://renamed.example.test', f.userId), null);
-  assert.equal(f.auth.origin, 'https://renamed.example.test');
-  assert.deepEqual(f.auth.previousOrigins, [ORIGIN]);
-  assert.equal(f.auth.originValid(req(null, { origin: ORIGIN })), true);
   // The DAV listener's last_used_at.
   const dav = await f.auth.appPasswords.verifyDav('owner', f.app.password, 'lan');
   assert.equal(dav.credentialId, f.app.id);

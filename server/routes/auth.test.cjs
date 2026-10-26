@@ -1,5 +1,5 @@
 'use strict';
-// The account mount over a fake auth service: Settings -> Sharing, the administrator gate on
+// The account mount over a fake auth service: the administrator gate on
 // /api/admin/*, the secrets rotation and account deletion. Everything else that was here is the
 // Rust front's (#1071). The session and CSRF checks before the mount are the router's.
 const test = require('node:test');
@@ -16,7 +16,6 @@ function fixture() {
     json: (res, status, body) => { sent.push({ status, body }); },
     readJson: async (req) => { let s = ''; for await (const c of req) s += c; return s ? JSON.parse(s) : {}; },
     authService,
-    davSettings: { get: (user) => ({ user: user.id, enabled: false }), save: (_u, body) => { if (body.bad) throw new Error('no'); return body; } },
     workspaceStore: { remove: (id) => calls.push(['workspace.remove', id]) },
     driveAccounts: { removeUser: async (id) => calls.push(['drive.removeUser', id]) },
     fetchJson: async (url, init) => { calls.push(['fetch', url, init.method, init.headers]); return { ok: true }; },
@@ -52,14 +51,10 @@ test('only the account mount is left, and it does not answer the Rust front\'s r
   assert.equal(await f.call('account', 'GET', '/api/integrations/storage'), false, 'storage is another module');
 });
 
-test('Settings -> Sharing keeps its codes', async () => {
+test('Settings -> Sharing is the Rust front\'s (#1071): the mount passes it on', async () => {
   const f = fixture();
-  await f.call('account', 'GET', '/api/profile/sharing');
-  assert.deepEqual(f.sent.pop(), { status: 200, body: { user: 'u1', enabled: false } });
-  await f.call('account', 'PUT', '/api/profile/sharing', { bad: true });
-  assert.deepEqual(f.sent.pop(), { status: 400, body: { error: 'no' } });
-  await f.call('account', 'PUT', '/api/profile/sharing', { enabled: true });
-  assert.deepEqual(f.sent.pop(), { status: 200, body: { enabled: true } });
+  for (const method of ['GET', 'PUT']) assert.equal(await f.call('account', method, '/api/profile/sharing', {}), false, method);
+  assert.deepEqual(f.sent, []);
 });
 
 test('the admin routes Node still answers refuse members first', async () => {

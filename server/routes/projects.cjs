@@ -162,7 +162,7 @@ function createProjectRoutes({
     if (sourceJob && req.method === 'GET') {
       const projectId = decodeURIComponent(sourceJob[1]);
       if (!getProject(projectId)) return json(res, 404, { error: 'project not found' });
-      const job = require('../source-jobs.cjs').read(currentWorkspace(), projectId, sourceJob[2]);
+      const job = await require('../source-jobs.cjs').read(currentWorkspace(), projectId, sourceJob[2]);
       return json(res, job ? 200 : 404, job || { error: 'Processing status expired or the server restarted; refresh or re-upload to retry.' });
     }
     const backgroundSource = p.match(/^\/api\/projects\/([^/]+)\/(upload|documents|sources\/sync)$/);
@@ -172,7 +172,7 @@ function createProjectRoutes({
       const hold = backgroundSource[2] === 'sources/sync' ? automaticHold(authn, req) : null;
       if (hold) return holdReply(res, hold);
       const body = await readJson(req, Math.ceil((backgroundSource[2] === 'upload' ? require('../pdf-reduce.cjs').INPUT_CAP : DOCUMENT_UPLOAD_CAP) / 3) * 4 + 512 * 1024);
-      const jobId = require('../source-jobs.cjs').start(currentWorkspace(), projectId, async (progress) => {
+      const jobId = await require('../source-jobs.cjs').start(currentWorkspace(), projectId, async (progress) => {
         const inner = require('node:stream').Readable.from([Buffer.from(JSON.stringify(body))]);
         Object.assign(inner, { method: req.method, url: p, headers: req.headers, socket: req.socket });
         let status = 500, data = '';

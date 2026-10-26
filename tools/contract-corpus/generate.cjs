@@ -193,7 +193,9 @@ async function main() {
     // A second account (seeded above): the tenant boundary is part of the contract.
     await step(member, 'GET', '/api/workspace');
     if (chatId) await step(member, 'GET', `/api/chats/${encodeURIComponent(chatId)}/history`);
-    await step(member, 'GET', '/api/admin/web-address', undefined, [403]);
+    // Address GETs are refused before Node's auth: the Rust front owns this read for every role.
+    const addressRead = await step(member, 'GET', '/api/admin/web-address', undefined, [503]);
+    if (addressRead.json?.code !== 'RUST_WEB_ADDRESS_READ_OWNED') throw new Error('Expected the Rust web-address read ownership refusal.');
     const memberId = seeded.member.id;
 
     // The reasoning default's PUT and the routing configuration are the Rust front's since #1071
