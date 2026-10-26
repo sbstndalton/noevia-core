@@ -120,6 +120,34 @@ the agent beside noevia's own state.
 The harness version is pinned as a build argument. An agent that updates itself is a
 supply-chain change nobody reviewed, in the one container allowed to run arbitrary commands.
 
+## Draft native supervisor packaging (#1071)
+
+The image keeps the Node supervisor as its default. The distinct
+CODE_SANDBOX_SUPERVISOR_IMPL selector accepts only node and rust. Choosing rust
+also requires SANDBOX_BRIDGE_IMPL=rust; the selector validates the two fixed
+read-only sibling executables, resolves only the image-reviewed opencode or
+node harness to an absolute path, and loads the checksum-pinned sandbox bridge
+WASM before exec. An unavailable binary, helper, harness or module refuses
+startup, without falling back to Node. Setting the selector back to node runs
+the original supervisor. The current Compose override still supplies the JS
+bridge by default, so this source change alone cannot activate native mode.
+
+The Dockerfile builds both native binaries from a separately checked, immutable
+noevia-rs archive at the reviewed supervisor source revision. This draft pin
+does not change sandbox-bridge.lock or the shared release pins. The final image
+retains Node 22, the pinned npm harness, pi-acp-bridge.cjs and verifier.cjs.
+The selector is CMD, not ENTRYPOINT: code-verify's explicit Node verifier
+command still bypasses it. Its separate no-network container and security
+settings are outside this source change.
+
+The native source's synthetic lifecycle suite covers session readiness, early
+client disconnect and descendant cleanup. The selector's own synthetic tests
+use fake commands in read-only temporary directories, without Docker or a real
+harness. Neither test set qualifies a built image. Before an image cutover,
+build the image from reconciled pins and verify both binary permissions and
+the complete ACP, pi bridge, verifier and container isolation paths in a
+separate nonproduction qualification.
+
 ## pi (not installed by default)
 
 pi has no permission prompts of its own and speaks JSONL RPC rather than ACP. noevia pins it with
