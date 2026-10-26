@@ -81,8 +81,8 @@ function fixture(t) {
 }
 
 test('Docker source pins the native archive and leaves verifier on explicit Node command', () => {
-  assert.match(dockerfile, /NATIVE_SUPERVISOR_RS_REF=c98b0aa776183a844aa220f1f910f6f3107cd523/);
-  assert.match(dockerfile, /NATIVE_SUPERVISOR_RS_SHA256=fe25d647e98c6a653350c6b30d3e31e45985140a528ea56b247b27952bc29ee5/);
+  assert.match(dockerfile, /NATIVE_SUPERVISOR_RS_REF=120533acc5362a81a2c24483320534873d402f9d/);
+  assert.match(dockerfile, /NATIVE_SUPERVISOR_RS_SHA256=18add3ce17a73666a3673ea16d94b5b4d88b81a204cad214ffd8a4e1cbe8026c/);
   assert.match(dockerfile, /sha256sum -c -/);
   assert.match(dockerfile, /cargo build --locked --release -p code-sandbox-supervisor --bins/);
   assert.match(dockerfile, /COPY --from=native-supervisor --chmod=0555 .*code-sandbox-supervisor/);

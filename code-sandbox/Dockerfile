@@ -31,8 +31,8 @@ RUN set -e; rustup target add wasm32-unknown-unknown; \
 # from sandbox-bridge.lock until the reviewed native source and image qualify
 # together. A release must reconcile the two refs through the normal pin gate.
 FROM node:22-bookworm-slim AS native-supervisor-src
-ARG NATIVE_SUPERVISOR_RS_REF=c98b0aa776183a844aa220f1f910f6f3107cd523
-ARG NATIVE_SUPERVISOR_RS_SHA256=fe25d647e98c6a653350c6b30d3e31e45985140a528ea56b247b27952bc29ee5
+ARG NATIVE_SUPERVISOR_RS_REF=120533acc5362a81a2c24483320534873d402f9d
+ARG NATIVE_SUPERVISOR_RS_SHA256=18add3ce17a73666a3673ea16d94b5b4d88b81a204cad214ffd8a4e1cbe8026c
 RUN set -eu; \
     printf '%s\n' "$NATIVE_SUPERVISOR_RS_REF" | grep -Eq '^[0-9a-f]{40}$'; \
     printf '%s\n' "$NATIVE_SUPERVISOR_RS_SHA256" | grep -Eq '^[0-9a-f]{64}$'; \
