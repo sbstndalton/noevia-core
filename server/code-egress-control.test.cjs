@@ -147,21 +147,36 @@ test('fresh file publication is confined to an owned profile and never repairs u
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
 test('actual paired Rust binary authenticates Ready, scoped cleanup, retained reports and Forget', async () => {
-  const { spawn } = require('node:child_process'), net = require('node:net');
+  const { spawn } = require('node:child_process'), { once } = require('node:events'), net = require('node:net');
   const binary = process.env.NOEVIA_EGRESS_CONTROL_BINARY; assert.ok(binary, 'explicit paired Rust binary is required');
   const digest = crypto.createHash('sha256').update(fs.readFileSync(binary)).digest('hex');
   assert.equal(digest, process.env.NOEVIA_EGRESS_CONTROL_BINARY_SHA256, 'binary provenance must match the source build receipt');
-  const dir = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), 'noevia-core-native-'));
-  let child, client; let exited = false;
+  const hermetic = globalThis[Symbol.for('noevia.hermetic.nativeFixture.v1')];
+  if (process.env.NOEVIA_HERMETIC_NATIVE_REQUIRED === '1') assert.ok(hermetic, 'actual hermetic native fixture lifecycle is required');
+  const dir = fs.mkdtempSync(path.join(hermetic?.directory || fs.realpathSync(os.tmpdir()), 'noevia-core-native-'));
+  let child, childClosed, client, releaseNative;
+  const refused = (port) => assert.throws(() => { const socket = net.connect({ host: '127.0.0.1', port }); socket.on('error', () => {}); socket.destroy(); }, /Hermetic test refused outbound connection/);
   try {
     const uid = process.getuid(), gid = process.getgid() || (uid === 0 ? 1 : 0); assert.ok(gid > 0);
     fs.chownSync(dir, uid, gid); fs.chmodSync(dir, 0o750);
     const keyFile = path.join(dir, 'control.key');
     publishWebKey({ masterKey: Buffer.alloc(32, 29), file: keyFile, uid, gid }); // earlier owned web incarnation
     const probe = net.createServer(); await new Promise((resolve, reject) => { probe.once('error', reject); probe.listen(0, '127.0.0.1', resolve); });
-    const port = probe.address().port; await new Promise((resolve) => probe.close(resolve));
+    const port = probe.address().port, reservation = hermetic?.reserve(probe);
+    await new Promise((resolve) => probe.close(resolve));
+    if (hermetic) {
+      refused(port);
+      assert.throws(() => hermetic.reserve({ listening: true, address: () => ({ address: '127.0.0.1', port }) }), /ownership refused/);
+    }
     child = spawn(binary, ['--native-control-v1', '--control-key-file', keyFile, '--control-key-uid', String(uid), '--control-key-gid', String(gid), '--listen', `127.0.0.1:${port}`], { stdio: ['ignore', 'ignore', 'pipe'] });
-    let diagnostics = ''; child.stderr.on('data', (b) => { diagnostics = (diagnostics + b).slice(-4096); }); child.once('exit', () => { exited = true; });
+    childClosed = new Promise((resolve) => child.once('close', resolve)); child.on('error', () => {});
+    let diagnostics = ''; child.stderr.on('data', (b) => { diagnostics = (diagnostics + b).slice(-4096); });
+    await once(child, 'spawn');
+    if (reservation) {
+      assert.throws(() => reservation.adopt({ pid: child.pid }), /ownership refused/);
+      releaseNative = reservation.adopt(child);
+      assert.throws(() => reservation.adopt(child), /ownership refused/);
+    }
     const { defaultTransport } = require('./code-egress-control.cjs'); let dropped = false;
     client = require('./code-egress.cjs').startEgressFromEnv({ CODE_EGRESS_PORT: String(port), CODE_EGRESS_RUST_HOST: '127.0.0.1', CODE_EGRESS_CONTROL_KEY_FILE: keyFile, CODE_EGRESS_KEY_UID: String(uid), CODE_EGRESS_KEY_GID: String(gid) }, { secrets: { derive: () => Buffer.alloc(32, 29) }, transport: async (req) => {
       const reply = await defaultTransport(req);
@@ -176,10 +191,26 @@ test('actual paired Rust binary authenticates Ready, scoped cleanup, retained re
     assert.equal((await client.activity(lease)).snapshotId, result.report.snapshotId);
     assert.equal((await client.forget(lease, result.report.snapshotId)).confirmed, true);
     const forgotten = await client.activity(lease); assert.equal(forgotten.available, false); assert.equal(Object.hasOwn(forgotten, 'hosts'), false);
-    assert.equal(exited, false, `owned native process unexpectedly exited: ${diagnostics}`);
+    assert.equal(child.exitCode, null, `owned native process unexpectedly exited: ${diagnostics}`);
+    await client.close(); client = null;
+    child.kill('SIGKILL'); await childClosed;
+    if (hermetic) { refused(port); releaseNative(); releaseNative(); refused(port); }
+    child = null;
+    if (hermetic) {
+      // A real child with a rejected startup profile must never acquire a port.
+      const failedProbe = net.createServer(); await new Promise((resolve) => failedProbe.listen(0, '127.0.0.1', resolve));
+      const failedPort = failedProbe.address().port, failedReservation = hermetic.reserve(failedProbe);
+      await new Promise((resolve) => failedProbe.close(resolve));
+      child = spawn(binary, [], { stdio: 'ignore' }); childClosed = new Promise((resolve) => child.once('close', resolve)); child.on('error', () => {});
+      await once(child, 'spawn'); assert.throws(() => failedReservation.adopt(child), /ownership refused/);
+      await childClosed; assert.equal(child.exitCode, 2); refused(failedPort); child = null;
+    }
   } finally {
-    if (client) await client.close();
-    if (child && !exited) { const done = new Promise((resolve) => child.once('exit', resolve)); child.kill('SIGKILL'); await done; }
-    fs.rmSync(dir, { recursive: true, force: true });
+    try { if (client) await client.close(); }
+    finally {
+      releaseNative?.();
+      if (child) { if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL'); await childClosed; }
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
   }
 });

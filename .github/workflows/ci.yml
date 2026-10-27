@@ -33,6 +33,8 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           repository: sbstndalton/noevia-web
+          # Immutable native-fixture guard companion; not a release pin.
+          ref: adacbea40d2c0181ea9074026bfb6de34db55027
           path: sib/noevia-web
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
@@ -174,6 +176,7 @@ jobs:
           native_source="$GITHUB_WORKSPACE/native-egress-rs"
           expected=e4c9f1eb5cf3d58fd55cee737bcebeaa223d4fe3
           test "$(git -C "$native_source" rev-parse HEAD)" = "$expected"
+          cmp "$GITHUB_WORKSPACE/sib/noevia-web/tests/hermetic-network.cjs" tests/hermetic-network.cjs
           cmp "$native_source/contracts/egress-control.v1.schema.json" contracts/egress-control.v1.schema.json
           cmp "$native_source/contracts/egress-control.v1.vectors.json" contracts/egress-control.v1.vectors.json
           CARGO_TARGET_DIR="$RUNNER_TEMP/native-egress-target" cargo build --locked \
@@ -192,7 +195,7 @@ jobs:
             assert.equal(probe.renewalMs, 5000);
             assert.equal(probe.readiness, "requires-authenticated-ready");'
           digest="$(sha256sum "$binary" | cut -d ' ' -f 1)"
-          printf 'NOEVIA_EGRESS_CONTROL_BINARY=%s\nNOEVIA_EGRESS_CONTROL_BINARY_SHA256=%s\nNOEVIA_RS_CONTROL_CONTRACT_DIR=%s\n' \
+          printf 'NOEVIA_EGRESS_CONTROL_BINARY=%s\nNOEVIA_EGRESS_CONTROL_BINARY_SHA256=%s\nNOEVIA_RS_CONTROL_CONTRACT_DIR=%s\nNOEVIA_HERMETIC_NATIVE_REQUIRED=1\n' \
             "$binary" "$digest" "$native_source/contracts" >> "$GITHUB_ENV"
       - run: npm run test:server
         env:
