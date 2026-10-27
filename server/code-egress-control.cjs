@@ -191,8 +191,14 @@ function createControlClient({ fileKey, endpoint, now = Date.now, monotonic = ()
     // Response arrival order is not native snapshot order. Once delivered, a
     // frozen final identity remains acknowledgeable across late active reads.
     if (r.ackable !== null) {
-      if (report.final && report.snapshotId && report.snapshotId !== r.ackable) throw error('snapshot');
       if (!report.final || !report.snapshotId || r.acknowledged) return;
+      const prior = r.report?.state;
+      if (prior === 'forgotten') return;
+      if (prior === 'evicted' && !['evicted', 'forgotten'].includes(report.state)) return;
+      // FIFO eviction drops the held frozen body and creates a new, unavailable
+      // final snapshot. Its new identity is valid only in this forward transition.
+      const evicted = ['complete', 'partial', 'interrupted'].includes(prior) && report.state === 'evicted';
+      if (report.snapshotId !== r.ackable && !evicted) throw error('snapshot');
     }
     if (report.final && report.snapshotId) r.ackable = report.snapshotId;
     r.report = report;

@@ -96,6 +96,38 @@ test('confirmed barrier with unavailable follow-up cannot erase a previously del
   const cleanup = await c.revoke(lease); assert.equal(cleanup.confirmed, true); assert.equal(cleanup.report.available, false);
   assert.equal((await c.forget(lease, final.snapshotId)).confirmed, true); assert.equal(final.hosts[0].host, 'example.com'); await c.close();
 });
+test('native final FIFO eviction advances acknowledgement without late held replies restoring the old identity', async () => {
+  for (const heldState of ['complete', 'partial', 'interrupted']) {
+    const f = fake(), evictedId = '12'.repeat(16); let reads = 0, release;
+    const c = createControlClient({ fileKey: file, endpoint: 'localhost:3001', autoRenew: false, transport: async (req) => {
+      if (req.route === ROUTES.forget) return f.transport(req);
+      const reply = await f.transport(req);
+      if (![ROUTES.activity, ROUTES.revoke].includes(req.route)) return reply;
+      const value = JSON.parse(reply.body); value.drained = true; value.barrierInstalled = true; value.snapshot.final = true;
+      if (req.route === ROUTES.revoke || reads >= 2) value.snapshot = { id: evictedId, state: 'evicted', final: true, summary: null, partial: false, overflow: false };
+      else { value.snapshot.state = heldState; value.snapshot.partial = heldState === 'partial'; }
+      const signed = response(req, value);
+      if (req.route === ROUTES.activity && ++reads === 2) return new Promise((resolve) => { release = () => resolve(signed); });
+      return signed;
+    } });
+    const lease = await c.grant({ taskId: `eviction.${heldState}`, domains: ['example.com'] });
+    const original = await c.activity(lease), stale = c.activity(lease); await Promise.resolve(); await Promise.resolve(); assert.equal(typeof release, 'function');
+    const cleanup = await c.revoke(lease); release(); assert.equal((await stale).snapshotId, original.snapshotId);
+    assert.equal(cleanup.confirmed, true); assert.equal(cleanup.report.available, false); assert.equal(cleanup.report.state, 'evicted'); assert.equal(cleanup.report.snapshotId, evictedId);
+    await assert.rejects(c.forget(lease, original.snapshotId));
+    const ack = c.forget(lease, evictedId); assert.equal((await ack).confirmed, true); assert.equal(c.forget(lease, evictedId), ack);
+    assert.equal(original.hosts[0].host, 'example.com'); assert.equal(f.calls.filter((r) => r.route === ROUTES.forget).length, 1); await c.close();
+  }
+});
+test('an unexplained new identity in the same held final state is rejected', async () => {
+  const f = fake(); let changed = false;
+  const c = createControlClient({ fileKey: file, endpoint: 'localhost:3001', autoRenew: false, transport: async (req) => {
+    const reply = await f.transport(req); if (req.route !== ROUTES.activity) return reply;
+    const v = JSON.parse(reply.body); v.drained = true; v.barrierInstalled = true; v.snapshot.final = true; if (changed) v.snapshot.id = '12'.repeat(16); return response(req, v);
+  } });
+  const lease = await c.grant({ taskId: 'identity.1', domains: ['example.com'] }); await c.activity(lease); changed = true;
+  await assert.rejects(c.activity(lease)); await c.revoke(lease); await c.close();
+});
 test('forged and late cached Ready proofs cannot create a live grant', async () => {
   const f = fake(); let clock = 0;
   const late = createControlClient({ fileKey: file, endpoint: 'localhost:3001', autoRenew: false, monotonic: () => clock, transport: async (req) => { const r = await f.transport(req); clock = 16000; return r; } });
