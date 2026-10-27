@@ -191,6 +191,36 @@ function createBrowserService({ launch, egress = null, log = () => {}, now = Dat
       ready = new Promise((res, rej) => { readyResolve = res; readyReject = rej; });
 
       jobs.run(id, async (ctx) => {
+        let activeAction = null;
+        const onCancel = () => {
+          // Take away the original lease independently of an outstanding
+          // Playwright promise (including a hung context close).
+          cleanup(ctx).catch(() => {});
+          if (activeAction && !activeAction.settled) {
+            try { ctx.uncertain({ tool: 'browser', action: activeAction.type, reason: 'The action was still pending when cancellation was accepted.' }); } catch {}
+          }
+        };
+        ctx.signal.addEventListener('abort', onCancel, { once: true });
+        if (ctx.signal.aborted) onCancel();
+        async function whileActive(work) {
+          if (ctx.signal.aborted) throw fail(499, 'Cancelled');
+          let onAbort;
+          try {
+            return await Promise.race([Promise.resolve().then(() => {
+              if (ctx.signal.aborted) throw fail(499, 'Cancelled');
+              return work();
+            }), new Promise((_, reject) => {
+              onAbort = () => {
+                // Keep an already-settling real receipt/refusal, but never wait
+                // beyond the independent cached cleanup outcome for this action.
+                const done = () => setImmediate(() => reject(fail(499, 'Cancelled')));
+                cleanup(ctx).then(done, done);
+              };
+              ctx.signal.addEventListener('abort', onAbort, { once: true });
+              if (ctx.signal.aborted) onAbort();
+            })]);
+          } finally { if (onAbort) ctx.signal.removeEventListener('abort', onAbort); }
+        }
         try {
         jobs.append(id, 'checkpoint.created', { domains });
         // The moment noevia's write-approval card is raised and answered is recorded on the job
@@ -273,19 +303,24 @@ function createBrowserService({ launch, egress = null, log = () => {}, now = Dat
             const item = queue.shift();
             if (item.finish) { output = item.result; break; }
             try {
-              const result = await executor.act(sessionId, item.action);
-              ctx.event('progress', { stage: `${item.action.type}: ${result.status}` });
+              const result = await whileActive(async () => {
+                const action = { type: item.action.type, settled: false };
+                activeAction = action;
+                try { return await executor.act(sessionId, item.action); }
+                finally { action.settled = true; if (activeAction === action) activeAction = null; }
+              });
+              if (!ctx.signal.aborted) ctx.event('progress', { stage: `${item.action.type}: ${result.status}` });
               item.resolve(result);
             } catch (error) { item.reject(error); }
           }
-        } finally { await cleanup(ctx); }
+        } finally { ctx.signal.removeEventListener('abort', onCancel); await cleanup(ctx); }
         const network = await cleanup(ctx);
         const result = network ? { ...(output && typeof output === 'object' && !Array.isArray(output) ? output : { value: output }), network } : output;
         if ((network && !network.cleanupConfirmed) || !executorClosed) throw Object.assign(fail(503, 'Browser cleanup could not be confirmed.'), { result });
         return result;
         } catch (error) {
           await cleanup(ctx); readyReject(error); throw error;
-        } finally { await cleanup(ctx); }
+        } finally { ctx.signal.removeEventListener('abort', onCancel); await cleanup(ctx); }
       }).catch(async (error) => {
         await cleanup();
         try { if (jobs.get(id)?.status === 'queued') jobs.append(id, 'job.failed', { error: 'The browser could not start.' }); } catch {}
