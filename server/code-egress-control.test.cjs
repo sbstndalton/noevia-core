@@ -47,6 +47,55 @@ test('scope mismatch and uncertainty never fabricate empty success or allow a re
   const f = fake(), c = createControlClient({ fileKey: file, endpoint: 'localhost:3001', transport: f.transport, autoRenew: false }); const lease = await c.grant({ taskId: 'job.1', domains: ['example.com'] }); f.mode('cross-task'); await assert.rejects(c.activity(lease)); f.mode('uncertain');
   const r = await c.revoke(lease); assert.equal(r.confirmed, false); assert.equal(r.report.available, false); assert.equal(Object.hasOwn(r.report, 'hosts'), false); await assert.rejects(c.grant({ taskId: 'job.1', domains: ['example.com'] })); await c.close();
 });
+test('zero and negative cleanup budgets stop renewal and new grants without a mutation request', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  try {
+    for (const budget of [0, -1]) {
+      const f = fake(), c = createControlClient({ fileKey: file, endpoint: 'localhost:3001', transport: f.transport });
+      const lease = await c.grant({ taskId: 'budget.1', domains: ['example.com'] }), count = f.calls.length;
+      const cleanup = c.revoke(lease, budget), result = await cleanup;
+      assert.equal(result.confirmed, false); assert.equal(result.report.available, false); assert.equal(Object.hasOwn(result.report, 'hosts'), false);
+      assert.equal(c.revoke(lease, 10000), cleanup);
+      await assert.rejects(c.grant({ taskId: 'budget.2', domains: ['example.com'] })); await assert.rejects(c.renew());
+      t.mock.timers.tick(15000); await Promise.resolve(); await Promise.resolve();
+      assert.equal(f.calls.length, count, 'no revoke, renewal, or replacement Ready request may escape'); await c.close();
+    }
+  } finally { t.mock.timers.reset(); }
+});
+test('late active reports before and after acknowledgement cannot downgrade a delivered final snapshot', async () => {
+  const f = fake(), pending = [];
+  const c = createControlClient({ fileKey: file, endpoint: 'localhost:3001', autoRenew: false, transport: async (req) => {
+    const reply = await f.transport(req);
+    if (req.route === ROUTES.activity) return new Promise((resolve) => pending.push(() => resolve(reply)));
+    return reply;
+  } });
+  const lease = await c.grant({ taskId: 'ordering.1', domains: ['example.com'] });
+  const early = c.activity(lease), later = c.activity(lease);
+  // Both transport calls have captured authenticated nonfinal native observations.
+  await Promise.resolve(); assert.equal(pending.length, 2);
+  const done = await c.revoke(lease); assert.equal(done.confirmed, true); assert.equal(done.report.final, true);
+  pending.shift()(); assert.equal((await early).final, false);
+  const ack = c.forget(lease, done.report.snapshotId); assert.equal((await ack).confirmed, true);
+  pending.shift()(); assert.equal((await later).final, false);
+  assert.equal(c.forget(lease, done.report.snapshotId), ack); assert.equal((await ack).confirmed, true);
+  await assert.rejects(c.forget(lease, '01'.repeat(16))); assert.equal(done.report.hosts[0].host, 'example.com');
+  assert.equal(f.calls.filter((r) => r.route === ROUTES.forget).length, 1); await c.close();
+});
+test('confirmed barrier with unavailable follow-up cannot erase a previously delivered final acknowledgement', async () => {
+  const f = fake(); let activityCount = 0;
+  const c = createControlClient({ fileKey: file, endpoint: 'localhost:3001', autoRenew: false, transport: async (req) => {
+    const b = JSON.parse(req.body);
+    if (req.route === ROUTES.revoke) return response(req, { state: 'barrier-installed', bootId: boot, sessionId: session, taskId: b.taskId, leaseNonce: b.leaseNonce, barrierInstalled: true, drained: true });
+    if (req.route === ROUTES.activity) {
+      if (++activityCount > 1) return response(req, { state: 'unavailable' }, 503);
+      const reply = await f.transport(req), value = JSON.parse(reply.body); value.drained = true; value.barrierInstalled = true; value.snapshot.final = true; return response(req, value);
+    }
+    return f.transport(req);
+  } });
+  const lease = await c.grant({ taskId: 'prior.final.1', domains: ['example.com'] }), final = await c.activity(lease);
+  const cleanup = await c.revoke(lease); assert.equal(cleanup.confirmed, true); assert.equal(cleanup.report.available, false);
+  assert.equal((await c.forget(lease, final.snapshotId)).confirmed, true); assert.equal(final.hosts[0].host, 'example.com'); await c.close();
+});
 test('forged and late cached Ready proofs cannot create a live grant', async () => {
   const f = fake(); let clock = 0;
   const late = createControlClient({ fileKey: file, endpoint: 'localhost:3001', autoRenew: false, monotonic: () => clock, transport: async (req) => { const r = await f.transport(req); clock = 16000; return r; } });

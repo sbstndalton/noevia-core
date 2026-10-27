@@ -182,22 +182,32 @@ function createControlClient({ fileKey, endpoint, now = Date.now, monotonic = ()
     const claims = { task: taskId, hosts, iat: stamp(taskId), exp: 0, idle, nonce: crypto.randomBytes(16).toString('base64url') }; claims.exp = safeInt(claims.iat + life);
     const key = deriveGrantKey(fileKey, epoch.boot, epoch.session), token = mintGrant(key, claims);
     const handle = { taskId, domains: Object.freeze([...hosts]) }; Object.defineProperty(handle, 'token', { value: token }); Object.freeze(handle);
-    const record = { handle, claims, token, key, boot: epoch.boot, session: epoch.session, cleanup: null, report: null, ackable: null, forget: null };
+    const record = { handle, claims, token, key, boot: epoch.boot, session: epoch.session, cleanup: null, report: null, ackable: null, acknowledged: false, forget: null };
     records.set(handle, record); active.add(record); return handle;
   }
   function recordFor(handle) { const r = handle && typeof handle === 'object' && records.get(handle); if (!r) throw error('handle'); return r; }
   const leaseBody = (r) => ({ version: 1, sessionId: r.session, taskId: r.claims.task, leaseNonce: r.claims.nonce, signedGrant: r.token });
+  function retainReport(r, report) {
+    // Response arrival order is not native snapshot order. Once delivered, a
+    // frozen final identity remains acknowledgeable across late active reads.
+    if (r.ackable !== null) {
+      if (report.final && report.snapshotId && report.snapshotId !== r.ackable) throw error('snapshot');
+      if (!report.final || !report.snapshotId || r.acknowledged) return;
+    }
+    if (report.final && report.snapshotId) r.ackable = report.snapshotId;
+    r.report = report;
+  }
   async function activity(handle, budgetMs = 10000) {
     const r = recordFor(handle), reply = await rpc('activity', leaseBody(r), r.boot, budgetMs);
     if (reply.status !== 200 || reply.value.state !== 'activity') throw error('report');
-    const report = reportValue(reply.value, r); if (report.final) r.ackable = report.snapshotId; r.report = report; return report;
+    const report = reportValue(reply.value, r); retainReport(r, report); return report;
   }
   const unavailableReport = () => Object.freeze({ confirmed: false, report: Object.freeze({ available: false, state: 'uncertain', final: false, partial: true }) });
   function revoke(handle, budgetMs = 10000) {
     const r = recordFor(handle); if (r.cleanup) return r.cleanup;
     r.cleanup = Promise.resolve().then(async () => {
       try {
-      if (budgetMs <= 0) return unavailableReport();
+      if (budgetMs <= 0) throw error('timeout');
       const first = mono(), until = first + Math.min(10000,budgetMs), iat = stamp(r.claims.task);
       const signedRevoke = mintGrant(r.key, { act: 'revoke', task: r.claims.task, hosts: [], iat, exp: safeInt(iat + life), idle: 1, nonce: crypto.randomBytes(16).toString('base64url') });
         const reply = await rpc('revoke', { ...leaseBody(r), grantIssuedAt: r.claims.iat, signedRevoke }, r.boot, until - mono());
@@ -207,7 +217,7 @@ function createControlClient({ fileKey, endpoint, now = Date.now, monotonic = ()
         if (report && (!report.final || reply.value.barrierInstalled !== true)) throw error('uncertain');
         if (!report) { try { report = await activity(handle, until - mono()); } catch { report = Object.freeze({ available: false, state: 'unavailable', final: true, partial: true }); } }
         if (!report.final) throw error('uncertain');
-        r.report = report; if (report.snapshotId) r.ackable = report.snapshotId; active.delete(r);
+        retainReport(r, report); active.delete(r);
         return Object.freeze({ confirmed: true, report });
       } catch { fail('cleanup'); return unavailableReport(); }
     });
@@ -215,10 +225,10 @@ function createControlClient({ fileKey, endpoint, now = Date.now, monotonic = ()
   }
   function forget(handle, snapshotId) {
     const r = recordFor(handle);
-    if (!r.report?.final || snapshotId !== r.ackable || !HEX32.test(snapshotId)) return Promise.reject(error('snapshot'));
+    if (snapshotId !== r.ackable || !HEX32.test(snapshotId)) return Promise.reject(error('snapshot'));
     if (r.forget) return r.forget;
     r.forget = Promise.resolve().then(async () => {
-      try { const reply = await rpc('forget', { version: 1, sessionId: r.session, taskId: r.claims.task, leaseNonce: r.claims.nonce, snapshotId }, r.boot, 5000); scope(reply.value, r); if (reply.status !== 200 || reply.value.state !== 'forgotten' || reply.value.snapshotId !== snapshotId) throw error('forget'); return Object.freeze({ confirmed: true }); }
+      try { const reply = await rpc('forget', { version: 1, sessionId: r.session, taskId: r.claims.task, leaseNonce: r.claims.nonce, snapshotId }, r.boot, 5000); scope(reply.value, r); if (reply.status !== 200 || reply.value.state !== 'forgotten' || reply.value.snapshotId !== snapshotId) throw error('forget'); r.acknowledged = true; return Object.freeze({ confirmed: true }); }
       catch { return Object.freeze({ confirmed: false }); }
     }); return r.forget;
   }
