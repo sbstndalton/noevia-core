@@ -1,6 +1,7 @@
+// Frozen Node behavioral oracle checks; production client is tested separately.
 const test = require('node:test'), assert = require('node:assert/strict');
 const http = require('node:http'), net = require('node:net');
-const { createEgressProxy, hostAllowed, parseTarget } = require('./code-egress.cjs');
+const { createEgressProxy, hostAllowed, parseTarget } = require('../tests/reference/code-egress.cjs');
 
 const basic = (token) => 'Basic ' + Buffer.from('task:' + token).toString('base64');
 // Tests run against loopback, which the real guard rightly calls private.
@@ -219,7 +220,7 @@ test('a client that disconnects mid-check does not take the proxy down with it',
 });
 
 test('the egress bind narrows to the code-network alias, not every interface (#296)', async () => {
-  const { resolveEgressBind } = require('./code-egress.cjs');
+  const { resolveEgressBind } = require('../tests/reference/code-egress.cjs');
   // An explicit CODE_EGRESS_BIND always wins.
   assert.deepEqual(
     await resolveEgressBind({ CODE_EGRESS_BIND: '10.0.0.5' }, 'egress', { lookup: async () => { throw Error('should not be called'); } }),
@@ -240,7 +241,7 @@ test('the egress bind narrows to the code-network alias, not every interface (#2
 });
 
 test('the deployment proxy starts only when a port is configured', async () => {
-  const { startEgressFromEnv } = require('./code-egress.cjs');
+  const { startEgressFromEnv } = require('../tests/reference/code-egress.cjs');
   assert.equal(startEgressFromEnv({}), null);
   assert.equal(startEgressFromEnv({ CODE_EGRESS_PORT: 'nope' }), null);
   assert.throws(() => startEgressFromEnv({ CODE_EGRESS_PORT: '8040', CODE_EGRESS_HOST: 'bad host/' }), /host name/);
@@ -266,7 +267,7 @@ test('the deployment proxy starts only when a port is configured', async () => {
 });
 
 test('a silent loopback fallback (alias not resolvable) is logged with its reason', async () => {
-  const { startEgressFromEnv } = require('./code-egress.cjs');
+  const { startEgressFromEnv } = require('../tests/reference/code-egress.cjs');
   const events = [];
   const live = startEgressFromEnv({ CODE_EGRESS_PORT: '38741' }, {
     log: (e) => events.push(e),
@@ -290,7 +291,7 @@ test('a failed listen is logged as egress.bind_failed and crashes the process li
   const port = blocker.address().port;
   try {
     const child = require('node:child_process').spawnSync(process.execPath, ['-e', `
-      const { startEgressFromEnv } = require(${JSON.stringify(require.resolve('./code-egress.cjs'))});
+      const { startEgressFromEnv } = require(${JSON.stringify(require.resolve('../tests/reference/code-egress.cjs'))});
       startEgressFromEnv({ CODE_EGRESS_PORT: '${port}', CODE_EGRESS_BIND: '127.0.0.1' },
         { log: (e) => console.log(JSON.stringify(e)) });
     `], { encoding: 'utf8' });
@@ -636,7 +637,7 @@ test('an idle tunnel closes after the tunnel idle timeout, logged with its task;
 });
 
 test('the deployment proxy reads the connection limits and tunnel idle timeout from env (#932)', () => {
-  const { startEgressFromEnv, DEFAULT_MAX_CONNECTIONS, DEFAULT_MAX_CONNECTIONS_PER_TASK, DEFAULT_TUNNEL_IDLE_MS } = require('./code-egress.cjs');
+  const { startEgressFromEnv, DEFAULT_MAX_CONNECTIONS, DEFAULT_MAX_CONNECTIONS_PER_TASK, DEFAULT_TUNNEL_IDLE_MS } = require('../tests/reference/code-egress.cjs');
   let seen;
   const withPort = (env) => { seen = null; startEgressFromEnv({ CODE_EGRESS_PORT: '1', CODE_EGRESS_BIND: '127.0.0.1', ...env },
     { create: (opts) => { seen = opts; return { server: { on() {}, listen() {} } }; } }); return seen; };

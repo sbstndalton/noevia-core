@@ -157,13 +157,13 @@ test('actual paired Rust binary authenticates Ready, scoped cleanup, retained re
     const uid = process.getuid(), gid = process.getgid() || (uid === 0 ? 1 : 0); assert.ok(gid > 0);
     fs.chownSync(dir, uid, gid); fs.chmodSync(dir, 0o750);
     const keyFile = path.join(dir, 'control.key');
-    const key = publishWebKey({ masterKey: Buffer.alloc(32, 29), file: keyFile, uid, gid });
+    publishWebKey({ masterKey: Buffer.alloc(32, 29), file: keyFile, uid, gid }); // earlier owned web incarnation
     const probe = net.createServer(); await new Promise((resolve, reject) => { probe.once('error', reject); probe.listen(0, '127.0.0.1', resolve); });
     const port = probe.address().port; await new Promise((resolve) => probe.close(resolve));
     child = spawn(binary, ['--native-control-v1', '--control-key-file', keyFile, '--control-key-uid', String(uid), '--control-key-gid', String(gid), '--listen', `127.0.0.1:${port}`], { stdio: ['ignore', 'ignore', 'pipe'] });
     let diagnostics = ''; child.stderr.on('data', (b) => { diagnostics = (diagnostics + b).slice(-4096); }); child.once('exit', () => { exited = true; });
     const { defaultTransport } = require('./code-egress-control.cjs'); let dropped = false;
-    client = createControlClient({ fileKey: key, endpoint: `127.0.0.1:${port}`, autoRenew: false, transport: async (req) => {
+    client = require('./code-egress.cjs').startEgressFromEnv({ CODE_EGRESS_PORT: String(port), CODE_EGRESS_RUST_HOST: '127.0.0.1', CODE_EGRESS_CONTROL_KEY_FILE: keyFile, CODE_EGRESS_KEY_UID: String(uid), CODE_EGRESS_KEY_GID: String(gid) }, { secrets: { derive: () => Buffer.alloc(32, 29) }, transport: async (req) => {
       const reply = await defaultTransport(req);
       if (req.route === ROUTES.revoke && !dropped) { dropped = true; throw Error('owned synthetic lost reply after native commit'); }
       return reply;

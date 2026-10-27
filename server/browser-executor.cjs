@@ -91,13 +91,17 @@ function createBrowserExecutor({ launch, askApproval, secrets = {}, log = () => 
    * @returns {Promise<string>} session id
    */
   async function open({ jobId, profile = 'isolated', allowedDomains = [], downloadsDir, uploadFiles = [], signal, proxy = null } = {}) {
+    if (shutdownFlight) throw Object.assign(Error('Browser executor is shut down.'), { status: 409 });
     if (profile !== 'isolated') throw Object.assign(Error('Named browser profiles need a paired execution node, which is not built.'), { status: 409 });
     if (!Array.isArray(allowedDomains) || !allowedDomains.length) throw Object.assign(Error('A browser task needs at least one allowed domain.'), { status: 400 });
     if (!downloadsDir) throw Object.assign(Error('A browser task needs its own downloads directory.'), { status: 400 });
     if (!proxy && !direct) throw Object.assign(Error('A browser task needs an egress proxy grant for its domains.'), { status: 409 });
     fs.mkdirSync(downloadsDir, { recursive: true, mode: 0o700 });
     const uploads = new Set(uploadFiles.map((f) => fs.realpathSync(f)));
+    const cancelled = () => Object.assign(Error('Cancelled'), { status: 499 });
+    if (signal?.aborted) throw cancelled();
     browser = browser || await launch();
+    if (signal?.aborted) throw cancelled();
     // A fresh context is an isolated profile: no cookies, storage or credentials from anything else.
     const context = await browser.newContext({ acceptDownloads: true, serviceWorkers: 'block', ...(proxy ? { proxy } : {}) });
     const id = crypto.randomUUID();
@@ -110,6 +114,14 @@ function createBrowserExecutor({ launch, askApproval, secrets = {}, log = () => 
       // A page leaving for a host it may not visit: the action that caused it reports blocked.
       if (req && req.isNavigationRequest() && req.frame() === req.frame().page().mainFrame()) session.navBlocked = reason;
     };
+    // Own the context before any asynchronous setup can fail.
+    sessions.set(id, session);
+    if (signal) {
+      session.abortSignal = signal; session.onAbort = () => { close(id); };
+      signal.addEventListener('abort', session.onAbort, { once: true });
+    }
+    try {
+    if (signal?.aborted) throw cancelled();
     await context.route('**/*', async (route) => {
       const req = route.request(), url = req.url();
       if (/^(data|blob):/i.test(url)) return route.continue();
@@ -117,6 +129,7 @@ function createBrowserExecutor({ launch, askApproval, secrets = {}, log = () => 
       if (!verdict.ok) { refuse(req, url, verdict.reason); return route.abort('blockedbyclient'); }
       return route.continue();
     });
+    if (signal?.aborted) throw cancelled();
     // WebSockets are not requests the route above sees.
     await context.routeWebSocket(/.*/, (ws) => {
       const url = ws.url().replace(/^ws/i, 'http');
@@ -125,6 +138,7 @@ function createBrowserExecutor({ launch, askApproval, secrets = {}, log = () => 
       refuse(null, ws.url(), verdict.reason);
       ws.close({ code: 1008, reason: 'Not on this task’s allowed list.' });
     });
+    if (signal?.aborted) throw cancelled();
     context.on('page', (page) => {
       // Popups share the context's route rules; the session follows the newest page, and falls
       // back to the most recent one still open when it closes.
@@ -137,13 +151,14 @@ function createBrowserExecutor({ launch, askApproval, secrets = {}, log = () => 
       });
     });
     session.page = await context.newPage();
-    sessions.set(id, session);
-    if (signal) {
-      if (signal.aborted) { await close(id); throw Object.assign(Error('Cancelled'), { status: 499 }); }
-      signal.addEventListener('abort', () => { close(id).catch(() => {}); }, { once: true });
-    }
+    if (signal?.aborted) throw cancelled();
     log({ event: 'browser.opened', jobId, session: id, allowedDomains: session.allowedDomains });
     return id;
+    } catch (error) {
+      // Start exact-context cleanup without hiding the setup error behind a hung close.
+      close(id);
+      throw error;
+    }
   }
 
   async function save(session, download) {
@@ -336,21 +351,40 @@ function createBrowserExecutor({ launch, askApproval, secrets = {}, log = () => 
     return { origin: s.page ? originOf(s.page) : '', blocked: [...s.blocked], downloads: s.downloads.map(({ name, path, from }) => ({ name, path, from })), closed: s.closed };
   }
 
-  async function close(sessionId) {
+  function close(sessionId) {
     const s = sessions.get(sessionId);
-    if (!s || s.closed) return;
-    s.closed = true;
-    await s.context.close().catch(() => {});
-    log({ event: 'browser.closed', jobId: s.jobId, session: sessionId });
+    if (!s) return Promise.resolve({ confirmed: false });
+    if (s.closeFlight) return s.closeFlight;
+    s.closed = true; // refuse admission immediately; completion is a separate proof
+    if (s.onAbort) s.abortSignal.removeEventListener('abort', s.onAbort);
+    s.closeFlight = Promise.resolve().then(() => s.context.close()).then(() => {
+      try { log({ event: 'browser.closed', jobId: s.jobId, session: sessionId }); } catch {}
+      return { confirmed: true };
+    }, () => ({ confirmed: false }));
+    return s.closeFlight;
+  }
+  async function closeTask(jobId) {
+    const owned = [...sessions.values()].filter((s) => s.jobId === jobId);
+    const results = await Promise.all(owned.map((s) => close(s.id)));
+    return { confirmed: results.every((r) => r.confirmed === true) };
   }
 
-  async function shutdown() {
-    for (const id of sessions.keys()) await close(id);
-    if (browser) await browser.close().catch(() => {});
-    browser = null;
+  let shutdownFlight = null;
+  function shutdown() {
+    if (shutdownFlight) return shutdownFlight;
+    shutdownFlight = Promise.resolve().then(async () => {
+      await Promise.all([...sessions.keys()].map((id) => close(id)));
+      // A service owns one fresh browser per executor (its launch contract).
+      // Closing that browser is the final process-wide proof even if a context
+      // close was refused. Never treat a failed browser close as confirmation.
+      try { if (browser) await browser.close(); } catch { return { confirmed: false }; }
+      browser = null;
+      return { confirmed: true };
+    });
+    return shutdownFlight;
   }
 
-  return { open, act, close, state, shutdown };
+  return { open, act, close, closeTask, state, shutdown };
 }
 
 module.exports = { createBrowserExecutor, describeInPage, ACTIONS };

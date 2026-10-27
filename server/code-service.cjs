@@ -77,6 +77,7 @@ function view(job, pending = null) {
     steps: job.steps, plan: job.plan, assistantOutput: job.assistantOutput,
     approval: pending ? { id: pending.id, ...pending.request } : null,
     result: job.result || null,
+    ...(job.artifacts?.some((a) => a.kind === 'native-network-report') ? { network: job.artifacts.filter((a) => a.kind === 'native-network-report').slice(-32).map((a) => a.network) } : {}),
     // The Planner's verdict (#519), only on a task that was reviewed: every other task's view is
     // exactly what it was before the review step existed.
     ...(job.review ? { review: job.review } : {}),
@@ -255,7 +256,7 @@ function createCodeService({ repos, connect, egress = null, engine = undefined, 
         if (!pipelineRun) throw fail(409, 'The Planner pipeline is not set up on this server.');
         // Planner → Executor → verification → review → Auditor (#705), as one job. The person still
         // answers every approval, including the final accept.
-        const started = pipelineRun.start({ projectId: project.id, repo, prompt, capabilities, domains, connect,
+        const started = await pipelineRun.start({ projectId: project.id, repo, prompt, capabilities, domains, connect,
           model: body.model ? String(body.model) : null, sandboxKind, harness: harnessId,
           context: String(sharedContext(workspace, project) || ''), approvePlan: body.approvePlan === true,
           tenantId: typeof workspace.userId === 'string' ? workspace.userId : null });

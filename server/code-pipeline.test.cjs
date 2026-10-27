@@ -66,7 +66,7 @@ function fakeVerifier(outcomes) {
  * function); `answers` maps a card action to the person's answer.
  */
 async function runPipeline({ verdicts = ['approve'], tests = ['pass'], merge = true, answers = {}, approvePlan = false,
-  plan = PLAN, verify = null, agent = null, onReview = null, onAccept = null, deadlines = {}, maxLoops = 2,
+  plan = PLAN, verify = null, agent = null, egress = null, onReview = null, onAccept = null, deadlines = {}, maxLoops = 2,
   auditText = JSON.stringify({ completeness: 'complete', summary: 'All plan steps have evidence.', evidence: [{ source: 'tests', note: 'Measured at head.' }], gaps: [] }),
   cancelDuring = null, detach = true, wrapJobs = (j) => j, pin = null, prompt = 'Make the widget return two.' } = {}) {
   const dir = temp('noevia-pjobs-');
@@ -80,7 +80,7 @@ async function runPipeline({ verdicts = ['approve'], tests = ['pass'], merge = t
     const a = answers[request.action];
     return typeof a === 'function' ? a(request) : a ?? 'approve';
   };
-  const harness = createCodeHarness({ jobs, workspaces, askApproval,
+  const harness = createCodeHarness({ jobs, workspaces, askApproval, egress,
     engine: () => ({ baseUrl: 'http://engine.test/v1', model: 'synthetic-coder', apiKey: null, contextTokens: 8192 }) });
   const sent = [], reviewStates = [], plannerStates = [], auditCalls = [];
   let round = 0;
@@ -117,8 +117,8 @@ async function runPipeline({ verdicts = ['approve'], tests = ['pass'], merge = t
     git(cwd, 'add', 'widget.js'); git(cwd, 'commit', '-qm', `round ${round}`);
     return { stopReason: 'end_turn' };
   } });
-  const started = pipeline.start({ projectId: 'p-synthetic', repo: { id: 'fixture', path: source }, prompt,
-    capabilities: ['read', 'edit', 'execute'], connect, tenantId: 'tenant-synthetic', approvePlan });
+  const started = await pipeline.start({ projectId: 'p-synthetic', repo: { id: 'fixture', path: source }, prompt,
+    capabilities: ['read', 'edit', 'execute', ...(egress ? ['network'] : [])], domains: egress ? ['example.com'] : [], connect, tenantId: 'tenant-synthetic', approvePlan });
   // noevia never moves a base that is checked out (#715 review): the owner's tree is on no branch.
   if (detach) git(source, 'checkout', '-q', '--detach');
   for (let i = 0; i < 600 && !['completed', 'failed', 'cancelled'].includes(jobs.get(started.taskId)?.status); i++) await new Promise((r) => setTimeout(r, 5));
@@ -545,4 +545,11 @@ test('#1157: a task blocked before the agent starts still carries its prompt and
   assert.equal(run.view.baseSha, git(run.source, 'rev-parse', 'main'));
   const long = await runPipeline({ prompt: 'Make the widget return two. '.repeat(10), pin: async () => ({ ok: false, reason: 'x' }) });
   assert.equal(long.view.task.length, 120);
+});
+
+test('uncertain native cleanup blocks verification, review, merge and another pipeline grant', async () => {
+  let grants = 0, revokes = 0;
+  const egress = { grant: async () => { grants++; return Object.freeze({ token: 'owned-synthetic-token' }); }, revoke: async () => { revokes++; return { confirmed: false, report: { available: false, final: false, partial: true, state: 'uncertain' } }; } };
+  const r = await runPipeline({ egress, verdicts: ['request_changes', 'approve'] });
+  assert.equal(grants, 1); assert.equal(revokes, 1); assert.equal(r.sent.length, 1); assert.equal(r.reviewStates.length, 0); assert.equal(r.job.status, 'failed'); assert.equal(r.job.uncertain.length, 1); assert.equal(r.job.result.network[0].cleanupConfirmed, false); assert.match(r.job.error, /cleanup could not be confirmed/);
 });

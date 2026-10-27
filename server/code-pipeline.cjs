@@ -130,13 +130,13 @@ function createCodePipeline({ jobs, workspaces, harness, roleEngine = null, plan
    *           domains?: string[], harness?: string, connect: Function, model?: string|null, sandboxKind?: string,
    *           context?: string, tenantId?: string|null, approvePlan?: boolean }} task
    */
-  function start(task) {
+  async function start(task) {
     const { projectId = null, repo, prompt, capabilities = [], domains = [], connect } = task;
     if (!prompt || !String(prompt).trim()) throw Object.assign(Error('A task needs a prompt'), { status: 400 });
     if (typeof connect !== 'function') throw Object.assign(Error('No harness transport'), { status: 500 });
     const taskId = jobs.create({ kind: 'code', projectId, capabilities: [...new Set(capabilities)] });
     let handle;
-    try { handle = harness.claimRun({ taskId, repoPath: repo.path, capabilities, domains, harness: task.harness || 'opencode' }); }
+    try { handle = await harness.claimRun({ taskId, repoPath: repo.path, capabilities, domains, harness: task.harness || 'opencode' }); }
     catch (error) {
       try { jobs.append(taskId, 'job.failed', { error: String(error?.message || error).slice(0, 500) }); } catch { /* the throw says it */ }
       throw error;
@@ -144,9 +144,10 @@ function createCodePipeline({ jobs, workspaces, harness, roleEngine = null, plan
     // Decided once, for the life of this task, like the review and guard flags.
     const settings = { merge: flag(merge), guarded: !!(guard && flag(() => guard.enabled())) };
     const state = { handle };
-    jobs.run(taskId, (ctx) => drive(ctx, { ...task, taskId, settings }, state)).catch(() => {
+    jobs.run(taskId, (ctx) => drive(ctx, { ...task, taskId, settings }, state)).catch(async () => {
       // jobs.run could not even record the start: the work never ran, so give the claim back.
-      harness.releaseRun(state.handle);
+      await harness.releaseRun(state.handle);
+      try { if (jobs.get(taskId)?.status === 'queued') jobs.append(taskId, 'job.failed', { error: 'Code pipeline could not start.' }); } catch {}
     });
     return { taskId, branch: handle.workspace.branch, workspace: handle.workspace.path };
   }
@@ -158,7 +159,7 @@ function createCodePipeline({ jobs, workspaces, harness, roleEngine = null, plan
     const first = state.handle.workspace;
     const branch = first.branch, baseSha = first.baseSha ?? null;
     const t = { lifecycle: 'planned', revision: 0, headSha: null, loops: 0 };
-    const tokens = [];
+    const tokens = [], network = [];
     const credentials = () => { let key = null; try { key = engineKey(); } catch { /* none */ } return key ? { engine: key } : undefined; };
 
     const stage = (to, reason, extra = {}) => {
@@ -239,7 +240,8 @@ function createCodePipeline({ jobs, workspaces, harness, roleEngine = null, plan
         const n = t.revision + 1;
         ctx.artifact({ name: 'plan', kind: 'plan', revision: n, planHash, plan });
         if (n > 1) {
-          try { state.handle = harness.claimRun({ taskId, capabilities, domains, harness: harnessId, resume: true }); }
+          if (state.handle.cleanupConfirmed === false) throw new Blocked('Native network cleanup could not be confirmed; the task cannot take another grant.');
+          try { state.handle = await harness.claimRun({ taskId, capabilities, domains, harness: harnessId, resume: true }); }
           catch (error) { throw new Blocked(`The task’s branch could not be taken up again: ${String(error?.message || error).slice(0, 200)}`); }
         }
         if (state.handle.grant?.token) tokens.push(state.handle.grant.token);
@@ -254,7 +256,7 @@ function createCodePipeline({ jobs, workspaces, harness, roleEngine = null, plan
             orchestrator: { metaPrompt: PIPELINE_META, systemPrompt: SHARED_FRAME },
           }).projection);
         } catch (error) {
-          harness.releaseRun(state.handle);
+          await harness.releaseRun(state.handle, ctx);
           if (error instanceof RoleContextLeakError) throw new Blocked('The coding agent’s brief would have carried text it must not see, so it was not sent.');
           throw new Blocked('The coding agent’s brief could not be prepared.');
         }
@@ -265,9 +267,12 @@ function createCodePipeline({ jobs, workspaces, harness, roleEngine = null, plan
             // #1853: the machine the task's model was pinned on (null: here); the Executor must run there too.
             ...(session.machine !== undefined ? { machine: session.machine } : {}) }));
         } catch (error) {
+          if (state.handle.network) { if (network.length >= 32) network.shift(); network.push({ revision: n, ...state.handle.network }); }
           if (error instanceof Blocked || error instanceof Cancelled) throw error;
           throw new Blocked(`The coding agent stopped: ${String(error?.publicMessage || error?.message || error).slice(0, 300)}`);
         }
+        if (state.handle.network) { if (network.length >= 32) network.shift(); network.push({ revision: n, ...state.handle.network }); }
+        if (state.handle.cleanupConfirmed === false) throw new Blocked('Native network cleanup could not be confirmed; this revision cannot continue.');
         const released = state.handle.released;
         if (!released || released.status !== 'released') throw new Blocked(`The workspace was not released cleanly${released?.error ? `: ${String(released.error).slice(0, 200)}` : '.'}`);
         const headSha = released.headSha;
@@ -375,7 +380,7 @@ function createCodePipeline({ jobs, workspaces, harness, roleEngine = null, plan
         live();
         const accepted = answer === 'approve' || answer === 'approve_all';
         const result = { pipeline: true, revision: n, branch, baseSha, headSha, verdict: judged.verdict.verdict,
-          audit: report.overall, accepted, decision: answer, merged: false, mergedInto: null, loops: t.loops };
+          audit: report.overall, accepted, decision: answer, merged: false, mergedInto: null, loops: t.loops, ...(network.length ? { network } : {}) };
         if (withheld) result.mergeWithheld = withheld.code;
         if (!accepted || !into) return result;
         // The flag is read again now: merging switched off while the card waited means record only.
@@ -401,9 +406,9 @@ function createCodePipeline({ jobs, workspaces, harness, roleEngine = null, plan
       try { if (t.lifecycle !== 'blocked' && t.lifecycle !== 'merged') stage('blocked', blocked.message); }
       catch (e) { log({ at: now(), taskId, event: 'code.pipeline_stage_failed', error: String(e?.message || e).slice(0, 200) }); }
       log({ at: now(), taskId, event: 'code.pipeline_blocked', revision: t.revision });
-      throw Object.assign(blocked, { result: { pipeline: true, blocked: true, revision: t.revision, headSha: t.headSha, loops: t.loops, ...(error.result || {}) } });
+      throw Object.assign(blocked, { result: { pipeline: true, blocked: true, revision: t.revision, headSha: t.headSha, loops: t.loops, ...(network.length ? { network } : {}), ...(error.result || {}) } });
     } finally {
-      harness.releaseRun(state.handle);
+      await harness.releaseRun(state.handle, ctx);
     }
 
     /** One more change round, or blocked once `maxLoops` are spent. Returns the next stage's reason. */

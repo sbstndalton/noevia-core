@@ -344,8 +344,8 @@ test('a read is served from the worktree, and a line window is honoured', { skip
 test('the workspace is released and the egress grant revoked however the task ends', { skip: skipWasm }, async () => {
   ran++;
   const revoked = [], granted = [];
-  const egress = { grant: ({ taskId, domains }) => { granted.push({ taskId, domains }); return { token: 'secret-token' }; },
-    revoke: (taskId) => { revoked.push(taskId); return 1; } };
+  const egress = { grant: ({ taskId, domains }) => { granted.push({ taskId, domains }); return { taskId, token: 'secret-token' }; },
+    revoke: (lease) => { revoked.push(lease.taskId); return { confirmed: true, report: { available: true, final: true, hosts: [], allowed: 0, refused: 0 } }; } };
   const ok = await run({ capabilities: [ACTIONS.NETWORK], domains: ['registry.npmjs.org'], egress, script: async () => {} });
   assert.equal(ok.job.status, 'completed');
   assert.equal(granted.length, 1);
@@ -373,7 +373,7 @@ test('no egress grant without both the capability and named domains', { skip: sk
 
 test('the job records what happened, and the proxy token never reaches the record', { skip: skipWasm }, async () => {
   ran++;
-  const egress = { grant: () => ({ token: 'super-secret-token' }), revoke: () => 1 };
+  const egress = { grant: ({ taskId }) => ({ taskId, token: 'super-secret-token' }), revoke: async () => ({ confirmed: true, report: { available: true, final: true, hosts: [], allowed: 0, refused: 0 } }) };
   const r = await run({
     capabilities: [ACTIONS.EDIT, ACTIONS.NETWORK], domains: ['a.test'], egress, answers: ['approve'],
     script: async (h, cwd) => {
@@ -652,7 +652,7 @@ test('a failure before the harness starts still gives back the workspace and the
   const jobs = createJobs({ dir });
   const workspaces = createCodeWorkspaces({ dir, epoch: 'test' });
   const revoked = [];
-  const egress = { grant: () => ({ token: 'secret' }), revoke: (id) => { revoked.push(id); return 1; } };
+  const egress = { grant: ({ taskId }) => ({ taskId, token: 'secret' }), revoke: (lease) => { revoked.push(lease.taskId); return { confirmed: true, report: { available: true, final: true, hosts: [], allowed: 0, refused: 0 } }; } };
   const brokenJobs = {
     ...jobs,
     run: (id, work) => jobs.run(id, (ctx) => work({
@@ -684,7 +684,7 @@ test('a run that cannot even record its start still gives back the workspace and
   const jobs = createJobs({ dir });
   const workspaces = createCodeWorkspaces({ dir, epoch: 'test' });
   const revoked = [];
-  const egress = { grant: () => ({ token: 'secret' }), revoke: (id) => { revoked.push(id); return 1; } };
+  const egress = { grant: ({ taskId }) => ({ taskId, token: 'secret' }), revoke: (lease) => { revoked.push(lease.taskId); return { confirmed: true, report: { available: true, final: true, hosts: [], allowed: 0, refused: 0 } }; } };
   let failing = false;
   // jobs.run's shape: the append that throws happens inside run, before `work` is ever called.
   const brokenJobs = { ...jobs, run: async () => { failing = true; throw new Error('ENOSPC: no space left on device'); } };
@@ -707,7 +707,7 @@ test('the real jobs.run failing to append job.started triggers the same cleanup'
   const jobs = createJobs({ dir });
   const workspaces = createCodeWorkspaces({ dir, epoch: 'test' });
   const revoked = [];
-  const egress = { grant: () => ({ token: 'secret' }), revoke: (id) => { revoked.push(id); return 1; } };
+  const egress = { grant: ({ taskId }) => ({ taskId, token: 'secret' }), revoke: (lease) => { revoked.push(lease.taskId); return { confirmed: true, report: { available: true, final: true, hosts: [], allowed: 0, refused: 0 } }; } };
   // createJobs' run calls its own closure-bound append, so the disk is what has to fail: the
   // job's log file is replaced by a directory the moment the run begins.
   const harness = createCodeHarness({ jobs: { ...jobs, run: (id, work) => {
@@ -745,7 +745,7 @@ test('usage is taken from the harness’s own usage_update, where the real one p
 
 test('a granted task reaches the proxy by its endpoint and the engine directly', { skip: skipWasm }, async () => {
   ran++;
-  const egress = { endpoint: 'egress:8040', grant: () => ({ token: 'tok' }), revoke: () => 1 };
+  const egress = { endpoint: 'egress:8040', grant: ({ taskId }) => ({ taskId, token: 'tok' }), revoke: async () => ({ confirmed: true, report: { available: true, final: true, hosts: [], allowed: 0, refused: 0 } }) };
   const r = await run({ capabilities: [ACTIONS.NETWORK], domains: ['pypi.org'], egress, script: async () => {} });
   assert.equal(r.connected.proxy.url, 'http://task:tok@egress:8040');
   // Through the proxy the engine would be refused as a private address, and the agent could not think.
@@ -768,9 +768,9 @@ test('shared project context reaches the agent ahead of the task, never the task
 test("a networked task's result says which hosts it reached and which were refused", { skip: skipWasm }, async () => {
   ran++;
   const forgotten = [];
-  const egress = { grant: () => ({ token: 't' }), revoke: () => 1,
-    activity: (taskId, { forget = false } = {}) => { if (forget) forgotten.push(taskId);
-      return { hosts: [{ host: 'github.com', allowed: 0, refused: 2, reason: 'host is not on this task’s list' }], allowed: 0, refused: 2 }; } };
+  const egress = { grant: ({ taskId }) => ({ taskId, token: 't' }),
+    revoke: async () => ({ confirmed: true, report: { available: true, final: true, snapshotId: 'ab'.repeat(16), hosts: [{ host: 'github.com', allowed: 0, refused: 2, reason: 'host is not on this task’s list' }], allowed: 0, refused: 2 } }),
+    forget: async (lease) => { forgotten.push(lease.taskId); return { confirmed: true }; } };
   const r = await run({ capabilities: [ACTIONS.NETWORK], domains: ['pypi.org'], egress, script: async () => {} });
   assert.equal(r.job.result.network.refused, 2);
   assert.equal(r.job.result.network.hosts[0].host, 'github.com');
@@ -904,4 +904,44 @@ test('a redirect under a standing execute allow still meets the edit containment
   assert.deepEqual(picked.map((p) => p.optionId), ['y', 'n', 'n', 'y']);
 });
 
-test.after(() => { if (!skipWasm) assert.equal(ran, 46, 'a wasm-guarded test body did not run'); });
+test.after(() => { if (!skipWasm) assert.equal(ran, 47, 'a wasm-guarded test body did not run'); });
+
+test('an asynchronous grant failure rolls back the claimed workspace before rejection', async () => {
+  let rejectGrant, released = 0;
+  const gate = new Promise((_, reject) => { rejectGrant = reject; });
+  const harness = createCodeHarness({ jobs: { append() {} }, workspaces: { claim: () => ({ path: '/owned/synthetic', branch: 'fixture' }), release: () => { released++; return { status: 'released' }; } }, egress: { grant: () => gate } });
+  const claim = harness.claimRun({ taskId: 'owned.fixture', capabilities: [ACTIONS.NETWORK], domains: ['example.com'] });
+  assert.equal(released, 0); rejectGrant(Error('synthetic unavailable')); await assert.rejects(claim, /synthetic unavailable/); assert.equal(released, 1);
+});
+test('concurrent cleanup owns one original lease, durably retains its report, and waits before workspace release', async () => {
+  const events = []; let revokeResolve, forgetResolve, enteredForget;
+  const revokeGate = new Promise((resolve) => { revokeResolve = resolve; }), forgetGate = new Promise((resolve) => { forgetResolve = resolve; }), forgetEntered = new Promise((resolve) => { enteredForget = resolve; });
+  const lease = Object.freeze({ token: 'owned-secret' }); let revokeCount = 0;
+  const harness = createCodeHarness({ jobs: { append: (id, type, data) => events.push({ type, data }) }, workspaces: { claim: () => ({ path: '/owned/synthetic', branch: 'fixture' }), release: () => { events.push({ type: 'released' }); return { status: 'released' }; } }, egress: {
+    grant: async () => lease, revoke: (got) => { assert.equal(got, lease); revokeCount++; return revokeGate; },
+    forget: (got, snapshotId) => { assert.equal(got, lease); assert.equal(snapshotId, 'ab'.repeat(16)); assert.equal(events[0].data.network.hosts[0].host, 'example.com'); enteredForget(); return forgetGate; },
+  } });
+  const handle = await harness.claimRun({ taskId: 'owned.fixture', capabilities: [ACTIONS.NETWORK], domains: ['example.com'] });
+  const one = harness.releaseRun(handle), two = harness.releaseRun(handle); assert.equal(one, two); await Promise.resolve(); assert.equal(revokeCount, 1); assert.equal(events.length, 0);
+  revokeResolve({ confirmed: true, report: Object.freeze({ available: true, final: true, snapshotId: 'ab'.repeat(16), hosts: [{ host: 'example.com', allowed: 1, refused: 0 }], allowed: 1, refused: 0 }) });
+  await forgetEntered; assert.equal(events.some((e) => e.type === 'released'), false); forgetResolve({ confirmed: true });
+  assert.equal((await one).status, 'released'); assert.equal(handle.network.allowed, 1); assert.equal(handle.networkAcknowledged, true); assert.equal(events.at(-1).type, 'released');
+});
+test('unconfirmed native cleanup records uncertainty before local release and never forgets', async () => {
+  const order = []; let forgot = false;
+  const harness = createCodeHarness({ jobs: { append: (id, type) => order.push(type) }, workspaces: { claim: () => ({}), release: () => { order.push('released'); return { status: 'released' }; } }, egress: {
+    grant: async () => Object.freeze({ token: 'owned-secret' }), revoke: async () => ({ confirmed: false, report: { available: false, partial: true, final: false, state: 'uncertain' } }), forget: () => { forgot = true; },
+  } });
+  const handle = await harness.claimRun({ taskId: 'owned.fixture', capabilities: [ACTIONS.NETWORK], domains: ['example.com'] }); await harness.releaseRun(handle);
+  assert.equal(handle.cleanupConfirmed, false); assert.deepEqual(order, ['tool.uncertain', 'artifact.created', 'released']); assert.equal(forgot, false); assert.equal(Object.hasOwn(handle.network, 'hosts'), false);
+});
+
+test('an executor failure waits for bounded native cleanup and preserves its original error', { skip: skipWasm }, async () => {
+  ran++;
+  let takeGrant, entered; const taking = new Promise((resolve) => { entered = resolve; }), gate = new Promise((resolve) => { takeGrant = resolve; });
+  const r = await run({ capabilities: [ACTIONS.NETWORK], domains: ['example.com'], egress: { grant: async ({ taskId }) => Object.freeze({ taskId, token: 'owned-private-token' }), revoke: () => { entered(); return gate; } }, script: async () => { throw Error('owned executor failure'); }, onStarted: async (started, jobs) => {
+    await taking; assert.equal(jobs.get(started.taskId).status, 'running'); takeGrant({ confirmed: false, report: { available: false, final: false, partial: true, state: 'uncertain' } });
+  } });
+  assert.equal(r.job.status, 'failed'); assert.equal(r.job.error, 'owned executor failure'); assert.equal(r.job.uncertain.length, 1); assert.equal(r.workspaces.get(r.taskId).status, 'released');
+  const report = r.job.artifacts.find((a) => a.kind === 'native-network-report'); assert.equal(report.network.cleanupConfirmed, false); assert.equal(Object.hasOwn(report.network, 'hosts'), false);
+});

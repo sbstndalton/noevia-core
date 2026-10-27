@@ -48,7 +48,7 @@ function fakeBrowser({ url = ORIGIN, failClick = false, elementGate = null } = {
 function service(extra = {}) {
   const workspace = { dir: temp('noevia-browser-sws-') };
   const fake = fakeBrowser(extra.browserOpts);
-  const egress = { endpoint: 'egress:8040', grant: ({ taskId }) => ({ token: `tok-${taskId}` }), revoke: () => {} };
+  const egress = { endpoint: 'egress:8040', grant: ({ taskId }) => ({ token: `tok-${taskId}` }), revoke: async () => ({ confirmed: true, report: { available: true, final: true, hosts: [], allowed: 0, refused: 0 } }) };
   const svc = createBrowserService({ launch: async () => fake.browser, egress, timeoutMs: 60, idleTimeoutMs: 200, ...extra });
   return { svc, workspace, fake };
 }
@@ -73,7 +73,7 @@ test('one task at a time per project, running through queued, running, finished'
   await new Promise((r) => setTimeout(r, 20));
   const done = svc.get(workspace, project, started.taskId);
   assert.equal(done.status, 'completed');
-  assert.deepEqual(done.result, { pages: 1 });
+  assert.equal(done.result.pages, 1); assert.equal(done.result.network.cleanupConfirmed, true);
   // The slot is free again.
   const second = await svc.start(workspace, project, { domains: ['shop.example.test'] });
   assert.ok(second.taskId);
@@ -163,7 +163,7 @@ test('a task idle too long times out (failed), not left running forever', { skip
 test('recovery after a restart marks a running task interrupted, never silently resumed', { skip: skipWasm }, async () => {
   ran++;
   const workspace = { dir: temp('noevia-browser-recover-') };
-  const egress = { endpoint: 'egress:8040', grant: ({ taskId }) => ({ token: `tok-${taskId}` }), revoke: () => {} };
+  const egress = { endpoint: 'egress:8040', grant: ({ taskId }) => ({ token: `tok-${taskId}` }), revoke: async () => ({ confirmed: true, report: { available: true, final: true, hosts: [], allowed: 0, refused: 0 } }) };
   const fake1 = fakeBrowser();
   // Short on purpose: nothing in this test ever finishes or cancels svc1's task (the whole point
   // is that its own process never gets the chance to), so its idle timer is left to fire and
@@ -195,7 +195,7 @@ test('a task from another project is not found, rather than forbidden — tenant
 test('a browser that fails to open never leaves a phantom running task', { skip: skipWasm }, async () => {
   ran++;
   const workspace = { dir: temp('noevia-browser-openfail-') };
-  const egress = { endpoint: 'egress:8040', grant: ({ taskId }) => ({ token: `tok-${taskId}` }), revoke: () => {} };
+  const egress = { endpoint: 'egress:8040', grant: ({ taskId }) => ({ token: `tok-${taskId}` }), revoke: async () => ({ confirmed: true, report: { available: true, final: true, hosts: [], allowed: 0, refused: 0 } }) };
   const svc = createBrowserService({ launch: async () => { throw Error('no browser on this host'); }, egress, timeoutMs: 60 });
   await assert.rejects(() => svc.start(workspace, project, { domains: ['shop.example.test'] }), /could not open/);
 });
@@ -207,7 +207,7 @@ test('a cancel that lands before the approval card exists is not left waiting th
   let releaseGate; const gate = new Promise((r) => { releaseGate = r; });
   const workspace = { dir: temp('noevia-browser-cancelgate-') };
   const fake = fakeBrowser({ elementGate: gate });
-  const egress = { endpoint: 'egress:8040', grant: ({ taskId }) => ({ token: `tok-${taskId}` }), revoke: () => {} };
+  const egress = { endpoint: 'egress:8040', grant: ({ taskId }) => ({ token: `tok-${taskId}` }), revoke: async () => ({ confirmed: true, report: { available: true, final: true, hosts: [], allowed: 0, refused: 0 } }) };
   const svc = createBrowserService({ launch: async () => fake.browser, egress, timeoutMs: 5000, idleTimeoutMs: 60000 });
   const started = await svc.start(workspace, project, { domains: ['shop.example.test'] });
   const actPromise = svc.act(workspace, project, started.taskId, { type: 'click', selector: '#go' });
@@ -239,10 +239,10 @@ test('a grant that throws leaves the job cancelled, not stuck queued and blockin
   ran++;
   const workspace = { dir: temp('noevia-browser-grantfail-') };
   const fake = fakeBrowser();
-  const egress = { endpoint: 'egress:8040', grant: () => { throw Object.assign(Error('no capacity'), { publicMessage: 'The egress proxy refused this task.' }); }, revoke: () => {} };
+  const egress = { endpoint: 'egress:8040', grant: () => { throw Object.assign(Error('no capacity'), { publicMessage: 'The egress proxy refused this task.' }); }, revoke: async () => ({ confirmed: true, report: { available: true, final: true, hosts: [], allowed: 0, refused: 0 } }) };
   const svc = createBrowserService({ launch: async () => fake.browser, egress, timeoutMs: 60 });
   await assert.rejects(() => svc.start(workspace, project, { domains: ['shop.example.test'] }), /refused this task/);
-  const workingEgress = { endpoint: 'egress:8040', grant: ({ taskId }) => ({ token: `tok-${taskId}` }), revoke: () => {} };
+  const workingEgress = { endpoint: 'egress:8040', grant: ({ taskId }) => ({ token: `tok-${taskId}` }), revoke: async () => ({ confirmed: true, report: { available: true, final: true, hosts: [], allowed: 0, refused: 0 } }) };
   const svc2 = createBrowserService({ launch: async () => fakeBrowser().browser, egress: workingEgress, timeoutMs: 60 });
   const started = await svc2.start(workspace, project, { domains: ['shop.example.test'] });
   assert.ok(started.taskId, 'the earlier failed attempt never occupies the "one task per project" slot');
@@ -275,3 +275,40 @@ test('finish() refuses a result over the size limit, and records nothing', { ski
 });
 
 test.after(() => { if (!skipWasm) assert.equal(ran, 16, 'a wasm-guarded test body did not run'); });
+
+test('Browser awaits grant and scoped cleanup, retaining the final native report before Forget and completion', async () => {
+  const workspace = { dir: temp('noevia-browser-controlled-') }, fake = fakeBrowser(); let giveGrant, takeGrant, revokeEntered, ackEntered;
+  const lease = Object.freeze({ token: 'owned-private-token' }), grantGate = new Promise((resolve) => { giveGrant = resolve; }), revokeGate = new Promise((resolve) => { takeGrant = resolve; }), revoked = new Promise((resolve) => { revokeEntered = resolve; }), acked = new Promise((resolve) => { ackEntered = resolve; }); let launches = 0, taskId;
+  const svc = createBrowserService({ launch: async () => { launches++; return fake.browser; }, egress: { endpoint: 'owned.test:1', grant: ({ taskId: id }) => { taskId = id; return grantGate; }, revoke: (got) => { assert.equal(got, lease); revokeEntered(); return revokeGate; }, forget: async (got, snapshotId) => {
+    assert.equal(got, lease); assert.equal(snapshotId, 'ab'.repeat(16));
+    const journal = fs.readFileSync(path.join(workspace.dir, 'jobs', `${taskId}.jsonl`), 'utf8'); assert.ok(journal.includes('network.cleanup')); assert.ok(journal.includes('example.com')); assert.ok(!journal.includes(lease.token)); ackEntered(); return { confirmed: true };
+  } }, idleTimeoutMs: 60000 });
+  const starting = svc.start(workspace, project, { domains: ['shop.example.test'] }); await Promise.resolve(); assert.equal(launches, 0);
+  giveGrant(lease); const started = await starting; svc.finish(workspace, project, started.taskId, { pages: 1 }); await revoked;
+  assert.equal(svc.get(workspace, project, taskId).status, 'running');
+  takeGrant({ confirmed: true, report: { available: true, final: true, snapshotId: 'ab'.repeat(16), hosts: [{ host: 'example.com', allowed: 1, refused: 0 }], allowed: 1, refused: 0 } }); await acked;
+  for (let i = 0; i < 100 && svc.get(workspace, project, taskId).status === 'running'; i++) await new Promise((r) => setTimeout(r, 1));
+  const job = svc.get(workspace, project, taskId); assert.equal(job.status, 'completed'); assert.equal(job.result.pages, 1); assert.equal(job.result.network.allowed, 1);
+});
+test('Browser startup journal failures still await original lease cleanup before rejecting', async () => {
+  for (const event of ['job.started', 'checkpoint.created']) {
+    const workspace = { dir: temp('noevia-browser-start-fault-') }; let revoked = 0, launches = 0;
+    const lease = Object.freeze({ token: 'owned-private-token' }), original = fs.writeFileSync; let injected = false, ownedId, unexpectedStart;
+    const svc = createBrowserService({ idleTimeoutMs: 30, launch: async () => { launches++; return fakeBrowser().browser; }, egress: { endpoint: 'owned.test:1', grant: async ({ taskId }) => { ownedId = taskId; return lease; }, revoke: async (got) => { assert.equal(got, lease); revoked++; return { confirmed: true, report: { available: true, final: true, hosts: [], allowed: 0, refused: 0 } }; } } });
+    try {
+      fs.writeFileSync = (file, bytes, ...rest) => { if (!injected && typeof file === 'number' && String(bytes).startsWith('{"job":')) { const record = JSON.parse(String(bytes)); if (record.job === ownedId && record.type === event) { injected = true; throw Error('owned synthetic append failure'); } } return original(file, bytes, ...rest); };
+      await assert.rejects(async () => { unexpectedStart = await svc.start(workspace, project, { domains: ['shop.example.test'] }); }, /browser could not open/i);
+      assert.equal(injected, true); assert.equal(revoked, 1); assert.equal(launches, 0);
+    } finally { fs.writeFileSync = original; if (unexpectedStart) svc.cancel(workspace, project, unexpectedStart.taskId); }
+  }
+});
+
+test('cancel during pending Browser setup revokes the original native lease before late context arrival', async () => {
+  const workspace = { dir: temp('noevia-browser-open-cancel-') }; let giveContext, entered, taskId; const creating = new Promise((resolve) => { entered = resolve; }), contextGate = new Promise((resolve) => { giveContext = resolve; }); let closes = 0, revokes = 0;
+  const lease = Object.freeze({ token: 'owned-private-token' });
+  const svc = createBrowserService({ launch: async () => ({ newContext: async () => { entered(); return contextGate; }, close: async () => {} }), egress: { endpoint: 'owned.test:1', grant: async ({ taskId: id }) => { taskId = id; return lease; }, revoke: async (got) => { assert.equal(got, lease); revokes++; return { confirmed: true, report: { available: true, final: true, hosts: [], allowed: 0, refused: 0 } }; } }, idleTimeoutMs: 30 });
+  const starting = svc.start(workspace, project, { domains: ['shop.example.test'] }); await creating; svc.cancel(workspace, project, taskId);
+  await assert.rejects(starting, /Cancelled/); assert.equal(revokes, 1);
+  giveContext({ route: async () => { throw Error('late cancelled setup must not route'); }, close: async () => { closes++; } });
+  for (let i = 0; i < 50 && !closes; i++) await new Promise((r) => setTimeout(r, 1)); assert.equal(closes, 1); assert.equal(svc.get(workspace, project, taskId).status, 'cancelled');
+});

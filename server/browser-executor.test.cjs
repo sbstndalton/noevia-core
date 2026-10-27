@@ -259,3 +259,29 @@ test('#1218: describeInPage reports a button’s DOM type (its real state), othe
 });
 
 test.after(() => { if (!skipWasm) assert.equal(ran, 14, 'a wasm-guarded test body did not run'); });
+
+test('context ownership precedes setup and concurrent close waits for actual completion', async () => {
+  let finishClose, entered; const started = new Promise((resolve) => { entered = resolve; }), closeGate = new Promise((resolve) => { finishClose = resolve; }); let closes = 0;
+  const context = { route: async () => { throw Error('owned setup failure'); }, close: async () => { closes++; entered(); await closeGate; } };
+  const executor = createBrowserExecutor({ launch: async () => ({ newContext: async () => context }), askApproval: async () => 'deny' });
+  await assert.rejects(executor.open({ jobId: 'owned.job', allowedDomains: ['example.com'], downloadsDir: temp(), proxy: { server: 'http://owned.test:1' } }), /owned setup failure/);
+  assert.equal(closes, 1, 'failed setup immediately starts closing the already owned context');
+  await started; let settled = false; const cleanup = executor.closeTask('owned.job').then((r) => { settled = true; return r; });
+  await Promise.resolve(); assert.equal(settled, false); assert.equal(closes, 1); assert.equal((await executor.closeTask('another.job')).confirmed, true); assert.equal(closes, 1);
+  finishClose(); assert.equal((await cleanup).confirmed, true); assert.equal((await executor.closeTask('owned.job')).confirmed, true); assert.equal(closes, 1);
+});
+test('a rejected context close is not reported as confirmed just because admission was closed', async () => {
+  let closes = 0;
+  const executor = createBrowserExecutor({ launch: async () => ({ newContext: async () => ({ route: async () => { throw Error('owned setup failure'); }, close: async () => { closes++; throw Error('owned close failure'); } }) }), askApproval: async () => 'deny' });
+  await assert.rejects(executor.open({ jobId: 'owned.job', allowedDomains: ['example.com'], downloadsDir: temp(), proxy: { server: 'http://owned.test:1' } }), /owned setup failure/);
+  assert.equal((await executor.closeTask('owned.job')).confirmed, false); assert.equal((await executor.closeTask('owned.job')).confirmed, false); assert.equal(closes, 1);
+});
+
+test('cancellation while context creation is pending still closes the late exact job-owned context', async () => {
+  const abort = new AbortController(); let giveContext, entered; const creating = new Promise((resolve) => { entered = resolve; }), contextGate = new Promise((resolve) => { giveContext = resolve; }); let closes = 0, routes = 0;
+  const executor = createBrowserExecutor({ launch: async () => ({ newContext: async () => { entered(); return contextGate; } }), askApproval: async () => 'deny' });
+  const opening = executor.open({ jobId: 'owned.late.job', allowedDomains: ['example.com'], downloadsDir: temp(), proxy: { server: 'http://owned.test:1' }, signal: abort.signal });
+  await creating; abort.abort(); assert.equal((await executor.closeTask('owned.late.job')).confirmed, true);
+  giveContext({ route: async () => { routes++; }, close: async () => { closes++; } });
+  await assert.rejects(opening, /Cancelled/); assert.equal((await executor.closeTask('owned.late.job')).confirmed, true); assert.equal(closes, 1); assert.equal(routes, 0);
+});
