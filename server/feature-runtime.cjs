@@ -109,7 +109,9 @@ function createFeatureRuntime({ db, storeClient, collector, bootFacts, start,
     if (!EPOCH.test(current || '') || current !== incarnation) { retire(); throw unavailable(); }
   }
   function current() {
-    if (!active || clock() >= active.expires) { retire(); throw unavailable(); }
+    // A read during registration is unavailable, not a revocation of that registration.
+    if (!active) throw unavailable();
+    if (clock() >= active.expires) { retire(); throw unavailable(); }
     checkEpoch(active.incarnation);
     return active;
   }

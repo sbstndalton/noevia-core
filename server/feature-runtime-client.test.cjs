@@ -247,3 +247,30 @@ test('an actual SQLite read outage returns deterministic unavailable instead of 
   f.db.close();
   assert.throws(() => f.runtime.read(() => true), { status: 503, code: 'FEATURE_RUNTIME_CONTEXT_UNAVAILABLE' });
 });
+
+
+test('refused reads while register ACK is deferred do not retire the pending generation', async t => {
+  const arrived = deferred(), finish = deferred();
+  const f = fixture(t, async p => { if (p.op === 'register') { arrived.resolve(); await finish.promise; } });
+  const registration = f.runtime.ready();
+  await arrived.promise;
+  for (let i = 0; i < 3; i++) assert.throws(() => f.runtime.read(() => true), { status: 503 });
+  finish.resolve();
+  await registration;
+  assert.equal(f.runtime.read(() => true), true);
+  await f.runtime.release();
+  assert.throws(() => f.runtime.read(() => true), { status: 503 });
+});
+
+test('refused reads cannot rescue an old-epoch register ACK', async t => {
+  const arrived = deferred(), finish = deferred();
+  const f = fixture(t, async (p, api) => {
+    if (p.op === 'register') { arrived.resolve(); await finish.promise; api.replaceEpoch(NEXT); }
+  });
+  const registration = f.runtime.ready();
+  await arrived.promise;
+  assert.throws(() => f.runtime.read(() => true), { status: 503 });
+  finish.resolve();
+  await assert.rejects(registration, { status: 503 });
+  assert.throws(() => f.runtime.read(() => true), { status: 503 });
+});
