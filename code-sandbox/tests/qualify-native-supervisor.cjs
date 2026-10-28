@@ -169,7 +169,13 @@ async function one(mode, index) {
         if (mode === 'capacity') {
           const reuse = docker(clientArgs('reuse', '-reuse')); assert.equal(JSON.parse(reuse.trim().split('\n').at(-1)).complete, true); await waitIdle(id);
         }
-        docker(['kill', '--signal', 'TERM', id]); assert.equal(docker(['wait', id]).trim(), mode.startsWith('node-') ? '143' : '0');
+        // The retained Node PID1 has no TERM handler. These two controls prove
+        // selector/ACP compatibility and live worker drain, not graceful Node
+        // shutdown. Recycle only their already-idle owned namespaces; native
+        // cases must still handle TERM and exit successfully themselves.
+        const nodeControl = mode.startsWith('node-');
+        docker(['kill', '--signal', nodeControl ? 'KILL' : 'TERM', id]);
+        assert.equal(docker(['wait', id]).trim(), nodeControl ? '137' : '0');
       }
       assert.equal(inspect(id).State.OOMKilled, false);
       console.log(JSON.stringify({ case: mode, workerSeen, result, boundary: mode.startsWith('escaped-') ? 'namespace-recycle-required' : 'live-supervisor-owned-group' }));

@@ -11,6 +11,13 @@ permissions and filesystem RPC, framing/refusals, output backpressure, observed
 worker cancellation, wall/shutdown/capacity and packaged pi bridge propagation.
 Every case must complete; there is no optional or skipped qualification path.
 
+The two retained Node controls prove default/explicit selector compatibility,
+ACP behavior and worker drain while the Node supervisor stays live. Its existing
+PID1 entrypoint has no TERM handler, so the qualifier recycles that already-idle
+owned namespace with KILL and requires exit137; this is not graceful Node shutdown
+credit. Native cases retain TERM with exit0, including the active-worker shutdown
+case, and cannot use that control-only recycling path.
+
 The actual pi bridge CLI runs with its pinned Rust WASM and a fixed readonly
 synthetic RPC executable at `pi`'s existing image lookup path. No environment
 allowlist is widened and no model inference is performed. The expiry case waits
