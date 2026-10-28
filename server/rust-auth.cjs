@@ -1,4 +1,5 @@
 'use strict';
+const FEATURE_CONTEXT_SOURCE_WRITE_SQL = require('./feature-setting-source.cjs').WRITE_SQL;
 // The cross-runtime single-writer guard for M3 of the full-Rust migration (noevia
 // docs/adr-0001-rust-and-repo-split.md, "Amendment 2026-10-10"): the Rust front (noevia-rs
 // bins/noevia-server) owns sign-in and the account routes and the tables they write, and this
@@ -138,6 +139,11 @@ function statements(sql) {
 // may affect any native key and fail closed; this is not a general SQL parser.
 function singleSettingKey(sql, args) {
   const source = String(sql).trim().replace(/;$/, '').trim();
+  // Exactly the two context-source owners' complete statement, not arbitrary RETURNING SQL.
+  if (source === FEATURE_CONTEXT_SOURCE_WRITE_SQL) {
+    const key = Array.isArray(args[0]) ? args[0][0] : args[0];
+    return key === 'decision:configuration' || key === 'inference:machines' ? key : null;
+  }
   const insert = /^(?:INSERT(?: OR (?:REPLACE|IGNORE))?|REPLACE) INTO settings\s*\(\s*key\s*,\s*value\s*\) VALUES\s*\(\s*(\?|'[^']*')\s*,\s*\?\s*\)$/i.exec(source);
   if (insert) {
     if (insert[1] !== '?') return insert[1].slice(1, -1);
@@ -151,6 +157,7 @@ function singleSettingKey(sql, args) {
 // switch are written only by the Rust front (their routes left Node). This connection refuses those
 // keys too, even inside exempt(), with their own codes.
 const FRONT_SETTING_KEYS = Object.freeze({
+  'native:feature-runtime:incarnation': ['Feature runtime state is owned by the Rust front.', 'RUST_FEATURE_RUNTIME_OWNED'],
   public_origin_admin: ['Web address changes are owned by the Rust front.', 'RUST_WEB_ADDRESS_WRITE_OWNED'],
   previous_origins: ['Web address changes are owned by the Rust front.', 'RUST_WEB_ADDRESS_WRITE_OWNED'],
   routing_modes_allowed: ['Routing settings are owned by the Rust front.', 'RUST_ROUTING_MODE_OWNED'],
@@ -229,6 +236,9 @@ function createRustAuthGuard() {
       let hasSettings = false;
       try { hasSettings = !!prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='settings'").get(); } catch { /* no schema yet */ }
       if (hasSettings) exec(`
+        CREATE TEMP TRIGGER rust_feature_epoch_insert BEFORE INSERT ON main.settings WHEN NEW.key='native:feature-runtime:incarnation' BEGIN SELECT RAISE(ABORT,'RUST_FEATURE_RUNTIME_OWNED'); END;
+        CREATE TEMP TRIGGER rust_feature_epoch_update BEFORE UPDATE ON main.settings WHEN OLD.key='native:feature-runtime:incarnation' OR NEW.key='native:feature-runtime:incarnation' BEGIN SELECT RAISE(ABORT,'RUST_FEATURE_RUNTIME_OWNED'); END;
+        CREATE TEMP TRIGGER rust_feature_epoch_delete BEFORE DELETE ON main.settings WHEN OLD.key='native:feature-runtime:incarnation' BEGIN SELECT RAISE(ABORT,'RUST_FEATURE_RUNTIME_OWNED'); END;
         CREATE TEMP TRIGGER rust_routing_insert BEFORE INSERT ON main.settings WHEN NEW.key='routing_modes_allowed' BEGIN SELECT RAISE(ABORT,'RUST_ROUTING_MODE_OWNED'); END;
         CREATE TEMP TRIGGER rust_routing_update BEFORE UPDATE ON main.settings WHEN OLD.key='routing_modes_allowed' OR NEW.key='routing_modes_allowed' BEGIN SELECT RAISE(ABORT,'RUST_ROUTING_MODE_OWNED'); END;
         CREATE TEMP TRIGGER rust_routing_delete BEFORE DELETE ON main.settings WHEN OLD.key='routing_modes_allowed' BEGIN SELECT RAISE(ABORT,'RUST_ROUTING_MODE_OWNED'); END;

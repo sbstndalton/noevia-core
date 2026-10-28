@@ -136,3 +136,44 @@ test('committed machine assignment and failed audit bind cache to the successful
   assert.equal(owner.runtimeContextSource(), store.readFact(MACHINES).source);
   assert.deepEqual(JSON.parse(store.get(MACHINES)).assignments, {});
 });
+
+test('actual guarded connection accepts only the two exact source-store write shapes', t => {
+  const { db } = fixture(t);
+  const guard = require('./rust-auth.cjs').createRustAuthGuard();
+  guard.install(db);
+  const store = createStore(db); // MUST prepare statements after installation.
+  const decision = createDecisionSettings({ store, env: {} });
+  decision.save({ url: 'http://192.168.1.20:8040', timeoutMs: 1500 }, 'synthetic');
+  assert.equal(decision.runtimeContextSource(), store.readFact(DECISION).source);
+  decision.reset('synthetic');
+  assert.equal(store.get(DECISION), undefined);
+  store.set(MACHINES, JSON.stringify(machineState(8040)));
+  const machines = createInferenceMachines({ store, log: () => {} });
+  machines.assign({ service: 'decision', machine: 'local' }, 'synthetic');
+  assert.equal(machines.runtimeContextSource(), store.readFact(MACHINES).source);
+  assert.equal(machines.urlFor('decision'), null);
+  const { WRITE_SQL } = require('./feature-setting-source.cjs');
+  for (const key of ['feature:plannerReview', 'native:feature-runtime:incarnation', 'public_origin_admin', 'unknown']) {
+    assert.throws(() => guard.exempt(() => db.prepare(WRITE_SQL).get(key, 'forged')), { code: 'RUST_AUTH_OWNED' });
+  }
+  assert.throws(() => guard.exempt(() => db.prepare('DELETE FROM settings WHERE key=?').run(DECISION)), { code: 'RUST_AUTH_OWNED' });
+  assert.throws(() => db.prepare(`${WRITE_SQL}, 1 AS extra`).get(DECISION, 'forged'), { code: 'RUST_AUTH_OWNED' });
+  assert.throws(() => guard.exempt(() => db.prepare('INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)').run('native:feature-runtime:incarnation', 'forged')), { code: 'RUST_FEATURE_RUNTIME_OWNED' });
+  const args = [DECISION, '{"url":"http://192.168.1.20:8040","timeoutMs":1500}'];
+  const statement = db.prepare(WRITE_SQL).bind(args);
+  args[0] = 'native:feature-runtime:incarnation';
+  statement.get(); // SQLite and the guard both retained the original decision key.
+  assert.equal(JSON.parse(store.get(DECISION)).timeoutMs, 1500);
+  const prohibited = db.prepare(WRITE_SQL).bind('native:feature-runtime:incarnation', 'forged').raw();
+  assert.throws(() => guard.exempt(() => prohibited.get()), { code: 'RUST_AUTH_OWNED' });
+});
+
+test('epoch guard also refuses indirect trigger writes even inside exemptions', t => {
+  const { db } = fixture(t);
+  db.exec("CREATE TABLE synthetic_source(x); CREATE TRIGGER forge_epoch AFTER INSERT ON synthetic_source BEGIN INSERT OR REPLACE INTO settings(key,value) VALUES('native:feature-runtime:incarnation','forged'); END;");
+  const guard = require('./rust-auth.cjs').createRustAuthGuard();
+  guard.install(db);
+  assert.throws(() => guard.exempt(() => db.prepare('INSERT INTO synthetic_source VALUES(?)').run('synthetic')), /RUST_FEATURE_RUNTIME_OWNED/);
+  assert.equal(db.prepare("SELECT count(*) AS n FROM settings WHERE key='native:feature-runtime:incarnation'").get().n, 0);
+  assert.equal(db.prepare('SELECT count(*) AS n FROM synthetic_source').get().n, 0);
+});
