@@ -4,6 +4,7 @@ const assert = require('node:assert/strict'), net = require('node:net');
 if (process.env.NOEVIA_NATIVE_VERIFIER_QUALIFICATION !== '1' || process.platform !== 'linux') throw Error('isolated qualification context required');
 const fs = require('node:fs');
 const { assertRefusal, assertNotAdmitted, assertFinalAdmission } = require('./native-verifier-assertions.cjs');
+const { waitForCancellation } = require('./native-verifier-cancel.cjs');
 const { createCodeVerify, isMeasured } = require('/reviewed-core/server/code-verify.cjs');
 const mode = process.argv[2], headSha = process.argv[3];
 const socketPath = '/run/noevia-verify/verify.sock';
@@ -41,7 +42,7 @@ async function raw() {
     else if (mode === 'disconnect') {
       socket.write(line);
       // The host observer releases cancellation only after actual command admission.
-      await new Promise((resolve) => process.stdin.once('data', resolve));
+      await waitForCancellation(process.stdin, closed);
       socket.destroy();
     }
     else if (mode === 'shutdown') { socket.write(line); console.log('SHUTDOWN_REQUEST_SENT'); }
@@ -49,6 +50,11 @@ async function raw() {
     await closed;
     assert.equal(bytes, '', 'refusal/cancellation cannot return a passing measurement');
     console.log(JSON.stringify({ case: mode, noAnswer: true }));
+  } catch (error) {
+    // Owned synthetic protocol bytes explain a premature close without trusting them.
+    let receipt;
+    try { receipt = admissionReceipt(); } catch (receiptError) { receipt = { unavailable: receiptError.code || 'invalid' }; }
+    throw Error(error.message + '; received=' + JSON.stringify(bytes.slice(-4096)) + '; admission=' + JSON.stringify(receipt));
   } finally { clearTimeout(timer); socket.destroy(); }
 }
 function admissionReceipt() {

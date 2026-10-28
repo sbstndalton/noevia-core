@@ -119,6 +119,7 @@ async function one(mode, index) {
         '--mount', 'type=bind,src=' + path.join(core, 'server') + ',dst=/reviewed-core/server,readonly',
         '--mount', 'type=bind,src=' + path.join(__dirname, 'native-verifier-client.cjs') + ',dst=/qualification/client.cjs,readonly',
         '--mount', 'type=bind,src=' + path.join(__dirname, 'native-verifier-assertions.cjs') + ',dst=/qualification/native-verifier-assertions.cjs,readonly',
+        '--mount', 'type=bind,src=' + path.join(__dirname, 'native-verifier-cancel.cjs') + ',dst=/qualification/native-verifier-cancel.cjs,readonly',
         ...(witnessed ? ['--mount', 'type=volume,src=' + name + '-proof,dst=/qualification-proof,readonly'] : []),
         '--entrypoint', 'node', image, '/qualification/client.cjs', mode, head];
       let output = '', errors = '', done = false;
@@ -146,7 +147,7 @@ async function one(mode, index) {
         if (mode === 'shutdown' && workerSeen && !stopped) { docker(['kill', '--signal', 'TERM', id]); stopped = true; }
         await delay(100);
       }
-      assert.ok(done, 'owned client exceeded qualification deadline');
+      assert.ok(done, 'owned client exceeded qualification deadline: ' + output + errors);
       assert.equal(await exit, 0, output + errors);
       const result = JSON.parse(output.trim().split('\n').at(-1)); assert.equal(result.case, mode);
       if (mode === 'disconnect' || mode === 'shutdown') assert.ok(workerSeen, 'cancellation must happen during actual command execution');
@@ -167,6 +168,11 @@ async function one(mode, index) {
       console.log(JSON.stringify({ case: mode, result: result.status || 'no-answer', workerSeen, maximumTasks }));
     }
     completed++; console.log('PASS native verifier ' + mode);
+  } catch (error) {
+    // Preserve bounded evidence from only this owned synthetic verifier before teardown.
+    try { console.error('Owned verifier diagnostics:', docker(['logs', '--tail', '40', name + '-code-verify-1'])); }
+    catch (diagnosticError) { console.error('Owned verifier logs unavailable:', diagnosticError.message); }
+    throw error;
   } finally {
     if (client && client.exitCode === null && client.signalCode === null) client.kill('SIGTERM');
     if (clientCreated) { try { docker(['rm', '-f', name + '-client']); } catch { /* --rm already removed this owned client */ } }
