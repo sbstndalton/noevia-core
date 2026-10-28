@@ -12,6 +12,12 @@ const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const deadlineMs = mode === 'pi-timeout-late' ? 350000 : 30000;
 const overall = setTimeout(() => { console.error('owned client deadline'); process.exit(2); }, deadlineMs);
 const start = (where = cwd) => JSON.stringify({ noevia: 'start', cwd: where, env: { PATH: '/usr/local/bin:/usr/bin:/bin', LD_PRELOAD: 'must-be-filtered', NODE_OPTIONS: 'must-be-filtered', PI_COMMAND: 'must-be-filtered' } }) + '\n';
+function assertPiCancellationEvidence() {
+  const refused = JSON.parse(fs.readFileSync(cwd + '/pi-refused.json', 'utf8'));
+  const aborted = JSON.parse(fs.readFileSync(cwd + '/pi-aborted.json', 'utf8'));
+  assert.deepEqual(refused, { mode, requested: true, confirmed: false, decisions: 1 });
+  assert.deepEqual(aborted, { mode, requested: true, aborted: true, confirmed: false, decisions: 1 });
+}
 async function socket() {
   const end = Date.now() + 10000;
   for (;;) {
@@ -69,7 +75,7 @@ async function raw() {
       send({ id: 3, method: 'session/prompt', params: { sessionId: 'owned-session', prompt: [{ type: 'text', text: 'synthetic' }] } });
       await until(() => frames.some((m) => m.id === 3));
       assert.equal(frames.find((m) => m.id === 3).result?.stopReason, 'end_turn'); s.destroy();
-    } else if (mode === 'pi-timeout-late') {
+    } else if (mode === 'pi-timeout-late' || mode === 'pi-protocol-cancel') {
       s.write(start()); send({ id: 1, method: 'initialize', params: {} });
       await until(() => frames.some((m) => m.id === 1));
       send({ id: 2, method: 'session/new', params: { cwd } }); await until(() => frames.some((m) => m.id === 2));
@@ -77,13 +83,22 @@ async function raw() {
       await until(() => frames.some((m) => m.method === 'session/request_permission'));
       const asked = frames.find((m) => m.method === 'session/request_permission'), began = Date.now();
       const hasText = (value) => frames.some((m) => m.params?.update?.content?.text === value);
-      await until(() => hasText('TIMEOUT_REFUSED'));
-      assert.ok(Date.now() - began >= 299000, 'exercise the real five-minute CLI deadline, not a test-only shortened knob');
-      // One TCP write: the expired answer is processed before the cancel barrier.
-      s.write(JSON.stringify({ jsonrpc: '2.0', id: asked.id, result: { outcome: { outcome: 'selected', optionId: 'allow_once' } } }) + '\n' +
-        JSON.stringify({ jsonrpc: '2.0', method: 'session/cancel', params: { sessionId: 'pi-1' } }) + '\n');
+      if (mode === 'pi-protocol-cancel') {
+        emit({ event: 'pending' }); await releaseOrFailure(ended);
+        send({ id: asked.id, result: { outcome: { outcome: 'selected', optionId: 'reject_once' } } });
+        await until(() => hasText('PERMISSION_REFUSED')); // Backend barrier, not a race-prone immediate file read.
+        send({ method: 'session/cancel', params: { sessionId: 'pi-1' } });
+      } else {
+        await until(() => hasText('TIMEOUT_REFUSED'));
+        assert.ok(Date.now() - began >= 299000, 'exercise the real five-minute CLI deadline, not a test-only shortened knob');
+        // One TCP write: the expired answer is processed before the cancel barrier.
+        s.write(JSON.stringify({ jsonrpc: '2.0', id: asked.id, result: { outcome: { outcome: 'selected', optionId: 'allow_once' } } }) + '\n' +
+          JSON.stringify({ jsonrpc: '2.0', method: 'session/cancel', params: { sessionId: 'pi-1' } }) + '\n');
+      }
       await until(() => frames.some((m) => m.id === 3));
-      assert.equal(hasText('LATE_REPLY_IGNORED'), true); assert.equal(frames.find((m) => m.id === 3).result?.stopReason, 'cancelled');
+      if (mode === 'pi-timeout-late') assert.equal(hasText('LATE_REPLY_IGNORED'), true);
+      else assertPiCancellationEvidence(); // Both backend records precede the actual cancelled ACP reply.
+      assert.equal(frames.find((m) => m.id === 3).result?.stopReason, 'cancelled');
       s.destroy();
     } else throw Error('unknown raw case');
     await ended;
@@ -97,28 +112,48 @@ async function raw() {
 async function releaseOrFailure(settled) {
   let release;
   const data = new Promise((resolve) => { release = resolve; process.stdin.once('data', release); });
-  try { await Promise.race([data, settled.then(() => { throw Error('request settled before observed-worker release'); })]); }
+  try { await (settled ? Promise.race([data, settled.then(() => { throw Error('request settled before observed-worker release'); })]) : data); }
   finally { process.stdin.removeListener('data', release); process.stdin.pause(); }
 }
 async function actual() {
-  const controller = new AbortController(); let pendingPermission;
+  const controller = new AbortController(); let pendingPermission, refusedBarrier, cancelNotifications = 0;
   const deferred = new Promise((resolve) => { pendingPermission = resolve; });
+  const refused = new Promise((resolve) => { refusedBarrier = resolve; });
   const h = {
     requestPermission: async (p) => {
       if (mode.startsWith('pi-')) assert.equal(p.toolCall.kind, 'execute');
-      if (['pi-cancel', 'pi-stubborn-cancel'].includes(mode)) { emit({ event: 'pending' }); return deferred; }
+      if (['pi-disconnect', 'pi-stubborn-disconnect', 'pi-cancel-omission-control'].includes(mode)) { emit({ event: 'pending' }); return deferred; }
       return { outcome: 'selected', optionId: mode === 'pi-deny' ? 'reject_once' : mode === 'permissions' ? 'yes' : 'allow_once',
         ...(mode === 'pi-deny' ? { _meta: { noevia: { reason: 'owned synthetic refusal' } } } : {}) };
     },
     readTextFile: async () => ({ content: 'owned read' }), writeTextFile: async () => null,
-    sessionUpdate: (u) => { if (u.content?.text === 'OWNED_PENDING') emit({ event: 'pending' }); },
+    sessionUpdate: (u) => { if (u.content?.text === 'OWNED_PENDING') emit({ event: 'pending' }); if (u.content?.text === 'PERMISSION_REFUSED') refusedBarrier(); },
   };
   const agent = await connectAcp({ endpoint, cwd, home: cwd + '/home', env: { PATH: '/usr/local/bin:/usr/bin:/bin', LD_PRELOAD: 'filtered', NODE_OPTIONS: 'filtered', PI_COMMAND: 'filtered' },
-    permission: { edits: 'ask' }, handlers: h, signal: controller.signal, handshakeMs: 10000 });
+    permission: { edits: 'ask' }, handlers: h, signal: controller.signal, handshakeMs: 10000,
+    connectFn: (...args) => {
+      const channel = net.connect(...args), write = channel.write;
+      channel.write = function (chunk, ...rest) {
+        try { for (const line of String(chunk).split('\n').filter(Boolean)) if (JSON.parse(line).method === 'session/cancel') cancelNotifications++; } catch { /* observation cannot alter transport */ }
+        return write.call(this, chunk, ...rest);
+      };
+      return channel;
+    } });
   const result = agent.prompt('owned synthetic prompt');
   const observed = result.then((value) => ({ value }), (error) => ({ error: error.message }));
-  if (['disconnect', 'pi-cancel', 'pi-stubborn-cancel'].includes(mode)) {
+  if (['disconnect', 'pi-disconnect', 'pi-stubborn-disconnect'].includes(mode)) {
     await releaseOrFailure(observed); controller.abort();
+    assert.equal(cancelNotifications, 1, 'the real Core client must emit its cancel notification; delivery after immediate close is not claimed');
+  }
+  if (mode === 'pi-cancel-omission-control') {
+    await releaseOrFailure(observed); pendingPermission({ outcome: 'selected', optionId: 'reject_once' });
+    await Promise.race([refused, observed.then(() => { throw Error('turn settled before backend refusal barrier'); })]);
+    agent.stop(); // Deliberate protocol omission: public transport stop, not AbortController.notify.
+    const outcome = await observed; assert.ok(outcome.error); assert.equal(cancelNotifications, 0);
+    emit({ event: 'await-idle' }); await releaseOrFailure(null); // Host releases only after actual live-init-only observation.
+    assert.deepEqual(JSON.parse(fs.readFileSync(cwd + '/pi-refused.json', 'utf8')), { mode, requested: true, confirmed: false, decisions: 1 });
+    assert.throws(() => assertPiCancellationEvidence(), (error) => error.code === 'ENOENT');
+    emit({ case: mode, complete: true, localError: true, cancellationEvidenceAccepted: false, omissionControl: true }); return;
   }
   if (mode === 'capacity') {
     const s = await socket(); let text = '';
@@ -126,7 +161,7 @@ async function actual() {
     assert.match(text, /already running 1 agents/); controller.abort();
   }
   const outcome = await observed;
-  if (['disconnect', 'shutdown', 'wall', 'capacity', 'pi-cancel', 'pi-stubborn-cancel'].includes(mode)) assert.ok(outcome.error, JSON.stringify(outcome));
+  if (['disconnect', 'shutdown', 'wall', 'capacity', 'pi-disconnect', 'pi-stubborn-disconnect'].includes(mode)) assert.ok(outcome.error, JSON.stringify(outcome));
   else {
     assert.equal(outcome.error, undefined); assert.equal(outcome.value.stopReason, 'end_turn');
     if (!mode.startsWith('pi-')) {
@@ -146,7 +181,7 @@ async function actual() {
 }
 (async () => {
   try {
-    const rawModes = ['malformed', 'oversized', 'partial', 'outside', 'symlink', 'fragment', 'slow-reader', 'stalled-reader', 'escaped-quiet', 'escaped-writer', 'pi-timeout-late'];
+    const rawModes = ['malformed', 'oversized', 'partial', 'outside', 'symlink', 'fragment', 'slow-reader', 'stalled-reader', 'escaped-quiet', 'escaped-writer', 'pi-timeout-late', 'pi-protocol-cancel'];
     if (rawModes.includes(mode)) await raw(); else await actual();
   } finally { clearTimeout(overall); }
 })().catch((error) => { console.error(error.stack); process.exitCode = 1; });

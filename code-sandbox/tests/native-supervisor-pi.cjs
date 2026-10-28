@@ -7,7 +7,8 @@ assert.equal(process.env.SANDBOX_BRIDGE_IMPL, undefined, 'the real CLI strips it
 const { mode } = JSON.parse(fs.readFileSync('case.json', 'utf8'));
 let buffer = '', requested = false, decisions = 0, confirmed = null;
 const send = (m) => process.stdout.write(JSON.stringify(m) + '\n');
-if (mode === 'pi-stubborn-cancel') process.on('SIGTERM', () => {});
+if (mode === 'pi-stubborn-disconnect') process.on('SIGTERM', () => {});
+process.stdout.on('error', () => {}); // Broken output must not substitute for the stubborn-engine kill check.
 function finish(value) {
   fs.writeFileSync('pi-decision.json', JSON.stringify(value));
   send({ type: 'message_update', assistantMessageEvent: { type: 'text_delta', delta: JSON.stringify(value) } });
@@ -37,7 +38,11 @@ process.stdin.on('data', (chunk) => {
       else if (mode === 'pi-deny') {
         assert.equal(m.confirmed, false);
         send({ type: 'extension_ui_request', id: 'owned-reason', method: 'input', placeholder: JSON.stringify({ noevia: 'refusal_reason', toolCallId: 'owned-call', toolName: 'bash' }) });
-      } else { assert.equal(m.confirmed, false); fs.writeFileSync('pi-refused.json', 'true'); }
+      } else {
+        assert.equal(m.confirmed, false);
+        fs.writeFileSync('pi-refused.json', JSON.stringify({ mode, requested, confirmed: false, decisions }));
+        send({ type: 'message_update', assistantMessageEvent: { type: 'text_delta', delta: 'PERMISSION_REFUSED' } });
+      }
     } else if (m.type === 'extension_ui_response' && m.id === 'owned-reason') {
       assert.equal(m.value, 'owned synthetic refusal');
       fs.writeFileSync('reason.json', JSON.stringify({ reason: m.value }));
@@ -45,7 +50,8 @@ process.stdin.on('data', (chunk) => {
     } else if (m.type === 'extension_ui_response' && m.id === 'owned-again') {
       assert.equal(m.cancelled, true); finish({ confirmed: false, reason: 'owned synthetic refusal', readOnce: true });
     } else if (m.type === 'abort') {
-      fs.writeFileSync('pi-aborted.json', JSON.stringify({ requested, aborted: true }));
+      if (mode === 'pi-protocol-cancel') { assert.equal(decisions, 1); assert.equal(confirmed, false); }
+      fs.writeFileSync('pi-aborted.json', JSON.stringify({ mode, requested, aborted: true, confirmed, decisions }));
       if (mode === 'pi-timeout-late') {
         assert.equal(decisions, 1); assert.equal(confirmed, false);
         send({ type: 'message_update', assistantMessageEvent: { type: 'text_delta', delta: 'LATE_REPLY_IGNORED' } });

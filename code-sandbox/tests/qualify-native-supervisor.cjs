@@ -10,7 +10,7 @@ assert.ok(profilePath && image && coreArg, 'qualifier <actual rendered profile> 
 const core = fs.realpathSync(coreArg), input = JSON.parse(fs.readFileSync(profilePath, 'utf8'));
 const original = input.services['code-sandbox'];
 const cases = ['node-default', 'node-explicit', 'roundtrip', 'permissions', 'fragment', 'malformed', 'oversized', 'partial', 'outside', 'symlink',
-  'slow-reader', 'stalled-reader', 'disconnect', 'wall', 'shutdown', 'capacity', 'pi-allow', 'pi-deny', 'pi-cancel', 'pi-stubborn-cancel',
+  'slow-reader', 'stalled-reader', 'disconnect', 'wall', 'shutdown', 'capacity', 'pi-allow', 'pi-deny', 'pi-disconnect', 'pi-stubborn-disconnect', 'pi-protocol-cancel', 'pi-cancel-omission-control',
   'pi-timeout-late', 'escaped-quiet', 'escaped-writer', 'bad-selector', 'bad-harness', 'missing-helper', 'nonexec-helper', 'symlink-helper', 'bad-wasm', 'bad-bridge'];
 const faults = new Map([['bad-selector', 'unknown CODE_SANDBOX_SUPERVISOR_IMPL'], ['bad-harness', 'native harness command is not an image-reviewed path'],
   ['missing-helper', 'native session helper is unavailable'], ['nonexec-helper', 'native session helper is unavailable'], ['symlink-helper', 'native session helper is unavailable'],
@@ -127,30 +127,40 @@ async function one(mode, index) {
       const text = logs(id); assert.ok(text.includes(faults.get(mode)), text);
     } else {
       await ready(id); // Trusted startup log, before any client/health connection can admit a harness.
-      let output = '', errors = '', done = false, workerSeen = false, pending = false, acted = false;
+      let output = '', errors = '', done = false, workerSeen = false, pending = false, acted = false, awaitingIdle = false, audited = false, streamError = null;
       client = spawn('docker', clientArgs(mode), { stdio: ['pipe', 'pipe', 'pipe'] });
-      client.stdout.on('data', (b) => { output += b; assert.ok(output.length < 1024 * 1024); pending ||= output.includes('"event":"pending"'); });
-      client.stderr.on('data', (b) => { errors += b; assert.ok(errors.length < 1024 * 1024); });
+      client.stdout.on('data', (b) => {
+        if (output.length + b.length >= 1024 * 1024) { streamError = Error('owned client stdout cap'); return; }
+        output += b; pending ||= output.includes('"event":"pending"'); awaitingIdle ||= output.includes('"event":"await-idle"');
+      });
+      client.stderr.on('data', (b) => { if (errors.length + b.length >= 1024 * 1024) streamError = Error('owned client stderr cap'); else errors += b; });
       const exit = new Promise((resolve) => { client.once('error', (e) => { errors += e.message; done = true; resolve(-1); }); client.once('close', (code) => { done = true; resolve(code); }); });
       const end = Date.now() + (mode === 'pi-timeout-late' ? 390000 : 45000);
-      while (!done && Date.now() < end) {
+      while (!done && !streamError && Date.now() < end) {
         if (inspect(id).State.Running) workerSeen ||= /\/qualification\/native-supervisor-harness.cjs|\/srv\/pi-acp-bridge.cjs/.test(top(id).slice(1).join('\n'));
         if (!acted && workerSeen && pending) {
-          if (['disconnect', 'pi-cancel', 'pi-stubborn-cancel'].includes(mode)) { client.stdin.write('release\n'); acted = true; }
+          if (['disconnect', 'pi-disconnect', 'pi-stubborn-disconnect', 'pi-protocol-cancel', 'pi-cancel-omission-control'].includes(mode)) { client.stdin.write('release\n'); acted = true; }
           if (mode === 'shutdown') { docker(['kill', '--signal', 'TERM', id]); acted = true; }
+        }
+        if (mode === 'pi-cancel-omission-control' && awaitingIdle && !audited) {
+          await waitIdle(id); // No backend can write a late abort receipt after this actual teardown barrier.
+          client.stdin.write('audit\n'); audited = true;
         }
         await delay(mode === 'pi-timeout-late' ? 2000 : 100);
       }
+      if (streamError) throw streamError; // An event-stream bound must pass through scoped finally cleanup.
       assert.ok(done, 'owned client deadline: ' + output + errors); assert.equal(await exit, 0, output + errors);
       const result = JSON.parse(output.trim().split('\n').at(-1)); assert.equal(result.case, mode); assert.equal(result.complete, true);
-      if (['disconnect', 'shutdown', 'wall', 'pi-cancel', 'pi-stubborn-cancel'].includes(mode)) assert.equal(workerSeen, true, 'cancellation/expiry requires observed actual harness');
+      if (['disconnect', 'shutdown', 'wall', 'pi-disconnect', 'pi-stubborn-disconnect', 'pi-protocol-cancel', 'pi-cancel-omission-control'].includes(mode)) assert.equal(workerSeen, true, 'cancellation/expiry requires observed actual harness');
+      if (mode === 'pi-cancel-omission-control') { assert.equal(audited, true); assert.equal(result.omissionControl, true); assert.equal(result.cancellationEvidenceAccepted, false); }
       if (mode.startsWith('escaped-')) {
         assert.equal(result.requiresNamespaceRecycle, true);
-        const escaped = top(id).slice(1).filter((row) => row.includes('escaped.json'));
+        const processRows = top(id), escaped = processRows.slice(1).filter((row) => row.includes('escaped.json'));
         assert.equal(escaped.length, 1, 'the actual detached fixture child must still exist');
         const fields = escaped[0].trim().split(/\s+/);
         assert.equal(Number(fields[0]), Number(fields[2])); assert.equal(Number(fields[0]), Number(fields[3]));
-        assert.equal(Number(fields[1]), inspect(id).State.Pid, 'the escaped child was adopted by the namespace init'); assert.equal(Number(fields[4]), 1000);
+        assert.equal(Number(fields[1]), inspect(id).State.Pid, 'the escaped child was adopted by the namespace init');
+        assert.equal(fields[4], processRows[1].trim().split(/\s+/)[4], 'host UID mapping matches the init; namespace UID1000 is checked by the fixture');
         docker(['kill', '--signal', 'TERM', id]); assert.equal(docker(['wait', id]).trim(), '0');
         assert.equal(inspect(id).State.Running, false); // Container-level cleanup, explicitly not per-session drain credit.
       } else if (mode === 'shutdown') assert.equal(docker(['wait', id]).trim(), '0');
