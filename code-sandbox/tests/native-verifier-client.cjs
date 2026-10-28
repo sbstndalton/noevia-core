@@ -117,6 +117,7 @@ async function measured() {
         assert.throws(() => assertFinalAdmission(receipt, nonce, 0));
       }
       if (mode === 'clone') {
+        assert.match(result.report.tail, /COPY_NOEXEC_AND_ARTIFACT_BINDING_OK/);
         assert.match(result.report.tail, /NON_SIGCHLD_CLONE_READY/);
         assert.match(result.report.tail, /ADOPTED_CLONE_SIGCHLD_DRAIN_CASE/);
         assert.match(result.report.tail, /CLONE_FIXTURE_PARENT_EXITED/);

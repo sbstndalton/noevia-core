@@ -78,6 +78,7 @@ async function one(mode, index) {
     configured.environment.PATH = '/qualification/bin:/usr/local/bin:/usr/bin:/bin';
     configured.volumes.push({ type: 'bind', source: path.join(__dirname, 'native-verifier-git-wrapper.cjs'), target: '/qualification/bin/git', read_only: true });
   }
+  if (mode === 'clone') configured.volumes.push({ type: 'bind', source: path.join(owned, 'clone-fixture'), target: '/qualification/clone-fixture', read_only: true });
   const config = path.join(work, 'compose.json');
   fs.writeFileSync(config, JSON.stringify({ services: { 'code-verify': configured }, volumes }));
   const compose = (args) => docker(['compose', '-p', name, '-f', config, '--profile', 'code', ...args]);
@@ -102,6 +103,7 @@ async function one(mode, index) {
     assert.equal(initial.HostConfig.PidsLimit, 256); assert.equal(initial.HostConfig.Memory, 2147483648); assert.equal(initial.HostConfig.NanoCpus, 2000000000);
     assert.ok(initial.Mounts.find((v) => v.Destination === '/workspaces' && v.Type === 'bind' && !v.RW));
     assert.ok(initial.Mounts.find((v) => v.Destination === '/run/noevia-verify' && v.Type === 'volume' && v.RW));
+    if (mode === 'clone') assert.ok(initial.Mounts.find((v) => v.Destination === '/qualification/clone-fixture' && v.Type === 'bind' && !v.RW), 'trusted C fixture is readonly and scoped');
     if (mode === 'root-gid') {
       assert.equal(docker(['wait', id]).trim(), '1', 'GID0 refuses before binding');
       const absent = docker(['run', '--rm', '--pull', 'never', '--network', 'none', '--read-only', '--user', '0:0',
