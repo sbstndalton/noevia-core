@@ -68,6 +68,13 @@ RUN cargo build --locked --release -p code-verify-native --bin code-verify-nativ
 # This static probe binds the artifact family only; namespace readiness and
 # actual helper/cleanup behavior require the isolated Linux qualification.
 
+# Qualification artifact only; never copied into the shipped runtime image.
+# Compiled against the same Debian family, then executed only in an owned
+# restricted verifier namespace by the mandatory Linux job.
+FROM native-verifier AS native-verifier-fixtures
+COPY tests/native-verifier-clone.c /native-verifier-clone.c
+RUN cc -O2 -Wall -Wextra -Werror /native-verifier-clone.c -o /native-verifier-clone
+
 FROM node:22-bookworm-slim
 
 ARG HARNESS_PACKAGE=opencode-ai
@@ -86,9 +93,9 @@ WORKDIR /srv
 # pi-acp-bridge.cjs: noevia's own ACP bridge for pi (routes pi's approvals to noevia). Used only
 # when the image installs pi (HARNESS_PACKAGE=@earendil-works/pi-coding-agent) and runs with
 # CODE_HARNESS_COMMAND=node CODE_HARNESS_ARGS=/srv/pi-acp-bridge.cjs and CODE_HARNESS_NAME=pi on web.
-# verifier.cjs: the server-measured test runner (#703). Runs ONLY in the separate `code-verify`
-# container (uid 1002, no network, workspaces read-only); never started in the agent sandbox.
-COPY supervisor.cjs pi-acp-bridge.cjs verifier.cjs ./
+# The verifier is native-only. Its frozen Node reference stays in tests/oracles and
+# is never installed as a production fallback.
+COPY supervisor.cjs pi-acp-bridge.cjs ./
 # SANDBOX_BRIDGE_IMPL=rust (#999; default js): the loader, its lock and the checked module. Read-only
 # like everything else here; the loader re-checks the module's sha256 against the lock at startup.
 COPY sandbox-bridge-wasm.cjs sandbox-bridge.lock ./

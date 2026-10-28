@@ -206,8 +206,8 @@ jobs:
           DAV_PARSE_WASM_REQUIRED: '1'
       - run: node --test tools/qualification/guard.test.cjs
         working-directory: self
-      # The verifier's privilege separation (#703) needs root to drop to its git and test uids.
-      - run: sudo "$(command -v node)" --test server/code-verify-root.test.cjs
+      # Native verifier identity/cleanup qualification runs only in its dedicated
+      # isolated container below. Never run the retired UID-wide verifier on the host.
       # The release build sets STAMP_VERSION (#317); re-run the stamp test with a SHA-shaped value.
       - run: STAMP_VERSION=ci1234567 node --test tests/server/build-version-stamp.test.cjs
       # Dev tooling (moved from noevia at the cutover, #952): no install step, but it imports
@@ -355,6 +355,31 @@ jobs:
           tags: noevia-code-sandbox:ci
           cache-from: type=gha,scope=code-sandbox
           cache-to: type=gha,mode=max,scope=code-sandbox
+      - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6 (v6.19.2)
+        with:
+          context: self/code-sandbox
+          file: self/code-sandbox/Dockerfile
+          target: native-verifier-fixtures
+          push: false
+          load: true
+          tags: noevia-code-sandbox:verifier-fixtures
+          cache-from: type=gha,scope=code-sandbox
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: sbstndalton/noevia
+          ref: 06f96d8a1ad023414a513eed3a2ba3358687bea8
+          path: native-verifier-profile
+      - name: Required native verifier namespace and measured-caller qualification
+        working-directory: .
+        env:
+          NOEVIA_NATIVE_VERIFIER_QUALIFICATION: '1'
+        run: |
+          set -euo pipefail
+          profile="$RUNNER_TEMP/native-verifier-profile.json"
+          docker compose --env-file native-verifier-profile/.env.example --project-directory native-verifier-profile --profile code \
+            -f native-verifier-profile/compose.yaml -f native-verifier-profile/deploy/examples/code-sandbox.override.yml \
+            config --format json > "$profile"
+          node self/code-sandbox/tests/qualify-native-verifier.cjs "$profile" noevia-code-sandbox:ci "$GITHUB_WORKSPACE/self" noevia-code-sandbox:verifier-fixtures
       - name: The shipped image loads sandbox-bridge.wasm
         run: |
           set -euo pipefail
