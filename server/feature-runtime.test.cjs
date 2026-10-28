@@ -92,3 +92,30 @@ test('unrecognized/freeform callback reasons never leave the collector', t => {
     decisionSettings: { ...f.decisionSettings, unavailable: () => 'http://private.example/?key=synthetic' }, env: {} });
   assert.throws(() => bad.collect(), err => err.code === 'FEATURE_RUNTIME_CONTEXT_UNAVAILABLE' && !err.message.includes('private.example'));
 });
+
+test('a real second WAL connection can commit during callbacks without mixing snapshot generations', t => {
+  const fs = require('node:fs'), os = require('node:os'), path = require('node:path');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'noevia-feature-snapshot-'));
+  const db = new Database(path.join(dir, 'synthetic.sqlite'));
+  db.pragma('journal_mode=WAL');
+  db.exec('CREATE TABLE settings(key TEXT PRIMARY KEY,value)');
+  const external = new Database(path.join(dir, 'synthetic.sqlite'));
+  t.after(() => { external.close(); db.close(); fs.rmSync(dir, { recursive: true }); });
+  const store = createStore(db), other = createStore(external);
+  const inferenceMachines = createInferenceMachines({ store, env: {}, log: () => {} });
+  const original = createDecisionSettings({ store, env: {}, machineUrl: () => inferenceMachines.urlFor('decision') });
+  let changed = false;
+  const actualOwner = { ...original, unavailable(kind) {
+    if (!changed) { changed = true; other.set(D, JSON.stringify(configured)); }
+    return original.unavailable(kind);
+  } };
+  const collector = createContextCollector({ db, store, inferenceMachines, decisionSettings: actualOwner, env: {} });
+  const before = store.readFact(D).source;
+  const snapshot = collector.collect();
+  assert.equal(snapshot.sources.decision, before);
+  assert.equal(snapshot.availability.chatFraming, 'decision-service-unconfigured');
+  assert.notEqual(snapshot.sources.decision, store.readFact(D).source); // newer producer commit after our snapshot began
+  const refreshed = collector.collect();
+  assert.equal(refreshed.sources.decision, store.readFact(D).source);
+  assert.equal(refreshed.availability.chatFraming, null);
+});
