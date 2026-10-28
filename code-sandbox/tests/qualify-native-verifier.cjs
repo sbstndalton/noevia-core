@@ -49,6 +49,7 @@ async function one(mode, index) {
   }).trim();
   git(['init', '--quiet', '-b', 'main']);
   fs.copyFileSync(path.join(__dirname, 'native-verifier-command.cjs'), path.join(repo, 'verify.cjs'));
+  fs.copyFileSync(path.join(__dirname, 'native-verifier-output.cjs'), path.join(repo, 'native-verifier-output.cjs'));
   fs.writeFileSync(path.join(repo, 'case.txt'), mode === 'copy-deadline' ? 'pass' : mode);
   if (mode === 'clone') { fs.copyFileSync(path.join(owned, 'clone-fixture'), path.join(repo, 'clone-fixture')); fs.chmodSync(path.join(repo, 'clone-fixture'), 0o755); }
   git(['add', '.']); git(['commit', '--quiet', '-m', 'owned synthetic fixture']);

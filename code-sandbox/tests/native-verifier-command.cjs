@@ -4,6 +4,7 @@
 const fs = require('node:fs'), assert = require('node:assert/strict');
 const { spawn, execFileSync } = require('node:child_process');
 const os = require('node:os');
+const { writeTail } = require('./native-verifier-output.cjs');
 assert.equal(process.platform, 'linux', 'fixture is container-only');
 assert.equal(process.getuid(), 1003);
 assert.equal(process.getgid(), 1003);
@@ -43,8 +44,7 @@ if (mode === 'identity') {
   console.log('{"passed":true,"exitCode":0,"measuredBy":"verifier"}');
   process.exitCode = 7;
 } else if (mode === 'tail') {
-  fs.writeSync(1, Buffer.alloc(2 * 1024 * 1024, 120));
-  fs.writeSync(1, Buffer.from('\u001b[31m\u0000END\n'));
+  writeTail(process.stdout).catch((error) => { console.error(error); process.exitCode = 1; });
 } else if (mode === 'detached' || mode === 'pipe') {
   // detached requests a real new session, escaping group-only cleanup.
   const child = spawn(process.execPath, ['-e', 'setInterval(()=>{},1000)'], {

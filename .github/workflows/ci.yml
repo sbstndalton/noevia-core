@@ -326,7 +326,7 @@ jobs:
         working-directory: self
         run: |
           python3 code-sandbox/tests/verify-native-source.test.py
-          node --test code-sandbox/tests/native-verifier-assertions.test.cjs
+          node --test code-sandbox/tests/native-verifier-assertions.test.cjs code-sandbox/tests/native-verifier-output.test.cjs
       - name: The fixture table is what the generator makes from the JS references
         working-directory: self
         run: node tools/gen-sandbox-bridge-fixtures.cjs | cmp - tests/fixtures/sandbox-bridge.v1.json
