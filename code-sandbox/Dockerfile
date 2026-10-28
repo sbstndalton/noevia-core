@@ -49,6 +49,25 @@ RUN cargo build --locked --release -p code-sandbox-supervisor --bins \
  && test -x target/release/code-sandbox-supervisor \
  && test -x target/release/code-sandbox-session-exec
 
+# The verifier source pin is a canonical Git-export content digest. It is
+# independent of codeload gzip timestamps; the bounded validator checks every
+# path/type/executable bit/content before extracting any build input.
+FROM python:3.12-slim-bookworm AS native-verifier-src
+ARG NATIVE_VERIFIER_RS_REF=e5c90a7d57b838b498f7e1933f88c8d8876e2374
+ARG NATIVE_VERIFIER_SOURCE_SHA256=3015e0b4ec6d759edd3713832eff9ee1047f0ae1afec09efbfa2667a51d16e47
+COPY verify-native-source.py /verify-native-source.py
+RUN python3 /verify-native-source.py fetch "$NATIVE_VERIFIER_RS_REF" "$NATIVE_VERIFIER_SOURCE_SHA256" /verifier-rs
+
+FROM rust:1.99-slim-bookworm AS native-verifier
+ENV RUSTUP_TOOLCHAIN=1.99.0 CARGO_TERM_COLOR=never CARGO_BUILD_JOBS=2
+COPY --from=native-verifier-src /verifier-rs /src
+WORKDIR /src
+RUN cargo build --locked --release -p code-verify-native --bin code-verify-native \
+ && test -x target/release/code-verify-native \
+ && target/release/code-verify-native --capabilities > /verifier-capabilities.json
+# This static probe binds the artifact family only; namespace readiness and
+# actual helper/cleanup behavior require the isolated Linux qualification.
+
 FROM node:22-bookworm-slim
 
 ARG HARNESS_PACKAGE=opencode-ai
@@ -78,6 +97,8 @@ COPY --from=sandbox-bridge /out/sandbox-bridge.wasm ./wasm/sandbox-bridge.wasm
 # resolves the helper beside its own executable before binding a listener.
 COPY --from=native-supervisor --chmod=0555 /src/target/release/code-sandbox-supervisor /usr/local/libexec/noevia/code-sandbox-supervisor
 COPY --from=native-supervisor --chmod=0555 /src/target/release/code-sandbox-session-exec /usr/local/libexec/noevia/code-sandbox-session-exec
+COPY --from=native-verifier --chmod=0555 /src/target/release/code-verify-native /usr/local/libexec/noevia/code-verify-native
+RUN /usr/local/libexec/noevia/code-verify-native --capabilities | node -e 'let s="";process.stdin.on("data",b=>s+=b);process.stdin.on("end",()=>{const c=JSON.parse(s);if(c.probe!=="source-capability"||c.nativeVerifier!==true||c.oneShot!==true||c.readiness!=="requires-isolated-namespace-init"||c.requestMaxBytes!==65536||!c.capabilities.includes("noevia-code-verify/1"))process.exit(1)})'
 COPY --chmod=0555 native-supervisor-entrypoint.sh /srv/native-supervisor-entrypoint.sh
 # The verifier's socket directory: root's, 0770, so a fresh named volume inherits that owner and
 # neither the agent (1000), git (1002) nor the test command (1003) can enter it. Web connects as
