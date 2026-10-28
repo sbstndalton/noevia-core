@@ -203,3 +203,39 @@ test('sparse or malformed boot facts cannot be serialized into invented construc
       collector: null, bootFacts, start: START }), { status: 503 });
   }
 });
+
+test('a known register ACK with concurrently changed source stays unreadable and renews SAME session', async t => {
+  let changed = false;
+  const f = fixture(t, p => {
+    if (p.op === 'register' && !changed) {
+      changed = true;
+      f.store.set('decision:configuration', JSON.stringify({ url: 'http://192.168.1.20:8040', timeoutMs: 1500 }));
+    }
+  });
+  await assert.rejects(f.runtime.ready(), { status: 503 });
+  assert.throws(() => f.runtime.read(() => true), { status: 503 });
+  const registration = f.calls.find(c => c.payload.op === 'register').payload;
+  await f.runtime.ready();
+  assert.equal(f.calls.filter(c => c.payload.op === 'register').length, 1);
+  assert.equal(f.calls.at(-1).payload.op, 'renew');
+  assert.equal(f.calls.at(-1).payload.session, registration.session);
+  assert.equal(f.runtime.read(() => true), true);
+});
+test('a known renew ACK overtaken by a source change recovers by next sequence without restarting session', async t => {
+  let changed = false;
+  const f = fixture(t, p => {
+    if (p.op === 'renew' && !changed) {
+      changed = true;
+      f.store.set('decision:configuration', JSON.stringify({ url: 'http://192.168.1.21:8040', timeoutMs: 1500 }));
+    }
+  });
+  await f.runtime.ready();
+  await assert.rejects(f.runtime.renew(), { status: 503 });
+  assert.throws(() => f.runtime.read(() => true), { status: 503 });
+  await f.runtime.ready();
+  const renewals = f.calls.filter(c => c.payload.op === 'renew').map(c => c.payload);
+  assert.deepEqual(renewals.map(p => p.sequence), [1, 2]);
+  assert.equal(renewals[0].session, renewals[1].session);
+  assert.equal(f.calls.filter(c => c.payload.op === 'register').length, 1);
+  assert.equal(f.runtime.read(() => true), true);
+});

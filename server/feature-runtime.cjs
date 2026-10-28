@@ -178,14 +178,21 @@ function createFeatureRuntime({ db, storeClient, collector, bootFacts, start,
         active = Object.freeze({ ...candidate, sequence: 0, snapshot, expires: acknowledged.expires });
         maintain();
         return read(() => true);
-      } catch { if (stamp === generation) active = null; throw unavailable(); }
+      } catch {
+        // A correlated ACK may have installed a lease whose source snapshot has already
+        // changed. Reads still refuse, but keep its identity so ready/maintenance can RENEW
+        // that same session instead of conflicting with its known native owner until expiry.
+        throw unavailable();
+      }
     });
   }
   function renew() {
     return run('renew', async () => {
       const stamp = generation;
+      let state = active;
       try {
-        const state = current(), snapshot = collector.collect();
+        state = current();
+        const snapshot = collector.collect();
         if (!Number.isSafeInteger(state.sequence + 1)) throw unavailable();
         const payload = { op: 'renew', request: uuid(), start, incarnation: state.incarnation,
           boot, session: state.session, sequence: state.sequence + 1, snapshot };
@@ -194,7 +201,12 @@ function createFeatureRuntime({ db, storeClient, collector, bootFacts, start,
         checkEpoch(state.incarnation);
         active = Object.freeze({ ...state, sequence: payload.sequence, snapshot, expires: acknowledged.expires });
         return read(() => true);
-      } catch { if (generation === stamp) retire(); throw unavailable(); }
+      } catch {
+        // Failure before a correlated ACK retires the old lease. A newly acknowledged but
+        // already stale source snapshot remains non-admissible and can be renewed again.
+        if (generation === stamp && active === state) retire();
+        throw unavailable();
+      }
     });
   }
   async function release() {
