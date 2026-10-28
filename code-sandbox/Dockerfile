@@ -53,8 +53,8 @@ RUN cargo build --locked --release -p code-sandbox-supervisor --bins \
 # independent of codeload gzip timestamps; the bounded validator checks every
 # path/type/executable bit/content before extracting any build input.
 FROM python:3.12-slim-bookworm AS native-verifier-src
-ARG NATIVE_VERIFIER_RS_REF=e5c90a7d57b838b498f7e1933f88c8d8876e2374
-ARG NATIVE_VERIFIER_SOURCE_SHA256=3015e0b4ec6d759edd3713832eff9ee1047f0ae1afec09efbfa2667a51d16e47
+ARG NATIVE_VERIFIER_RS_REF=e21b92a219c5266429d8d3cff1fe9df76003ce3c
+ARG NATIVE_VERIFIER_SOURCE_SHA256=a4dd45eb2e475a9762efbaf568c398b60bfe4fb1fa9ce5b6afae4385ad64ffe3
 COPY verify-native-source.py /verify-native-source.py
 RUN python3 /verify-native-source.py fetch "$NATIVE_VERIFIER_RS_REF" "$NATIVE_VERIFIER_SOURCE_SHA256" /verifier-rs
 

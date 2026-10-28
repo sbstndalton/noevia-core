@@ -3,7 +3,7 @@
 const assert = require('node:assert/strict'), net = require('node:net');
 if (process.env.NOEVIA_NATIVE_VERIFIER_QUALIFICATION !== '1' || process.platform !== 'linux') throw Error('isolated qualification context required');
 const fs = require('node:fs');
-const { assertRefusal, assertNotAdmitted } = require('./native-verifier-assertions.cjs');
+const { assertRefusal, assertNotAdmitted, assertFinalAdmission } = require('./native-verifier-assertions.cjs');
 const { createCodeVerify, isMeasured } = require('/reviewed-core/server/code-verify.cjs');
 const mode = process.argv[2], headSha = process.argv[3];
 const socketPath = '/run/noevia-verify/verify.sock';
@@ -51,12 +51,23 @@ async function raw() {
     console.log(JSON.stringify({ case: mode, noAnswer: true }));
   } finally { clearTimeout(timer); socket.destroy(); }
 }
+function admissionReceipt() {
+  const fd = fs.openSync('/run/noevia-verify/.noevia-native-admission.json',
+    fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
+  try {
+    const stat = fs.fstatSync(fd);
+    assert.ok(stat.isFile()); assert.equal(stat.nlink, 1);
+    assert.equal(stat.uid, 0); assert.equal(stat.gid, 0);
+    assert.equal(stat.mode & 0o7777, 0o600); assert.ok(stat.size <= 1024);
+    return JSON.parse(fs.readFileSync(fd, 'utf8'));
+  } finally { fs.closeSync(fd); }
+}
 async function measured() {
-  const taskId = 'owned-qualification', revision = 3;
-  const witnessed = ['copy-deadline', 'copy-descendant', 'admission-witness-control'].includes(mode);
+  const taskId = 'owned-qualification', revision = 3, nonce = 'cd'.repeat(16);
+  const witnessed = ['copy-deadline', 'copy-descendant', 'admission-witness-control', 'admission-early-control'].includes(mode);
   if (witnessed) assertNotAdmitted('/qualification-proof');
   const verify = createCodeVerify({ endpoint: 'unix:' + socketPath,
-    timeoutMs: 20000, connectRetryMs: 15000, tailBytes: 1024 });
+    timeoutMs: 20000, connectRetryMs: 15000, tailBytes: 1024, nonceFn: () => nonce });
   const targetHead = mode === 'bad-head' ? '1'.repeat(40) : headSha;
   const result = await verify.run({ taskId, revision, repo: mode === 'unconfigured' ? 'other' : 'synthetic',
     headSha: targetHead, workspaces: { verifyCheckout: (id, head) => {
@@ -65,19 +76,26 @@ async function measured() {
     } } });
   if (['bad-head', 'unconfigured', 'hostile-config', 'copy-deadline'].includes(mode)) {
     assertRefusal(mode, result);
+    assertFinalAdmission(admissionReceipt(), nonce, 0);
     if (mode === 'copy-deadline') assertNotAdmitted('/qualification-proof');
   } else if (mode === 'saturation') {
     assert.notEqual(result.status, 'passed');
     assert.equal(result.report?.passed ?? false, false);
   } else {
     assert.ok(result.report, JSON.stringify(result));
+    const receipt = admissionReceipt();
+    assertFinalAdmission(receipt, nonce, 1);
     assert.equal(isMeasured(result.report, { taskId, headSha, revision }), true);
     assert.equal(Object.isFrozen(result.report), true);
     assert.equal(isMeasured(JSON.parse(JSON.stringify(result.report)), { taskId, headSha, revision }), false);
     for (const mismatch of [{ taskId: 'other' }, { headSha: '2'.repeat(40) }, { revision: 4 }]) {
       assert.equal(isMeasured(result.report, { taskId, headSha, revision, ...mismatch }), false);
     }
-    if (mode === 'fail') {
+    if (mode === 'admission-early-control') {
+      assert.equal(result.status, 'failed'); assert.equal(result.report.exitCode, 1);
+      assertNotAdmitted('/qualification-proof'); // No JavaScript payload marker was reached.
+      assert.throws(() => assertFinalAdmission(receipt, nonce, 0));
+    } else if (mode === 'fail') {
       assert.equal(result.status, 'failed'); assert.equal(result.report.exitCode, 7);
     } else if (mode === 'timeout') {
       assert.equal(result.status, 'failed'); assert.equal(result.report.timedOut, true);
@@ -96,6 +114,7 @@ async function measured() {
         assert.throws(() => assertNotAdmitted('/qualification-proof'), /operator command was admitted/);
         const proof = JSON.parse(fs.readFileSync('/qualification-proof/operator-started', 'utf8'));
         assert.equal(proof.uid, 1003);
+        assert.throws(() => assertFinalAdmission(receipt, nonce, 0));
       }
       if (mode === 'clone') {
         assert.match(result.report.tail, /NON_SIGCHLD_CLONE_READY/);

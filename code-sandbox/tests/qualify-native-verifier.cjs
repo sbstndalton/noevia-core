@@ -37,7 +37,7 @@ const owned = fs.mkdtempSync(path.join(os.tmpdir(), runId + '-'));
 const docker = (args) => execFileSync('docker', args, { encoding: 'utf8', maxBuffer: 8 * 1024 * 1024, timeout: 30000 });
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const cases = ['pass', 'identity', 'fail', 'tail', 'detached', 'pipe', 'clone', 'timeout', 'copy-deadline',
-  'copy-descendant', 'admission-witness-control', 'bad-head', 'unconfigured', 'hostile-config', 'malformed', 'partial', 'oversized', 'disconnect', 'shutdown', 'root-gid', 'saturation'];
+  'copy-descendant', 'admission-witness-control', 'admission-early-control', 'bad-head', 'unconfigured', 'hostile-config', 'malformed', 'partial', 'oversized', 'disconnect', 'shutdown', 'root-gid', 'saturation'];
 let completed = 0;
 async function one(mode, index) {
   const name = runId + '-' + index;
@@ -54,7 +54,7 @@ async function one(mode, index) {
   git(['add', '.']); git(['commit', '--quiet', '-m', 'owned synthetic fixture']);
   const head = git(['rev-parse', 'HEAD']);
   if (mode === 'hostile-config') git(['config', 'alias.synthetic', '!echo MUST_NOT_RUN']);
-  const witnessed = ['copy-deadline', 'copy-descendant', 'admission-witness-control'].includes(mode);
+  const witnessed = ['copy-deadline', 'copy-descendant', 'admission-witness-control', 'admission-early-control'].includes(mode);
   const configured = structuredClone(service);
   configured.image = image; delete configured.build; delete configured.restart;
   configured.environment = { ...configured.environment,
@@ -63,6 +63,7 @@ async function one(mode, index) {
     CODE_VERIFY_TAIL_BYTES: '1024', VERIFY_MIN_UPTIME_MS: '60000',
   };
   if (mode === 'root-gid') configured.environment.VERIFY_TEST_USER = '1003:0';
+  if (mode === 'admission-early-control') configured.environment.CODE_VERIFY = 'synthetic|/bin/false';
   configured.volumes = [
     { type: 'bind', source: sources, target: '/workspaces', read_only: true },
     { type: 'volume', source: 'socket', target: '/run/noevia-verify' },
@@ -111,7 +112,7 @@ async function one(mode, index) {
       const args = ['run', '--interactive', '--rm', '--name', name + '-client', '--pull', 'never', '--read-only', '--network', 'none', '--user', '0:0',
         '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges:true', '--pids-limit', '128', '--memory', '512m', '--cpus', '1',
         '--env', 'NOEVIA_NATIVE_VERIFIER_QUALIFICATION=1',
-        '--mount', 'type=volume,src=' + name + '-socket,dst=/run/noevia-verify',
+        '--mount', 'type=volume,src=' + name + '-socket,dst=/run/noevia-verify,readonly',
         '--mount', 'type=bind,src=' + path.join(core, 'server') + ',dst=/reviewed-core/server,readonly',
         '--mount', 'type=bind,src=' + path.join(__dirname, 'native-verifier-client.cjs') + ',dst=/qualification/client.cjs,readonly',
         '--mount', 'type=bind,src=' + path.join(__dirname, 'native-verifier-assertions.cjs') + ',dst=/qualification/native-verifier-assertions.cjs,readonly',

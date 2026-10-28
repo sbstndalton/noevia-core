@@ -75,6 +75,14 @@ loose object.
   process, and `CODE_VERIFY_WALL_MS` (default 10 min) covers the copy and the run. The output tail
   (16 KiB by default) comes back inside one JSON line.
 
+The protected socket volume also holds one bounded mode0600 root-owned admission
+receipt, bound to the request nonce. It counts actual test-helper creation before
+payload/bootstrap progress and becomes final only after the all-child barrier.
+The Linux qualifier checks this trusted record, including an early `/bin/false`
+control that never reaches a JavaScript marker. A missing/stale/unfinished record
+is uncertainty; payload-marker absence is not zero-admission proof. This adds no
+public helper mode, selector, worker permission or unbounded log.
+
 Tests that write must use `$TMPDIR` (the copy is read-only). With no network, the repository must
 run without installing dependencies. git inside the tests sees a repository owned by another uid.
 
