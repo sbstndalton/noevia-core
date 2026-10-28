@@ -49,6 +49,32 @@ RUN cargo build --locked --release -p code-sandbox-supervisor --bins \
  && test -x target/release/code-sandbox-supervisor \
  && test -x target/release/code-sandbox-session-exec
 
+# The verifier source pin is a canonical Git-export content digest. It is
+# independent of codeload gzip timestamps; the bounded validator checks every
+# path/type/executable bit/content before extracting any build input.
+FROM python:3.12-slim-bookworm AS native-verifier-src
+ARG NATIVE_VERIFIER_RS_REF=e21b92a219c5266429d8d3cff1fe9df76003ce3c
+ARG NATIVE_VERIFIER_SOURCE_SHA256=a4dd45eb2e475a9762efbaf568c398b60bfe4fb1fa9ce5b6afae4385ad64ffe3
+COPY verify-native-source.py /verify-native-source.py
+RUN python3 /verify-native-source.py fetch "$NATIVE_VERIFIER_RS_REF" "$NATIVE_VERIFIER_SOURCE_SHA256" /verifier-rs
+
+FROM rust:1.99-slim-bookworm AS native-verifier
+ENV RUSTUP_TOOLCHAIN=1.99.0 CARGO_TERM_COLOR=never CARGO_BUILD_JOBS=2
+COPY --from=native-verifier-src /verifier-rs /src
+WORKDIR /src
+RUN cargo build --locked --release -p code-verify-native --bin code-verify-native \
+ && test -x target/release/code-verify-native \
+ && target/release/code-verify-native --capabilities > /verifier-capabilities.json
+# This static probe binds the artifact family only; namespace readiness and
+# actual helper/cleanup behavior require the isolated Linux qualification.
+
+# Qualification artifact only; never copied into the shipped runtime image.
+# Compiled against the same Debian family, then executed only in an owned
+# restricted verifier namespace by the mandatory Linux job.
+FROM native-verifier AS native-verifier-fixtures
+COPY tests/native-verifier-clone.c /native-verifier-clone.c
+RUN cc -O2 -Wall -Wextra -Werror /native-verifier-clone.c -o /native-verifier-clone
+
 FROM node:22-bookworm-slim
 
 ARG HARNESS_PACKAGE=opencode-ai
@@ -67,9 +93,9 @@ WORKDIR /srv
 # pi-acp-bridge.cjs: noevia's own ACP bridge for pi (routes pi's approvals to noevia). Used only
 # when the image installs pi (HARNESS_PACKAGE=@earendil-works/pi-coding-agent) and runs with
 # CODE_HARNESS_COMMAND=node CODE_HARNESS_ARGS=/srv/pi-acp-bridge.cjs and CODE_HARNESS_NAME=pi on web.
-# verifier.cjs: the server-measured test runner (#703). Runs ONLY in the separate `code-verify`
-# container (uid 1002, no network, workspaces read-only); never started in the agent sandbox.
-COPY supervisor.cjs pi-acp-bridge.cjs verifier.cjs ./
+# The verifier is native-only. Its frozen Node reference stays in tests/oracles and
+# is never installed as a production fallback.
+COPY supervisor.cjs pi-acp-bridge.cjs ./
 # SANDBOX_BRIDGE_IMPL=rust (#999; default js): the loader, its lock and the checked module. Read-only
 # like everything else here; the loader re-checks the module's sha256 against the lock at startup.
 COPY sandbox-bridge-wasm.cjs sandbox-bridge.lock ./
@@ -78,6 +104,8 @@ COPY --from=sandbox-bridge /out/sandbox-bridge.wasm ./wasm/sandbox-bridge.wasm
 # resolves the helper beside its own executable before binding a listener.
 COPY --from=native-supervisor --chmod=0555 /src/target/release/code-sandbox-supervisor /usr/local/libexec/noevia/code-sandbox-supervisor
 COPY --from=native-supervisor --chmod=0555 /src/target/release/code-sandbox-session-exec /usr/local/libexec/noevia/code-sandbox-session-exec
+COPY --from=native-verifier --chmod=0555 /src/target/release/code-verify-native /usr/local/libexec/noevia/code-verify-native
+RUN /usr/local/libexec/noevia/code-verify-native --capabilities | node -e 'let s="";process.stdin.on("data",b=>s+=b);process.stdin.on("end",()=>{const c=JSON.parse(s);if(c.probe!=="source-capability"||c.nativeVerifier!==true||c.oneShot!==true||c.readiness!=="requires-isolated-namespace-init"||c.requestMaxBytes!==65536||!c.capabilities.includes("noevia-code-verify/1"))process.exit(1)})'
 COPY --chmod=0555 native-supervisor-entrypoint.sh /srv/native-supervisor-entrypoint.sh
 # The verifier's socket directory: root's, 0770, so a fresh named volume inherits that owner and
 # neither the agent (1000), git (1002) nor the test command (1003) can enter it. Web connects as

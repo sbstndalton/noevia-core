@@ -1,11 +1,11 @@
 'use strict';
-// #703: server-measured verification. The verifier (services/code-sandbox/verifier.cjs) is tested
+// #703: frozen test-only Node oracle plus unchanged measured caller/workspace contracts, tested
 // from here, like the sandbox supervisor, against a real git fixture and a real shell. Synthetic
 // repositories only; nothing touches the network.
 const test = require('node:test'), assert = require('node:assert/strict');
 const fs = require('node:fs'), os = require('node:os'), path = require('node:path'), net = require('node:net'), zlib = require('node:zlib');
 const { execFileSync } = require('node:child_process');
-const { createVerifier, parseVerify, verifyEnv, createTail, SCRATCH_PREFIX } = require('../../../services/code-sandbox/verifier.cjs');
+const { createVerifier, parseVerify, verifyEnv, createTail, SCRATCH_PREFIX } = require('../../../services/code-sandbox/tests/oracles/node-verifier.cjs');
 const { createCodeWorkspaces } = require('./code-workspace.cjs');
 const { createCodeVerify, isMeasured, cleanTail } = require('./code-verify.cjs');
 
@@ -195,7 +195,7 @@ test('the verifier refuses a hostile source config, an unconfigured repository, 
 });
 
 test('a source path that could inject git config is refused before any config is written (#855)', async () => {
-  const { configSafePath } = require('../../../services/code-sandbox/verifier.cjs');
+  const { configSafePath } = require('../../../services/code-sandbox/tests/oracles/node-verifier.cjs');
   assert.equal(configSafePath('/workspaces/repos/a b#c;d'), true, 'ordinary punctuation is fine inside a quoted value');
   for (const bad of ['/w/a\nb', '/w/a\rb', '/w/a\tb', '/w/a\u0000b', '/w/a\u007fb', '/w/a"b', '/w/a\\b', '']) {
     assert.equal(configSafePath(bad), false, JSON.stringify(bad));

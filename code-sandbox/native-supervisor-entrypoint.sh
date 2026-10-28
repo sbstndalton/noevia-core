@@ -1,6 +1,6 @@
 #!/bin/sh
 # Fixed, source-only supervisor selector. This is CMD, not ENTRYPOINT:
-# code-verify's explicit Node command still starts verifier.cjs directly.
+# code-verify's explicit native command bypasses this sandbox-only selector.
 set -eu
 
 fail() {

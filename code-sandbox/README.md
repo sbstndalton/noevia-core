@@ -31,7 +31,7 @@ bounded memory and pids, one volume, no `ports:`.
 
 ## The verifier (#703)
 
-The pipeline's "do the tests pass?" is answered by `verifier.cjs`, not by the agent, and **not in
+The pipeline's "do the tests pass?" is answered by `code-verify-native`, not by the agent, and **not in
 this container**. It ships in the same image but runs as its own service, `code-verify` (see
 `deploy/examples/code-sandbox.override.yml`). The agent runs here as uid 1000 with a writable
 `/tmp` and `HOME`, so anything it leaves behind could otherwise reach the run that judges it: a
@@ -49,12 +49,13 @@ loose object.
   - **git** runs as 1002, with the repositories' shared group, for the copy.
   - The **test command** runs as 1003, so it cannot signal the server, enter the socket
     directory, or write or chmod the copy, which belongs to 1002 and is read-only.
-- **One-shot:** the verifier serves exactly one request, then exits, and `restart: always` brings it
-  back with empty tmpfs. Every process a test left behind, even one that escaped with `setsid`, dies
-  with the container. Before that, after the copy step and after the command, every process of the
-  uid that just ran is killed (`kill -9 -1` run *as* that uid, which needs no capability). The
-  answer is sent only after that cleanup. Web retries the connection for a few seconds while the
-  verifier restarts, then reports `busy`.
+- **One-shot namespace authority:** the native verifier is PID1 of its dedicated Linux
+  container. It serves one request and exits; `restart: always` supplies fresh tmpfs.
+  Before a result, descriptor-bound signalling and the all-child status collector must
+  account for copy/test helpers, escaped sessions and adopted descendants. The final
+  `waitpid(-1, WNOHANG | __WALL)` ECHILD barrier is required; namespace teardown,
+  an empty proc listing or a process-group wait cannot substitute for it. No UID-wide
+  signalling is used. Uncertain cleanup refuses a result. Web retries while it restarts.
 - **The command is the operator's:** `CODE_VERIFY=name|command` (one per line, names as in web's
   `CODE_REPOS`), set only on `code-verify`. noevia sends a repository name, the source path, the
   commit and a per-request **nonce** (echoed back, so a stale answer is rejected). It never sends a
@@ -74,10 +75,18 @@ loose object.
   process, and `CODE_VERIFY_WALL_MS` (default 10 min) covers the copy and the run. The output tail
   (16 KiB by default) comes back inside one JSON line.
 
+The protected socket volume also holds one bounded mode0600 root-owned admission
+receipt, bound to the request nonce. It counts actual test-helper creation before
+payload/bootstrap progress and becomes final only after the all-child barrier.
+The Linux qualifier checks this trusted record, including an early `/bin/false`
+control that never reaches a JavaScript marker. A missing/stale/unfinished record
+is uncertainty; payload-marker absence is not zero-admission proof. This adds no
+public helper mode, selector, worker permission or unbounded log.
+
 Tests that write must use `$TMPDIR` (the copy is read-only). With no network, the repository must
 run without installing dependencies. git inside the tests sees a repository owned by another uid.
 
-**Shipping it** needs a code-sandbox image release (new `verifier.cjs`, socket and tmpfs
+**Shipping it** needs a code-sandbox image release (native verifier binary, socket and tmpfs
 directories) **and** the new `code-verify` container. See `docs/deployment.md` under Code mode.
 
 ## Why not the Docker socket
@@ -135,10 +144,12 @@ bridge by default, so this source change alone cannot activate native mode.
 The Dockerfile builds both native binaries from a separately checked, immutable
 noevia-rs archive at the reviewed supervisor source revision. This draft pin
 does not change sandbox-bridge.lock or the shared release pins. The final image
-retains Node 22, the pinned npm harness, pi-acp-bridge.cjs and verifier.cjs.
-The selector is CMD, not ENTRYPOINT: code-verify's explicit Node verifier
-command still bypasses it. Its separate no-network container and security
-settings are outside this source change.
+retains Node 22, the pinned npm harness and pi-acp-bridge.cjs.
+The separate verifier binary is built from its own reviewed content pin.
+The selector is CMD, not ENTRYPOINT: code-verify's explicit native command bypasses it.
+The frozen Node verifier is a test-only oracle and is not copied into the image.
+Actual paired image/Compose Linux qualification and release promotion are still required;
+a source capability probe is not isolation readiness.
 
 The native source's synthetic lifecycle suite covers session readiness, early
 client disconnect and descendant cleanup. The selector's own synthetic tests
