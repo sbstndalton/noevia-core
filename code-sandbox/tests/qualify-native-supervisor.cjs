@@ -117,6 +117,8 @@ async function one(mode, index) {
     const netInfo = JSON.parse(docker(['network', 'inspect', network]))[0]; assert.equal(netInfo.Internal, true);
     assert.equal(netInfo.Id, actual.NetworkSettings.Networks[network].NetworkID);
     assert.ok(actual.Mounts.find((m) => m.Destination === '/workspaces' && m.Type === 'volume' && m.RW));
+    assert.equal(actual.Mounts.length, cfg.volumes.length);
+    assert.deepEqual(actual.Mounts.map((m) => m.Destination).sort(), cfg.volumes.map((m) => m.target).sort());
     assert.ok(actual.Mounts.every((m) => m.Destination === '/workspaces' || !m.RW));
     if (faults.has(mode)) {
       assert.equal(docker(['wait', id]).trim(), '2');
