@@ -57,6 +57,7 @@ test('#1071: the guard is unconditional: no option or environment turns it off',
 // noevia-rs contracts/http/routes.toml, the owner = "rust" sign-in and account entries with the
 // methods Rust answers (a method not listed stays Node's).
 const RUST_ROUTES = [
+  ['/api/chat-framing/preferences', null],
   ['/api/account/instructions', null], ['/api/account/memory', null], ['/api/account/preferences', null],
   ['/api/account/retention', ['GET']],
   ['/api/admin/invitations', ['POST']], ['/api/admin/users', ['GET']], ['/api/admin/users/u1/disabled', ['PUT']], ['/api/admin/users/u1/recovery', ['POST']],
@@ -72,7 +73,7 @@ const RUST_ROUTES = [
 const METHODS = ['GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'];
 
 test('#1071: Node refuses exactly the sign-in and account routes the Rust front answers', () => {
-  assert.equal(OWNED_ROUTES.length, 25);
+  assert.equal(OWNED_ROUTES.length, 26);
   for (const [p, methods] of RUST_ROUTES) {
     for (const m of METHODS) assert.equal(ownedRoute(m, p), methods === null || methods.includes(m), `${m} ${p}`);
   }
@@ -81,7 +82,7 @@ test('#1071: Node refuses exactly the sign-in and account routes the Rust front 
   for (const [m, p] of [
     ['DELETE', '/api/admin/users/u1'], ['GET', '/api/admin/web-address'], ['POST', '/api/admin/web-address'], ['POST', '/api/admin/secrets/rotate'],
     ['GET', '/api/admin/features'], ['POST', '/api/profile/sharing'], ['GET', '/api/profile/diary-connectors'],
-    ['PUT', '/api/account/retention'], ['GET', '/device'], ['GET', '/api/auth/sessionx'], ['GET', '/api/profile/'],
+    ['PUT', '/api/account/retention'], ['GET', '/api/chat-framing/preferences/'], ['GET', '/api/chat-framing/suggest'], ['GET', '/device'], ['GET', '/api/auth/sessionx'], ['GET', '/api/profile/'],
     ['GET', '/api/auth/session/x'], ['DELETE', '/api/auth/passkeys/a/b'], ['GET', '/api/workspace'], ['GET', '/api/auth/status'],
   ]) assert.equal(ownedRoute(m, p), false, `${m} ${p}`);
   const sent = [];

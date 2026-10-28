@@ -158,7 +158,8 @@ test('framing settings: model-agnostic role ids, validated and audited', () => {
 
 test('framing preferences live in the user directory, default off, and refuse non-booleans (#738)', () => {
   const fs = require('node:fs'), os = require('node:os'), path = require('node:path');
-  const { readPreferences, writePreferences } = require('./chat-framing.cjs');
+  const { readPreferences } = require('./chat-framing.cjs');
+  const { writePreferences } = require('../tests/server/oracle/chat-framing-preferences.cjs');
   const one = fs.mkdtempSync(path.join(os.tmpdir(), 'noevia-framing-a-')), two = fs.mkdtempSync(path.join(os.tmpdir(), 'noevia-framing-b-'));
   const off = { autoAccept: false, keepReasoningTraces: false };
   assert.deepEqual(readPreferences(one), off);
