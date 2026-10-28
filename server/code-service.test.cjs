@@ -477,17 +477,23 @@ test('#1062 a task that loses the race to auto-tune fails with the pause message
 test('#1069 a lease refused at run time releases the claimed worktree and network grant', { skip: skipWasm }, async () => {
   ran++;
   const gate = createMaintenanceGate();
-  const released = [];
+  const released = [], issued = [];
   let refuse = true;
-  const egress = { endpoint: 'egress:3128', grant: () => ({ token: 't' }), revoke: (id) => released.push(id), activity: () => ({}) };
+  const egress = { endpoint: 'egress:3128',
+    grant: async ({ taskId }) => { const lease = Object.freeze({ taskId, token: 't' }); issued.push(lease); return lease; },
+    revoke: async (lease) => { assert.ok(issued.includes(lease)); released.push(lease); return { confirmed: true, report: { available: true, final: true, hosts: [], allowed: 0, refused: 0 } }; },
+  };
   const { svc, ws } = service({ egress, inference: { enter: () => { if (refuse) throw Object.assign(Error('busy'), { status: 503 }); return gate.enter(); }, paused: () => false } });
   const started = await svc.start(ws, project, { repository: 'noevia', prompt: 'fix', capabilities: ['read_file', 'network'], domains: ['x.test'] });
   const done = await settle(svc, ws, started.taskId);
   assert.equal(done.status, 'failed'); assert.equal(done.error, INFERENCE_PAUSED);
-  assert.deepEqual(released, [started.taskId], 'the network grant was revoked');
+  assert.equal(issued[0].taskId, started.taskId);
+  assert.deepEqual(released, [issued[0]], 'the original network lease was revoked');
   refuse = false;
   const again = await svc.start(ws, project, { repository: 'noevia', prompt: 'fix' });
   assert.equal((await settle(svc, ws, again.taskId)).status, 'completed');
+  assert.equal(issued.length, 1, 'the network-free retry creates no extra lease');
+  assert.deepEqual(released, issued, 'the original lease was cleaned up exactly once');
   gate.hold('idle')();
 });
 
