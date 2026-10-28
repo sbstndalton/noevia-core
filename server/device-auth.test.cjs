@@ -133,3 +133,19 @@ test('the request authenticator is exactly auth.cjs while the feature is off', (
   on = false;
   assert.equal(gate.authenticate(bearerReq(tokens.access)), null);
 });
+
+test('browser credentials do not consult unavailable native feature context; device credentials never fall back', () => {
+  const unavailable = Object.assign(new Error('Feature runtime context is unavailable.'), { status: 503 });
+  let checks = 0, browsers = 0;
+  const browser = { user: { id: 'synthetic-browser', role: 'member' } };
+  const requestAuth = device.createRequestAuth({ enabled() { checks++; throw unavailable; },
+    deviceAuth: { authenticate() { throw Error('unknown context must not admit device'); } },
+    authService: { authenticate() { browsers++; return browser; } },
+  });
+  for (const headers of [{}, { cookie: 'cowork_session=synthetic' }, { authorization: 'Bearer ordinary-legacy-token' }]) {
+    assert.equal(requestAuth.authenticate({ headers }), browser);
+  }
+  assert.equal(checks, 0); assert.equal(browsers, 3);
+  assert.throws(() => requestAuth.authenticate({ headers: { authorization: 'Bearer nva_synthetic' } }), { status: 503 });
+  assert.equal(checks, 1); assert.equal(browsers, 3);
+});

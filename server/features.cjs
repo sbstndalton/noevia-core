@@ -235,6 +235,75 @@ function createFeatures({ env = process.env, store = null, audit = () => {}, reg
   };
 }
 
+/** Native-owner adapter. Index switches to this factory only as part of the complete pair;
+ * the existing writer factory is not a fallback for a failed native context. */
+function createReadOnlyFeatures({ db, runtime, env = process.env, availability }) {
+  const unavailable = () => Object.assign(new Error('Feature runtime context is unavailable.'), { status: 503, code: 'FEATURE_RUNTIME_CONTEXT_UNAVAILABLE' });
+  const dynamic = ['stepSupervision', 'toolGate', 'systemOneRouting', 'chatFraming', 'framingReasoner'];
+  if (typeof runtime !== 'function' || !availability || !dynamic.every(name => typeof availability[name] === 'function')
+    || Object.keys(availability).some(name => !dynamic.includes(name))) throw unavailable();
+  const names = Object.keys(REGISTRY), aliases = new Map();
+  const read = db.prepare("SELECT CASE WHEN typeof(value)='text' AND value IN ('true','false') THEN value ELSE NULL END AS value FROM settings WHERE key=?");
+  const state = new Map();
+  function selected(name) {
+    const spec = REGISTRY[name], fixed = state.get(name);
+    if (fixed.env !== undefined) return { value: fixed.env, source: 'env' };
+    let saved = read.get(SETTING_PREFIX + name)?.value;
+    if (saved !== 'true' && saved !== 'false' && spec.legacy?.name) saved = read.get(SETTING_PREFIX + spec.legacy.name)?.value;
+    return saved === 'true' || saved === 'false' ? { value: saved === 'true', source: 'admin' }
+      : { value: spec.default === true, source: 'default' };
+  }
+  // Capture actual construction facts once, without writing/migrating any setting. Ordinary
+  // execution queries below NEVER use a construction bypass, including before runtime Ready.
+  for (const name of names) {
+    const spec = REGISTRY[name];
+    if (spec.legacy?.name) aliases.set(spec.legacy.name, name);
+    state.set(name, { env: parseEnv(env[spec.env]), unavailable: spec.unavailable?.(env) || null });
+    state.get(name).boot = selected(name).value;
+  }
+  const resolve = name => names.includes(name) ? name : aliases.get(name) || name;
+  const reason = name => availability[name] ? availability[name]() : state.get(name).unavailable;
+  function live(action) {
+    const owner = runtime();
+    if (!owner || typeof owner.read !== 'function') throw unavailable();
+    return owner.read(view => {
+      if (view !== db) throw unavailable(); // Never mix this factory's rows with another context DB.
+      return action();
+    });
+  }
+  const features = Object.freeze({
+    names: () => [...names], resolve,
+    enabled(name) {
+      name = resolve(name);
+      if (!names.includes(name)) throw new Error(`Unknown feature: ${name}`);
+      return live(() => !reason(name) && (REGISTRY[name].restart ? state.get(name).boot : selected(name).value));
+    },
+    flags: () => live(() => Object.fromEntries(names.map(name => [name,
+      !reason(name) && (REGISTRY[name].restart ? state.get(name).boot : selected(name).value)]))),
+    describe: () => live(() => names.map(name => {
+      const spec = REGISTRY[name], current = selected(name), unavailableReason = reason(name);
+      return { id: name, name, label: spec.label, description: spec.description,
+        enabled: current.value, source: current.source, locked: current.source === 'env', env: spec.env,
+        ...(spec.experimental ? { experimental: true, unavailable: unavailableReason, unavailableId: unavailableId(name, unavailableReason) }
+          : spec.unavailable ? { unavailable: unavailableReason, unavailableId: unavailableId(name, unavailableReason) } : {}),
+        pendingRestart: !!spec.restart && current.value !== state.get(name).boot };
+    })),
+  });
+  const staticNames = ['browserExecutor', 'codePipeline', 'codeMerge', 'nativeClientAuth'];
+  const startupWarnings = Object.freeze(staticNames.filter(name => selected(name).value && state.get(name).unavailable)
+    .map(name => Object.freeze({ name, env: REGISTRY[name].env, reason: state.get(name).unavailable })));
+  const construction = Object.freeze({ diaryMcpWrite: state.get('diaryMcpWrite').boot,
+    kiwix: state.get('kiwix').boot, startupWarnings });
+  const browserReason = state.get('browserExecutor').unavailable;
+  const browser = browserReason === null ? 'available' : browserReason === 'Needs Playwright installed on this server; it is not in this image.'
+    ? 'playwright' : browserReason === 'Needs a Chromium browser installed for Playwright on this server.' ? 'chromium' : null;
+  if (!browser) throw unavailable();
+  const bootFacts = Object.freeze({ env: Object.freeze(names.map(name => state.get(name).env ?? null)),
+    restart: Object.freeze([construction.diaryMcpWrite, construction.kiwix]), browser,
+    code: state.get('codePipeline').unavailable === null, trustProxy: state.get('nativeClientAuth').unavailable === null });
+  return Object.freeze({ features, construction, bootFacts });
+}
+
 /** The auth database's key/value settings table as a feature store. */
 function settingsStore(db) {
   return {
@@ -246,4 +315,4 @@ function settingsStore(db) {
   };
 }
 
-module.exports = { browserRuntimeReason, codeSandboxReason, unavailableId, REGISTRY, createFeatures, settingsStore, parseEnv, migrateLegacySetting, refuseRustStorageRead, RUST_STORAGE_READS_REFUSAL, RUST_STORAGE_BROWSE_REFUSAL, RUST_CHATGPT_STATUS_REFUSAL };
+module.exports = { browserRuntimeReason, codeSandboxReason, unavailableId, REGISTRY, createFeatures, createReadOnlyFeatures, settingsStore, parseEnv, migrateLegacySetting, refuseRustStorageRead, RUST_STORAGE_READS_REFUSAL, RUST_STORAGE_BROWSE_REFUSAL, RUST_CHATGPT_STATUS_REFUSAL };

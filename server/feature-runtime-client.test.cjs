@@ -21,7 +21,7 @@ function fixture(t, behavior = () => {}) {
   db.prepare('INSERT INTO settings VALUES(?,?)').run('native:feature-runtime:incarnation', INC);
   const replaceEpoch = value => nativeActor.prepare("UPDATE settings SET value=? WHERE key='native:feature-runtime:incarnation'").run(value);
   createRustAuthGuard().install(db);
-  t.after(() => { nativeActor.close(); db.close(); fs.rmSync(directory, { recursive: true }); });
+  t.after(() => { if (nativeActor.open) nativeActor.close(); if (db.open) db.close(); fs.rmSync(directory, { recursive: true }); });
   const store = createStore(db), env = {};
   const inferenceMachines = createInferenceMachines({ store, env, log: () => {} });
   const decisionSettings = createDecisionSettings({ store, env, machineUrl: () => inferenceMachines.urlFor('decision') });
@@ -238,4 +238,12 @@ test('a known renew ACK overtaken by a source change recovers by next sequence w
   assert.equal(renewals[0].session, renewals[1].session);
   assert.equal(f.calls.filter(c => c.payload.op === 'register').length, 1);
   assert.equal(f.runtime.read(() => true), true);
+});
+
+
+test('an actual SQLite read outage returns deterministic unavailable instead of a cached live answer', async t => {
+  const f = fixture(t); await f.runtime.ready();
+  assert.equal(f.runtime.read(() => true), true);
+  f.db.close();
+  assert.throws(() => f.runtime.read(() => true), { status: 503, code: 'FEATURE_RUNTIME_CONTEXT_UNAVAILABLE' });
 });

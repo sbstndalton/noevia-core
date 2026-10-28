@@ -179,7 +179,7 @@ function ensureDeviceSchema(db) {
 function createRequestAuth({ enabled, deviceAuth, authService }) {
   return {
     authenticate(req) {
-      if (enabled() && bearerToken(req)) return hasSessionCookie(req) ? null : deviceAuth.authenticate(req);
+      if (bearerToken(req) && enabled()) return hasSessionCookie(req) ? null : deviceAuth.authenticate(req);
       return authService.authenticate(req);
     },
     /** A device token is not an ambient credential, so CSRF does not apply; a cookie never rides along. */

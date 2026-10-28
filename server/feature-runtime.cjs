@@ -116,13 +116,13 @@ function createFeatureRuntime({ db, storeClient, collector, bootFacts, start,
   const readTransaction = db.transaction(fn => {
     const state = current();
     collector.assertSources(state.snapshot.sources);
-    const result = fn();
+    const result = fn(db);
     if (result && typeof result.then === 'function') throw unavailable(); // SQLite view cannot span await.
     collector.assertSources(state.snapshot.sources);
     if (clock() >= state.expires || active !== state) { retire(); throw unavailable(); }
     return result;
   });
-  function read(fn) { return readTransaction(fn); }
+  function read(fn) { try { return readTransaction(fn); } catch { throw unavailable(); } }
   function uuid() { const id = newId(); if (!UUID.test(id)) throw unavailable(); return id; }
   async function logical(payload) {
     const first = clock(), deadline = first + 2500;
