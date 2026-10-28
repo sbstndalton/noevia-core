@@ -7,6 +7,7 @@ from pathlib import Path
 import tarfile
 import tempfile
 import unittest
+from unittest.mock import patch
 
 SPEC = importlib.util.spec_from_file_location('source', Path(__file__).parents[1] / 'verify-native-source.py')
 source = importlib.util.module_from_spec(SPEC)
@@ -94,6 +95,48 @@ class ReviewedSource(unittest.TestCase):
         for rows in bad:
             with self.subTest(rows=rows), self.assertRaises(ValueError):
                 source.inspect(archive(rows), 'root')
+
+    def test_gnu_and_pax_sparse_entries_refuse_before_content_read_or_write(self):
+        for sparse_kind in ['gnu', 'pax']:
+            output = io.BytesIO()
+            with tarfile.open(fileobj=output, mode='w', format=tarfile.PAX_FORMAT) as tar:
+                root = tarfile.TarInfo('root')
+                root.type = tarfile.DIRTYPE
+                tar.addfile(root)
+                member = tarfile.TarInfo('root/sparse')
+                member.size = 1
+                if sparse_kind == 'gnu':
+                    member.type = tarfile.GNUTYPE_SPARSE
+                else:
+                    member.pax_headers = {'GNU.sparse.map': '0,1',
+                                          'GNU.sparse.size': '32768',
+                                          'GNU.sparse.name': 'root/sparse'}
+                tar.addfile(member, io.BytesIO(b'x'))
+            with self.subTest(kind=sparse_kind), tempfile.TemporaryDirectory() as parent:
+                destination = Path(parent) / 'must-not-exist'
+                with patch.object(tarfile.TarFile, 'extractfile',
+                                  side_effect=AssertionError('sparse content was read')):
+                    with self.assertRaisesRegex(ValueError, 'sparse source entry refused'):
+                        source.extract(output.getvalue(), 'root', '0' * 64, destination)
+                self.assertFalse(destination.exists())
+
+    def test_aggregate_budget_rejects_before_reading_the_overbudget_file(self):
+        data = archive([('root', 'directory', None, 0o755),
+                        ('root/one', 'file', b'a' * 16, 0o644),
+                        ('root/two', 'file', b'b' * 16, 0o644)])
+        read_names = []
+        original = tarfile.TarFile.extractfile
+        def observed(tar, member):
+            read_names.append(member.name)
+            return original(tar, member)
+        with tempfile.TemporaryDirectory() as parent:
+            destination = Path(parent) / 'must-not-exist'
+            with patch.object(source, 'MAX_CONTENT', 24, create=True), \
+                    patch.object(tarfile.TarFile, 'extractfile', observed):
+                with self.assertRaisesRegex(ValueError, 'aggregate source content limit'):
+                    source.extract(data, 'root', '0' * 64, destination)
+            self.assertEqual(read_names, ['root/one'])
+            self.assertFalse(destination.exists())
 
     def test_compressed_bomb_and_input_size_are_bounded(self):
         old = source.MAX_ARCHIVE, source.MAX_EXPANDED, source.MAX_ENTRIES

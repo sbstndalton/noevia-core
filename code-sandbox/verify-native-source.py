@@ -18,6 +18,7 @@ import urllib.request
 MAX_ARCHIVE = 64 * 1024 * 1024
 MAX_EXPANDED = 128 * 1024 * 1024
 MAX_ENTRIES = 20000
+MAX_CONTENT = 128 * 1024 * 1024
 DOMAIN = b'noevia-reviewed-git-export-v1\0'
 
 
@@ -51,6 +52,7 @@ def inspect(data, prefix):
     if len(expanded) > MAX_EXPANDED:
         raise ValueError('expanded source size limit')
     entries = {}
+    logical_bytes = 0
     with tarfile.open(fileobj=io.BytesIO(expanded), mode='r:') as archive:
         for member in archive:
             if len(entries) >= MAX_ENTRIES:
@@ -68,9 +70,18 @@ def inspect(data, prefix):
             path_ok(name)
             if name in entries:
                 raise ValueError('duplicate source entry')
+            if (member.issparse() or member.type == tarfile.GNUTYPE_SPARSE
+                    or any(k.startswith('GNU.sparse.') or k == 'SCHILY.realsize'
+                           for k in member.pax_headers)):
+                raise ValueError('sparse source entry refused')
             if member.isfile():
+                if member.type not in (tarfile.REGTYPE, tarfile.AREGTYPE):
+                    raise ValueError('unsupported regular source encoding')
                 if not 0 <= member.size <= MAX_EXPANDED:
                     raise ValueError('source file size')
+                logical_bytes += member.size
+                if logical_bytes > MAX_CONTENT:
+                    raise ValueError('aggregate source content limit')
                 stream = archive.extractfile(member)
                 if stream is None:
                     raise ValueError('missing source bytes')
