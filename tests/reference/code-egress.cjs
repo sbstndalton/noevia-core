@@ -1,0 +1,538 @@
+// Frozen pre-control Node behavior oracle; never imported by production.
+'use strict';
+// Egress proxy for coding tasks (D15: allowlists are enforced at the proxy, not in the tool).
+//
+// A sandboxed task has no network at all unless it was granted one. When it was, its container
+// reaches the internet only through this proxy, and the proxy is what decides — not the harness,
+// not the model, not a tool description. The harness cannot talk itself past a rule it never
+// sees, and an agent that ignores ACP and opens its own socket still lands here.
+//
+// Three properties do the work:
+//   * Deny by default. No grant, no token, no match — no connection, and the refusal is logged
+//     against the task.
+//   * The allowlist is checked against the host the task asked for AND the address it actually
+//     resolves to, and the connection is then made to that same address. A name that resolves
+//     to something private, or re-resolves between check and connect (DNS rebinding), does not
+//     get through.
+//   * Credentials never cross. The proxy's own `Proxy-Authorization` is stripped before
+//     forwarding, and the task holds a token scoped to itself that dies with the job.
+const http = require('node:http'), net = require('node:net'), dns = require('node:dns'), crypto = require('node:crypto');
+const { isPrivateIp } = require('../../server/ssrf.cjs');
+
+// Only the web ports. A task that needs a package registry needs 80/443; anything else
+// (SSH, a database, a mail relay) is a different conversation with the user.
+const ALLOWED_PORTS = Object.freeze([80, 443]);
+// A token dies after this long without traffic (#160). CODE_EGRESS_TOKEN_TTL_MS overrides.
+const DEFAULT_TOKEN_TTL_MS = 6 * 60 * 60 * 1000;
+// Connection limits (#932), mirroring noevia-rs egress-proxy `Limits`. One task must not be able to
+// exhaust the web process's file descriptors. A client connection — a CONNECT tunnel above all —
+// holds its slot until it closes. 256 proxy-wide is the Rust default; 64 per task is well above
+// what a package install opens at once (npm keeps ≤15 sockets per registry by default, pip a pool
+// of 10, cargo/go a few dozen over HTTP/2) yet leaves room for four busy tasks at the proxy cap.
+// CODE_EGRESS_MAX_CONNECTIONS / CODE_EGRESS_MAX_CONNECTIONS_PER_TASK override.
+const DEFAULT_MAX_CONNECTIONS = 256;
+const DEFAULT_MAX_CONNECTIONS_PER_TASK = 64;
+// A CONNECT tunnel with no bytes in either direction for this long is closed (#932); without it a
+// tunnel lives as long as its grant. CODE_EGRESS_TUNNEL_IDLE_MS overrides.
+const DEFAULT_TUNNEL_IDLE_MS = 10 * 60 * 1000;
+const STATUS_TEXT = Object.freeze({ 400: 'Bad Request', 403: 'Forbidden', 407: 'Proxy Authentication Required',
+  429: 'Too Many Requests', 502: 'Bad Gateway', 503: 'Service Unavailable' });
+// Hop-by-hop headers (RFC 9110 §7.6.1) plus the proxy's own credential headers: they stop at the
+// proxy in both directions.
+const HOP_BY_HOP = Object.freeze(['connection', 'keep-alive', 'proxy-connection', 'proxy-authenticate',
+  'proxy-authorization', 'te', 'trailer', 'transfer-encoding', 'upgrade']);
+
+/**
+ * A copy of `headers` without hop-by-hop headers and without every header the message's own
+ * `Connection` names (#930). `Connection` may not strip `content-length` (a request body would be
+ * forwarded unframed) or `host` (the proxy sets it). node frames the outgoing message itself, so
+ * dropping `transfer-encoding` is safe: it re-chunks when there is no content-length.
+ */
+function stripHopByHop(headers) {
+  const out = { ...headers };
+  for (const name of String(headers.connection || '').split(',')) {
+    const h = name.trim().toLowerCase();
+    if (h && h !== 'content-length' && h !== 'host') delete out[h];
+  }
+  for (const h of HOP_BY_HOP) delete out[h];
+  return out;
+}
+
+const positive = (n, fallback) => (Number.isFinite(n) && n > 0 ? n : fallback);
+
+/** Exact host or a subdomain of a granted domain; a lookalike suffix (`notexample.com`) is not. */
+function hostAllowed(host, domains) {
+  const name = String(host || '').toLowerCase().replace(/\.$/, '');
+  return (domains || []).some((d) => {
+    const domain = String(d || '').toLowerCase().replace(/^\.|\.$/g, '');
+    return domain && (name === domain || name.endsWith('.' + domain));
+  });
+}
+
+function parseTarget(raw, defaultPort) {
+  const text = String(raw || '');
+  const match = text.startsWith('[')
+    ? text.match(/^\[([^\]]+)\](?::(\d+))?$/)        // [::1]:443
+    : text.match(/^([^:/?#]+)(?::(\d+))?$/);
+  if (!match) return null;
+  const port = match[2] ? Number(match[2]) : defaultPort;
+  if (!Number.isInteger(port) || port <= 0 || port > 65535) return null;
+  return { host: match[1].toLowerCase(), port };
+}
+
+/**
+ * @param {{now?: () => number, log?: (entry: object) => void,
+ *          lookup?: (host: string) => Promise<string[]>,
+ *          isPublicAddress?: (ip: string) => boolean,
+ *          connect?: (opts: {address: string, port: number, host: string}) => import('node:net').Socket}} deps
+ */
+function createEgressProxy({ now = Date.now, log = () => {}, lookup = defaultLookup,
+  isPublicAddress = (ip) => !isPrivateIp(ip), connect = defaultConnect, allowedPorts = ALLOWED_PORTS,
+  ttlMs = DEFAULT_TOKEN_TTL_MS, maxConnections = DEFAULT_MAX_CONNECTIONS,
+  maxConnectionsPerTask = DEFAULT_MAX_CONNECTIONS_PER_TASK, tunnelIdleMs = DEFAULT_TUNNEL_IDLE_MS } = {}) {
+  const ports = new Set(allowedPorts);
+  const limits = { maxConnections: positive(maxConnections, DEFAULT_MAX_CONNECTIONS),
+    maxConnectionsPerTask: positive(maxConnectionsPerTask, DEFAULT_MAX_CONNECTIONS_PER_TASK),
+    tunnelIdleMs: positive(tunnelIdleMs, DEFAULT_TUNNEL_IDLE_MS) };
+  const grants = new Map(); // token -> { taskId, domains, grantedAt, lastUsed, sockets:Set }
+  const ttl = Number.isFinite(ttlMs) && ttlMs > 0 ? ttlMs : DEFAULT_TOKEN_TTL_MS;
+
+  /** A revoked or expired token takes its live connections with it (tunnels would outlive it). */
+  function dropGrant(token, g) {
+    grants.delete(token);
+    for (const s of g.sockets) { try { s.destroy(); } catch { /* already gone */ } }
+    g.sockets.clear();
+  }
+  /** Tokens expire after `ttlMs` without activity (#160); returns how many were dropped. */
+  function sweep() {
+    let dropped = 0;
+    const t = now();
+    for (const [token, g] of grants) if (t - g.lastUsed > ttl) {
+      dropGrant(token, g); dropped++;
+      log({ at: t, event: 'egress.expired', taskId: g.taskId });
+    }
+    return dropped;
+  }
+  function track(g, ...sockets) {
+    for (const s of sockets) {
+      if (!s) continue;
+      if (!grants.has(g.token)) { try { s.destroy(); } catch { /* ignore */ } continue; }
+      g.sockets.add(s);
+      s.on?.('close', () => g.sockets.delete(s));
+      s.on?.('data', () => { g.lastUsed = now(); });
+    }
+  }
+
+  /** Capability sets are fixed at creation (§4): a grant is written once and never widened. */
+  function grant({ taskId, domains = [] }) {
+    if (!taskId) throw Object.assign(Error('taskId required'), { status: 400 });
+    for (const [token, g] of grants) if (g.taskId === taskId) dropGrant(token, g);
+    const token = crypto.randomBytes(32).toString('base64url');
+    const at = now();
+    grants.set(token, { token, taskId, domains: [...domains], grantedAt: at, lastUsed: at, sockets: new Set() });
+    return { token, taskId, domains: [...domains] };
+  }
+  function revoke(taskId) {
+    let removed = 0;
+    for (const [token, g] of grants) if (g.taskId === taskId) { dropGrant(token, g); removed++; }
+    return removed;
+  }
+  /** Constant-time token compare, so a wrong token leaks nothing by how long it took. */
+  function authorize(header) {
+    const raw = /^Basic\s+(\S+)$/i.exec(String(header || ''))?.[1];
+    if (!raw) return null;
+    let decoded; try { decoded = Buffer.from(raw, 'base64').toString('utf8'); } catch { return null; }
+    const token = decoded.slice(decoded.indexOf(':') + 1);
+    const wanted = Buffer.from(token);
+    sweep();
+    for (const [known, g] of grants) {
+      const candidate = Buffer.from(known);
+      if (candidate.length === wanted.length && crypto.timingSafeEqual(candidate, wanted)) { g.lastUsed = now(); return g; }
+    }
+    return null;
+  }
+
+  /** Decide, and say why. Returns the address to connect to, so nothing re-resolves later. */
+  async function check({ header, target, defaultPort }) {
+    const g = authorize(header);
+    if (!g) return { ok: false, status: 407, reason: 'no valid task token' };
+    const parsed = parseTarget(target, defaultPort);
+    if (!parsed) return { ok: false, status: 400, reason: 'unreadable target', taskId: g.taskId };
+    const { host, port } = parsed;
+    if (!ports.has(port)) return { ok: false, status: 403, reason: `port ${port} is not allowed`, taskId: g.taskId, host };
+    if (!hostAllowed(host, g.domains)) return { ok: false, status: 403, reason: 'host is not on this task’s list', taskId: g.taskId, host };
+    // An IP literal is judged directly; a name is resolved, and every answer must be public.
+    let addresses;
+    if (net.isIP(host)) addresses = [host];
+    else { try { addresses = await lookup(host); } catch { addresses = []; } }
+    if (!addresses.length) return { ok: false, status: 502, reason: 'host does not resolve', taskId: g.taskId, host };
+    if (!addresses.every(isPublicAddress)) return { ok: false, status: 403, reason: 'host resolves to a private address', taskId: g.taskId, host };
+    if (!grants.has(g.token)) return { ok: false, status: 407, reason: 'task token was revoked', taskId: g.taskId, host };
+    return { ok: true, taskId: g.taskId, host, port, address: addresses[0], grant: g };
+  }
+
+  // What each task reached and what it was refused, by host, so the task's own result can say
+  // "github.com was refused" instead of leaving a failed install to be guessed at. Hosts and
+  // counts only, never paths, headers or tokens. Bounded per task and in tasks kept.
+  const activityByTask = new Map(); // taskId -> Map(host -> {host, allowed, refused, reason})
+  function tally(entry) {
+    if (!entry.taskId || !entry.host || !/^egress\.(allowed|refused)$/.test(entry.event)) return;
+    let hosts = activityByTask.get(entry.taskId);
+    if (!hosts) {
+      if (activityByTask.size >= 500) activityByTask.delete(activityByTask.keys().next().value);
+      activityByTask.set(entry.taskId, hosts = new Map());
+    }
+    let h = hosts.get(entry.host);
+    if (!h) { if (hosts.size >= 50) return; hosts.set(entry.host, h = { host: entry.host, allowed: 0, refused: 0, reason: null }); }
+    if (entry.event === 'egress.allowed') h.allowed++; else { h.refused++; h.reason = entry.reason || null; }
+  }
+  /** A task's network activity, most-refused first; `forget` drops it once the task has it. */
+  function activity(taskId, { forget = false } = {}) {
+    const hosts = [...(activityByTask.get(taskId)?.values() || [])].map((h) => ({ ...h }))
+      .sort((a, b) => b.refused - a.refused || b.allowed - a.allowed || a.host.localeCompare(b.host));
+    if (forget) activityByTask.delete(taskId);
+    return { hosts, allowed: hosts.reduce((n, h) => n + h.allowed, 0), refused: hosts.reduce((n, h) => n + h.refused, 0) };
+  }
+
+  function record(entry) { tally(entry); log({ at: now(), ...entry }); }
+
+  // Per-task slots (#932): a CONNECT tunnel or a forwarded plain request holds one until its
+  // client socket / response closes. Keyed by task, so a re-grant does not reset the count.
+  const openByTask = new Map(); // taskId -> count
+  /** Takes a slot for the task, or returns null when it is at its cap. The release runs once. */
+  function takeTaskSlot(taskId) {
+    const n = openByTask.get(taskId) || 0;
+    if (n >= limits.maxConnectionsPerTask) return null;
+    openByTask.set(taskId, n + 1);
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      const left = (openByTask.get(taskId) || 1) - 1;
+      if (left > 0) openByTask.set(taskId, left); else openByTask.delete(taskId);
+    };
+  }
+  const tooManyForTask = (verdict) => ({ ok: false, status: 429, taskId: verdict.taskId, host: verdict.host,
+    reason: `task has ${limits.maxConnectionsPerTask} connections open` });
+
+  const server = http.createServer();
+
+  // Proxy-wide cap (#932): every client connection counts until it closes, and a CONNECT tunnel
+  // keeps its client socket, so open tunnels count too. Over the cap the socket is closed on accept.
+  let openConnections = 0;
+  server.on('connection', (socket) => {
+    if (openConnections >= limits.maxConnections) {
+      log({ at: now(), event: 'egress.connection_limit', limit: limits.maxConnections });
+      socket.destroy();
+      return;
+    }
+    openConnections++;
+    socket.once('close', () => { openConnections--; });
+  });
+
+  // Plain HTTP: the client sends an absolute URL. Forwarded to the address we checked.
+  server.on('request', async (req, res) => {
+    // Attached before anything can await: deciding a verdict involves a DNS lookup, and a task's
+    // container being killed mid-request resets the connection. An 'error' with no listener is
+    // an uncaught exception, and this proxy runs inside the web process — so that is the whole
+    // server, taken down by a cancelled coding task.
+    req.on('error', () => {});
+    res.on('error', () => {});
+    const url = (() => { try { return new URL(req.url); } catch { return null; } })();
+    if (url && url.protocol !== 'http:' && url.protocol !== 'https:') {
+      return refuse(res, { ok: false, status: 400, reason: `unsupported protocol "${url.protocol}"` }, record);
+    }
+    // An absolute-form `https://` request would be forwarded below as plaintext HTTP on port 80:
+    // the task believes it has TLS and gets none. TLS goes through CONNECT only (#930).
+    if (url && url.protocol === 'https:') {
+      return refuse(res, { ok: false, status: 400, reason: 'https:// must be requested with CONNECT' }, record);
+    }
+    const verdict = await check({ header: req.headers['proxy-authorization'],
+      target: url ? url.host : null, defaultPort: 80 });
+    // The task may have hung up during the lookup. Its response has then already emitted 'close',
+    // so a slot taken now would never be released (#932) and the upstream request would dangle:
+    // stop here, as the CONNECT handler does.
+    if (req.socket?.destroyed || res.destroyed) return;
+    if (!verdict.ok) return refuse(res, verdict, record);
+    const { grant: owner } = verdict; delete verdict.grant;
+    const release = takeTaskSlot(verdict.taskId);
+    if (!release) return refuse(res, tooManyForTask(verdict), record);
+    res.on('close', release); // synchronously after taking the slot: no await in between
+    record({ event: 'egress.allowed', taskId: verdict.taskId, host: verdict.host, port: verdict.port, method: req.method });
+
+    // Proxy-Authorization (the task token) never travels onward; hop-by-hop headers stop here.
+    const headers = stripHopByHop(req.headers);
+    headers.host = url.host;
+    const upstream = http.request({ host: verdict.address, port: verdict.port, method: req.method,
+      path: url.pathname + url.search, headers, setHost: false }, (up) => {
+      track(owner, up.socket);
+      // The response hop too: the origin's hop-by-hop headers, the ones its Connection names, and
+      // a Proxy-Authenticate it might send (which would look like this proxy asking for
+      // credentials) stay on the upstream hop (#930).
+      res.writeHead(up.statusCode || 502, stripHopByHop(up.headers));
+      up.pipe(res);
+    });
+    upstream.on('error', () => { if (!res.headersSent) res.writeHead(502, { 'content-type': 'text/plain' }); res.end('Upstream failed\n'); });
+    // If the client's own socket goes away mid-request, the upstream request must not be left
+    // dangling: an aborted/errored client is exactly the "cancelled task" case this proxy has to
+    // survive without leaking a socket per abandoned request.
+    track(owner, req.socket);
+    const dropUpstream = () => { if (!res.writableEnded) upstream.destroy(); };
+    req.on('aborted', dropUpstream);
+    res.on('close', dropUpstream);
+    req.pipe(upstream);
+  });
+
+  // HTTPS: CONNECT tunnel. The proxy never sees the plaintext; it only decides where the
+  // tunnel may go, which is the whole point of enforcing here rather than in a tool.
+  server.on('connect', async (req, clientSocket, head) => {
+    // Same reason as above, and more so: a CONNECT socket is detached from the HTTP server's own
+    // error handling, so nothing else is watching it.
+    clientSocket.on('error', () => {});
+    const verdict = await check({ header: req.headers['proxy-authorization'], target: req.url, defaultPort: 443 });
+    if (clientSocket.destroyed) return;
+    if (!verdict.ok) {
+      record({ event: 'egress.refused', ...verdict, ok: undefined });
+      // A refused CONNECT is answered as a normal HTTP response on the same socket, which is
+      // what curl, npm and pip expect, and then closed. (Node's own HTTP client does not
+      // surface a non-2xx CONNECT reply at all, so the test reads these bytes directly.)
+      const lines = [`HTTP/1.1 ${verdict.status} ${STATUS_TEXT[verdict.status] || 'Forbidden'}`];
+      if (verdict.status === 407) lines.push('Proxy-Authenticate: Basic realm="noevia task"');
+      lines.push('Content-Length: 0', 'Connection: close', '', '');
+      clientSocket.end(lines.join('\r\n'));
+      return;
+    }
+    const { grant: owner } = verdict; delete verdict.grant;
+    const release = takeTaskSlot(verdict.taskId);
+    if (!release) {
+      const refusal = tooManyForTask(verdict);
+      record({ event: 'egress.refused', ...refusal, ok: undefined });
+      clientSocket.end(`HTTP/1.1 429 ${STATUS_TEXT[429]}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n`);
+      return;
+    }
+    clientSocket.once('close', release);
+    record({ event: 'egress.allowed', taskId: verdict.taskId, host: verdict.host, port: verdict.port, method: 'CONNECT' });
+    const upstream = connect({ address: verdict.address, port: verdict.port, host: verdict.host });
+    track(owner, clientSocket, upstream);
+    // Idle tunnel (#932): no bytes either way on the client socket — which carries both
+    // directions — for tunnelIdleMs closes the tunnel and frees its slots.
+    clientSocket.setTimeout(limits.tunnelIdleMs, () => {
+      log({ at: now(), event: 'egress.tunnel_idle', taskId: verdict.taskId, host: verdict.host, idleMs: limits.tunnelIdleMs });
+      upstream.destroy(); clientSocket.destroy();
+    });
+    upstream.on('connect', () => {
+      clientSocket.write('HTTP/1.1 200 Connection Established\r\n\r\n');
+      if (head && head.length) upstream.write(head);
+      upstream.pipe(clientSocket);
+      clientSocket.pipe(upstream);
+    });
+    const drop = () => { upstream.destroy(); clientSocket.destroy(); };
+    upstream.on('error', drop);
+    clientSocket.on('error', drop);
+    clientSocket.on('close', () => upstream.destroy());
+  });
+
+  return { server, grant, revoke, check, hostAllowed, activity, sweep, ttlMs: ttl, limits: { ...limits },
+    /** Open client connections and per-task slots, for tests and diagnostics. */
+    openCounts: () => ({ connections: openConnections, byTask: Object.fromEntries(openByTask) }),
+    /** Drop every live connection too: a tunnel outlives the listener otherwise. */
+    closeAll: () => { server.closeAllConnections?.(); },
+    listen: (port = 0, host = '127.0.0.1') => new Promise((r) => server.listen(port, host, () => r(server.address()))),
+    close: () => new Promise((r) => { server.closeAllConnections?.(); server.close(() => r()); }) };
+}
+
+function refuse(res, verdict, record) {
+  record({ event: 'egress.refused', ...verdict, ok: undefined });
+  const headers = { 'content-type': 'text/plain' };
+  if (verdict.status === 407) headers['proxy-authenticate'] = 'Basic realm="noevia task"';
+  res.writeHead(verdict.status, headers);
+  res.end(`Refused: ${verdict.reason}\n`);
+}
+
+async function defaultLookup(host) {
+  const answers = await dns.promises.lookup(host, { all: true, verbatim: true });
+  return answers.map((a) => a.address);
+}
+function defaultConnect({ address, port }) { return net.connect(port, address); }
+
+/**
+ * The narrowest default bind (#296): web joins two networks — `default` and the internal `code`
+ * network the sandbox is confined to — and binding `0.0.0.0` listens on both, exposing the proxy
+ * on `default` for no reason (the sandbox cannot reach it there). The compose override that wires
+ * Code mode gives web an alias on `code` (`aliases: [egress]`, the same name `CODE_EGRESS_HOST`
+ * hands the sandbox), so web can resolve that same name to learn *its own* address on that one
+ * network and bind only there. An explicit `CODE_EGRESS_BIND` always wins; without the override
+ * (no such alias to resolve) this falls back to loopback rather than every interface web has —
+ * a misconfigured deployment fails closed instead of wide open.
+ */
+async function resolveEgressBind(env, host, { lookup = (h) => dns.promises.lookup(h) } = {}) {
+  if (env.CODE_EGRESS_BIND) return { address: String(env.CODE_EGRESS_BIND).trim(), fallback: false };
+  try {
+    const { address } = await lookup(host);
+    return { address, fallback: false };
+  } catch (err) {
+    return { address: '127.0.0.1', fallback: true, reason: String((err && err.message) || err) };
+  }
+}
+
+/**
+ * The proxy as a deployment runs it: on `CODE_EGRESS_PORT` inside the web process, reached by the
+ * sandbox as `CODE_EGRESS_HOST` (a network alias on the internal code network). Unset, there is
+ * no proxy, and Code mode keeps network and installs unavailable rather than pretending.
+ */
+function startEgressFromEnv(env = process.env, { log = () => {}, create = createEgressProxy, lookup, secrets = null } = {}) {
+  const port = Number(env.CODE_EGRESS_PORT);
+  if (!Number.isInteger(port) || port <= 0 || port > 65535) return null;
+  const host = String(env.CODE_EGRESS_HOST || 'egress').trim();
+  if (!/^[a-z0-9.-]+$/i.test(host)) throw Error(`CODE_EGRESS_HOST should be a host name, not "${host}"`);
+  const ttlMs = Number(env.CODE_EGRESS_TOKEN_TTL_MS) > 0 ? Number(env.CODE_EGRESS_TOKEN_TTL_MS) : DEFAULT_TOKEN_TTL_MS;
+  // #926 dark switch: `rust` hands the sandbox the noevia-rs egress-proxy service instead of the
+  // in-process proxy. Anything else (default `node`) keeps the in-process proxy below.
+  if (String(env.CODE_EGRESS_IMPL || 'node').trim() === 'rust') return startRustEgressClient(env, { log, secrets, port, ttlMs });
+  const intEnv = (name, fallback) => { const n = Number(env[name]); return Number.isInteger(n) && n > 0 ? n : fallback; };
+  const proxy = create({ log, ttlMs,
+    maxConnections: intEnv('CODE_EGRESS_MAX_CONNECTIONS', DEFAULT_MAX_CONNECTIONS),
+    maxConnectionsPerTask: intEnv('CODE_EGRESS_MAX_CONNECTIONS_PER_TASK', DEFAULT_MAX_CONNECTIONS_PER_TASK),
+    tunnelIdleMs: intEnv('CODE_EGRESS_TUNNEL_IDLE_MS', DEFAULT_TUNNEL_IDLE_MS) });
+  // A failed listen (e.g. the port is already taken, or EADDRNOTAVAIL on a bind that does not
+  // exist on this host) must not fail silently: it is reported the same way any other startup
+  // failure is — logged, then rethrown so the process crashes with it rather than limping on
+  // with no working egress proxy.
+  proxy.server.on('error', (err) => {
+    log({ event: 'egress.bind_failed', error: String((err && err.message) || err) });
+    throw err;
+  });
+  proxy.server.on('listening', () => {
+    const addr = proxy.server.address();
+    log({ event: 'egress.listening', bind: addr && addr.address, port: addr && addr.port });
+  });
+  resolveEgressBind(env, host, { lookup }).then(({ address, fallback, reason }) => {
+    if (fallback) log({ event: 'egress.bind_fallback_loopback', host, reason });
+    proxy.server.listen(port, address);
+  });
+  if (typeof proxy.sweep === 'function') {
+    const timer = setInterval(() => proxy.sweep(), Math.min(ttlMs, 60_000));
+    timer.unref?.();
+    proxy.server.on('close', () => clearInterval(timer));
+  }
+  return Object.assign(proxy, { endpoint: `${host}:${port}` });
+}
+
+// ---- Signed grants for the Rust proxy (#926, docs/egress-grant-contract.md) -------------------
+// Glue only: the web mints, noevia-rs `crates/egress` verifies and enforces. The byte-exact format
+// is pinned by apps/web/contracts/egress-grant.v1.vectors.json, which both sides test against.
+const GRANT_KEY_LABEL = 'code-egress-grant';
+const GRANT_MAX_LIFETIME_MS = 24 * 60 * 60 * 1000;
+const DEFAULT_GRANT_LIFETIME_MS = 2 * 60 * 60 * 1000; // near a real task; a lost revoke expires soon
+const b64url = (buf) => Buffer.from(buf).toString('base64url');
+
+/** A task's domains as the contract carries them: lowercased, outer dots dropped, deduplicated. */
+function grantHosts(domains) {
+  const hosts = [];
+  for (const d of domains || []) {
+    const h = String(d || '').toLowerCase().replace(/^\.+|\.+$/g, '');
+    if (!h) continue;
+    if (h.length > 253 || !/^[a-z0-9-]+(\.[a-z0-9-]+)*$/.test(h)) throw Object.assign(Error(`"${d}" is not a domain the egress proxy can grant`), { status: 400 });
+    if (!hosts.includes(h)) hosts.push(h);
+  }
+  if (hosts.length > 64) throw Object.assign(Error('at most 64 domains per task'), { status: 400 });
+  return hosts;
+}
+
+/** `ngr1.` + base64url(canonical JSON) + `.` + base64url(HMAC-SHA256(key, everything before it)). */
+function mintGrant(key, { act = 'grant', task, hosts = [], iat, exp, idle, nonce }) {
+  const payload = `{"v":1,"act":${JSON.stringify(act)},"task":${JSON.stringify(task)},"hosts":${JSON.stringify(hosts)},`
+    + `"iat":${iat},"exp":${exp},"idle":${idle},"nonce":${JSON.stringify(nonce)}}`;
+  const signed = `ngr1.${b64url(payload)}`;
+  return `${signed}.${b64url(crypto.createHmac('sha256', key).update(signed).digest())}`;
+}
+
+/**
+ * The egress interface code-harness / browser-service already use (grant, revoke, endpoint), backed
+ * by the Rust proxy: `grant` mints a signed token instead of remembering one, `revoke` posts a signed
+ * revoke to the proxy. No `activity` (the per-task host summary stays a Node-proxy feature for now).
+ */
+function createRustEgressClient({ key, endpoint, now = Date.now, ttlMs = DEFAULT_TOKEN_TTL_MS,
+  lifetimeMs = DEFAULT_GRANT_LIFETIME_MS, log = () => {}, post = defaultRevokePost, revokeDelaysMs = [2000, 8000] }) {
+  if (!Buffer.isBuffer(key) || key.length !== 32) throw Error('the egress grant key must be 32 bytes');
+  const life = Math.min(positive(lifetimeMs, DEFAULT_GRANT_LIFETIME_MS), GRANT_MAX_LIFETIME_MS);
+  const nonce = () => b64url(crypto.randomBytes(16));
+  // taskId -> last iat, so a re-grant or revoke in the same millisecond still moves forward (the
+  // proxy orders a task's grants by iat). Bounded: the oldest entries go first.
+  const latest = new Map();
+  const stamp = (taskId) => {
+    const t = Math.max(now(), (latest.get(taskId) || 0) + 1);
+    latest.delete(taskId); latest.set(taskId, t);
+    if (latest.size > 10_000) latest.delete(latest.keys().next().value);
+    return t;
+  };
+  function grant({ taskId, domains = [] }) {
+    if (!taskId || !/^[A-Za-z0-9._:-]{1,128}$/.test(String(taskId))) throw Object.assign(Error('taskId required'), { status: 400 });
+    const hosts = grantHosts(domains);
+    if (!hosts.length) throw Object.assign(Error('a grant needs at least one domain'), { status: 400 });
+    const iat = stamp(taskId);
+    const token = mintGrant(key, { task: taskId, hosts, iat, exp: iat + life, idle: Math.min(positive(ttlMs, DEFAULT_TOKEN_TTL_MS), life), nonce: nonce() });
+    return { token, taskId, domains: hosts };
+  }
+  /** Always sent, even for a task this process never granted (it may predate a restart). */
+  function revoke(taskId) {
+    if (!taskId || !/^[A-Za-z0-9._:-]{1,128}$/.test(String(taskId))) return 0;
+    const iat = stamp(taskId);
+    const token = mintGrant(key, { act: 'revoke', task: taskId, hosts: [], iat, exp: iat + life, idle: 1, nonce: nonce() });
+    // Retried with backoff (a revoke is idempotent); only the last failure is logged.
+    const attempt = (n) => Promise.resolve().then(() => post(endpoint, token)).then(
+      (status) => (status === 204 ? null : { status }),
+      (err) => ({ error: String((err && err.code) || 'error') }),
+    ).then((failure) => {
+      if (!failure) return;
+      if (n < revokeDelaysMs.length) { const t = setTimeout(() => attempt(n + 1), revokeDelaysMs[n]); t.unref?.(); return; }
+      log({ event: 'egress.revoke_failed', taskId, attempts: n + 1, ...failure });
+    });
+    attempt(0);
+    return 1;
+  }
+  return { impl: 'rust', grant, revoke, endpoint, sweep: () => 0 };
+}
+
+function defaultRevokePost(endpoint, token) {
+  const [host, port] = endpoint.split(':');
+  return new Promise((resolve, reject) => {
+    const req = http.request({ host, port: Number(port), method: 'POST', path: '/v1/revoke', timeout: 5000,
+      headers: { authorization: `Bearer ${token}`, 'content-length': 0 } }, (res) => { res.resume(); resolve(res.statusCode); });
+    req.on('timeout', () => req.destroy(Object.assign(Error('timeout'), { code: 'ETIMEDOUT' })));
+    req.on('error', reject);
+    req.end();
+  });
+}
+
+/**
+ * CODE_EGRESS_IMPL=rust: derive the grant key, hand it to the proxy through the shared key file
+ * (CODE_EGRESS_GRANT_KEY_FILE, a volume only web and the proxy mount), and point tasks at
+ * CODE_EGRESS_RUST_HOST:CODE_EGRESS_PORT. Fails loudly rather than falling back to no proxy.
+ */
+function startRustEgressClient(env, { log, secrets, port, ttlMs }) {
+  if (!secrets || typeof secrets.derive !== 'function') throw Error('CODE_EGRESS_IMPL=rust needs the secret store');
+  const host = String(env.CODE_EGRESS_RUST_HOST || 'egress-rs-code').trim();
+  if (!/^[a-z0-9.-]+$/i.test(host)) throw Error(`CODE_EGRESS_RUST_HOST should be a host name, not "${host}"`);
+  const file = String(env.CODE_EGRESS_GRANT_KEY_FILE || '').trim();
+  if (!file) throw Error('CODE_EGRESS_IMPL=rust needs CODE_EGRESS_GRANT_KEY_FILE');
+  const key = secrets.derive(GRANT_KEY_LABEL, 32);
+  const fs = require('node:fs'), path = require('node:path');
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  const tmp = `${file}.${process.pid}.tmp`;
+  // Owner + one shared group, never world-readable: the proxy reads it through group_add of
+  // CODE_EGRESS_KEY_GID (the override sets the same fixed gid on both containers).
+  const gid = Number(env.CODE_EGRESS_KEY_GID);
+  if (!Number.isInteger(gid) || gid <= 0) throw Error('CODE_EGRESS_IMPL=rust needs CODE_EGRESS_KEY_GID (a positive integer)');
+  try { fs.rmSync(tmp, { force: true }); } catch { /* none */ }
+  fs.writeFileSync(tmp, `${key.toString('hex')}\n`, { mode: 0o440, flag: 'wx' });
+  try { fs.chownSync(tmp, process.getuid?.() ?? -1, gid); fs.chmodSync(tmp, 0o440); fs.renameSync(tmp, file); }
+  catch (e) { try { fs.rmSync(tmp, { force: true }); } catch { /* ignore */ } throw e; }
+  const lifetimeMs = Number(env.CODE_EGRESS_GRANT_LIFETIME_MS) > 0 ? Number(env.CODE_EGRESS_GRANT_LIFETIME_MS) : DEFAULT_GRANT_LIFETIME_MS;
+  log({ event: 'egress.rust_client', endpoint: `${host}:${port}` });
+  return createRustEgressClient({ key, endpoint: `${host}:${port}`, ttlMs, lifetimeMs, log });
+}
+
+module.exports = { DEFAULT_TOKEN_TTL_MS, DEFAULT_MAX_CONNECTIONS, DEFAULT_MAX_CONNECTIONS_PER_TASK, DEFAULT_TUNNEL_IDLE_MS,
+  createEgressProxy, stripHopByHop, hostAllowed, parseTarget, startEgressFromEnv, resolveEgressBind,
+  GRANT_KEY_LABEL, grantHosts, mintGrant, createRustEgressClient };

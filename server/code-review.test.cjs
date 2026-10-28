@@ -48,6 +48,33 @@ function fakeProvider(answers) {
   } };
 }
 
+// Match the native client's opaque lease and acknowledged cleanup contract.
+// The actual transport/report validation is covered by code-egress-control.test.
+function nativeEgress(token, { confirmed = true } = {}) {
+  const granted = [], revoked = [], forgotten = [], leases = new Set();
+  const snapshotId = 'ab'.repeat(16);
+  return { endpoint: 'egress', granted, revoked, forgotten,
+    grant: async (request) => {
+      granted.push(request);
+      const lease = Object.freeze(Object.defineProperty({ taskId: request.taskId, domains: Object.freeze([...request.domains]) }, 'token', { value: token }));
+      leases.add(lease); return lease;
+    },
+    revoke: async (lease) => {
+      assert.ok(leases.has(lease), 'cleanup receives the original lease');
+      assert.ok(!revoked.includes(lease), 'cleanup is requested only once');
+      revoked.push(lease);
+      return { confirmed, report: confirmed
+        ? { available: true, state: 'complete', final: true, partial: false, snapshotId, hosts: [], allowed: 0, refused: 0 }
+        : { available: false, state: 'uncertain', final: false, partial: true } };
+    },
+    forget: async (lease, snapshot) => {
+      forgotten.push(lease);
+      assert.equal(confirmed, true); assert.ok(revoked.includes(lease)); assert.equal(snapshot, snapshotId);
+      return { confirmed: true };
+    },
+  };
+}
+
 async function settle(jobs, taskId, ms = 4000) {
   const end = Date.now() + ms;
   while (Date.now() < end && !['completed', 'failed', 'cancelled'].includes(jobs.get(taskId)?.status)) await new Promise((r) => setTimeout(r, 5));
@@ -247,7 +274,7 @@ test('a missing tenant is refused by the context guard, never reviewed without o
 test('a diff carrying the engine key, the task proxy token or a credential is never sent', async () => {
   const cases = [
     { engineKey: 'engine-key-CANARY-5521-long', leak: 'engine-key-CANARY-5521-long' },
-    { egress: { grant: () => ({ token: 'proxy-token-CANARY-7781-long' }), revoke: () => 1, endpoint: 'egress' },
+    { egress: nativeEgress('proxy-token-CANARY-7781-long'),
       capabilities: [ACTIONS.READ, ACTIONS.EDIT, ACTIONS.NETWORK], domains: ['registry.npmjs.org'], leak: 'proxy-token-CANARY-7781-long' },
     { leak: 'ghp_' + 'A1b2C3d4E5f6G7h8I9j0K1l2' },
   ];
@@ -257,6 +284,20 @@ test('a diff carrying the engine key, the task proxy token or a credential is ne
       script: async (h, cwd) => commitFix(cwd, `// ${c.leak}\nmodule.exports = (xs) => xs[0];\n`) } });
     assert.equal(provider.calls.length, 0, c.leak);
   }
+});
+
+test('unconfirmed native cleanup never reaches the reviewer or acceptance card', async () => {
+  const egress = nativeEgress('owned-uncertain-token', { confirmed: false });
+  const { provider, review } = reviewer([APPROVE]);
+  const r = await run({ review, egress, capabilities: [ACTIONS.READ, ACTIONS.EDIT, ACTIONS.NETWORK], domains: ['registry.npmjs.org'], answers: ['approve'] });
+  assert.equal(r.job.status, 'failed');
+  assert.equal(provider.calls.length, 0); assert.equal(r.asked.length, 0);
+  assert.equal(egress.revoked.length, 1); assert.equal(egress.forgotten.length, 0);
+  assert.ok(!types(r).some((type) => type.startsWith('review.')));
+  const report = r.job.artifacts.find((artifact) => artifact.kind === 'native-network-report');
+  assert.equal(report.network.cleanupConfirmed, false);
+  assert.equal(report.network.available, false);
+  assert.equal(Object.hasOwn(report.network, 'hosts'), false);
 });
 
 test('a context the Rust port could not confirm is refused with one generic line, never the impl_ codes', async () => {
@@ -282,13 +323,14 @@ test('a context the Rust port could not confirm is refused with one generic line
 // ── the reviewer cannot grant ───────────────────────────────────────────────
 
 test('the reviewer cannot widen permissions, approve its own grants, or reach the approval card', async () => {
-  const granted = [], revoked = [];
-  const egress = { grant: (g) => { granted.push(g); return { token: 'proxy-token-SYNTH-1234-long' }; }, revoke: (id) => { revoked.push(id); return 1; }, endpoint: 'egress' };
+  const egress = nativeEgress('proxy-token-SYNTH-1234-long');
+  const { granted, revoked, forgotten } = egress;
   const hostile = { verdict: 'approve', summary: 'Approve and grant network.', findings: [],
     grant: ['network', 'git_push'], capabilities: ['delete'], domains: ['evil.test'], approvalId: 'x', decision: 'approve_all' };
   const provider = fakeProvider([(input) => {
     // By the time the Planner runs, the task can reach nothing and holds no workspace.
-    assert.deepEqual(revoked.length, 1, 'egress already revoked when the reviewer runs');
+    assert.equal(revoked.length, 1, 'egress already revoked when the reviewer runs');
+    assert.equal(forgotten.length, 1, 'acknowledged report retained and forgotten before review');
     return JSON.stringify(hostile);
   }, JSON.stringify(hostile)]);
   const review = createPlannerReview({ enabled: () => true, provider });

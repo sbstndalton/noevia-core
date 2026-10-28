@@ -18,6 +18,9 @@ const { projectAppearance } = require('./project-appearance.cjs');
 // Secrets enter only via environment (ui.env on the server). Never hardcoded.
 
 'use strict';
+// Defer scheduled work until the configured native authority proves Ready.
+const readyRuntime = [];
+const afterNativeReady = (start) => readyRuntime.push(start);
 const { bindBoxes } = require('./mcp-boxes.cjs');
 const { createMcpWiring, createDirectoryUrlAllowed, createCredentialOriginCheck } = require('./mcp-wiring.cjs');
 
@@ -255,10 +258,10 @@ const embeddingMigration = require('./embedding-migration.cjs').createEmbeddingM
 // #1668: the embedding service as the model manager runs it (which models cowork-embed serves, or
 // off). Refreshed in the background so the delete guard (model-system.cjs) follows it.
 const embeddingService = require('./embedding-service.cjs').install(require('./embedding-service.cjs').createEmbeddingService({ env: process.env, fetchJson }));
-if (process.env.MODEL_LOADER_URL) { embeddingService.refresh(); setInterval(() => embeddingService.refresh(), 10000).unref(); }
+if (process.env.MODEL_LOADER_URL) afterNativeReady(() => { embeddingService.refresh(); setInterval(() => embeddingService.refresh(), 10000).unref(); });
 // A re-index under way also covers files indexed meanwhile; with none under way nothing runs.
 rag.onIndexed(() => { if (embeddingConfig.next()) embeddingMigration.kick(); });
-if (embeddingConfig.next()) setTimeout(() => embeddingMigration.kick(), 30000).unref();
+if (embeddingConfig.next()) afterNativeReady(() => setTimeout(() => embeddingMigration.kick(), 30000).unref());
 // What runs when the process is told to stop (shutdown-hooks.cjs): the sweeps below, and the inference gate leases
 // further down. One handler runs them all, bounded, and then lets the process end.
 const shutdownHooks = require('./shutdown-hooks.cjs').createShutdownHooks();
@@ -293,12 +296,12 @@ shutdownHooks.install();
     refresh: (project, file) => projectStore.refreshDocumentFigures(project, file),
     paused: () => (embeddingConfig.next() ? 'a re-index is under way' : null),
   });
-  if (multimodal.enabled()) {
+  if (multimodal.enabled()) afterNativeReady(() => {
     setTimeout(() => mediaBackfill.kick(), 45000).unref();
     setInterval(() => mediaBackfill.kick(), 30 * 60 * 1000).unref();
     setTimeout(() => figureSweep.kick(), 60000).unref();
     setInterval(() => figureSweep.kick(), 30 * 60 * 1000).unref();
-  }
+  });
   // #1770 review: on shutdown no new document or image is started.
   shutdownHooks.add(() => { figureSweep.stop(); mediaBackfill.stop(); });
 }
@@ -319,7 +322,7 @@ shutdownHooks.install();
     completeUpload: (project, file, options) => projectStore.completeUploadedDocument(project, file, options),
     paused: () => (embeddingConfig.next() ? 'a re-index is under way' : null),
   });
-  documentBackfill.start(); // unref'd timers: never holds the process open
+  afterNativeReady(() => documentBackfill.start()); // unref'd timers
 }
 
 // User-created projects; the earlier fixed demo spaces were removed.
@@ -420,7 +423,7 @@ const inferenceBudgetWatch = modelManager.kind === 'llamacpp' ? (() => {
     baselineAllowed: () => !modelManager.maintenanceHeld?.(),
   });
 })() : null;
-inferenceBudgetWatch?.start();
+afterNativeReady(() => inferenceBudgetWatch?.start());
 // #697: every web caller of the shared engine checks its model first against the inference memory
 // budget. Throws a 409 with a publicMessage when the model would not fit. A no-op for other managers.
 // noevia#2115: switching models is the inference gate's. A request for another model waits in the
@@ -969,7 +972,8 @@ const changeJournal = require('./chat-change-journal.cjs').createChangeJournalRe
   onChange: require('./chat-change-journal.cjs').scheduleMirrorAndBrain({ chatVaultMirror, chatBrains }),
   onRescan: (userId) => chatVaultMirror.schedule(userId),
   stamp: (userId) => require('./chat-change-journal.cjs').fileStamp(DATA_DIR, userId),
-}).start();
+});
+afterNativeReady(() => changeJournal.start());
 const chatVaultMirrorRoutes = require('./routes/chat-vault-mirror.cjs').createChatVaultMirrorRoutes({ json, readJson,
   preferences: { get: () => vaultMirrorLib.readPreferences(currentWorkspace().dir), save: (value) => vaultMirrorLib.writePreferences(currentWorkspace().dir, value) },
   available: vaultMirrorAvailable, schedule: chatVaultMirror.schedule, audit: (action, actor, detail) => authService.audit(action, actor, actor, detail) });
@@ -1360,6 +1364,10 @@ async function handleRequest(req,res) {
 let processReady = false;
 
 if (require.main === module) {
+  (async () => {
+  // Authenticated native readiness precedes listeners and scheduled runtime work.
+  if (codeEgress) await codeEgress.ready();
+  for (const start of readyRuntime) start();
   fs.mkdirSync(DATA_DIR, { recursive: true });
   authTokens.warnings.forEach((w) => console.warn(w));
   if (!DIARY_TENANT_KEY) console.warn('WARNING: DIARY_TENANT_KEY is unset; Diary calls carry no tenant assertion and remote storage secrets ride on every call.');
@@ -1494,6 +1502,7 @@ if (require.main === module) {
     // A GGUF that appears in the models folder becomes usable without anyone opening a page.
     folderSync?.start();
   });
+  })().catch(() => { console.error('[startup] readiness or initialisation failed'); process.exitCode = 1; });
 }
 
 module.exports = { handleRequest, chatListHolder, sanitizeChats, MCP_SERVERS, toolboxOffered, ownsFile, projectFolderName, prefill, TOOL_PREFILL_TARGET_MS, isWriteTool, chatWideApproved, pendingApprovals, resolveTools, allToolboxes, mcpCredentialOriginAllowed, toolTokenBudgetFor, MCP_TOOLBOX_MANIFEST, toolboxSummaries, estimateToolTokens, toolCapFor, sanitizeToolboxes, executeToolCall, TOOLBOXES, classifierVerdict, heuristicWantsSmart, heuristicWantsCode, CLASSIFIER_MAX_TOKENS, recordUsage, recordToolUse, readUsage, usageDayKey, USAGE_RETENTION_DAYS };

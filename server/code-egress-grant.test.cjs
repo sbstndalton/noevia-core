@@ -2,7 +2,8 @@
 // noevia-rs verifies. The vectors file is shared with noevia-rs crates/egress (identical copy).
 const test = require('node:test'), assert = require('node:assert/strict');
 const fs = require('node:fs'), os = require('node:os'), path = require('node:path'), crypto = require('node:crypto');
-const { mintGrant, grantHosts, createRustEgressClient, startEgressFromEnv, GRANT_KEY_LABEL } = require('./code-egress.cjs');
+const { mintGrant, grantHosts, startEgressFromEnv, GRANT_KEY_LABEL } = require('./code-egress.cjs');
+const { createRustEgressClient } = require('../tests/reference/code-egress.cjs'); // frozen legacy behavior only
 const vectors = require('../contracts/egress-grant.v1.vectors.json');
 const schema = require('../contracts/egress-grant.v1.schema.json');
 
@@ -108,37 +109,28 @@ test('default grant lifetime is 2 h, configurable, capped at 24 h', () => {
   assert.equal(exp({ lifetimeMs: 48 * 3_600_000 }), 24 * 3_600_000);
 });
 
-test('CODE_EGRESS_IMPL=rust writes the derived key file and returns the client; node stays the default', async () => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'egress-grant-'));
-  const derived = [];
-  const secrets = { derive: (label, bytes) => { derived.push([label, bytes]); return Buffer.alloc(32, 7); } };
+test('enabled egress publishes a fresh incarnation key and selects only the authenticated native client', async () => {
+  const dir = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), 'egress-control-profile-'));
   try {
-    const file = path.join(dir, 'keys', 'grant.key');
-    const logs = [];
-    const gid = String(process.getgid()); // a group this (non-root) test may chown to
-    const env = { CODE_EGRESS_IMPL: 'rust', CODE_EGRESS_PORT: '8040', CODE_EGRESS_GRANT_KEY_FILE: file, CODE_EGRESS_KEY_GID: gid };
-    const client = startEgressFromEnv(env, { secrets, log: (e) => logs.push(e) });
-    assert.equal(client.impl, 'rust');
-    assert.equal(client.endpoint, 'egress-rs-code:8040');
-    assert.deepEqual(derived, [[GRANT_KEY_LABEL, 32]]);
-    assert.equal(GRANT_KEY_LABEL, 'code-egress-grant');
-    assert.equal(fs.readFileSync(file, 'utf8'), `${'07'.repeat(32)}\n`);
-    const st = fs.statSync(file);
-    assert.equal(st.mode & 0o777, 0o440, 'owner + group read only, never world-readable');
-    assert.equal(st.gid, Number(gid));
-    // Rewritten on restart (atomic replace over the read-only previous file).
-    startEgressFromEnv(env, { secrets });
-    assert.equal(fs.statSync(file).mode & 0o777, 0o440);
-    assert.deepEqual(fs.readdirSync(path.dirname(file)), ['grant.key'], 'no temp file left behind');
-    assert.throws(() => startEgressFromEnv({ ...env, CODE_EGRESS_KEY_GID: '' }, { secrets }), /KEY_GID/);
-    derived.length = 1;
-    assert.ok(!JSON.stringify(logs).includes('0707'), 'key material must not be logged');
-    assert.throws(() => startEgressFromEnv({ CODE_EGRESS_IMPL: 'rust', CODE_EGRESS_PORT: '8040' }, { secrets }), /GRANT_KEY_FILE/);
-    assert.throws(() => startEgressFromEnv({ CODE_EGRESS_IMPL: 'rust', CODE_EGRESS_PORT: '8040', CODE_EGRESS_GRANT_KEY_FILE: file }), /secret store/);
-    // Default and explicit `node` keep the in-process proxy (nothing changes in production).
-    const node = startEgressFromEnv({ CODE_EGRESS_PORT: '38750', CODE_EGRESS_BIND: '127.0.0.1' }, { secrets });
-    try { assert.ok(node.server); assert.equal(node.impl, undefined); assert.equal(node.endpoint, 'egress:38750'); }
-    finally { await new Promise((r) => node.server.listening ? r() : node.server.once('listening', r)); node.server.close(); }
-    assert.equal(derived.length, 1, 'node mode derives no grant key');
+    const uid = process.getuid(), gid = process.getgid() || (uid === 0 ? 1 : 0); fs.chownSync(dir, uid, gid); fs.chmodSync(dir, 0o750);
+    const file = path.join(dir, 'control.key'), derived = [], logs = [];
+    const secrets = { derive: (label, bytes) => { derived.push([label, bytes]); return Buffer.alloc(32, 7); } };
+    const env = { CODE_EGRESS_PORT: '8040', CODE_EGRESS_KEY_UID: String(uid), CODE_EGRESS_KEY_GID: String(gid), CODE_EGRESS_CONTROL_KEY_FILE: file };
+    const first = startEgressFromEnv(env, { secrets, log: (v) => logs.push(v) });
+    assert.equal(first.impl, 'rust-controlled'); assert.equal(first.endpoint, 'egress-rs-code:8040'); assert.equal(first.server, undefined);
+    const a = fs.readFileSync(file); assert.notEqual(a.toString().trim(), '07'.repeat(32));
+    const second = startEgressFromEnv({ ...env, CODE_EGRESS_IMPL: 'rust' }, { secrets }); assert.notDeepEqual(fs.readFileSync(file), a);
+    assert.deepEqual(derived, [[GRANT_KEY_LABEL, 32], [GRANT_KEY_LABEL, 32]]); assert.equal(JSON.stringify(logs).includes(a.toString().trim()), false);
+    assert.throws(() => startEgressFromEnv({ ...env, CODE_EGRESS_IMPL: 'node' }, { secrets }), /unavailable/);
+    assert.throws(() => startEgressFromEnv({ ...env, CODE_EGRESS_KEY_UID: '' }, { secrets }), /unavailable/);
+    assert.throws(() => startEgressFromEnv({ ...env, CODE_EGRESS_CONTROL_KEY_FILE: '' }, { secrets }), /unavailable/);
+    assert.throws(() => startEgressFromEnv({ ...env, CODE_EGRESS_RUST_HOST: 'http://private-secret/' }, { secrets }), (e) => !e.message.includes('private-secret'));
+    for (const port of ['-1', '65536', '1e3', 'invalid']) assert.throws(() => startEgressFromEnv({ ...env, CODE_EGRESS_PORT: port }, { secrets }), /unavailable/);
+    await first.close(); await second.close();
+    fs.chmodSync(file, 0o600); assert.throws(() => startEgressFromEnv(env, { secrets }), /unavailable/); assert.equal(fs.statSync(file).mode & 0o777, 0o600);
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+test('disabled egress has no key publication, listener or native network activity', () => {
+  const secrets = { derive: () => { throw Error('must not derive a disabled key'); } };
+  assert.equal(startEgressFromEnv({}, { secrets }), null); assert.equal(startEgressFromEnv({ CODE_EGRESS_PORT: '0', CODE_EGRESS_IMPL: 'node' }, { secrets }), null);
 });

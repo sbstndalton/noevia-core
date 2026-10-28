@@ -50,7 +50,7 @@ function createCodeHarness({ jobs, workspaces, egress = null, askApproval, now =
    * network grant. `resume` takes a released task's workspace again on the same branch, for the
    * pipeline's next revision. Throws with nothing left held. The handle is what run and release use.
    */
-  function claimRun({ taskId, repoPath = null, capabilities = [], domains = [], harness = 'opencode', resume = false }) {
+  async function claimRun({ taskId, repoPath = null, capabilities = [], domains = [], harness = 'opencode', resume = false }) {
     const pinned = pinnedPaths(harness);
     const workspace = resume
       ? workspaces.reclaim({ taskId, pinned })
@@ -58,9 +58,9 @@ function createCodeHarness({ jobs, workspaces, egress = null, askApproval, now =
     const handle = { taskId, workspace, grant: null, cleaned: false, released: null };
     // Network is a capability like any other: no grant unless the task has it AND named domains.
     const wantsNetwork = capabilities.includes(ACTIONS.NETWORK) || capabilities.includes(ACTIONS.INSTALL);
-    try { handle.grant = egress && wantsNetwork && domains.length ? egress.grant({ taskId, domains }) : null; }
+    try { handle.grant = egress && wantsNetwork && domains.length ? await egress.grant({ taskId, domains }) : null; }
     catch (error) {
-      releaseRun(handle);
+      await releaseRun(handle);
       if (error && typeof error === 'object') error[GRANT_FAILED] = true;
       throw error;
     }
@@ -75,15 +75,39 @@ function createCodeHarness({ jobs, workspaces, egress = null, askApproval, now =
    * handle, so the run can correct the checkpoint's head once the workspace is actually gone; every
    * caller after the first gets that cached value.
    */
-  function releaseRun(handle) {
-    if (!handle || handle.cleaned) return handle?.released ?? null;
-    handle.cleaned = true;
-    const { taskId, grant } = handle;
-    try { if (grant) { egress.revoke(taskId); if (typeof egress.activity === 'function') egress.activity(taskId, { forget: true }); } }
-    catch (error) { log({ at: now(), taskId, event: 'code.cleanup_failed', what: 'network grant', error: String(error?.message || error) }); }
-    try { handle.released = workspaces.release({ taskId }); }
-    catch (error) { log({ at: now(), taskId, event: 'code.cleanup_failed', what: 'workspace', error: String(error?.message || error) }); }
-    return handle.released;
+  function releaseRun(handle, ctx = null) {
+    if (!handle) return Promise.resolve(null);
+    if (handle.releaseFlight) return handle.releaseFlight;
+    handle.releaseFlight = Promise.resolve().then(async () => {
+      const { taskId, grant } = handle;
+      handle.cleanupConfirmed = !grant;
+      if (grant) {
+        let cleanup;
+        try { cleanup = await egress.revoke(grant); } catch { /* explicit uncertainty below */ }
+        handle.cleanupConfirmed = cleanup?.confirmed === true;
+        handle.network = Object.freeze({ ...(cleanup?.report || { available: false, state: 'uncertain', partial: true, final: false }), cleanupConfirmed: handle.cleanupConfirmed });
+        if (!handle.cleanupConfirmed) {
+          try {
+            const data = { tool: 'network', reason: 'Native egress cleanup could not be confirmed.' };
+            if (ctx?.uncertain) ctx.uncertain(data); else jobs.append(taskId, 'tool.uncertain', data);
+          } catch { /* preserve the original executor failure */ }
+        }
+        // Preserve the immutable report in the existing job journal before native Forget.
+        // A failed journal append leaves native retention intact for reconciliation.
+        let retained = false;
+        try { jobs.append(taskId, 'artifact.created', { name: 'network.cleanup', kind: 'native-network-report', network: handle.network }); retained = true; }
+        catch { try { log({ at: now(), taskId, event: 'code.cleanup_failed', what: 'network report' }); } catch {} }
+        if (retained && handle.cleanupConfirmed && handle.network.final && handle.network.snapshotId && typeof egress.forget === 'function') {
+          try { handle.networkAcknowledged = (await egress.forget(grant, handle.network.snapshotId))?.confirmed === true; }
+          catch { handle.networkAcknowledged = false; }
+        }
+      }
+      try { handle.released = workspaces.release({ taskId }); }
+      catch (error) { try { log({ at: now(), taskId, event: 'code.cleanup_failed', what: 'workspace', error: String(error?.message || error) }); } catch {} }
+      handle.cleaned = true;
+      return handle.released;
+    });
+    return handle.releaseFlight;
   }
 
   /**
@@ -103,7 +127,7 @@ function createCodeHarness({ jobs, workspaces, egress = null, askApproval, now =
     // corrected, post-release checkpoint is owed at all (a task that never got this far — a
     // config pin that failed, a connect() that threw — still gets its workspace back, but has
     // no result to attach a head commit to).
-    let scope = null, meta = null;
+    let scope = null, meta = null, result = null;
     try {
       // A task that named no model runs on whatever this deployment loads, and the identity
       // records the model that actually ran rather than the absence of a choice.
@@ -176,16 +200,15 @@ function createCodeHarness({ jobs, workspaces, egress = null, askApproval, now =
       ctx.event('checkpoint.created', { branch: workspace.branch, task: title,
         identityHash: scope.identityHash, identity: scope.identity, meta,
         baseSha: workspace.baseSha ?? null, headSha: workspaces.headSha(taskId) });
-      return { stopReason: outcome?.stopReason || 'end_turn', branch: workspace.branch,
-        identityHash: scope.identityHash, meta, ...session.summary(),
-        // Which hosts the task reached and which it was refused, from the proxy's own record.
-        ...(grant && typeof egress.activity === 'function' ? { network: egress.activity(taskId) } : {}) };
+      result = { stopReason: outcome?.stopReason || 'end_turn', branch: workspace.branch,
+        identityHash: scope.identityHash, meta, ...session.summary() };
     } finally {
       // Whatever happened, the task stops being able to reach anything, and no approval it
       // raised is left waiting to be answered into an action.
-      sessionEnd?.();
-      relayLease?.close();
-      const releasedWorkspace = releaseRun(handle);
+      try { sessionEnd?.(); } catch { /* native cleanup must still run */ }
+      try { Promise.resolve(relayLease?.close()).catch(() => {}); } catch { /* preserve original failure */ }
+      const releasedWorkspace = await releaseRun(handle, ctx);
+      if (result && grant) result.network = handle.network;
       // The corrected checkpoint: release() reads the branch back from the SOURCE repository,
       // after any WIP auto-commit and after ownership is handed back to noevia, so this never
       // needs "dubious ownership" cooperation from a harness-owned clone (#1) and it reflects
@@ -203,10 +226,12 @@ function createCodeHarness({ jobs, workspaces, egress = null, askApproval, now =
             identityHash: scope.identityHash, identity: scope.identity, meta,
             baseSha: workspace.baseSha ?? null, headSha: releasedWorkspace?.headSha ?? null });
         } catch (error) {
-          log({ at: now(), taskId, event: 'code.cleanup_failed', what: 'corrected checkpoint', error: String(error?.message || error) });
+          try { log({ at: now(), taskId, event: 'code.cleanup_failed', what: 'corrected checkpoint', error: String(error?.message || error) }); } catch {}
         }
       }
     }
+    if (grant && !handle.cleanupConfirmed) throw Object.assign(Error('Native network cleanup could not be confirmed.'), { result });
+    return result;
   }
 
   /**
@@ -222,7 +247,7 @@ function createCodeHarness({ jobs, workspaces, egress = null, askApproval, now =
     // The whole claim is inside the try: the grant and the worktree have to come back even when
     // something fails before the harness ever starts.
     let handle;
-    try { handle = claimRun({ taskId, repoPath, capabilities, domains, harness }); }
+    try { handle = await claimRun({ taskId, repoPath, capabilities, domains, harness }); }
     catch (error) {
       if (error?.[GRANT_FAILED]) { try { jobs.append(taskId, 'job.failed', { error: String(error.message).slice(0, 500) }); } catch { /* the throw below says it */ } }
       else jobs.append(taskId, 'job.failed', { error: String(error.message).slice(0, 500) });
@@ -310,10 +335,11 @@ function createCodeHarness({ jobs, workspaces, egress = null, askApproval, now =
         accepted, decision: answer, headSha: shas.headSha } };
     }
 
-    jobs.run(taskId, reviewer ? reviewed : work).catch(() => {
+    jobs.run(taskId, reviewer ? reviewed : work).catch(async () => {
       // jobs.run records the failure when it can; when it could not even record the start, the
       // work never ran, so the grant and the claim are given back here instead.
-      releaseRun(handle);
+      await releaseRun(handle);
+      try { if (jobs.get(taskId)?.status === 'queued') jobs.append(taskId, 'job.failed', { error: 'Code task could not start.' }); } catch {}
     });
 
     return { taskId, branch: workspace.branch, workspace: workspace.path };

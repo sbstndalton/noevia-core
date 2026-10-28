@@ -43,6 +43,7 @@ function view(job, pending = null) {
     capabilities: job.capabilities, steps: job.steps,
     approval: pending ? { id: pending.id, ...pending.request } : null,
     result: job.result || null,
+    ...(job.artifacts?.some((a) => a.kind === 'native-network-report') ? { network: job.artifacts.filter((a) => a.kind === 'native-network-report').slice(-32).map((a) => a.network) } : {}), uncertain: job.uncertain || [],
   };
 }
 
@@ -145,27 +146,88 @@ function createBrowserService({ launch, egress = null, log = () => {}, now = Dat
       const id = jobs.create({ kind: 'browser', projectId: project.id, capabilities: ['open_browser'] });
       const downloadsDir = path.join(workspace.dir, 'browser-downloads', id);
       let grant = null;
-      try { grant = egress && domains.length ? egress.grant({ taskId: id, domains }) : null; }
+      try { grant = egress && domains.length ? await egress.grant({ taskId: id, domains }) : null; }
       catch (e) { jobs.cancel(id); throw fail(503, e.publicMessage || 'The egress proxy refused this task.'); }
-      // The grant's token outlives this task under any sane configuration: code-egress.cjs
-      // defaults CODE_EGRESS_TOKEN_TTL_MS to 6 hours, well past both IDLE_TIMEOUT_MS (10 min,
-      // above) and the approval timeout (5 min) that would otherwise end the task first. An
-      // operator who sets CODE_EGRESS_TOKEN_TTL_MS below IDLE_TIMEOUT_MS could still see a task's
-      // last action refused at the proxy after its token expires; nothing here refreshes it.
+      let executor = null, sessionId = null, opening = null, cleanupFlight = null, executorClosed = true;
+      const queue = [];
+      function cleanup(ctx = null) {
+        if (cleanupFlight) return cleanupFlight;
+        cleanupFlight = Promise.resolve().then(async () => {
+          sessions.delete(id);
+          for (const waiting of pendingAll(id)) waiting.decide('aborted');
+          while (queue.length) { const item = queue.shift(); if (!item.finish) item.reject(fail(409, 'This task ended before this action ran.')); }
+          const uncertain = (reason) => {
+            try { const data = { tool: 'network', reason }; if (ctx?.uncertain) ctx.uncertain(data); else jobs.append(id, 'tool.uncertain', data); } catch { /* preserve original failure */ }
+          };
+          const closed = (async () => {
+            if (!executor) return;
+            let timer;
+            try { const result = await Promise.race([Promise.resolve().then(async () => { await executor.closeTask(id); if (opening) await opening.catch(() => {}); return executor.shutdown(); }), new Promise((_, reject) => { timer = setTimeout(() => reject(Error('close timeout')), 5000); })]); if (result?.confirmed !== true) throw Error('close unconfirmed'); }
+            catch { executorClosed = false; uncertain('Browser executor closure could not be confirmed.'); }
+            finally { clearTimeout(timer); }
+          })();
+          const network = (async () => {
+            if (!grant) return null;
+            let taken;
+            try { taken = await egress.revoke(grant); } catch { /* explicit uncertainty below */ }
+            const report = Object.freeze({ ...(taken?.report || { available: false, final: false, partial: true, state: 'uncertain' }), cleanupConfirmed: taken?.confirmed === true });
+            if (!report.cleanupConfirmed) uncertain('Native egress cleanup could not be confirmed.');
+            let retained = false;
+            try { jobs.append(id, 'artifact.created', { name: 'network.cleanup', kind: 'native-network-report', network: report }); retained = true; } catch { /* never forget an unretained report */ }
+            if (retained && report.cleanupConfirmed && report.final && report.snapshotId && typeof egress.forget === 'function') {
+              try { await egress.forget(grant, report.snapshotId); } catch { /* retain the caller's recorded report */ }
+            }
+            return report;
+          })();
+          const [report] = await Promise.all([network, closed]);
+          return report;
+        });
+        return cleanupFlight;
+      }
       const proxy = grant ? { server: `http://${egress.endpoint || 'egress'}`, username: 'task', password: grant.token } : null;
-      if (!proxy && !direct) { jobs.cancel(id); throw fail(503, 'Browser tasks need the egress proxy (D15) configured on this server.'); }
+      if (!proxy && !direct) { await cleanup(); jobs.cancel(id); throw fail(503, 'Browser tasks need the egress proxy (D15) configured on this server.'); }
 
       let ready, readyResolve, readyReject;
       ready = new Promise((res, rej) => { readyResolve = res; readyReject = rej; });
 
       jobs.run(id, async (ctx) => {
+        let activeAction = null;
+        const onCancel = () => {
+          // Take away the original lease independently of an outstanding
+          // Playwright promise (including a hung context close).
+          cleanup(ctx).catch(() => {});
+          if (activeAction && !activeAction.settled) {
+            try { ctx.uncertain({ tool: 'browser', action: activeAction.type, reason: 'The action was still pending when cancellation was accepted.' }); } catch {}
+          }
+        };
+        ctx.signal.addEventListener('abort', onCancel, { once: true });
+        if (ctx.signal.aborted) onCancel();
+        async function whileActive(work) {
+          if (ctx.signal.aborted) throw fail(499, 'Cancelled');
+          let onAbort;
+          try {
+            return await Promise.race([Promise.resolve().then(() => {
+              if (ctx.signal.aborted) throw fail(499, 'Cancelled');
+              return work();
+            }), new Promise((_, reject) => {
+              onAbort = () => {
+                // Keep an already-settling real receipt/refusal, but never wait
+                // beyond the independent cached cleanup outcome for this action.
+                const done = () => setImmediate(() => reject(fail(499, 'Cancelled')));
+                cleanup(ctx).then(done, done);
+              };
+              ctx.signal.addEventListener('abort', onAbort, { once: true });
+              if (ctx.signal.aborted) onAbort();
+            })]);
+          } finally { if (onAbort) ctx.signal.removeEventListener('abort', onAbort); }
+        }
+        try {
         jobs.append(id, 'checkpoint.created', { domains });
-        const revoke = () => { try { if (grant) egress.revoke(id); } catch { /* best effort */ } };
         // The moment noevia's write-approval card is raised and answered is recorded on the job
         // itself (mirrors code-harness.cjs): `waiting_approval` and its reversal both come from
         // these two events, never from in-memory state alone, so the card's status survives a
         // poll racing the decision.
-        const executor = createBrowserExecutor({ launch, secrets: {}, direct,
+        executor = createBrowserExecutor({ launch, secrets: {}, direct,
           log: (entry) => log({ ...entry, projectId: project.id }),
           askApproval: async (card, opts) => {
             ctx.event('approval.requested', { ...card, jobId: id });
@@ -178,20 +240,28 @@ function createBrowserService({ launch, egress = null, log = () => {}, now = Dat
             ctx.event('approval.decided', { decision: answer, action: card.action });
             return answer;
           } });
-        let sessionId;
         try {
-          sessionId = await executor.open({ jobId: id, allowedDomains: domains, downloadsDir, proxy, signal: ctx.signal });
+          if (ctx.signal.aborted) throw fail(499, 'Cancelled');
+          let abortOpen;
+          try {
+            opening = executor.open({ jobId: id, allowedDomains: domains, downloadsDir, proxy, signal: ctx.signal });
+            sessionId = await Promise.race([opening, new Promise((_, reject) => {
+              abortOpen = () => reject(fail(499, 'Cancelled')); ctx.signal.addEventListener('abort', abortOpen, { once: true });
+              if (ctx.signal.aborted) abortOpen();
+            })]);
+          } finally { if (abortOpen) ctx.signal.removeEventListener('abort', abortOpen); }
+
         } catch (error) {
-          revoke();
+          await cleanup(ctx);
           readyReject(error);
           throw error;
         }
-        const queue = [];
         let waking = null;
         sessions.set(id, {
           enqueue(item) { queue.push(item); if (waking) { const w = waking; waking = null; w(); } },
         });
         readyResolve();
+        let output = null;
         try {
           for (;;) {
             if (ctx.signal.aborted) break;
@@ -231,26 +301,29 @@ function createBrowserService({ launch, egress = null, log = () => {}, now = Dat
               continue;
             }
             const item = queue.shift();
-            if (item.finish) return item.result;
+            if (item.finish) { output = item.result; break; }
             try {
-              const result = await executor.act(sessionId, item.action);
-              ctx.event('progress', { stage: `${item.action.type}: ${result.status}` });
+              const result = await whileActive(async () => {
+                const action = { type: item.action.type, settled: false };
+                activeAction = action;
+                try { return await executor.act(sessionId, item.action); }
+                finally { action.settled = true; if (activeAction === action) activeAction = null; }
+              });
+              if (!ctx.signal.aborted) ctx.event('progress', { stage: `${item.action.type}: ${result.status}` });
               item.resolve(result);
             } catch (error) { item.reject(error); }
           }
-          return null;
-        } finally {
-          sessions.delete(id);
-          for (const waiting of pendingAll(id)) waiting.decide('aborted');
-          // Whatever is still queued (behind a `finish`, a cancel, an idle timeout or the
-          // executor open failing) is never going to be picked up by the loop above again: the
-          // HTTP request that is awaiting each one would otherwise hang until its own client
-          // timeout instead of learning the task ended.
-          while (queue.length) { const item = queue.shift(); if (!item.finish) item.reject(fail(409, 'This task ended before this action ran.')); }
-          await executor.close(sessionId).catch(() => {});
-          revoke();
-        }
-      }).catch((error) => {
+        } finally { ctx.signal.removeEventListener('abort', onCancel); await cleanup(ctx); }
+        const network = await cleanup(ctx);
+        const result = network ? { ...(output && typeof output === 'object' && !Array.isArray(output) ? output : { value: output }), network } : output;
+        if ((network && !network.cleanupConfirmed) || !executorClosed) throw Object.assign(fail(503, 'Browser cleanup could not be confirmed.'), { result });
+        return result;
+        } catch (error) {
+          await cleanup(ctx); readyReject(error); throw error;
+        } finally { ctx.signal.removeEventListener('abort', onCancel); await cleanup(ctx); }
+      }).catch(async (error) => {
+        await cleanup();
+        try { if (jobs.get(id)?.status === 'queued') jobs.append(id, 'job.failed', { error: 'The browser could not start.' }); } catch {}
         // A rejection here can be the executor.open() failure already reported through
         // readyReject below, or something earlier still (job.started's own append failing, a
         // disk error) that never reached that catch at all — either way, a caller still awaiting
