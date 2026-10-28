@@ -23,6 +23,13 @@ if (mode === 'identity') {
   for (const field of ['CapInh', 'CapPrm', 'CapEff', 'CapAmb']) assert.match(status, new RegExp('^' + field + ':\\s+0+$', 'm'));
   assert.match(status, /^NoNewPrivs:\s+1$/m);
   assert.equal(fs.readlinkSync('/proc/self/fd/0'), '/dev/null');
+  for (const fd of fs.readdirSync('/proc/self/fd')) {
+    let target;
+    try { target = fs.readlinkSync('/proc/self/fd/' + fd); }
+    catch (error) { if (error.code === 'ENOENT') continue; throw error; }
+    assert.doesNotMatch(target, /socket:\[|anon_inode:\[pidfd\]|\/run\/noevia-verify\//,
+      'no bootstrap/listener/request socket, pidfd or root admission writer may reach worker exec');
+  }
   const init = fs.readFileSync('/proc/1/status', 'utf8');
   assert.match(init, /^Uid:\s+0\s+0\s+0\s+0$/m);
   assert.match(init, /^CapEff:\s+0*c0$/m);
