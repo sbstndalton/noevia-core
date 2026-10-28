@@ -187,7 +187,18 @@ async function one(mode, index) {
 (async () => {
   try {
     const container = run + '-artifact';
-    try { docker(['create', '--name', container, imageId]); docker(['cp', container + ':/usr/local/libexec/noevia', artifact]); }
+    // Copy fixed image files into a runner-owned directory. Copying the image's
+    // readonly directory first makes docker cp unable to extract its children
+    // as the non-root CI runner. Keep it traversable by the UID1000 fixtures.
+    fs.mkdirSync(artifact, { mode: 0o755 });
+    try {
+      docker(['create', '--name', container, imageId]);
+      for (const file of ['code-sandbox-supervisor', 'code-sandbox-session-exec', 'code-verify-native']) {
+        docker(['cp', container + ':/usr/local/libexec/noevia/' + file, path.join(artifact, file)]);
+        const copied = fs.lstatSync(path.join(artifact, file));
+        assert.ok(copied.isFile()); assert.equal(copied.mode & 0o777, 0o555);
+      }
+    }
     finally { docker(['rm', '-f', container]); }
     for (let i = 0; i < cases.length; i++) await one(cases[i], i);
     assert.equal(completed, cases.length); console.log('Native supervisor isolated Linux qualification: ' + completed + ' PASS, 0 skipped');
