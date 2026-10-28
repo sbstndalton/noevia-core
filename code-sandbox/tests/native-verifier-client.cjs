@@ -2,6 +2,8 @@
 // Run only in the owned Node container, beside the exact Core checkout and shared socket.
 const assert = require('node:assert/strict'), net = require('node:net');
 if (process.env.NOEVIA_NATIVE_VERIFIER_QUALIFICATION !== '1' || process.platform !== 'linux') throw Error('isolated qualification context required');
+const fs = require('node:fs');
+const { assertRefusal, assertNotAdmitted } = require('./native-verifier-assertions.cjs');
 const { createCodeVerify, isMeasured } = require('/reviewed-core/server/code-verify.cjs');
 const mode = process.argv[2], headSha = process.argv[3];
 const socketPath = '/run/noevia-verify/verify.sock';
@@ -51,6 +53,8 @@ async function raw() {
 }
 async function measured() {
   const taskId = 'owned-qualification', revision = 3;
+  const witnessed = ['copy-deadline', 'copy-descendant', 'admission-witness-control'].includes(mode);
+  if (witnessed) assertNotAdmitted('/qualification-proof');
   const verify = createCodeVerify({ endpoint: 'unix:' + socketPath,
     timeoutMs: 20000, connectRetryMs: 15000, tailBytes: 1024 });
   const targetHead = mode === 'bad-head' ? '1'.repeat(40) : headSha;
@@ -59,10 +63,12 @@ async function measured() {
       assert.equal(id, taskId); assert.equal(head, targetHead);
       return { source: '/workspaces/synthetic' };
     } } });
-  if (['bad-head', 'unconfigured', 'hostile-config', 'copy-deadline', 'saturation'].includes(mode)) {
+  if (['bad-head', 'unconfigured', 'hostile-config', 'copy-deadline'].includes(mode)) {
+    assertRefusal(mode, result);
+    if (mode === 'copy-deadline') assertNotAdmitted('/qualification-proof');
+  } else if (mode === 'saturation') {
     assert.notEqual(result.status, 'passed');
     assert.equal(result.report?.passed ?? false, false);
-    if (mode === 'copy-deadline') assert.ok(!result.report?.tail.includes('COMMAND_STARTED'));
   } else {
     assert.ok(result.report, JSON.stringify(result));
     assert.equal(isMeasured(result.report, { taskId, headSha, revision }), true);
@@ -80,8 +86,20 @@ async function measured() {
       assert.equal(result.report.exitCode, 0); assert.equal(result.report.timedOut, false);
       if (mode === 'identity') assert.match(result.report.tail, /IDENTITY_AND_ISOLATION_OK/);
       if (mode === 'detached' || mode === 'pipe') assert.match(result.report.tail, /ESCAPED_DESCENDANT_STARTED/);
+      if (mode === 'copy-descendant') {
+        const proof = JSON.parse(fs.readFileSync('/qualification-proof/copy-started', 'utf8'));
+        assert.equal(proof.uid, 1002); assert.ok(Number.isInteger(proof.pid) && proof.pid > 0);
+      }
+      if (mode === 'admission-witness-control') {
+        // Real admitted execution must trip the same witness used by copy-deadline,
+        // even if a later failure were to prevent any report from being returned.
+        assert.throws(() => assertNotAdmitted('/qualification-proof'), /operator command was admitted/);
+        const proof = JSON.parse(fs.readFileSync('/qualification-proof/operator-started', 'utf8'));
+        assert.equal(proof.uid, 1003);
+      }
       if (mode === 'clone') {
         assert.match(result.report.tail, /NON_SIGCHLD_CLONE_READY/);
+        assert.match(result.report.tail, /ADOPTED_CLONE_SIGCHLD_DRAIN_CASE/);
         assert.match(result.report.tail, /CLONE_FIXTURE_PARENT_EXITED/);
       }
       if (mode === 'tail') {

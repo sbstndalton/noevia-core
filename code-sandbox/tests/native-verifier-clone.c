@@ -29,11 +29,15 @@ int main(void) {
     char *stack = malloc(size);
     if (stack == NULL) return 11;
     /* Low signal bits are zero, deliberately not SIGCHLD. */
-    if (clone(escaped, stack + size, 0, &ready) < 0) return 12;
+    pid_t child = clone(escaped, stack + size, 0, &ready);
+    if (child < 0) return 12;
     close(fds[1]);
     char value = 0;
     if (read(fds[0], &value, 1) != 1 || value != 'r') return 13;
     close(fds[0]);
+    FILE *proof = fopen("/verify/run/qualification-clone-pid", "w");
+    if (proof == NULL) return 14;
+    if (fprintf(proof, "%ld\n", (long)child) < 0 || fclose(proof) != 0) return 15;
     puts("NON_SIGCHLD_CLONE_READY");
     free(stack);
     return 0;

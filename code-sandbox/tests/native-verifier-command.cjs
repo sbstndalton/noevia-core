@@ -3,11 +3,15 @@
 // This is untrusted worker code, never loaded by the web server or run on the host.
 const fs = require('node:fs'), assert = require('node:assert/strict');
 const { spawn, execFileSync } = require('node:child_process');
+const os = require('node:os');
 assert.equal(process.platform, 'linux', 'fixture is container-only');
 assert.equal(process.getuid(), 1003);
 assert.equal(process.getgid(), 1003);
 assert.match(fs.readFileSync('/proc/1/status', 'utf8'), /^CapEff:\s+0*c0$/m);
 const mode = fs.readFileSync('case.txt', 'utf8').trim();
+if (fs.existsSync('/qualification-proof')) {
+  fs.writeFileSync('/qualification-proof/operator-started', JSON.stringify({ uid: process.getuid(), pid: process.pid }), { mode: 0o644 });
+}
 console.log('COMMAND_STARTED');
 if (mode === 'identity') {
   assert.equal(process.getuid(), 1003);
@@ -44,6 +48,13 @@ if (mode === 'identity') {
   console.log('ESCAPED_DESCENDANT_STARTED');
 } else if (mode === 'clone') {
   execFileSync('./clone-fixture', [], { stdio: 'inherit', env: { ...process.env, NOEVIA_NATIVE_VERIFIER_FIXTURE: '1' } });
+  const pid = fs.readFileSync('/verify/run/qualification-clone-pid', 'utf8').trim();
+  assert.match(pid, /^[1-9][0-9]*$/);
+  const stat = fs.readFileSync('/proc/' + pid + '/stat', 'utf8');
+  const fields = stat.slice(stat.lastIndexOf(') ') + 2).trim().split(/\s+/);
+  assert.equal(Number(fields[1]), 1, 'clone child was actually adopted by init');
+  assert.equal(Number(fields[35]), os.constants.signals.SIGCHLD, 'observed adopted class, not a __WALL omission proof');
+  console.log('ADOPTED_CLONE_SIGCHLD_DRAIN_CASE');
   console.log('CLONE_FIXTURE_PARENT_EXITED');
 } else if (mode === 'timeout' || mode === 'disconnect' || mode === 'shutdown') {
   setInterval(() => {}, 1000);
@@ -58,6 +69,6 @@ if (mode === 'identity') {
     });
   }
   setInterval(() => {}, 1000);
-} else if (mode !== 'pass') {
+} else if (!['pass', 'copy-descendant', 'admission-witness-control'].includes(mode)) {
   throw Error('unknown owned fixture case');
 }

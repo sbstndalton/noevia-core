@@ -37,7 +37,7 @@ const owned = fs.mkdtempSync(path.join(os.tmpdir(), runId + '-'));
 const docker = (args) => execFileSync('docker', args, { encoding: 'utf8', maxBuffer: 8 * 1024 * 1024, timeout: 30000 });
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const cases = ['pass', 'identity', 'fail', 'tail', 'detached', 'pipe', 'clone', 'timeout', 'copy-deadline',
-  'bad-head', 'unconfigured', 'hostile-config', 'malformed', 'partial', 'oversized', 'disconnect', 'shutdown', 'root-gid', 'saturation'];
+  'copy-descendant', 'admission-witness-control', 'bad-head', 'unconfigured', 'hostile-config', 'malformed', 'partial', 'oversized', 'disconnect', 'shutdown', 'root-gid', 'saturation'];
 let completed = 0;
 async function one(mode, index) {
   const name = runId + '-' + index;
@@ -54,6 +54,7 @@ async function one(mode, index) {
   git(['add', '.']); git(['commit', '--quiet', '-m', 'owned synthetic fixture']);
   const head = git(['rev-parse', 'HEAD']);
   if (mode === 'hostile-config') git(['config', 'alias.synthetic', '!echo MUST_NOT_RUN']);
+  const witnessed = ['copy-deadline', 'copy-descendant', 'admission-witness-control'].includes(mode);
   const configured = structuredClone(service);
   configured.image = image; delete configured.build; delete configured.restart;
   configured.environment = { ...configured.environment,
@@ -66,12 +67,29 @@ async function one(mode, index) {
     { type: 'bind', source: sources, target: '/workspaces', read_only: true },
     { type: 'volume', source: 'socket', target: '/run/noevia-verify' },
   ];
+  const volumes = { socket: { name: name + '-socket' } };
+  if (witnessed) {
+    volumes.proof = { name: name + '-proof' };
+    configured.volumes.push({ type: 'volume', source: 'proof', target: '/qualification-proof' });
+  }
+  if (mode === 'copy-descendant') {
+    configured.environment.PATH = '/qualification/bin:/usr/local/bin:/usr/bin:/bin';
+    configured.volumes.push({ type: 'bind', source: path.join(__dirname, 'native-verifier-git-wrapper.cjs'), target: '/qualification/bin/git', read_only: true });
+  }
   const config = path.join(work, 'compose.json');
-  fs.writeFileSync(config, JSON.stringify({ services: { 'code-verify': configured }, volumes: { socket: { name: name + '-socket' } } }));
+  fs.writeFileSync(config, JSON.stringify({ services: { 'code-verify': configured }, volumes }));
   const compose = (args) => docker(['compose', '-p', name, '-f', config, '--profile', 'code', ...args]);
   let created = false, client, clientCreated = false;
   try {
-    created = true; compose(['up', '-d', '--no-build', 'code-verify']);
+    created = true;
+    if (witnessed) {
+      docker(['volume', 'create', '--label', 'com.docker.compose.project=' + name, '--label', 'com.docker.compose.volume=proof', name + '-proof']);
+      docker(['run', '--rm', '--pull', 'never', '--network', 'none', '--read-only', '--user', '0:0',
+        '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges:true', '--pids-limit', '32', '--memory', '256m', '--cpus', '1',
+        '--mount', 'type=volume,src=' + name + '-proof,dst=/proof', '--entrypoint', 'node', image,
+        '-e', 'require("fs").chmodSync("/proof",0o1777)']);
+    }
+    compose(['up', '-d', '--no-build', 'code-verify']);
     const id = compose(['ps', '-a', '-q', 'code-verify']).trim(); assert.ok(id);
     const initial = JSON.parse(docker(['inspect', id]))[0];
     assert.equal(initial.Config.User, '0:0'); assert.equal(initial.HostConfig.ReadonlyRootfs, true);
@@ -79,7 +97,7 @@ async function one(mode, index) {
     assert.deepEqual(caps(initial.HostConfig.CapAdd), ['SETGID', 'SETUID']);
     assert.deepEqual(caps(initial.HostConfig.CapDrop), ['ALL']);
     assert.ok(!initial.HostConfig.PortBindings || Object.keys(initial.HostConfig.PortBindings).length === 0);
-    assert.equal(initial.HostConfig.PidsLimit, 256); assert.equal(initial.HostConfig.Memory, 2147483648);
+    assert.equal(initial.HostConfig.PidsLimit, 256); assert.equal(initial.HostConfig.Memory, 2147483648); assert.equal(initial.HostConfig.NanoCpus, 2000000000);
     assert.ok(initial.Mounts.find((v) => v.Destination === '/workspaces' && v.Type === 'bind' && !v.RW));
     assert.ok(initial.Mounts.find((v) => v.Destination === '/run/noevia-verify' && v.Type === 'volume' && v.RW));
     if (mode === 'root-gid') {
@@ -94,8 +112,11 @@ async function one(mode, index) {
         '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges:true', '--pids-limit', '128', '--memory', '512m', '--cpus', '1',
         '--env', 'NOEVIA_NATIVE_VERIFIER_QUALIFICATION=1',
         '--mount', 'type=volume,src=' + name + '-socket,dst=/run/noevia-verify',
-        '--mount', 'type=bind,src=' + core + ',dst=/reviewed-core,readonly',
-        '--entrypoint', 'node', image, '/reviewed-core/code-sandbox/tests/native-verifier-client.cjs', mode, head];
+        '--mount', 'type=bind,src=' + path.join(core, 'server') + ',dst=/reviewed-core/server,readonly',
+        '--mount', 'type=bind,src=' + path.join(__dirname, 'native-verifier-client.cjs') + ',dst=/qualification/client.cjs,readonly',
+        '--mount', 'type=bind,src=' + path.join(__dirname, 'native-verifier-assertions.cjs') + ',dst=/qualification/native-verifier-assertions.cjs,readonly',
+        ...(witnessed ? ['--mount', 'type=volume,src=' + name + '-proof,dst=/qualification-proof,readonly'] : []),
+        '--entrypoint', 'node', image, '/qualification/client.cjs', mode, head];
       let output = '', errors = '', done = false;
       clientCreated = true;
       client = spawn('docker', args, { stdio: ['pipe', 'pipe', 'pipe'] });
