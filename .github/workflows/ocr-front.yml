@@ -66,8 +66,8 @@ jobs:
           rustup target add wasm32-unknown-unknown --toolchain 1.99.0
           "$RUNNER_TEMP/wasm-rs/tools/build-dav-parse-wasm.sh" "$GITHUB_WORKSPACE/ws/server/wasm/dav-parse.wasm"
           echo "$DAV_PARSE_WASM_SHA256  ws/server/wasm/dav-parse.wasm" | sha256sum -c -
-      - name: Scan oracle unit tests
-        run: node --test ws/tools/ocr-front/contracts.test.cjs
+      - name: Scan oracle unit tests and Core boot under the harness environment
+        run: node --test ws/tools/ocr-front/contracts.test.cjs ws/tools/ocr-front/boot.test.cjs
       - name: Build native worker and Rust front
         working-directory: rs
         run: cargo build --locked -p noevia-server -p noevia-ocr --features native-ocr

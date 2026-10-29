@@ -66,6 +66,13 @@ test('with the feature off, the approval page is 404 and the device endpoints ar
   const both = await request('/api/workspace', { headers: { authorization: 'Bearer nva_synthetic', cookie } });
   assert.equal(both.status, 200, 'with the feature off, a bearer beside a cookie is ignored as before');
   assert.equal((await request('/api/workspace/model', { method: 'PUT', body: {}, headers: { cookie, origin: 'http://localhost', 'content-type': 'application/json' } })).status, 403, 'CSRF still required');
-  const flags = JSON.parse((await request('/api/features', { headers: { cookie } })).text).flags;
-  assert.equal(flags.nativeClientAuth, false);
+  // The flag list is the Rust front's: Node refuses the read (503), so the OFF default is asserted against
+  // the registry and the original Node implementation kept as the oracle instead of a Node reply.
+  const flags = await request('/api/features', { headers: { cookie } });
+  assert.equal(flags.status, 503);
+  assert.equal(JSON.parse(flags.text).code, 'RUST_FEATURES_OWNED');
+  const { REGISTRY } = require('./features.cjs');
+  assert.notEqual(REGISTRY.nativeClientAuth.default, true);
+  const legacy = require('../tests/server/oracles/features-legacy.cjs');
+  assert.equal(legacy.createFeatures({ env: {}, store: { get: () => undefined, set() {} } }).flags().nativeClientAuth, false);
 });

@@ -70,7 +70,12 @@ test.before(() => {
   member = seedAccount(testDataDir, { username: 'member', role: 'member', onboarded: false });
 });
 test('a member who has not finished onboarding gets no administrator or global model access', async () => {
-  for (const url of ['/api/admin/features', '/api/models/download', '/api/models/preset/suggest?model=synthetic', '/api/models/calibration', '/api/models/calibration/cancel', '/api/models/presets/reload', '/api/model-manager/sections', '/api/model-manager/backends/cowork-llama-1/logs']) {
+  // Feature administration is the Rust front's: Node refuses it before authentication, so this member
+  // meets that refusal (never a Node answer) and it cannot be used as an administrator probe either.
+  const features = await request('/api/admin/features', { method: 'GET', headers: headers(member), body: '' });
+  assert.equal(features.status, 503, '/api/admin/features');
+  assert.equal(JSON.parse(features.text).code, 'RUST_FEATURES_OWNED');
+  for (const url of ['/api/models/download', '/api/models/preset/suggest?model=synthetic', '/api/models/calibration', '/api/models/calibration/cancel', '/api/models/presets/reload', '/api/model-manager/sections', '/api/model-manager/backends/cowork-llama-1/logs']) {
     const method = url === '/api/admin/features' || url.startsWith('/api/models/preset/suggest') || url.endsWith('/logs') ? 'GET' : 'POST';
     assert.equal((await request(url, { method, headers: headers(member), body: method === 'POST' ? '{}' : '' })).status, 403, url);
   }

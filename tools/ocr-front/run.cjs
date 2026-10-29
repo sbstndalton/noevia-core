@@ -9,6 +9,7 @@ const http = require('node:http');
 const { spawn, spawnSync } = require('node:child_process');
 const { once } = require('node:events');
 const { SERVER, GUARD, startMocks, serverEnv } = require('../contract-corpus/mocks.cjs');
+const { bindProjectStore } = require('./boot.cjs');
 const { requireScan, requireReducedPdf, REDUCED_CAP } = require('./contracts.cjs');
 const { seedAccount } = require('../../tests/server/seed-account.cjs');
 const { startProjectStore } = require('../../tests/server/project-store-server.cjs');
@@ -101,14 +102,15 @@ async function scenario(front, mode, workerBase, fixtures, root, calls) {
   // Node saves projects.json only through the Rust front's project store and refuses to start
   // without one (sbstndalton/noevia#1071): a loopback stand-in on this data dir.
   const store = await startProjectStore(dataDir);
-  Object.assign(env, { NOEVIA_PROJECT_STORE_PORT: String(store.port), NOEVIA_PROJECT_STORE_TOKEN: store.token });
-  env.NOEVIA_CORPUS_ALLOWED_PORTS += `,${store.port}`;
+  // Node is not ready until its feature runtime registers through this store under the shared start id
+  // (boot.cjs); the front below gets the same id, as in production. No bypass of the readiness barrier.
+  const startId = bindProjectStore(env, store);
   const node = child(process.execPath, ['--require', GUARD, SERVER], env);
   let rust;
   try {
     await ready(`http://127.0.0.1:${nodePort}`, '/api/ready', node);
     if (front) {
-      rust = child(front, [], { PATH: process.env.PATH, UI_PORT: String(frontPort), UI_HOST: '127.0.0.1', UI_DATA_DIR: dataDir, PUBLIC_ORIGIN: base, NOEVIA_FRONT: 'rust', NOEVIA_LEGACY_UPSTREAM: `http://127.0.0.1:${nodePort}` });
+      rust = child(front, [], { PATH: process.env.PATH, UI_PORT: String(frontPort), UI_HOST: '127.0.0.1', UI_DATA_DIR: dataDir, PUBLIC_ORIGIN: base, NOEVIA_FRONT: 'rust', NOEVIA_START_ID: startId, NOEVIA_LEGACY_UPSTREAM: `http://127.0.0.1:${nodePort}` });
       await ready(base, '/api/ready', rust);
     }
     const admin = new Client(base); const member = new Client(base);
