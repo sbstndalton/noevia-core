@@ -16,7 +16,8 @@ const skipWasm = !fs.existsSync(process.env.DAV_PARSE_WASM || davParseWasm.DEFAU
 const AUTOCONFIG = path.join(__dirname, 'llamacpp-autoconfig.cjs');
 const CALIBRATION = path.join(__dirname, 'llamacpp-calibration.cjs');
 const HOST = path.join(__dirname, 'llamacpp-autoconfig-host.cjs');
-const EXPECTED_RAN = 35;
+// 31 since #2189 moved the suggestion and the estimate to the Rust front (noevia-rs model_sizing.rs).
+const EXPECTED_RAN = 31;
 
 let ran = 0;
 test.after(() => { assert.equal(ran, skipWasm ? 0 : EXPECTED_RAN, 'every guarded body must have run'); });
@@ -245,12 +246,10 @@ test('auto-tune: a planning failure that is not a refusal still falls back to th
 
 // ---- manager: a boot-time budget fault refuses the dependent features per request --------------------------
 
-test('manager: with a budget fault and no other budget, suggestions, estimates and auto-tune refuse with the reason (503)', { skip: skipWasm }, async (t) => {
+test('manager: with a budget fault and no other budget, auto-tune refuses with the reason (503)', { skip: skipWasm }, async (t) => {
   const { m, calls, ini } = synthetic(t, { autoconfig: { budgetGib: 0, budgetFault: FAULT_REASON } });
   const before = fs.readFileSync(ini, 'utf8');
   for (const [what, call, prefix] of [
-    ['suggest', () => m.suggestPreset('small'), 'Suggestions unavailable'],
-    ['estimate', () => m.estimateMemory('small'), 'Estimate unavailable'],
     ['autotune', () => m.autotune.start('small', { confirmPause: true, promptBudgetSeconds: 30 }), 'Auto-tune unavailable'],
   ]) {
     const r = await call();
@@ -283,22 +282,20 @@ test('manager: a known budget makes the fault irrelevant (the inference budget, 
     ['container limit', { autoconfig: { budgetGib: 32 } }],
   ]) {
     const { m } = synthetic(t, opts);
-    const s = await m.suggestPreset('small'), e = await m.estimateMemory('small');
+    // The suggestion and the estimate that sized against it are the Rust front's (#2189); the
+    // budget they and auto-tune use is still this one.
     ran++;
-    assert.equal(s.ok, true, what); assert.equal(s.status, 200, what); assert.ok(s.body.values, what);
-    assert.equal(e.ok, true, what); assert.equal(e.status, 200, what); assert.ok(e.body.budgetGib > 0, what);
+    assert.ok(m.sizingBudgetGib() > 0, what);
   }
 });
 
-test('manager: with no budget and no fault the old answers are unchanged (501 suggestion, estimate without a budget)', { skip: skipWasm }, async (t) => {
+test('manager: with no budget and no fault there is no sizing budget and no fault', { skip: skipWasm }, async (t) => {
   const { m } = synthetic(t, { autoconfig: { budgetGib: 0 } });
-  const s = await m.suggestPreset('small'), e = await m.estimateMemory('small');
   ran++;
-  assert.equal(s.status, 501); assert.match(s.body.error, /^Suggestions need an inference memory budget/);
-  assert.equal(e.status, 200); assert.equal(e.body.budgetGib, null);
+  assert.equal(m.sizingBudgetGib(), 0);
 });
 
-test('manager: a budget fault with a faulty evaluator still refuses every load, save, suggestion and estimate', { skip: skipWasm }, async (t) => {
+test('manager: a budget fault with a faulty evaluator still refuses every load and save', { skip: skipWasm }, async (t) => {
   const probe = faultyEvaluator(t);
   const { m, calls, ini } = synthetic(t, { autoconfig: { budgetGib: 0, budgetFault: FAULT_REASON }, inferenceBudget: { budgetGib: () => 64 } });
   const before = fs.readFileSync(ini, 'utf8');
@@ -308,23 +305,15 @@ test('manager: a budget fault with a faulty evaluator still refuses every load, 
   const save = await m.presetRefusal('small', { 'ctx-size': '8192' });
   ran++;
   assert.equal(save.code, 'autoconfig_impl');
-  const suggest = await m.suggestPreset('small');
-  ran++;
-  assert.equal(suggest.body.code, 'autoconfig_impl'); assert.equal(suggest.body.values, undefined);
-  const estimate = await m.estimateMemory('small');
-  ran++;
-  assert.equal(estimate.status, 503);
   assert.ok(probe.ran > 0);
   assert.equal(fs.readFileSync(ini, 'utf8'), before);
   assert.ok(!calls.includes('POST /models/load'), calls.join('\n'));
 });
 
-test('manager: the normal path (no fault) loads, saves, suggests and estimates as before', { skip: skipWasm }, async (t) => {
+test('manager: the normal path (no fault) loads and saves as before', { skip: skipWasm }, async (t) => {
   const { m, calls } = synthetic(t, { autoconfig: { budgetGib: 0 }, inferenceBudget: { budgetGib: () => 64 } });
   assert.equal((await m.load('small')).ok, true);
   assert.ok(calls.includes('POST /models/load'));
   assert.equal(await m.presetRefusal('small', { 'ctx-size': '8192' }), null);
-  assert.equal((await m.suggestPreset('small')).status, 200);
-  assert.equal((await m.estimateMemory('small')).status, 200);
   ran++;
 });
