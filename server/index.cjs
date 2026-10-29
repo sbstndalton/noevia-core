@@ -1235,6 +1235,8 @@ async function handleRequestInner(req, res) {
   if (require('./features.cjs').refuseRustStorageRead(req, res, { parseRequestUrl, badRequestUrl, json })) return;
   if (require('./routes/chat-framing.cjs').refuseOwnedPreferences(req, res, { parseRequestUrl, json })) return;
   if (require('./routes/features.cjs').refuseOwnedFeatures(req, res, { parseRequestUrl, json })) return;
+  // The Diary routes that are only a proxy and a policy are the Rust front's (#2185).
+  if (require('./rust-diary.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   await readyFeatures();
   const preAuth = requestAuth.authenticate(req);
   // accountRole: a device token acts as a member, but its account's workspace is the same one.
@@ -1360,7 +1362,8 @@ async function handleRequest(req,res) {
   // This is a browser/core contract marker, including unauthenticated and error
   // responses. Set it before the maintenance gate, which may return early.
   if (pathname.startsWith('/api/')) res.setHeader('X-Noevia-API', '1');
-  const inference=req.method!=='GET' && (pathname==='/api/chat' || pathname.startsWith('/api/diary/'));
+  // The Diary routes the Rust front owns (rust-diary.cjs) are refused below and never take the gate.
+  const inference=req.method!=='GET' && (pathname==='/api/chat' || (pathname.startsWith('/api/diary/') && !require('./rust-diary.cjs').owned(pathname)));
   let leave;
   // #1896: a chat turn waits a moment (<= 3 s) for a briefly held gate, then answers a retryable 503 and logs its reason.
   const chatAdmission=require('./chat-admission.cjs');

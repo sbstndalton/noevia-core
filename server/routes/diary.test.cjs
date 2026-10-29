@@ -29,7 +29,7 @@ function fixture({ dir = '/nowhere', diaryOn = true, limited = false, connectorL
     diary: {
       diaryHeaders: (method, url, opts) => ({ 'X-Cowork-User-ID': 'u1', ...(opts?.storageRetry ? { 'X-Cowork-Storage-Retry': '1' } : {}) }),
       log: log || (() => {}),
-      corpusSource: { name: 'sidecar', listMonths: async () => [{ id: '2026-09', label: '2026-09' }], readMonth: async (m) => ({ todayLog: m || 'today', standing: '' }) },
+      corpusSource: { name: 'sidecar', readMonth: async (m) => ({ todayLog: m || 'today', standing: '' }) },
       connectorFiles: { list: async () => [], read: async () => ({}), write: async () => ({}) },
     },
   });
@@ -104,27 +104,36 @@ test('credentials are listed, created with a name and revoked by id', async () =
   assert.equal(await f.call('connectors', 'DELETE', '/api/profile/diary-connectors/short'), false, 'a malformed id is not a connector route');
 });
 
-test('every /api/diary route is gated on the add-on and guards its method', async () => {
+test('every /api/diary route this mount keeps is gated on the add-on and guards its method', async () => {
   const off = fixture({ diaryOn: false });
-  for (const [method, path] of [['GET', '/api/diary/exchanges'], ['GET', '/api/diary/workspace-trash'], ['POST', '/api/diary/workspace-import'], ['GET', '/api/diary/workspace-export'], ['GET', '/api/diary/storage-status'], ['GET', '/api/diary/files'], ['GET', '/api/diary/source'], ['GET', '/api/diary/today'], ['POST', '/api/diary/entries/edit']]) {
+  for (const [method, path] of [['GET', '/api/diary/exchanges'], ['GET', '/api/diary/workspace-trash'], ['GET', '/api/diary/storage-status'], ['GET', '/api/diary/files'], ['GET', '/api/diary/history'], ['POST', '/api/diary/entries/edit']]) {
     assert.equal(await off.call('diary', method, path, method === 'POST' ? {} : undefined), true, path);
     assert.deepEqual(off.sent.pop(), { status: 404, body: { error: 'Diary add-on is disabled' } }, path);
   }
   const f = fixture();
   await f.call('diary', 'DELETE', '/api/diary/workspace-trash');
   assert.deepEqual(f.sent.pop(), { status: 405, body: { error: 'Method not allowed' } });
-  await f.call('diary', 'GET', '/api/diary/storage-import');
+  // The status route kept the combined route's guard (GET only).
+  await f.call('diary', 'POST', '/api/diary/storage-status', {});
   assert.deepEqual(f.sent.pop(), { status: 405, body: { error: 'Method not allowed' } });
   await f.call('diary', 'DELETE', '/api/diary/file');
   assert.deepEqual(f.sent.pop(), { status: 405, body: { error: 'Method not allowed' } });
   assert.equal(await f.call('diary', 'GET', '/api/diary/entries/edit'), false, 'an unhandled method falls through');
   assert.equal(await f.call('diary', 'GET', '/api/chat'), false);
+  // #2185: the five routes the Rust front owns are not this mount's any more, in any method, add-on on or off.
+  // (Their add-on gate, method guards and answers are noevia-rs crates/server-diary/tests/sidecar.rs;
+  // Node refuses them before authentication: rust-diary.test.cjs.)
+  for (const path of ['/api/diary/source', '/api/diary/today', '/api/diary/storage-import', '/api/diary/workspace-export', '/api/diary/workspace-import']) {
+    for (const method of ['GET', 'POST', 'PUT', 'DELETE']) {
+      assert.equal(await off.call('diary', method, path, method === 'POST' ? {} : undefined), false, `${method} ${path}`);
+      assert.equal(await f.call('diary', method, path, method === 'POST' ? {} : undefined), false, `${method} ${path}`);
+    }
+  }
+  assert.deepEqual(f.fetched, []);
 });
 
-test('the corpus reads, the trash proxy and the local exchange keep their shapes and limits', async () => {
+test('the history read, the trash proxy and the local exchange keep their shapes and limits', async () => {
   const f = fixture({ reply: (url) => (url.includes('workspace-trash') ? { ok: false, status: 502, body: null } : { ok: true, status: 200, body: { echo: url } }) });
-  await f.call('diary', 'GET', '/api/diary/source');
-  assert.deepEqual(f.sent.pop(), { status: 200, body: { source: 'sidecar', months: [{ id: '2026-09', label: '2026-09' }] } });
   await f.call('diary', 'GET', '/api/diary/history', undefined, { search: '?month=2026-08' });
   assert.deepEqual(f.sent.pop(), { status: 200, body: { todayLog: '2026-08', standing: '' } });
   await f.call('diary', 'GET', '/api/diary/workspace-trash', undefined, { search: '?after=x' });

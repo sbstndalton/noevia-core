@@ -4,9 +4,10 @@
 //   connector   POST /api/diary-connector — a connected app's credential, checked here, not a
 //               session; mounted BEFORE the session and CSRF checks and refuses any browser origin
 //   connectors  /api/profile/diary-connectors[/:id] — list, create and revoke those credentials
-//   diary       /api/diary/* — recovery records, workspace trash/import/export, storage status
-//               and import, files and the local exchange, the corpus reads, the operator import
-//               folders and the journaled entry edit; every one gated on the Diary add-on
+//   diary       /api/diary/* — recovery records, workspace trash, storage status, files and the
+//               local exchange, the history read, the operator import folders and the journaled entry
+//               edit; every one gated on the Diary add-on. The corpus source and day reads, the
+//               storage import and the workspace import and export are the Rust front's (rust-diary.cjs)
 //
 // Each returns true when it handled the request. Blocks keep their original order and an
 // unmatched method falls through as it did inline.
@@ -99,29 +100,15 @@ function createDiaryRoutes({ json, readBody, readJson, fetchJson, DIARY_BASE, au
       return json(res, r.status, r.ok ? r.body : { error: r.body?.detail || 'Diary recovery request failed. Retry or refresh Trash.' });
     }
 
-    if (p === '/api/diary/workspace-import') {
-      if (!authService.diaryEnabled(authn.user.id)) return json(res, 404, { error: 'Diary add-on is disabled' });
-      if (req.method !== 'POST') return json(res, 405, { error: 'Method not allowed' });
-      const target = `${DIARY_BASE}/api/workspace-import${url.search}`;
-      return require('../workspace-import.cjs').proxyWorkspaceImport(req, res, target, (secret) => diaryHeaders('POST', target, { secret, contentType: 'application/zip' }), diary.withStorageCredential);
-    }
-
-    if (p === '/api/diary/workspace-export') {
+    // storage-import is the Rust front's (rust-diary.cjs). The status stays here: it reads the
+    // storage-login latch (#1589), which lives in this process.
+    if (p === '/api/diary/storage-status') {
       if (!authService.diaryEnabled(authn.user.id)) return json(res, 404, { error: 'Diary add-on is disabled' });
       if (req.method !== 'GET') return json(res, 405, { error: 'Method not allowed' });
-      const target = `${DIARY_BASE}/api/workspace-export`;
-      return require('../workspace-export.cjs').proxyWorkspaceExport(res, target, (secret) => diaryHeaders('GET', target, { secret }), diary.withStorageCredential);
-    }
-
-    if (['/api/diary/storage-status', '/api/diary/storage-import'].includes(p)) {
-      if (!authService.diaryEnabled(authn.user.id)) return json(res, 404, { error: 'Diary add-on is disabled' });
-      const status = p.endsWith('storage-status');
-      if (req.method !== (status ? 'GET' : 'POST')) return json(res, 405, { error: 'Method not allowed' });
-      const body = status ? undefined : await readBody(req, 4096);
-      const r = await diaryFetchJson(`${DIARY_BASE}/api/${status ? 'storage-status' : 'storage-import'}`, { method: req.method, body }, status ? 60000 : 300000);
+      const r = await diaryFetchJson(`${DIARY_BASE}/api/storage-status`, { method: req.method }, 60000);
       // #1589: while a refused or throttled login holds this account's automatic storage calls (the backup
       // among them), the status says so and when the next attempt is due, instead of looking healthy.
-      if (status && r.ok && r.body && typeof r.body === 'object' && !Array.isArray(r.body) && storageLatch) {
+      if (r.ok && r.body && typeof r.body === 'object' && !Array.isArray(r.body) && storageLatch) {
         let held = null;
         try { held = storageLatch.statusFor(authn.user.id, (id) => authService.getStorage(id, true)); } catch { held = null; }
         if (held) return json(res, r.status, { ...r.body, automaticStorage: { held: true, kind: held.kind, nextAttemptAt: held.nextAttemptAt } });
@@ -179,13 +166,9 @@ function createDiaryRoutes({ json, readBody, readJson, fetchJson, DIARY_BASE, au
       return json(res, r.status, { error, ...(r.body?.code === 'storageLoginRejected' ? { code: r.body.code } : {}) });
     }
 
-    if (p === '/api/diary/source') {
-      if (!authService.diaryEnabled(authn.user.id)) return json(res, 404, { error: 'Diary add-on is disabled' });
-      const months = await corpusSource.listMonths();
-      return json(res, 200, { source: corpusSource.name, months });
-    }
-
-    if (p === '/api/diary/today' || p === '/api/diary/history') {
+    // /api/diary/source and /api/diary/today are the Rust front's (rust-diary.cjs); /history is the same
+    // read under the name the web client does not use, and stays here.
+    if (p === '/api/diary/history') {
       if (!authService.diaryEnabled(authn.user.id)) return json(res, 404, { error: 'Diary add-on is disabled' });
       const monthId = url.searchParams.get('month');
       const data = await corpusSource.readMonth(monthId);
