@@ -26,6 +26,10 @@ async function main() {
   Object.assign(env, { NOEVIA_FRONT: 'rust', NOEVIA_PROJECT_STORE_PORT: process.env.NOEVIA_PROJECT_STORE_PORT, NOEVIA_PROJECT_STORE_TOKEN: process.env.NOEVIA_PROJECT_STORE_TOKEN });
   // net-guard.cjs lets Node reach the store's loopback port, as it does the mocks.
   env.NOEVIA_CORPUS_ALLOWED_PORTS = `${env.NOEVIA_CORPUS_ALLOWED_PORTS},${Number(process.env.NOEVIA_PROJECT_STORE_PORT)}`;
+  // The feature settings are the front's too: Node registers its runtime facts with the front's
+  // store under the start id both processes share, and is not ready without one (feature-runtime.cjs).
+  if (!/^[0-9a-f]{32}$/.test(process.env.NOEVIA_START_ID || '')) throw new Error('serve.cjs needs NOEVIA_START_ID (the start id the harness gives the Rust front)');
+  env.NOEVIA_START_ID = process.env.NOEVIA_START_ID;
   // The project-writes slices stay switched (NOEVIA_RUST_PROJECT_WRITES, with its confirmation).
   if (process.env.NOEVIA_RUST_PROJECT_WRITES === '1') Object.assign(env, { NOEVIA_RUST_PROJECT_WRITES: '1', NOEVIA_RUST_PROJECT_WRITES_CONFIRMED: process.env.NOEVIA_RUST_PROJECT_WRITES_CONFIRMED === '1' ? '1' : '' });
   // sbstndalton/noevia#1071: usage, sampling/reasoning/routing settings, routing default, stats,

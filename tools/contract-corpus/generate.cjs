@@ -134,7 +134,8 @@ async function main() {
   // protocol, on this throwaway data dir.
   const store = await startProjectStore(dataDir);
   const env = serverEnv({ port, dataDir, origin: base, mocks, record: exchanges });
-  Object.assign(env, { NOEVIA_PROJECT_STORE_PORT: String(store.port), NOEVIA_PROJECT_STORE_TOKEN: store.token });
+  // The stand-in also answers the feature runtime's context exchange, under this run's start id.
+  Object.assign(env, { NOEVIA_PROJECT_STORE_PORT: String(store.port), NOEVIA_PROJECT_STORE_TOKEN: store.token, NOEVIA_START_ID: require('node:crypto').randomBytes(16).toString('hex') });
   env.NOEVIA_CORPUS_ALLOWED_PORTS = `${env.NOEVIA_CORPUS_ALLOWED_PORTS},${store.port}`;
   const log = [];
   const child = spawn(process.execPath, ['--require', GUARD, SERVER], { env, cwd: path.dirname(SERVER), stdio: ['ignore', 'pipe', 'pipe'] });
