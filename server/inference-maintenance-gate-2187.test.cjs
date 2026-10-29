@@ -231,3 +231,126 @@ test('#2187: without a gate admin token the manager keeps its own in-process hol
   assert.equal(typeof release, 'function', 'synchronous, as before #2187');
   release();
 });
+
+// ── review findings (#2187 M1) ─────────────────────────────────────────────────
+
+const held = (code) => new GateError({ code, status: code === 'engine_busy' ? 409 : 503, retryable: true, message: code });
+
+test('#2187: shutdown gives the gate\'s hold back (bounded), once', async () => {
+  const remote = stubRemote();
+  const gate = createMaintenanceGate({ remote, setTimer: () => null, clearTimer: () => {}, log: () => {} });
+  assert.equal(await gate.releaseRemote(), false, 'nothing held');
+  await gate.hold('Chat is paused while noevia runs a throughput sweep.');
+  assert.equal(await gate.releaseRemote({ timeoutMs: 50 }), true);
+  assert.deepEqual(remote.log.releases, [HOLD]);
+  assert.deepEqual(gate.holdHeaders(), {});
+  assert.equal(await gate.releaseRemote(), false, 'given back once');
+  // A gate that never answers the release does not hold up the shutdown.
+  const stuck = { ...stubRemote(), releaseMaintenance: () => new Promise(() => {}) };
+  const g2 = createMaintenanceGate({ remote: stuck, setTimer: () => null, clearTimer: () => {}, log: () => {} });
+  await g2.hold('x');
+  const t0 = Date.now();
+  assert.equal(await g2.releaseRemote({ timeoutMs: 30 }), true);
+  assert.ok(Date.now() - t0 < 1000);
+  // The manager exposes it for the shutdown hook.
+  const gateStub = { ...fakeGate({ admin: ADMIN }), ...stubRemote() };
+  const manager = createModelManager({ gate: gateStub, kind: 'llamacpp', baseUrl: 'http://synthetic', fetchJson: routerFake([]) });
+  const release = await manager.holdMaintenance('Sweep');
+  assert.equal(await manager.releaseMaintenanceHold({ timeoutMs: 50 }), true);
+  assert.deepEqual(gateStub.log.releases, [HOLD]);
+  release();
+});
+
+test('#2187: a sweep still running after a restart is adopted once the previous process\'s hold is gone', async () => {
+  const { createSweepGuard } = require('./benchmark-sweep-guard.cjs');
+  let asks = 0;
+  const remote = stubRemote({ answer: async () => { asks += 1; if (asks === 1) throw held('maintenance_held'); return { token: HOLD, idleTtlMs: 60000 }; } });
+  const gate = createMaintenanceGate({ remote, setTimer: () => null, clearTimer: () => {}, log: () => {} });
+  const guard = createSweepGuard({
+    hold: (reason) => gate.hold(reason),
+    progress: async () => ({ ok: true, body: { job: { active: true, unit: 'models', total: 2 } } }),
+    adoptRetryMs: 5, adoptMaxDelayMs: 10, pollMs: 60000,
+    // Timers the test keeps alive (the guard unrefs real ones).
+    // The sweep's own progress poll (long) may not keep the test process alive.
+    setTimer: (fn, ms) => { const h = setTimeout(fn, ms); if (ms >= 1000) h.unref(); return { h }; }, clearTimer: (t) => clearTimeout(t?.h),
+  });
+  assert.equal(await guard.adopt(), true);
+  assert.equal(asks, 2, 'asked again after the refusal');
+  assert.equal(gate.held(), true);
+  assert.deepEqual(gate.holdHeaders(), { [HOLD_HEADER]: HOLD });
+  assert.equal(guard.active(), true);
+  guard.cancelAdopt();
+});
+
+test('#2187: a hold the gate forgot is taken again; if it cannot be, the job\'s requests stop carrying the dead token', async (t) => {
+  t.mock.timers.enable({ apis: ['setInterval'] });
+  const NEW = 'd'.repeat(32);
+  for (const retake of ['granted', 'refused']) {
+    const remote = stubRemote();
+    let asks = 0;
+    remote.holdMaintenance = async (reason, options = {}) => { asks += 1; remote.log.holds.push({ reason, waitMs: options.waitMs ?? 0 });
+      if (asks === 1) return { token: HOLD, idleTtlMs: 60000 }; if (retake === 'granted') return { token: NEW, idleTtlMs: 60000 }; throw held('engine_busy'); };
+    remote.renewMaintenance = async (token) => { remote.log.renewals.push({ token }); return token !== HOLD; };
+    const lines = [];
+    const gate = { ...fakeGate({ admin: ADMIN }), ...remote };
+    const calls = [];
+    const origLog = console.log; console.log = (l) => lines.push(String(l));
+    let manager;
+    try { manager = createModelManager({ gate, kind: 'llamacpp', baseUrl: 'http://synthetic', fetchJson: routerFake(calls) }); } finally { console.log = origLog; }
+    const release = await manager.holdMaintenance('Chat is paused while noevia calibrates synthetic.');
+    await manager.request('/models');
+    assert.equal(calls.at(-1).hold, HOLD);
+    console.log = (l) => lines.push(String(l));
+    try {
+      t.mock.timers.tick(20000);
+      for (let i = 0; i < 10; i++) await tick();
+    } finally { console.log = origLog; }
+    assert.equal(remote.log.holds.at(-1).waitMs, 10000, 'taken again with a bounded wait');
+    await manager.request('/models');
+    if (retake === 'granted') {
+      assert.equal(calls.at(-1).hold, NEW, 'the new hold rides on the job\'s requests');
+      assert.ok(lines.some((l) => /taken again/.test(l)));
+    } else {
+      assert.equal(calls.at(-1).hold, null, 'no dead token: the job\'s requests (and its restore) run unheld');
+      assert.ok(lines.some((l) => /could not be taken again; this work goes on without it/.test(l)));
+    }
+    assert.equal(manager.maintenanceHeld(), true, 'this process\'s own chat stays paused until the work ends');
+    assert.throws(() => manager.enterInference(), (e) => e.status === 503);
+    // The restore path still runs: a reload under the (now local or renewed) hold reaches the router.
+    calls.length = 0;
+    await manager.request('/models?reload=1');
+    assert.equal(calls[0].route, '/models?reload=1');
+    release();
+    assert.equal(manager.maintenanceHeld(), false);
+  }
+});
+
+test('#2187: a gate without the hold API is asked again after the reprobe interval', async (t) => {
+  let clock = 0;
+  const answers = [null, { token: HOLD, idleTtlMs: 60000 }];
+  const remote = stubRemote({ answer: async () => answers.shift() });
+  const gate = createMaintenanceGate({ remote, now: () => clock, reprobeMs: 1000, setTimer: () => null, clearTimer: () => {}, log: () => {} });
+  (await gate.hold('a'))();
+  assert.equal(gate.delegated(), false);
+  clock = 500;
+  const local = gate.hold('b'); assert.equal(typeof local, 'function', 'local within the interval'); local();
+  clock = 1500;
+  const release = await gate.hold('c');
+  assert.equal(gate.delegated(), true);
+  assert.deepEqual(gate.holdHeaders(), { [HOLD_HEADER]: HOLD }, 'an upgraded gate is used without a restart');
+  release();
+  // The client too: a 404 is remembered for the interval, then the gate is asked again.
+  let status = 404;
+  const g = await syntheticGate(t, (req, res) => {
+    if (status === 404) { res.writeHead(404, { 'content-type': 'application/json' }); res.end(gateError('not_found', 'No such gate endpoint.', false)); return; }
+    res.writeHead(201, { 'content-type': 'application/json' }); res.end(JSON.stringify({ hold: HOLD, idle_ttl_ms: 60000 }));
+  });
+  let now = 0;
+  const client = createGateClient({ baseUrl: g.base, adminToken: ADMIN, log: () => {}, now: () => now, holdReprobeMs: 1000 });
+  assert.equal(await client.holdMaintenance('x'), null);
+  status = 201; now = 999;
+  assert.equal(await client.holdMaintenance('x'), null);
+  assert.equal(g.seen.length, 1);
+  now = 1000;
+  assert.deepEqual(await client.holdMaintenance('x'), { token: HOLD, idleTtlMs: 60000 });
+});

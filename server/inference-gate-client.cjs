@@ -86,13 +86,15 @@ async function* sseEvents(body) {
 /**
  * @param {{ baseUrl: string, fetch?: typeof fetch, adminToken?: string|null, holder?: string, log?: (line: string) => void }} options
  */
-function createGateClient({ baseUrl, fetch = (url, init) => globalThis.fetch(url, init), adminToken = null, holder = 'web', log = (line) => console.log(line) }) {
+function createGateClient({ baseUrl, fetch = (url, init) => globalThis.fetch(url, init), adminToken = null, holder = 'web', log = (line) => console.log(line), now = () => Date.now(), holdReprobeMs = 5 * 60 * 1000 }) {
   const base = String(baseUrl || '').replace(/\/+$/, '').replace(/\/v1$/, '');
   const origin = (() => { try { return new URL(base).origin; } catch { return null; } })();
   const token = typeof adminToken === 'string' && adminToken.trim() ? adminToken.trim() : null;
   let waiting = 0;
   let absentLogged = false;
-  let holdAbsent = false; // nothing at the engine address knows the maintenance hold
+  // When nothing at the engine address knew the maintenance hold; asked again after holdReprobeMs
+  // (a gate upgraded since is then used without a restart).
+  let holdAbsentAt = null;
   const held = new Set(); // leases not yet given back, for a shutdown
   const detachedLogged = new Set(); // addresses a lease was not attached to, said once each
 
@@ -261,16 +263,20 @@ function createGateClient({ baseUrl, fetch = (url, init) => globalThis.fetch(url
    */
   async function holdMaintenance(reason, { waitMs = 0, signal } = {}) {
     signal?.throwIfAborted();
-    if (!token || holdAbsent) return null;
+    if (!token || (holdAbsentAt !== null && now() - holdAbsentAt < holdReprobeMs)) return null;
     const wait = Math.max(0, Math.min(MAX_HOLD_WAIT_MS, Math.floor(Number(waitMs) || 0)));
     const { status, body } = await gateJson('/gate/v1/maintenance', { body: { reason: String(reason || '').slice(0, 300), wait_ms: wait }, signal, timeoutMs: wait + 10000 });
+    if (status !== 404 && holdAbsentAt !== null) {
+      log('[inference-gate] the engine address now has the maintenance hold; holds go to the gate again');
+      holdAbsentAt = null;
+    }
     if (status === 201 && typeof body?.hold === 'string' && LEASE_TOKEN.test(body.hold)) {
       return { token: body.hold, idleTtlMs: Number.isSafeInteger(body.idle_ttl_ms) && body.idle_ttl_ms > 0 ? body.idle_ttl_ms : 60000 };
     }
     const refusal = refusalOf(status, body);
     if (status === 404 && (!refusal || refusal.code === 'not_found')) {
-      holdAbsent = true;
-      log('[inference-gate] the engine address has no maintenance hold (no gate, or an older one); this process holds maintenance on its own');
+      if (holdAbsentAt === null) log('[inference-gate] the engine address has no maintenance hold (no gate, or an older one); this process holds maintenance on its own');
+      holdAbsentAt = now();
       return null;
     }
     if (refusal) throw refusal;

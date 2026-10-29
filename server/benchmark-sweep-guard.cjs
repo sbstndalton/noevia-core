@@ -28,7 +28,7 @@ function createSweepGuard({ hold, progress, log = () => {}, pollMs = 5000, perMo
     const refusal = () => Object.assign(Error(SWEEP_BUSY_ERROR), { status: 409, publicMessage: SWEEP_BUSY_ERROR });
     let held;
     try { held = hold(SWEEP_PAUSE_REASON); } catch { throw refusal(); }
-    if (typeof held?.then === 'function') return held.catch(() => { throw refusal(); });
+    if (typeof held?.then === 'function') return held.catch((e) => { throw Object.assign(refusal(), { fromGate: e?.fromGate === true }); });
     return held;
   }
 
@@ -88,8 +88,18 @@ function createSweepGuard({ hold, progress, log = () => {}, pollMs = 5000, perMo
     }
     // Only a throughput sweep (counted in models) runs outside the engine; the prompt suite does not.
     if (!job || job.active !== true || job.unit !== 'models' || watching) return false;
+    // #2187: the previous process's gate hold may still be live (it ends when released or after its idle
+    // limit), and a chat may be finishing: the hold is asked for again with the same doubling delay, at most
+    // adoptAttempts times (the delays add up to well past the gate's 60 s idle limit).
     let release;
-    try { release = await acquire(); } catch { return false; }
+    for (let attempt = 1, delay = adoptRetryMs; ; attempt += 1, delay = Math.min(delay * 2, adoptMaxDelayMs)) {
+      if (adoptCancelled || watching) return false;
+      // Only the inference gate's refusal is waited out; a hold of this process (a calibration) is not fought over.
+      try { release = await acquire(); break; } catch (e) { if (!e?.fromGate) return false; }
+      if (attempt >= adoptAttempts) { log('[models] throughput sweep still running after a restart, but chat could not be paused for it.'); return false; }
+      await pause(delay);
+    }
+    if (adoptCancelled || watching) { release(); return false; }
     log('[models] throughput sweep still running after a restart: chat paused until it finishes.');
     watch(release, Math.max(1, Number(job.total) || 1));
     return true;

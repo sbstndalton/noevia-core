@@ -756,6 +756,9 @@ function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloa
     gateAdmin: () => gateClient.hasAdmin(),
     // A shutdown: every lease still held is given back (best effort; the gate ends the rest by idle time).
     releaseLeases: options => typeof gateClient.releaseAll === 'function' ? gateClient.releaseAll(options) : Promise.resolve(0),
+    // #2187: at shutdown, the gate's maintenance hold (a sweep, calibration or tune) is given back so the
+    // next process can take it at once instead of waiting for it to expire. Bounded; never throws.
+    releaseMaintenanceHold: options => maintenance.releaseRemote(options),
     // #697 watchdog: unload without waiting behind maintenance; memory is running out. With the admin
     // token it ends a model in use (the gate logs it); without one the gate unloads only an idle model.
     emergencyUnload: model => gateClient.hasAdmin() ? forcedUnload(model, 60000) : post('/models/unload', { model }, 60000),

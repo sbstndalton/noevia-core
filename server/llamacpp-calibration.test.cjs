@@ -166,6 +166,20 @@ test('#1062 a foreignWait that gives up stops calibration as before',async t=>{
   assert.equal(fs.readFileSync(ini,'utf8'),original);
 });
 
+test('#2187: a hold the inference gate refuses for another reason than busy says so; busy keeps its text',async t=>{
+  const {GateError}=require('./inference-gate-client.cjs');
+  for(const [err,status,match,code] of [
+    [new GateError({code:'engine_unavailable',status:502,retryable:true,message:'The local model engine is not answering. Try again shortly.'}),503,/not answering/,'engine_unavailable'],
+    [new GateError({code:'admin_required',status:403,message:"The maintenance hold needs the gate's admin token."}),403,/admin token/,'admin_required'],
+    [Object.assign(Error('Inference is busy.'),{status:409}),409,/^Requests are in progress/,undefined],
+  ]){
+    const {manager}=fixture(t,{extra:{maintenance:{hold:async()=>{throw err;}}}});
+    const r=await manager.calibration.start('synthetic',{promptBudgetSeconds:120,confirmPause:true});
+    assert.equal(r.status,status,err.message);assert.match(r.body.error,match);assert.equal(r.body.code,code);
+    assert.doesNotMatch(status===409?'':r.body.error,/Requests are in progress/);
+  }
+});
+
 test('calibration will not start while requests are in flight',async t=>{
   const {manager}=fixture(t);
   const leave=manager.enterInference();

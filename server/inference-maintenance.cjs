@@ -13,13 +13,19 @@
 //
 // The gate ends a hold its holder neither renews nor uses for its idle limit; this process renews
 // its hold every third of that limit for as long as it holds it. A renewal the gate answers "ended"
-// (it restarted, or the hold expired while this process could not reach it) is logged once and the
-// local hold stays: this process's own chat stays paused until the work ends.
+// (it restarted, or the hold expired while this process could not reach it) takes the hold again
+// (a bounded wait); if that fails the job goes on without the gate's hold (its requests no longer
+// carry a dead token) and this is logged. The local hold stays either way: this process's own chat
+// stays paused until the work ends. A gate found without the hold API is asked again after
+// `reprobeMs`, so a gate upgraded later is used without a restart. releaseRemote() gives the gate's
+// hold back at shutdown (bounded), so a restarted process can take it at once.
 //
 // hold() returns the release function, or (with a remote) a promise of it: callers await it.
-function createMaintenanceGate({ remote = null, log = (line) => console.log(line), setTimer = setInterval, clearTimer = clearInterval } = {}) {
+function createMaintenanceGate({ remote = null, log = (line) => console.log(line), setTimer = setInterval, clearTimer = clearInterval, now = () => Date.now(), reprobeMs = 5 * 60 * 1000, retakeWaitMs = 10000 } = {}) {
   let active=0,maintenance=false,reason='',holdToken=null;
-  let remoteAbsent=!remote;
+  // When the remote last answered that it has no hold API (null: never asked, or asked again since).
+  let absentAt=null;
+  const absent=()=>!remote||(absentAt!==null&&now()-absentAt<reprobeMs);
   const waiting=new Set();
   const wake=()=>{for(const notify of waiting)notify();};
   const busy=()=>Object.assign(Error('Inference is busy. Wait for requests to finish before changing native presets.'),{status:409});
@@ -29,13 +35,24 @@ function createMaintenanceGate({ remote = null, log = (line) => console.log(line
   // The release of a hold that is now this process's (the gate's token, when there is one).
   function holding(message, granted) {
     maintenance=true;reason=message||'';holdToken=granted?.token||null;
-    let released=false,timer=null,lostLogged=false;
+    let released=false,timer=null,renewing=false;
     if(holdToken){
       const every=Math.max(1000,Math.floor((granted.idleTtlMs||60000)/3));
-      const token=holdToken;
       timer=setTimer(async()=>{
-        const renewed=await remote.renewMaintenance(token,reason).catch(()=>null);
-        if(renewed===false&&!lostLogged){lostLogged=true;log('[inference-gate] the gate no longer has this process\'s maintenance hold; other clients may use the engine until this work ends');}
+        if(renewing||!holdToken)return;
+        renewing=true;
+        try{
+          const renewed=await remote.renewMaintenance(holdToken,reason).catch(()=>null);
+          if(renewed!==false||released)return;
+          // The gate has forgotten the hold: take it again, briefly waiting for the engine.
+          let again=null;
+          try{again=await remote.holdMaintenance(reason,{waitMs:retakeWaitMs});}catch{again=null;}
+          if(released){if(again)void remote.releaseMaintenance(again.token);return;}
+          if(again){holdToken=again.token;log('[inference-gate] the gate had lost this process\'s maintenance hold; it was taken again');return;}
+          holdToken=null;
+          if(timer)clearTimer(timer);
+          log('[inference-gate] the gate lost this process\'s maintenance hold and it could not be taken again; this work goes on without it, so other clients may use the engine until it ends');
+        }finally{renewing=false;}
       },every);
       timer?.unref?.();
     }
@@ -54,23 +71,24 @@ function createMaintenanceGate({ remote = null, log = (line) => console.log(line
     };
     return release;
   }
-  // The gate's hold, or null when it has none (then this process holds on its own from now on).
+  // The gate's hold, or null when it has none (then this process holds on its own until reprobeMs).
   async function remoteHold(message, options) {
-    if(remoteAbsent)return null;
+    if(absent())return null;
     const granted=await remote.holdMaintenance(message,options);
-    if(granted===null)remoteAbsent=true;
+    absentAt=granted===null?now():null;
     return granted;
   }
   // Holds the gate until release() for work that outlives one request (calibration jobs).
   // Throws (rejects, with a gate) a 409 while requests are in flight or the gate is held.
   function hold(message) {
     if(maintenance||active)throw busy();
-    if(remoteAbsent)return holding(message,null);
+    if(absent())return holding(message,null);
     // Reserved here at once, so nothing of this process starts while the gate is asked.
     maintenance=true;reason=message||'';
     return remoteHold(message,{}).then(granted=>holding(message,granted),e=>{
       maintenance=false;reason='';wake();
-      throw remoteBusy(e)?busy():e;
+      // fromGate: refused by the inference gate (another client's hold, or its engine busy), not by this process.
+      throw remoteBusy(e)?Object.assign(busy(),{fromGate:true}):e;
     });
   }
   async function holdWhenIdle(message,{timeoutMs=300000,signal}={}) {
@@ -79,7 +97,7 @@ function createMaintenanceGate({ remote = null, log = (line) => console.log(line
     for(;;) {
       if(signal?.aborted)throw Object.assign(Error('Cancelled'),{cancelled:true});
       if(!maintenance&&!active){
-        if(remoteAbsent)return holding(message,null);
+        if(absent())return holding(message,null);
         // The gate waits for other clients' work to end (bounded, in slices so a cancel is prompt);
         // this process's own chat may still start meanwhile, as without a gate.
         let granted;
@@ -98,7 +116,7 @@ function createMaintenanceGate({ remote = null, log = (line) => console.log(line
       }
       const remaining=deadline-Date.now();
       if(remaining<=0)throw Object.assign(Error('Timed out waiting for chat to become idle.'),{idleTimeout:true});
-      if(!maintenance&&!active&&!remoteAbsent)continue;
+      if(!maintenance&&!active&&!absent())continue;
       await new Promise((resolve,reject)=>{
         let timer;
         const done=()=>{clearTimeout(timer);waiting.delete(done);signal?.removeEventListener('abort',abort);resolve();};
@@ -142,7 +160,18 @@ function createMaintenanceGate({ remote = null, log = (line) => console.log(line
     // #2187: the header this process's requests to the engine carry while it holds the gate's hold.
     holdHeaders: () => (holdToken ? { 'X-Noevia-Maintenance': holdToken } : {}),
     // #2187: whether holds go to the inference gate (false: none configured, or it has no hold API).
-    delegated: () => !remoteAbsent,
+    delegated: () => !absent(),
+    // #2187: at shutdown, gives the gate's hold back (bounded) so the next process can take it at once.
+    // Never throws; true when there was a gate hold to give back.
+    async releaseRemote({ timeoutMs = 2000 } = {}) {
+      const token=holdToken;
+      if(!token)return false;
+      holdToken=null;
+      let timer;
+      await Promise.race([remote.releaseMaintenance(token).catch(()=>{}),new Promise(r=>{timer=setTimeout(r,timeoutMs);})]);
+      clearTimeout(timer);
+      return true;
+    },
   };
   return gate;
 }
