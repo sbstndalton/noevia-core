@@ -64,29 +64,20 @@ test('a disabled account\'s device token is refused', (t) => {
   assert.equal(f.deviceAuth.authenticate(bearerReq(tokens.access)), null);
 });
 
-test('F4: revokeAll deletes every grant and pending request and audits each account once (a rust-auth.cjs exemption)', (t) => {
+test('F4: Node has no revoke-all authority; front revocation is visible to its read gate', (t) => {
   const f = fixture(t);
-  const a = seedDeviceToken(f.root, f.userId, { clientName: 'One', now: f.clock.t });
-  const b = seedDeviceToken(f.root, f.userId, { clientName: 'Two', now: f.clock.t });
-  const db = new Database(path.join(f.root, 'cowork.db'));
-  try {
-    db.prepare(`INSERT INTO device_authorizations(device_code_hash,user_code_hash,client_name,ip,user_agent,created_at,expires_at,interval_ms,status,user_id)
-      VALUES('synthetic-device-code','synthetic-user-code','Approved','127.0.0.1','ua',?,?,5000,'approved',?)`).run(f.clock.t, f.clock.t + 600000, f.userId);
-  } finally { db.close(); }
-  // Outside the exemption, Node's connection refuses the same delete.
-  assert.throws(() => f.auth.db.prepare('DELETE FROM device_grants').run(), (e) => e.code === 'RUST_AUTH_OWNED');
-  assert.equal(f.deviceAuth.revokeAll('admin-actor', 'feature-off'), 2);
-  assert.equal(f.deviceAuth.authenticate(bearerReq(a.access)), null);
-  assert.equal(f.deviceAuth.authenticate(bearerReq(b.access)), null);
-  assert.equal(f.auth.db.prepare('SELECT count(*) AS n FROM device_tokens').get().n, 0);
-  assert.equal(f.auth.db.prepare('SELECT count(*) AS n FROM device_authorizations').get().n, 0, 'an approved code cannot be redeemed after the switch-off');
-  const revokes = f.audits.filter(([action]) => action === 'device.revoke_all');
-  assert.deepEqual(revokes.map(([, actor, target, detail]) => [actor, target, detail.count, detail.reason]), [['admin-actor', f.userId, 2, 'feature-off']]);
-  assert.equal(f.deviceAuth.revokeAll('admin-actor', 'feature-off'), 0);
+  const tokens=seedDeviceToken(f.root,f.userId,{now:f.clock.t});
+  assert.equal(f.deviceAuth.revokeAll,undefined);
+  assert.ok(f.deviceAuth.authenticate(bearerReq(tokens.access)));
+  assert.throws(()=>f.auth.db.prepare('DELETE FROM device_grants').run(),e=>e.code==='RUST_AUTH_OWNED');
+  const db=new Database(path.join(f.root,'cowork.db'));
+  try { db.prepare('DELETE FROM device_tokens').run();db.prepare('DELETE FROM device_grants').run(); } finally {db.close();}
+  assert.equal(f.deviceAuth.authenticate(bearerReq(tokens.access)),null);
+  assert.equal(f.audits.length,0,'Node did not perform cleanup/audits; actual native OFF audits are Rust-tested');
 });
 
 test('N3: native-app sign-in cannot be enabled without TRUST_PROXY', () => {
-  const { createFeatures } = require('./features.cjs');
+  const { createFeatures } = require('../tests/server/oracles/features-legacy.cjs');
   const store = () => { const m = new Map(); return { get: (k) => m.get(k), set: (k, v) => m.set(k, v) }; };
   const off = createFeatures({ env: { NOEVIA_FEATURE_NATIVE_CLIENT_AUTH: 'true' }, store: store() });
   assert.equal(off.enabled('nativeClientAuth'), false, 'even the env var cannot switch it on');

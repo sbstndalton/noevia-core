@@ -7,7 +7,7 @@
 //   - the tables' schema (ensureDeviceSchema, run by auth.cjs at boot);
 //   - authenticate: a request's device access token, read-only (the front touches the grant's
 //     last_used_at before it proxies, server-auth upkeep);
-//   - revokeAll: switching the feature off deletes every grant (a rust-auth.cjs exemption, wired
+//   - device-off cleanup and issuance are native-only (no Node revoke API), formerly wired
 //     in index.cjs);
 //   - createRequestAuth and BROWSER_ONLY, the router's single credential check.
 //
@@ -55,21 +55,16 @@ function digest(value) {
 /**
  * @param {object} deps
  * @param {import('better-sqlite3').Database} deps.db       the auth database (auth.cjs)
- * @param {(action:string, actor:string|null, target:string|null, detail?:object) => void} deps.audit
  * @param {(row:object) => object} deps.publicUser          auth.cjs publicUser
- * @param {{ exempt: (fn:() => any) => any }} deps.guard     rust-auth.cjs: revokeAll is its exemption
  * @param {() => number} [deps.now]
  */
-function createDeviceAuth({ db, audit, publicUser, guard, now = Date.now }) {
+function createDeviceAuth({ db, publicUser, now = Date.now }) {
   ensureDeviceSchema(db);
   const q = {
     userRow: db.prepare('SELECT * FROM users WHERE id=?'),
     tokenRow: db.prepare(`SELECT t.token_hash, t.kind, t.expires_at AS token_expires_at, g.id AS grant_id, g.user_id,
         g.client_name, g.expires_at AS grant_expires_at
       FROM device_tokens t JOIN device_grants g ON g.id=t.grant_id WHERE t.token_hash=?`),
-    grantsByUser: db.prepare('SELECT user_id, count(*) AS n FROM device_grants GROUP BY user_id'),
-    deleteAllGrants: db.prepare('DELETE FROM device_grants'),
-    deleteAllAuthorizations: db.prepare('DELETE FROM device_authorizations'),
   };
 
   /**
@@ -92,29 +87,7 @@ function createDeviceAuth({ db, audit, publicUser, guard, now = Date.now }) {
     };
   }
 
-  /**
-   * Deletes every grant, and so every device token (review F4: switching the feature off is a
-   * revoke, not a pause). One audit entry per affected account. Returns the number deleted.
-   */
-  function revokeAll(actorId, reason) {
-    return guard.exempt(() => revokeAllNow(actorId, reason));
-  }
-
-  function revokeAllNow(actorId, reason) {
-    const affected = q.grantsByUser.all();
-    // Pending and approved-but-unredeemed requests too: none may turn into a grant afterwards.
-    q.deleteAllAuthorizations.run();
-    if (!affected.length) return 0;
-    q.deleteAllGrants.run();
-    let total = 0;
-    for (const { user_id: userId, n } of affected) {
-      total += n;
-      audit('device.revoke_all', actorId || null, userId, { count: n, reason });
-    }
-    return total;
-  }
-
-  return { authenticate, revokeAll };
+  return { authenticate };
 }
 
 /** The bearer value when it is a device access token, else ''. Never reads a query string. */

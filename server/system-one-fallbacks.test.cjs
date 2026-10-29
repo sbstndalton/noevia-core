@@ -12,7 +12,7 @@ const test = require('node:test'), assert = require('node:assert/strict');
 const fs = require('node:fs'), os = require('node:os'), path = require('node:path');
 const { createDecisionSettings, SERVICE_LIMITS } = require('./decision-settings.cjs');
 const { createDecisions, causeOf, CAUSE_RE } = require('./decision/index.cjs');
-const { createFeatures } = require('./features.cjs');
+const { createFeatures } = require('../tests/server/oracles/features-legacy.cjs');
 const { createToolGate, offeredProjection, boxesProjection, DEFAULT_BOXES } = require('./tool-gate.cjs');
 const { createStepSupervision } = require('./step-supervision.cjs');
 const { createSystemOneRouter } = require('./system-one-router.cjs');

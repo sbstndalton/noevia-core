@@ -13,7 +13,7 @@ const { BRAIN_SCHEMA, BRAIN_JSON_SCHEMA, LIMITS, validateBrain, parseBrain, rend
   readBrain, writeBrain, removeBrain, createBrainBuilder, createBrainScheduler, MAX_CONTEXT_BRAINS, CONTEXT_INTRO } = brainLib;
 const { renderNote, createChatVaultMirror } = require('./chat-vault-mirror.cjs');
 const { createFramingSettings } = require('./chat-framing.cjs');
-const { REGISTRY, createFeatures } = require('./features.cjs');
+const { REGISTRY, createFeatures } = require('../tests/server/oracles/features-legacy.cjs');
 
 const good = (over = {}) => ({ brain_schema: 1, summary: 'Planning a synthetic garden shed.', decisions: ['Use untreated timber'],
   facts: ['The plot is 3 by 4 metres'], open_questions: ['Is a permit needed?'], entities: ['Garden shed'], ...over });

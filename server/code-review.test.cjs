@@ -13,7 +13,7 @@ const { ACTIONS } = require('./code-actions.cjs');
 const { createPlannerReview, createEngineReviewer, REVIEW_ACTION, INSTRUCTIONS } = require('./code-review.cjs');
 const { readVerdict, boundReviewEvent, VERDICT_SCHEMA } = require('./code-review-verdict.cjs');
 const { buildRoleContext, allowedFields, REVIEW_ROLE, ROLES } = require('./role-context.cjs');
-const { createFeatures } = require('./features.cjs');
+const { createFeatures } = require('../tests/server/oracles/features-legacy.cjs');
 
 const temps = [];
 const temp = (p) => { const d = fs.mkdtempSync(path.join(os.tmpdir(), p)); temps.push(d); return d; };

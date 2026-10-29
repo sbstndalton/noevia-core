@@ -2,8 +2,8 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const { Readable } = require('node:stream');
-const { createFeatures } = require('../features.cjs');
-const { createFeatureRoutes } = require('./features.cjs');
+const { createFeatures } = require('../../tests/server/oracles/features-legacy.cjs');
+const { createFeatureRoutes } = require('../../tests/server/oracles/feature-routes-legacy.cjs');
 
 function harness() {
   const m = new Map();
@@ -46,7 +46,7 @@ test('constrainedPlanDecoding is available since the Code pipeline runs the plan
 });
 
 test('Browser mode without a browser runtime is listed with a reason, refused with 409 and reads false (issue 550)', async () => {
-  const { REGISTRY } = require('../features.cjs');
+  const { REGISTRY } = require('../../tests/server/oracles/features-legacy.cjs');
   const reason = 'Needs Playwright installed on this server; it is not in this image.';
   const registry = { ...REGISTRY, browserExecutor: { ...REGISTRY.browserExecutor, unavailable: () => reason } };
   const m = new Map();

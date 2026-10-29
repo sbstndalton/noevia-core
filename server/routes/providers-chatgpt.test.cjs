@@ -239,7 +239,7 @@ test('#1071: the status GET is the Rust front\'s, so Node always refuses it befo
 });
 
 test('native ChatGPT status: Node writes use current feature truth and device gate stays prior', async () => {
-  const { createFeatures, REGISTRY } = require('../features.cjs');
+  const { createFeatures, REGISTRY } = require('../../tests/server/oracles/features-legacy.cjs');
   const rows = new Map([['feature:chatgptOAuth', 'true']]);
   const store = { get: key => rows.get(key), set: (key, value) => { rows.set(key, value); } };
   const features = createFeatures({ env: {}, store, registry: { chatgptOAuth: REGISTRY.chatgptOAuth } });

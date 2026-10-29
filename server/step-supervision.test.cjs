@@ -62,7 +62,7 @@ test('simultaneous requests have no shared state',async()=>{
   assert.deepEqual(values.map(x=>x.action),['verify','continue']);
 });
 test('unconfigured experiment cannot be activated by setting or operator env',()=>{
-  const {createFeatures}=require('./features.cjs');
+  const {createFeatures}=require('../tests/server/oracles/features-legacy.cjs');
   const features=createFeatures({env:{NOEVIA_FEATURE_STEP_SUPERVISION:'true'}});
   assert.equal(features.enabled('stepSupervision'),false);
   const normal=createFeatures({env:{},store:{get:()=>undefined,set:()=>assert.fail('must not persist activation')}});

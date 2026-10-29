@@ -108,8 +108,9 @@ test('the writers that stay Node\'s still work', async (t) => {
   const authed = f.deviceAuth.authenticate({ headers: { authorization: `Bearer ${grant.access}` } });
   assert.equal(authed.device.id, grant.grantId);
   assert.equal(row(f.auth.db, 'SELECT last_used_at AS u FROM device_grants WHERE id=?', grant.grantId).u, 1, 'the grant touch is the front\'s');
-  assert.equal(f.deviceAuth.revokeAll(f.userId, 'feature-off'), 1);
-  assert.equal(row(f.auth.db, 'SELECT count(*) AS n FROM device_tokens').n, 0);
+  assert.equal(f.deviceAuth.revokeAll,undefined);
+  assert.throws(()=>f.guard.exempt(()=>f.auth.db.prepare('DELETE FROM device_grants').run()),owned);
+  assert.equal(row(f.auth.db, 'SELECT count(*) AS n FROM device_tokens').n, 2, 'Node keeps both tokens; native owns feature-off cleanup');
   // Deleting an account (and its cleanup) is Node's.
   const member = row(f.auth.db, "SELECT id FROM users WHERE username='member'").id;
   assert.equal(f.auth.deleteUser(f.userId, member, 'member'), true);

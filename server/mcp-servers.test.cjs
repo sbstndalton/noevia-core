@@ -62,7 +62,7 @@ test('every box names a server, and boxes for an unconfigured one are not offere
   // that every box names SOME server, and that a box whose server is absent is
   // filtered out rather than offered as a promise nothing can keep.
   const MCP_SERVERS = parseWith({ MCP_SERVER_URL: 'http://nextcloud-mcp:8000/mcp' });
-  const MCP_TOOLBOX_MANIFEST = require('./mcp-toolbox-manifest.cjs').buildToolboxManifest({ features: { enabled: () => false } });
+  const MCP_TOOLBOX_MANIFEST = require('./mcp-toolbox-manifest.cjs').buildToolboxManifest({ diaryMcpWrite:false });
   const configured = new Set(MCP_SERVERS.map((s) => s.id));
   assert.deepEqual([...configured], ['nextcloud']);
 

@@ -133,7 +133,7 @@ test('settings: only the owned keys, literal or bound', () => {
     assert.throws(() => db.prepare('INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)').run(key, 'v'), (e) => e.code === 'RUST_AUTH_OWNED', key);
     assert.throws(() => db.prepare('INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)').run([key, 'v']), (e) => e.code === 'RUST_AUTH_OWNED', key);
   }
-  db.prepare('INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)').run('feature:nativeClientAuth', 'false');
+  assert.throws(()=>db.prepare('INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)').run('feature:nativeClientAuth', 'false'),e=>e.code==='RUST_FEATURES_OWNED');
   // The front's own keys (#1071) are refused with their own codes.
   for (const [key, [, code]] of Object.entries(FRONT_SETTING_KEYS)) {
     assert.throws(() => db.prepare(`INSERT OR REPLACE INTO settings(key,value) VALUES('${key}',?)`).run('v'), (e) => e.code === code, key);

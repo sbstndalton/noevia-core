@@ -67,32 +67,14 @@ function grantCount() {
   try { return db.prepare('SELECT count(*) AS n FROM device_grants').get().n; } finally { db.close(); }
 }
 
-test('starting with the feature off deletes grants left from an earlier "on" period, audited', async () => {
-  assert.equal(grantCount(), 1);
-  await request('/api/ready');
-  assert.equal(grantCount(), 0);
-  const rows = auditRows('device.revoke_all');
-  assert.equal(rows.length, 1);
-  assert.equal(rows[0].target_user_id, adminId);
-  assert.equal(rows[0].detail.reason, 'feature-off');
-});
-
-test('an administrator switching the feature off revokes every device; switching it on again does not revive them', async () => {
-  const { cookie, csrf } = admin;
-  const write = (url, body, method = 'POST') => request(url, { method, body, headers: { cookie, origin: ORIGIN, 'x-csrf-token': csrf } });
-
-  assert.equal((await write('/api/admin/features/nativeClientAuth', { enabled: true }, 'PUT')).status, 200);
-  // A device signed in through the front while the feature is on.
-  const tokens = seedDeviceToken(dataDir, adminId, { clientName: 'Toggle Mac' });
-  assert.equal((await request('/api/workspace', { headers: { authorization: `Bearer ${tokens.access}` } })).status, 200);
-  assert.equal(grantCount(), 1);
-
-  assert.equal((await write('/api/admin/features/nativeClientAuth', { enabled: false }, 'PUT')).status, 200);
-  assert.equal(grantCount(), 0, 'switching off deletes the grants');
-  const rows = auditRows('device.revoke_all');
-  assert.equal(rows.length, 2);
-  assert.equal(rows[1].actor_user_id, adminId, 'the administrator who switched it off is the actor');
-
-  assert.equal((await write('/api/admin/features/nativeClientAuth', { enabled: true }, 'PUT')).status, 200);
-  assert.equal((await request('/api/workspace', { headers: { authorization: `Bearer ${tokens.access}` } })).status, 401);
+test('all direct Node feature paths refuse before auth/body and cannot revoke devices', async()=>{
+  const before=auditRows('feature.set').length;
+  for(const method of ['GET','PUT','POST','DELETE','HEAD','OPTIONS'])for(const url of ['/api/features','/api/admin/features','/api/admin/features/nativeClientAuth','/api/admin/features/%']) {
+    const response=await request(url,{method,body:{enabled:false}});
+    assert.equal(response.status,503);
+    assert.equal(response.json.code,'RUST_FEATURES_OWNED');
+  }
+  assert.equal(auditRows('feature.set').length,before);
+  const Database=require('better-sqlite3');const db=new Database(path.join(dataDir,'cowork.db'));
+  try {assert.equal(db.prepare('SELECT count(*) AS n FROM device_grants').get().n,1,'Node startup and bypass requests do not perform native cleanup');}finally{db.close();}
 });

@@ -5,7 +5,8 @@
 // so the manifest is built once from the injected `features`. `mcp-boxes.cjs` binds a box to
 // a discovered server and `index.cjs` gates its writes.
 
-function buildToolboxManifest({ features }) {
+function buildToolboxManifest({ diaryMcpWrite }) {
+if(typeof diaryMcpWrite!=='boolean')throw new TypeError('Captured Diary construction value required');
 // ── MCP toolboxes (master step 15) ───────────────────────────────────────
 //
 // Curation is by explicit tool NAME, not by app prefix, and that is not
@@ -38,7 +39,7 @@ const MCP_TOOLBOX_MANIFEST = [
     // decision and a sidecar change, not a tool quietly added here.
     // diary_append (D10) is listed only when features.diaryMcpWrite is on; it is not in
     // `reads`, so every call stops at the approval card.
-    tools: ['diary_read_today', 'diary_read_month', 'diary_list_months', ...(features.enabled('diaryMcpWrite') ? ['diary_append'] : [])],
+    tools: ['diary_read_today', 'diary_read_month', 'diary_list_months', ...(diaryMcpWrite ? ['diary_append'] : [])],
     reads: ['diary_read_today', 'diary_read_month', 'diary_list_months'],
   },
   {
