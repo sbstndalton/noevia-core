@@ -44,8 +44,11 @@ function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloa
   const base = String(baseUrl || '').replace(/\/+$/, '').replace(/\/v1$/, '');
   const url = new URL(base);
   if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password || url.search || url.hash) throw Error('Invalid llama.cpp router URL');
+  // #2187: while this process holds the inference gate's maintenance hold, its requests to the
+  // engine carry it (set once the maintenance gate exists, below).
+  let holdHeaders = () => ({});
   function headers(extra) {
-    return { 'Content-Type': 'application/json', ...(apiKey && apiKey !== 'local' ? { Authorization: `Bearer ${apiKey}` } : {}), ...(extra || {}) };
+    return { 'Content-Type': 'application/json', ...(apiKey && apiKey !== 'local' ? { Authorization: `Bearer ${apiKey}` } : {}), ...holdHeaders(), ...(extra || {}) };
   }
   const rawRequest = (path, options = {}, timeout = 8000) => fetchJson(base + path, { ...options, headers: headers(options.headers) }, timeout);
   // #697: every load this process asks for (the Models page, calibration, auto-tune) passes the
@@ -77,7 +80,10 @@ function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloa
   // write by reading models.ini back instead of assuming nothing changed (#339).
   const {commitReconciled}=require('./models-ini-writer.cjs');
   const presets=store ? {...store,commit:(candidate,options)=>commitReconciled(store,candidate,options)} : null;
-  const maintenance=require('./inference-maintenance.cjs').createMaintenanceGate();
+  // #2187: the inference gate is the maintenance authority whenever it is configured (and has the
+  // hold API); this process's own gate is the fallback without one (inference-maintenance.cjs).
+  const maintenance=require('./inference-maintenance.cjs').createMaintenanceGate({remote:typeof gateClient.holdMaintenance==='function'&&gateClient.hasAdmin?.()===true?gateClient:null});
+  holdHeaders=maintenance.holdHeaders;
   // #1012: what the router last read, so a reload can keep loaded models (preset-reload.cjs, #1071: always on).
   const reloadGuard=reloadGuardOption||require('./preset-reload.cjs').createReloadGuard({stateFile:reloadStatePath,log:m=>console.log(m)});
   // Every router preset reload noevia makes goes through here: re-read the file just before the
@@ -716,7 +722,8 @@ function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloa
     // gate between models but still restores settings by revision).
     maintenanceHeld: () => maintenance.held(),
     // #873: the throughput sweep runs outside this process; the proxy holds the gate while it runs.
-    // Throws a 409 when requests are in flight or the gate is already held.
+    // Throws a 409 when requests are in flight or the gate is already held; with the inference
+    // gate as the authority (#2187) it returns a promise of the release instead (callers await it).
     holdMaintenance: reason => maintenance.hold(reason),
     tuningActive: () => maintenance.held() || calibrator?.status().body.job?.status === 'running' || autotuner?.status().body.job?.status === 'running',
     getPreset: model => presets ? Promise.resolve({ok:true,status:200,body:presets.get(model)}) : unsupported('Native preset editing'),
@@ -779,7 +786,6 @@ function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloa
     metrics: model => model ? request('/metrics' + modelQuery(model), {}, 6000) : unsupported('Aggregate metrics'),
     stats,
     systemStats: () => unsupported('Host telemetry'),
-    systemInfo: () => unsupported('Host hardware discovery'),
     variants: repo => require('./llamacpp-variants.cjs').variants(repo, fetchJson),
   };
 }

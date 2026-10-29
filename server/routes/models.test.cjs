@@ -82,12 +82,14 @@ test('every write under /api/models/ is refused for members before anything else
   assert.equal(await f.call('DELETE', '/api/auto-roles'), false, 'an unhandled method keeps falling through');
 });
 
-test('capabilities read the adapter; the roles round-trip and warm up', async () => {
+test('the roles round-trip and warm up; the front\'s model reads are not answered here (#2187)', async () => {
   const f = fixture({ env: { MODEL_LOADER_URL: 'http://loader' } });
-  await f.call('GET', '/api/models/capabilities', undefined, 'admin');
-  assert.deepEqual(f.sent.pop(), { status: 200, body: { kind: 'llamacpp', enabled: true, admin: true, routing: true, modelManagement: true } });
-  await f.call('GET', '/api/models/capabilities');
-  assert.equal(f.sent.pop().body.modelManagement, false, 'members do not see model management');
+  // GET /api/models/capabilities and /hardware are the Rust front's (rust-models.cjs refuses them
+  // before this module); nothing here answers them.
+  assert.equal(await f.call('GET', '/api/models/capabilities', undefined, 'admin'), false);
+  assert.equal(await f.call('GET', '/api/models/hardware', undefined, 'admin'), false);
+  await f.call('PUT', '/api/models/hardware', {}, 'admin');
+  assert.deepEqual(f.sent.pop(), { status: 405, body: { error: 'Method not allowed' } }, 'the hardware path\'s other methods keep their 405');
   await f.call('GET', '/api/auto-roles');
   assert.deepEqual(f.sent.pop(), { status: 200, body: { configured: false, roles: null, missing: { roles: null, catalogue: [{ name: 'm' }] } } });
   await f.call('PUT', '/api/auto-roles', { fast: ' m ', smart: 'm' }, 'admin');
@@ -336,8 +338,6 @@ test('any write under /api/models/ drops the scan, and pull/delete/load keep the
   assert.deepEqual(off.sent.pop(), { status: 404, body: { error: 'model management is disabled' } });
   await off.call('GET', '/api/models/downloads');
   assert.deepEqual(off.sent.pop(), { status: 200, body: [] });
-  await off.call('GET', '/api/models/hardware');
-  assert.deepEqual(off.sent.pop(), { status: 404, body: { error: 'Model manager is disabled. Enter a memory plan manually.' } });
 });
 
 test('engine-specific routes say what is unavailable and guard the method', async () => {
@@ -739,19 +739,6 @@ test('#545: load refuses a preset whose model file is missing with 409, but unlo
   assert.equal(f.sent.pop().status, 200);
   await f.call('POST', '/api/models/load', { name: 'ok' }, 'admin');
   assert.equal(f.sent.pop().status, 200);
-});
-
-test('#629: hardware discovery reports unsupported as a clean 200, real failures stay 502', async () => {
-  for (const status of [404, 501]) {
-    const f = fixture({ manager: { systemInfo: async () => ({ ok: false, status, body: { error: 'Host hardware discovery is not exposed' } }) } });
-    await f.call('GET', '/api/models/hardware');
-    assert.deepEqual(f.sent.pop(), { status: 200, body: { supported: false } }, `manager ${status}`);
-  }
-  for (const systemInfo of [async () => ({ ok: false, status: 503, body: {} }), async () => ({ ok: false }), async () => { throw new Error('down'); }]) {
-    const f = fixture({ manager: { systemInfo } });
-    await f.call('GET', '/api/models/hardware');
-    assert.equal(f.sent.pop().status, 502, 'manager down still surfaces as an error');
-  }
 });
 
 // #697: the inference memory budget setting, the estimates beside it, and the two proxied paths

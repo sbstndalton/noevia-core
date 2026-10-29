@@ -29,7 +29,7 @@ const { isSystemModel, modelPathFromArgs, SYSTEM_MODEL_DELETE_REASON, SYSTEM_MOD
 // the router's error shape; the model manager passes on a refusal it got while asking for a lease in its own shape.
 // Other failures (the memory budget, for one) keep their answers.
 const GATE_CODES = new Set(['inference_queue_full', 'inference_queue_timeout', 'engine_unavailable', 'engine_switch_stuck', 'lease_unknown',
-  'model_in_use', 'engine_busy', 'gate_busy', 'model_not_found', 'admin_required']);
+  'model_in_use', 'engine_busy', 'gate_busy', 'model_not_found', 'admin_required', 'maintenance_held']);
 function refusalOf(r) {
   const b = r?.body, e = b?.error;
   if (!Number.isInteger(r?.status) || r.status < 400 || r.status > 599) return null;
@@ -319,7 +319,7 @@ function createModelRoutes({ servedEmbeddingModels = (target) => require('../rag
           if(refusal)return json(res,409,refusal);
         }
         if(sweepGuard&&aliases.length){
-          try{sweepRelease=sweepGuard.acquire();}catch(e){return json(res,409,{error:e.publicMessage||'The sweep could not start.'});}
+          try{sweepRelease=await sweepGuard.acquire();}catch(e){return json(res,409,{error:e.publicMessage||'The sweep could not start.'});}
           sweepModels=aliases.length;
         }
       }
@@ -597,22 +597,10 @@ function createModelRoutes({ servedEmbeddingModels = (target) => require('../rag
       return json(res,result.status,result.body);
     }
 
-    if (p === '/api/models/capabilities' && req.method === 'GET') {
-      return json(res,200,{kind:modelManager.kind,enabled:modelManager.enabled,admin:authn.user.role==='admin',...modelManager.capabilities,modelManagement:!!env.MODEL_LOADER_URL&&authn.user.role==='admin'});
-    }
-
-    if (p === '/api/models/hardware') {
-      if(req.method!=='GET')return json(res,405,{error:'Method not allowed'});
-      if(!modelManager.enabled)return json(res,404,{error:'Model manager is disabled. Enter a memory plan manually.'});
-      try {
-        const result=await modelManager.systemInfo();
-        // #629: a manager that cannot discover hardware (404/501, e.g. the llama.cpp adapter) is a normal
-        // capability answer, not a gateway failure. Genuine failures still surface as 502 below.
-        if(!result.ok&&(result.status===404||result.status===501))return json(res,200,{supported:false});
-        if(!result.ok)return json(res,502,{error:'Inference hardware is unavailable. Enter a memory plan manually or retry.'});
-        return json(res,200,require('../model-hardware.cjs').modelHardware(result.body));
-      } catch { return json(res,502,{error:'Could not read inference hardware. Enter a memory plan manually or retry.'}); }
-    }
+    // #2187: GET /api/models/capabilities and GET /api/models/hardware are the Rust front's
+    // (rust-models.cjs refuses them before authentication). The hardware path's other methods keep
+    // their 405 here; the capabilities path never had other methods (they fall through).
+    if (p === '/api/models/hardware' && req.method !== 'GET') return json(res,405,{error:'Method not allowed'});
 
     // #1662: what each model-backed service uses, for every signed-in user (read-only for members).
     if (p === '/api/models/assignments') {
