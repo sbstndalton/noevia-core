@@ -58,19 +58,15 @@ test('storage that fails the origin policy is sent as blocked, never as its cred
   assert.equal(JSON.stringify(h).includes('pw'), false);
 });
 
-test('the sidecar corpus source lists real months sorted and reads a month or today', async () => {
-  const f = fixture({ reply: (url) => (url.endsWith('/api/months')
-    ? { ok: true, status: 200, body: { months: [{ id: '2026-09', label: 'September 2026' }, { id: 'nope' }, { id: '2026-08' }] } }
-    : url.includes('month=') ? { ok: true, status: 200, body: { log: 'MONTH', standing: 'S' } } : { ok: true, status: 200, body: { today_log: 'TODAY' } }) });
+test('the sidecar corpus source reads a month or today; the month list is the Rust front\'s now', async () => {
+  const f = fixture({ reply: (url) => (url.includes('month=') ? { ok: true, status: 200, body: { log: 'MONTH', standing: 'S' } } : { ok: true, status: 200, body: { today_log: 'TODAY' } }) });
   assert.equal(f.diary.corpusSource.name, 'sidecar');
-  assert.deepEqual(await f.diary.corpusSource.listMonths(), [{ id: '2026-08', label: '2026-08' }, { id: '2026-09', label: 'September 2026' }]);
-  assert.deepEqual(await f.diary.corpusSource.readMonth('2026-09'), { todayLog: 'MONTH', standing: 'S' });
-  assert.deepEqual(await f.diary.corpusSource.readMonth(null), { todayLog: 'TODAY', standing: '' });
-  assert.equal(f.fetched[1].url, 'http://diary:8010/api/day?month=2026-09');
-  const down = fixture({ reply: () => { throw new Error('unreachable'); } });
-  assert.deepEqual(await down.diary.corpusSource.listMonths(), [], 'a failed listing is an empty list, not an error');
+  assert.equal(f.diary.corpusSource.listMonths, undefined, '#2185: GET /api/diary/source is answered by noevia-rs crates/server-diary');
+  assert.deepEqual(await f.asUser('u1', () => f.diary.corpusSource.readMonth('2026-09')), { todayLog: 'MONTH', standing: 'S' });
+  assert.deepEqual(await f.asUser('u1', () => f.diary.corpusSource.readMonth(null)), { todayLog: 'TODAY', standing: '' });
+  assert.equal(f.fetched[0].url, 'http://diary:8010/api/day?month=2026-09');
   const failing = fixture({ reply: () => ({ ok: false, status: 503, body: null }) });
-  await assert.rejects(failing.diary.corpusSource.readMonth(null), /sidecar 503/);
+  await assert.rejects(failing.asUser('u1', () => failing.diary.corpusSource.readMonth(null)), /sidecar 503/);
 });
 
 test('an unsupported DIARY_SOURCE fails at startup and names the value', () => {

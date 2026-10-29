@@ -135,7 +135,8 @@ test('the 428 retry re-signs the same buffered body and query with a fresh nonce
 test('every Diary call made inside a workspace scope names the tenant and is signed', async () => {
   const f = fixture({ storage: remote, reply: () => ({ ok: true, status: 200, body: { months: [], files: [] } }) });
   await f.asUser(async () => {
-    await f.diary.corpusSource.listMonths();
+    // (the month list itself is the Rust front's since #2185; the same GET through the shared client)
+    await f.diary.diaryFetchJson('http://diary:8010/api/months', {}, 1000);
     await f.diary.corpusSource.readMonth('2026-09');
     await f.diary.diaryFetchJson('http://diary:8010/api/storage-status', {}, 1000);
   });
