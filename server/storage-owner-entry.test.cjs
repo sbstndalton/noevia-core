@@ -122,7 +122,7 @@ test('M4_ENTRY/complete_original_index', { concurrency: false }, async t => {
     global.fetch = async (input, init) => {
       const target = new URL(String(input?.url ?? input));
       if (target.protocol === 'http:' && target.hostname === '127.0.0.1' && target.port === process.env.NOEVIA_PROJECT_STORE_PORT
-        && target.pathname === '/v1/features/context') return realFetch(input, init);
+        && target.pathname === '/v1/features/context' && init?.method === 'POST') return realFetch(input, init);
       assert.fail('M4_ENTRY/unexpected_network');
     };
     const { createSecretStore } = require('./secrets.cjs');

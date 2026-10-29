@@ -44,7 +44,7 @@ test('Core becomes ready through the stand-in store with the shared start id', a
     assert.match(node.given, /^[0-9a-f]{32}$/);
     const ok = await until(async () => {
       if (node.proc.exitCode !== null) assert.fail(`Core exited: ${node.errors()}`);
-      try { return (await fetch(`http://127.0.0.1:${node.port}/api/ready`)).ok; } catch { return false; }
+      try { return (await fetch(`http://127.0.0.1:${node.port}/api/ready`, { signal: AbortSignal.timeout(2000) })).ok; } catch { return false; }
     }, 30000);
     assert.ok(ok, `Core did not become ready: ${node.errors()}`);
   } finally { await node.cleanup(); }

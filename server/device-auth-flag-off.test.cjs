@@ -74,5 +74,5 @@ test('with the feature off, the approval page is 404 and the device endpoints ar
   const { REGISTRY } = require('./features.cjs');
   assert.notEqual(REGISTRY.nativeClientAuth.default, true);
   const legacy = require('../tests/server/oracles/features-legacy.cjs');
-  assert.equal(legacy.createFeatures({ env: {}, store: { get: () => undefined, set() {} } }).flags().nativeClientAuth, false);
+  assert.equal(legacy.createFeatures({ env: { TRUST_PROXY: 'true' }, store: { get: () => undefined, set() {} } }).flags().nativeClientAuth, false);
 });

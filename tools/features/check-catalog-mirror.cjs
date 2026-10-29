@@ -125,6 +125,7 @@ try {
   assert.equal(db.prepare("SELECT value FROM settings WHERE key='feature:plannerReview'").get().value, fixture.legacy.updated);
   // The facade is read-only: no writer is reachable from it.
   for (const name of ['set', 'delete', 'reset', 'migrate']) assert.equal(features[name], undefined, name);
+  assert.ok(cases > 0 && transitions > 0, 'the pinned fixture must hold cases and transitions');
   console.log(`feature catalog mirror: ${catalog.features.length} definitions, ${cases} cases, ${transitions} native transitions, legacy alias`);
 } finally {
   Module._resolveFilename = resolveFilename;
