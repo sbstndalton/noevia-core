@@ -405,6 +405,8 @@ const modelManager = createModelManager({
 // noevia#2115: leases still held when the process is told to stop are given back (best effort, a short wait); the
 // gate would otherwise end them only after its idle time, holding its queue for that long.
 if (typeof modelManager.releaseLeases === 'function') shutdownHooks.add(() => modelManager.releaseLeases({ timeoutMs: 2000 }));
+// #2187: so is the inference gate's maintenance hold; a sweep that outlives the restart is adopted again (benchmark-sweep-guard.cjs).
+if (typeof modelManager.releaseMaintenanceHold === 'function') shutdownHooks.add(() => modelManager.releaseMaintenanceHold({ timeoutMs: 2000 }));
 // Without the admin token the memory watchdog and "unload anyway" cannot end a model that is answering a request.
 {
   const warning = typeof modelManager.gateAdmin === 'function' && !modelManager.gateAdmin() ? require('./inference-gate-client.cjs').adminTokenWarning() : null;
@@ -1237,6 +1239,8 @@ async function handleRequestInner(req, res) {
   if (require('./routes/features.cjs').refuseOwnedFeatures(req, res, { parseRequestUrl, json })) return;
   // The Diary routes that are only a proxy and a policy are the Rust front's (#2185).
   if (require('./rust-diary.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
+  // So are the two configuration-only model reads (#2187): GET /api/models/capabilities and /hardware.
+  if (require('./rust-models.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   await readyFeatures();
   const preAuth = requestAuth.authenticate(req);
   // accountRole: a device token acts as a member, but its account's workspace is the same one.

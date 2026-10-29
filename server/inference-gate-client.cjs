@@ -17,8 +17,16 @@
 // 404 with its own error), turns run without a lease and the router's own queue decides; this is
 // said once in the log. The gate's refusals are GateErrors with a stable code, an HTTP status, a
 // retryable flag and plain text for people; never a model's output or a request body.
+//
+// sbstndalton/noevia#2187: the gate is also the one maintenance authority. holdMaintenance() takes
+// its maintenance hold (`POST /gate/v1/maintenance`, admin only) for inference-maintenance.cjs; the
+// hold's requests carry it in `X-Noevia-Maintenance`, renewMaintenance() keeps it from expiring and
+// releaseMaintenance() gives it back. Without an admin token, or when nothing at the engine address
+// knows the hold (a router without a gate, or a gate from before #2187: 404), holdMaintenance()
+// answers null and the caller keeps its own in-process hold; that is said once in the log.
 const { readCappedText } = require('./http.cjs');
 const LEASE_HEADER = 'X-Noevia-Lease';
+const HOLD_HEADER = 'X-Noevia-Maintenance';
 const ADMIN_HEADER = 'X-Noevia-Gate-Admin';
 const CLIENT_HEADER = 'X-Noevia-Client';
 const REFUSAL_HEADER = 'x-noevia-gate-refusal';
@@ -27,6 +35,8 @@ const LEASE_TOKEN = /^[0-9a-f]{32}$/;
 // not the gate's.
 const MAX_EVENT_BYTES = 16384;
 const RELEASE_TIMEOUT_MS = 5000;
+// The gate waits at most this long for the engine to become idle per hold request.
+const MAX_HOLD_WAIT_MS = 600000;
 
 class GateError extends Error {
   constructor({ code, message, status = 503, retryable = false }) {
@@ -76,12 +86,15 @@ async function* sseEvents(body) {
 /**
  * @param {{ baseUrl: string, fetch?: typeof fetch, adminToken?: string|null, holder?: string, log?: (line: string) => void }} options
  */
-function createGateClient({ baseUrl, fetch = (url, init) => globalThis.fetch(url, init), adminToken = null, holder = 'web', log = (line) => console.log(line) }) {
+function createGateClient({ baseUrl, fetch = (url, init) => globalThis.fetch(url, init), adminToken = null, holder = 'web', log = (line) => console.log(line), now = () => Date.now(), holdReprobeMs = 5 * 60 * 1000 }) {
   const base = String(baseUrl || '').replace(/\/+$/, '').replace(/\/v1$/, '');
   const origin = (() => { try { return new URL(base).origin; } catch { return null; } })();
   const token = typeof adminToken === 'string' && adminToken.trim() ? adminToken.trim() : null;
   let waiting = 0;
   let absentLogged = false;
+  // When nothing at the engine address knew the maintenance hold; asked again after holdReprobeMs
+  // (a gate upgraded since is then used without a restart).
+  let holdAbsentAt = null;
   const held = new Set(); // leases not yet given back, for a shutdown
   const detachedLogged = new Set(); // addresses a lease was not attached to, said once each
 
@@ -222,8 +235,74 @@ function createGateClient({ baseUrl, fetch = (url, init) => globalThis.fetch(url
     try { return new URL(String(url)).origin === origin; } catch { return false; }
   }
 
+  // A JSON answer of the gate's own endpoints: { status, body } (body null when not JSON).
+  async function gateJson(path, { method = 'POST', body, signal, timeoutMs = RELEASE_TIMEOUT_MS } = {}) {
+    const limit = AbortSignal.timeout(timeoutMs);
+    let response;
+    try {
+      response = await fetch(`${base}${path}`, { method, headers: { 'Content-Type': 'application/json', [ADMIN_HEADER]: token, [CLIENT_HEADER]: holder },
+        ...(body === undefined ? {} : { body: JSON.stringify(body) }), signal: signal ? AbortSignal.any([signal, limit]) : limit, redirect: 'error' });
+    } catch (error) {
+      if (signal?.aborted) throw signal.reason;
+      throw unavailable();
+    }
+    let parsed = null;
+    try { const text = (await readCappedText(response, MAX_EVENT_BYTES)).text; parsed = text ? JSON.parse(text) : null; } catch { parsed = null; }
+    return { status: response.status, body: parsed };
+  }
+
+  /**
+   * Takes the gate's maintenance hold. Resolves to { token, idleTtlMs }, or to null when this
+   * process has no admin token or nothing at the engine address knows the hold (the caller then
+   * holds in process only). Throws a GateError for a refusal: 409 `engine_busy` (work is running;
+   * after up to `waitMs` of waiting for it to end), 503 `maintenance_held` (another client holds it),
+   * 403 `admin_required` (the token is not the gate's), 502 `engine_unavailable` (no answer), and
+   * the signal's reason when it is aborted.
+   * @param {string} reason  plain text for people (shown in the gate's status)
+   * @param {{ waitMs?: number, signal?: AbortSignal }} [options]
+   */
+  async function holdMaintenance(reason, { waitMs = 0, signal } = {}) {
+    signal?.throwIfAborted();
+    if (!token || (holdAbsentAt !== null && now() - holdAbsentAt < holdReprobeMs)) return null;
+    const wait = Math.max(0, Math.min(MAX_HOLD_WAIT_MS, Math.floor(Number(waitMs) || 0)));
+    const { status, body } = await gateJson('/gate/v1/maintenance', { body: { reason: String(reason || '').slice(0, 300), wait_ms: wait }, signal, timeoutMs: wait + 10000 });
+    if (status !== 404 && holdAbsentAt !== null) {
+      log('[inference-gate] the engine address now has the maintenance hold; holds go to the gate again');
+      holdAbsentAt = null;
+    }
+    if (status === 201 && typeof body?.hold === 'string' && LEASE_TOKEN.test(body.hold)) {
+      return { token: body.hold, idleTtlMs: Number.isSafeInteger(body.idle_ttl_ms) && body.idle_ttl_ms > 0 ? body.idle_ttl_ms : 60000 };
+    }
+    const refusal = refusalOf(status, body);
+    if (status === 404 && (!refusal || refusal.code === 'not_found')) {
+      if (holdAbsentAt === null) log('[inference-gate] the engine address has no maintenance hold (no gate, or an older one); this process holds maintenance on its own');
+      holdAbsentAt = now();
+      return null;
+    }
+    if (refusal) throw refusal;
+    throw unavailable();
+  }
+
+  /** Keeps the hold `holdToken` from expiring (and sets its reason). true: renewed; false: it has ended; null: no answer. */
+  async function renewMaintenance(holdToken, reason) {
+    try {
+      const { status } = await gateJson(`/gate/v1/maintenance/${holdToken}/renew`, { body: reason === undefined ? {} : { reason: String(reason || '').slice(0, 300) } });
+      if (status === 200) return true;
+      if (status === 404) return false;
+      return null;
+    } catch { return null; }
+  }
+
+  /** Gives the hold back. Never throws (the gate ends a hold that is not renewed on its own). */
+  async function releaseMaintenance(holdToken) {
+    try { await gateJson(`/gate/v1/maintenance/${holdToken}`, { method: 'DELETE' }); } catch { /* expires on its own */ }
+  }
+
   return {
     acquire,
+    holdMaintenance,
+    renewMaintenance,
+    releaseMaintenance,
     /** Gives back every lease still held (a shutdown); best effort, bounded by `timeoutMs`. Never throws. */
     releaseAll: async ({ timeoutMs = 2000 } = {}) => {
       const open = [...held];
@@ -260,4 +339,4 @@ const replayable = (body) => body === undefined || body === null || typeof body 
 // The boot warning when the gate's admin token is not set (the key name only, never a value).
 const adminTokenWarning = () => '[inference-gate] INFERENCE_GATE_ADMIN_TOKEN is not set: the memory watchdog cannot unload a model that is answering a request, and "unload anyway" on the Models page is unavailable. Set it to the admin token of the gate.';
 
-module.exports = { adminTokenWarning, createGateClient, GateError, LEASE_HEADER, ADMIN_HEADER, REFUSAL_HEADER, sseEvents };
+module.exports = { adminTokenWarning, createGateClient, GateError, LEASE_HEADER, HOLD_HEADER, ADMIN_HEADER, REFUSAL_HEADER, sseEvents };

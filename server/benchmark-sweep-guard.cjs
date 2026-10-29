@@ -21,10 +21,18 @@ function createSweepGuard({ hold, progress, log = () => {}, pollMs = 5000, perMo
   adoptRetryMs = 2000, adoptMaxDelayMs = 60 * 1000, adoptAttempts = 10 }) {
   let watching = null, adoptTimer = null, adoptWake = null, adoptCancelled = false;
 
-  // Takes the gate or throws a 409 for the client. Returns a release that is safe to call twice.
+  // Takes the gate or throws a 409 for the client. Returns a release that is safe to call twice,
+  // or (when the hold goes to the inference gate, #2187) a promise of it that rejects with the 409:
+  // callers await it.
   function acquire() {
-    try { return hold(SWEEP_PAUSE_REASON); }
-    catch { throw Object.assign(Error(SWEEP_BUSY_ERROR), { status: 409, publicMessage: SWEEP_BUSY_ERROR }); }
+    const refusal = () => Object.assign(Error(SWEEP_BUSY_ERROR), { status: 409, publicMessage: SWEEP_BUSY_ERROR });
+    let held;
+    // waitable: a refusal that ends on its own (the inference gate's, this process's chat running, or
+    // the gate not answering), unlike a hold of this process (a calibration), which is not fought over.
+    const waitable = (e) => e?.fromGate === true || e?.chatActive === true || e?.status === 502;
+    try { held = hold(SWEEP_PAUSE_REASON); } catch (e) { throw Object.assign(refusal(), { waitable: waitable(e) }); }
+    if (typeof held?.then === 'function') return held.catch((e) => { throw Object.assign(refusal(), { waitable: waitable(e) }); });
+    return held;
   }
 
   // Keeps the gate until the model manager says the sweep is over. `models` bounds the hold.
@@ -83,8 +91,18 @@ function createSweepGuard({ hold, progress, log = () => {}, pollMs = 5000, perMo
     }
     // Only a throughput sweep (counted in models) runs outside the engine; the prompt suite does not.
     if (!job || job.active !== true || job.unit !== 'models' || watching) return false;
+    // #2187: the previous process's gate hold may still be live (it ends when released or after its idle
+    // limit), and a chat may be finishing: the hold is asked for again with the same doubling delay, at most
+    // adoptAttempts times (the delays add up to well past the gate's 60 s idle limit).
     let release;
-    try { release = acquire(); } catch { return false; }
+    for (let attempt = 1, delay = adoptRetryMs; ; attempt += 1, delay = Math.min(delay * 2, adoptMaxDelayMs)) {
+      if (adoptCancelled || watching) return false;
+      // Only a refusal that ends on its own is waited out; a hold of this process (a calibration) is not fought over.
+      try { release = await acquire(); break; } catch (e) { if (!e?.waitable) return false; }
+      if (attempt >= adoptAttempts) { log('[models] throughput sweep still running after a restart, but chat could not be paused for it.'); return false; }
+      await pause(delay);
+    }
+    if (adoptCancelled || watching) { release(); return false; }
     log('[models] throughput sweep still running after a restart: chat paused until it finishes.');
     watch(release, Math.max(1, Number(job.total) || 1));
     return true;

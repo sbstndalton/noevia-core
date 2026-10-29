@@ -517,8 +517,13 @@ function createCalibrator(deps) {
       return { ok: false, status: err.status || 503, body: { error: `Calibration is unavailable: ${err.message}`, code: 'autoconfig_impl' } };
     }
     let release;
-    try { release = maintenance.hold(`Chat is paused while noevia calibrates ${model}. It will be available again when calibration finishes or is cancelled.`); }
-    catch { return { ok: false, status: 409, body: { error: 'Requests are in progress. Wait for them to finish, then start calibration.' } }; }
+    try { release = await maintenance.hold(`Chat is paused while noevia calibrates ${model}. It will be available again when calibration finishes or is cancelled.`); }
+    catch (err) {
+      if (err?.status === 409 || !err?.status) return { ok: false, status: 409, body: { error: 'Requests are in progress. Wait for them to finish, then start calibration.' } };
+      // #2187: the inference gate refused the hold for another reason (not answering, a wrong admin token).
+      // A token mismatch is this server's configuration, not the browser's credentials: 503, as models-ini-writer does.
+      return { ok: false, status: err.status >= 500 || err.status === 401 || err.status === 403 ? 503 : err.status, body: { error: `Calibration could not pause chat: ${err.publicMessage || 'the inference gate refused the maintenance hold.'}`, ...(err.code ? { code: err.code } : {}) } };
+    }
     cancelRequested = false;
     const job = { id: crypto.randomUUID(), model, promptBudgetSeconds, native, base, status: 'running', phase: 'Preparing', startedAt: now(), steps: [], memoryFloorGib, memoryGuard: readMemory() == null ? 'unavailable' : 'active' };
     state.job = job;
