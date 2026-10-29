@@ -1216,7 +1216,21 @@ const mcpDirectoryRoutes = require('./routes/mcp-directory.cjs').createMcpDirect
   onToolsChange: () => permittedToolsCache.clear(),
 });
 
+// The headers every page and API reply carries, the refusals answered before authentication too.
+function publicHeaders(res) {
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('Referrer-Policy', 'same-origin');
+  res.setHeader('X-Frame-Options', 'DENY');
+  res.setHeader('Content-Security-Policy', "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; font-src 'self'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'");
+  // #1480: HSTS for six months, no includeSubDomains (nothing else on this host is known to need HTTP).
+  res.setHeader('Strict-Transport-Security', 'max-age=15552000');
+  // #1480: the browser features this app never calls are switched off for every page and API reply.
+  res.setHeader('Permissions-Policy', 'camera=(), microphone=(), geolocation=(), payment=(), usb=(), serial=(), bluetooth=(), hid=(), midi=(), magnetometer=(), gyroscope=(), accelerometer=()');
+}
+
 async function handleRequestInner(req, res) {
+  // The ownership refusals below answer before handleRequestScoped; they carry the same headers.
+  publicHeaders(res);
   // GET /api/integrations/storage is the Rust front's (#1071): refused before authentication.
   if (require('./features.cjs').refuseRustStorageRead(req, res, { parseRequestUrl, badRequestUrl, json })) return;
   if (require('./routes/chat-framing.cjs').refuseOwnedPreferences(req, res, { parseRequestUrl, json })) return;
@@ -1252,14 +1266,7 @@ async function handleRequestScoped(req, res) {
   const url = parseRequestUrl(req, `http://${req.headers.host || 'localhost'}`) || parseRequestUrl(req);
   if (!url) return badRequestUrl(res);
   const p = url.pathname;
-  res.setHeader('X-Content-Type-Options', 'nosniff');
-  res.setHeader('Referrer-Policy', 'same-origin');
-  res.setHeader('X-Frame-Options', 'DENY');
-  res.setHeader('Content-Security-Policy', "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; font-src 'self'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'");
-  // #1480: HSTS for six months, no includeSubDomains (nothing else on this host is known to need HTTP).
-  res.setHeader('Strict-Transport-Security', 'max-age=15552000');
-  // #1480: the browser features this app never calls are switched off for every page and API reply.
-  res.setHeader('Permissions-Policy', 'camera=(), microphone=(), geolocation=(), payment=(), usb=(), serial=(), bluetooth=(), hid=(), midi=(), magnetometer=(), gyroscope=(), accelerometer=()');
+  publicHeaders(res);
 
   try {
     if ((req.method === 'GET' || req.method === 'HEAD') && publicPage(p)) {

@@ -296,7 +296,7 @@ function createHandler(dataDir, token, writes = [], failures = [], { changes = f
   const contextIncarnation=crypto.randomBytes(16).toString('hex');
   let contextInstalled=false;
   const contextReply=body=>{
-    const db=new (require('better-sqlite3'))(path.join(dataDir,'cowork.db'),{fileMustExist:true});
+    const db=new (require(require.resolve('better-sqlite3',{paths:[path.join(__dirname,'..','..','server')]})))(path.join(dataDir,'cowork.db'),{fileMustExist:true});
     try {
       if(body.op==='hello') {
         if(!contextInstalled) {db.prepare('INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)').run('native:feature-runtime:incarnation',contextIncarnation);contextInstalled=true;}
