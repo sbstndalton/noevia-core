@@ -111,6 +111,8 @@ test('through the router: owned routes are refused signed out and signed in, kep
   for (const [method, url] of [
     ['GET', '/api/diary/source'], ['GET', '/api/diary/today?month=2026-09'], ['POST', '/api/diary/storage-import'],
     ['GET', '/api/diary/workspace-export'], ['POST', '/api/diary/workspace-import?action=preview'], ['DELETE', '/api/diary/source'],
+    // Routed on the WHATWG pathname, as the router routes: dot-segments still reach the refusal.
+    ['GET', '/api/diary/./source'], ['GET', '/api/diary/x/../today'], ['GET', '/api/diary/%2e/workspace-export'],
   ]) {
     for (const headers of [{}, as(member), as(withDiary)]) {
       const r = await request(url, { method, headers, body: method === 'POST' ? '{}' : undefined });
@@ -118,6 +120,11 @@ test('through the router: owned routes are refused signed out and signed in, kep
       assert.deepEqual(r.json, ROUTE_REFUSAL, `${method} ${url}`);
       assert.equal(r.headers['x-noevia-api'], '1');
       assert.equal(r.headers['cache-control'], 'no-store');
+      // The refusal carries the public hardening headers (publicHeaders runs before it).
+      assert.equal(r.headers['x-content-type-options'], 'nosniff', `${method} ${url}`);
+      assert.equal(r.headers['x-frame-options'], 'DENY', `${method} ${url}`);
+      assert.ok(String(r.headers['content-security-policy']).includes("frame-ancestors 'none'"), `${method} ${url}`);
+      assert.equal(r.headers['strict-transport-security'], 'max-age=15552000', `${method} ${url}`);
     }
   }
   // Positive controls: the routes Node keeps still run the ordinary chain (auth, then the add-on gate).
