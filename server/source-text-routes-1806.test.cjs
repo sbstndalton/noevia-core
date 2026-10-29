@@ -46,6 +46,8 @@ test.before(async () => {
 const mutation = () => ({ origin: 'http://localhost', cookie, 'content-type': 'application/json', 'x-csrf-token': csrf });
 const workspace = async () => JSON.parse((await request('/api/workspace', { headers: { cookie } })).text);
 const textUrl = (id, name) => `/api/projects/${encodeURIComponent(id)}/sources/text?name=${encodeURIComponent(name)}`;
+// #2191: the per-source text route is the Rust front's; the stored text is read as it reads it.
+const stored = require('../tests/server/stored-sources.cjs');
 
 const NOTES = '# Synthetic notes\n\nThe synthetic code word is CEDAR-1806.';
 const PLAN = 'Synthetic plan: ship the widget.';
@@ -65,38 +67,17 @@ test('#1806: /api/workspace sends source metadata only; the text is fetched per 
     ['docs/plan.txt', false, PLAN.length, crypto.createHash('sha256').update(PLAN).digest('hex')],
   ]);
 
-  const one = await request(textUrl(id, 'docs/plan.txt'), { headers: { cookie } });
-  assert.equal(one.status, 200, one.text);
-  assert.deepEqual(JSON.parse(one.text), { name: 'docs/plan.txt', content: PLAN, chars: PLAN.length });
+  const one = stored.sourceText(testDataDir, id, 'docs/plan.txt');
+  assert.equal(one.status, 200, JSON.stringify(one.json));
+  assert.deepEqual(one.json, { name: 'docs/plan.txt', content: PLAN, chars: PLAN.length });
 });
 
-test('#1806: the per-source text answers its owner only: signed out 401, another tenant\'s project 404, unknown 404, no name 400', async () => {
+test('#2191: Node refuses the per-source text read, signed in or not; the front answers it (noevia-rs tests/project_reads.rs covers its owner-only scope)', async () => {
   const id = (await workspace()).projects.find((p) => p.name === 'Synthetic 1806').id;
-  assert.equal((await request(textUrl(id, 'notes.md'))).status, 401, 'signed out');
-  assert.equal((await request(textUrl(id, 'missing.md'), { headers: { cookie } })).status, 404, 'unknown source');
-  assert.equal((await request(textUrl('proj-nope', 'notes.md'), { headers: { cookie } })).status, 404, 'unknown project');
-  assert.equal((await request(`/api/projects/${id}/sources/text`, { headers: { cookie } })).status, 400, 'no name');
-  // An internal project (a free chat's attachments) exists for this person but is not listed, so it is refused as a project.
-  // Context creation is Rust-owned; seed its output for this Node source-route test.
-  const users = path.join(testDataDir, 'users');
-  const user = fs.readdirSync(users).find((id) => fs.existsSync(path.join(users, id, 'projects.json')));
-  const file = path.join(users, user, 'projects.json');
-  const stored = JSON.parse(fs.readFileSync(file, 'utf8'));
-  stored.projects.push({ id: 'cowork-chat-context-c-1806-synthetic', files: [] });
-  fs.writeFileSync(file, JSON.stringify(stored));
-  const internal = await request(textUrl('cowork-chat-context-c-1806-synthetic', 'notes.md'), { headers: { cookie } });
-  assert.deepEqual([internal.status, JSON.parse(internal.text).error], [404, 'no such project']);
-
-  // Another person's workspace, on disk beside this one: its project id is not this person's.
-  const other = path.join(testDataDir, 'users', '99999999-8888-4777-8666-555555555555');
-  fs.mkdirSync(path.join(other, 'project-sources', 'proj-other'), { recursive: true });
-  const secret = 'another tenant synthetic secret';
-  const ref = crypto.createHash('sha256').update(secret).digest('hex');
-  fs.writeFileSync(path.join(other, 'project-sources', 'proj-other', `${ref}.txt`), secret);
-  fs.writeFileSync(path.join(other, 'projects.json'), JSON.stringify({ projects: [{ id: 'proj-other', name: 'Other', files: [{ name: 'secret.md', textRef: ref, chars: secret.length }] }] }));
-  const cross = await request(textUrl('proj-other', 'secret.md'), { headers: { cookie } });
-  assert.equal(cross.status, 404);
-  assert.ok(!cross.text.includes(secret));
+  for (const headers of [{}, { cookie }]) for (const url of [textUrl(id, 'notes.md'), `/api/projects/${id}/sources/text`, textUrl('proj-nope', 'notes.md')]) {
+    const r = await request(url, { headers });
+    assert.deepEqual([r.status, JSON.parse(r.text).code], [503, 'RUST_PROJECT_READS_OWNED'], url);
+  }
 });
 
 test('#1806: a config save listing sources without text (the web client\'s remove and add) keeps the others as they are', async () => {
@@ -107,8 +88,8 @@ test('#1806: a config save listing sources without text (the web client\'s remov
   assert.equal(saved.status, 200, saved.text);
   const after = (await workspace()).projects.find((p) => p.id === project.id);
   assert.deepEqual(after.files.map((f) => f.name), ['notes.md', 'picked.md']);
-  assert.equal(JSON.parse((await request(textUrl(project.id, 'notes.md'), { headers: { cookie } })).text).content, NOTES, 'the kept source keeps its text');
-  assert.equal(JSON.parse((await request(textUrl(project.id, 'picked.md'), { headers: { cookie } })).text).content, 'picked synthetic text');
+  assert.equal(stored.sourceText(testDataDir, project.id, 'notes.md').json.content, NOTES, 'the kept source keeps its text');
+  assert.equal(stored.sourceText(testDataDir, project.id, 'picked.md').json.content, 'picked synthetic text');
   // A metadata-only entry naming no held source is not a source.
   await request(`/api/projects/${project.id}/config`, { method: 'POST', headers: mutation(), body: JSON.stringify({ files: [...after.files, { name: 'ghost.md' }] }) });
   assert.deepEqual((await workspace()).projects.find((p) => p.id === project.id).files.map((f) => f.name), ['notes.md', 'picked.md']);

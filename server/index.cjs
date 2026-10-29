@@ -1241,6 +1241,8 @@ async function handleRequestInner(req, res) {
   if (require('./rust-diary.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   // So are the two configuration-only model reads (#2187): GET /api/models/capabilities and /hardware.
   if (require('./rust-models.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
+  // And a project source's stored text and originals (#2191): GET sources/text, documents/original, uploads/original.
+  if (require('./rust-project-reads.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   await readyFeatures();
   const preAuth = requestAuth.authenticate(req);
   // accountRole: a device token acts as a member, but its account's workspace is the same one.

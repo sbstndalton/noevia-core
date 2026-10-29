@@ -47,6 +47,7 @@ test.before(async () => {
   ({ cookie, csrf } = require('../tests/server/seed-account.cjs').seedAccount(testDataDir, { username: 'admin', displayName: 'Admin', publicOrigin: 'http://localhost' }));
 });
 const mutation = () => ({ origin: 'http://localhost', cookie, 'content-type': 'application/json', 'x-csrf-token': csrf });
+const stored = require('../tests/server/stored-sources.cjs');
 const textUrl = (id, name) => `/api/projects/${encodeURIComponent(id)}/sources/text?name=${encodeURIComponent(name)}`;
 /** The one text file named `ref` under any workspace of the test data dir. */
 function textFile(ref) {
@@ -81,22 +82,27 @@ test('#1815: a source whose text file is deleted is listed with textMissing and 
   assert.equal('textMissing' in byName['keep.md'], false, 'a normal source carries no flag');
   assert.equal(byName['gone.md'].textRef, sha(GONE), 'the pointer is still listed');
 
-  const missing = await request(textUrl(id, 'gone.md'), { headers: { cookie } });
-  assert.equal(missing.status, 404, missing.text);
-  assert.equal(JSON.parse(missing.text).code, 'SOURCE_TEXT_MISSING');
-  const kept = await request(textUrl(id, 'keep.md'), { headers: { cookie } });
+  // #2191: the per-source read is the Rust front's (Node refuses it); the stored state it reads is checked.
+  assert.equal((await request(textUrl(id, 'gone.md'), { headers: { cookie } })).status, 503);
+  const missing = stored.sourceText(testDataDir, id, 'gone.md');
+  assert.equal(missing.status, 404);
+  assert.equal(missing.json.code, 'SOURCE_TEXT_MISSING');
+  const kept = stored.sourceText(testDataDir, id, 'keep.md');
   assert.equal(kept.status, 200);
-  assert.equal(JSON.parse(kept.text).content, KEEP);
+  assert.equal(kept.json.content, KEEP);
 
   assert.equal(fs.readFileSync(lost.projectsJson, 'utf8'), before, 'projects.json is not rewritten by reading');
   assert.ok(JSON.parse(before).projects.find((p) => p.id === id).files.some((f) => f.textRef === sha(GONE)));
 
-  // The text comes back (a restore): the text is served again (checked on the file), which clears the flag.
+  // The text comes back (a restore): the list's background scan clears the flag.
   fs.writeFileSync(lost.file, GONE, { mode: 0o600 });
-  const served = await request(textUrl(id, 'gone.md'), { headers: { cookie } });
-  assert.deepEqual([served.status, JSON.parse(served.text).content], [200, GONE]);
+  assert.deepEqual([stored.sourceText(testDataDir, id, 'gone.md').status, stored.sourceText(testDataDir, id, 'gone.md').json.content], [200, GONE]);
+  sourceText._setScanMs(0);
+  await request('/api/workspace', { headers: { cookie } });
+  await sourceText.scanSettled(lost.workspace);
   const again = JSON.parse((await request('/api/workspace', { headers: { cookie } })).text).projects.find((p) => p.id === id);
   assert.equal('textMissing' in again.files.find((f) => f.name === 'gone.md'), false);
+  sourceText._setScanMs(sourceText.SCAN_MS);
 });
 
 

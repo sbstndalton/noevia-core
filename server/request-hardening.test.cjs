@@ -164,31 +164,14 @@ test('#786: deleting a project file with a null body is a 400', async () => {
   assert.equal(del.status, 400, del.text);
 });
 
-test('#786: a stored upload whose original file is gone from disk is a 404', async () => {
-  const project = await createProject('Synthetic hardening original');
-
-  const bytes = Buffer.alloc(2048, 65); bytes.set([0x50, 0x4b, 3, 4]);
-  const up = await request(`/api/projects/${project.id}/upload`, {
-    method: 'POST', headers: writeHeaders(), body: JSON.stringify({ organized: true, name: 'synthetic.docx', dataBase64: bytes.toString('base64') }),
-  });
-  assert.equal(up.status, 200, up.text);
-  const url = `/api/projects/${project.id}/uploads/original?name=synthetic.docx`;
-  assert.equal((await request(url, { headers: { cookie } })).status, 200);
-
-  // The stored original disappears from disk (a restored backup without project-uploads).
-  const removed = [];
-  const walk = (dir) => {
-    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
-      const full = path.join(dir, entry.name);
-      if (entry.isDirectory()) walk(full);
-      else if (/^[a-f0-9]{64}$/.test(entry.name) && full.includes(`${path.sep}project-uploads${path.sep}`)) { fs.rmSync(full); removed.push(full); }
-    }
-  };
-  walk(testDataDir);
-  assert.ok(removed.length >= 1, 'the synthetic original was found on disk');
-  const missing = await request(url, { headers: { cookie } });
-  assert.equal(missing.status, 404, missing.text);
-  assert.deepEqual(missing.json, { error: 'No such original' });
+// #786 (a stored upload whose original is gone answers 404) moved with GET .../uploads/original to
+// the Rust front (#2191): noevia-rs tests/project_reads.rs. Node refuses the read before auth.
+test('#2191: Node refuses the stored-original download before authentication', async () => {
+  for (const headers of [{}, { cookie }]) {
+    const r = await request('/api/projects/p-any/uploads/original?name=synthetic.docx', { headers });
+    assert.equal(r.status, 503);
+    assert.equal(r.json.code, 'RUST_PROJECT_READS_OWNED');
+  }
 });
 
 test('L3: an unparseable request target is a 400 without a logged stack; a malformed Host header still routes', async () => {

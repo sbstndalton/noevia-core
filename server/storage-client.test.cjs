@@ -458,10 +458,11 @@ async function createTestProject(name, extra = {}) {
 }
 
 // #1806: GET /api/workspace lists sources without their text; this reads one source's text.
+// #2191: that route is the Rust front's; the stored text is read as the front reads it.
 async function sourceText(projectId, name) {
-  const r = await request(`/api/projects/${encodeURIComponent(projectId)}/sources/text?name=${encodeURIComponent(name)}`, { headers: { cookie } });
-  assert.equal(r.status, 200, r.text);
-  return JSON.parse(r.text).content;
+  const r = require('../tests/server/stored-sources.cjs').sourceText(testDataDir, projectId, name);
+  assert.equal(r.status, 200, JSON.stringify(r.json));
+  return r.json.content;
 }
 
 async function workspaceProject(id) {

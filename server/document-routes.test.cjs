@@ -20,6 +20,7 @@ test.after(() => {
   fs.rmSync(testDataDir, { recursive: true, force: true });
 });
 
+const stored = require('../tests/server/stored-sources.cjs');
 async function request(url, { method = 'GET', headers = {}, body = '' } = {}) {
   const req = Readable.from(body ? [body] : []);
   req.url = url;
@@ -82,9 +83,9 @@ test('authenticated upload persists metadata/original/pages and config cannot fo
   assert.equal(up.status, 200);
   const d = JSON.parse(up.text).document;
   assert.equal(d.state, 'partial');
-  const original = await request(docUrl(p.id, 'original'), { headers: { cookie } });
-  assert.deepEqual(original.bytes, fixture('mixed-pages.pdf'));
-  assert.match(original.headers['Content-Disposition'], /attachment/);
+  // #2191: the original's download is the Rust front's (Node refuses it); what it serves is stored here.
+  assert.equal((await request(docUrl(p.id, 'original'), { headers: { cookie } })).status, 503);
+  assert.deepEqual(stored.documentOriginal(testDataDir, p.id, 'statement.pdf').bytes, fixture('mixed-pages.pdf'));
   const read = await request(docUrl(p.id, 'pages') + '&startPage=2', { headers: { cookie } });
   assert.equal(read.status, 200); assert.match(read.text, /ocr-needed/);
   await post(`/api/projects/${p.id}/config`, { files: [{ name: 'statement.pdf', content: 'forged text', document: { byteHash: '../outside', state: 'ready' } }] });
@@ -94,7 +95,7 @@ test('authenticated upload persists metadata/original/pages and config cannot fo
     assert.equal((await request(docUrl(p.id, 'pages') + suffix, { headers: { cookie } })).status, 400);
   }
   await post(`/api/projects/${p.id}/config`, { files: [] });
-  assert.equal((await request(docUrl(p.id, 'original'), { headers: { cookie } })).status, 404);
+  assert.equal(stored.documentOriginal(testDataDir, p.id, 'statement.pdf').status, 404);
 });
 
 test('legacy PDF upload also saves failures, originals and explicit stale state', async () => {
@@ -107,21 +108,19 @@ test('legacy PDF upload also saves failures, originals and explicit stale state'
   assert.equal(failed.document.state, 'failed'); assert.equal(failed.document.stale, true);
   const pages = await request(docUrl(p.id, 'pages'), { headers: { cookie } });
   assert.match(pages.text, /STALE/); assert.match(pages.text, /TEXT-P1/);
-  assert.deepEqual((await request(docUrl(p.id, 'original'), { headers: { cookie } })).bytes, fixture('encrypted.pdf'));
+  assert.deepEqual(stored.documentOriginal(testDataDir, p.id, 'statement.pdf').bytes, fixture('encrypted.pdf'));
 });
 
 test('document originals and pages are inaccessible to another authenticated user or project', async () => {
   const p = await project('Owner-only PDF');
   await upload(p.id, 'statement.pdf', fixture('text.pdf'));
   const otherProject = await project('Empty project');
-  for (const kind of ['original', 'pages']) {
-    assert.equal((await request(docUrl(otherProject.id, kind), { headers: { cookie } })).status, 404);
-    assert.equal((await request(docUrl(p.id, kind))).status, 401);
-  }
+  // #2191: the original is the Rust front's (its owner-only scope: noevia-rs tests/project_reads.rs).
+  assert.equal((await request(docUrl(otherProject.id, 'pages'), { headers: { cookie } })).status, 404);
+  assert.equal((await request(docUrl(p.id, 'pages'))).status, 401);
+  assert.equal((await request(docUrl(p.id, 'original'))).status, 503);
   const otherCookie = seedAccount(testDataDir, { username: 'reader', displayName: 'Reader', role: 'member' }).cookie;
-  for (const kind of ['original', 'pages']) {
-    assert.equal((await request(docUrl(p.id, kind), { headers: { cookie: otherCookie } })).status, 404);
-  }
+  assert.equal((await request(docUrl(p.id, 'pages'), { headers: { cookie: otherCookie } })).status, 404);
 });
 
 
@@ -141,7 +140,7 @@ test('background upload survives a short response and polling remains authentica
   }
   assert.equal(job.done, true); assert.equal(job.status, 200, JSON.stringify(job));
   assert.equal(job.body.document.state, 'ready');
-  assert.deepEqual((await request(docUrl(p.id, 'original'), { headers: { cookie } })).bytes, fixture('text.pdf'));
+  assert.deepEqual(stored.documentOriginal(testDataDir, p.id, 'statement.pdf').bytes, fixture('text.pdf'));
 });
 
 test('a chat turn sent right after a 202 background upload waits for that upload to finish (#1441)', async () => {
@@ -167,13 +166,15 @@ test('unified uploads accept DOCX, preserve opaque bytes, protect metadata and e
   let job;
   for (let i=0;i<100;i++) { job=JSON.parse((await request(poll,{headers:{cookie}})).text); if(job.done) break; await new Promise(r=>setTimeout(r,10)); }
   assert.equal(job.status,200,JSON.stringify(job)); assert.equal(job.body.attachment.state,'stored');
+  // #2191: the download is the Rust front's (Node refuses it; noevia-rs tests/project_reads.rs covers
+  // its scope, headers and traversal refusals); the stored original is what it serves.
   const url = `/api/projects/${p.id}/uploads/original?name=fixture.docx`;
-  assert.equal((await request(url)).status,401);
+  assert.equal((await request(url)).status,503);
+  assert.equal((await request(url,{headers:{cookie}})).status,503);
   const other = await project('No access through other project');
-  assert.equal((await request(url.replace(p.id,other.id),{headers:{cookie}})).status,404);
+  assert.equal(stored.uploadOriginal(testDataDir, other.id, 'fixture.docx'), null);
   await post(`/api/projects/${p.id}/config`, { files: [{ name:'fixture.docx',content:'forged',attachment:{id:'../escape'} }] });
-  const original=await request(url,{headers:{cookie}});
-  assert.deepEqual(original.bytes,bytes); assert.equal(original.headers['Content-Type'],'application/octet-stream');
+  assert.deepEqual(stored.uploadOriginal(testDataDir, p.id, 'fixture.docx'),bytes, 'a forged attachment id does not replace the stored one');
   const bad=await post(`/api/projects/${p.id}/upload`,{organized:true,name:'fixture.zip',dataBase64:bytes.toString('base64')});
   assert.equal(bad.status,400);
 });
@@ -194,13 +195,13 @@ test('diary extras are lazy, private to the tenant, and hidden from ordinary pro
   assert.equal(JSON.parse((await post('/api/diary/context',{})).text).project.files.length,1);
   const otherCookie = seedAccount(testDataDir, { username: 'reader', role: 'member' }).cookie;
   assert.equal((await request('/api/diary/context',{headers:{cookie:otherCookie}})).status,404);
-  assert.equal((await request(`/api/projects/${p.id}/uploads/original?name=context.txt`,{headers:{cookie:otherCookie}})).status,404);
+  assert.equal((await request(`/api/projects/${p.id}/uploads/original?name=context.txt`,{headers:{cookie:otherCookie}})).status,503, 'the front answers it (#2191)');
   // Rust owns chat-context creation. Seed only this fixture's front-owned state;
   // actual two-tenant context isolation is covered by noevia-rs project_routes.
   const file = path.join(testDataDir, 'users', adminId, 'projects.json');
   const stored = JSON.parse(fs.readFileSync(file, 'utf8'));
   stored.projects.push({ id: 'cowork-chat-context-c-fixture', name: 'Synthetic private context', files: [] });
   fs.writeFileSync(file, JSON.stringify(stored));
-  assert.equal((await request('/api/projects/cowork-chat-context-c-fixture/uploads/original?name=context.txt', { headers: { cookie: otherCookie } })).status, 404);
+  assert.equal((await request('/api/projects/cowork-chat-context-c-fixture/uploads/original?name=context.txt', { headers: { cookie: otherCookie } })).status, 503);
   assert.equal((await request('/api/chats/c-fixture/context', { headers: { cookie: otherCookie } })).status, 503, 'Node refuses even for another tenant');
 });
