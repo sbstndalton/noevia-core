@@ -922,7 +922,6 @@ const reasoningTraces = { enabled: (dir) => require('./chat-framing.cjs').readPr
 const FRAMING_RATE_LIMIT = 10;
 const chatFramingRoutes = require('./routes/chat-framing.cjs').createChatFramingRoutes({ json, readJson, framing: chatFraming, settings: framingSettings,
   rateLimited: (userId) => llmRateLimiter.rateLimited(`chat-frame:${userId}`, FRAMING_RATE_LIMIT, LLM_RATE_WINDOW_MS),
-  preferences: { get: () => require('./chat-framing.cjs').readPreferences(currentWorkspace().dir), save: (value) => require('./chat-framing.cjs').writePreferences(currentWorkspace().dir, value) },
   // #810: only Chat-mode, unarchived projects are offered as a destination; every own chat still counts for links and tags.
   workspace: () => { const projects = PROJECTS.filter((proj) => !diaryExtras.internalProject(proj)); return { projects: projects.filter(require('./project-modes.cjs').chatDestination).map((proj) => ({ id: proj.id, name: proj.name })), chats: [...Array.from(FREE_CHATS), ...projects.flatMap((proj) => proj.chats || [])] }; } });
 // #741: "Mirror chats to Diary", per user and off by default. One-way, debounced, through the Diary
@@ -1212,6 +1211,7 @@ const mcpDirectoryRoutes = require('./routes/mcp-directory.cjs').createMcpDirect
 async function handleRequestInner(req, res) {
   // GET /api/integrations/storage is the Rust front's (#1071): refused before authentication.
   if (require('./features.cjs').refuseRustStorageRead(req, res, { parseRequestUrl, badRequestUrl, json })) return;
+  if (require('./routes/chat-framing.cjs').refuseOwnedPreferences(req, res, { parseRequestUrl, json })) return;
   const preAuth = requestAuth.authenticate(req);
   // accountRole: a device token acts as a member, but its account's workspace is the same one.
   const workspace = preAuth ? workspaceStore.get(preAuth.user.id, {

@@ -350,7 +350,8 @@ test('traces: off by default; opted in, one line with the packet and the answer 
 });
 
 test('trace preference: the per-user switch is stored in the user directory and off by default', (t) => {
-  const { readPreferences, writePreferences } = require('./chat-framing.cjs');
+  const { readPreferences } = require('./chat-framing.cjs');
+  const { writePreferences } = require('../tests/server/oracle/chat-framing-preferences.cjs');
   const a = tmp(t, 'noevia-trace-pref-a-'), b = tmp(t, 'noevia-trace-pref-b-');
   assert.equal(readPreferences(a).keepReasoningTraces, false);
   writePreferences(a, { keepReasoningTraces: true });

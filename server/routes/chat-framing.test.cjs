@@ -45,28 +45,39 @@ test('admin settings are admin-only; other paths fall through', async () => {
   assert.equal(await routes({ method: 'GET' }, {}, { path: '/api/other', authn: user }), false);
 });
 
-test('framing preferences: signed-in only, GET and PUT, invalid values refused (#738)', async () => {
-  let stored = { autoAccept: false };
-  const sent = [];
-  let body = {};
+test('native framing preferences refuse every method before reading a body or workspace', async () => {
   const routes = createChatFramingRoutes({
-    json: (res, status, payload) => { sent.push({ status, payload }); },
-    readJson: async () => body,
-    framing: { suggest: async () => ({ frame: null }) }, settings: { get: () => ({}), save: (v) => v }, workspace: () => ({ projects: [], chats: [] }),
-    preferences: { get: () => stored, save: (v) => { if (typeof v?.autoAccept !== 'boolean') throw Object.assign(Error('autoAccept must be true or false'), { status: 400 }); stored = { autoAccept: v.autoAccept }; return stored; } },
+    json: (res, status, body) => Object.assign(res, { status, body }),
+    readJson: async () => { throw Error('must not read a native-owned body'); },
+    workspace: () => { throw Error('must not construct a native-owned workspace'); },
   });
-  const call = (method, authn = user) => routes({ method }, {}, { path: '/api/chat-framing/preferences', authn });
-  assert.equal(await call('GET', null), true);
-  assert.equal(sent.pop().status, 401);
-  await call('GET');
-  assert.deepEqual(sent.pop(), { status: 200, payload: { autoAccept: false } });
-  body = { autoAccept: true };
-  await call('PUT');
-  assert.deepEqual(sent.pop(), { status: 200, payload: { autoAccept: true } });
-  body = { autoAccept: 'yes' };
-  await call('PUT');
-  assert.deepEqual(sent.pop(), { status: 400, payload: { error: 'autoAccept must be true or false' } });
-  await call('DELETE');
-  assert.equal(sent.pop().status, 405);
-  assert.deepEqual(stored, { autoAccept: true });
+  for (const method of ['GET', 'PUT', 'POST', 'DELETE', 'HEAD', 'OPTIONS']) {
+    for (const authn of [null, user, admin]) {
+      const res = {};
+      assert.equal(await routes({ method }, res, { path: '/api/chat-framing/preferences', authn }), true);
+      assert.equal(res.status, 503);
+      assert.equal(res.body.code, 'RUST_FRAMING_PREFERENCES_OWNED');
+    }
+  }
+  assert.equal(typeof require('../chat-framing.cjs').writePreferences, 'undefined');
+});
+
+
+test('early native preference refusal precedes authentication and workspace construction', () => {
+  const {refuseOwnedPreferences}=require('./chat-framing.cjs');
+  const sent=[];const json=(_res,status,body)=>sent.push({status,body});
+  for(const method of ['GET','PUT','DELETE','HEAD','OPTIONS']) {
+    assert.equal(refuseOwnedPreferences({method,headers:{host:'example.test'},get body(){throw Error('body reached');}}, {},
+      {json,parseRequestUrl:()=>({pathname:'/api/chat-framing/preferences'})}),true);
+    assert.equal(sent.pop().body.code,'RUST_FRAMING_PREFERENCES_OWNED');
+  }
+  for(const pathname of ['/api/chat-framing/preferences/','/api/chat-framing/suggest','/api/admin/framing-settings']) {
+    assert.equal(refuseOwnedPreferences({headers:{}},{},{json,parseRequestUrl:()=>({pathname})}),false);
+  }
+  assert.equal(refuseOwnedPreferences({headers:{}},{},{json,parseRequestUrl:()=>null}),false);
+  const source=require('node:fs').readFileSync(require('node:path').join(__dirname,'../index.cjs'),'utf8');
+  const start=source.indexOf('async function handleRequestInner');
+  const early=source.indexOf('.refuseOwnedPreferences(',start);
+  assert.ok(early>start && early<source.indexOf('const preAuth = requestAuth.authenticate(req)',start));
+  assert.ok(early<source.indexOf('workspaceStore.get(',start));
 });
