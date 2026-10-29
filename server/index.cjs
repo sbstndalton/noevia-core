@@ -161,7 +161,6 @@ let featureStartup=null;
 const readyFeatures=()=>featureStartup ||= featureRuntime.ready();
 
 const featureRoutes = require('./routes/features.cjs').createFeatureRoutes({ json, readJson, decisionSettings });
-const pluginDirectoryRoutes = require('./routes/plugin-directory.cjs').createPluginDirectoryRoutes({ json });
 // Settings → Data: the signed-in user's conversations as a ZIP (routes/export.cjs).
 // GET /api/export/conversations is the Rust front's (#1071): this mount only refuses a bypass.
 const exportRoutes = require('./routes/export.cjs').createExportRoutes({ json });
@@ -203,7 +202,6 @@ const driveAccounts = require('./drive-accounts.cjs').createDriveAccounts({
     uploadBase: process.env.GOOGLE_DRIVE_UPLOAD_BASE_URL || undefined, log: (event) => console.log('[gdrive]', JSON.stringify(event)),
   }),
 });
-const { publicPage } = require('./routes/public-pages.cjs');
 const webAddressRoutes = require('./routes/web-address.cjs').createWebAddressRoutes({ auth: authService, json });
 const davConfig = require('./dav-settings.cjs').configuration(process.env, authService.origin);
 const davSettings = require('./dav-settings.cjs').createDavSettings({ auth: authService });
@@ -1241,6 +1239,9 @@ async function handleRequestInner(req, res) {
   if (require('./rust-diary.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   // So are the two configuration-only model reads (#2187): GET /api/models/capabilities and /hardware.
   if (require('./rust-models.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
+  // #2190: the public pages and the device approval page, and the plugin directory.
+  if (require('./rust-public-pages.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
+  if (require('./rust-plugin-directory.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   await readyFeatures();
   const preAuth = requestAuth.authenticate(req);
   // accountRole: a device token acts as a member, but its account's workspace is the same one.
@@ -1275,10 +1276,6 @@ async function handleRequestScoped(req, res) {
   publicHeaders(res);
 
   try {
-    if ((req.method === 'GET' || req.method === 'HEAD') && publicPage(p)) {
-      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'public, max-age=300' });
-      return res.end(req.method === 'HEAD' ? undefined : publicPage(p));
-    }
     // Sign-in and the account are the Rust front's (#1071): a request that reaches Node bypassed it.
     if (require('./rust-auth.cjs').refuseOwned(req, res, p, json)) return;
     // So are the M4 project routes (#1071): Node refuses them whoever asks.
@@ -1310,7 +1307,6 @@ async function handleRequestScoped(req, res) {
     if (authn && await accountRoutes(req, res, { path: p, authn })) return;
     if (authn && await offsiteRoutes(req, res, { path: p, authn })) return;
     if (authn && await connectorRoutes(req, res, { path: p, authn })) return;
-    if (authn && await pluginDirectoryRoutes(req, res, { path: p, authn })) return;
     if (await mcpDirectoryRoutes(req, res, { path: p, authn })) return;
     if (authn && await webAddressRoutes(req, res, { path: p, authn })) return;
     if (authn && p.startsWith('/api/projects/') && await researchRoutes(req, res, { path: p, authn })) return;

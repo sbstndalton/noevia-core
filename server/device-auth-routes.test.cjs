@@ -174,9 +174,10 @@ test('bearer tokens cannot carry cookies, and a cookie session cannot borrow a b
   assert.equal((await asDevice('nva_not-a-real-token', '/api/workspace')).status, 401);
   assert.equal((await asDevice(tokens.refresh, '/api/workspace')).status, 401, 'a refresh token is not an access token');
   assert.equal((await request(`/api/workspace?access_token=${tokens.access}`)).status, 401);
-  // The approval page is served while the feature is on.
+  // The approval page is the Rust front's (#2190): Node refuses it, feature on or off.
   const page = await request('/device');
-  assert.notEqual(page.status, 404);
+  assert.equal(page.status, 503);
+  assert.equal(page.json.code, 'RUST_PUBLIC_PAGES_OWNED');
 });
 
 test('F2: a device token cannot link connectors or change their tool policy', async () => {

@@ -59,7 +59,10 @@ test('with the feature off, the approval page is 404 and the device endpoints ar
       assert.equal(r.status, 503, `${method} ${url} (${headers.cookie ? 'signed in' : 'signed out'}) -> ${r.status}`);
       assert.equal(JSON.parse(r.text).code, 'RUST_AUTH_OWNED');
     }
-    assert.equal((await request('/device', { headers })).status, 404);
+    // The approval page's 404 is the Rust front's (#2190, public_pages.rs); Node refuses the page.
+    const page = await request('/device', { headers });
+    assert.equal(page.status, 503);
+    assert.equal(JSON.parse(page.text).code, 'RUST_PUBLIC_PAGES_OWNED');
   }
   // A device-shaped bearer means nothing; cookie sessions and CSRF behave exactly as before.
   assert.equal((await request('/api/workspace', { headers: { authorization: 'Bearer nva_synthetic' } })).status, 401);
