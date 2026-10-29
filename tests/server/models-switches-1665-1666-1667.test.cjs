@@ -11,7 +11,7 @@ const { Readable } = require('node:stream');
 const { createRerankSettings } = require('../../server/rerank-settings.cjs');
 const { rerankTarget } = require('../../server/rerank-target.cjs');
 const { createDecisionSettings, describeDecision } = require('../../server/decision-settings.cjs');
-const { createFeatureRoutes } = require('../../server/routes/features.cjs');
+const { rustSavesDecision, rustResetsDecision } = require('./rust-decision-row.cjs');
 const { createModelRoutes } = require('../../server/routes/models.cjs');
 const { modelAssignments } = require('../../server/model-assignments.cjs');
 const { createModelService } = require('../../server/models.cjs');
@@ -196,55 +196,39 @@ test('#1665 retrieval follows the saved switch (rag.configureRerank / reloadRera
 
 const KEV_ENV = { COWORK_DECISION_URL: 'http://kev:11435', COWORK_DECISION_MODEL: 'kev-0.8b', COWORK_DECISION_API_KEY: 'synthetic-key' };
 function decisionFixture(env = KEV_ENV) {
-  const store = memStore(), audits = [];
-  const settings = createDecisionSettings({ store, env, fetchImpl: async () => Response.json({ ready: true }), audit: (a, actor, d) => audits.push([a, actor, d]) });
-  // The feature registry is the Rust front's; these routes are the decision-settings leaf that stays Node's.
-  const route = createFeatureRoutes({ decisionSettings: settings, json: (res, status, body) => Object.assign(res, { status, body }), readJson: async (req) => req.body });
-  const call = async (method, body, role = 'admin') => { const res = {}; await route({ method, body }, res, { path: '/api/admin/decision-settings', authn: { user: { id: `${role}-1`, role } } }); return res; };
-  return { store, audits, settings, call };
+  const store = memStore();
+  // #2190: the routes (validation, the unknown-model and member refusals, audit) are the Rust front's,
+  // tested in noevia-rs tests/decision_settings.rs; Node re-reads what it saves on the next use.
+  const settings = createDecisionSettings({ store, env, fetchImpl: async () => Response.json({ ready: true }) });
+  return { store, settings, save: (value) => rustSavesDecision(store, value), reset: () => rustResetsDecision(store) };
 }
 
-test('#1666 nothing chosen: the deployment model applies, the GET reply keeps its recorded shape, admins get the choices on the row', async () => {
+test('#1666 nothing chosen: the deployment model applies, the view keeps its recorded shape, admins get the choices on the row', async () => {
   const f = decisionFixture();
-  const got = await f.call('GET');
-  assert.deepEqual(got.body, { url: 'http://kev:11435', timeoutMs: 1500, source: 'deployment' }, 'unchanged (the HTTP contract corpus)');
+  assert.deepEqual(f.settings.get(), { url: 'http://kev:11435', timeoutMs: 1500, source: 'deployment' }, 'unchanged (the HTTP contract corpus)');
   assert.deepEqual([f.settings.backend().model, f.settings.backend().wording], ['kev-0.8b', 'compact']);
   const row = modelAssignments({ installed: [], env: KEV_ENV, admin: true, decision: f.settings.describe() }).services.find((s) => s.id === 'decision');
   assert.deepEqual([row.models, row.deploymentModel], [['laya', 'kev-0.8b'], 'kev-0.8b']);
   assert.equal('models' in modelAssignments({ installed: [], env: KEV_ENV, admin: false }).services.find((s) => s.id === 'decision'), false);
 });
 
-test('#1666 choosing a model is an admin save next to the URL: requests and wording follow it, audited', async () => {
+test('#1666 a model saved next to the URL: requests and wording follow it on the next decision', async () => {
   const f = decisionFixture();
   // Laya on the deployment's own Kev URL: Laya format and wording, even though COWORK_DECISION_MODEL says Kev.
-  const laya = await f.call('PUT', { url: 'http://kev:11435', timeoutMs: 1500, model: 'laya' });
-  assert.deepEqual([laya.status, laya.body.model, laya.body.source], [200, 'laya', 'admin']);
+  f.save({ url: 'http://kev:11435', timeoutMs: 1500, model: 'laya' });
+  assert.deepEqual([f.settings.get().model, f.settings.get().source], ['laya', 'admin']);
   assert.deepEqual([f.settings.backend().model, f.settings.backend().wording], ['laya', 'standard']);
-  assert.deepEqual(f.audits.at(-1), ['decision.configure', 'admin-1', { url: 'http://kev:11435', timeoutMs: 1500, model: 'laya' }]);
   assert.deepEqual(describeDecision(KEV_ENV, f.settings.get()).decision, { model: 'laya', state: 'active', source: 'admin', modelSource: 'admin' });
-  // Kev on another URL (before #1666 that URL always got Laya), case-insensitive.
-  await f.call('PUT', { url: 'http://192.168.1.20:11435', timeoutMs: 900, model: ' KEV-0.8B ' });
+  // Kev on another URL (before #1666 that URL always got Laya).
+  f.save({ url: 'http://192.168.1.20:11435', timeoutMs: 900, model: 'kev-0.8b' });
   assert.deepEqual([f.settings.backend().model, f.settings.backend().wording], ['kev-0.8b', 'compact']);
   assert.equal(f.settings.describe().decision.model, 'kev-0.8b');
   assert.equal(f.settings.describe().sensitivity.model, 'kev-0.8b', 'a shared sensitivity check follows the chosen model');
-  // Automatic ('' or absent) goes back to the #1639 rule: another URL gets Laya, the deployment URL its model.
-  await f.call('PUT', { url: 'http://192.168.1.20:11435', timeoutMs: 900, model: '' });
+  // Automatic (no model stored) goes back to the #1639 rule: another URL gets Laya, the deployment URL its model.
+  f.save({ url: 'http://192.168.1.20:11435', timeoutMs: 900 });
   assert.equal(f.settings.backend().model, 'laya');
-  await f.call('PUT', { url: 'http://kev:11435', timeoutMs: 900 });
+  f.save({ url: 'http://kev:11435', timeoutMs: 900 });
   assert.equal(f.settings.backend().model, 'kev-0.8b');
-  assert.deepEqual(f.audits.at(-1)[2], { url: 'http://kev:11435', timeoutMs: 900, model: 'auto' });
-});
-
-test('#1666 an unknown model id is refused (not silently sent as Laya), and members cannot choose', async () => {
-  const f = decisionFixture();
-  for (const model of ['decima-small', 7, {}]) {
-    const res = await f.call('PUT', { url: 'http://kev:11435', timeoutMs: 1500, model });
-    assert.deepEqual([res.status, res.body.errorId], [400, 'invalidModel'], JSON.stringify(model));
-  }
-  const member = await f.call('PUT', { url: 'http://kev:11435', timeoutMs: 1500, model: 'laya' }, 'member');
-  assert.equal(member.status, 403);
-  assert.equal((await f.call('GET', undefined, 'member')).status, 403, 'a deep-linked read is refused too');
-  assert.equal(f.settings.get().source, 'deployment');
   // An unknown COWORK_DECISION_MODEL still falls back to Laya wording, as before.
   const typo = decisionFixture({ COWORK_DECISION_URL: 'http://laya:8040', COWORK_DECISION_MODEL: 'kev-typo' });
   assert.equal(typo.settings.backend().wording, 'standard');
@@ -252,9 +236,9 @@ test('#1666 an unknown model id is refused (not silently sent as Laya), and memb
 
 test('#1666 reset forgets the chosen model with the URL; a saved record from before #1666 reads as automatic', async () => {
   const f = decisionFixture();
-  await f.call('PUT', { url: 'http://kev:11435', timeoutMs: 1500, model: 'laya' });
-  const reset = await f.call('DELETE');
-  assert.deepEqual([reset.body.model, reset.body.source], [undefined, 'deployment']);
+  f.save({ url: 'http://kev:11435', timeoutMs: 1500, model: 'laya' });
+  f.reset();
+  assert.deepEqual([f.settings.get().model, f.settings.get().source], [undefined, 'deployment']);
   assert.equal(f.settings.backend().model, 'kev-0.8b');
   const store = memStore();
   store.set('decision:configuration', JSON.stringify({ url: 'http://kev:11435', timeoutMs: 1200 }));

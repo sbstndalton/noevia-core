@@ -137,8 +137,12 @@ test('scope limits: a device token never reaches administration or account secur
     assert.equal(r.status, 503, `${method} ${url} -> ${r.status}`);
     assert.equal(r.json.code, 'RUST_FEATURES_OWNED', `${method} ${url}`);
   }
+  // Decision settings are the Rust front's too (#2190): refused before authentication.
+  const decision = await asDevice(tokens.access, '/api/admin/decision-settings', { method: 'GET' });
+  assert.equal(decision.status, 503);
+  assert.equal(decision.json.code, 'RUST_DECISION_SETTINGS_OWNED');
   const refused = [
-    ['GET', '/api/admin/decision-settings'],
+    ['GET', '/api/admin/offsite-backup'],
     ['DELETE', `/api/admin/users/${memberId}`, { username: 'memberqa' }],
     ['POST', '/api/profile/diary-connectors', {}],
     ['PUT', '/api/integrations/storage', { kind: 'local' }],
@@ -152,7 +156,7 @@ test('scope limits: a device token never reaches administration or account secur
   }
   // The admin's own browser session still reads the administration routes Node answers, so the
   // refusals above are the device token's scope, not a closed route.
-  assert.equal((await admin.read('/api/admin/decision-settings')).status, 200);
+  assert.equal((await admin.read('/api/admin/offsite-backup')).status, 200);
   // The admin's own browser session no longer reads feature administration from Node either.
   const own = await admin.read('/api/admin/features');
   assert.equal(own.status, 503);

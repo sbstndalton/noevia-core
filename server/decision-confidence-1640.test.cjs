@@ -14,6 +14,7 @@ const http = require('node:http');
 const rm = require('./routing-modes.cjs');
 const { createDecisions } = require('./decision/index.cjs');
 const { createDecisionSettings } = require('./decision-settings.cjs');
+const { rustSavesDecision } = require('../tests/server/rust-decision-row.cjs');
 const { createDecisionEndpoint } = require('./decision-endpoint.cjs');
 const { createToolGate } = require('./tool-gate.cjs');
 const { createStepSupervision } = require('./step-supervision.cjs');
@@ -50,7 +51,7 @@ async function fakeService(t, reply) {
 function stack(url, { sensitivityDeadlineMs } = {}) {
   const map = new Map();
   const settings = createDecisionSettings({ store: { get: (k) => map.get(k), set: (k, v) => map.set(k, v) }, env: {} });
-  settings.save({ url, timeoutMs: 1500 }, 'admin');
+  rustSavesDecision({ set: (k, v) => map.set(k, v) }, { url, timeoutMs: 1500 });
   const backend = settings.backend();
   const logs = [];
   const decisions = createDecisions({ backends: { configured: backend }, chains: { 'routing.sensitivity': ['configured'], 'tool.gate': ['configured'] },

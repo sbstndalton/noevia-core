@@ -11,6 +11,7 @@ if (!require('node:fs').existsSync(process.env.DAV_PARSE_WASM || require('./dav-
 const test = require('node:test'), assert = require('node:assert/strict');
 const fs = require('node:fs'), os = require('node:os'), path = require('node:path');
 const { createDecisionSettings, SERVICE_LIMITS } = require('./decision-settings.cjs');
+const { rustSavesDecision } = require('../tests/server/rust-decision-row.cjs');
 const { createDecisions, causeOf, CAUSE_RE } = require('./decision/index.cjs');
 const { createFeatures } = require('../tests/server/oracles/features-legacy.cjs');
 const { createToolGate, offeredProjection, boxesProjection, DEFAULT_BOXES } = require('./tool-gate.cjs');
@@ -53,8 +54,9 @@ function fakeDecisionService(pick, seen = []) {
 // and a fetch that never answers holds it, which must not carry over into the next case.
 let nextPort = 8040;
 function configured(fetchImpl, kinds) {
-  const settings = createDecisionSettings({ store: store(), env: {}, fetchImpl, ...(kinds ? { kinds } : {}) });
-  settings.save({ url: `http://decision-service:${nextPort++}`, timeoutMs: 1500 }, 'admin');
+  const st = store();
+  const settings = createDecisionSettings({ store: st, env: {}, fetchImpl, ...(kinds ? { kinds } : {}) });
+  rustSavesDecision(st, { url: `http://decision-service:${nextPort++}`, timeoutMs: 1500 });
   return settings;
 }
 

@@ -140,7 +140,7 @@ const chatMachines = require('./chat-machines.cjs').createChatMachines({ machine
 // #1880: an administrator-started measurement of a chat role's model on its machine (nothing on this machine changes).
 const machineTune = require('./machine-tune.cjs').createMachineTune({ machines: inferenceMachines, chatMachines, store: require('./features.cjs').settingsStore(authService.db),
   audit: (action,actor,detail)=>authService.audit(action,actor,actor,detail) });
-const decisionSettings = require('./decision-settings.cjs').createDecisionSettings({ store: featureSourceStore, audit: (action,actor,detail)=>authService.audit(action,actor,actor,detail), machineUrl: () => inferenceMachines.urlFor('decision'), sensitivityMachineUrl: () => inferenceMachines.urlFor('sensitivity') });
+const decisionSettings = require('./decision-settings.cjs').createDecisionSettings({ store: featureSourceStore, machineUrl: () => inferenceMachines.urlFor('decision'), sensitivityMachineUrl: () => inferenceMachines.urlFor('sensitivity') });
 // #1841: OCR and Docling read their address from the same registry (document-workers.cjs), the environment being the fallback.
 require('./document-workers.cjs').useMachines((kind) => inferenceMachines.urlFor(kind));
 // #1665: the reranker's on/off and model, saved in Settings over the deployment's RERANK_* environment.
@@ -160,7 +160,7 @@ featureRuntime = require('./feature-runtime.cjs').createFeatureRuntime({
 let featureStartup=null;
 const readyFeatures=()=>featureStartup ||= featureRuntime.ready();
 
-const featureRoutes = require('./routes/features.cjs').createFeatureRoutes({ json, readJson, decisionSettings });
+const featureRoutes = require('./routes/features.cjs').createFeatureRoutes({ json });
 // Settings → Data: the signed-in user's conversations as a ZIP (routes/export.cjs).
 // GET /api/export/conversations is the Rust front's (#1071): this mount only refuses a bypass.
 const exportRoutes = require('./routes/export.cjs').createExportRoutes({ json });
@@ -1242,6 +1242,7 @@ async function handleRequestInner(req, res) {
   // #2190: the public pages and the device approval page, and the plugin directory.
   if (require('./rust-public-pages.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   if (require('./rust-plugin-directory.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
+  if (require('./rust-decision-settings.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   await readyFeatures();
   const preAuth = requestAuth.authenticate(req);
   // accountRole: a device token acts as a member, but its account's workspace is the same one.
