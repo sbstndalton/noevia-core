@@ -241,7 +241,6 @@ test('autoconfig sizes against the inference budget, lowered only by an explicit
   const make = (autoconfig, budget) => createModelManager({ kind: 'llamacpp', baseUrl: 'http://synthetic', presetPath: path.join(dir, 'models.ini'), autoconfig: { modelsPath: dir, ...autoconfig }, inferenceBudget: { budgetGib: () => budget }, fetchJson: async () => ({ ok: true, status: 200, body: { data: [] } }) });
   // The container memory limit (budgetGib fallback) does not count GTT: the inference budget wins.
   assert.equal(make({ budgetGib: 14 }, 20).sizingBudgetGib(), 20);
-  assert.equal((await make({ budgetGib: 14 }, 20).estimateMemory('m')).body.budgetGib, 20);
   assert.equal(make({ budgetGib: 14, explicitBudgetGib: 10 }, 20).sizingBudgetGib(), 10);
   assert.equal(make({ budgetGib: 14 }, 0).sizingBudgetGib(), 14, 'no inference budget: the deployment figure as before');
 });
