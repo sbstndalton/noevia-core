@@ -172,10 +172,10 @@ async function stopCalibration(s) {
 
 // What each fault path must do to each request. `refused` means the evaluator-backed answer is withheld.
 const EXPECT = {
-  none: { bootFaults: 0, estimate: 200, suggest: 'values', calibration: 202, load: 200 },
-  'memory-limit': { bootFaults: 1, estimate: 200, suggest: 'values', calibration: 202, load: 200 },
-  'ctx-candidates': { bootFaults: 0, estimate: 200, suggest: 'values', calibration: 503, load: 200 },
-  evaluator: { bootFaults: 1, estimate: 503, suggest: 'refused', calibration: 503, load: 502 },
+  none: { bootFaults: 0, calibration: 202, load: 200 },
+  'memory-limit': { bootFaults: 1, calibration: 202, load: 200 },
+  'ctx-candidates': { bootFaults: 0, calibration: 503, load: 200 },
+  evaluator: { bootFaults: 1, calibration: 503, load: 502 },
 };
 
 for (const mode of Object.keys(EXPECT)) {
@@ -196,19 +196,14 @@ for (const mode of Object.keys(EXPECT)) {
     assert.equal(budget.status, 200, budget.text.slice(0, 300));
     assert.ok(budget.json.budgetGib > 0 || budget.json.budget?.budgetGib > 0 || JSON.stringify(budget.json).includes('budgetGib'), budget.text.slice(0, 300));
 
-    // The Will-it-fit panel.
-    const estimate = await s.call('GET', '/api/models/estimate?model=small');
-    ran++;
-    assert.equal(estimate.status, want.estimate, estimate.text.slice(0, 300));
-    if (want.estimate === 503) { assert.equal(estimate.json.code, 'autoconfig_impl'); assert.match(estimate.json.error, /^Estimate unavailable: /); }
-    else assert.ok(estimate.json.budgetGib > 0);
-
-    // The size-based suggestion: settings, or a refusal that carries none. Never settings from a fault.
-    const suggest = await s.call('GET', '/api/models/preset/suggest?model=small');
-    ran++;
-    assert.equal(suggest.status, 200, suggest.text.slice(0, 300));
-    if (want.suggest === 'values') assert.ok(suggest.json.values, suggest.text.slice(0, 300));
-    else { assert.equal(suggest.json.values, undefined); assert.equal(suggest.json.code, 'autoconfig_impl'); }
+    // The Will-it-fit panel and the size-based suggestion are the Rust front's (#2189,
+    // bins/noevia-server/tests/model_sizing.rs); Node refuses them under every fault.
+    for (const p of ['/api/models/estimate?model=small', '/api/models/preset/suggest?model=small']) {
+      const owned = await s.call('GET', p);
+      ran++;
+      assert.equal(owned.status, 503, owned.text.slice(0, 300));
+      assert.equal(owned.json.code, 'RUST_MODEL_SIZING_OWNED');
+    }
 
     // Calibration: accepted on the normal path; refused with the autoconfig_impl 503 when the ladder cannot be read.
     s.router.calls.length = 0;
