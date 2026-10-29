@@ -982,9 +982,8 @@ const changeJournal = require('./chat-change-journal.cjs').createChangeJournalRe
   stamp: (userId) => require('./chat-change-journal.cjs').fileStamp(DATA_DIR, userId),
 });
 afterNativeReady(() => changeJournal.start());
-const chatVaultMirrorRoutes = require('./routes/chat-vault-mirror.cjs').createChatVaultMirrorRoutes({ json, readJson,
-  preferences: { get: () => vaultMirrorLib.readPreferences(currentWorkspace().dir), save: (value) => vaultMirrorLib.writePreferences(currentWorkspace().dir, value) },
-  available: vaultMirrorAvailable, schedule: chatVaultMirror.schedule, audit: (action, actor, detail) => authService.audit(action, actor, actor, detail) });
+// #2190: the Rust front owns the mirror preferences; a save that turns the mirror on nudges it here.
+afterNativeReady(() => require('./rust-vault-mirror-preferences.cjs').startNudges({ dataDir: DATA_DIR, schedule: chatVaultMirror.schedule }));
 // #682: a decision experiment switched on that cannot run (no service, or one without `choice`)
 // says so once at startup; Settings shows the same reason, and the chat path skips it silently.
 for (const [key, id] of [['COWORK_DECISION_MODEL', process.env.COWORK_DECISION_MODEL], ['COWORK_SENSITIVITY_DECISION_MODEL', process.env.COWORK_SENSITIVITY_DECISION_MODEL]]) {
@@ -1246,6 +1245,7 @@ async function handleRequestInner(req, res) {
   if (require('./rust-plugin-directory.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   if (require('./rust-decision-settings.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   if (require('./rust-storage-integrations.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
+  if (require('./rust-vault-mirror-preferences.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   await readyFeatures();
   const preAuth = requestAuth.authenticate(req);
   // accountRole: a device token acts as a member, but its account's workspace is the same one.
@@ -1300,7 +1300,6 @@ async function handleRequestScoped(req, res) {
     }
     if (authn && await featureRoutes(req, res, { path: p, authn })) return;
     if (authn && await chatFramingRoutes(req, res, { path: p, authn })) return;
-    if (authn && await chatVaultMirrorRoutes(req, res, { path: p, authn })) return;
     // #741: a successful change to the user's chats nudges their mirror (debounced; a no-op unless opted in).
     const mirrorNudge = authn ? vaultMirrorLib.mirrorTrigger(req.method, p) : null;
     // #2153: a history save is the Rust front's; the change journal schedules it (touch: read this user).
