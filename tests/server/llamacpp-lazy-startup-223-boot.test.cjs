@@ -119,6 +119,8 @@ async function boot(t, mode) {
     MODEL_MANAGER_KIND: 'llamacpp', MODEL_MANAGER_BASE_URL: `http://127.0.0.1:${router.port}`,
     LLAMACPP_PRESET_PATH: ini, LLAMACPP_MODELS_PATH: modelsDir,
     NOEVIA_PROJECT_STORE_PORT: String(store.port), NOEVIA_PROJECT_STORE_TOKEN: store.token,
+    // Core registers its feature runtime with the store under the start id both share before it is ready.
+    NOEVIA_START_ID: require('node:crypto').randomBytes(16).toString('hex'),
     FAULT_223: mode, SERVER_DIR_223: SERVER_DIR,
     ...(process.env.DAV_PARSE_WASM ? { DAV_PARSE_WASM: process.env.DAV_PARSE_WASM } : {}),
     ...(process.env.DAV_PARSE_WASM_REQUIRED ? { DAV_PARSE_WASM_REQUIRED: process.env.DAV_PARSE_WASM_REQUIRED } : {}),

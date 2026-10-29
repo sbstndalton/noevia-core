@@ -134,7 +134,8 @@ async function main() {
   // protocol, on this throwaway data dir.
   const store = await startProjectStore(dataDir);
   const env = serverEnv({ port, dataDir, origin: base, mocks, record: exchanges });
-  Object.assign(env, { NOEVIA_PROJECT_STORE_PORT: String(store.port), NOEVIA_PROJECT_STORE_TOKEN: store.token });
+  // The stand-in also answers the feature runtime's context exchange, under this run's start id.
+  Object.assign(env, { NOEVIA_PROJECT_STORE_PORT: String(store.port), NOEVIA_PROJECT_STORE_TOKEN: store.token, NOEVIA_START_ID: require('node:crypto').randomBytes(16).toString('hex') });
   env.NOEVIA_CORPUS_ALLOWED_PORTS = `${env.NOEVIA_CORPUS_ALLOWED_PORTS},${store.port}`;
   const log = [];
   const child = spawn(process.execPath, ['--require', GUARD, SERVER], { env, cwd: path.dirname(SERVER), stdio: ['ignore', 'pipe', 'pipe'] });
@@ -168,7 +169,9 @@ async function main() {
     await step(anon, 'GET', '/api/health');
     await step(anon, 'GET', '/api/workspace');
     await step(admin, 'GET', '/api/workspace', undefined, [200]);
-    await step(admin, 'GET', '/api/features', undefined, [200]);
+    // The feature settings are the Rust front's (sbstndalton/noevia-rs#338): Node refuses them.
+    const featureRead = await step(admin, 'GET', '/api/features', undefined, [503]);
+    if (featureRead.json?.code !== 'RUST_FEATURES_OWNED') throw new Error('Expected the Rust feature ownership refusal.');
     // A write without the CSRF header is refused.
     const noCsrf = new Client(base, base); noCsrf.jar = new Map([...admin.jar].filter(([k]) => k !== 'cowork_csrf'));
     await step(noCsrf, 'POST', '/api/projects', { name: 'no csrf' });

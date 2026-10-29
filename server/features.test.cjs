@@ -1,13 +1,13 @@
 'use strict';
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { createFeatures, REGISTRY, parseEnv } = require('./features.cjs');
+const { createFeatures, REGISTRY, parseEnv } = require('../tests/server/oracles/features-legacy.cjs');
 
 const memoryStore = (seed = {}) => { const m = new Map(Object.entries(seed)); return { m, get: k => m.get(k), set: (k, v) => m.set(k, v) }; };
 
 test('#1071: the retired storage-read switch is no feature and no ownership selector', () => {
-  const { RUST_STORAGE_READS_REFUSAL } = require('./features.cjs');
-  assert.equal(require('./features.cjs').rustStorageReadsOwned, undefined, 'the switch reader is gone');
+  const { RUST_STORAGE_READS_REFUSAL } = require('../tests/server/oracles/features-legacy.cjs');
+  assert.equal(require('../tests/server/oracles/features-legacy.cjs').rustStorageReadsOwned, undefined, 'the switch reader is gone');
   const env = { NOEVIA_RUST_STORAGE_READS: '1', NOEVIA_RUST_STORAGE_READS_CONFIRMED: '1' };
   const features = createFeatures({ env, store: memoryStore() });
   assert.equal(features.names().includes('rustStorageReads'), false);
@@ -81,7 +81,7 @@ test('features wired at startup report a pending restart instead of pretending t
 });
 
 test('toolGate is experimental, off by default and unavailable until the decision service is configured', () => {
-  const { createFeatures: make } = require('./features.cjs');
+  const { createFeatures: make } = require('../tests/server/oracles/features-legacy.cjs');
   const off = make({ env: {} });
   const info = off.describe().find((f) => f.name === 'toolGate');
   assert.equal(info.experimental, true); assert.equal(info.enabled, false); assert.equal(info.env, 'NOEVIA_FEATURE_TOOL_GATE');
@@ -96,7 +96,7 @@ test('toolGate is experimental, off by default and unavailable until the decisio
 });
 
 test('browserRuntimeReason: missing playwright, missing Chromium, and a complete runtime (issue 550)', () => {
-  const { browserRuntimeReason } = require('./features.cjs');
+  const { browserRuntimeReason } = require('../tests/server/oracles/features-legacy.cjs');
   const missing = () => { throw Object.assign(new Error('nope'), { code: 'MODULE_NOT_FOUND' }); };
   assert.match(browserRuntimeReason({ resolve: missing }), /Playwright installed/);
   const pw = { chromium: { executablePath: () => '/ms/chromium' } };
@@ -146,7 +146,7 @@ test('every feature is described with a stable id equal to its flag name, for th
 });
 
 test('the reasons a feature is unavailable carry a stable id where the server owns the text (#618)', () => {
-  const { unavailableId, browserRuntimeReason } = require('./features.cjs');
+  const { unavailableId, browserRuntimeReason } = require('../tests/server/oracles/features-legacy.cjs');
   assert.equal(unavailableId('browserExecutor', browserRuntimeReason({ resolve: () => { throw new Error('no'); } })), 'browserPlaywright');
   assert.equal(unavailableId('browserExecutor', browserRuntimeReason({ resolve: () => 'x', load: () => { throw new Error('no'); } })), 'browserChromium');
   assert.equal(unavailableId('browserExecutor', null), null);
@@ -250,13 +250,13 @@ test('#705: the Code pipeline and merge flags are off by default and need the co
 const nativeStatusEnv = () => ({ NOEVIA_FRONT: 'rust', NOEVIA_RUST_AUTH: '1', NOEVIA_RUST_AUTH_CONFIRMED: '1' });
 
 test('#1071: the ChatGPT status has no ownership selector; Node always refuses it', () => {
-  const lib = require('./features.cjs');
+  const lib = require('../tests/server/oracles/features-legacy.cjs');
   assert.equal(lib.rustChatgptStatusOwned, undefined, 'the switch reader is gone');
   assert.deepEqual(lib.RUST_CHATGPT_STATUS_REFUSAL, { error: 'ChatGPT status is owned by the Rust front.', code: 'RUST_CHATGPT_STATUS_OWNED' });
 });
 test('native ChatGPT status: typed SQL projection affects only the two product keys', () => {
   const Database = require('better-sqlite3');
-  const { settingsStore } = require('./features.cjs');
+  const { settingsStore } = require('../tests/server/oracles/features-legacy.cjs');
   const db = new Database(':memory:');
   try {
     db.exec('CREATE TABLE settings(key TEXT PRIMARY KEY,value TEXT)');

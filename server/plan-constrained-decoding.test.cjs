@@ -4,7 +4,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 const { PLAN_ARTIFACT_SCHEMA, planConstraint, requestPlanArtifact, supportsJsonSchema } = require('./plan-constrained-decoding.cjs');
-const { createFeatures } = require('./features.cjs');
+const { createFeatures } = require('../tests/server/oracles/features-legacy.cjs');
 const { parseCapabilities, effectiveCapabilities, engineCapabilities } = require('./providers.cjs');
 
 // Synthetic rows only. The capable one declares the capability; nothing about its address matters.

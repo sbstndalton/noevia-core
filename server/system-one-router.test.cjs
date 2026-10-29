@@ -2,7 +2,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const { configuration, createSystemOneRouter } = require('./system-one-router.cjs');
-const { createFeatures } = require('./features.cjs');
+const { createFeatures } = require('../tests/server/oracles/features-legacy.cjs');
 
 function harness(decide = async () => ({ selected: 'smart', scores: { smart: 1 } })) {
   let on = false, calls = 0, legacy = 0;

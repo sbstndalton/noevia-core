@@ -32,7 +32,7 @@ test('a 204/empty decision response is treated as no decision, not a JSON.parse 
   await assert.rejects(provider.decide(input),/no decision/);
 });
 test('configured feature can be enabled and disabled through existing settings',()=>{
-  const {createFeatures}=require('./features.cjs'), saved=new Map();
+  const {createFeatures}=require('../tests/server/oracles/features-legacy.cjs'), saved=new Map();
   const f=createFeatures({env,store:{get:k=>saved.get(k),set:(k,v)=>saved.set(k,v)}});
   assert.equal(f.enabled('stepSupervision'),false);f.set('stepSupervision',true,'admin');assert.equal(f.enabled('stepSupervision'),true);
   f.set('stepSupervision',false,'admin');assert.equal(f.enabled('stepSupervision'),false);

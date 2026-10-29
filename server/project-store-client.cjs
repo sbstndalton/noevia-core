@@ -128,7 +128,50 @@ function createClient({ port, token, fetchImpl = globalThis.fetch, timeoutMs = T
       : 'The research job store is unavailable; retry shortly.';
     throw Object.assign(Error(message), { status: [400,404,409,410].includes(status) ? status : 503 });
   }
+  // Dedicated bounded context exchange over the existing private store capability. Never
+  // reuse the project-file 32 MiB reply cap or export the token back into process.env.
+  async function featureContext(body, { timeoutMs = 2500 } = {}) {
+    const unavailable = () => Object.assign(new Error('Feature runtime context is unavailable.'), { status: 503, code: 'FEATURE_RUNTIME_CONTEXT_UNAVAILABLE' });
+    if (typeof body !== 'string' || Buffer.byteLength(body, 'utf8') > 32768
+      || !Number.isFinite(timeoutMs) || timeoutMs <= 0 || timeoutMs > 2500
+      || !Number.isInteger(port) || port < 1 || port > 65535 || typeof token !== 'string' || token.length < 32) throw unavailable();
+    const abort = new AbortController();
+    const deadline = require('node:perf_hooks').performance.now() + timeoutMs;
+    let timer, reader, timedOut = false;
+    const expired = new Promise((_, reject) => { timer = setTimeout(() => {
+      timedOut = true; abort.abort(); reader?.cancel().catch(() => {}); reject(unavailable());
+    }, timeoutMs); });
+    try {
+      const fetched = Promise.resolve().then(() => fetchImpl(`http://127.0.0.1:${port}/v1/features/context`, {
+        method: 'POST', redirect: 'error', cache: 'no-store',
+        headers: { 'content-type': 'application/json', 'x-noevia-store-token': token },
+        body, signal: abort.signal,
+      })).then(response => {
+        if (timedOut) { response?.body?.cancel?.().catch(() => {}); throw unavailable(); }
+        return response;
+      });
+      const response = await Promise.race([fetched, expired]);
+      if (!response?.body || typeof response.body.getReader !== 'function') throw unavailable();
+      reader = response.body.getReader();
+      const chunks = []; let size = 0;
+      for (;;) {
+        const { done, value } = await Promise.race([reader.read(), expired]);
+        if (timedOut || require('node:perf_hooks').performance.now() >= deadline) throw unavailable();
+        if (done) break;
+        size += value.byteLength;
+        if (size > 2048) throw unavailable();
+        chunks.push(Buffer.from(value));
+      }
+      if (timedOut || require('node:perf_hooks').performance.now() >= deadline || response.status !== 200 || response.headers.get('cache-control') !== 'no-store') throw unavailable();
+      return Buffer.concat(chunks, size).toString('utf8');
+    } catch { throw unavailable(); }
+    finally {
+      clearTimeout(timer); abort.abort();
+      if (reader) { reader.cancel().catch(() => {}); reader.releaseLock(); }
+    }
+  }
   return {
+    featureContext,
     researchJobsFor(user) {
       return {
         recover: (owner) => researchCall('recover', user, owner),

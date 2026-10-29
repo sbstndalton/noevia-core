@@ -107,9 +107,14 @@ const portOf = (value) => { try { const u = new URL(String(value || '').trim());
 
 function emptyState() { return { version: 1, machines: [], assignments: {} }; }
 
-function readState(store, log) {
+function readState(store, log, recordSource = () => {}) {
   let raw;
-  try { raw = store.get(KEY); } catch { return emptyState(); }
+  recordSource(null);
+  try {
+    const observed = typeof store.readFact === 'function' ? store.readFact(KEY) : { value: store.get(KEY), source: null };
+    raw = observed.value;
+    recordSource(observed.source);
+  } catch { return emptyState(); }
   if (!raw) return emptyState();
   try {
     const s = JSON.parse(raw);
@@ -146,12 +151,15 @@ function readState(store, log) {
  * @param {(service:string) => void} [o.onChange]     called after a change that moves `service` (or every service on a machine)
  */
 function createInferenceMachines({ store, audit = () => {}, lookup, embeddingActive = () => null, localEmbeddingUrl = () => null, workerEnabled = (service) => !!String(process.env[service === 'ocr' ? 'OCR_BASE_URL' : 'DOCLING_BASE_URL'] || '').trim(), onChange = () => {}, modelsAt = null, log = (line) => console.warn(line) } = {}) {
-  let state = readState(store, log);
+  let runtimeSource = null;
+  let state = readState(store, log, source => { runtimeSource = source; });
   const machineById = (id) => state.machines.find((m) => m.id === id) || null;
 
   function save(next) {
-    store.set(KEY, JSON.stringify(next));
+    const encoded = JSON.stringify(next);
+    const observed = typeof store.writeFact === 'function' ? store.writeFact(KEY, encoded) : (store.set(KEY, encoded), null);
     state = next;
+    runtimeSource = observed?.source ?? null;
   }
 
   /** The machine embeddings run on now, derived from the active target: 'local', a machine id, or 'other'. */
@@ -340,7 +348,10 @@ function createInferenceMachines({ store, audit = () => {}, lookup, embeddingAct
     return view();
   }
 
-  return { view, add, update, remove, assign, urlFor, chatTarget, assignmentOf, rerankProtocol, embeddingMachine, machine: machineById };
+  return { view, add, update, remove, assign, urlFor, chatTarget, assignmentOf, rerankProtocol, embeddingMachine, machine: machineById,
+    runtimeContextSource: () => runtimeSource,
+    refreshRuntimeContextSource: () => { state = readState(store, log, source => { runtimeSource = source; }); return runtimeSource; },
+  };
 }
 
 module.exports = { createInferenceMachines, normalizeAddress, serviceUrl, addressOf, cleanModel, SERVICES, SERVICE_IDS, CHAT_ROLE_SERVICE, LOCAL_ID, KEY };

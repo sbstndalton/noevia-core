@@ -291,19 +291,36 @@ function createHandler(dataDir, token, writes = [], failures = [], { changes = f
   // clients still have no Node journal fallback; Rust tests cover the actual store.
   const sourceOps = new Set(['recover', 'start', 'abandon', 'progress', 'finish', 'read']);
   const sourceClients = new Map();
+  // Test-only transport stand-in for unrelated index fixtures. It never claims
+  // native cleanup/lease/ownership qualification; real Rust two-process tests do.
+  const contextIncarnation=crypto.randomBytes(16).toString('hex');
+  let contextInstalled=false;
+  const contextReply=body=>{
+    const db=new (require(require.resolve('better-sqlite3',{paths:[path.join(__dirname,'..','..','server')]})))(path.join(dataDir,'cowork.db'),{fileMustExist:true});
+    try {
+      if(body.op==='hello') {
+        if(!contextInstalled) {db.prepare('INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)').run('native:feature-runtime:incarnation',contextIncarnation);contextInstalled=true;}
+        return {op:'hello',request:body.request,start:body.start,incarnation:contextIncarnation};
+      }
+      if(!contextInstalled||body.incarnation!==contextIncarnation||!['register','renew','release'].includes(body.op))throw Error('context unavailable');
+      return {op:body.op,request:body.request,start:body.start,incarnation:contextIncarnation,boot:body.boot,session:body.session,sequence:body.sequence,status:body.op==='release'?'released':'ready',...(body.op==='release'?{}:{leaseMs:15000})};
+    } finally {db.close();}
+  };
+
   return (req, res) => {
     const chunks = [];
     req.on('data', (c) => chunks.push(c));
     req.on('end', async () => {
       try {
         const sourceOp = req.url.startsWith('/v1/source-jobs/') ? req.url.slice('/v1/source-jobs/'.length) : null;
-        if (req.method !== 'POST' || !(['/v1/read', '/v1/write'].includes(req.url) || HISTORY_OPS.has(req.url) || sourceOps.has(sourceOp))) return send(res, 404, { error: 'not found' });
+        if (req.method !== 'POST' || !(['/v1/read', '/v1/write','/v1/features/context'].includes(req.url) || HISTORY_OPS.has(req.url) || sourceOps.has(sourceOp))) return send(res, 404, { error: 'not found' });
         if (req.url === '/v1/changes/read' && !changes) return send(res, 404, { error: 'not found' });
         if (req.headers['x-noevia-store-token'] !== token) return send(res, 401, { error: 'unauthorised' });
         const planned = failures.find((f) => f.url === req.url && f.times > 0);
         if (planned) { planned.times -= 1; return send(res, planned.status, planned.body); }
         let body;
         try { body = JSON.parse(Buffer.concat(chunks).toString('utf8')); } catch { return send(res, 400, { error: 'invalid JSON' }); }
+        if(req.url==='/v1/features/context')return send(res,200,contextReply(body));
         if (!body || typeof body.user !== 'string') return send(res, 400, { error: 'user required' });
         if (!sourceOps.has(sourceOp) && !HISTORY_OPS.has(req.url) && !FILES.has(body.file)) return send(res, 400, { error: 'file must be projects.json or free-chats.json' });
         if (!USER.test(body.user)) return send(res, 400, { error: 'invalid user' });
@@ -379,6 +396,7 @@ function freePortSync() {
  *  secret out of the environment) and starts the store on that port, unref'd so it never keeps
  *  the test process alive. Call it before requiring index.cjs. */
 function installProjectStore(dataDir, env = process.env) {
+  if(!/^[0-9a-f]{32}$/.test(env.NOEVIA_START_ID||''))env.NOEVIA_START_ID=crypto.randomBytes(16).toString('hex');
   const port = freePortSync();
   const token = crypto.randomBytes(32).toString('hex');
   env.NOEVIA_PROJECT_STORE_PORT = String(port);

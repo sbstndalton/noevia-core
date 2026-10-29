@@ -4,7 +4,7 @@ const assert = require('node:assert/strict');
 const { createChatFraming, createFramingSettings, normalizeFrame, existingTags, KINDS, NONE } = require('./chat-framing.cjs');
 const { createDecisions } = require('./decision/index.cjs');
 const { mergeChats } = require('./chat-lists.cjs');
-const { REGISTRY, createFeatures } = require('./features.cjs');
+const { REGISTRY, createFeatures } = require('../tests/server/oracles/features-legacy.cjs');
 
 // Synthetic fixtures only.
 const projects = [{ id: 'p-garden', name: 'Garden' }, { id: 'p-tax', name: 'Taxes' }];

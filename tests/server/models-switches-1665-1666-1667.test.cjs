@@ -11,7 +11,6 @@ const { Readable } = require('node:stream');
 const { createRerankSettings } = require('../../server/rerank-settings.cjs');
 const { rerankTarget } = require('../../server/rerank-target.cjs');
 const { createDecisionSettings, describeDecision } = require('../../server/decision-settings.cjs');
-const { createFeatures } = require('../../server/features.cjs');
 const { createFeatureRoutes } = require('../../server/routes/features.cjs');
 const { createModelRoutes } = require('../../server/routes/models.cjs');
 const { modelAssignments } = require('../../server/model-assignments.cjs');
@@ -199,8 +198,8 @@ const KEV_ENV = { COWORK_DECISION_URL: 'http://kev:11435', COWORK_DECISION_MODEL
 function decisionFixture(env = KEV_ENV) {
   const store = memStore(), audits = [];
   const settings = createDecisionSettings({ store, env, fetchImpl: async () => Response.json({ ready: true }), audit: (a, actor, d) => audits.push([a, actor, d]) });
-  const features = createFeatures({ store, env: {}, availability: {} });
-  const route = createFeatureRoutes({ features, decisionSettings: settings, json: (res, status, body) => Object.assign(res, { status, body }), readJson: async (req) => req.body });
+  // The feature registry is the Rust front's; these routes are the decision-settings leaf that stays Node's.
+  const route = createFeatureRoutes({ decisionSettings: settings, json: (res, status, body) => Object.assign(res, { status, body }), readJson: async (req) => req.body });
   const call = async (method, body, role = 'admin') => { const res = {}; await route({ method, body }, res, { path: '/api/admin/decision-settings', authn: { user: { id: `${role}-1`, role } } }); return res; };
   return { store, audits, settings, call };
 }

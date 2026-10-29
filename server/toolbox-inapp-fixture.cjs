@@ -10,7 +10,7 @@ const { buildToolboxManifest } = require('./mcp-toolbox-manifest.cjs');
 const fn = (name) => ({ type: 'function', function: { name, description: 'synthetic', parameters: { type: 'object', properties: {} } } });
 
 function buildInAppBoxes() {
-  const manifest = buildToolboxManifest({ features: { enabled: () => true } });
+  const manifest = buildToolboxManifest({ diaryMcpWrite:true });
   const perServer = new Map();
   for (const box of manifest) {
     const owned = perServer.get(box.server) || new Map();

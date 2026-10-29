@@ -52,8 +52,17 @@ const invalidUrl=()=>Object.assign(Error('Use a private HTTP address such as htt
 // #1844: `sensitivityMachineUrl` is the same for the sensitivity check's own entry on that page
 // (inference-machines.cjs urlFor('sensitivity')); see sensitivityBackend().
 function createDecisionSettings({store,env=process.env,fetchImpl=decisionServiceFetch,sensitivityFetchImpl=(fetchImpl===decisionServiceFetch?serviceFetch:fetchImpl),lookup=undefined,audit=()=>{},kinds=SERVICE_KINDS,machineUrl=()=>null,sensitivityMachineUrl=()=>null}) {
-  let saved;
-  try { saved=JSON.parse(store.get(KEY)||'null'); } catch { saved={url:'',timeoutMs:1500}; }
+  let saved, runtimeSource=null;
+  function loadRuntimeSource() {
+    runtimeSource=null;
+    try {
+      const observed=typeof store.readFact==='function' ? store.readFact(KEY) : {value:store.get(KEY),source:null};
+      runtimeSource=observed.source;
+      saved=JSON.parse(observed.value||'null');
+    } catch { saved={url:'',timeoutMs:1500}; }
+    return runtimeSource;
+  }
+  loadRuntimeSource();
   // #1666: `model` is the decision model the administrator chose in Settings, present only when one was chosen (absent =
   // automatic: the deployment's COWORK_DECISION_MODEL when the URL is the deployment's own, Laya otherwise, exactly as
   // before). The reply is otherwise unchanged (the recorded HTTP contract corpus); the choosable ids are on the admin's
@@ -158,6 +167,9 @@ function createDecisionSettings({store,env=process.env,fetchImpl=decisionService
   }
   return {
     get, backend, sensitivityBackend,
+    // A known malformed row may produce the existing fallback; a failed read has no provenance.
+    runtimeContextSource:()=>runtimeSource,
+    refreshRuntimeContextSource:loadRuntimeSource,
     /** Why an experiment that needs `kind` decisions cannot run, or null. Without a kind: only
      *  whether a service is configured. */
     unavailable:(kind)=>{
@@ -165,13 +177,15 @@ function createDecisionSettings({store,env=process.env,fetchImpl=decisionService
       if(typeof kind==='string' && !kinds.includes(kind)) return `The configured decision service does not support ${kind} decisions, so this experiment cannot run.`;
       return null;
     },
-    save(value,actor) {const next=validate(value);store.set(KEY,JSON.stringify(next));saved=next;audit('decision.configure',actor,{url:next.url,timeoutMs:next.timeoutMs,model:next.model||'auto'});return get();},
+    save(value,actor) {const next=validate(value);const encoded=JSON.stringify(next);const observed=typeof store.writeFact==='function' ? store.writeFact(KEY,encoded) : (store.set(KEY,encoded),null);saved=next;runtimeSource=observed?.source??null;audit('decision.configure',actor,{url:next.url,timeoutMs:next.timeoutMs,model:next.model||'auto'});return get();},
     /** #1765: forgets the URL and deadline saved in Settings, so COWORK_DECISION_URL (and its key and model)
      *  applies again. Audited, also when nothing was saved, so the log shows every attempt. */
     reset(actor) {
       const had=!!saved;
-      if(typeof store.delete==='function') store.delete(KEY); else store.set(KEY,'null');
-      saved=null;
+      let observed=null;
+      if(typeof store.deleteFact==='function') observed=store.deleteFact(KEY);
+      else if(typeof store.delete==='function') store.delete(KEY); else store.set(KEY,'null');
+      saved=null; runtimeSource=observed?.source??null;
       audit('decision.reset',actor,{hadSaved:had});
       return get();
     },

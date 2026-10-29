@@ -127,7 +127,8 @@ const authService = createAuth({
 });
 // #1638: Settings → Inference machines: which machine each service runs on (default: all on this one). The decision
 // service and the reranker read their address from it; embeddings move only through the #1636 re-index.
-const inferenceMachines = require('./inference-machines.cjs').createInferenceMachines({ store: require('./features.cjs').settingsStore(authService.db), audit: (action,actor,detail)=>authService.audit(action,actor,actor,detail),
+const featureSourceStore = require('./feature-setting-source.cjs').createStore(authService.db);
+const inferenceMachines = require('./inference-machines.cjs').createInferenceMachines({ store: featureSourceStore, audit: (action,actor,detail)=>authService.audit(action,actor,actor,detail),
   embeddingActive: () => require('./embedding-config.cjs').current()?.active() || null,
   localEmbeddingUrl: () => require('./embedding-service.cjs').current()?.baseUrl || String(process.env.EMBEDDING_BASE_URL || '').trim() || null,
   modelsAt: (address, port) => chatMachines.modelsAt(address, port), // #1851 (chatMachines is built just below)
@@ -139,7 +140,7 @@ const chatMachines = require('./chat-machines.cjs').createChatMachines({ machine
 // #1880: an administrator-started measurement of a chat role's model on its machine (nothing on this machine changes).
 const machineTune = require('./machine-tune.cjs').createMachineTune({ machines: inferenceMachines, chatMachines, store: require('./features.cjs').settingsStore(authService.db),
   audit: (action,actor,detail)=>authService.audit(action,actor,actor,detail) });
-const decisionSettings = require('./decision-settings.cjs').createDecisionSettings({ store: require('./features.cjs').settingsStore(authService.db), audit: (action,actor,detail)=>authService.audit(action,actor,actor,detail), machineUrl: () => inferenceMachines.urlFor('decision'), sensitivityMachineUrl: () => inferenceMachines.urlFor('sensitivity') });
+const decisionSettings = require('./decision-settings.cjs').createDecisionSettings({ store: featureSourceStore, audit: (action,actor,detail)=>authService.audit(action,actor,actor,detail), machineUrl: () => inferenceMachines.urlFor('decision'), sensitivityMachineUrl: () => inferenceMachines.urlFor('sensitivity') });
 // #1841: OCR and Docling read their address from the same registry (document-workers.cjs), the environment being the fallback.
 require('./document-workers.cjs').useMachines((kind) => inferenceMachines.urlFor(kind));
 // #1665: the reranker's on/off and model, saved in Settings over the deployment's RERANK_* environment.
@@ -147,11 +148,19 @@ const rerankSettings = require('./rerank-settings.cjs').install(require('./reran
   machine: () => { const url = inferenceMachines.urlFor('reranker'); return url ? { url, protocol: inferenceMachines.rerankProtocol() } : null; } }));
 // #697: the inference memory budget (admin setting; INFERENCE_MEMORY_BUDGET_GIB is its initial value).
 const inferenceBudget = require('./inference-budget.cjs').createInferenceBudget({ store: require('./features.cjs').settingsStore(authService.db), audit: (action,actor,detail)=>authService.audit(action,actor,actor,detail) });
-const features = require('./features.cjs').createFeatures({ store: require('./features.cjs').settingsStore(authService.db), audit: (action, actor, detail) => authService.audit(action, actor, actor, detail),
-  // #555 F4: switching native-app sign-in off is a revoke, not a pause (deviceAuth is built below).
-  onChange: (name, enabled, actorId) => { if (name === 'nativeClientAuth' && !enabled) deviceAuth.revokeAll(actorId, 'feature-off'); },
-  availability:{stepSupervision:()=>decisionSettings.unavailable('choice'),toolGate:()=>decisionSettings.unavailable('choice'),systemOneRouting:()=>decisionSettings.unavailable() && require('./system-one-router.cjs').configuration().reason,chatFraming:()=>decisionSettings.unavailable('choice'),framingReasoner:()=>decisionSettings.unavailable('choice')} });
-const featureRoutes = require('./routes/features.cjs').createFeatureRoutes({ features, json, readJson, decisionSettings });
+let featureRuntime;
+const featureSetup = require('./features.cjs').createReadOnlyFeatures({ db:authService.db, runtime:()=>featureRuntime, availability:{stepSupervision:()=>decisionSettings.unavailable('choice'),toolGate:()=>decisionSettings.unavailable('choice'),systemOneRouting:()=>decisionSettings.unavailable() && require('./system-one-router.cjs').configuration().reason,chatFraming:()=>decisionSettings.unavailable('choice'),framingReasoner:()=>decisionSettings.unavailable('choice')} });
+const features = featureSetup.features, featureConstruction = featureSetup.construction;
+featureRuntime = require('./feature-runtime.cjs').createFeatureRuntime({
+  db:authService.db, storeClient:PROJECT_STORE, bootFacts:featureSetup.bootFacts, start:process.env.NOEVIA_START_ID,
+  collector:require('./feature-runtime.cjs').createContextCollector({db:authService.db,store:featureSourceStore,decisionSettings,inferenceMachines}),
+});
+// One initial barrier, shared by real startup and the existing imported request API.
+// Ordinary enabled/flags/describe never initiate an RPC or bypass the live lease.
+let featureStartup=null;
+const readyFeatures=()=>featureStartup ||= featureRuntime.ready();
+
+const featureRoutes = require('./routes/features.cjs').createFeatureRoutes({ json, readJson, decisionSettings });
 const pluginDirectoryRoutes = require('./routes/plugin-directory.cjs').createPluginDirectoryRoutes({ json });
 // Settings → Data: the signed-in user's conversations as a ZIP (routes/export.cjs).
 // GET /api/export/conversations is the Rust front's (#1071): this mount only refuses a bypass.
@@ -499,7 +508,7 @@ const FREE_CHATS = arrayProxy('freeChats');
 const { USAGE_RETENTION_DAYS, usageDayKey, readUsage, recordUsage, recordToolUse } = require('./usage.cjs');
 
 // D9: read-only offline Wikipedia box, only with features.kiwix and an internal KIWIX_URL.
-const kiwixTools = features.enabled('kiwix') && process.env.KIWIX_URL ? require('./kiwix.cjs').createKiwixTools({ baseUrl: process.env.KIWIX_URL, cap: TOOL_RESULT_CAP }) : null;
+const kiwixTools = featureConstruction.kiwix && process.env.KIWIX_URL ? require('./kiwix.cjs').createKiwixTools({ baseUrl: process.env.KIWIX_URL, cap: TOOL_RESULT_CAP }) : null;
 // Offered per request only to accounts with a connected Drive (connectedBoxes).
 const driveTools = require('./gdrive-tools.cjs').createDriveTools({ accounts: driveAccounts, cap: TOOL_RESULT_CAP });
 // Toolboxes, the resolver, the read/write gate and the built-in executor live in toolboxes.cjs.
@@ -589,7 +598,7 @@ const {
   readHistory, ownsFile, ensureProjectFolder, withSourceLock, pruneDocuments, researchReportTarget, writeProjectTextFile, sweepDeletedProject, indexSource,
 } = projectStore;
 // ── MCP toolboxes (master step 15): curated in mcp-toolbox-manifest.cjs ─────────
-const MCP_TOOLBOX_MANIFEST = require('./mcp-toolbox-manifest.cjs').buildToolboxManifest({ features });
+const MCP_TOOLBOX_MANIFEST = require('./mcp-toolbox-manifest.cjs').buildToolboxManifest({ diaryMcpWrite:featureConstruction.diaryMcpWrite });
 
 
 // MCP server list and curated-box filter: parsed in mcp-servers.cjs.
@@ -983,9 +992,9 @@ for (const [key, id] of [['COWORK_DECISION_MODEL', process.env.COWORK_DECISION_M
 }
 // #1745: a Kev host behind COWORK_DECISION_URL with a non-Kev model fails every decision; say so once.
 for (const line of require('./decision-settings.cjs').startupWarnings(process.env)) console.warn(line);
-for (const f of features.describe()) {
+afterNativeReady(() => { for (const f of features.describe()) {
   if (['toolGate', 'stepSupervision', 'systemOneRouting', 'chatFraming'].includes(f.id) && f.enabled && f.unavailable) console.warn(`[system-one] ${f.id} is on but cannot run: ${f.unavailable}`);
-}
+} });
 
 // #778: one decision layer for the sensitivity check, rebuilt only when the backend changes.
 let sensitivityBackend = null, sensitivityDecisions = null;
@@ -1118,10 +1127,9 @@ const publicAuthRoutes = new Set([
 // /device page hidden while it is off. requestAuth is the router's single credential check.
 const nativeClientAuth = () => features.enabled('nativeClientAuth');
 const deviceAuth = require('./device-auth.cjs').createDeviceAuth({
-  db: authService.db, audit: authService.audit, publicUser: authService.publicUser, guard: rustAuth,
+  db: authService.db, publicUser: authService.publicUser,
 });
-// Started with the feature off: grants from an earlier "on" period are revoked, not kept dormant.
-if (!nativeClientAuth()) deviceAuth.revokeAll(null, 'feature-off');
+// Native registration commits initial device cleanup before this process becomes ready.
 const requestAuth = require('./device-auth.cjs').createRequestAuth({ enabled: nativeClientAuth, deviceAuth, authService });
 const deviceRoutes = require('./routes/device-auth.cjs').createDeviceAuthRoutes({ json, enabled: nativeClientAuth });
 const authRoutes = require('./routes/auth.cjs').createAuthRoutes({
@@ -1208,10 +1216,26 @@ const mcpDirectoryRoutes = require('./routes/mcp-directory.cjs').createMcpDirect
   onToolsChange: () => permittedToolsCache.clear(),
 });
 
+// The headers every page and API reply carries, the refusals answered before authentication too.
+function publicHeaders(res) {
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('Referrer-Policy', 'same-origin');
+  res.setHeader('X-Frame-Options', 'DENY');
+  res.setHeader('Content-Security-Policy', "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; font-src 'self'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'");
+  // #1480: HSTS for six months, no includeSubDomains (nothing else on this host is known to need HTTP).
+  res.setHeader('Strict-Transport-Security', 'max-age=15552000');
+  // #1480: the browser features this app never calls are switched off for every page and API reply.
+  res.setHeader('Permissions-Policy', 'camera=(), microphone=(), geolocation=(), payment=(), usb=(), serial=(), bluetooth=(), hid=(), midi=(), magnetometer=(), gyroscope=(), accelerometer=()');
+}
+
 async function handleRequestInner(req, res) {
+  // The ownership refusals below answer before handleRequestScoped; they carry the same headers.
+  publicHeaders(res);
   // GET /api/integrations/storage is the Rust front's (#1071): refused before authentication.
   if (require('./features.cjs').refuseRustStorageRead(req, res, { parseRequestUrl, badRequestUrl, json })) return;
   if (require('./routes/chat-framing.cjs').refuseOwnedPreferences(req, res, { parseRequestUrl, json })) return;
+  if (require('./routes/features.cjs').refuseOwnedFeatures(req, res, { parseRequestUrl, json })) return;
+  await readyFeatures();
   const preAuth = requestAuth.authenticate(req);
   // accountRole: a device token acts as a member, but its account's workspace is the same one.
   const workspace = preAuth ? workspaceStore.get(preAuth.user.id, {
@@ -1242,14 +1266,7 @@ async function handleRequestScoped(req, res) {
   const url = parseRequestUrl(req, `http://${req.headers.host || 'localhost'}`) || parseRequestUrl(req);
   if (!url) return badRequestUrl(res);
   const p = url.pathname;
-  res.setHeader('X-Content-Type-Options', 'nosniff');
-  res.setHeader('Referrer-Policy', 'same-origin');
-  res.setHeader('X-Frame-Options', 'DENY');
-  res.setHeader('Content-Security-Policy', "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; font-src 'self'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'");
-  // #1480: HSTS for six months, no includeSubDomains (nothing else on this host is known to need HTTP).
-  res.setHeader('Strict-Transport-Security', 'max-age=15552000');
-  // #1480: the browser features this app never calls are switched off for every page and API reply.
-  res.setHeader('Permissions-Policy', 'camera=(), microphone=(), geolocation=(), payment=(), usb=(), serial=(), bluetooth=(), hid=(), midi=(), magnetometer=(), gyroscope=(), accelerometer=()');
+  publicHeaders(res);
 
   try {
     if ((req.method === 'GET' || req.method === 'HEAD') && publicPage(p)) {
@@ -1366,6 +1383,7 @@ let processReady = false;
 if (require.main === module) {
   (async () => {
   // Authenticated native readiness precedes listeners and scheduled runtime work.
+  await readyFeatures();
   if (codeEgress) await codeEgress.ready();
   for (const start of readyRuntime) start();
   fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -1505,4 +1523,4 @@ if (require.main === module) {
   })().catch(() => { console.error('[startup] readiness or initialisation failed'); process.exitCode = 1; });
 }
 
-module.exports = { handleRequest, chatListHolder, sanitizeChats, MCP_SERVERS, toolboxOffered, ownsFile, projectFolderName, prefill, TOOL_PREFILL_TARGET_MS, isWriteTool, chatWideApproved, pendingApprovals, resolveTools, allToolboxes, mcpCredentialOriginAllowed, toolTokenBudgetFor, MCP_TOOLBOX_MANIFEST, toolboxSummaries, estimateToolTokens, toolCapFor, sanitizeToolboxes, executeToolCall, TOOLBOXES, classifierVerdict, heuristicWantsSmart, heuristicWantsCode, CLASSIFIER_MAX_TOKENS, recordUsage, recordToolUse, readUsage, usageDayKey, USAGE_RETENTION_DAYS };
+module.exports = { readyFeatures, handleRequest, chatListHolder, sanitizeChats, MCP_SERVERS, toolboxOffered, ownsFile, projectFolderName, prefill, TOOL_PREFILL_TARGET_MS, isWriteTool, chatWideApproved, pendingApprovals, resolveTools, allToolboxes, mcpCredentialOriginAllowed, toolTokenBudgetFor, MCP_TOOLBOX_MANIFEST, toolboxSummaries, estimateToolTokens, toolCapFor, sanitizeToolboxes, executeToolCall, TOOLBOXES, classifierVerdict, heuristicWantsSmart, heuristicWantsCode, CLASSIFIER_MAX_TOKENS, recordUsage, recordToolUse, readUsage, usageDayKey, USAGE_RETENTION_DAYS };

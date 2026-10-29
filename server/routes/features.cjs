@@ -4,12 +4,16 @@
 // PUT  /api/admin/features/:name     { enabled } -> feature  admin
 // GET|PUT|DELETE /api/admin/decision-settings (PUT {reset:true} = DELETE: back to the deployment's URL) admin
 // Returns true when it handled the request. CSRF/origin checks run before routes are mounted.
-function createFeatureRoutes({ features, json, readJson, decisionSettings = null }) {
+const FEATURE_REFUSAL=Object.freeze({ error:'Feature settings are owned by the Rust front.',code:'RUST_FEATURES_OWNED' });
+const owned=path=>path==='/api/features'||path==='/api/admin/features'||path.startsWith('/api/admin/features/');
+function refuseOwnedFeatures(req,res,{parseRequestUrl,json}) {
+  const url=parseRequestUrl(req,`http://${req.headers.host||'localhost'}`)||parseRequestUrl(req);
+  if(!url||!owned(url.pathname))return false;
+  json(res,503,FEATURE_REFUSAL);return true;
+}
+function createFeatureRoutes({ json, readJson, decisionSettings = null }) {
   return async function featureRoutes(req, res, { path, authn }) {
-    if (path === '/api/features') {
-      if (req.method !== 'GET') return json(res, 405, { error: 'method not allowed' }), true;
-      return json(res, 200, { flags: features.flags() }), true;
-    }
+    if (owned(path)) return json(res,503,FEATURE_REFUSAL),true;
     if (path === '/api/admin/decision-settings' || path === '/api/admin/decision-settings/test') {
       if (!authn || authn.user.role !== 'admin') return json(res,403,{error:'Administrator required'}),true;
       if (!decisionSettings) return json(res,503,{error:'Decision configuration unavailable'}),true;
@@ -23,24 +27,7 @@ function createFeatureRoutes({ features, json, readJson, decisionSettings = null
         return json(res,200,result),true;
       } catch(error) {return json(res,error.status||400,{error:error.status?error.message:'Invalid decision settings',...(error.status&&error.messageId?{errorId:error.messageId}:{})}),true;}
     }
-    if (path !== '/api/admin/features' && !path.startsWith('/api/admin/features/')) return false;
-    if (!authn || authn.user.role !== 'admin') return json(res, 403, { error: 'Administrator required' }), true;
-    if (path === '/api/admin/features') {
-      if (req.method !== 'GET') return json(res, 405, { error: 'method not allowed' }), true;
-      return json(res, 200, { features: features.describe() }), true;
-    }
-    // A legacy flag name (e.g. astraReview, renamed plannerReview) is still accepted (a stale client or script).
-    const requested = decodeURIComponent(path.slice('/api/admin/features/'.length));
-    const name = typeof features.resolve === 'function' ? features.resolve(requested) : requested;
-    if (req.method !== 'PUT') return json(res, 405, { error: 'method not allowed' }), true;
-    let body;
-    try { body = await readJson(req); } catch { return json(res, 400, { error: 'invalid JSON' }), true; }
-    try {
-      features.set(name, body?.enabled, authn.user.id);
-      return json(res, 200, features.describe().find(f => f.name === name)), true;
-    } catch (error) {
-      return json(res, error.status || 500, { error: error.status ? error.message : 'Could not save the feature' }), true;
-    }
+    return false;
   };
 }
-module.exports = { createFeatureRoutes };
+module.exports = { createFeatureRoutes,refuseOwnedFeatures,FEATURE_REFUSAL };

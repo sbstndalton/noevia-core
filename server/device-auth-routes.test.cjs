@@ -130,9 +130,15 @@ test('a device token acts as its own account, as a member, and reads without wri
 
 test('scope limits: a device token never reaches administration or account security on Node\'s routes', async () => {
   const tokens = deviceFor(adminId, 'Scoped Mac');
+  // Feature administration is the Rust front's: Node refuses it before authentication for every
+  // credential, so a device token gets that refusal and never a Node-side answer or write.
+  for (const [method, url, body] of [['GET', '/api/admin/features'], ['PUT', '/api/admin/features/nativeClientAuth', { enabled: false }]]) {
+    const r = await asDevice(tokens.access, url, { method, body });
+    assert.equal(r.status, 503, `${method} ${url} -> ${r.status}`);
+    assert.equal(r.json.code, 'RUST_FEATURES_OWNED', `${method} ${url}`);
+  }
   const refused = [
-    ['GET', '/api/admin/features'],
-    ['PUT', '/api/admin/features/nativeClientAuth', { enabled: false }],
+    ['GET', '/api/admin/decision-settings'],
     ['DELETE', `/api/admin/users/${memberId}`, { username: 'memberqa' }],
     ['POST', '/api/profile/diary-connectors', {}],
     ['PUT', '/api/integrations/storage', { kind: 'local' }],
@@ -144,8 +150,13 @@ test('scope limits: a device token never reaches administration or account secur
     assert.equal(r.status, 403, `${method} ${url} -> ${r.status}`);
     assert.equal(r.json.code, 'browser_session_required', `${method} ${url}`);
   }
-  // The admin's own browser session can still read the administration routes Node answers.
-  assert.equal((await admin.read('/api/admin/features')).status, 200);
+  // The admin's own browser session still reads the administration routes Node answers, so the
+  // refusals above are the device token's scope, not a closed route.
+  assert.equal((await admin.read('/api/admin/decision-settings')).status, 200);
+  // The admin's own browser session no longer reads feature administration from Node either.
+  const own = await admin.read('/api/admin/features');
+  assert.equal(own.status, 503);
+  assert.equal(own.json.code, 'RUST_FEATURES_OWNED');
 });
 
 test('bearer tokens cannot carry cookies, and a cookie session cannot borrow a bearer', async () => {

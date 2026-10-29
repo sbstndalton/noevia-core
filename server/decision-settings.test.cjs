@@ -6,7 +6,7 @@ if (!require('node:fs').existsSync(process.env.DAV_PARSE_WASM || require('./dav-
 }
 const test=require('node:test'),assert=require('node:assert/strict');
 const {createDecisionSettings}=require('./decision-settings.cjs');
-const {createFeatures}=require('./features.cjs');
+const {createFeatures}=require('../tests/server/oracles/features-legacy.cjs');
 const {createFeatureRoutes}=require('./routes/features.cjs');
 const {createSystemOneRouter}=require('./system-one-router.cjs');
 function fixture(fetchImpl=async()=>Response.json({ready:true})) {

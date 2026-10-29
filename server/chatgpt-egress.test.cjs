@@ -161,7 +161,7 @@ test('not connected, or reconnect needed, is said plainly; a refresh refused mid
 });
 
 test('the feature is off by default and only an operator env var or an administrator turns it on', () => {
-  const { createFeatures } = require('./features.cjs');
+  const { createFeatures } = require('../tests/server/oracles/features-legacy.cjs');
   assert.equal(createFeatures({ env: {} }).enabled('chatgptOAuth'), false);
   assert.equal(createFeatures({ env: {} }).flags().chatgptOAuth, false);
   assert.equal(createFeatures({ env: { NOEVIA_FEATURE_CHATGPT_OAUTH: 'true' } }).enabled('chatgptOAuth'), true);

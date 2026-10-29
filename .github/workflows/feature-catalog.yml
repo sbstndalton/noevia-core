@@ -30,6 +30,10 @@ jobs:
           set -euo pipefail
           cmp server/feature-catalog.json canonical-rs/contracts/features/catalog.json
           python3 canonical-rs/tools/features/generate_catalog.py --check --core-output "$PWD/server/feature-catalog.json"
-          node canonical-rs/tools/features/check_generated_core.cjs "$PWD"
       - run: npm ci --prefix server --no-fund --no-audit
+      # The canonical script of the same name drives the retired Node writer (createFeatures). Node's features
+      # are read-only behind the native runtime lease now, so Core's own check compares the canonical catalog
+      # and fixture with the production read-only mirror, native writes reproduced as settings-row changes.
+      - name: Canonical Rust fixture matches the production Node read-only mirror
+        run: node tools/features/check-catalog-mirror.cjs "$PWD" "$PWD/canonical-rs"
       - run: node --test server/feature-catalog.test.cjs server/features.test.cjs server/routes/features.test.cjs
