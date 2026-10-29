@@ -6,6 +6,8 @@ const os = require('node:os');
 const path = require('node:path');
 const { Readable, Writable } = require('node:stream');
 const test = require('node:test');
+// #2191 round 2: POST /api/projects is the Rust front's; fixtures are written as its create leaves them.
+const { createProjectAs } = require('../tests/server/front-projects.cjs');
 
 const testDataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cowork-auth-test-'));
 process.env.DIARY_AUTH_TOKEN = 'test-cowork-token';
@@ -130,8 +132,7 @@ test('provider DELETE removes private and shared providers through the real rout
 });
 
 test('chat reports upstream errors in SSE without writing headers twice', async (t) => {
-  const project = await request('/api/projects', {method:'POST', headers:adminHeaders, body:JSON.stringify({name:'Failure test', model:'model'})});
-  const projectId = JSON.parse(project.text).id;
+  const projectId = createProjectAs(testDataDir, adminId, {name:'Failure test', model:'model'}).id;
   for (const fetchStub of [async () => { throw new Error('offline'); }, async () => new Response('unavailable', {status:503})]) {
     t.mock.method(global, 'fetch', fetchStub);
     const result = await request('/api/chat', {method:'POST', headers:adminHeaders, body:JSON.stringify({projectId, chatId:'test', message:'hello'})});
@@ -143,8 +144,7 @@ test('chat reports upstream errors in SSE without writing headers twice', async 
 });
 
 test('empty SSE fallback refuses redirects and reconstructs split SSE lines', async (t) => {
-  const created = await request('/api/projects', {method:'POST', headers:adminHeaders, body:JSON.stringify({name:'Stream test', model:'model'})});
-  const projectId = JSON.parse(created.text).id;
+  const projectId = createProjectAs(testDataDir, adminId, {name:'Stream test', model:'model'}).id;
   let calls = 0;
   t.mock.method(global, 'fetch', async (_url, opts) => {
     assert.equal(opts.redirect, 'error');
@@ -167,7 +167,8 @@ test('empty SSE fallback refuses redirects and reconstructs split SSE lines', as
 });
 
 test('large authenticated request is bounded before JSON parsing', async () => {
-  const result = await request('/api/projects', {method:'POST', headers:adminHeaders, body:'x'.repeat(1024*1024+1)});
+  // POST /api/projects is the Rust front's (#2191 round 2); the config route reads with the same default cap.
+  const result = await request('/api/projects/p1/config', {method:'POST', headers:adminHeaders, body:'x'.repeat(1024*1024+1)});
   assert.equal(result.status, 413);
 });
 

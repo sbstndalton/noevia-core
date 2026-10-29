@@ -10,6 +10,8 @@ const path = require('node:path');
 const crypto = require('node:crypto');
 const { Readable, Writable } = require('node:stream');
 const test = require('node:test');
+// #2191 round 2: POST /api/projects is the Rust front's; fixtures are written as its create leaves them.
+const { createProjectAs } = require('../tests/server/front-projects.cjs');
 
 const testDataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'noevia-1815-'));
 process.env.DIARY_AUTH_TOKEN = 'test-cowork-token';
@@ -41,10 +43,11 @@ async function request(url, { method = 'GET', headers = {}, body = '' } = {}) {
 }
 
 let cookie = '', csrf = '';
+let frontUserId = '';
 test.before(async () => {
   ({ handleRequest } = require('./index.cjs'));
   // Sign-in is the Rust front's (#1071): the account and its session are seeded directly.
-  ({ cookie, csrf } = require('../tests/server/seed-account.cjs').seedAccount(testDataDir, { username: 'admin', displayName: 'Admin', publicOrigin: 'http://localhost' }));
+  ({ cookie, csrf, id: frontUserId } = require('../tests/server/seed-account.cjs').seedAccount(testDataDir, { username: 'admin', displayName: 'Admin', publicOrigin: 'http://localhost' }));
 });
 const mutation = () => ({ origin: 'http://localhost', cookie, 'content-type': 'application/json', 'x-csrf-token': csrf });
 const stored = require('../tests/server/stored-sources.cjs');
@@ -64,8 +67,8 @@ const KEEP = 'Synthetic kept text: the code word is SPRUCE-1815.';
 const GONE = 'Synthetic lost text: the code word is ASPEN-1815.';
 
 test('#1815: a source whose text file is deleted is listed with textMissing and its text is a SOURCE_TEXT_MISSING 404; a normal source is not; the pointer is kept', async () => {
-  const created = await request('/api/projects', { method: 'POST', headers: mutation(),
-    body: JSON.stringify({ name: 'Synthetic 1815', files: [{ name: 'keep.md', content: KEEP }, { name: 'gone.md', content: GONE }] }) });
+  const createdProject = createProjectAs(testDataDir, frontUserId, { name: 'Synthetic 1815', files: [{ name: 'keep.md', content: KEEP }, { name: 'gone.md', content: GONE }] });
+  const created = { status: 200, text: JSON.stringify(createdProject) };
   assert.equal(created.status, 200, created.text);
   const id = JSON.parse(created.text).id;
   const lost = textFile(sha(GONE));
@@ -108,8 +111,8 @@ test('#1815: a source whose text file is deleted is listed with textMissing and 
 
 test('#1818: GET /api/workspace makes no sync stat or access call on any source text', async () => {
   const texts = Array.from({ length: 20 }, (_, i) => `Synthetic hot-path text ${i} (#1818).`);
-  const created = await request('/api/projects', { method: 'POST', headers: mutation(),
-    body: JSON.stringify({ name: 'Synthetic 1818', files: texts.map((t, i) => ({ name: `${i}.md`, content: t })) }) });
+  const createdProject = createProjectAs(testDataDir, frontUserId, { name: 'Synthetic 1818', files: texts.map((t, i) => ({ name: `${i}.md`, content: t })) });
+  const created = { status: 200, text: JSON.stringify(createdProject) };
   assert.equal(created.status, 200, created.text);
   const orig = { accessSync: fs.accessSync, statSync: fs.statSync, lstatSync: fs.lstatSync, existsSync: fs.existsSync };
   const hits = [];

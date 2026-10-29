@@ -6,6 +6,8 @@ const os = require('node:os');
 const path = require('node:path');
 const { Readable, Writable } = require('node:stream');
 const test = require('node:test');
+// #2191 round 2: POST /api/projects is the Rust front's; fixtures are written as its create leaves them.
+const { createProjectAs } = require('../tests/server/front-projects.cjs');
 
 const testDataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'noevia-project-sweep-route-test-'));
 process.env.DIARY_AUTH_TOKEN = 'test-cowork-token';
@@ -56,9 +58,10 @@ async function request(url, { method = 'GET', headers = {}, body = '' } = {}) {
 
 let cookie = '';
 let csrf = '';
+let frontUserId = '';
 test.before(async () => {
   // Sign-in is the Rust front's (#1071): the account and its session are seeded directly.
-  ({ cookie, csrf } = require('../tests/server/seed-account.cjs').seedAccount(testDataDir, { username: 'admin', displayName: 'Admin', publicOrigin: 'http://localhost' }));
+  ({ cookie, csrf, id: frontUserId } = require('../tests/server/seed-account.cjs').seedAccount(testDataDir, { username: 'admin', displayName: 'Admin', publicOrigin: 'http://localhost' }));
 });
 
 const mutationHeaders = () => ({ origin: 'http://localhost', cookie, 'content-type': 'application/json', 'x-csrf-token': csrf });
@@ -77,26 +80,17 @@ function workspaceDirOf(projectId) {
 }
 const until = async (check) => { for (let i = 0; i < 100 && !check(); i++) await new Promise(r => setTimeout(r, 10)); };
 
-test('deleting a project removes its empty local directories and keeps a non-empty one', async () => {
-  const project = JSON.parse((await post('/api/projects', { name: 'Synthetic sweep' })).text);
+// #2191 round 2: DELETE /api/projects/{id} is the Rust front's (noevia-rs tests/project_lifecycle.rs: the
+// directories it leaves, non-recursive; the storage sweep is queued in the index outbox, which
+// rust-index-outbox.cjs drains through project-sweep.cjs). Here it is refused before anything is removed.
+test('a project delete reaching Node is refused and removes nothing', async () => {
+  const project = createProjectAs(testDataDir, frontUserId, { name: 'Synthetic sweep' });
   const dir = workspaceDirOf(project.id);
-  const hash = crypto.createHash('sha256').update(project.id).digest('hex');
-  const uploads = path.join(dir, 'project-uploads', hash);
-  const documents = path.join(dir, 'project-documents', hash);
   const assets = path.join(dir, 'project-assets', project.id);
-  for (const d of [uploads, documents, assets]) fs.mkdirSync(d, { recursive: true });
-  // Pruning removes unreferenced asset files; content it doesn't own (a nested folder) must survive.
-  fs.mkdirSync(path.join(assets, 'nested')); fs.writeFileSync(path.join(assets, 'nested', 'late-write'), 'synthetic');
-  const other = JSON.parse((await post('/api/projects', { name: 'Synthetic neighbour' })).text);
-  const neighbour = path.join(dir, 'project-assets', other.id); fs.mkdirSync(neighbour, { recursive: true });
-
+  fs.mkdirSync(assets, { recursive: true });
   const deleted = await request(`/api/projects/${project.id}`, { method: 'DELETE', headers: mutationHeaders() });
-  assert.equal(deleted.status, 200);
-  await until(() => !fs.existsSync(uploads) && !fs.existsSync(documents));
-  assert.equal(fs.existsSync(uploads), false);
-  assert.equal(fs.existsSync(documents), false);
-  assert.equal(fs.readFileSync(path.join(assets, 'nested', 'late-write'), 'utf8'), 'synthetic', 'non-empty directory must stay');
-  assert.ok(fs.existsSync(neighbour), 'another project is untouched');
-  const again = await request(`/api/projects/${project.id}`, { method: 'DELETE', headers: mutationHeaders() });
-  assert.equal(again.status, 404);
+  assert.equal(deleted.status, 503);
+  assert.equal(JSON.parse(deleted.text).code, 'RUST_PROJECT_LIFECYCLE_OWNED');
+  assert.ok(fs.existsSync(assets));
 });
+

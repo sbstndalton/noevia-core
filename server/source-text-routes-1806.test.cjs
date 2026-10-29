@@ -10,6 +10,8 @@ const path = require('node:path');
 const crypto = require('node:crypto');
 const { Readable, Writable } = require('node:stream');
 const test = require('node:test');
+// #2191 round 2: POST /api/projects is the Rust front's; fixtures are written as its create leaves them.
+const { createProjectAs } = require('../tests/server/front-projects.cjs');
 
 const testDataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'noevia-1806-routes-'));
 process.env.DIARY_AUTH_TOKEN = 'test-cowork-token';
@@ -38,10 +40,11 @@ async function request(url, { method = 'GET', headers = {}, body = '' } = {}) {
 }
 
 let cookie = '', csrf = '';
+let frontUserId = '';
 test.before(async () => {
   ({ handleRequest } = require('./index.cjs'));
   // Sign-in is the Rust front's (#1071): the account and its session are seeded directly.
-  ({ cookie, csrf } = require('../tests/server/seed-account.cjs').seedAccount(testDataDir, { username: 'admin', displayName: 'Admin', publicOrigin: 'http://localhost' }));
+  ({ cookie, csrf, id: frontUserId } = require('../tests/server/seed-account.cjs').seedAccount(testDataDir, { username: 'admin', displayName: 'Admin', publicOrigin: 'http://localhost' }));
 });
 const mutation = () => ({ origin: 'http://localhost', cookie, 'content-type': 'application/json', 'x-csrf-token': csrf });
 const workspace = async () => JSON.parse((await request('/api/workspace', { headers: { cookie } })).text);
@@ -53,8 +56,8 @@ const NOTES = '# Synthetic notes\n\nThe synthetic code word is CEDAR-1806.';
 const PLAN = 'Synthetic plan: ship the widget.';
 
 test('#1806: /api/workspace sends source metadata only; the text is fetched per source', async () => {
-  const created = await request('/api/projects', { method: 'POST', headers: mutation(),
-    body: JSON.stringify({ name: 'Synthetic 1806', files: [{ name: 'notes.md', content: NOTES }, { name: 'docs/plan.txt', content: PLAN }] }) });
+  const createdProject = createProjectAs(testDataDir, frontUserId, { name: 'Synthetic 1806', files: [{ name: 'notes.md', content: NOTES }, { name: 'docs/plan.txt', content: PLAN }] });
+  const created = { status: 200, text: JSON.stringify(createdProject) };
   assert.equal(created.status, 200, created.text);
   const id = JSON.parse(created.text).id;
   assert.ok(!created.text.includes('CEDAR-1806'), 'the create answer carries no source text');

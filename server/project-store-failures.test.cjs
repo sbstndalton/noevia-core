@@ -126,23 +126,8 @@ test('#1071 slice 6: Node\'s routes no longer answer a chat\'s delete', async ()
   assert.deepEqual(tombstones(h), []);
 });
 
-test('#1914: store busy -> DELETE a project answers 503 and keeps its RAG index and chats', async () => {
-  const h = harness({ projects: [{ id: 'p1', name: 'P', chats: [{ id: 'c1', title: 'T' }], instructionSkills: {} }] });
-  const ragDir = path.join(h.dir, 'rag');
-  fs.mkdirSync(ragDir, { recursive: true });
-  fs.writeFileSync(path.join(ragDir, 'p1.db'), 'synthetic index');
-  fs.writeFileSync(history(h, 'c1'), '[]');
-  h.state.fail = () => true;
-  const r = await h.call('DELETE', '/api/projects/p1');
-  assert.equal(r.status, 503);
-  assert.ok(fs.existsSync(path.join(ragDir, 'p1.db')), 'the RAG index is still there');
-  assert.ok(fs.existsSync(history(h, 'c1')), "its chats' transcripts too");
-  assert.deepEqual(h.wsStore.get(USER).projects.map((p) => p.id), ['p1']);
-  h.state.fail = () => false;
-  assert.equal((await h.call('DELETE', '/api/projects/p1')).status, 200);
-  assert.ok(!fs.existsSync(path.join(ragDir, 'p1.db')));
-});
-
+// #1914 for a project's DELETE moved with the route (#2191 round 2): noevia-rs tests/project_lifecycle.rs
+// `a_failed_save_removes_nothing`. The store's deleteProject (a chat's attachments project) keeps it here.
 test('#1915: a separately queued save of the other file behind a failed one never writes', async () => {
   const h = harness({ projects: [{ id: 'p1', chats: [], instructionSkills: {} }] });
   h.state.fail = (file) => file === 'projects.json';

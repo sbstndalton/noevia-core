@@ -6,6 +6,8 @@ const os = require('node:os');
 const path = require('node:path');
 const { Readable, Writable } = require('node:stream');
 const test = require('node:test');
+// #2191 round 2: POST /api/projects is the Rust front's; fixtures are written as its create leaves them.
+const { createProjectAs } = require('../tests/server/front-projects.cjs');
 
 const testDataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cowork-document-route-test-'));
 process.env.DIARY_AUTH_TOKEN = 'test-cowork-token';
@@ -68,7 +70,17 @@ const mutationHeaders = () => ({ origin: 'http://localhost', cookie, 'content-ty
 
 const fixture = name => fs.readFileSync(path.join(__dirname, 'fixtures/documents', name));
 const post = (url, body, headers = mutationHeaders()) => request(url, { method: 'POST', headers, body: JSON.stringify(body) });
-const project = async name => JSON.parse((await post('/api/projects', { name })).text);
+// The front's create is seen at the next request start once no save of this process is in flight
+// (rust-projects.cjs refresh): wait until the workspace lists it, as a client does after the create.
+const project = async (name) => {
+  const made = createProjectAs(testDataDir, adminId, { name });
+  for (let i = 0; i < 200; i++) {
+    const listed = await request('/api/workspace', { headers: { cookie } });
+    if ((JSON.parse(listed.text).projects || []).some((x) => x.id === made.id)) break;
+    await new Promise((r) => setTimeout(r, 10));
+  }
+  return made;
+};
 const upload = (id, name, bytes) => post(`/api/projects/${id}/upload`, { name, dataBase64: bytes.toString('base64') });
 const docUrl = (id, kind, name = 'statement.pdf') => `/api/projects/${id}/documents/${kind}?name=${encodeURIComponent(name)}`;
 

@@ -598,15 +598,27 @@ const embedBatchAndStore = (index, rows, isCurrent) => embedRowsInto(index, inde
 // by the new chunks in one transaction, so a search during re-index sees only the NEW version
 // (at first without vectors, then gaining them batch by batch) — never a mix of versions, and
 // never an old vector joined to new text.
+// #2191 round 2: the Rust front deletes projects (rust-project-lifecycle.cjs). A run queued before a
+// delete of its project stops at its next step and closes its handle (rust-index-outbox.cjs tombstones),
+// so it never recreates the deleted project's index. Without a guard nothing is ever deleted elsewhere.
+let lifecycleGuard = { generation: () => 0, deletedSince: () => false };
+function setLifecycleGuard(guard) { lifecycleGuard = guard || { generation: () => 0, deletedSince: () => false }; }
+const notDeleted = (projectId, userId) => {
+  let seen = 0;
+  try { seen = lifecycleGuard.generation(userId); } catch { seen = 0; }
+  return () => { try { return !lifecycleGuard.deletedSince(projectId, userId, seen); } catch { return true; } };
+};
+
 function indexProjectFile(projectId, fileName, text, userId) {
   const key = fileKey(projectId, fileName, userId);
+  const alive = notDeleted(projectId, userId);
   const generation = bumpGeneration(key);
   const version = hash(String(text));
   fileVersions.set(key, version);
   const run = (fileQueues.get(key) || Promise.resolve())
     .catch(() => {})
     .then(() => indexProjectFileNow(projectId, fileName, text, userId,
-      () => fileGenerations.get(key) === generation && (!userId || userActive(userId)), version));
+      () => fileGenerations.get(key) === generation && (!userId || userActive(userId)) && alive(), version));
   const tail = run.catch(() => ({ ok: false, failed: true }));
   fileQueues.set(key, tail);
   tail.then((outcome) => {
@@ -622,6 +634,8 @@ async function indexProjectFileNow(projectId, fileName, text, userId, isCurrent,
   if (!isCurrent()) return { ok: true, stored: 0, embedded: 0, superseded: true };
   const index = openIndex(projectId, userId);
   if (!index) return { ok: false, reason: 'rag-unavailable' };
+  // #2191 round 2: deleted elsewhere between the check above and the open: nothing is written.
+  if (!isCurrent()) { index.db.close(); return { ok: true, stored: 0, embedded: 0, superseded: true }; }
   try {
     if (text.length <= DIRECT_INJECT_MAX) {
       // Small file: stored for the record, injected directly by handleChat.
@@ -690,10 +704,11 @@ async function indexProjectFileNow(projectId, fileName, text, userId, isCurrent,
 // it has none and is not final), `complete` says the final window has every vector.
 function appendFileTail(projectId, fileName, headText, tail, userId, { limit = 8, signal, fromPage = null, toPage = null, final = true } = {}) {
   const key = fileKey(projectId, fileName, userId);
+  const alive = notDeleted(projectId, userId);
   const prior = fileQueues.get(key) || null;
   const generation = fileGenerations.get(key);
   const run = (prior || Promise.resolve(null)).then(() => appendFileTailNow(projectId, fileName, String(headText), Array.isArray(tail) ? tail : [], userId, {
-    limit, signal, fromPage, toPage, final, isCurrent: () => fileGenerations.get(key) === generation && (!userId || userActive(userId)) && !signal?.aborted,
+    limit, signal, fromPage, toPage, final, isCurrent: () => fileGenerations.get(key) === generation && (!userId || userActive(userId)) && !signal?.aborted && alive(),
   }));
   // The queue resolves to the outcome of the last INDEX run, which decides what pruneFileState may forget.
   const tailP = Promise.all([prior || Promise.resolve(null), run.catch(() => null)]).then(([outcome]) => outcome);
@@ -1307,4 +1322,4 @@ const trackedFileState = () => ({ queues: fileQueues.size, generations: fileGene
 
 // #1646: the sentence a hybrid cloud route without a grant removes (read_project_file is not offered there).
 const READ_FILE_HINT = ' Use read_project_file with PDF startPage/endPage and offset for pages beyond the summary.';
-module.exports = { ...testSeam, appendFileTail, foreground, foregroundBusy, searchProjectWithImages, syncProjectMedia, releaseMediaModel, readCaption, writeCaption, mediaModelFor, embeddingOff, READ_FILE_HINT, servedModels, servedModelsCached, init, trackedFileState, indexProjectFile, deleteProjectFile, searchProject, filesContext, chunkText, ragAvailable, retrievalStatus, embed, embedModel, embeddingIdentity, embeddingConfig: getEmbeddingConfig, onIndexed, listIndexes, indexCoverage, fillMissing, dropIndexSlot, rerankPool, configureRerank, reloadRerank };
+module.exports = { ...testSeam, setLifecycleGuard, appendFileTail, foreground, foregroundBusy, searchProjectWithImages, syncProjectMedia, releaseMediaModel, readCaption, writeCaption, mediaModelFor, embeddingOff, READ_FILE_HINT, servedModels, servedModelsCached, init, trackedFileState, indexProjectFile, deleteProjectFile, searchProject, filesContext, chunkText, ragAvailable, retrievalStatus, embed, embedModel, embeddingIdentity, embeddingConfig: getEmbeddingConfig, onIndexed, listIndexes, indexCoverage, fillMissing, dropIndexSlot, rerankPool, configureRerank, reloadRerank };

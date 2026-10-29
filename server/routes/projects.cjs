@@ -84,7 +84,7 @@ function createProjectRoutes({
   storageLatch = require('../storage-latch.cjs').createStorageLatch(),
 }) {
   const {
-    getProject, saveProjects, createProject, deleteProject, whenSaved = (fn) => fn(), pruneDocuments, withSourceLock, ensureProjectFolder, indexSource, ownsFile,
+    getProject, saveProjects, whenSaved = (fn) => fn(), pruneDocuments, withSourceLock, ensureProjectFolder, indexSource, ownsFile,
   } = store;
   // #849: a rejected storage login is its own answer, not "could not create the folder". The
   // wording is the one the refresh toast and the Settings save already use (#770); `code` lets the
@@ -193,29 +193,10 @@ function createProjectRoutes({
       return json(res, 200, { project });
     }
 
-    if (p === '/api/projects' && req.method === 'POST') {
-      const raw = await readBody(req);
-      let body;
-      try {
-        body = JSON.parse(raw);
-      } catch {
-        return json(res, 400, { error: 'invalid JSON' });
-      }
-      try { return json(res, 200, await createProject(body)); }
-      catch (e) { if (e.status === 400) return json(res, 400, { error: e.message }); throw e; }
-    }
-
-    const projMatch = p.match(/^\/api\/projects\/([^/]+)$/);
-    if (projMatch && req.method === 'DELETE') {
-      // The whole cleanup (record, local uploads/documents/assets, RAG index, chats, empty-dir
-      // sweep) lives in the store so a deleted chat's attachments project shares it (#788).
-      // #1914: awaited, so a failed save answers its error and nothing of the project is removed.
-      let removed;
-      try { removed = await deleteProject(decodeURIComponent(projMatch[1])); }
-      catch (e) { if (e && e.status && e.status < 500 && e.status !== 410) throw e; return saveFailureReply(json, res, e, 'could not delete the project; nothing was changed'); }
-      if (!removed) return json(res, 404, { error: 'no such project' });
-      return json(res, 200, { ok: true });
-    }
+    // POST /api/projects and DELETE /api/projects/{projectId} are the Rust front's (#2191 round 2,
+    // rust-project-lifecycle.cjs, refused before authentication); the conversation import still
+    // creates through store.createProject, and a chat's attachments project is still deleted through
+    // store.deleteProject.
 
     const skillManifestRoute = p.match(/^\/api\/projects\/([^/]+)\/instruction-skills\/manifests$/);
     const skillContentRoute = p.match(/^\/api\/projects\/([^/]+)\/instruction-skills\/manifests\/([^/]+)\/content$/);

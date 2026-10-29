@@ -11,6 +11,8 @@ const os = require('node:os');
 const path = require('node:path');
 const { Readable, Writable } = require('node:stream');
 const test = require('node:test');
+// #2191 round 2: POST /api/projects is the Rust front's; fixtures are written as its create leaves them.
+const { createProjectAs } = require('../tests/server/front-projects.cjs');
 
 const testDataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'noevia-request-hardening-'));
 process.env.DIARY_AUTH_TOKEN = 'synthetic-sidecar-token';
@@ -141,7 +143,8 @@ test('#786: a JSON body of null is a 400 on every route that reads its body', as
     assert.equal(res.status, 400, `${method} ${url} answered ${res.status}: ${res.text}`);
   }
   // A well-formed body is unaffected.
-  assert.equal((await request('/api/projects', { method: 'POST', headers: writeHeaders(), body: JSON.stringify({ name: 'Synthetic null-body control' }) })).status, 200);
+  const control = createProjectAs(testDataDir, adminId, { name: 'Synthetic null-body control' });
+  assert.equal((await request(`/api/projects/${control.id}/config`, { method: 'POST', headers: writeHeaders(), body: JSON.stringify({ pinned: true }) })).status, 200);
 });
 
 test('#786: the Diary connector endpoint refuses a null body with 400', async () => {
@@ -153,7 +156,7 @@ test('#786: the Diary connector endpoint refuses a null body with 400', async ()
 });
 
 const createProject = async (name) => {
-  const project = (await request('/api/projects', { method: 'POST', headers: writeHeaders(), body: JSON.stringify({ name }) })).json;
+  const project = createProjectAs(testDataDir, adminId, { name });
   assert.ok(project?.id);
   return project;
 };

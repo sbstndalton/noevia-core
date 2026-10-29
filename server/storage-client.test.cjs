@@ -7,6 +7,8 @@ const os = require('node:os');
 const path = require('node:path');
 const { Readable, Writable } = require('node:stream');
 const test = require('node:test');
+// #2191 round 2: POST /api/projects is the Rust front's; fixtures are written as its create leaves them.
+const { createProjectAs } = require('../tests/server/front-projects.cjs');
 
 const { listFiles, readTextFile, createFolder, isBrowsable, safeRelativePath } = require('./storage-client.cjs');
 
@@ -416,13 +418,14 @@ let cookie = '';
 let csrf = '';
 let sharedDav = null;
 
+let frontUserId = '';
 test.before(async () => {
   sharedDav = await startFakeDav();
   // No model/inference endpoint: the owned DAV fixture refuses embedding POSTs with 405.
   process.env.EMBEDDING_BASE_URL = `http://127.0.0.1:${sharedDav.port}/dav`;
   ({ handleRequest } = require('./index.cjs'));
   // Sign-in is the Rust front's (#1071): the account and its session are seeded directly.
-  ({ cookie, csrf } = require('../tests/server/seed-account.cjs').seedAccount(testDataDir, { username: 'admin', displayName: 'Admin', publicOrigin: 'http://localhost' }));
+  ({ cookie, csrf, id: frontUserId } = require('../tests/server/seed-account.cjs').seedAccount(testDataDir, { username: 'admin', displayName: 'Admin', publicOrigin: 'http://localhost' }));
   // Connect the fake WebDAV as the user's storage.
   const save = await request('/api/integrations/storage', {
     method: 'PUT',
@@ -452,9 +455,12 @@ test('browse route requires authentication', async () => {
 
 
 async function createTestProject(name, extra = {}) {
-  const result = await request('/api/projects', { method: 'POST', headers: mutationHeaders(), body: JSON.stringify({ name, ...extra }) });
-  assert.equal(result.status, 200, result.text);
-  return JSON.parse(result.text);
+  // POST /api/projects is the Rust front's (#2191 round 2): written as its create leaves it, the folder
+  // reserved as it reserves one with storage connected (#589).
+  const made = createProjectAs(testDataDir, frontUserId, { name, ...extra, reserveIn: 'noevia projects' });
+  // Seen at the next request start once no save of this process is in flight (rust-projects.cjs refresh).
+  for (let i = 0; i < 200 && !(await workspaceProject(made.id)); i++) await new Promise((r) => setTimeout(r, 10));
+  return made;
 }
 
 // #1806: GET /api/workspace lists sources without their text; this reads one source's text.
