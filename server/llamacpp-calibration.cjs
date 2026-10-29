@@ -521,7 +521,8 @@ function createCalibrator(deps) {
     catch (err) {
       if (err?.status === 409 || !err?.status) return { ok: false, status: 409, body: { error: 'Requests are in progress. Wait for them to finish, then start calibration.' } };
       // #2187: the inference gate refused the hold for another reason (not answering, a wrong admin token).
-      return { ok: false, status: err.status >= 500 ? 503 : err.status, body: { error: `Calibration could not pause chat: ${err.publicMessage || 'the inference gate refused the maintenance hold.'}`, ...(err.code ? { code: err.code } : {}) } };
+      // A token mismatch is this server's configuration, not the browser's credentials: 503, as models-ini-writer does.
+      return { ok: false, status: err.status >= 500 || err.status === 401 || err.status === 403 ? 503 : err.status, body: { error: `Calibration could not pause chat: ${err.publicMessage || 'the inference gate refused the maintenance hold.'}`, ...(err.code ? { code: err.code } : {}) } };
     }
     cancelRequested = false;
     const job = { id: crypto.randomUUID(), model, promptBudgetSeconds, native, base, status: 'running', phase: 'Preparing', startedAt: now(), steps: [], memoryFloorGib, memoryGuard: readMemory() == null ? 'unavailable' : 'active' };

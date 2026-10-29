@@ -22,7 +22,7 @@
 //
 // hold() returns the release function, or (with a remote) a promise of it: callers await it.
 function createMaintenanceGate({ remote = null, log = (line) => console.log(line), setTimer = setInterval, clearTimer = clearInterval, now = () => Date.now(), reprobeMs = 5 * 60 * 1000, retakeWaitMs = 10000 } = {}) {
-  let active=0,maintenance=false,reason='',holdToken=null;
+  let active=0,maintenance=false,reason='',holdToken=null,shuttingDown=false;
   // When the remote last answered that it has no hold API (null: never asked, or asked again since).
   let absentAt=null;
   const absent=()=>!remote||(absentAt!==null&&now()-absentAt<reprobeMs);
@@ -39,15 +39,16 @@ function createMaintenanceGate({ remote = null, log = (line) => console.log(line
     if(holdToken){
       const every=Math.max(1000,Math.floor((granted.idleTtlMs||60000)/3));
       timer=setTimer(async()=>{
-        if(renewing||!holdToken)return;
+        if(renewing||!holdToken||shuttingDown)return;
         renewing=true;
         try{
           const renewed=await remote.renewMaintenance(holdToken,reason).catch(()=>null);
-          if(renewed!==false||released)return;
+          if(renewed!==false||released||shuttingDown)return;
           // The gate has forgotten the hold: take it again, briefly waiting for the engine.
           let again=null;
           try{again=await remote.holdMaintenance(reason,{waitMs:retakeWaitMs});}catch{again=null;}
-          if(released){if(again)void remote.releaseMaintenance(again.token);return;}
+          // Released, or given back at shutdown, while the hold was asked for again: the new token goes back too.
+          if(released||shuttingDown){if(again)void remote.releaseMaintenance(again.token);return;}
           if(again){holdToken=again.token;log('[inference-gate] the gate had lost this process\'s maintenance hold; it was taken again');return;}
           holdToken=null;
           if(timer)clearTimer(timer);
@@ -81,7 +82,9 @@ function createMaintenanceGate({ remote = null, log = (line) => console.log(line
   // Holds the gate until release() for work that outlives one request (calibration jobs).
   // Throws (rejects, with a gate) a 409 while requests are in flight or the gate is held.
   function hold(message) {
-    if(maintenance||active)throw busy();
+    if(maintenance)throw busy();
+    // chatActive: only this process's own requests are running (they end on their own).
+    if(active)throw Object.assign(busy(),{chatActive:true});
     if(absent())return holding(message,null);
     // Reserved here at once, so nothing of this process starts while the gate is asked.
     maintenance=true;reason=message||'';
@@ -164,6 +167,7 @@ function createMaintenanceGate({ remote = null, log = (line) => console.log(line
     // #2187: at shutdown, gives the gate's hold back (bounded) so the next process can take it at once.
     // Never throws; true when there was a gate hold to give back.
     async releaseRemote({ timeoutMs = 2000 } = {}) {
+      shuttingDown=true;
       const token=holdToken;
       if(!token)return false;
       holdToken=null;

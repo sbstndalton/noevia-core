@@ -354,3 +354,49 @@ test('#2187: a gate without the hold API is asked again after the reprobe interv
   now = 1000;
   assert.deepEqual(await client.holdMaintenance('x'), { token: HOLD, idleTtlMs: 60000 });
 });
+
+test('#2187: a hold taken again while shutdown gives the old one back is given back too, never kept', async (t) => {
+  t.mock.timers.enable({ apis: ['setInterval'] });
+  const NEW = 'e'.repeat(32);
+  const remote = stubRemote();
+  let asks = 0, grant;
+  remote.holdMaintenance = (reason, options = {}) => { asks += 1; remote.log.holds.push({ reason, waitMs: options.waitMs ?? 0 });
+    if (asks === 1) return Promise.resolve({ token: HOLD, idleTtlMs: 60000 }); return new Promise((r) => { grant = r; }); };
+  remote.renewMaintenance = async () => false;
+  const gate = createMaintenanceGate({ remote, log: () => {} });
+  const release = await gate.hold('Calibrating');
+  t.mock.timers.tick(20000);
+  for (let i = 0; i < 10 && !grant; i++) await tick();
+  assert.ok(grant, 'a re-take is in flight');
+  assert.equal(await gate.releaseRemote({ timeoutMs: 50 }), true);
+  grant({ token: NEW, idleTtlMs: 60000 });
+  for (let i = 0; i < 10; i++) await tick();
+  assert.deepEqual(gate.holdHeaders(), {}, 'the new token is not restored after shutdown');
+  assert.deepEqual(remote.log.releases, [HOLD, NEW]);
+  release();
+});
+
+test('#2187: a restart adopt waits out this process\'s own chat and an unreachable gate, but not its own hold', async () => {
+  const { createSweepGuard } = require('./benchmark-sweep-guard.cjs');
+  const job = { active: true, unit: 'models', total: 1 };
+  const make = (hold) => createSweepGuard({ hold, progress: async () => ({ ok: true, body: { job } }),
+    adoptRetryMs: 1, adoptMaxDelayMs: 2, adoptAttempts: 5, pollMs: 60000,
+    setTimer: (fn, ms) => { const h = setTimeout(fn, ms); if (ms >= 1000) h.unref(); return { h }; }, clearTimer: (x) => clearTimeout(x?.h) });
+  // This process's chat is still running: the sync busy refusal is waited out.
+  const local = createMaintenanceGate();
+  const leave = local.enter();
+  setTimeout(leave, 3);
+  const g1 = make((r) => local.hold(r));
+  assert.equal(await g1.adopt(), true); assert.equal(local.held(), true); g1.cancelAdopt();
+  // The gate does not answer (502) at first.
+  let asks = 0;
+  const remote = stubRemote({ answer: async () => { asks += 1; if (asks === 1) throw new GateError({ code: 'engine_unavailable', status: 502, retryable: true, message: 'x' }); return { token: HOLD, idleTtlMs: 60000 }; } });
+  const viaGate = createMaintenanceGate({ remote, setTimer: () => null, clearTimer: () => {}, log: () => {} });
+  const g2 = make((r) => viaGate.hold(r));
+  assert.equal(await g2.adopt(), true); assert.equal(asks, 2); g2.cancelAdopt();
+  // A hold of this process (a calibration) is still not fought over: no second ask.
+  const mine = createMaintenanceGate(); const rel = mine.hold('calibrating');
+  let tries = 0;
+  const g3 = make((r) => { tries += 1; return mine.hold(r); });
+  assert.equal(await g3.adopt(), false); assert.equal(tries, 1); rel();
+});

@@ -27,8 +27,11 @@ function createSweepGuard({ hold, progress, log = () => {}, pollMs = 5000, perMo
   function acquire() {
     const refusal = () => Object.assign(Error(SWEEP_BUSY_ERROR), { status: 409, publicMessage: SWEEP_BUSY_ERROR });
     let held;
-    try { held = hold(SWEEP_PAUSE_REASON); } catch { throw refusal(); }
-    if (typeof held?.then === 'function') return held.catch((e) => { throw Object.assign(refusal(), { fromGate: e?.fromGate === true }); });
+    // waitable: a refusal that ends on its own (the inference gate's, this process's chat running, or
+    // the gate not answering), unlike a hold of this process (a calibration), which is not fought over.
+    const waitable = (e) => e?.fromGate === true || e?.chatActive === true || e?.status === 502;
+    try { held = hold(SWEEP_PAUSE_REASON); } catch (e) { throw Object.assign(refusal(), { waitable: waitable(e) }); }
+    if (typeof held?.then === 'function') return held.catch((e) => { throw Object.assign(refusal(), { waitable: waitable(e) }); });
     return held;
   }
 
@@ -94,8 +97,8 @@ function createSweepGuard({ hold, progress, log = () => {}, pollMs = 5000, perMo
     let release;
     for (let attempt = 1, delay = adoptRetryMs; ; attempt += 1, delay = Math.min(delay * 2, adoptMaxDelayMs)) {
       if (adoptCancelled || watching) return false;
-      // Only the inference gate's refusal is waited out; a hold of this process (a calibration) is not fought over.
-      try { release = await acquire(); break; } catch (e) { if (!e?.fromGate) return false; }
+      // Only a refusal that ends on its own is waited out; a hold of this process (a calibration) is not fought over.
+      try { release = await acquire(); break; } catch (e) { if (!e?.waitable) return false; }
       if (attempt >= adoptAttempts) { log('[models] throughput sweep still running after a restart, but chat could not be paused for it.'); return false; }
       await pause(delay);
     }
