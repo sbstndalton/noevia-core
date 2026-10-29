@@ -141,13 +141,17 @@ test('scope limits: a device token never reaches administration or account secur
   const decision = await asDevice(tokens.access, '/api/admin/decision-settings', { method: 'GET' });
   assert.equal(decision.status, 503);
   assert.equal(decision.json.code, 'RUST_DECISION_SETTINGS_OWNED');
+  // The Nextcloud sign-in is the Rust front's too (#2190; its gate refuses device tokens the same way).
+  for (const url of ['/api/integrations/storage/nextcloud/start', '/api/integrations/storage/nextcloud/cancel']) {
+    const r = await asDevice(tokens.access, url, { method: 'POST', body: {} });
+    assert.equal(r.status, 503, `POST ${url} -> ${r.status}`);
+    assert.equal(r.json.code, 'RUST_STORAGE_INTEGRATIONS_OWNED', url);
+  }
   const refused = [
     ['GET', '/api/admin/offsite-backup'],
     ['DELETE', `/api/admin/users/${memberId}`, { username: 'memberqa' }],
     ['POST', '/api/profile/diary-connectors', {}],
     ['PUT', '/api/integrations/storage', { kind: 'local' }],
-    ['POST', '/api/integrations/storage/nextcloud/start', {}],
-    ['POST', '/api/integrations/storage/nextcloud/cancel', {}],
   ];
   for (const [method, url, body] of refused) {
     const r = await asDevice(tokens.access, url, { method, body });

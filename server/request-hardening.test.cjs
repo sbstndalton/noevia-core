@@ -133,7 +133,6 @@ test('#786: a JSON body of null is a 400 on every route that reads its body', as
   // The sign-in and account routes in this list moved to the Rust front (#1071).
   const routes = [
     ['PUT', '/api/integrations/storage', writeHeaders()],
-    ['POST', '/api/integrations/storage/folder', writeHeaders()],
     ['POST', '/api/profile/diary-connectors', writeHeaders()],
   ];
   for (const [method, url, headers] of routes) {

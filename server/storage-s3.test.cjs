@@ -80,27 +80,13 @@ test('S3 storage connection round-trips bucket through the encrypted row', async
   assert.equal(fetched.status, 503);
 });
 
-test('S3 test route validates before probing', async () => {
-  const missingBucket = await request('/api/integrations/storage/test', {
+test('the S3 connection test is the Rust front\'s: Node refuses it before reading the row (#2190)', async () => {
+  // Its validation (bucket, endpoint), signing and failures are asserted in noevia-rs
+  // tests/storage_integrations.rs.
+  const refused = await request('/api/integrations/storage/test', {
     method: 'POST', headers: mutationHeaders(),
     body: JSON.stringify({ kind: 's3', baseUrl: 'https://s3.example.com' }),
   });
-  assert.equal(missingBucket.status, 400);
-  assert.match(JSON.parse(missingBucket.text).error, /Bucket is required/);
-
-  const badUrl = await request('/api/integrations/storage/test', {
-    method: 'POST', headers: mutationHeaders(),
-    body: JSON.stringify({ kind: 's3', baseUrl: 'not-a-url', bucket: 'b' }),
-  });
-  assert.equal(badUrl.status, 400);
-  assert.match(JSON.parse(badUrl.text).error, /http/);
-});
-
-test('S3 test route surfaces unreachable endpoints as 502', async () => {
-  const unreachable = await request('/api/integrations/storage/test', {
-    method: 'POST', headers: mutationHeaders(),
-    body: JSON.stringify({ kind: 's3', baseUrl: 'http://127.0.0.1:1', bucket: 'b', username: 'ak', secret: 'sk' }),
-  });
-  assert.equal(unreachable.status, 502);
-  assert.ok(JSON.parse(unreachable.text).error);
+  assert.equal(refused.status, 503);
+  assert.equal(JSON.parse(refused.text).code, 'RUST_STORAGE_INTEGRATIONS_OWNED');
 });

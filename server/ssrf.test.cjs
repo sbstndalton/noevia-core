@@ -328,13 +328,16 @@ test('member cannot save a private-range storage connection', async () => {
   } finally { db.close(); }
 });
 
-test('member cannot run the storage connection test against a private target', async () => {
-  const response = await request('/api/integrations/storage/test', {
-    method: 'POST', headers: { ...memberHeaders(), 'content-type': 'application/json' },
-    body: JSON.stringify({ kind: 'webdav', baseUrl: 'http://169.254.169.254/remote.php/dav', username: 'u', secret: 'p', corpusRoot: '' }),
-  });
-  assert.equal(response.status, 400);
-  assert.match(JSON.parse(response.text).error, /approved/i);
+test('the storage connection test and the Nextcloud sign-in are the Rust front\'s: Node refuses them (#2190)', async () => {
+  // The member-origin rule on these targets is asserted in noevia-rs tests/storage_integrations.rs.
+  for (const [url, body] of [
+    ['/api/integrations/storage/test', { kind: 'webdav', baseUrl: 'http://169.254.169.254/remote.php/dav', username: 'u', secret: 'p', corpusRoot: '' }],
+    ['/api/integrations/storage/nextcloud/start', { baseUrl: 'https://10.1.2.3:8080' }],
+  ]) {
+    const response = await request(url, { method: 'POST', headers: { ...memberHeaders(), 'content-type': 'application/json' }, body: JSON.stringify(body) });
+    assert.equal(response.status, 503, url);
+    assert.equal(JSON.parse(response.text).code, 'RUST_STORAGE_INTEGRATIONS_OWNED', url);
+  }
 });
 
 test('member cannot browse or read through a saved private connection (Node refuses both, #1071)', async () => {
@@ -363,16 +366,6 @@ test('member cannot browse or read through a saved private connection (Node refu
   db.prepare('DELETE FROM storage_connections WHERE user_id=?').run(member.id);
   db.close();
 });
-
-test('member cannot start a Nextcloud login flow against a private host', async () => {
-  const response = await request('/api/integrations/storage/nextcloud/start', {
-    method: 'POST', headers: { ...memberHeaders(), 'content-type': 'application/json' },
-    body: JSON.stringify({ baseUrl: 'https://10.1.2.3:8080' }),
-  });
-  assert.equal(response.status, 400);
-  assert.match(JSON.parse(response.text).error, /approved/i);
-});
-
 
 test('member can connect an operator-approved origin, but not a lookalike origin', async () => {
   process.env.MEMBER_OUTBOUND_ORIGINS = 'https://approved.example.com';

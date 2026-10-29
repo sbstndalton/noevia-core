@@ -1085,7 +1085,9 @@ const chatRoutes = require('./routes/chat.cjs').createChatRoutes({
 
 // Projects, sources and uploads (routes/projects.cjs). Background source jobs re-enter the router.
 // #1429: one latch per process, shared by the project source refresh and the Diary backup worker.
-const storageLatch = require('./storage-latch.cjs').createStorageLatch();
+// sbstndalton/noevia#2190: the Rust front's folder write and connection test prove a saved login
+// through storage-login-proofs.json, re-read when it changes.
+const storageLatch = require('./storage-latch.cjs').createStorageLatch({ proofOf: require('./rust-storage-integrations.cjs').createProofReader(DATA_DIR) });
 const projectRoutes = require('./routes/projects.cjs').createProjectRoutes({
   storageLatch,
   json, readBody, readJson, requestScope, dispatch: (req, res) => handleRequestScoped(req, res), currentWorkspace, authService, storageClient, documents, documentSources, rag, fs, path,
@@ -1140,9 +1142,9 @@ const authRoutes = require('./routes/auth.cjs').createAuthRoutes({
 });
 // The user's own storage connection: read, save, test, browse, one folder, the Nextcloud login flow
 // (routes/storage.cjs). fetch is resolved per call: tests swap the global at runtime.
-// #1431: pending Login Flow v2 sign-ins survive a web restart; the poll token is sealed with the credential key.
-const storageRoutes = require('./routes/storage.cjs').createStorageRoutes({ json, readJson, authService, storageClient, endpointApproved, fetch: (...args) => globalThis.fetch(...args), crypto,
-  flowStore: require('./nextcloud-flows.cjs').createNextcloudFlowStore({ file: path.join(DATA_DIR, 'nextcloud-login-flows.json'), secrets: secretStore }),
+// Saving the storage connection (PUT). The Nextcloud sign-in (its sealed pending flows), the folder
+// write and the connection test are the Rust front's (sbstndalton/noevia#2190).
+const storageRoutes = require('./routes/storage.cjs').createStorageRoutes({ json, readJson, authService, endpointApproved, fetch: (...args) => globalThis.fetch(...args),
   storageLatch,
 });
 // The human's answer to a pending write (routes/approvals.cjs); the gate itself is approvals.cjs.
@@ -1243,6 +1245,7 @@ async function handleRequestInner(req, res) {
   if (require('./rust-public-pages.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   if (require('./rust-plugin-directory.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   if (require('./rust-decision-settings.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
+  if (require('./rust-storage-integrations.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   await readyFeatures();
   const preAuth = requestAuth.authenticate(req);
   // accountRole: a device token acts as a member, but its account's workspace is the same one.

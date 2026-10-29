@@ -92,10 +92,8 @@ function routeFixture(storage) {
     json: (res, status, body) => { sent.push({ status, body }); },
     readJson: async (req) => { let s = ''; for await (const c of req) s += c; return s ? JSON.parse(s) : {}; },
     authService: { getStorage: () => storage, saveStorage: (_id, body) => { saved.push(body); return body; } },
-    storageClient: { isBrowsable: () => true },
     endpointApproved: () => true,
     fetch: async (url, init) => { requests.push({ url, init }); return { ok: true, status: 200, json: async () => ({}) }; },
-    crypto: { randomUUID: () => 'x' },
   });
   const call = (method, p, body) => {
     const req = Readable.from([Buffer.from(JSON.stringify(body))]); req.method = method;
@@ -104,11 +102,10 @@ function routeFixture(storage) {
   return { call, sent, saved, requests };
 }
 
-test('the S3 probe signs with the region and an invalid region is refused on save', async () => {
+// The S3 probe (POST /test) and its region scope are the Rust front's since sbstndalton/noevia#2190
+// (noevia-rs tests/storage_integrations.rs); the save keeps its region rule here.
+test('an invalid region is refused on save', async () => {
   const f = routeFixture({ ...S3, region: 'eu-west-2' });
-  await f.call('POST', '/api/integrations/storage/test', { ...S3, region: 'eu-north-1' });
-  await f.call('POST', '/api/integrations/storage/test', { useSaved: true, kind: 's3' });
-  assert.deepEqual(f.requests.map((r) => scopeRegion(r.init.headers)), ['eu-north-1', 'eu-west-2']);
   await f.call('PUT', '/api/integrations/storage', { ...S3, region: 'eu west/1' });
   assert.equal(f.sent.pop().status, 400);
   assert.equal(f.saved.length, 0);
