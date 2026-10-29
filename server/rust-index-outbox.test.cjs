@@ -33,6 +33,7 @@ function front(dir) {
       db.prepare("DELETE FROM jobs WHERE project = ? AND kind = 'index'").run(project);
       if (folder) db.prepare("INSERT INTO jobs (key, kind, project, file, payload, generation, created_at) VALUES (?, 'sweep', ?, NULL, ?, ?, 1)").run(JSON.stringify(['sweep', project]), project, JSON.stringify({ folder }), g);
     }),
+    revive: (project) => tx((db) => { db.prepare('DELETE FROM tombstones WHERE project = ?').run(project); }), // outbox.rs revive_listed
     rows: () => { const db = new DatabaseSync(file); try { return db.prepare('SELECT key, kind, project, file, generation, state, attempts FROM jobs ORDER BY key').all().map((r) => ({ ...r })); } finally { db.close(); } },
     file,
   };
@@ -113,20 +114,38 @@ test('a delete tombstones the project: queued index work is dropped, an earlier 
   const g = w.f1.tombstone('p1', 'noevia projects/p1');
   assert.equal(outbox.generation('u1'), g, 'the change is seen on the next use');
   assert.equal(outbox.deletedSince('p1', 'u1', seen), true, 'a run queued before the delete stops');
-  assert.equal(outbox.deletedSince('p1', 'u1', g), false, 'a run queued after it (a project made again) is not stopped');
+  assert.equal(outbox.deletedSince('p1', 'u1', g + 1), true, 'a run that started after the delete stops too');
   assert.equal(outbox.deletedSince('p2', 'u1', seen), false);
   assert.equal(outbox.deletedSince('p1', 'u2', 0), false, 'another account is unaffected');
   await outbox.tick();
   assert.deepEqual(ran, [['sweep', 'p1', { folder: 'noevia projects/p1' }]]);
+  w.f1.revive('p1'); // a fixed id created again: the front's projects.json write lifts its tombstone
+  assert.equal(outbox.deletedSince('p1', 'u1', 0), false, 'a project made again is indexed again');
 });
 
-test('rag.cjs stops an index run its project was deleted under (lifecycle guard)', () => {
+test('a deleted project never gets its index back: not from a run that starts after the delete, nor one the delete lands in', async (t) => {
   const rag = require('./rag.cjs');
-  assert.equal(typeof rag.setLifecycleGuard, 'function');
-  const src = fs.readFileSync(path.join(__dirname, 'rag.cjs'), 'utf8');
-  assert.match(src, /userActive\(userId\)\) && alive\(\), version\)\);/);
-  assert.match(src, /!signal\?\.aborted && alive\(\),/);
-  rag.setLifecycleGuard(null); // back to the default guard
+  const w = world(t, async () => {});
+  const outbox = w.make();
+  rag.init({ dataDir: path.dirname(w.dirs.u1), inferenceUrl: 'http://unused.invalid', userDataDirFn: (u) => w.dirs[u], userActive: () => true });
+  t.after(() => rag.setLifecycleGuard(null));
+  rag.setLifecycleGuard(outbox);
+  const db = (p) => path.join(w.dirs.u1, 'rag', `${p}.db`);
+  // The delete is already in the outbox when a slow request (an upload, a sources sync) indexes.
+  w.f1.tombstone('p-dead', null);
+  const late = await rag.indexProjectFile('p-dead', 'a.md', 'synthetic content', 'u1');
+  assert.equal(late.stored || 0, 0, JSON.stringify(late));
+  assert.equal(fs.existsSync(db('p-dead')), false, 'no index is made for a deleted project');
+  // The delete lands while the index opens: the open made the file, which goes again.
+  rag.setLifecycleGuard({ generation: () => 0, deletedSince: (p) => fs.existsSync(db(p)) });
+  const raced = await rag.indexProjectFile('p-race', 'a.md', 'synthetic content', 'u1');
+  assert.equal(raced.stored || 0, 0, JSON.stringify(raced));
+  for (const f of [db('p-race'), `${db('p-race')}-wal`, `${db('p-race')}-shm`]) assert.equal(fs.existsSync(f), false, f);
+  // A live project still indexes.
+  rag.setLifecycleGuard(outbox);
+  const live = await rag.indexProjectFile('p-live', 'a.md', 'synthetic content', 'u1');
+  assert.ok(live.ok, JSON.stringify(live));
+  assert.equal(fs.existsSync(db('p-live')), true);
 });
 
 test('a kick starts one pass at a time and never throws', async (t) => {
