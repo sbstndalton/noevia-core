@@ -28,7 +28,7 @@ const TOOLS = path.join(__dirname, '..', 'tools');
 
 test('the oracle modules exist', { skip: !fs.existsSync(ORACLE) && 'no tests/server/oracle here' }, () => {
   const names = fs.readdirSync(ORACLE).filter((n) => n.endsWith('.cjs')).sort();
-  assert.deepEqual(names, ['auth-tokens.cjs', 'chat-context.cjs', 'code-review-verdict.cjs', 'dav-listing.cjs', 'decision.cjs', 'mcp-servers.cjs', 'mcp.cjs', 'prompt-framing.cjs', 'provenance-policy.cjs', 'public-fetch.cjs', 's3-listing.cjs', 's3-sign.cjs', 'secret-envelope.cjs', 'ssrf.cjs', 'storage-path.cjs', 'task-packet.cjs', 'tool-exchange.cjs', 'tool-policy.cjs', 'upload-sniff.cjs']);
+  assert.deepEqual(names, ['auth-tokens.cjs', 'chat-context.cjs', 'chat-framing-preferences.cjs', 'code-review-verdict.cjs', 'dav-listing.cjs', 'decision.cjs', 'mcp-servers.cjs', 'mcp.cjs', 'prompt-framing.cjs', 'provenance-policy.cjs', 'public-fetch.cjs', 's3-listing.cjs', 's3-sign.cjs', 'secret-envelope.cjs', 'ssrf.cjs', 'storage-path.cjs', 'task-packet.cjs', 'tool-exchange.cjs', 'tool-policy.cjs', 'upload-sniff.cjs']);
 });
 
 // The shipped web image has no tools/ (like the differential tests' "no generator here").
@@ -65,7 +65,7 @@ test('no production module under server/ requires an oracle module', () => {
 });
 
 test('requiring the production modules does not load any oracle file', () => {
-  for (const m of ['dav-listing', 's3-listing', 'chat-context', 'chat-template-caps', 'preset-reload', 'load-advisor', 'dav-parse-wasm', 'storage-client', 'storage-path', 'secret-envelope', 'secrets', 'upload-sniff', 's3-sign', 's3-region', 'mcp', 'ssrf', 'public-fetch', 'prompt-framing', 'provenance-policy', 'task-packet',
+  for (const m of ['dav-listing', 's3-listing', 'chat-context', 'chat-framing', 'chat-template-caps', 'preset-reload', 'load-advisor', 'dav-parse-wasm', 'storage-client', 'storage-path', 'secret-envelope', 'secrets', 'upload-sniff', 's3-sign', 's3-region', 'mcp', 'ssrf', 'public-fetch', 'prompt-framing', 'provenance-policy', 'task-packet',
     'auth-tokens', 'tool-policy', 'code-review-verdict', 'tool-exchange', 'decision/index', 'mcp-servers', 'task-lifecycle', 'completeness-report', 'code-net-guard', 'llamacpp-autoconfig', 'jobs']) require(`./${m}.cjs`);
   const loaded = Object.keys(require.cache).filter((f) => f.startsWith(ORACLE + path.sep));
   assert.deepEqual(loaded, []);

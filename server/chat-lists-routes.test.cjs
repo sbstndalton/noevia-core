@@ -186,19 +186,21 @@ test('a move with an invalid frame is refused and keeps the stored frame (#759)'
   assert.deepEqual((await freeMeta('c-bad-frame')).frame, frame(), 'still free, frame intact');
 });
 
-test('auto-accept chat frames is a per-user preference, off by default (#738, #740)', async () => {
-  const get = async () => JSON.parse((await request('/api/chat-framing/preferences', { headers: mutationHeaders() })).text);
-  const prefs = (autoAccept, keepReasoningTraces = false) => ({ autoAccept, keepReasoningTraces });
-  assert.deepEqual(await get(), prefs(false));
-  const put = (body) => request('/api/chat-framing/preferences', { method: 'PUT', headers: mutationHeaders(), body: JSON.stringify(body) });
-  assert.equal((await put({ autoAccept: true })).status, 200);
-  assert.deepEqual(await get(), prefs(true));
-  assert.equal((await put({ autoAccept: 'yes' })).status, 400);
-  assert.deepEqual(await get(), prefs(true), 'an invalid value changes nothing');
-  assert.equal((await put({ keepReasoningTraces: true })).status, 200);
-  assert.deepEqual(await get(), prefs(true, true), 'a partial update keeps the other choice');
-  assert.equal((await put({ autoAccept: false })).status, 200);
-  assert.deepEqual(await get(), prefs(false, true));
+// The native route and its frozen original-source oracle cover preference behavior.
+// This Node entry point must refuse bypasses instead of retaining another writer.
+test('Node refuses native framing preference reads and writes without changing legacy data', async () => {
+  const file = userFile('chat-framing.json');
+  const before = fs.existsSync(file) ? fs.readFileSync(file) : null;
+  for (const method of ['GET', 'PUT', 'POST', 'DELETE', 'HEAD', 'OPTIONS']) {
+    for (const headers of [{}, mutationHeaders()]) {
+      const response = await request('/api/chat-framing/preferences', { method, headers, body: '{invalid-json' });
+      assert.equal(response.status, 503, `${method}: bypass must not reach auth or the old body parser`);
+      assert.deepEqual(JSON.parse(response.text), {
+        error: 'Chat framing preferences are owned by the Rust front.', code: 'RUST_FRAMING_PREFERENCES_OWNED',
+      });
+    }
+  }
+  assert.deepEqual(fs.existsSync(file) ? fs.readFileSync(file) : null, before);
 });
 
 test('the move never puts a chat into an archived project; a once Code-only project takes it (#810, #1576)', async () => {
