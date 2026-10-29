@@ -312,7 +312,7 @@ test('index.cjs starts with the pinned module and every retired switch left at j
   const deadline = Date.now() + 30000;
   while (!/dav-parse\.wasm verified/.test(out) && child.exitCode === null && Date.now() < deadline) await new Promise((r) => setTimeout(r, 100));
   assert.match(out, /\[dav-parse\] dav-parse\.wasm verified/, `stdout ${out.slice(-500)} stderr ${err.slice(-500)}`);
-  assert.equal(child.exitCode, null, 'still running');
+  assert.equal(child.exitCode, null, `still running\nstdout ${out.slice(-1500)}\nstderr ${err.slice(-1500)}`);
   // This run sets the deprecated LAYA_LOAD_ADVISOR: it counts as DECISION_LOAD_ADVISOR, the warning names the variable that was set, and a note says it is deprecated (#2093).
   for (const flag of Object.keys(davParseWasm.RETIRED_FLAGS)) assert.match(err, new RegExp(`${flag === 'DECISION_LOAD_ADVISOR' ? 'LAYA_LOAD_ADVISOR' : flag} is retired; Rust is always used`));
   assert.match(err, /LAYA_LOAD_ADVISOR is a deprecated alias of DECISION_LOAD_ADVISOR; set DECISION_LOAD_ADVISOR instead/);
