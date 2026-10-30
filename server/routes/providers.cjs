@@ -8,13 +8,14 @@
 //   GET    /api/providers/:id/models[?refresh=1]  that provider's model ids (#1009), fetched with
 //                                the stored credential and cached per account for MODEL_LIST_TTL_MS
 //
-// Sign in with ChatGPT (#447, chatgpt-oauth.cjs), only while features.chatgptOAuth is on (404 off):
-//   GET    /api/providers/chatgpt              this account's connection: state + masked account
-//   POST   /api/providers/chatgpt/device       start a device-code sign-in -> { loginId, userCode, verificationUrl }
-//   POST   /api/providers/chatgpt/device/poll  { loginId } -> pending | connected | expired
-//   POST   /api/providers/chatgpt/device/cancel { loginId }
-//   GET    /api/providers/chatgpt/models[?refresh=1]  the account's model ids, cached/fetchedAt (#1306)
-//   DELETE /api/providers/chatgpt              disconnect: tokens deleted, the provider row removed
+// Sign in with ChatGPT (#447), only while features.chatgptOAuth is on (404 off). The Rust front is
+// its token broker (sbstndalton/noevia#2190 round 5, rust-chatgpt-oauth.cjs): it answers the status
+// GET, the device sign-in (POST device, device/poll, device/cancel) and GET /models, and keeps the
+// tokens. This mount answers only:
+//   DELETE /api/providers/chatgpt              disconnect: tokens deleted (by the broker), the provider row removed
+// The provider row follows the broker's token row: it is added here when the account lists or uses
+// its providers and a token row exists (the broker cannot write providers.json, which this process
+// writes), so a sign-in finished on the front shows up in the next listing.
 // A connection is always the signed-in account's own private provider, never shared.
 //
 // Returns true when it handled the request. Auth and CSRF run before routes are mounted.
@@ -60,6 +61,7 @@ function createProviderRoutes({ json, readBody, readJson, fetchJson, endpointApp
   const chatgpt = require('../chatgpt-oauth.cjs');
   const egress = require('../provider-egress.cjs');
   const { RUST_CHATGPT_STATUS_REFUSAL } = require('../features.cjs');
+  const brokerRoutes = require('../rust-chatgpt-oauth.cjs');
   // #1209: provider addresses are short; a long one only costs every listing and chat.
   const MAX_BASE_URL = 2048;
   const chatgptOn = () => !!chatgptOAuth && chatgptEnabled();
@@ -69,6 +71,11 @@ function createProviderRoutes({ json, readBody, readJson, fetchJson, endpointApp
     if (Array.from(PROVIDERS).some((pr) => pr.id === chatgpt.PROVIDER_ID && !pr.shared)) return;
     PROVIDERS.push(chatgpt.providerRow());
     saveProviders();
+  }
+  // sbstndalton/noevia#2190 round 5: the broker saved a sign-in this process did not see finish.
+  function reconcileChatGptRow(userId) {
+    if (!chatgptOn() || !userId) return;
+    if (chatgptOAuth.status(userId).state !== 'disconnected') ensureChatGptRow();
   }
   function removeChatGptRow() {
     const row = Array.from(PROVIDERS).find((pr) => pr.id === chatgpt.PROVIDER_ID);
@@ -88,30 +95,18 @@ function createProviderRoutes({ json, readBody, readJson, fetchJson, endpointApp
     if (p === '/api/providers/chatgpt' && req.method === 'GET') {
       return json(res, 503, RUST_CHATGPT_STATUS_REFUSAL);
     }
+    // The device sign-in and the model list are the broker's (refused before authentication by
+    // rust-chatgpt-oauth.cjs); one that reaches this mount is a bypass, refused before any read.
+    if (brokerRoutes.owned(req.method, p)) return json(res, 503, brokerRoutes.ROUTE_REFUSAL);
     if (!chatgptOn()) return json(res, 404, { error: 'Sign in with ChatGPT is turned off on this server.' });
     const userId = authn?.user?.id;
     if (!userId) return json(res, 401, { error: 'Sign in to noevia first.' });
     try {
       if (p === '/api/providers/chatgpt' && req.method === 'DELETE') {
-        chatgptOAuth.disconnect(userId);
+        // The tokens first: if the broker cannot delete them, the row stays and the answer says so.
+        await chatgptOAuth.disconnect(userId);
         removeChatGptRow();
         return json(res, 200, { ok: true, state: 'disconnected' });
-      }
-      if (p === '/api/providers/chatgpt/device' && req.method === 'POST') {
-        return json(res, 200, await chatgptOAuth.startDeviceLogin(userId));
-      }
-      if (p === '/api/providers/chatgpt/device/poll' && req.method === 'POST') {
-        const body = await readJson(req).catch(() => ({}));
-        const result = await chatgptOAuth.pollDeviceLogin(userId, String(body?.loginId || ''));
-        if (result.state === 'connected') ensureChatGptRow();
-        return json(res, 200, result);
-      }
-      if (p === '/api/providers/chatgpt/device/cancel' && req.method === 'POST') {
-        const body = await readJson(req).catch(() => ({}));
-        return json(res, 200, { ok: chatgptOAuth.cancelDeviceLogin(userId, String(body?.loginId || '')) });
-      }
-      if (p === '/api/providers/chatgpt/models' && req.method === 'GET') {
-        return json(res, 200, await chatgptModels(userId, url));
       }
     } catch (e) {
       // Messages from chatgpt-oauth.cjs are written for people and carry no credential.
@@ -120,12 +115,11 @@ function createProviderRoutes({ json, readBody, readJson, fetchJson, endpointApp
     return json(res, 405, { error: 'method not allowed' });
   }
 
-  // #1306: ?refresh=1 reaches the account's catalogue (bounded there: one fetch in flight per
-  // account, refreshes closer than its gap served from the cache and marked throttled).
+  // #1306: ?refresh=1 reaches the account's catalogue, the broker's (one fetch in flight per account,
+  // refreshes closer than its gap served from the cache and marked throttled).
   async function chatgptModels(userId, url) {
     const refresh = url?.searchParams?.get('refresh') === '1';
-    if (typeof chatgptOAuth.modelList === 'function') return chatgptOAuth.modelList(userId, { refresh });
-    return { models: await chatgptOAuth.listModels(userId), cached: false };
+    return chatgptOAuth.modelList(userId, { refresh });
   }
 
   // #1009: a stored provider's model list for the routing pickers. Keyed by account, provider id and
@@ -138,6 +132,7 @@ function createProviderRoutes({ json, readBody, readJson, fetchJson, endpointApp
     const userId = authn?.user?.id;
     if (!userId) return json(res, 401, { error: 'Sign in first.' });
     if (id === DEFAULT_PROVIDER_ID || id === 'lemonade') return json(res, 400, { error: 'the default provider lists its models under Settings → Models' });
+    if (id === chatgpt.PROVIDER_ID) reconcileChatGptRow(userId);
     const row = Array.from(PROVIDERS).find((pr) => pr.id === id);
     if (!row) return json(res, 404, { error: 'no such provider' });
     const refresh = url?.searchParams?.get('refresh') === '1';
@@ -233,6 +228,7 @@ function createProviderRoutes({ json, readBody, readJson, fetchJson, endpointApp
     // ── Provider registry (step 9): list / connect / remove. GET never returns
     // a saved apiKey in plaintext — masked, e.g. sk-…last4.
     if (p === '/api/providers' && req.method === 'GET') {
+      reconcileChatGptRow(authn?.user?.id);
       // A ChatGPT row is listed only while the flag is on, with its connection state instead of a key.
       const listed = Array.from(PROVIDERS).filter((pr) => !chatgpt.isChatGptProvider(pr) || (chatgptOn() && !pr.shared));
       return json(res, 200, { providers: listed.map((pr) => listRow(pr, authn)) });
@@ -338,9 +334,13 @@ function createProviderRoutes({ json, readBody, readJson, fetchJson, endpointApp
       if (id === DEFAULT_PROVIDER_ID || id === 'lemonade') return json(res, 400, { error: 'the default provider cannot be removed' });
       const selectedProvider = Array.from(PROVIDERS).find(p => p.id === id);
       if (selectedProvider?.shared && authn.user.role !== 'admin') return json(res, 403, { error: 'administrator required' });
+      // Removing the ChatGPT row is disconnecting: its tokens go too, flag on or off, and first (the
+      // broker's), so a failed delete leaves the row rather than tokens without a row.
+      if (chatgpt.isChatGptProvider(selectedProvider) && !selectedProvider.shared && chatgptOAuth && authn?.user?.id) {
+        try { await chatgptOAuth.disconnect(authn.user.id); }
+        catch (e) { return json(res, e.status && e.status < 600 ? e.status : 503, { error: e.status ? e.message : 'ChatGPT sign-in failed.' }); }
+      }
       if (!currentWorkspace().removeProvider(id)) return json(res, 404, { error: 'no such provider' });
-      // Removing the ChatGPT row is disconnecting: its tokens go too, flag on or off.
-      if (chatgpt.isChatGptProvider(selectedProvider) && !selectedProvider.shared && chatgptOAuth && authn?.user?.id) chatgptOAuth.disconnect(authn.user.id);
       // Projects pointing at the removed provider fall back to the configured default.
       for (const pr of PROJECTS) {
         if (pr.provider === id) {

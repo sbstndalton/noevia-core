@@ -15,14 +15,12 @@ const { EventEmitter } = require('node:events');
 const Database = require('better-sqlite3');
 const { createChatHandler } = require('./chat.cjs');
 const { createToolExchange } = require('./tool-exchange.cjs');
-const { createSecretStore } = require('./secrets.cjs');
 const chatgpt = require('./chatgpt-oauth.cjs');
+// sbstndalton/noevia#2190 round 5: the tokens are the Rust broker's; a synthetic broker plays it.
+const { createFakeBroker } = require('../tests/server/chatgpt-broker-fake.cjs');
 const egress = require('./provider-egress.cjs');
 
-const ISSUER = 'https://auth.fixture.invalid';
 const CODEX = 'https://codex.fixture.invalid';
-const b64 = (o) => Buffer.from(JSON.stringify(o)).toString('base64url');
-const idToken = `${b64({ alg: 'none' })}.${b64({ 'https://api.openai.com/auth': { chatgpt_account_id: 'acct-synthetic' } })}.sig`;
 const reply = (o, status = 200) => new Response(JSON.stringify(o), { status, headers: { 'content-type': 'application/json' } });
 const BOXES = [
   { id: 'core', tools: [{ type: 'function', function: { name: 'core_time' } }] },
@@ -38,12 +36,6 @@ async function setup(t, { flag = true, connected = true, refresh = 'ok', storage
   const upstream = { responses: [], queue: [] };
   const fakeOpenAI = async (url, init) => {
     url = String(url);
-    if (url.endsWith('/deviceauth/usercode')) return reply({ device_auth_id: 'D', user_code: 'CODE-0000', interval: '1' });
-    if (url.endsWith('/deviceauth/token')) return reply({ authorization_code: 'A', code_challenge: 'C', code_verifier: 'V' });
-    if (url.endsWith('/oauth/token')) {
-      if (String(init.body).includes('refresh_token') && refresh === 'invalid') return reply({ error: 'invalid_grant' }, 400);
-      return reply({ access_token: String(init.body).includes('refresh_token') ? 'AT-new' : 'AT-first', refresh_token: 'RT', id_token: idToken, expires_in: 3600 });
-    }
     if (url === `${CODEX}/responses`) {
       upstream.responses.push({ headers: init.headers, body: JSON.parse(init.body) });
       const next = upstream.queue.shift();
@@ -53,12 +45,12 @@ async function setup(t, { flag = true, connected = true, refresh = 'ok', storage
     throw new Error('unexpected upstream ' + url);
   };
   const clock = { t: 1_800_000_000_000 };
-  const oauth = chatgpt.createChatGptOAuth({ db: new Database(':memory:'), secrets: createSecretStore(dir, { env: {} }), fetchImpl: fakeOpenAI, now: () => clock.t, config: { issuer: ISSUER, codexBaseUrl: CODEX } });
-  if (connected) {
-    const l = await oauth.startDeviceLogin('user-a');
-    clock.t += 1000;
-    assert.equal((await oauth.pollDeviceLogin('user-a', l.loginId)).state, 'connected');
-  }
+  const db = new Database(':memory:');
+  const fake = createFakeBroker({ db, now: () => clock.t });
+  fake.state.refresh = refresh;
+  fake.state.catalogue = [{ slug: 'gpt-synthetic', effort: null, summary: null, summaryParam: true, levels: null }];
+  const oauth = chatgpt.createChatGptOAuth({ db, broker: fake.broker, signal: fake.signal, fetchImpl: fakeOpenAI, now: () => clock.t, config: { codexBaseUrl: CODEX } });
+  if (connected) fake.connect('user-a', { accessToken: 'AT-first', accountId: 'acct-synthetic' });
   const row = chatgpt.providerRow();
   const localFetch = [];
   const executed = [];

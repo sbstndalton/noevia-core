@@ -117,8 +117,8 @@ function writeTargets(sql) {
   for (const m of clean.matchAll(WRITE_RE)) {
     const table = unquote(m[1]);
     if (table === 'set') continue; // ON CONFLICT DO UPDATE SET
-    // sbstndalton/noevia#2190 round 4: the storage row's one allowed statement is matched exactly.
-    if (table === 'storage_connections') { out.push(Object.defineProperty({ table, key: null }, 'sql', { value: raw })); continue; }
+    // sbstndalton/noevia#2190 rounds 4-5: a front table's one allowed statement is matched exactly.
+    if (Object.hasOwn(FRONT_TABLES, table)) { out.push(Object.defineProperty({ table, key: null }, 'sql', { value: raw })); continue; }
     if (table !== 'settings') { out.push({ table, key: null }); continue; }
     const k = SETTING_KEY_RE.exec(raw);
     out.push(Object.defineProperty({ table, key: k ? (k[1] ?? k[2]) : null }, 'sql', { value: raw }));
@@ -175,6 +175,12 @@ const FRONT_TABLES = Object.freeze({
     message: require('./rust-storage-connection.cjs').ROUTE_REFUSAL.error,
     code: require('./rust-storage-connection.cjs').ROUTE_REFUSAL.code,
     allowed: require('./rust-storage-connection.cjs').RESEAL_SQL,
+  }),
+  // sbstndalton/noevia#2190 round 5: the ChatGPT token broker (rust-chatgpt-oauth.cjs).
+  chatgpt_oauth_tokens: Object.freeze({
+    message: require('./rust-chatgpt-oauth.cjs').ROUTE_REFUSAL.error,
+    code: require('./rust-chatgpt-oauth.cjs').ROUTE_REFUSAL.code,
+    allowed: require('./rust-chatgpt-oauth.cjs').RESEAL_SQL,
   }),
 });
 /** The guard. It takes no options: Rust always owns these tables (sbstndalton/noevia#1071). */

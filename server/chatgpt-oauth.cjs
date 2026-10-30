@@ -2,19 +2,17 @@
 // Sign in with ChatGPT (#447): a person connects their OWN ChatGPT account as a private AI
 // provider. Behind the `chatgptOAuth` feature flag (off by default).
 //
-// How it works
-//   Login     OAuth device code, the same flow the Codex CLI offers as `codex login --device-auth`:
-//             the server asks auth.openai.com for a one-time code, the person enters it at
-//             https://auth.openai.com/codex/device, and the server polls until OpenAI hands back an
-//             authorization code plus its PKCE verifier, which it exchanges for tokens. No
-//             redirect ever reaches this server, so it works behind Cloudflare with no callback
-//             URL, and nothing depends on browser storage or ~/.codex.
-//   Storage   access + refresh token, per user, encrypted by secrets.cjs in the v2 user-bound
-//             format (AES-GCM with the user id as associated data), in chatgpt_oauth_tokens.
-//             Never returned to the client (status and a masked e-mail only), never logged.
-//   Refresh   before expiry, and once on a 401. Single-flight per user: OpenAI rotates refresh
-//             tokens, so two concurrent refreshes would burn each other. A refused refresh marks
-//             the account "reconnect"; a network failure does not.
+// How it works (sbstndalton/noevia#2190 round 5: the Rust front is the token broker)
+//   Login     OAuth device code, the same flow the Codex CLI offers as `codex login --device-auth`,
+//             answered by the Rust front (noevia-rs chatgpt_oauth_routes.rs; this core refuses the
+//             routes, rust-chatgpt-oauth.cjs).
+//   Storage   access + refresh token, per user, sealed enc:v2 bound to the owner by the front, in
+//             chatgpt_oauth_tokens, which only the front writes (rust-auth.cjs FRONT_TABLES). This
+//             process reads a row's state only, and never sees a refresh token.
+//   Refresh   the front's: single-flight per account, refresh-ahead inside five minutes of expiry,
+//             compare-and-swap writes. This process asks for a current access token
+//             (createChatGptOAuth `session`), caches it briefly, and on a 401 asks once more with
+//             the rejected token; a second 401 marks that sign-in "reconnect".
 //   Transport fetchFor(userId) returns a fetch-shaped function that accepts the OpenAI
 //             /chat/completions body the chat loop already builds, sends it to the ChatGPT Codex
 //             backend's Responses endpoint, and answers in /chat/completions shape (streamed SSE
@@ -34,23 +32,16 @@ const { readCappedText } = require('./http.cjs');
 const KIND = 'chatgpt-oauth';
 const PROVIDER_ID = 'chatgpt-oauth';
 const DEFAULTS = Object.freeze({
-  issuer: 'https://auth.openai.com',
-  clientId: 'app_EMoamEEZ73f0CkXaXp7hrann', // the Codex CLI's public OAuth client
   codexBaseUrl: 'https://chatgpt.com/backend-api/codex',
-  codexClientVersion: '0.155.0', // only the model catalogue reads it
 });
-const DEVICE_TTL_MS = 15 * 60 * 1000;
-const MAX_PENDING_PER_USER = 3;
+// sbstndalton/noevia#2190 round 5: the access token is cached in this process at most this long,
+// and never inside the broker's refresh margin (five minutes before expiry).
 const REFRESH_MARGIN_MS = 5 * 60 * 1000;
-const MODEL_CACHE_MS = 5 * 60 * 1000;
-const MODEL_FAILURE_CACHE_MS = 60 * 1000;
-const MODEL_REFRESH_GAP_MS = 10 * 1000; // #1306: explicit refreshes closer than this are served from the cache
-const START_WINDOW_MS = 10 * 60 * 1000;
-const MAX_STARTS_PER_WINDOW = 5;
-const TIMEOUT_MS = 15000;
+const SESSION_CACHE_MS = 60 * 1000;
+const SESSION_CACHE_MAX = 1000;
 // One stable, honest User-Agent. The Codex CLI sends `codex_cli_rs/<version> (<os>; <arch>) <terminal>`
 // (codex-rs/login/src/auth/default_client.rs get_codex_user_agent); nothing shows the backend
-// requires that shape, and noevia does not pretend to be the CLI.
+// requires that shape, and noevia does not pretend to be the CLI. The Rust broker sends the same.
 const USER_AGENT = (() => { let v = '0'; try { v = require('../package.json').version || v; } catch { /* runtime without package.json */ } return `noevia/${v} (chatgpt-oauth; +https://github.com/sbstndalton/noevia)`; })();
 
 const fail = (message, status = 502, code = undefined) => Object.assign(new Error(message), { status, code });
@@ -61,69 +52,11 @@ const MESSAGES = {
 };
 const authError = (code) => fail(MESSAGES[code], code === 'transient' ? 503 : 401, code);
 
-// ── JWT claims (display and routing only; the token came straight from OpenAI over TLS) ──
-function jwtClaims(token) {
-  if (typeof token !== 'string') return null;
-  const parts = token.split('.');
-  if (parts.length !== 3) return null;
-  try {
-    const value = JSON.parse(Buffer.from(parts[1], 'base64url').toString('utf8'));
-    return value && typeof value === 'object' && !Array.isArray(value) ? value : null;
-  } catch { return null; }
-}
 const record = (v) => (v && typeof v === 'object' && !Array.isArray(v) ? v : null);
-function accountIdFrom(token) {
-  const claims = jwtClaims(token);
-  if (!claims) return undefined;
-  const auth = record(claims['https://api.openai.com/auth']);
-  if (auth && typeof auth.chatgpt_account_id === 'string' && auth.chatgpt_account_id) return auth.chatgpt_account_id;
-  if (typeof claims.chatgpt_account_id === 'string' && claims.chatgpt_account_id) return claims.chatgpt_account_id;
-  const first = Array.isArray(claims.organizations) ? record(claims.organizations[0]) : null;
-  return first && typeof first.id === 'string' && first.id ? first.id : undefined;
-}
 /** A UUID-shaped, stable digest of `text` (never reversible to it). */
 function uuidFrom(text) {
   const h = crypto.createHash('sha256').update(String(text)).digest('hex');
   return `${h.slice(0, 8)}-${h.slice(8, 12)}-5${h.slice(13, 16)}-${((parseInt(h[16], 16) & 3) | 8).toString(16)}${h.slice(17, 20)}-${h.slice(20, 32)}`;
-}
-const isFedRamp = (token) => record(jwtClaims(token)?.['https://api.openai.com/auth'])?.chatgpt_account_is_fedramp === true;
-function maskEmail(email) {
-  if (typeof email !== 'string' || !email.includes('@')) return null;
-  const [name, domain] = [email.slice(0, email.lastIndexOf('@')), email.slice(email.lastIndexOf('@') + 1)];
-  return `${name.slice(0, 1)}…@${domain}`.slice(0, 120);
-}
-
-/** The account's plan as sent to the browser (#1373). What is stored is the id token's
- *  `chatgpt_plan_type` claim, a short identifier such as "plus" or "team". Only that shape is sent:
- *  any other value (an object, an array, a number, a longer or odd string from an older or edited
- *  row) is null, so nothing else stored beside the tokens can be echoed. The Rust front's native
- *  status (noevia-rs server-chatgpt-status) applies the same rule. */
-const PLAN_PATTERN = /^[A-Za-z0-9_.-]{1,40}$/;
-function publicPlan(plan) {
-  return typeof plan === 'string' && PLAN_PATTERN.test(plan) ? plan : null;
-}
-
-/** The token endpoint's answer, reduced to what is stored. `previous` keeps a refresh token that a refresh did not rotate. */
-function tokensFrom(payload, { now, previous = null }) {
-  const p = record(payload);
-  if (!p || typeof p.access_token !== 'string' || !p.access_token) throw fail('ChatGPT did not issue an access token.');
-  const idToken = typeof p.id_token === 'string' ? p.id_token : undefined;
-  const accountId = accountIdFrom(idToken) || accountIdFrom(p.access_token) || previous?.accountId;
-  if (!accountId) throw fail('ChatGPT did not say which account signed in.');
-  const idClaims = jwtClaims(idToken) || {};
-  const auth = record(idClaims['https://api.openai.com/auth']) || record(jwtClaims(p.access_token)?.['https://api.openai.com/auth']) || {};
-  const exp = Number(jwtClaims(p.access_token)?.exp);
-  const expiresAt = Number.isFinite(Number(p.expires_in)) && Number(p.expires_in) > 0 ? now() + Number(p.expires_in) * 1000
-    : Number.isFinite(exp) && exp > 0 ? exp * 1000 : null;
-  return {
-    accessToken: p.access_token,
-    refreshToken: typeof p.refresh_token === 'string' && p.refresh_token ? p.refresh_token : previous?.refreshToken || null,
-    accountId,
-    fedRamp: isFedRamp(idToken) || isFedRamp(p.access_token),
-    expiresAt,
-    email: typeof idClaims.email === 'string' ? idClaims.email : previous?.email || null,
-    plan: typeof auth.chatgpt_plan_type === 'string' ? auth.chatgpt_plan_type.slice(0, 40) : previous?.plan || null,
-  };
 }
 
 // ── /chat/completions → Responses (request) ─────────────────────────────────
@@ -422,237 +355,72 @@ function upstreamMessage(text, status) {
 }
 
 /**
+ * sbstndalton/noevia#2190 round 5: the Rust front is Sign in with ChatGPT's token broker (noevia-rs
+ * bins/noevia-server chatgpt_oauth_routes.rs, capability rust-chatgpt-oauth): the device sign-in, the
+ * token store (chatgpt_oauth_tokens, enc:v2 bound to the owner), the single-flight refresh and the
+ * model catalogue cache are its own. This process keeps only the chat transport: it asks the broker
+ * for a current access token over the internal store channel (project-store-client.cjs
+ * chatgptSession: loopback, the per-start secret) and never holds a refresh token. The access token
+ * is cached here for at most a minute, never inside the refresh margin, and dropped as soon as the
+ * broker's change signal (chatgpt-token-changes.json, shared-reread.cjs fileSignal) moves or the
+ * upstream answers 401. Node writes nothing to the table (rust-auth.cjs FRONT_TABLES); it only
+ * creates it (Node is the schema migrator) and reads a row's state.
+ *
  * @param {object} deps
- * @param {{ exec(sql:string):void, prepare(sql:string):any }} deps.db   the auth database
- * @param {{ encrypt(v:string, userId?:string):string, decrypt(v:string, userId?:string):string }} deps.secrets
+ * @param {{ exec(sql:string):void, prepare(sql:string):any }} deps.db   the auth database (read-only use)
+ * @param {object} deps.broker   project-store-client.cjs: chatgptSession, chatgptReject, chatgptCatalogue,
+ *                               chatgptModels, chatgptDisconnect, chatgptForget
+ * @param {() => string} [deps.signal]   the broker's change signal (fileSignal of chatgpt-token-changes.json)
  * @param {typeof fetch} [deps.fetchImpl]
  * @param {() => number} [deps.now]
- * @param {(action:string, userId:string|null, detail:object) => void} [deps.audit]
- * @param {Partial<typeof DEFAULTS>} [deps.config]
+ * @param {{ codexBaseUrl?: string }} [deps.config]
  */
-function createChatGptOAuth({ db, secrets, fetchImpl = (...args) => globalThis.fetch(...args), now = () => Date.now(), audit = () => {}, config = {} }) {
-  const cfg = { ...DEFAULTS, ...Object.fromEntries(Object.entries(config).filter(([, v]) => typeof v === 'string' && v)) };
-  const issuer = cfg.issuer.replace(/\/+$/, '');
-  const codexBase = cfg.codexBaseUrl.replace(/\/+$/, '');
+function createChatGptOAuth({ db, broker, signal = () => '', fetchImpl = (...args) => globalThis.fetch(...args), now = () => Date.now(), config = {} }) {
+  const codexBase = (typeof config.codexBaseUrl === 'string' && config.codexBaseUrl ? config.codexBaseUrl : DEFAULTS.codexBaseUrl).replace(/\/+$/, '');
   db.exec(`CREATE TABLE IF NOT EXISTS chatgpt_oauth_tokens(user_id TEXT PRIMARY KEY, data_enc TEXT NOT NULL,
     state TEXT NOT NULL DEFAULT 'connected', updated_at INTEGER NOT NULL)`);
 
-  // ── storage (v2, bound to the owning user) ──
-  function read(userId) {
-    if (!userId) return null;
-    const row = db.prepare('SELECT data_enc, state FROM chatgpt_oauth_tokens WHERE user_id=?').get(String(userId));
-    if (!row) return null;
-    let data = null;
-    try { data = JSON.parse(secrets.decrypt(row.data_enc, String(userId))); } catch { data = null; }
-    return { state: row.state, data: record(data), raw: row.data_enc };
-  }
-  function write(userId, data, state = 'connected') {
-    db.prepare(`INSERT INTO chatgpt_oauth_tokens(user_id, data_enc, state, updated_at) VALUES(?,?,?,?)
-      ON CONFLICT(user_id) DO UPDATE SET data_enc=excluded.data_enc, state=excluded.state, updated_at=excluded.updated_at`)
-      .run(String(userId), secrets.encrypt(JSON.stringify(data), String(userId)), state, now());
-  }
-  /** Marks THIS stored sign-in (by its ciphertext) as needing a reconnect; a newer one is left alone. */
-  function markReconnect(userId, raw = null) {
-    const r = raw
-      ? db.prepare("UPDATE chatgpt_oauth_tokens SET state='reconnect', updated_at=? WHERE user_id=? AND data_enc=?").run(now(), String(userId), raw)
-      : db.prepare("UPDATE chatgpt_oauth_tokens SET state='reconnect', updated_at=? WHERE user_id=?").run(now(), String(userId));
-    if (r.changes) audit('chatgpt.oauth.reconnect_needed', String(userId), {});
-  }
-
-  async function postJson(url, body, { form = false } = {}) {
-    const r = await fetchImpl(url, {
-      method: 'POST', redirect: 'error', signal: AbortSignal.timeout(TIMEOUT_MS),
-      headers: { 'content-type': form ? 'application/x-www-form-urlencoded' : 'application/json', accept: 'application/json', 'user-agent': USER_AGENT },
-      body: form ? new URLSearchParams(body).toString() : JSON.stringify(body),
-    });
-    const text = (await readCappedText(r, 256 * 1024).catch(() => ({ text: '' }))).text;
-    let parsed = null;
-    try { parsed = JSON.parse(text); } catch { parsed = null; }
-    return { ok: r.ok, status: r.status, body: parsed };
-  }
-
-  // ── device-code login ──
-  // Endpoints and bodies match the Codex CLI's `codex login --device-auth`
-  // (openai/codex codex-rs/login/src/device_code_auth.rs @985cf47: usercode L63-70 and L167-175,
-  // token poll L107-131, redirect_uri L206; code exchange as a form, oauth/client.rs L58-67).
-  const pending = new Map(); // loginId -> { userId, deviceAuthId, userCode, interval, expires, nextPollAt, polling, cancelled, generation }
-  const models = new Map(); // userId -> { until, ids, fetchedAt }: the account's model catalogue (ids null = unavailable)
-  const modelFlights = new Map(); // userId -> { gen, promise }: the one catalogue fetch in flight (#1306)
-  const modelRefreshes = new Map(); // userId -> time of the last explicit refresh (#1306 throttle)
-  const catalogueEpochs = new Map(); // userId -> number, bumped on connect/disconnect: a fetch in flight then caches nothing
-  const catalogueEpoch = (userId) => catalogueEpochs.get(userId) || 0;
-  const resetCatalogue = (userId) => {
-    catalogueEpochs.set(userId, catalogueEpoch(userId) + 1);
-    models.delete(userId);
-    modelFlights.delete(userId);
-    modelRefreshes.delete(userId);
-  };
-  const generations = new Map(); // userId -> number, bumped by disconnect: an exchange in flight must not reconnect
-  const starts = new Map(); // userId -> start timestamps (rate limit)
-  const generation = (userId) => generations.get(userId) || 0;
-  const bump = (userId) => generations.set(userId, generation(userId) + 1);
-  const prune = () => { for (const [k, v] of pending) if (v.expires < now()) pending.delete(k); };
-  const dropPending = (userId) => { for (const [k, v] of pending) if (v.userId === userId) { v.cancelled = true; pending.delete(k); } };
-
-  async function startDeviceLogin(userId) {
-    if (!userId) throw fail('Sign in to noevia first.', 401);
-    const recent = (starts.get(userId) || []).filter((at) => at > now() - START_WINDOW_MS);
-    if (recent.length >= MAX_STARTS_PER_WINDOW) throw fail('Too many ChatGPT sign-in attempts. Wait a few minutes and try again.', 429);
-    starts.set(userId, [...recent, now()]);
-    prune();
-    const own = [...pending].filter(([, v]) => v.userId === userId).map(([k]) => k);
-    while (own.length >= MAX_PENDING_PER_USER) { const k = own.shift(); pending.get(k).cancelled = true; pending.delete(k); }
-    let r;
-    try { r = await postJson(`${issuer}/api/accounts/deviceauth/usercode`, { client_id: cfg.clientId }); }
-    catch { throw fail('ChatGPT sign-in could not be reached. Try again.', 502); }
-    if (r.status === 404) throw fail('ChatGPT device sign-in is not available right now.', 502);
-    const deviceAuthId = r.body?.device_auth_id;
-    const userCode = r.body?.user_code ?? r.body?.usercode;
-    if (!r.ok || typeof deviceAuthId !== 'string' || typeof userCode !== 'string' || !deviceAuthId || !userCode || deviceAuthId.length > 512 || userCode.length > 64) {
-      throw fail(`ChatGPT sign-in could not start (${r.status}).`, 502);
-    }
-    const interval = Math.min(30, Math.max(1, Number.parseInt(String(r.body.interval ?? '5'), 10) || 5));
-    const loginId = crypto.randomBytes(18).toString('base64url');
-    const expires = now() + DEVICE_TTL_MS;
-    pending.set(loginId, { userId, deviceAuthId, userCode, interval, expires, nextPollAt: now() + interval * 1000, polling: false, cancelled: false, generation: generation(userId) });
-    audit('chatgpt.oauth.start', userId, {});
-    return { loginId, userCode, verificationUrl: `${issuer}/codex/device`, interval, expiresAt: expires };
-  }
-
-  async function exchange(code, verifier) {
-    let r;
-    try {
-      r = await postJson(`${issuer}/oauth/token`, { grant_type: 'authorization_code', code, redirect_uri: `${issuer}/deviceauth/callback`,
-        client_id: cfg.clientId, code_verifier: verifier }, { form: true });
-    } catch { throw fail('ChatGPT sign-in could not be completed. Start again.', 502); }
-    if (!r.ok) throw fail(`ChatGPT sign-in was refused (${r.status}). Start again.`, 502);
-    return tokensFrom(r.body, { now });
-  }
-
-  /** Poll one pending login. Only the account that started it may poll or cancel it. The entry
-   *  stays pending through the token exchange, so a Cancel or Disconnect during it still wins. */
-  async function pollDeviceLogin(userId, loginId) {
-    const p = pending.get(String(loginId || ''));
-    if (p && p.userId !== userId) throw fail('This sign-in was started by a different account.', 403);
-    if (!p || p.expires < now()) { if (p) pending.delete(loginId); return { state: 'expired' }; }
-    if (p.polling || now() < p.nextPollAt) return { state: 'pending', interval: p.interval };
-    p.polling = true;
-    p.nextPollAt = now() + p.interval * 1000;
-    const abandoned = () => p.cancelled || p.generation !== generation(userId);
-    try {
-      let r;
-      try { r = await postJson(`${issuer}/api/accounts/deviceauth/token`, { device_auth_id: p.deviceAuthId, user_code: p.userCode }); }
-      catch { return { state: 'pending', interval: p.interval }; }
-      if (r.status === 403 || r.status === 404) return { state: 'pending', interval: p.interval };
-      const code = r.body?.authorization_code;
-      const verifier = r.body?.code_verifier;
-      if (!r.ok || typeof code !== 'string' || typeof verifier !== 'string' || !code || !verifier) {
-        pending.delete(loginId);
-        throw fail(`ChatGPT sign-in failed (${r.status}). Start again.`, 502);
-      }
-      if (abandoned()) return { state: 'cancelled' };
-      let tokens;
-      try { tokens = await exchange(code, verifier); } finally { if (pending.get(loginId) === p) pending.delete(loginId); }
-      // Checked after the exchange and before the (synchronous) write: nothing can slip in between.
-      if (abandoned()) { audit('chatgpt.oauth.cancelled', userId, {}); return { state: 'cancelled' }; }
-      write(userId, { ...tokens, connectedAt: now() });
-      resetCatalogue(userId);
-      audit('chatgpt.oauth.connect', userId, { plan: publicPlan(tokens.plan) || undefined });
-      return { state: 'connected', account: { email: maskEmail(tokens.email), plan: publicPlan(tokens.plan) } };
-    } finally {
-      p.polling = false;
-    }
-  }
-
-  function cancelDeviceLogin(userId, loginId) {
-    const p = pending.get(String(loginId || ''));
-    if (!p) return false;
-    if (p.userId !== userId) throw fail('This sign-in was started by a different account.', 403);
-    p.cancelled = true;
-    return pending.delete(loginId);
-  }
-
-  // ── tokens in use ──
-  // Known limit: if OpenAI completes a refresh but the answer never reaches us (timeout), the old
-  // refresh token is already spent and the next refresh is refused, so the account shows
-  // "Reconnect needed". There is no safe automatic recovery; signing in again fixes it.
-  const refreshing = new Map(); // userId -> Promise<{ data, raw }>  (raw: ciphertext of the row those tokens live in)
-  function refresh(userId, row) {
-    if (refreshing.has(userId)) return refreshing.get(userId);
-    const current = row.data;
-    const run = (async () => {
-      if (!current.refreshToken) { markReconnect(userId, row.raw); throw authError('reconnect'); }
-      let r;
-      try { r = await postJson(`${issuer}/oauth/token`, { grant_type: 'refresh_token', refresh_token: current.refreshToken, client_id: cfg.clientId }); }
-      catch { throw authError('transient'); }
-      if ([400, 401, 403].includes(r.status)) {
-        markReconnect(userId, row.raw);
-        const latest = read(userId);
-        // A re-sign-in that landed meanwhile is still good: use it rather than failing.
-        if (latest && latest.raw !== row.raw && latest.state === 'connected' && latest.data) return { data: latest.data, raw: latest.raw };
-        throw authError('reconnect');
-      }
-      if (!r.ok) throw authError('transient');
-      let next;
-      try { next = { ...tokensFrom(r.body, { now, previous: current }), connectedAt: current.connectedAt || now() }; }
-      catch { throw authError('transient'); }
-      // Compare-and-set on the ciphertext this refresh started from: a disconnect or a newer
-      // sign-in that landed while the refresh was in flight wins, never the stale refresh.
-      const nextRaw = secrets.encrypt(JSON.stringify(next), String(userId));
-      const kept = db.prepare("UPDATE chatgpt_oauth_tokens SET data_enc=?, updated_at=? WHERE user_id=? AND state='connected' AND data_enc=?")
-        .run(nextRaw, now(), String(userId), row.raw);
-      if (kept.changes) return { data: next, raw: nextRaw };
-      const latest = read(userId);
-      if (latest && latest.state === 'connected' && latest.data) return { data: latest.data, raw: latest.raw };
-      throw authError(latest ? 'reconnect' : 'disconnected');
-    })();
-    refreshing.set(userId, run);
-    run.then(() => refreshing.delete(userId), () => refreshing.delete(userId));
-    return run;
-  }
-  /** Usable tokens for this user, with the ciphertext of the stored row they came from (`raw`, for
-   *  markReconnect; never returned to callers outside this module): refreshed near expiry, or after
-   *  a 401 on `rejectedToken`. */
-  async function sessionRow(userId, { rejectedToken = null } = {}) {
-    const row = read(userId);
-    if (!row) throw authError('disconnected');
-    if (row.state !== 'connected' || !row.data || typeof row.data.accessToken !== 'string') throw authError('reconnect');
-    const t = row.data;
-    if (rejectedToken) {
-      // Another request may already have refreshed; use that rather than burning a refresh token.
-      if (t.accessToken !== rejectedToken) return { data: t, raw: row.raw };
-      return refresh(userId, row);
-    }
-    if (t.expiresAt && t.expiresAt - now() <= REFRESH_MARGIN_MS) {
-      try { return await refresh(userId, row); } catch (e) {
-        // A soft failure inside the early-refresh window keeps the still-valid token (fork 3b04587).
-        if (e.code === 'transient' && t.expiresAt > now()) return { data: t, raw: row.raw };
-        throw e;
-      }
-    }
-    return { data: t, raw: row.raw };
-  }
-  async function session(userId, opts) { return (await sessionRow(userId, opts)).data; }
-
+  /** The account's connection state, read from the broker's row (its state only, never its tokens). */
   function status(userId) {
-    const row = read(userId);
+    if (!userId) return { state: 'disconnected' };
+    const row = db.prepare('SELECT state FROM chatgpt_oauth_tokens WHERE user_id=?').get(String(userId));
     if (!row) return { state: 'disconnected' };
-    if (row.state !== 'connected' || !row.data) return { state: 'reconnect' };
-    return { state: 'connected', account: { email: maskEmail(row.data.email), plan: publicPlan(row.data.plan) } };
+    return { state: row.state === 'connected' ? 'connected' : 'reconnect' };
   }
-  function disconnect(userId) {
-    bump(userId);
-    db.prepare('DELETE FROM chatgpt_oauth_tokens WHERE user_id=?').run(String(userId));
-    dropPending(userId);
-    resetCatalogue(userId);
-    audit('chatgpt.oauth.disconnect', String(userId), {});
+
+  const sessions = new Map(); // userId -> { session, until, signal }
+  /** The broker's answer as core's errors: written for people, never a credential. */
+  const brokerError = (r) => fail(typeof r?.error === 'string' ? r.error.slice(0, 300) : MESSAGES.transient,
+    Number.isInteger(r?.status) && r.status >= 400 && r.status < 600 ? r.status : 503, typeof r?.code === 'string' ? r.code : undefined);
+  /** Usable tokens for this user ({ accessToken, accountId, fedRamp, expiresAt, generation }). */
+  async function session(userId, { rejectedToken = null } = {}) {
+    const key = String(userId);
+    const mark = (() => { try { return signal(); } catch { return null; } })();
+    if (!rejectedToken && mark !== null) {
+      const hit = sessions.get(key);
+      if (hit && hit.signal === mark && hit.until > now()) return hit.session;
+    }
+    sessions.delete(key);
+    let r;
+    try { r = await broker.chatgptSession(key, rejectedToken); } catch { throw authError('transient'); }
+    if (!r || !r.ok) throw brokerError(r);
+    const s = r.session;
+    const until = Math.min(now() + SESSION_CACHE_MS, Number.isFinite(s.expiresAt) && s.expiresAt > 0 ? s.expiresAt - REFRESH_MARGIN_MS : Infinity);
+    if (mark !== null && until > now()) {
+      sessions.set(key, { session: s, until, signal: mark });
+      while (sessions.size > SESSION_CACHE_MAX) sessions.delete(sessions.keys().next().value);
+    }
+    return s;
   }
-  function forgetUser(userId) {
-    bump(userId);
-    db.prepare('DELETE FROM chatgpt_oauth_tokens WHERE user_id=?').run(String(userId));
-    dropPending(userId);
-    resetCatalogue(userId);
-    starts.delete(userId);
+  async function disconnect(userId) {
+    sessions.delete(String(userId));
+    const r = await broker.chatgptDisconnect(String(userId));
+    if (!r || !r.ok) throw brokerError(r);
+  }
+  async function forgetUser(userId) {
+    sessions.delete(String(userId));
+    const r = await broker.chatgptForget(String(userId));
+    if (!r || !r.ok) throw brokerError(r);
   }
 
   /** The protocol headers the Codex client itself sends (openai/codex @985cf47):
@@ -672,21 +440,35 @@ function createChatGptOAuth({ db, secrets, fetchImpl = (...args) => globalThis.f
   /** One authorised upstream call with the refresh-once-on-401 rule. Returns a Response or an error Response. */
   async function authorised(userId, send) {
     let t;
-    let raw;
-    try { ({ data: t, raw } = await sessionRow(userId)); } catch (e) { return errorResponse(e.status || 401, e.message, e.code); }
+    try { t = await session(userId); } catch (e) { return errorResponse(e.status || 401, e.message, e.code); }
     let r = await send(t);
     if (r.status !== 401) return r;
     try { await r.body?.cancel?.(); } catch { /* already closed */ }
-    try { ({ data: t, raw } = await sessionRow(userId, { rejectedToken: t.accessToken })); } catch (e) { return errorResponse(e.status || 401, e.message, e.code); }
+    try { t = await session(userId, { rejectedToken: t.accessToken }); } catch (e) { return errorResponse(e.status || 401, e.message, e.code); }
     r = await send(t);
     if (r.status === 401) {
       try { await r.body?.cancel?.(); } catch { /* already closed */ }
       // Only the sign-in that actually failed: a newer one written meanwhile is left alone (#934).
-      markReconnect(userId, raw);
+      sessions.delete(String(userId));
+      await broker.chatgptReject(String(userId), t.generation).catch(() => null);
       return errorResponse(401, MESSAGES.reconnect, 'reconnect');
     }
     return r;
   }
+
+  /** The account's catalogue entries from the broker ({ slug, effort, summary, summaryParam, levels }). */
+  async function modelCatalogue(userId) {
+    const r = await broker.chatgptCatalogue(String(userId));
+    if (!r || !r.ok) throw brokerError(r);
+    return r.models;
+  }
+  /** #1306: the picker's view of the catalogue, cached, throttled and shared by the broker. */
+  async function modelList(userId, { refresh = false } = {}) {
+    const r = await broker.chatgptModels(String(userId), refresh === true);
+    if (!r || !r.ok) throw brokerError(r);
+    return r.body;
+  }
+  async function listModels(userId) { return (await modelList(userId)).models; }
 
   /** A fetch for the chat loop: /chat/completions in, /chat/completions out, the user's bearer on the wire. */
   function fetchFor(userId, { conversation = null } = {}) {
@@ -764,87 +546,12 @@ function createChatGptOAuth({ db, secrets, fetchImpl = (...args) => globalThis.f
     };
   }
 
-  /** The account's model catalogue (public ids only), cached for five minutes per user; a failure
-   *  is remembered for a minute so a broken catalogue does not add a call to every chat. */
-  async function listModels(userId) {
-    return (await modelCatalogue(userId)).map((m) => m.slug);
-  }
-  /** #1306: the picker's view of the catalogue. `refresh` bypasses the cache (and a remembered
-   *  failure) unless this account refreshed within MODEL_REFRESH_GAP_MS, in which case the cached
-   *  list is served and marked throttled. Concurrent fetches for one account share one request. */
-  async function modelList(userId, { refresh = false } = {}) {
-    const out = await catalogueEntry(userId, { refresh });
-    return { models: out.ids.map((m) => m.slug), cached: out.cached, fetchedAt: out.fetchedAt, ...(out.throttled ? { throttled: true } : {}) };
-  }
-  async function modelCatalogue(userId) {
-    return (await catalogueEntry(userId)).ids;
-  }
-  async function catalogueEntry(userId, { refresh = false } = {}) {
-    const cached = models.get(userId);
-    const fresh = cached && cached.until > now();
-    // The gap counts every refresh attempt, including ones that failed (network, timeout, 401,
-    // a provider message), so a held-down Refresh cannot hammer the provider on errors either.
-    const throttled = !!(refresh && now() - (modelRefreshes.get(userId) ?? -Infinity) < MODEL_REFRESH_GAP_MS);
-    if (fresh && (!refresh || throttled)) {
-      if (cached.ids) return { ids: cached.ids, cached: true, fetchedAt: cached.fetchedAt, throttled };
-      throw fail(cached.error, 502);
-    }
-    // Throttled with nothing usable cached: join the refresh still in flight, else refuse.
-    if (throttled && modelFlights.get(userId)?.gen !== catalogueEpoch(userId)) throw fail('The ChatGPT model list was refreshed a moment ago. Try again in a few seconds.', 429);
-    if (refresh && !throttled) {
-      modelRefreshes.set(userId, now());
-      while (modelRefreshes.size > 1000) modelRefreshes.delete(modelRefreshes.keys().next().value);
-    }
-    const gen = catalogueEpoch(userId);
-    let flight = modelFlights.get(userId);
-    if (!flight || flight.gen !== gen) {
-      const entry = { gen, promise: null };
-      entry.promise = fetchCatalogue(userId, gen).finally(() => { if (modelFlights.get(userId) === entry) modelFlights.delete(userId); });
-      modelFlights.set(userId, entry);
-      flight = entry;
-    }
-    const { ids, fetchedAt } = await flight.promise;
-    return { ids, cached: false, fetchedAt, throttled: false };
-  }
-  async function fetchCatalogue(userId, gen) {
-    const r = await authorised(userId, (t) => fetchImpl(`${codexBase}/models?client_version=${encodeURIComponent(cfg.codexClientVersion)}`, {
-      method: 'GET', redirect: 'error', signal: AbortSignal.timeout(TIMEOUT_MS), headers: upstreamHeaders(t, 'application/json'),
-    }));
-    const text = (await readCappedText(r, 2 * 1024 * 1024).catch(() => ({ text: '' }))).text;
-    if (r.headers.get('x-noevia-provider-message') === '1') { let m = ''; try { m = JSON.parse(text).error.message; } catch { /* fallthrough */ } throw fail(m || MESSAGES.reconnect, r.status); }
-    // A disconnect or reconnect (possibly another ChatGPT account) while this fetch was in flight bumps the generation: the
-    // result then belongs to no one and is not cached.
-    const current = () => catalogueEpoch(userId) === gen;
-    // A failure never replaces a good list that is still fresh (a failed refresh): plain reads keep
-    // the last good list and only the refreshing call sees the error.
-    const remember = (error) => {
-      const prior = models.get(userId);
-      if (current() && !(prior?.ids && prior.until > now())) models.set(userId, { until: now() + MODEL_FAILURE_CACHE_MS, ids: null, error });
-      return fail(error, 502);
-    };
-    if (!r.ok) throw remember(upstreamMessage(text, r.status));
-    let parsed = null;
-    try { parsed = JSON.parse(text); } catch { parsed = null; }
-    const word = (v) => (typeof v === 'string' && /^[a-z_]{1,20}$/.test(v) ? v : null);
-    const ids = (Array.isArray(parsed?.models) ? parsed.models : [])
-      .filter((m) => record(m) && typeof m.slug === 'string' && m.slug && m.supported_in_api !== false && (m.visibility === undefined || m.visibility === 'list'))
-      .map((m) => ({ slug: m.slug.slice(0, 120), effort: word(m.default_reasoning_level), summary: word(m.default_reasoning_summary),
-        summaryParam: m.supports_reasoning_summary_parameter !== false,
-        // #1311: the levels this model publishes (null when the list is absent), so an explicit choice is checked.
-        levels: Array.isArray(m.supported_reasoning_levels) ? m.supported_reasoning_levels.map((l) => word(record(l) ? l.effort : null)).filter(Boolean).slice(0, 12) : null })).slice(0, 50);
-    if (!ids.length) throw remember('ChatGPT returned no models for this account.');
-    const fetchedAt = now();
-    if (current()) models.set(userId, { until: fetchedAt + MODEL_CACHE_MS, ids, fetchedAt });
-    return { ids, fetchedAt };
-  }
-
-  return { startDeviceLogin, pollDeviceLogin, cancelDeviceLogin, status, disconnect, forgetUser, session, fetchFor, listModels, modelList };
+  return { status, disconnect, forgetUser, session, fetchFor, listModels, modelList };
 }
-
 /** The private provider row that points chats at this account. No credential lives in it. */
 function providerRow() {
   return { id: PROVIDER_ID, kind: KIND, label: 'ChatGPT', baseUrl: DEFAULTS.codexBaseUrl, apiKey: '', defaultModel: '', shared: false, external: true };
 }
 const isChatGptProvider = (provider) => !!provider && provider.kind === KIND;
 
-module.exports = { KIND, PROVIDER_ID, DEFAULTS, createChatGptOAuth, providerRow, isChatGptProvider, toResponsesRequest, chatParts, maskEmail, publicPlan, accountIdFrom };
+module.exports = { KIND, PROVIDER_ID, DEFAULTS, USER_AGENT, createChatGptOAuth, providerRow, isChatGptProvider, toResponsesRequest, chatParts };

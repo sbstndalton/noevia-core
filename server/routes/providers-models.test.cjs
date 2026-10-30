@@ -26,7 +26,7 @@ function fixture({ probe = async () => ({ ok: true, status: 200, body: { data: [
     PROVIDERS: providers, PROJECTS: [], DEFAULT_PROVIDER_ID: 'default', modelManager: { enabled: true },
     currentWorkspace: () => ({ removeProvider: () => false }), saveProjects: () => {},
     registry: { saveProviders() {}, saveSharedProviders() {}, maskKey: () => null },
-    chatgptOAuth: { listModels: async (userId) => [`gpt-syn-${userId}`], status: () => ({ state: 'connected' }) },
+    chatgptOAuth: { modelList: async (userId) => ({ models: [`gpt-syn-${userId}`], cached: false }), status: () => ({ state: 'connected' }) },
     chatgptEnabled: () => chatgptOn,
     now: () => clock,
   });

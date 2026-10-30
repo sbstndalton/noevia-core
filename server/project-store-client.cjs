@@ -26,6 +26,9 @@ const CHAT_MOVE_CLIENT_MARKER = 'noevia-chat-move-client/1';
 const SOURCE_JOBS_CLIENT_MARKER = 'noevia-source-jobs-client/1';
 const RESEARCH_JOBS_CLIENT_MARKER = 'noevia-research-jobs-client/1';
 const TIMEOUT_MS = 10000;
+// sbstndalton/noevia#2190 round 5: a ChatGPT session may refresh upstream and a model list may
+// fetch the catalogue after a refresh (the broker's 15 s each).
+const CHATGPT_WAIT_MS = 45000;
 const REPLY_CAP = 2 * 32 * 1024 * 1024 + 64 * 1024;
 const FILES = new Set(['projects.json', 'free-chats.json']);
 
@@ -51,14 +54,14 @@ function failure(status, body) {
 }
 
 function createClient({ port, token, fetchImpl = globalThis.fetch, timeoutMs = TIMEOUT_MS }) {
-  async function call(op, payload) {
+  async function call(op, payload, wait = timeoutMs) {
     let res;
     try {
       res = await fetchImpl(`http://127.0.0.1:${port}/v1/${op}`, {
         method: 'POST',
         headers: { 'content-type': 'application/json', 'x-noevia-store-token': token },
         body: JSON.stringify(payload),
-        signal: AbortSignal.timeout(timeoutMs),
+        signal: AbortSignal.timeout(wait),
       });
     } catch (err) {
       // Unreachable or too slow: as a store that could not be locked in time.
@@ -294,6 +297,39 @@ function createClient({ port, token, fetchImpl = globalThis.fetch, timeoutMs = T
       if (status === 200 && body && typeof body.saved === 'boolean') return { saved: body.saved };
       throw failure(status, body);
     },
+    /** sbstndalton/noevia#2190 round 5: Sign in with ChatGPT's token broker (the Rust front,
+     *  chatgpt_oauth_routes.rs). Each answers { ok: true, ... } or { ok: false, status, error, code }
+     *  (the broker's refusal, written for people). A session may refresh and a model list may fetch
+     *  the catalogue upstream (15 s each), so these wait longer than the file operations.
+     *  `session` hands out an access token, never a refresh token. */
+    async chatgptSession(user, rejected = null) {
+      const { status, body } = await call('chatgpt/session', { user, ...(rejected ? { rejected: String(rejected) } : {}) }, CHATGPT_WAIT_MS);
+      if (status === 200 && body && typeof body.accessToken === 'string' && typeof body.generation === 'string') {
+        return { ok: true, session: { accessToken: body.accessToken, accountId: String(body.accountId ?? ''), fedRamp: body.fedRamp === true,
+          expiresAt: Number.isFinite(body.expiresAt) ? body.expiresAt : null, generation: body.generation } };
+      }
+      return chatgptRefusal(status, body);
+    },
+    async chatgptReject(user, generation) {
+      const { status, body } = await call('chatgpt/reject', { user, generation: String(generation || '') }, CHATGPT_WAIT_MS);
+      return status === 200 && body ? { ok: true, marked: body.marked === true } : chatgptRefusal(status, body);
+    },
+    async chatgptCatalogue(user) {
+      const { status, body } = await call('chatgpt/catalogue', { user }, CHATGPT_WAIT_MS);
+      return status === 200 && body && Array.isArray(body.models) ? { ok: true, models: body.models } : chatgptRefusal(status, body);
+    },
+    async chatgptModels(user, refresh = false) {
+      const { status, body } = await call('chatgpt/models', { user, refresh: refresh === true }, CHATGPT_WAIT_MS);
+      return status === 200 && body && Array.isArray(body.models) ? { ok: true, body } : chatgptRefusal(status, body);
+    },
+    async chatgptDisconnect(user) {
+      const { status, body } = await call('chatgpt/disconnect', { user }, CHATGPT_WAIT_MS);
+      return status === 200 && body?.ok === true ? { ok: true } : chatgptRefusal(status, body);
+    },
+    async chatgptForget(user) {
+      const { status, body } = await call('chatgpt/forget', { user }, CHATGPT_WAIT_MS);
+      return status === 200 && body?.ok === true ? { ok: true } : chatgptRefusal(status, body);
+    },
     /** sbstndalton/noevia#2153: the user's chat change journal after `after` (chat-change-journal.cjs):
      *  { entries, oldestSeq, latestSeq, more, start }, or { unsupported: true } from a store
      *  without the op (404: an older Rust front). */
@@ -304,6 +340,14 @@ function createClient({ port, token, fetchImpl = globalThis.fetch, timeoutMs = T
       throw historyFailure(status, body);
     },
   };
+}
+
+/** A broker refusal ({ error, code, status }) or an unusable answer, as { ok: false, ... }. */
+function chatgptRefusal(status, body) {
+  // Only the broker's own refusals carry their status; anything else (the store's 401 for a wrong
+  // secret, a 404 from an older front, a 5xx) is "try again", never its raw text.
+  if (!body || !Number.isInteger(body.status) || typeof body.error !== 'string') return { ok: false, status: 503 };
+  return { ok: false, status: body.status, error: body.error, code: typeof body.code === 'string' ? body.code : undefined };
 }
 
 function moveFailure(status, body) {
