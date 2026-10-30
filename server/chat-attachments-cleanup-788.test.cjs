@@ -161,12 +161,13 @@ test('a chat that never had an attachments project deletes as before, touching n
   } finally { f.cleanup(); }
 });
 
-test('an archived chat keeps its attachments project; only deleting it removes them (#788)', async () => {
+test('deleting an archived chat removes its attachments project (#788)', async () => {
   const f = fixture();
   try {
     f.alice.freeChats.push({ id: 'old', archived: true });
     const { paths } = seedProject(f.alice, CONTEXT('old'));
-    assert.ok(allExist(paths), 'archived is not deleted');
+    // That an archived chat is no orphan (it is listed, so the cleanup leaves it) is the Rust workspace list's, tested in
+    // noevia-rs tests/workspace.rs; here only the delete.
     assert.equal(await f.store.deleteFreeChat('old'), true);
     await tick();
     assert.ok(noneExist(paths));

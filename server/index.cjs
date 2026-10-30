@@ -1145,14 +1145,17 @@ const modelRoutes = require('./routes/models.cjs').createModelRoutes({
 // status behind GET /api/health (rust-health.cjs) and the served catalogue and machine models behind
 // GET /api/auto-roles (rust-auto-roles.cjs). Both files age out when this process stops publishing.
 {
-  const ragStatus = require('./rust-health.cjs').createRagStatusPublisher({ dataDir: DATA_DIR, rag });
+  // Both run only while the front's demand marker is young: it touches it on each signed-in GET of the two routes.
+  const snapshots = require('./published-snapshot.cjs');
+  const demand = snapshots.createDemand({ dir: DATA_DIR, pollMs: snapshots.intervalFrom(process.env.SNAPSHOT_DEMAND_POLL_MS, snapshots.DEMAND_POLL_MS, 200, 10000) });
+  const ragStatus = require('./rust-health.cjs').createRagStatusPublisher({ dataDir: DATA_DIR, rag, demand });
   ragStatus.watch(embeddingService);
   const autoRolesSnapshot = require('./rust-auto-roles.cjs').createAutoRolesPublisher({
     dataDir: DATA_DIR, servedCatalogue: () => modelService.servedCatalogue(),
-    remoteRoles: () => chatMachines.remoteRoles(), machineModels: () => chatMachines.machineModels(),
+    remoteRoles: () => chatMachines.remoteRoles(), machineModels: () => chatMachines.machineModels(), demand,
   });
   autoRolesSnapshot.watch(modelService);
-  afterNativeReady(() => { ragStatus.start(); autoRolesSnapshot.start(); });
+  afterNativeReady(() => { ragStatus.start(); autoRolesSnapshot.start(); demand.start(); });
 }
 // ── Routing ────────────────────────────────────────────────────────────────
 

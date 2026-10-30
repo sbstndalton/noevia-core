@@ -174,7 +174,19 @@ function createModelRoutes({ servedEmbeddingModels = (target) => require('../rag
   async function handle(req, res, { path: p, authn, url }) {
     // #1461: a write that can change what the shared reads report drops them first, so the next read is not older than the write.
     if (!['GET', 'HEAD'].includes(req.method || 'GET') && /^\/api\/(models|model-manager|auto-roles)(\/|$)/.test(p)) {
-      if (service.invalidateModelReads) service.invalidateModelReads();
+      if (service.invalidateModelReads) {
+        service.invalidateModelReads();
+        // The write lands after this. A read in between can cache the old state, and the snapshot the Rust front
+        // reads is rebuilt from those same reads (rust-auto-roles.cjs watches this call to republish at once), so
+        // the reads are dropped again, and the snapshot republished, when the answer is out. Once, whichever of
+        // 'finish' (answered) and 'close' (the client left first) comes first.
+        if (typeof res.once === 'function') {
+          let again = false;
+          const afterWrite = () => { if (again) return; again = true; service.invalidateModelReads(); };
+          res.once('finish', afterWrite);
+          res.once('close', afterWrite);
+        }
+      }
     }
     if (p.startsWith('/api/models/') && !['GET', 'HEAD'].includes(req.method || 'GET') && authn.user.role !== 'admin') {
       return json(res, 403, { error: 'administrator required' });

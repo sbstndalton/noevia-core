@@ -5,7 +5,8 @@
 // dependencies) and the embedding probe's tri-state (rag.cjs retrievalStatus, with its cache and the
 // administrator's embedding switch), is published here as rag-status.json (published-snapshot.cjs);
 // the front reads it on every request and reports a file older than two intervals as
-// `retrieval: "unavailable"`.
+// `retrieval: "unavailable"`. It is published only while a signed-in page has asked in the last minute
+// (the front's demand marker, published-snapshot.cjs), so an idle installation does not probe the embedder.
 //
 // Only the GET is the front's, and it is refused here before authentication, so a stale route table
 // cannot make two processes answer. Node answered the path for every method; the other methods now
@@ -45,9 +46,9 @@ async function ragState(rag) {
 }
 
 /** The publisher of rag-status.json. `watch(service)` also republishes after the embedding service refreshes. */
-function createRagStatusPublisher({ dataDir, rag, env = process.env, onError = (err) => console.warn('[rag-status] could not publish:', err?.message || err) }) {
+function createRagStatusPublisher({ dataDir, rag, demand = null, env = process.env, onError = (err) => console.warn('[rag-status] could not publish:', err?.message || err) }) {
   const everyMs = intervalFrom(env.RAG_STATUS_PUBLISH_MS, DEFAULT_EVERY_MS);
-  const publisher = createPublisher({ file: path.join(dataDir, SNAPSHOT_FILE), kind: KIND, everyMs, build: () => ragState(rag), onError });
+  const publisher = createPublisher({ file: path.join(dataDir, SNAPSHOT_FILE), kind: KIND, everyMs, build: () => ragState(rag), onError, demand });
   return {
     ...publisher,
     everyMs,

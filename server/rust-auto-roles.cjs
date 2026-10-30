@@ -6,7 +6,9 @@
 // model's name and missingFile, or null when the engine cannot be read), the chat roles other
 // machines serve and the models those machines serve that this catalogue does not list (#1840,
 // #1849, #1855). The front reads it on every request; a file older than two intervals reads as an
-// engine that cannot be reached (nothing reported missing, no machine models).
+// engine that cannot be reached (nothing reported missing, no machine models). Like the health
+// snapshot it is published only while a signed-in page has asked in the last minute (the front's
+// demand marker, published-snapshot.cjs), so an idle installation does not read the engines.
 //
 // The PUT stays here: a save warms the roles in the engine (ensureRolesLoaded), which is chat-live.
 // Only the GET is refused, before authentication, so a stale route table cannot make two processes
@@ -52,10 +54,10 @@ async function autoRolesState({ servedCatalogue, remoteRoles, machineModels }) {
 }
 
 /** The publisher of auto-roles-snapshot.json. `watch(service)` republishes whenever model reads are invalidated. */
-function createAutoRolesPublisher({ dataDir, servedCatalogue, remoteRoles, machineModels, env = process.env, onError = (err) => console.warn('[auto-roles] could not publish the snapshot:', err?.message || err) }) {
+function createAutoRolesPublisher({ dataDir, servedCatalogue, remoteRoles, machineModels, demand = null, env = process.env, onError = (err) => console.warn('[auto-roles] could not publish the snapshot:', err?.message || err) }) {
   const everyMs = intervalFrom(env.AUTO_ROLES_PUBLISH_MS, DEFAULT_EVERY_MS);
   const file = path.join(dataDir, SNAPSHOT_FILE);
-  const publisher = createPublisher({ file, kind: KIND, everyMs, build: () => autoRolesState({ servedCatalogue, remoteRoles, machineModels }), onError });
+  const publisher = createPublisher({ file, kind: KIND, everyMs, build: () => autoRolesState({ servedCatalogue, remoteRoles, machineModels }), onError, demand });
   return {
     ...publisher,
     everyMs,
