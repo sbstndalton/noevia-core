@@ -340,8 +340,7 @@ test('#2210: a non-reported record carries the identity it was measured on and t
   const again=read(await manager.recordEvidence('fx',{category:'vision',result:'failed',value:null,suite:{name:'s',version:1},source:'recheck',limitations:[]}));
   assert.notEqual(again.identityHash,entry.identityHash);
   assert.equal(read(passed).identityHash,entry.identityHash);
-  // The draft file enters the identity through its own line, on both sides (#2215). Pinned: noevia-rs's replay
-  // case "a speculative draft model in the preset" expects this same hash for this same preset.
+  // The draft file enters the identity through its own line (#2215).
   fs.writeFileSync(ini,'version = 1\n\n[fx]\nmodel = /models/fx/fx.gguf\nspec-type = draft-mtp\nspec-draft-model = /models/fx/draft.gguf\n');
   const drafted=(await manager.evidence('fx')).body.identityHash;
   fs.writeFileSync(path.join(models,'fx','draft.gguf'),Buffer.alloc(4096,9));
@@ -351,5 +350,19 @@ test('#2210: a non-reported record carries the identity it was measured on and t
   assert.equal(reported.identityHash,undefined);assert.equal(reported.at,undefined);
   assert.equal(props,asked,'a rate asks the router nothing');
   assert.equal(await manager.recordEvidence('gone',{category:'vision',result:'passed',value:null,suite:{name:'s',version:1},source:'recheck',limitations:[]}),null,'no identity: not queued');
+ }finally{fs.rmSync(root,{recursive:true,force:true});}
+});
+test('#2215: Node\'s identity for a preset with a draft model is the hash noevia-rs\'s replay case expects',async()=>{
+ const fs=require('node:fs'),os=require('node:os'),path=require('node:path');
+ const root=fs.mkdtempSync(path.join(os.tmpdir(),'noevia-draft-pin-'));
+ try{
+  const models=path.join(root,'models');fs.mkdirSync(path.join(models,'fx'),{recursive:true});
+  // noevia-rs tests/fixtures/model-maint/evidence-cases.json, "a speculative draft model in the preset".
+  for(const [f,n,b] of [['fx.gguf',2048,7],['draft.gguf',512,9]]){fs.writeFileSync(path.join(models,'fx',f),Buffer.alloc(n,b));fs.utimesSync(path.join(models,'fx',f),1700000000,1700000000);}
+  const ini=path.join(root,'models.ini');
+  fs.writeFileSync(ini,'version = 1\n\n[fx]\nmodel = /models/fx/fx.gguf\nctx-size = 8192\nspec-type = draft-simple\nspec-draft-model = /models/fx/draft.gguf\n');
+  const manager=createModelManager({gate:fakeGate(),kind:'llamacpp',baseUrl:'http://127.0.0.1:18517/v1',presetPath:ini,evidenceDir:path.join(root,'evidence-0'),autoconfig:{modelsPath:models},fetchStream:async()=>({ok:false}),
+   fetchJson:async(url)=>{const p=new URL(url).pathname;return {ok:true,status:200,body:p==='/models'?{data:[{id:'fx',status:{value:'unloaded',preset:'p',args:['--model','/models/fx/fx.gguf']}}]}:p==='/props'?{build_info:"b-synthetic"}:{}};}});
+  assert.equal((await manager.evidence('fx')).body.identityHash,'020672eed05cd79afff0a83eb80abfcfb682271e57a2a7585caf35736c02a9d7');
  }finally{fs.rmSync(root,{recursive:true,force:true});}
 });
