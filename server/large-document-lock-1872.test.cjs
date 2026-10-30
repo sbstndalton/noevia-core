@@ -100,68 +100,7 @@ test('#1872: work started inside a holder inherits it unless run through detache
   });
 });
 
-test('#1872: a file listed at 1 MiB but sent at 90 MiB takes the lock before the body; two such reads never overlap', async () => {
-  serve(90 * MiB, 90 * MiB);
-  let active = 0, most = 0, bodies = 0;
-  const one = () => lock.readThenUse(1 * MiB,
-    (beforeBody) => storage.readBinaryFile(conn, 'liar.pdf', { cap: 96 * MiB, beforeBody }),
-    async (bytes) => {
-      bodies++;
-      active++; most = Math.max(most, active);
-      await sleep(30);
-      active--;
-      return bytes.length;
-    });
-  const [a, b] = await Promise.all([one(), one()]);
-  assert.equal(a, 90 * MiB); assert.equal(b, 90 * MiB);
-  assert.equal(bodies, 2);
-  assert.equal(most, 1, 'never two at once');
-  assert.equal(lock.held(), false);
-});
 
-test('#1872: the second large read does not start its body while the first is held', () => withEnv({ LARGE_DOCUMENT_ACQUIRE_WAIT_MS: '5000' }, async () => {
-  let bodyReads = 0;
-  global.fetch = async () => {
-    const body = new ReadableStream({ pull(c) { bodyReads++; c.enqueue(new Uint8Array(MiB)); c.close(); } }, { highWaterMark: 0 });
-    return new Response(body, { headers: { 'content-length': String(30 * MiB) } });
-  };
-  // declared 30 MiB, sends 1 MiB: only the lock decision matters here
-  let letGo;
-  const holder = lock.withLargeDocument(() => new Promise((r) => { letGo = r; }));
-  await sleep(5);
-  const waiting = lock.readThenUse(1 * MiB, (beforeBody) => storage.readBinaryFile(conn, 'x.pdf', { cap: 96 * MiB, beforeBody }), async () => 'read');
-  await sleep(30);
-  assert.equal(bodyReads, 0, 'no body byte was read while another large document held the lock');
-  letGo();
-  await holder;
-  assert.equal(await waiting, 'read');
-}));
-
-test('#1872: a missing Content-Length takes the lock; a small declared one does not', async () => {
-  serve(2 * MiB, null);
-  let heldInside = null;
-  await lock.readThenUse(1 * MiB, (beforeBody) => storage.readBinaryFile(conn, 'chunked.pdf', { cap: 96 * MiB, beforeBody }), async () => { heldInside = lock.held(); });
-  assert.equal(heldInside, true);
-  serve(2 * MiB, 2 * MiB);
-  await lock.readThenUse(1 * MiB, (beforeBody) => storage.readBinaryFile(conn, 'small.pdf', { cap: 96 * MiB, beforeBody }), async () => { heldInside = lock.held(); });
-  assert.equal(heldInside, false);
-});
-
-test('#1872: a read that times out waiting for the lock drops its body and fails busy', () => withEnv({ LARGE_DOCUMENT_ACQUIRE_WAIT_MS: '40' }, async () => {
-  let cancelled = false;
-  global.fetch = async () => new Response(new ReadableStream({ pull(c) { c.enqueue(new Uint8Array(MiB)); }, cancel() { cancelled = true; } }, { highWaterMark: 0 }), { headers: { 'content-length': String(40 * MiB) } });
-  let letGo;
-  const holder = lock.withLargeDocument(() => new Promise((r) => { letGo = r; }));
-  await sleep(5);
-  let used = false;
-  await assert.rejects(
-    lock.readThenUse(1 * MiB, (beforeBody) => storage.readBinaryFile(conn, 'late.pdf', { cap: 96 * MiB, beforeBody }), async () => { used = true; }),
-    (e) => e.status === 503 && /busy/i.test(e.message));
-  assert.equal(used, false);
-  assert.equal(cancelled, true, 'the unread body was cancelled');
-  letGo(); await holder;
-  assert.equal(await lock.withLargeDocument(async () => 'free'), 'free');
-}));
 
 test('#1872: bytes much smaller than the declared size are copied out of the oversized shared buffer', async () => {
   serve(1 * MiB, 30 * MiB);

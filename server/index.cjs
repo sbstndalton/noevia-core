@@ -1118,13 +1118,13 @@ const chatRoutes = require('./routes/chat.cjs').createChatRoutes({
   },
 });
 
-// Projects, sources and uploads (routes/projects.cjs). Background source jobs re-enter the router.
-// #1429: one latch per process, shared by the project source refresh and the Diary backup worker.
+// Project configuration and the Diary context (routes/projects.cjs); uploads, documents and the folder sync are the front's (#2191).
+// #1429: one hold per account, shared with the front's project source refresh and this process's Diary backup worker.
 // sbstndalton/noevia#2190: the Rust front's folder write and connection test prove a saved login
 // through storage-login-proofs.json, re-read when it changes.
-const storageLatch = require('./storage-latch.cjs').createStorageLatch({ proofOf: require('./rust-storage-integrations.cjs').createProofReader(DATA_DIR) });
+// #2191 round 8: the hold is UI_DATA_DIR/storage-latch.db, shared with the front's project source sync.
+const storageLatch = require('./storage-latch.cjs').createStorageLatch({ file: require('node:path').join(DATA_DIR, 'storage-latch.db'), proofOf: require('./rust-storage-integrations.cjs').createProofReader(DATA_DIR) });
 const projectRoutes = require('./routes/projects.cjs').createProjectRoutes({
-  storageLatch,
   json, readBody, readJson, requestScope, dispatch: (req, res) => handleRequestScoped(req, res), currentWorkspace, authService, storageClient, documents, documentSources, rag, fs, path,
   reasoningEffort, projectAppearance, diaryExtras, PROJECTS, DEFAULT_TOOLBOXES, sanitizeToolboxes, allToolboxes, getProvider, ensureRolesLoaded, servedCatalogue, DEFAULT_PROVIDER_ID, store: projectStore,
   onToolboxesChange: () => permittedToolsCache.clear(),
@@ -1292,6 +1292,8 @@ async function handleRequestInner(req, res) {
   if (require('./rust-project-documents.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   // And the background source jobs, whose store the front owns (#2191 round 6).
   if (require('./rust-source-jobs.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
+  // And the project source operations themselves: the upload, the folder sync and the folder import's plan (#2191 round 8).
+  if (require('./rust-project-source-work.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   // And the two read-only sizing reads (#2189): GET /api/models/estimate and /api/models/preset/suggest.
   if (require('./rust-model-sizing.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   // #2190: the public pages and the device approval page, and the plugin directory.

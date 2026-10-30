@@ -8,11 +8,8 @@ const skipWasm = !require('node:fs').existsSync(process.env.DAV_PARSE_WASM || re
 // test reports ok): when the module is there, every guarded body must have run.
 let ran = 0;
 const fs = require('node:fs'), os = require('node:os'), path = require('node:path'), crypto = require('node:crypto');
-const { Readable, } = require('node:stream');
 const { EventEmitter } = require('node:events');
-const { AsyncLocalStorage } = require('node:async_hooks');
 const { applyProjectDocsDefault } = require('./project-docs-default.cjs');
-const { createProjectRoutes } = require('./routes/projects.cjs');
 const { createGoogleDrive } = require('./gdrive.cjs');
 const { createDriveAccounts } = require('./drive-accounts.cjs');
 const { createDriveTools } = require('./gdrive-tools.cjs');
@@ -79,74 +76,8 @@ test('the default toolboxes of a project with an upload include the project edit
   }
 });
 
-function routesFixture(projects) {
-  const dir = temp('noevia-659-routes-');
-  const sent = [];
-  const store = {
-    getProject: (id) => projects.find((p) => p.id === id) || null, saveProjects: () => { store.saves += 1; }, saves: 0,
-    createProject: async () => null, pruneDocuments() {}, sweepDeletedProject() {}, purgeProjectChats() {},
-    withSourceLock: (_p, op) => op(), ensureProjectFolder: async () => null, indexSource() {}, ownsFile: () => false,
-    loadChats: () => [], saveChats() {}, deleteChat: () => false,
-  };
-  const routes = createProjectRoutes({
-    json: (_res, status, body) => { sent.push({ status, body }); },
-    readBody: async (req) => { let s = ''; for await (const c of req) s += c; return s; },
-    readJson: require('./http.cjs').readJson, requestScope: new AsyncLocalStorage(), dispatch: async () => {},
-    currentWorkspace: () => ({ dir, userId: 'u1', ragDir: () => path.join(dir, 'rag'), assetDir: () => path.join(dir, 'assets') }),
-    authService: { diaryEnabled: () => false, getStorage: () => ({ kind: 'local' }) },
-    storageClient: { isBrowsable: () => false, TEXT_EXTENSIONS: new Set(['.md', '.txt']), safeRelativePath: (f) => f },
-    documents: { isDocument: () => false }, documentSources: {}, rag: { deleteProjectFile() {} }, fs, path,
-    reasoningEffort: { validEffort: () => true }, projectAppearance: () => ({}),
-    diaryExtras: { PROJECT_ID: 'diary-extras', chatProjectId: () => null, newProject: () => ({ id: 'diary-extras' }) },
-    PROJECTS: projects, DEFAULT_TOOLBOXES: ['core'], sanitizeToolboxes: (b) => (Array.isArray(b) ? b : null),
-    allToolboxes: () => [{ id: 'core' }, { id: 'project-docs' }], getProvider: () => ({ id: 'default' }), ensureRolesLoaded() {},
-    servedCatalogue: async () => [], DEFAULT_PROVIDER_ID: 'default', store,
-  });
-  const upload = (id, name, text) => {
-    const req = Readable.from([Buffer.from(JSON.stringify({ name, dataBase64: Buffer.from(text).toString('base64') }))]);
-    Object.assign(req, { method: 'POST', url: `/api/projects/${id}/upload`, headers: {}, socket: {} });
-    return routes(req, { writeHead() {}, end() {} }, { path: `/api/projects/${id}/upload`, authn: { user: { id: 'u1', role: 'member' } }, url: new URL(`http://localhost/api/projects/${id}/upload`) });
-  };
-  const sync = (id) => {
-    const req = Readable.from([]);
-    Object.assign(req, { method: 'POST', url: `/api/projects/${id}/sources/sync`, headers: {}, socket: {} });
-    return routes(req, { writeHead() {}, end() {} }, { path: `/api/projects/${id}/sources/sync`, authn: { user: { id: 'u1', role: 'member' } }, url: new URL(`http://localhost/api/projects/${id}/sources/sync`) });
-  };
-  return { upload, sync, sent, store };
-}
-
-test('uploading the first file to a fresh project turns its Project documents box on, and saves it', async () => {
-  const projects = [{ id: 'p1', name: 'Fresh', toolboxes: ['core'], files: [], chats: [] },
-    { id: 'diary-extras', name: 'Diary extras', toolboxes: [], files: [], chats: [] }];
-  const f = routesFixture(projects);
-  await f.upload('p1', 'qa-notes.md', 'Zahl: 1');
-  assert.equal(f.sent.at(-1).status, 200, JSON.stringify(f.sent.at(-1)));
-  assert.deepEqual(projects[0].toolboxes, ['core', 'project-docs']);
-  assert.equal(projects[0].docsToolboxDefaulted, true);
-  assert.ok(f.store.saves >= 1, 'saved with the upload');
-  // The Diary's extras project chooses its tools per session: never changed by an upload.
-  projects[1].toolboxes = ['core'];
-  await f.upload('diary-extras', 'extra.md', 'x');
-  assert.deepEqual(projects[1].toolboxes, ['core']);
-});
-
-test('an existing project that already had uploads keeps its toolboxes after a sync or another upload (#659 review)', async () => {
-  // Uploaded before this change, Project documents never ticked (or unticked on purpose).
-  const projects = [{ id: 'p-old', name: 'Old', toolboxes: ['core'], files: [{ name: 'old.md', content: 'x' }], sourceFolders: [], chats: [] },
-    { id: 'cowork-chat-context-c1', name: 'Chat attachments c1', toolboxes: ['core'], files: [], chats: [] }];
-  const f = routesFixture(projects);
-  await f.sync('p-old');
-  assert.equal(f.sent.at(-1).status, 200, JSON.stringify(f.sent.at(-1)));
-  assert.deepEqual(projects[0].toolboxes, ['core'], 'the automatic sync after deploy changes nothing');
-  await f.upload('p-old', 'more.md', 'y');
-  assert.equal(f.sent.at(-1).status, 200);
-  assert.deepEqual(projects[0].toolboxes, ['core'], 'nor does a later upload');
-  assert.equal(projects[0].docsToolboxDefaulted, undefined);
-  // A free chat's hidden attachments project: its edit tools stay opt-in.
-  await f.upload('cowork-chat-context-c1', 'attached.md', 'z');
-  assert.equal(f.sent.at(-1).status, 200);
-  assert.deepEqual(projects[1].toolboxes, ['core']);
-});
+// The upload and the sync that applied this default through Node's routes are the Rust front's since #2191 round 8; the default
+// itself is applied there (server-projects source_reply, tested in noevia-rs) and the rule is checked above.
 
 // ── (b)-(d) Google Drive writes ───────────────────────────────────────────────────────────
 const key = crypto.randomBytes(32);

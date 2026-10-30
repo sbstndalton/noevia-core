@@ -291,7 +291,7 @@ function createChatHandler({
   // setChatFlags(projectId, chatId, patch), log(entry) }. Not wired or flag off: nothing changes.
   routingModes = null,
   // #1441: how a turn waits for the project's file jobs still running; the wait is bounded.
-  sourceJobs = require('./source-work.cjs'), sourceWaitMs = 30000, visionStageTimeoutMs = 120000,
+  sourceJobs = require('./rust-source-ops.cjs'), sourceWaitMs = 30000, visionStageTimeoutMs = 120000,
   // #1574: how long a local reply may go silent after its first output before it is ended (0 = no limit).
   streamIdleMs = 120000,
   // #1785: { save(projectId|null, chatId, title, firstMessage) } stores a generated title over the derived one only

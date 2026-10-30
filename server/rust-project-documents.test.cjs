@@ -3,7 +3,7 @@
 // project_documents.rs on the Docling pipeline and its durable extraction queue, tested there through
 // real HTTP against synthetic Docling and OCR sidecars: Docling down -> queued -> recovered). Node refuses
 // the POST before authentication, with or without ?background=1, and its handler is gone; uploads
-// (/upload), the folder sync and folder imports still extract here.
+// (/upload), the folder sync and folder imports moved to the front too in round 8 (rust-project-source-work.cjs).
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const os = require('node:os');
@@ -38,11 +38,11 @@ test('an owned request is refused with a 503 before its body is read; the rest f
   assert.equal(refuseOwned({ url: '//[', method: 'POST', headers: {} }, {}, { parseRequestUrl, json }), false);
 });
 
-test('the dead Node handler is gone; the uploads and the sync keep their extraction', () => {
+test('the dead Node handler is gone, and so are the uploads and the sync (round 8)', () => {
   const routes = fs.readFileSync(path.join(__dirname, 'routes', 'projects.cjs'), 'utf8');
   assert.equal(routes.includes('projDocs'), false);
   assert.equal(routes.includes('upload|documents|sources'), false, 'no background wrapper for the documents path');
-  assert.ok(routes.includes('documentSources.ingest('), 'the /upload and sync paths still ingest here');
+  assert.equal(routes.includes('documentSources.ingest('), false, 'no extraction in the project routes any more');
   assert.equal(typeof require('./documents.cjs').extractDocumentText, 'function');
 });
 
@@ -94,6 +94,6 @@ test('through the router: the document upload is refused signed out and signed i
   const users = path.join(dataDir, 'users');
   const documents = fs.existsSync(users) ? fs.readdirSync(users).filter((u) => fs.existsSync(path.join(users, u, 'project-documents'))) : [];
   assert.deepEqual(documents, [], 'no original or result was written');
-  // Positive control: the file upload is still Node's (no such project).
-  assert.equal((await request('/api/projects/p1/upload', { method: 'POST', headers: as(admin), body: {} })).status, 404);
+  // Positive control: the project config is still Node's (no such project).
+  assert.equal((await request('/api/projects/p1/config', { method: 'POST', headers: as(admin), body: {} })).status, 404);
 });

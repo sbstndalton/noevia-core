@@ -13,7 +13,6 @@ const storage = require('./storage-client.cjs');
 const ocr = require('./ocr.cjs');
 const docling = require('./docling.cjs');
 const docx = require('./docx.cjs');
-const pdfReduce = require('./pdf-reduce.cjs');
 const documents = require('./documents.cjs');
 const { uploadInit, isShared } = require('./upload-body.cjs');
 const { sendWithLookup } = require('./public-fetch.cjs');
@@ -109,19 +108,6 @@ test('#1885: Docling ranged upload of a SAB-backed read succeeds with identical 
   } finally { await side.close(); }
 });
 
-test('#1885: DOCX and PDF-reduce uploads accept SAB-backed bytes too', async () => {
-  const side = await fakeSidecar();
-  try {
-    const r = await docx.extract(shared, { url: side.url });
-    assert.equal(r.text, 'SYN-DOCX');
-    // pdf-reduce's reply format is its own; what matters here is that the body got there whole.
-    await pdfReduce.prepare('big.pdf', shared, { url: side.url }).catch(() => {});
-    const hits = side.seen.filter((s) => !s.refused);
-    assert.ok(side.seen.every((s) => !s.refused), 'no upload went without a Content-Length');
-    assert.equal(hits.length, 2, 'both reached their worker');
-    for (const h of hits) assert.equal(h.hash, sha(source));
-  } finally { await side.close(); }
-});
 
 test('#1885: the machine-assigned fetch (sendWithLookup) sends the sized stream with its Content-Length', async () => {
   const side = await fakeSidecar();
