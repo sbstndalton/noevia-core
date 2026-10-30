@@ -169,6 +169,17 @@ function createPresetStore(file,{writer=null,cacheRam=null,backupKeep=BACKUP_KEE
     try{pruneBackups(file,backupKeep);}catch{}
   }
   // Container paths of the files a section loads. Read-only; used for size estimates.
+  // The speculative draft model's file: not an editable option, so parse() does not keep it (#2215).
+  function draftFile(model) {
+    const data=read(),section=data.sections.get(model);
+    if(!section)return null;
+    let file=null;
+    for(const line of data.lines.slice(section.start+1,section.end)){
+      const match=/^\s*spec-draft-model\s*=\s*(.*?)\s*$/.exec(line);
+      if(match&&match[1])file=match[1];
+    }
+    return file;
+  }
   function files(model) {
     const data=read(),section=data.sections.get(model),out={};
     if(!section)return out;
@@ -179,7 +190,7 @@ function createPresetStore(file,{writer=null,cacheRam=null,backupKeep=BACKUP_KEE
     return out;
   }
   const snapshot=()=>{const data=read();return {text:data.text,revision:data.revision};};
-  return {get,prepare,commit,files,snapshot};
+  return {get,prepare,commit,files,draftFile,snapshot};
 }
 // Known option keys under their canonical names (aliases such as LLAMA_ARG_CACHE_RAM or cram
 // folded in); unknown keys are dropped. Later keys win, like the router's last-wins reading.

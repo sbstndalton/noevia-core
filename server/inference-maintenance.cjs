@@ -21,8 +21,18 @@
 // hold back at shutdown (bounded), so a restarted process can take it at once.
 //
 // hold() returns the release function, or (with a remote) a promise of it: callers await it.
-function createMaintenanceGate({ remote = null, log = (line) => console.log(line), setTimer = setInterval, clearTimer = clearInterval, now = () => Date.now(), reprobeMs = 5 * 60 * 1000, retakeWaitMs = 10000 } = {}) {
+function createMaintenanceGate({ remote = null, log = (line) => console.log(line), setTimer = setInterval, clearTimer = clearInterval, now = () => Date.now(), reprobeMs = 5 * 60 * 1000, retakeWaitMs = 10000, observeMs = 0 } = {}) {
   let active=0,maintenance=false,reason='',holdToken=null,shuttingDown=false;
+  // sbstndalton/noevia#2210: a hold another client took at the gate (the Rust front's reload, calibration or
+  // tune) is not in this process's memory. With `observeMs`, the gate is asked its state on that interval
+  // and held() reports it, so the folder sync, the optional chat work and the code machine wait for it.
+  // The last answer stands while the gate does not answer. The hold this process holds itself is not foreign.
+  let foreignHeld=false,generation=0;
+  if(remote&&typeof remote.maintenanceHeld==='function'&&observeMs>0){
+    const poll=async()=>{const started=generation;try{const held=await remote.maintenanceHeld();if(typeof held==='boolean'&&started===generation)foreignHeld=held;}catch{/* the last answer stands */}};
+    const timer=setTimer(poll,observeMs);timer?.unref?.();
+    void poll();
+  }
   // When the remote last answered that it has no hold API (null: never asked, or asked again since).
   let absentAt=null;
   const absent=()=>!remote||(absentAt!==null&&now()-absentAt<reprobeMs);
@@ -35,6 +45,8 @@ function createMaintenanceGate({ remote = null, log = (line) => console.log(line
   // The release of a hold that is now this process's (the gate's token, when there is one).
   function holding(message, granted) {
     maintenance=true;reason=message||'';holdToken=granted?.token||null;
+    // The hold at the gate (if any) is ours now, and an answer asked before this is about someone else's.
+    foreignHeld=false;generation++;
     let released=false,timer=null,renewing=false;
     if(holdToken){
       const every=Math.max(1000,Math.floor((granted.idleTtlMs||60000)/3));
@@ -62,7 +74,7 @@ function createMaintenanceGate({ remote = null, log = (line) => console.log(line
       released=true;
       if(timer)clearTimer(timer);
       const token=holdToken;
-      maintenance=false;reason='';holdToken=null;wake();
+      maintenance=false;reason='';holdToken=null;foreignHeld=false;generation++;wake();
       if(token)void remote.releaseMaintenance(token);
     };
     release.setReason=message=>{
@@ -157,7 +169,7 @@ function createMaintenanceGate({ remote = null, log = (line) => console.log(line
     hold,
     holdWhenIdle,
     // Read-only: whether a calibration, auto-tune model or preset write holds the gate (#872).
-    held: () => maintenance,
+    held: () => maintenance||(foreignHeld&&!holdToken),
     // Read-only: inference requests in flight (#1785: the chat title skips a busy engine).
     active: () => active,
     // #2187: the header this process's requests to the engine carry while it holds the gate's hold.

@@ -451,22 +451,17 @@ function createModelRoutes({ servedEmbeddingModels = (target) => require('../rag
       return json(res,result.status,result.ok?detail:{error:detail.detail||detail.error||'Model management request failed.'});
     }
 
+    // POST /api/models/presets/reload is the Rust front's (#2210, noevia-rs model_maint/reload.rs;
+    // rust-model-maintenance.cjs refuses it before authentication). Node keeps the other methods' answers:
+    // the administrator check, then 405. (reloadPresets stays in the manager for this process's own
+    // reloads: the folder sync, delete, prune, idle-unload.)
     if (p === '/api/models/presets/reload') {
       if(authn.user.role!=='admin')return json(res,403,{error:'Administrator required for shared model profiles'});
-      if(req.method!=='POST')return json(res,405,{error:'Method not allowed'});
-      if(!modelManager.reloadPresets)return json(res,404,{error:'This engine does not use a preset file'});
-      try { const result=await modelManager.reloadPresets({unload:(await readJson(req))?.unload===true}); return json(res,result.status,result.body); }
-      catch(e){ return json(res,e.status||500,{error:e.status===409?'Requests are in progress. Try again when chats finish.':clientMessage(e,'Could not reload model profiles.')}); }
+      return json(res,405,{error:'Method not allowed'});
     }
 
-    if (p === '/api/models/evidence' && req.method === 'GET') {
-      if (!modelManager.evidence) return json(res, 404, { error: 'Qualification evidence needs the native engine' });
-      const model = url.searchParams.get('model') || '';
-      if (!model || model.length > 200) return json(res, 400, { error: 'Choose a model' });
-      const result = await modelManager.evidence(model);
-      res.setHeader('Cache-Control', 'no-store');
-      return json(res, result.status, result.body);
-    }
+    // GET /api/models/evidence is the Rust front's (#2210, noevia-rs model_maint/evidence_live.rs;
+    // rust-model-maintenance.cjs refuses it before authentication).
 
     // Re-run the cheap image probe for one model and record the result. It may load the model.
     if (p === '/api/models/evidence/recheck') {
@@ -480,24 +475,17 @@ function createModelRoutes({ servedEmbeddingModels = (target) => require('../rag
       const provider=getProvider(DEFAULT_PROVIDER_ID);
       const vision=await createVisionProbe()(provider.baseUrl,providerHeaders(provider),model);
       if(!vision.supported&&!/projector|mmproj/i.test(vision.reason||''))return json(res,503,{error:vision.reason||'The engine could not run the image probe.'});
-      await modelManager.recordEvidence(model,{category:'vision',result:vision.supported?'passed':'failed',value:null,suite:{name:'vision-probe',version:1},source:'recheck',limitations:vision.supported?['1×1 image accepted; not an accuracy test']:[String(vision.reason||'').slice(0,200)]});
+      // The front files the record (#2210): wait, bounded, so the answer shows it.
+      const queued=await modelManager.recordEvidence(model,{category:'vision',result:vision.supported?'passed':'failed',value:null,suite:{name:'vision-probe',version:1},source:'recheck',limitations:vision.supported?['1×1 image accepted; not an accuracy test']:[String(vision.reason||'').slice(0,200)]});
+      if(queued)await modelManager.evidenceApplied?.(queued);
       return json(res,200,(await modelManager.evidence(model)).body);
     }
 
-    // Explicit "fetch evidence" action (#266): re-import attributable model-card evidence
-    // for one model from its source. Offline/failed lookups never surface as an error here —
-    // they return the same shape as "nothing to show" — since this must never look like the
-    // model itself is broken.
+    // POST /api/models/evidence/import is the Rust front's (#2210, noevia-rs model_maint/evidence_live.rs;
+    // rust-model-maintenance.cjs refuses it before authentication). Node keeps the other methods' answers.
     if (p === '/api/models/evidence/import') {
       if(authn.user.role!=='admin')return json(res,403,{error:'Administrator required for shared model evidence'});
-      if(req.method!=='POST')return json(res,405,{error:'Method not allowed'});
-      if(!modelManager.importEvidence)return json(res,404,{error:'Model evidence import needs the native engine'});
-      const body=await readJson(req).catch(()=>null);
-      const model=typeof body?.model==='string'?body.model:'';
-      if(!model||model.length>200)return json(res,400,{error:'Choose a model'});
-      const checkpoint=typeof body?.checkpoint==='string'?body.checkpoint:undefined;
-      await modelManager.importEvidence(model,{checkpoint}).catch(()=>null);
-      return json(res,200,(await modelManager.evidence(model)).body);
+      return json(res,405,{error:'Method not allowed'});
     }
 
     if (p === '/api/models/autotune' || p === '/api/models/autotune/cancel' || p === '/api/models/autotune/resume' || p === '/api/models/autotune/clear' || p === '/api/models/autotune/untuned' || p === '/api/models/autotune/settings') {

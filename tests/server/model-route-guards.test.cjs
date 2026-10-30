@@ -82,8 +82,10 @@ test('internal error text is not sent to the client', async (t) => {
   const f = routes({ manager: { reloadPresets: async () => { throw Error('EACCES /secret/models.ini'); } } });
   await f.call('GET', '/api/models/installed');
   assert.deepEqual(f.sent.pop(), { status: 502, body: { error: 'Could not list installed models.' } });
+  // The preset reload's POST is the Rust front's (#2210; its fixed sentence for a failed reload is asserted in
+  // noevia-rs tests/model_reload.rs): a POST that reaches this route does not run the manager at all.
   await f.call('POST', '/api/models/presets/reload', {});
-  assert.deepEqual(f.sent.pop(), { status: 500, body: { error: 'Could not reload model profiles.' } });
+  assert.deepEqual(f.sent.pop(), { status: 405, body: { error: 'Method not allowed' } });
 });
 
 function tuner(t, rows) {

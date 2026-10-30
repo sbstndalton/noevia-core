@@ -1230,6 +1230,11 @@ const toolboxRoutes = require('./routes/toolboxes.cjs').createToolboxRoutes({
   mcp: () => ({ enabled: mcpWiring.enabled(), state: mcpState, servers: MCP_SERVERS, manifest: MCP_TOOLBOX_MANIFEST }),
 });
 
+// With no inference gate, the Rust front's reload holds this process's own maintenance gate (#2210).
+const maintenanceLeases = require('./model-maintenance-lease.cjs').createLeaseRoutes({
+  secret: FRONT_SECRET, json, hold: typeof modelManager.holdMaintenance === 'function' ? () => modelManager.holdMaintenance() : null,
+});
+
 // The headers every page and API reply carries, the refusals answered before authentication too.
 function publicHeaders(res) {
   res.setHeader('X-Content-Type-Options', 'nosniff');
@@ -1245,6 +1250,8 @@ function publicHeaders(res) {
 async function handleRequestInner(req, res) {
   // The ownership refusals below answer before handleRequestScoped; they carry the same headers.
   publicHeaders(res);
+  // The Rust front's maintenance lease on this process's gate (#2210): before everything, and only the front's.
+  if (await maintenanceLeases.handle(req, res)) return;
   // #2191 round 2: a toolbox discovered since the last request reaches the front's next project create
   // (project-catalogue.cjs; written only when it changed).
   projectCatalogue.publish();
@@ -1286,6 +1293,8 @@ async function handleRequestInner(req, res) {
   if (require('./rust-admin-users.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   // And the two read-only sizing reads (#2189): GET /api/models/estimate and /api/models/preset/suggest.
   if (require('./rust-model-sizing.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
+  // And the model maintenance authorities (#2210): POST /api/models/presets/reload.
+  if (require('./rust-model-maintenance.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   // #2190: the public pages and the device approval page, and the plugin directory.
   if (require('./rust-public-pages.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   if (require('./rust-plugin-directory.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;

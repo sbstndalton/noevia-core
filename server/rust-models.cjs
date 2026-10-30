@@ -8,8 +8,7 @@
 //
 // What stays here with the other 20 model routes, and why (each reads this process's memory or job
 // state): /api/model-manager (the folder scan cache), /api/models/autotune* and /calibration* (the
-// job runners, batch M2), /api/models/evidence (the identity cache it fills),
-// /api/models/inference-budget (the budget store, its PUT, the shared installed list),
+// job runners, batch M2), /api/models/inference-budget (the budget store, its PUT, the shared installed list),
 // /api/models/installed (the shared installed list), /api/models/machines (probe and tune caches), the
 // writes, and /api/models/{*}. GET /api/models/estimate and GET /api/models/preset/suggest moved in
 // batch M2-A (#2189): rust-model-sizing.cjs refuses them.

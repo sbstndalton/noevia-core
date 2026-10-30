@@ -136,11 +136,13 @@ test('qualification evidence is tied to the live configuration and goes stale wh
   assert.equal(reported.source,'generation_config.json');
   const plan=(await manager.evidence('fx')).body.samplingPlan;
   assert.equal(plan.tier,'model-card');assert.deepEqual(plan.values,{temperature:0.7,top_p:0.9});assert.equal(plan.provenance.revision,'a'.repeat(40));
-  await manager.recordEvidence('fx',{category:'context_capacity',result:'passed',value:{ctx:8192},suite:{name:'native-calibration',version:1},source:'calibration'});
+  // #2210: the Rust front writes the store (under the live identity); this plays its part.
+  const filed=async(rec)=>require('./evidence.cjs').createStore(ev).append({model:'fx',identityHash:(await manager.evidence('fx')).body.identityHash,...rec});
+  await filed({category:'context_capacity',result:'passed',value:{ctx:8192},suite:{name:'native-calibration',version:1},source:'calibration'});
   const verified=(await manager.evidence('fx')).body.categories.find(c=>c.category==='context_capacity');
   assert.equal(verified.state,'verified');assert.equal(verified.value.ctx,8192);
   assert.deepEqual(verified.limitationKeys,[],'no limitations, no keys');
-  await manager.recordEvidence('fx',{category:'vision',result:'passed',value:null,suite:{name:'vision-probe',version:1},source:'probe',limitations:['1×1 image accepted; not an accuracy test','A new sentence nobody translated']});
+  await filed({category:'vision',result:'passed',value:null,suite:{name:'vision-probe',version:1},source:'probe',limitations:['1×1 image accepted; not an accuracy test','A new sentence nobody translated']});
   const vision=(await manager.evidence('fx')).body.categories.find(c=>c.category==='vision');
   assert.deepEqual(vision.limitations,['1×1 image accepted; not an accuracy test','A new sentence nobody translated'],'the English sentences stay for older clients');
   assert.deepEqual(JSON.parse(JSON.stringify(vision.limitationKeys)),[{id:'vision-probe',params:{}},null],'#598: a stable id beside each known sentence, null for the rest');
@@ -313,4 +315,54 @@ test('noevia#2115: a shutdown gives back the gate leases still held, with the op
  // A gate without the call (a test double) has nothing to give back.
  const bare=createModelManager({gate:fakeGate(),kind:'llamacpp',baseUrl:'http://synthetic',fetchJson:routerFake({},[])});
  assert.equal(await bare.releaseLeases(),0);
+});
+test('#2210: a non-reported record carries the identity it was measured on and the time; a reported one does not',async()=>{
+ const fs=require('node:fs'),os=require('node:os'),path=require('node:path');
+ const root=fs.mkdtempSync(path.join(os.tmpdir(),'noevia-evidence-carry-'));
+ try{
+  const models=path.join(root,'models'),ev=path.join(root,'evidence-0123');fs.mkdirSync(path.join(models,'fx'),{recursive:true});
+  fs.writeFileSync(path.join(models,'fx','fx.gguf'),Buffer.alloc(2048,7));
+  fs.writeFileSync(path.join(models,'fx','draft.gguf'),Buffer.alloc(1024,3));
+  const ini=path.join(root,'models.ini');
+  fs.writeFileSync(ini,'version = 1\n\n[fx]\nmodel = /models/fx/fx.gguf\nspec-type = draft-mtp\nspec-draft-model = /models/fx/draft.gguf\n');
+  let props=0;
+  const manager=createModelManager({gate:fakeGate(),kind:'llamacpp',baseUrl:'http://synthetic-router/v1/',presetPath:ini,evidenceDir:ev,autoconfig:{modelsPath:models},fetchStream:async()=>({ok:false}),
+   fetchJson:async(url)=>{const p=new URL(url).pathname;if(p==='/props')props++;return {ok:true,status:200,body:p==='/models'?{data:[{id:'fx',status:{value:'unloaded',args:[]}}]}:p==='/props'?{build_info:'b-synthetic'}:{}};}});
+  const inboxDir=require('./evidence-inbox.cjs').inboxDirFor(ev);
+  const read=name=>JSON.parse(fs.readFileSync(path.join(inboxDir,name),'utf8'));
+  const before=Date.now();
+  const passed=await manager.recordEvidence('fx',{category:'vision',result:'passed',value:null,suite:{name:'s',version:1},source:'recheck',limitations:[]});
+  const entry=read(passed);
+  assert.equal(entry.identityHash,(await manager.evidence('fx')).body.identityHash);
+  assert.ok(entry.at>=before&&entry.at<=Date.now());
+  // Taken when recorded: a preset change afterwards does not change what the queued entry carries.
+  fs.writeFileSync(ini,'version = 1\n\n[fx]\nmodel = /models/fx/fx.gguf\nspec-type = draft-mtp\nctx-size = 4096\n');
+  const again=read(await manager.recordEvidence('fx',{category:'vision',result:'failed',value:null,suite:{name:'s',version:1},source:'recheck',limitations:[]}));
+  assert.notEqual(again.identityHash,entry.identityHash);
+  assert.equal(read(passed).identityHash,entry.identityHash);
+  // The draft file enters the identity through its own line (#2215).
+  fs.writeFileSync(ini,'version = 1\n\n[fx]\nmodel = /models/fx/fx.gguf\nspec-type = draft-mtp\nspec-draft-model = /models/fx/draft.gguf\n');
+  const drafted=(await manager.evidence('fx')).body.identityHash;
+  fs.writeFileSync(path.join(models,'fx','draft.gguf'),Buffer.alloc(4096,9));
+  assert.notEqual((await manager.evidence('fx')).body.identityHash,drafted,'a replaced draft file is a new identity');
+  const asked=props;
+  const reported=read(await manager.recordEvidence('fx',{category:'throughput',result:'reported',value:{rate:5},suite:{name:'s',version:1},source:'chat',limitations:[]}));
+  assert.equal(reported.identityHash,undefined);assert.equal(reported.at,undefined);
+  assert.equal(props,asked,'a rate asks the router nothing');
+  assert.equal(await manager.recordEvidence('gone',{category:'vision',result:'passed',value:null,suite:{name:'s',version:1},source:'recheck',limitations:[]}),null,'no identity: not queued');
+ }finally{fs.rmSync(root,{recursive:true,force:true});}
+});
+test('#2215: Node\'s identity for a preset with a draft model is the hash noevia-rs\'s replay case expects',async()=>{
+ const fs=require('node:fs'),os=require('node:os'),path=require('node:path');
+ const root=fs.mkdtempSync(path.join(os.tmpdir(),'noevia-draft-pin-'));
+ try{
+  const models=path.join(root,'models');fs.mkdirSync(path.join(models,'fx'),{recursive:true});
+  // noevia-rs tests/fixtures/model-maint/evidence-cases.json, "a speculative draft model in the preset".
+  for(const [f,n,b] of [['fx.gguf',2048,7],['draft.gguf',512,9]]){fs.writeFileSync(path.join(models,'fx',f),Buffer.alloc(n,b));fs.utimesSync(path.join(models,'fx',f),1700000000,1700000000);}
+  const ini=path.join(root,'models.ini');
+  fs.writeFileSync(ini,'version = 1\n\n[fx]\nmodel = /models/fx/fx.gguf\nctx-size = 8192\nspec-type = draft-simple\nspec-draft-model = /models/fx/draft.gguf\n');
+  const manager=createModelManager({gate:fakeGate(),kind:'llamacpp',baseUrl:'http://127.0.0.1:18517/v1',presetPath:ini,evidenceDir:path.join(root,'evidence-0'),autoconfig:{modelsPath:models},fetchStream:async()=>({ok:false}),
+   fetchJson:async(url)=>{const p=new URL(url).pathname;return {ok:true,status:200,body:p==='/models'?{data:[{id:'fx',status:{value:'unloaded',preset:'p',args:['--model','/models/fx/fx.gguf']}}]}:p==='/props'?{build_info:"b-synthetic"}:{}};}});
+  assert.equal((await manager.evidence('fx')).body.identityHash,'020672eed05cd79afff0a83eb80abfcfb682271e57a2a7585caf35736c02a9d7');
+ }finally{fs.rmSync(root,{recursive:true,force:true});}
 });

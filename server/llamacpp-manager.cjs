@@ -82,7 +82,7 @@ function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloa
   const presets=store ? {...store,commit:(candidate,options)=>commitReconciled(store,candidate,options)} : null;
   // #2187: the inference gate is the maintenance authority whenever it is configured (and has the
   // hold API); this process's own gate is the fallback without one (inference-maintenance.cjs).
-  const maintenance=require('./inference-maintenance.cjs').createMaintenanceGate({remote:typeof gateClient.holdMaintenance==='function'&&gateClient.hasAdmin?.()===true?gateClient:null});
+  const maintenance=require('./inference-maintenance.cjs').createMaintenanceGate({remote:typeof gateClient.holdMaintenance==='function'&&gateClient.hasAdmin?.()===true?gateClient:null,observeMs:gate?0:3000});
   holdHeaders=maintenance.holdHeaders;
   // #1012: what the router last read, so a reload can keep loaded models (preset-reload.cjs, #1071: always on).
   const reloadGuard=reloadGuardOption||require('./preset-reload.cjs').createReloadGuard({stateFile:reloadStatePath,log:m=>console.log(m)});
@@ -540,7 +540,9 @@ function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloa
   // Live identity of a model's current configuration (spec-agent-execution §1). Null when
   // the engine or the model file cannot be read: evidence is then `unavailable`.
   const evidenceLib=require('./evidence.cjs');
-  const evidenceStore=evidenceDir?evidenceLib.createStore(evidenceDir):null;
+  // #2210: the Rust front writes the evidence store; this process reads it and queues what its producers record.
+  const evidenceStore=evidenceDir?evidenceLib.createReader(evidenceDir):null;
+  const evidenceInbox=evidenceDir?require('./evidence-inbox.cjs').createInbox({dir:require('./evidence-inbox.cjs').inboxDirFor(evidenceDir)}):null;
   const identityCache=new Map();
   async function evidenceIdentity(model) {
     const hit=identityCache.get(model);
@@ -557,21 +559,27 @@ function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloa
     let build=null;try{const props=await request('/props',{},8000);build=props?.body?.build_info||null;}catch{}
     const profile=presets?presets.get(model):{options:{},defaults:{}};
     const options={...(profile.defaults||{}),...(profile.options||{})};
-    const draft=options['spec-draft-model']?evidenceLib.fileFingerprint(localFile(options['spec-draft-model'])?.file):null;
+    const draftPath=presets?.draftFile?.(model);
+    const draft=draftPath?evidenceLib.fileFingerprint(localFile(draftPath)?.file):null;
     const identity={backend:'llamacpp',build,endpoint:evidenceLib.identityHash(base).slice(0,16),model,artifact,
       projector:files.mmproj?evidenceLib.fileFingerprint(localFile(files.mmproj)?.file):null,preset:evidenceLib.presetHash(options),
       context:{ctx:options['ctx-size']||null,parallel:options.parallel||null,cacheK:options['cache-type-k']||null,cacheV:options['cache-type-v']||null},
       mtp:options['spec-type']?{type:options['spec-type'],draft}:null};
     return {identity,identityHash:evidenceLib.identityHash(identity)};
   }
+  // Queued for the front (the store's one writer); resolves to a handle for evidenceApplied, or null when it
+  // was not queued. Producers are best effort and ignore the result.
+  // A result is true of the configuration it was measured on, so a non-reported record carries that configuration's
+  // identity and the time; the front files it only if the live identity still equals it. A frequent reported rate
+  // is filed under the identity live when it is drained, and asks nothing of the router here.
   async function recordEvidence(model,record){
-    if(!evidenceStore)return null;
-    // Only frequent reported rates may use the cached identity; results right after a
-    // configuration change (calibration) must be filed under the new configuration.
-    const live=record.result==='reported'?await evidenceIdentity(model):await computeIdentity(model);
+    if(!evidenceInbox)return null;
+    if(record?.result==='reported')return evidenceInbox.put({kind:'record',model,record});
+    let live=null;
+    try{live=await computeIdentity(model);}catch(e){console.warn(`[evidence] no identity for a record: ${e?.message||e}`);}
     if(!live)return null;
-    const entry={model,identityHash:live.identityHash,identity:live.identity,...record};
-    return record.result==='reported'&&Number.isFinite(Number(record.value?.rate))?evidenceStore.appendReportedRate(entry):evidenceStore.appendIfChanged(entry);
+    // A /props that failed here is no change of configuration: the front compares without the build.
+    return evidenceInbox.put({kind:'record',model,record,identityHash:live.identityHash,at:Date.now(),...(live.identity.build==null?{buildUnknown:true}:{})});
   }
   async function evidence(model){
     const live=evidenceStore?await computeIdentity(model):null;
@@ -613,21 +621,12 @@ function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloa
     }
     return resolveSampling(model,sampling);
   }
-  // Best-effort import of attributable model-card evidence for one model (#266). The
-  // checkpoint (HF repo) equals the llama.cpp model id for a pulled model; a locally
-  // renamed or non-HF model simply has no importable checkpoint and this resolves to
-  // { ok:false }. An explicit checkpoint override (only reachable from the admin-only
-  // "fetch evidence" route) is rejected unless it names the same repository as the model
-  // itself — see resolveCheckpoint in model-evidence-import.cjs — so an admin cannot
-  // attribute an unrelated repo's card to this model. This resolves failures, it does not
-  // throw for them; but the write it performs (store.append, on a change) can still throw
-  // on credential-shaped content, so every caller here (the download-completed hook and the
-  // explicit route) catches and swallows.
+  // Best-effort import of attributable model-card evidence for one model (#266, #2210): the front fetches the
+  // card and records it (noevia-rs model_maint/evidence_live.rs `import_evidence`); this queues the request.
   async function importEvidence(model,{checkpoint}={}){
-    const importLib=require('./model-evidence-import.cjs');
-    const live=await computeIdentity(model);
-    if(!live)return {ok:false,reason:'model artifact unavailable'};
-    return importLib.importModelEvidence({model,checkpoint,artifact:live.identity.artifact,fetchJson,store:evidenceStore,now:()=>Date.now()});
+    if(!evidenceInbox)return {ok:false,reason:'evidence is not tracked'};
+    const queued=evidenceInbox.put({kind:'import',model,checkpoint:typeof checkpoint==='string'?checkpoint:null});
+    return queued?{ok:true,queued}:{ok:false,reason:'the evidence inbox did not take the request'};
   }
   onDownloadCompleted=evidenceStore?(model=>importEvidence(model).catch(()=>{})):null;
   // Identity for the auto-tune lookup table: architecture, quantisation and hardware class.
@@ -713,6 +712,8 @@ function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloa
     // noevia#1863: the models.ini text the router is known to run on, or null when unknowable.
     async presetsInRouter(){try{const l=await rawModels();return l.ok&&Array.isArray(l.body?.data)?reloadGuard.routerText(l.body.data):null;}catch{return null;}},
     evidence, recordEvidence, importEvidence,
+    // #2210: waits (bounded) until the front has applied a queued record (recordEvidence's handle).
+    evidenceApplied: (handle,options)=>evidenceInbox?evidenceInbox.applied(handle,options):Promise.resolve(true),
     calibration: calibrator ? { start: calibrator.start, cancel: calibrator.cancel, status: calibrator.status, recover: calibrator.recover } : null,
     autotune: autotuner ? { start: (...args) => { const fault = budgetFaultReason(); return fault ? Promise.resolve({ ok: false, status: 503, body: budgetFaultBody('Auto-tune unavailable', fault) }) : autotuner.start(...args); }, resume: autotuner.resume, cancel: autotuner.cancel, clear: autotuner.clear, status: autotuner.status, setSettings: autotuner.setSettings, recover: autotuner.recover, untuned: autotuner.untuned } : null,
     // noevia#2115: the gate refuses to unload a model in use (409 `model_in_use`); `unloadAnyway` is the

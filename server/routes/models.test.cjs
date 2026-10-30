@@ -347,12 +347,16 @@ test('any write under /api/models/ drops the scan, and pull/delete/load keep the
 
 test('engine-specific routes say what is unavailable and guard the method', async () => {
   const f = fixture();
+  // POST /api/models/presets/reload is the Rust front's (#2210; rust-model-maintenance.cjs refuses it before
+  // authentication). A POST that reaches this route anyway gets the administrator check and a 405, not a reload.
   await f.call('POST', '/api/models/presets/reload', {}, 'admin');
-  assert.deepEqual(f.sent.pop(), { status: 404, body: { error: 'This engine does not use a preset file' } });
+  assert.deepEqual(f.sent.pop(), { status: 405, body: { error: 'Method not allowed' } });
+  await f.call('POST', '/api/models/presets/reload', {}, 'member');
+  assert.deepEqual(f.sent.pop(), { status: 403, body: { error: 'administrator required' } });
   await f.call('GET', '/api/models/presets/reload', undefined, 'admin');
   assert.deepEqual(f.sent.pop(), { status: 405, body: { error: 'Method not allowed' } });
-  await f.call('GET', '/api/models/evidence', undefined, 'member', '?model=m');
-  assert.deepEqual(f.sent.pop(), { status: 404, body: { error: 'Qualification evidence needs the native engine' } });
+  await f.call('GET', '/api/models/presets/reload', undefined, 'member');
+  assert.deepEqual(f.sent.pop(), { status: 403, body: { error: 'Administrator required for shared model profiles' } });
   await f.call('GET', '/api/models/autotune', undefined, 'admin');
   assert.deepEqual(f.sent.pop(), { status: 404, body: { error: 'Auto-tune is unavailable' } });
   await f.call('GET', '/api/models/preset', undefined, 'member');
@@ -671,38 +675,16 @@ test('GET of the estimate and the suggestion is the Rust front\'s; their other m
   assert.deepEqual(seen, [], 'no manager sizing call is left in the route');
 });
 
-test('evidence import (#266) is admin-only, validates the model, and always reports current evidence back', async () => {
+test('evidence import (#266, #2210) is the Rust front\'s: a POST that reaches this route is not imported', async () => {
   const calls = [];
-  const f = fixture({
-    manager: {
-      importEvidence: async (model, opts) => { calls.push([model, opts]); return { ok: true }; },
-      evidence: async (model) => ({ status: 200, body: { model, external: { category: 'external_model_card', state: 'reported' } } }),
-    },
-  });
+  const f = fixture({ manager: { importEvidence: async (model, opts) => { calls.push([model, opts]); return { ok: true }; }, evidence: async (model) => ({ status: 200, body: { model } }) } });
   await f.call('POST', '/api/models/evidence/import', { model: 'm' }, 'member');
   assert.deepEqual(f.sent.pop(), { status: 403, body: { error: 'administrator required' } });
   await f.call('GET', '/api/models/evidence/import', { model: 'm' }, 'admin');
   assert.deepEqual(f.sent.pop(), { status: 405, body: { error: 'Method not allowed' } });
-  await f.call('POST', '/api/models/evidence/import', {}, 'admin');
-  assert.deepEqual(f.sent.pop(), { status: 400, body: { error: 'Choose a model' } });
-  await f.call('POST', '/api/models/evidence/import', { model: 'm', checkpoint: 'acme/model-7b' }, 'admin');
-  assert.deepEqual(f.sent.pop(), { status: 200, body: { model: 'm', external: { category: 'external_model_card', state: 'reported' } } });
-  assert.deepEqual(calls, [['m', { checkpoint: 'acme/model-7b' }]]);
-
-  const none = fixture();
-  await none.call('POST', '/api/models/evidence/import', { model: 'm' }, 'admin');
-  assert.deepEqual(none.sent.pop(), { status: 404, body: { error: 'Model evidence import needs the native engine' } });
-});
-
-test('evidence import never throws through the route when the source lookup fails', async () => {
-  const f = fixture({
-    manager: {
-      importEvidence: async () => { throw Error('source unavailable'); },
-      evidence: async (model) => ({ status: 200, body: { model, external: { state: 'unavailable' } } }),
-    },
-  });
   await f.call('POST', '/api/models/evidence/import', { model: 'm' }, 'admin');
-  assert.deepEqual(f.sent.pop(), { status: 200, body: { model: 'm', external: { state: 'unavailable' } } });
+  assert.deepEqual(f.sent.pop(), { status: 405, body: { error: 'Method not allowed' } });
+  assert.deepEqual(calls, [], 'the front does the import, not this route');
 });
 
 test('#548: load and unload refuse Laya and the in-use sidecar models with 409 and never reach the engine', async () => {
@@ -1026,4 +1008,40 @@ test('a model or role write drops the shared reads before it and again once its 
   f.response().emit('finish');
   f.response().emit('close');
   assert.equal(f.invalidations.length, 4, 'a read changes nothing');
+});
+
+test('#2210: the recheck waits for the front to apply its record, so the answer shows the new state', async () => {
+  const fs = require('node:fs'), os = require('node:os'), path = require('node:path');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'noevia-recheck-'));
+  try {
+    const { createInbox } = require('../evidence-inbox.cjs');
+    const inbox = createInbox({ dir });
+    let state = 'old';
+    const f = fixture({ manager: {
+      recordEvidence: async (model, record) => inbox.put({ kind: 'record', model, record }),
+      evidenceApplied: (handle) => inbox.applied(handle, { timeoutMs: 3000, stepMs: 10 }),
+      evidence: async () => ({ ok: true, status: 200, body: { state } }),
+    } });
+    // The fake front: takes the entry about 100 ms later.
+    const front = setTimeout(() => {
+      const [name] = fs.readdirSync(dir).filter((n) => n.endsWith('.json'));
+      state = 'verified';
+      fs.rmSync(path.join(dir, name));
+    }, 100);
+    await f.call('POST', '/api/models/evidence/recheck', { model: 'm', category: 'vision' }, 'admin');
+    clearTimeout(front);
+    assert.deepEqual(f.sent.pop(), { status: 200, body: { state: 'verified' } });
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('#2210: a front that does not apply the record bounds the recheck, and the answer is the state as it stands', async () => {
+  const applied = [];
+  const f = fixture({ manager: {
+    recordEvidence: async () => 'handle',
+    evidenceApplied: async (handle) => { applied.push(handle); return false; },
+    evidence: async () => ({ ok: true, status: 200, body: { state: 'old' } }),
+  } });
+  await f.call('POST', '/api/models/evidence/recheck', { model: 'm', category: 'vision' }, 'admin');
+  assert.deepEqual(applied, ['handle']);
+  assert.deepEqual(f.sent.pop(), { status: 200, body: { state: 'old' } });
 });
