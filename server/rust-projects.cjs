@@ -51,8 +51,9 @@
 // not merged: the other side's value is taken (refresh) or replaced (save), as before.
 // A chat's delete is the store's operation (#1071 slice 6): it also removes the chat's transcript,
 // context meter, brain note and partial reply under the transcript lock. The attachments project
-// (a whole project delete, with its RAG index and storage sweep) stays Node's: the orphan reaper
-// (projects.cjs removeOrphanChatContexts) frees it once the chat is tombstoned and in no list.
+// (a whole project delete, with its RAG index and storage sweep) is freed by the orphan reaper, which is the
+// Rust front's workspace list since the #2191 close-out (noevia-rs crates/server-projects workspace.rs
+// reap_orphan_contexts), once the chat is tombstoned and in no list.
 //
 // Chat attachments context (GET/POST /api/chats/{chatId}/context) is also permanently
 // Rust-owned after its verified live rollout (#1264, #1071). Node's copies and both

@@ -65,8 +65,8 @@ test('with the feature off, the approval page is 404 and the device endpoints ar
     assert.equal(JSON.parse(page.text).code, 'RUST_PUBLIC_PAGES_OWNED');
   }
   // A device-shaped bearer means nothing; cookie sessions and CSRF behave exactly as before.
-  assert.equal((await request('/api/workspace', { headers: { authorization: 'Bearer nva_synthetic' } })).status, 401);
-  const both = await request('/api/workspace', { headers: { authorization: 'Bearer nva_synthetic', cookie } });
+  assert.equal((await request('/api/chats/search', { headers: { authorization: 'Bearer nva_synthetic' } })).status, 401);
+  const both = await request('/api/chats/search', { headers: { authorization: 'Bearer nva_synthetic', cookie } });
   assert.equal(both.status, 200, 'with the feature off, a bearer beside a cookie is ignored as before');
   assert.equal((await request('/api/workspace/model', { method: 'PUT', body: {}, headers: { cookie, origin: 'http://localhost', 'content-type': 'application/json' } })).status, 403, 'CSRF still required');
   // The flag list is the Rust front's: Node refuses the read (503), so the OFF default is asserted against

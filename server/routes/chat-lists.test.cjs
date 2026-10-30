@@ -49,16 +49,12 @@ function fixture() {
   return { call, routes, sent, removed, projects, freeChats, histories, store, dir, storeCalls, stored, headers, setTranscripts: (t) => { transcripts = t; } };
 }
 
-test('the workspace view hides the internal project and sanitizes chat metas', async () => {
+// GET /api/workspace is the Rust front's (#2191 close-out; noevia-rs tests/workspace.rs holds the view, the
+// retention sweep and the orphan cleanup): this mount no longer has it, and index.cjs refuses it first.
+test('the workspace list is not this mount\'s any more (#2191)', async () => {
   const f = fixture();
-  assert.equal(await f.call('GET', '/api/workspace/x'), false);
-  assert.equal(await f.call('GET', '/api/workspace'), true);
-  const { status, body } = f.sent.pop();
-  assert.equal(status, 200);
-  assert.deepEqual(body.projects.map((p) => p.id), ['p1']);
-  assert.deepEqual(body.projects[0].chats, [{ id: 'c1' }]);
-  assert.deepEqual(body.freeChats, [{ id: 'f1', title: 'Free' }]);
-  assert.equal(f.projects[0].chats.length, 2, 'the stored list is left alone');
+  for (const p of ['/api/workspace', '/api/workspace/x']) assert.equal(await f.call('GET', p), false, p);
+  assert.equal(f.sent.length, 0);
 });
 
 // GET and POST /api/freechats are the Rust front's (#1071): this mount no longer has them, and
