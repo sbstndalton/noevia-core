@@ -106,3 +106,28 @@ test('a failing tool keeps its public words and hides the rest; a caller going a
 test('Kiwix keeps the page cleaner research used to lend it', () => {
   assert.equal(stripBoilerplate('<nav>x</nav><h2>Title</h2><p>Body &amp; more</p>\nCookie settings'), '## Title\nBody & more');
 });
+
+// H1 of the #2218 review: index.cjs read process.env.NOEVIA_PROJECT_STORE_TOKEN after clientFromEnv had deleted it
+// (#1916), so the lease and the bridge were built with an empty secret and every call was a 404. The tests above pass
+// a secret in by hand, which is how that slipped through; these read the wiring itself.
+test('index.cjs hands the lease and the bridge the secret it took before clientFromEnv deleted it', () => {
+  const index = fs.readFileSync(path.join(__dirname, 'index.cjs'), 'utf8');
+  const taken = index.indexOf("const FRONT_SECRET = String(process.env.NOEVIA_PROJECT_STORE_TOKEN || '');");
+  const deleted = index.indexOf('clientFromEnv(process.env)');
+  assert.ok(taken > 0 && deleted > 0 && taken < deleted, 'the secret is taken before clientFromEnv removes it from process.env');
+  assert.equal(index.slice(deleted).includes('process.env.NOEVIA_PROJECT_STORE_TOKEN'), false, 'nothing reads the deleted variable afterwards');
+  for (const ctor of ["require('./inference-admission-lease.cjs').createAdmissionRoutes({", "require('./rust-research-bridge.cjs').createResearchBridge({"]) {
+    const at = index.indexOf(ctor);
+    assert.ok(at > deleted, ctor);
+    assert.match(index.slice(at, at + 200), /secret: FRONT_SECRET\b/, `${ctor} gets the captured secret`);
+  }
+  assert.match(index, /if \(await inferenceAdmission\.handle\(req, res\)\) return;/);
+  assert.match(index, /if \(await researchBridge\(req, res\)\) return;/);
+});
+
+test('clientFromEnv takes the token out of the environment, so a later read finds nothing (the thing H1 relied on)', () => {
+  const { clientFromEnv } = require('./project-store-client.cjs');
+  const env = { NOEVIA_PROJECT_STORE_PORT: '1', NOEVIA_PROJECT_STORE_TOKEN: SECRET };
+  clientFromEnv(env);
+  assert.equal(env.NOEVIA_PROJECT_STORE_TOKEN, undefined);
+});
