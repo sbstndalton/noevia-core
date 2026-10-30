@@ -14,7 +14,7 @@
 // migrator) and read here on every call, but since sbstndalton/noevia#2190 round 7 the Rust front is
 // its only WRITER (Settings -> Connectors, bins/noevia-server connector_routes.rs; Node's database
 // guard refuses every write, rust-auth.cjs FRONT_TABLES). The Nextcloud permissions, which need the
-// live MCP tools, are written by the front on Node's behalf (project-store-client.cjs toolPolicySet).
+// live MCP tools, are written by the front itself (rust-connectors.cjs: PUT /api/connectors/nextcloud/policy).
 // Fails closed: a fault in mode() answers `block` (never weaker than the old JS: the port also
 // reads an unknown stored mode as `block`). The JS reference is tests/server/oracle/tool-policy.cjs
 // (tests only).
@@ -40,18 +40,7 @@ function createToolPolicy({ db, wasmLoader = () => require('./dav-parse-wasm.cjs
     }
   }
 
-  /**
-   * A fingerprint of every stored permission (a digest of the rows in key order): it changes in the same
-   * statement as any write, whoever made it. Node's permitted-tools cache re-reads by it (shared-reread.cjs),
-   * since the writer is the Rust front and no Node code path clears the cache for its writes.
-   */
-  function fingerprint() {
-    const h = require('node:crypto').createHash('sha256');
-    for (const r of db.prepare('SELECT user_id, tool, mode, updated_at FROM tool_policies ORDER BY user_id, tool').iterate()) h.update(`${r.user_id}\0${r.tool}\0${r.mode}\0${r.updated_at}\n`);
-    return h.digest('hex');
-  }
-
-  return { mode, stored, fingerprint };
+  return { mode, stored };
 }
 
 module.exports = { createToolPolicy };

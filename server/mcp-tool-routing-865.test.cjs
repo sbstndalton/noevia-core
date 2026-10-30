@@ -50,7 +50,7 @@ async function setup({ withDirectory = true, withInternal = false } = {}) {
     manifest: [{ id: 'nc-files', label: 'Files', server: 'nc', tools: ['search_files', 'nc_only'], reads: ['search_files', 'nc_only'] }],
     mcp, bindBoxes,
     directoryMcp: {
-      asServers: () => directoryServers,
+      signal: () => 0, asServers: () => directoryServers,
       boxFor: (server, names) => ({ id: server.id, server: server.id, label: server.title, directory: true, description: 'synthetic', tools: [...names] }),
       headersFor: () => ({ 'X-Key': 'directory-key' }), userHeadersFor: () => ({}), hasUserKey: () => false,
     },

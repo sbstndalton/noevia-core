@@ -7,10 +7,11 @@
 // tool_policies. Node answered exactly these methods on these paths, so only they are refused here,
 // before authentication: a stale route table cannot make two processes answer.
 //
-// What stays Node's: GET /api/connectors and PUT /api/connectors/nextcloud/policy. The Nextcloud half
-// lists the toolbox tools the live MCP servers offer and whether each writes, state only this chat
-// process has. Node asks the broker for the Google Drive half (gdrive-broker.cjs `view`) and, for the
-// Nextcloud permissions, for the one write of tool_policies (project-store-client.cjs toolPolicySet).
+// GET /api/connectors and PUT /api/connectors/nextcloud/policy followed in sbstndalton/noevia#2202 round 2
+// (rust-connectors.cjs): the Nextcloud half lists the toolbox tools the live MCP servers offer and whether each
+// writes, which this process publishes for the front (mcp-discovery-snapshot.cjs). The store calls it used to make
+// for that page (`gdriveView`, `toolPolicySet`) are gone from the client; the front's `/v1/gdrive/view` and
+// `/v1/gdrive/policy` ops stay served for the old Core of a rollback pair.
 //
 // Node's chat tools hold no refresh token: they ask the broker for a short-lived access token over the
 // internal store (gdrive-broker.cjs) and re-ask when the broker's state file moves. This file names

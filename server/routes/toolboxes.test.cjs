@@ -66,105 +66,11 @@ test('other paths and methods are left alone or refused', async () => {
   assert.equal(f.discoveries(), 0);
 });
 
-// ── #237: GET /api/toolboxes/permitted ──
-function permittedFixture({ cache, cacheKeyExtra } = {}) {
-  const sent = [], calls = [];
-  let mode0 = 'ask';
-  // Two tenants: each account sees only its own project, as the real getProject does.
-  const projects = { 'u-a': { pa: { id: 'pa' } }, 'u-b': { pb: { id: 'pb' } } };
-  const routes = createToolboxRoutes({
-    discoverMcpTools: async () => {}, toolboxSummaries: () => [], prefill: { targetMs: 1, stats: () => ({}) },
-    mcp: () => ({ enabled: false }), json: (res, status, body) => { sent.push({ status, body }); return true; }, ...(cache ? { cache } : {}), ...(cacheKeyExtra ? { cacheKeyExtra } : {}),
-    permitted: ({ authn, projectId, mode }) => {
-      calls.push({ user: authn.user.id, projectId, mode });
-      const project = projectId ? projects[authn.user.id][projectId] : null;
-      if (projectId && !project) return null;
-      return { project, boxes: [{ id: 'core', owner: authn.user.id, mode, policy: mode0 }] };
-    },
-  });
-  const get = (user, query = '') => routes({ method: 'GET' }, {}, { path: '/api/toolboxes/permitted', authn: { user }, url: new URL(`http://x/api/toolboxes/permitted${query}`) });
-  return { get, sent, calls, setPolicy: (v) => { mode0 = v; } };
-}
-const A = { id: 'u-a', role: 'member' }, B = { id: 'u-b', role: 'admin' };
-
-test('permitted tools are computed per account and never served from another account\'s cache', async () => {
-  const f = permittedFixture();
-  await f.get(A, '?projectId=pa&mode=chat');
-  await f.get(B, '?mode=chat');
-  assert.equal(f.sent[0].body.boxes[0].owner, 'u-a');
-  assert.equal(f.sent[1].body.boxes[0].owner, 'u-b');
-  assert.equal(f.calls.length, 2);
-});
-
-test('another tenant\'s project is a 404, not an empty catalogue', async () => {
-  const f = permittedFixture();
-  await f.get(A, '?projectId=pb');
-  assert.equal(f.sent[0].status, 404);
-});
-
-test('the view is cached per account/project/mode and a mode change recomputes', async () => {
-  const f = permittedFixture();
-  await f.get(A, '?projectId=pa&mode=chat');
-  await f.get(A, '?projectId=pa&mode=chat');
-  assert.equal(f.calls.length, 1, 'a repeat inside the TTL is served from cache');
-  await f.get(A, '?projectId=pa&mode=cowork');
-  assert.equal(f.calls.length, 2);
-  assert.equal(f.sent[2].body.mode, 'cowork');
-});
-
-test('an unknown mode is refused', async () => {
-  const f = permittedFixture();
-  await f.get(A, '?mode=code');
-  assert.equal(f.sent[0].status, 400);
-});
-
-test('#796: clearing the shared cache (what a policy or toolbox save does) shows the new permission at once', async () => {
-  const cache = require('../toolboxes-permitted.cjs').createTtlCache({ ttlMs: 30000 });
-  const f = permittedFixture({ cache });
-  await f.get(A, '?projectId=pa&mode=chat');
-  f.setPolicy('block');
-  await f.get(A, '?projectId=pa&mode=chat');
-  assert.equal(f.sent[1].body.boxes[0].policy, 'ask', 'without invalidation the old view is served for the TTL');
-  cache.clear();
-  await f.get(A, '?projectId=pa&mode=chat');
-  assert.equal(f.sent[2].body.boxes[0].policy, 'block');
-  assert.equal(f.calls.length, 2);
-});
-
-test('M3: a Diary preference written elsewhere (the Rust front) shows at once: it is part of the cache key', async () => {
-  let diary = false;
-  const f = permittedFixture({ cacheKeyExtra: () => diary });
-  await f.get(A, '?projectId=pa&mode=chat');
-  await f.get(A, '?projectId=pa&mode=chat');
-  assert.equal(f.calls.length, 1);
-  diary = true;
-  await f.get(A, '?projectId=pa&mode=chat');
-  assert.equal(f.calls.length, 2, 'a changed preference is not served from the old entry');
-});
-
-test('#2202: the key is given the project asked about, so a project edit made by the Rust front shows at once', async () => {
-  const projects = { pa: ['search'], pb: ['search'] };
-  const seen = [];
-  const f = permittedFixture({ cacheKeyExtra: (authn, projectId) => { seen.push([authn.user.id, projectId]); return projects[projectId] ?? null; } });
-  await f.get(A, '?projectId=pa&mode=chat');
-  await f.get(A, '?projectId=pa&mode=chat');
-  assert.equal(f.calls.length, 1);
-  assert.deepEqual(seen.at(-1), [A.id, 'pa']);
-  projects.pa = ['search', 'files']; // PUT /api/projects/pa is the front's: nothing here cleared the cache
-  await f.get(A, '?projectId=pa&mode=chat');
-  assert.equal(f.calls.length, 2, 'the project\'s new toolboxes are not served from the old entry');
-  await f.get(A, '?projectId=pb&mode=chat');
-  assert.equal(f.calls.length, 3, 'another project is another entry');
-  await f.get(A, '?mode=chat');
-  assert.deepEqual(seen.at(-1), [A.id, null], 'a project-less view asks with no project');
-});
-
-test('#2202: index.cjs keys the view on the project\'s selection, the connected connectors and the MCP readiness', () => {
-  const index = require('node:fs').readFileSync(require('node:path').join(__dirname, '..', 'index.cjs'), 'utf8');
-  const at = index.indexOf('cacheKeyExtra: (authn, projectId) => {');
-  assert.ok(at > 0);
-  const body = index.slice(at, index.indexOf('},\n', at));
-  for (const needle of ['authService.diaryEnabled(authn.user.id)', 'connectedBoxes(authn.user)', 'mcpCredentials.signal()', 'mcpState.discoveredAt', 'project.toolsMode', 'project.docsToolboxDefaulted', 'project.toolboxes', 'getProject(projectId)']) {
-    assert.ok(body.includes(needle), needle);
-  }
+// GET /api/toolboxes/permitted is the Rust front's (sbstndalton/noevia#2202 round 2): this route leaves it alone, and
+// the refusal of it (rust-toolboxes-permitted.cjs) is tested with the other refusals.
+test('the permitted view is not this route\'s: it is left alone', async () => {
+  const f = fixture();
+  assert.equal(await f.routes({ method: 'GET' }, {}, { path: '/api/toolboxes/permitted', authn: { user: { id: 'u' } } }), false);
+  assert.equal(f.sent.length, 0);
+  assert.equal(f.discoveries(), 0);
 });

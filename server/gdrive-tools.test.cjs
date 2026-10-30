@@ -82,16 +82,14 @@ test('policy: reads default to allow, writes to ask, and the table is read here 
   assert.equal(policy.mode('u1', 'read_a', false), 'allow');
   assert.equal(policy.mode('u1', 'write_a', true), 'ask');
   assert.equal(typeof policy.set, 'undefined', 'Node has no writer left');
-  const empty = policy.fingerprint();
   put('u1', 'read_a', 'ask');
   assert.equal(policy.mode('u1', 'read_a', false), 'ask', 'a write by another process is seen at once');
   assert.equal(policy.mode('u2', 'read_a', false), 'allow', 'one account\'s choice never applies to another');
-  assert.notEqual(policy.fingerprint(), empty, 'and moves the content fingerprint');
-  const one = policy.fingerprint();
+  assert.equal(typeof policy.fingerprint, 'undefined', 'the permitted view is the front\'s now: nothing here watches the table');
   put('u1', 'read_a', 'block', 2);
-  assert.notEqual(policy.fingerprint(), one);
+  assert.equal(policy.mode('u1', 'read_a', false), 'block');
   put('u1', 'read_a', 'ask', 1);
-  assert.equal(policy.fingerprint(), one, 'the fingerprint is of the content, not a counter');
+  assert.equal(policy.mode('u1', 'read_a', false), 'ask');
   put('u1', 'write_a', 'block');
   assert.equal(policy.mode('u1', 'write_a', true), 'block');
   // A write stored as allow before it became a write asks; an unknown stored mode blocks.

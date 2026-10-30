@@ -82,10 +82,11 @@ test('rotate re-encrypts every stored kind, upgrades plaintext, counts failures,
   raw.prepare('INSERT INTO mcp_oauth_tokens VALUES(?,?,?,?)').run(U2, 'srv', 'enc:v2:garbage', 0);
   raw.prepare('INSERT INTO mcp_oauth_clients VALUES(?,?,?)').run('srv', old.encrypt(JSON.stringify({ clientId: 'c' })), 0);
   raw.prepare('INSERT INTO directory_mcp_user_keys VALUES(?,?,?,?)').run(U1, 'dir-x', old.encrypt(JSON.stringify({ Authorization: 'mine' })), 0);
-  const mcpRows = () => ['SELECT * FROM mcp_oauth_tokens ORDER BY user_id', 'SELECT * FROM mcp_oauth_clients', 'SELECT * FROM directory_mcp_user_keys'].map((q) => JSON.stringify(raw.prepare(q).all()));
-  const mcpBefore = mcpRows();
-  db.prepare(`INSERT INTO directory_mcp_servers(id, registry_name, title, url, added_by, added_at, headers_enc) VALUES(?,?,?,?,?,?,?)`)
+  // The administrator's shared key sits in the directory row, which is the front's too (#2202 round 2).
+  raw.prepare(`INSERT INTO directory_mcp_servers(id, registry_name, title, url, added_by, added_at, headers_enc) VALUES(?,?,?,?,?,?,?)`)
     .run('dir-x', 'x', 'X', 'https://mcp.example.test', U1, 0, old.encrypt(JSON.stringify({ Authorization: 'shared' })));
+  const mcpRows = () => ['SELECT * FROM mcp_oauth_tokens ORDER BY user_id', 'SELECT * FROM mcp_oauth_clients', 'SELECT * FROM directory_mcp_user_keys', 'SELECT * FROM directory_mcp_servers'].map((q) => JSON.stringify(raw.prepare(q).all()));
+  const mcpBefore = mcpRows();
   fs.writeFileSync(path.join(root, 'shared-providers.json'), JSON.stringify({ providers: [{ id: 'p', apiKey: old.encrypt('shared-key') }, { id: 'q', apiKey: 'plain-shared' }] }));
   fs.mkdirSync(path.join(root, 'users', U1), { recursive: true });
   fs.writeFileSync(path.join(root, 'users', U1, 'providers.json'), JSON.stringify({ providers: [{ id: 'mine', apiKey: old.encrypt('private-key') }] }));
@@ -109,6 +110,7 @@ test('rotate re-encrypts every stored kind, upgrades plaintext, counts failures,
       mcp_oauth_tokens: { current: current ? 1 : 0, rotated: current ? 0 : 1, upgraded: 0, empty: 0, failed: 1 },
       mcp_oauth_clients: { current: current ? 1 : 0, rotated: current ? 0 : 1, upgraded: 0, empty: 0, failed: 0 },
       directory_mcp_user_keys: { current: current ? 1 : 0, rotated: current ? 0 : 1, upgraded: 0, empty: 0, failed: 0 },
+      directory_mcp_servers: { current: current ? 1 : 0, rotated: current ? 0 : 1, upgraded: 0, empty: 0, failed: 0 },
     },
     failures: [{ table: 'mcp_oauth_tokens', ref: [U2, 'srv'], error: 'credential could not be opened' }],
   });
@@ -117,12 +119,13 @@ test('rotate re-encrypts every stored kind, upgrades plaintext, counts failures,
   const secrets = createSecretStore(root, noPrev);
   const audits = [];
   const report = await runRotation({ secrets, db, dataDir: root, actorId: U1, audit: (...a) => audits.push(a), resealProviders: front(), resealMcp: mcp() });
-  // This process re-sealed storage (2) and the shared server key (1); the front's two passes brought the rest.
+  // This process re-sealed storage (2); the front's two passes brought the rest (including the shared server key).
   assert.deepEqual(report.totals, { current: 0, rotated: 7, upgraded: 2, empty: 0, failed: 1 });
   assert.equal(report.failures[0].table, 'mcp_oauth_tokens');
   assert.deepEqual(report.failures[0].ref, [U2, 'srv']);
   assert.equal(report.tables.directory_mcp_user_keys.rotated, 1);
-  assert.deepEqual(mcpRows(), mcpBefore, 'this process wrote none of the three MCP credential tables');
+  assert.equal(report.tables.directory_mcp_servers.rotated, 1, 'the shared key is re-sealed by the front now');
+  assert.deepEqual(mcpRows(), mcpBefore, 'this process wrote none of the four MCP tables');
   assert.deepEqual(report.tables.shared_providers, { current: 0, rotated: 1, upgraded: 1, empty: 0, failed: 0 });
   assert.equal(audits[0][0], 'secrets.rotate');
   assert.deepEqual(providerBytes(), providersBefore, 'this process wrote neither provider file');
@@ -134,7 +137,7 @@ test('rotate re-encrypts every stored kind, upgrades plaintext, counts failures,
   assert.equal(only.decrypt(val('SELECT secret v FROM storage_connections WHERE user_id=?', U1), U1), 'storage-one');
   assert.match(val('SELECT secret v FROM storage_connections WHERE user_id=?', U2), /^enc:v2:/);
   assert.equal(only.decrypt(val('SELECT secret v FROM storage_connections WHERE user_id=?', U2), U2), 'plain-storage-two');
-  assert.equal(JSON.parse(only.decrypt(val('SELECT headers_enc v FROM directory_mcp_servers WHERE id=?', 'dir-x'))).Authorization, 'shared');
+  assert.equal(val('SELECT count(*) v FROM storage_connections'), 2);
 
   const again = await runRotation({ secrets: only, db, dataDir: root, resealProviders: front(true), resealMcp: mcp(true) });
   assert.deepEqual(again.totals, { current: 9, rotated: 0, upgraded: 0, empty: 0, failed: 1 });

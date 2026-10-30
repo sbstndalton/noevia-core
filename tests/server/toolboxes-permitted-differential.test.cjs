@@ -83,9 +83,9 @@ test('fixture rows: the exact reply', { skip: skipWasm }, () => {
   }
 });
 
-test('frozen inputs: the functions give what the live composition gave, and never more than the JS alone', { skip: skipWasm }, () => {
+test('frozen inputs: the two id functions give what the live composition gave, and never more than the JS alone', { skip: skipWasm }, () => {
   ran++;
-  const count = { total: 0, projectSame: 0, selectedSame: 0, selectedFault: 0, selectedNonString: 0, catSameAsJs: 0, catFault: 0, catBoxes: 0, tools: 0 };
+  const count = { total: 0, projectSame: 0, selectedSame: 0, selectedFault: 0, selectedNonString: 0 };
   const strings = (l) => l.filter((id) => typeof id === 'string');
   for (const { i, in: c, project, selected, catalogue } of FROZEN.cases) {
     const label = `case ${i}`;
@@ -101,24 +101,7 @@ test('frozen inputs: the functions give what the live composition gave, and neve
     if (selected.live.length !== selected.js.length) { count.selectedFault++; assert.deepEqual(selected.live, [], label); assert.deepEqual(s, [], label); } else count.selectedSame++;
     for (const id of s) assert.ok(selected.js.includes(id), `${label}: ${id} was carried by the JS alone`);
     if (selected.live.some((id) => typeof id !== 'string')) count.selectedNonString++;
-    // The catalogue.
-    const out = quietly(() => tp.computePermittedTools(toInput(c)));
-    assert.equal(H(out), catalogue.live, label);
     count.total++;
-    count.catBoxes += out.length;
-    for (const b of out) count.tools += b.tools.length;
-    if (catalogue.live === catalogue.js) count.catSameAsJs++;
-    else {
-      // Where live differs from the JS alone it showed everything unchecked; so does the function now.
-      assert.equal(catalogue.faulted, true, label);
-      count.catFault++;
-      for (const b of out) {
-        assert.equal(b.state, 'unavailable', label);
-        assert.equal(b.reasonCode, 'unchecked', label);
-        assert.equal(b.active, false, label);
-        for (const t of b.tools) assert.deepEqual([t.permission, t.reasonCode], ['unavailable', 'unchecked'], label);
-      }
-    }
   }
-  assert.deepEqual(count, { total: 2500, projectSame: 2500, selectedSame: 2099, selectedFault: 401, selectedNonString: 523, catSameAsJs: 1646, catFault: 854, catBoxes: 18508, tools: 35226 });
+  assert.deepEqual(count, { total: 2500, projectSame: 2500, selectedSame: 2099, selectedFault: 401, selectedNonString: 523 });
 });

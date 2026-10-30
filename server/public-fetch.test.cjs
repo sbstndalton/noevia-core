@@ -156,7 +156,7 @@ test('fetch-shaped details: form bodies, gzip, other schemes, credentials in the
 function wiring({ servers, publicFetch, directoryUrlAllowed = async () => true, warnings = [] }) {
   return createMcpWiring({
     servers, mcp, publicFetch, directoryUrlAllowed,
-    bindBoxes: () => [], directoryMcp: { asServers: () => [], headersFor: () => ({}) }, mcpOAuth: {},
+    bindBoxes: () => [], directoryMcp: { signal: () => 0, asServers: () => [], headersFor: () => ({}) }, mcpOAuth: {},
     credentialOriginAllowed: () => false,
     scope: { getStore: () => ({ workspace: { userId: 'alice' }, authn: { user: { id: 'alice' } } }) },
     storageFor: () => ({}), isWriteTool: () => false,
@@ -179,7 +179,7 @@ test('DNS rebinding against a directory server: the check passes, the connection
   assert.equal(fx.hits.length, 0);
 });
 
-test('a directory server that rebinds is refused for tool calls and the auth probe too', async (t) => {
+test('a directory server that rebinds is refused for tool calls too', async (t) => {
   const fx = await mcpFixture(t);
   const url = `http://localhost:${fx.port}/mcp`;
   const server = { id: 'dir-x', url, auth: 'none', directory: true };
@@ -187,7 +187,6 @@ test('a directory server that rebinds is refused for tool calls and the auth pro
   w.state.tools.set('echo', { tool: {}, readOnly: true, serverId: 'dir-x' });
   const out = await w.executeMcpToolCall('echo', { s: 'x' });
   assert.match(out, /^ERROR calling echo: refused: localhost resolves to a private address/);
-  assert.deepEqual(await w.probeMcpAuth(url), { status: 0, challenge: '' });
   assert.equal(fx.hits.length, 0);
 });
 
@@ -219,7 +218,7 @@ test('a directory server whose name stays public works end to end through the wi
 
 test('wiring refuses a publicFetch it cannot use rather than silently skipping it', () => {
   assert.throws(() => createMcpWiring({
-    servers: [], mcp: { convertTool() {} }, publicFetch: async () => {}, directoryMcp: { asServers: () => [] },
+    servers: [], mcp: { convertTool() {} }, publicFetch: async () => {}, directoryMcp: { signal: () => 0, asServers: () => [] },
     logger: { log() {}, warn() {} },
   }), /withFetch/);
 });

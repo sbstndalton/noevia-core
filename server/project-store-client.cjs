@@ -392,20 +392,6 @@ function createClient({ port, token, fetchImpl = globalThis.fetch, timeoutMs = T
       }
       return chatgptRefusal(status, body);
     },
-    /** The Google Drive half of GET /api/connectors, as the front would answer it. */
-    async gdriveView(user, admin) {
-      const { status, body } = await call('gdrive/view', { user, admin: admin === true }, CHATGPT_WAIT_MS);
-      return status === 200 && body && body.id === 'gdrive' ? { ok: true, view: body } : chatgptRefusal(status, body);
-    },
-    /** The one write of tool_policies, on Node's behalf (the Nextcloud permissions: Node knows the live
-     *  MCP tools and which of them write). `writes[i]` is whether `tools[i]` is a write. 400 carries the
-     *  words core always showed. */
-    async toolPolicySet(user, tools, writes, mode) {
-      const { status, body } = await call('gdrive/policy', { user, tools: [].concat(tools), writes: [].concat(writes).map((w) => w === true), mode }, CHATGPT_WAIT_MS);
-      if (status === 200 && body?.ok === true) return { ok: true };
-      if (status === 400 && body && typeof body.error === 'string') return { ok: false, status: 400, error: body.error };
-      return chatgptRefusal(status, body);
-    },
     /** sbstndalton/noevia#2153: the user's chat change journal after `after` (chat-change-journal.cjs):
      *  { entries, oldestSeq, latestSeq, more, start }, or { unsupported: true } from a store
      *  without the op (404: an older Rust front). */

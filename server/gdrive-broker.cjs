@@ -64,7 +64,7 @@ function ownsBackup({ admin, userId, backup, personalFile }) {
 
 /**
  * @param {object} deps
- * @param {{gdriveSession, gdriveReject, gdriveDisconnect, gdriveForget, gdriveView}} deps.broker  the project-store client
+ * @param {{gdriveSession, gdriveReject, gdriveDisconnect, gdriveForget}} deps.broker  the project-store client
  * @param {string} deps.dataDir
  * @param {string} [deps.apiBase] @param {string} [deps.uploadBase]
  */
@@ -167,19 +167,7 @@ function createDriveAccounts({ broker, dataDir, apiBase = DEFAULT_API, uploadBas
     } catch (e) { warn(`Google Drive connection of a deleted account was not removed (${e?.code || e?.status || 'error'}).`); }
   }
 
-  /** The Google Drive half of GET /api/connectors, from the broker. */
-  async function view(user) {
-    let r;
-    try { r = await broker.gdriveView(String(user.id), admin(user)); } catch { r = null; }
-    if (r && r.ok) return r.view;
-    // The broker cannot answer: the page still lists Nextcloud, and says why this one is missing.
-    return { id: 'gdrive', name: 'Google Drive', configured: true, state: 'error', email: null, connectedAt: null, message: MESSAGES.unavailable, backup: null, tools: [] };
-  }
-
-  /** A change signal for everything that decides which Drive tools an account is offered: the broker's state file. */
-  const fingerprint = () => { try { return fileSignal(signalFile); } catch { return 'unreadable'; } };
-
-  return { forUser, removeUser, fingerprint, connected: (user) => !!user && !!user.id && stateOf(user) === 'connected', view, ownsBackup };
+  return { forUser, removeUser, connected: (user) => !!user && !!user.id && stateOf(user) === 'connected', ownsBackup };
 }
 
 module.exports = { createDriveAccounts, ownsBackup, loopbackBase, MESSAGES };

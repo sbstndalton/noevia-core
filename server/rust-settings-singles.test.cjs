@@ -48,13 +48,13 @@ test('other path shapes are not refused', () => {
   assert.equal(refuse(pages, 'GET', '//['), null);
 });
 
-test('the dead Node handlers are gone; the library the Node routes use stays', () => {
+test('the dead Node handlers are gone; the one library function the Node routes use stays', () => {
   assert.equal(fs.existsSync(path.join(__dirname, 'routes', 'public-pages.cjs')), false);
   assert.equal(fs.existsSync(path.join(__dirname, 'plugin-starters.json')), false);
   const lib = require('./routes/plugin-directory.cjs');
   assert.equal(lib.createPluginDirectoryRoutes, undefined);
-  for (const kept of ['mcpItems', 'fetchPublishedSkill', 'findRegistryServer', 'installable', 'fallbackServerName']) assert.equal(typeof lib[kept], 'function', kept);
-  assert.ok(lib.RESERVED_HEADERS instanceof RegExp);
+  assert.equal(typeof lib.fetchPublishedSkill, 'function');
+  for (const gone of ['mcpItems', 'findRegistryServer', 'installable', 'fallbackServerName', 'RESERVED_HEADERS']) assert.equal(lib[gone], undefined, gone);
   const device = fs.readFileSync(path.join(__dirname, 'routes', 'device-auth.cjs'), 'utf8');
   assert.equal(device.includes('isDevicePage'), false);
 });
