@@ -554,7 +554,7 @@ const projectStore = require('./projects.cjs').createProjectStore({
 });
 const {
   saveProjects, getProject, sanitizeChats, loadChats, saveChats, deleteChat, saveFreeChats, deleteFreeChat, createProject,
-  readHistory, ownsFile, ensureProjectFolder, withSourceLock, pruneDocuments, researchReportTarget, writeProjectTextFile, sweepDeletedProject, indexSource,
+  readHistory, ownsFile, ensureProjectFolder, withSourceLock, pruneDocuments, writeProjectTextFile, sweepDeletedProject, indexSource,
 } = projectStore;
 // #2191 round 2: the Rust front creates and deletes projects (rust-project-lifecycle.cjs). It reads the
 // toolbox catalogue published here (MCP discovery is this process's), and leaves the RAG index of
@@ -758,41 +758,30 @@ const browserRoutes = require('./routes/browser.cjs').createBrowserRoutes({
 // GET /api/usage[/aggregate] is the Rust front's (#1071): this mount only refuses a bypass.
 const usageRoutes = require('./routes/usage.cjs').createUsageRoutes({ json });
 
-// ── Deep research (D12): module in research-service.cjs, routes in routes/research.cjs ──
-// The model a research step asks and its one completion (research-model.cjs); #1849: Smart on an Inference machine runs there.
-const researchEngine = require('./research-model.cjs').createResearchModel({ autoRoles, lastLoadedModel, chatMachines, getProvider, DEFAULT_PROVIDER_ID,
-  providerHeaders, fetch: (...args) => fetch(...args), modelManager, admitEngineModel, readCappedJson });
-const researchRoutes = require('./routes/research.cjs').createResearchRoutes({
-  features, getProject, workspace: () => currentWorkspace(), json, readJson,
-  available: () => {
-    if (!toolboxOffered('web-search') || !mcpState.tools.has('tavily_search') || !mcpState.tools.has('tavily_extract')) return 'Deep research needs the web-search toolbox (tavily_search and tavily_extract) on this server.';
-    if (operatorServerFor('tavily_search') === undefined || operatorServerFor('tavily_extract') === undefined) return 'Web search is not configured on this server.';
-    if (!researchModel()) return 'Pick a Smart model for Auto routing, or load a model, before starting research.';
-    return null;
-  },
-  service: require('./research-service.cjs').createResearchService({
-    saveFile: (project, name, text, target) => writeProjectTextFile(project, name, text, { createOnly: true, expectedTarget: target }),
-    reportTarget: (project, name) => researchReportTarget(project, name),
-    getProject,
-    tools: (workspace, project) => ({
-      complete: (messages, options) => researchEngine.complete(project, messages, options),
-      // The operator's own search server, even if a directory server offers the same name (#865);
-      // with none, research fails rather than reaching a directory server (#891).
-      search: async (query) => require('./routes/research.cjs').parseSearchResults(await executeOperatorToolCall('tavily_search', { query, max_results: 5 })),
-      extract: async (url) => {
-        const text = await executeOperatorToolCall('tavily_extract', { urls: [url] });
-        if (/^ERROR/.test(text)) throw Error(text);
-        return text;
-      },
-      projectRetrieve: async (question) => rag.ragAvailable()
-        ? (await rag.searchProject(project.id, question, workspace.userId)).slice(0, 5).map((h) => ({ file: h.file, text: h.body }))
-        : [],
-    }),
-  }),
+// ── Deep research (#2218): the Rust front's (rust-research.cjs); what its jobs still need from this process ──
+const ADMISSION_SECRET = String(process.env.NOEVIA_PROJECT_STORE_TOKEN || '');
+const inferenceAdmission = require('./inference-admission-lease.cjs').createAdmissionRoutes({
+  secret: ADMISSION_SECRET, modelManager, admitEngineModel, chatMachines, json, readJson,
 });
-function researchModel(project) {
-  return researchEngine.model(project);
-}
+const researchBridge = require('./rust-research-bridge.cjs').createResearchBridge({
+  secret: ADMISSION_SECRET, json, readJson,
+  asUser: (userId, fn) => diaryAsUser(userId, fn),
+  // The tool half of core's old `available()`; the model half reads the roles and machines row on the front.
+  availability: () => {
+    let reason = null;
+    if (!toolboxOffered('web-search') || !mcpState.tools.has('tavily_search') || !mcpState.tools.has('tavily_extract')) reason = 'Deep research needs the web-search toolbox (tavily_search and tavily_extract) on this server.';
+    else if (operatorServerFor('tavily_search') === undefined || operatorServerFor('tavily_extract') === undefined) reason = 'Web search is not configured on this server.';
+    return { reason, lastLoaded: lastLoadedModel() || null };
+  },
+  // The operator's own search server, even if a directory server offers the same name (#865);
+  // with none, research fails rather than reaching a directory server (#891).
+  executeOperatorToolCall: (name, args, signal) => executeOperatorToolCall(name, args, signal),
+  retrieve: async (projectId, question, userId) => {
+    const project = getProject(projectId);
+    if (!project || !rag.ragAvailable()) return [];
+    return (await rag.searchProject(project.id, question, userId)).slice(0, 5).map((h) => ({ file: h.file, text: h.body }));
+  },
+});
 
 // noevia's own capabilities, offered over the same MCP path as everything
 // else. Default 0 means the listener never binds, no `internal` entry can
@@ -1285,6 +1274,10 @@ async function handleRequestInner(req, res) {
   if (require('./rust-source-jobs.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   // And the project source operations themselves: the upload, the folder sync and the folder import's plan (#2191 round 8).
   if (require('./rust-project-source-work.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
+  // And deep research, every method, and the front's loopback calls for its jobs (#2218).
+  if (require('./rust-research.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
+  if (await inferenceAdmission.handle(req, res)) return;
+  if (await researchBridge(req, res)) return;
   // And a project's configuration, its instruction skills and a published skill's install (#2191 round 9).
   if (require('./rust-project-config.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   // And an account's deletion, complete (#2190, #2191 round 9): DELETE /api/admin/users/{id}.
@@ -1378,7 +1371,6 @@ async function handleRequestScoped(req, res) {
     if (authn && await importRoutes(req, res, { path: p, authn })) return;
     if (authn && await accountRoutes(req, res, { path: p, authn })) return;
     if (authn && await webAddressRoutes(req, res, { path: p, authn })) return;
-    if (authn && p.startsWith('/api/projects/') && await researchRoutes(req, res, { path: p, authn })) return;
     if (authn && (p === '/api/code/active' || p.startsWith('/api/projects/')) && await codeRoutes(req, res, { path: p, authn })) return;
     if (authn && p.startsWith('/api/projects/') && await browserRoutes(req, res, { path: p, authn })) return;
     if (await authRoutes.account(req, res, { path: p, authn })) return;

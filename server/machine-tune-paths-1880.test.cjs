@@ -11,7 +11,7 @@ const { createChatMachines } = require('./chat-machines.cjs');
 const { createMachineHealth } = require('./machine-health.cjs');
 const { createMachineTune } = require('./machine-tune.cjs');
 const { codeTargetFrom, createEngineRelay } = require('./code-machine.cjs');
-const { createResearchModel } = require('./research-model.cjs');
+const { createAdmission } = require('./inference-admission-lease.cjs');
 const { createChatHandler } = require('./chat.cjs');
 const { createToolExchange } = require('./tool-exchange.cjs');
 const { createVisionProbe } = require('./vision.cjs');
@@ -91,12 +91,12 @@ test('#1880 Code relay: each forwarded request holds the machine; a measurement 
 
 test('#1880 Deep Research: a step on the machine holds it; a measurement is refused while it is in flight', async (t) => {
   const s = await setup(t, 'chatSmart');
-  const research = createResearchModel({ autoRoles: () => ({ smart: 'synthetic-local' }), lastLoadedModel: () => null, chatMachines: s.chatMachines,
-    getProvider: () => ({ id: 'default', baseUrl: 'http://default.invalid' }), DEFAULT_PROVIDER_ID: 'default', providerHeaders: () => ({}),
-    fetch: async () => { throw Error('nothing local'); }, modelManager: {}, admitEngineModel: async () => {}, readCappedJson });
-  const text = await research.complete({}, [{ role: 'user', content: 'QA-SYNTH-1880 summarise' }], { signal: new AbortController().signal, maxTokens: 64 });
-  assert.match(text, /Synthetic description/);
-  assert.deepEqual(s.attempts, ['machineBusy']);
+  const admit = createAdmission({ modelManager: {}, admitEngineModel: async () => {}, chatMachines: s.chatMachines });
+  const target = s.chatMachines.target('smart');
+  const held = await admit({ role: 'smart', machine: target.machine.id, model: target.model }, new AbortController().signal);
+  assert.equal(s.chatMachines.busy(s.machineId), true);
+  await assert.rejects(s.tune.start({ service: 'chatSmart', confirm: true, actor: 'synthetic-admin' }), (e) => e.code === 'machineBusy');
+  held.release();
   assert.equal(s.chatMachines.busy(s.machineId), false);
   await settle(s);
 });
