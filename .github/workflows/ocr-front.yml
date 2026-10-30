@@ -25,8 +25,10 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           repository: sbstndalton/noevia-rs
-          # Reviewed sbstndalton/noevia#2191 projects rounds 4-7 (the front owns the page reader, the upload and the source jobs); acceptance input only.
-          ref: c32a3f22bc8c77d2e0b9a1ec5019fe18d3781c2b
+          # sbstndalton/noevia#2191 round 8: the front runs the upload, the sync and the folder plan itself (the Docling
+          # extraction, the OCR worker and the source jobs); acceptance input only. The head of claude/projects8-native
+          # before its final front-core.ref pin; the integrator moves it to the merged noevia-rs main.
+          ref: a34a2aaf7994047597e6b0bece5e8cb611785cad
           path: rs
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
