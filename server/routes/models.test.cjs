@@ -5,7 +5,8 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const { Readable } = require('node:stream');
-const { createModelRoutes, STATS_REFUSAL, ROUTING_DEFAULT_REFUSAL } = require('./models.cjs');
+const { EventEmitter } = require('node:events');
+const { createModelRoutes, STATS_REFUSAL, ROUTING_DEFAULT_REFUSAL, AUTO_ROLES_REFUSAL } = require('./models.cjs');
 const { createModelService } = require('../models.cjs');
 
 // A workspace-shaped test double (autoRoles + saveAutoRoles), for tests that pass
@@ -15,7 +16,8 @@ function makeWorkspace(autoRoles = null) {
 }
 
 function fixture({ env = {}, enabled = true, kind = 'llamacpp', manager = {}, workspace = { userId: 'u1' }, catalogue = [{ name: 'm' }], servedCatalogue = async () => catalogue, modelsInstalled = async () => [{ name: 'm', loaded: true }], initialRoles = null, initialLastLoaded = null, otherWorkspaces = [], inferenceBudget = null, idleUnload = null, sweepGuardOptions, fetchReply = null, machineModels = undefined } = {}) {
-  const sent = [], headers = [], fetched = [];
+  const sent = [], headers = [], fetched = [], invalidations = [];
+  let lastRes = null;
   const scan = new Map();
   let refreshes = 0;
   const roles = { current: initialRoles, warmed: undefined };
@@ -56,7 +58,7 @@ function fixture({ env = {}, enabled = true, kind = 'llamacpp', manager = {}, wo
     service: {
       modelScanCache: scan, refreshModelScan: () => { refreshes += 1; },
       autoRoles: () => roles.current, setAutoRoles: (next) => { roles.current = next; }, ensureRolesLoaded: () => { roles.warmed = true; },
-      servedCatalogue, modelsInstalled,
+      servedCatalogue, modelsInstalled, invalidateModelReads: () => { invalidations.push(Date.now()); },
       deriveUserModelName: (c) => `user.${c}`,
       lastLoadedModel: () => lastLoaded.current,
       clearLastLoadedModel: (name) => { if (lastLoaded.current === name) lastLoaded.current = null; },
@@ -66,10 +68,11 @@ function fixture({ env = {}, enabled = true, kind = 'llamacpp', manager = {}, wo
   const call = (method, path, body, role = 'member', search = '') => {
     const req = Readable.from(body === undefined ? [] : [Buffer.from(typeof body === 'string' ? body : JSON.stringify(body))]);
     req.method = method;
-    const res = { setHeader: (k, v) => headers.push([k, v]) };
+    const res = Object.assign(new EventEmitter(), { setHeader: (k, v) => headers.push([k, v]) });
+    lastRes = res;
     return routes(req, res, { path, authn: { user: { id: 'u1', role } }, url: new URL(`http://localhost${path}${search}`) });
   };
-  return { call, sent, headers, fetched, scan, refreshes: () => refreshes, roles, lastLoaded, ready: routes.sweepAdopted };
+  return { call, sent, headers, fetched, scan, invalidations, response: () => lastRes, refreshes: () => refreshes, roles, lastLoaded, ready: routes.sweepAdopted };
 }
 
 test('every write under /api/models/ is refused for members before anything else is looked at', async () => {
@@ -90,8 +93,10 @@ test('the roles round-trip and warm up; the front\'s model reads are not answere
   assert.equal(await f.call('GET', '/api/models/hardware', undefined, 'admin'), false);
   await f.call('PUT', '/api/models/hardware', {}, 'admin');
   assert.deepEqual(f.sent.pop(), { status: 405, body: { error: 'Method not allowed' } }, 'the hardware path\'s other methods keep their 405');
+  // The GET is the Rust front's (#2190 close-out, rust-auto-roles.cjs); the PUT is still this module's.
   await f.call('GET', '/api/auto-roles');
-  assert.deepEqual(f.sent.pop(), { status: 200, body: { configured: false, roles: null, missing: { roles: null, catalogue: [{ name: 'm' }] } } });
+  assert.deepEqual(f.sent.pop(), { status: 503, body: AUTO_ROLES_REFUSAL });
+  assert.equal(f.sent.length, 0);
   await f.call('PUT', '/api/auto-roles', { fast: ' m ', smart: 'm' }, 'admin');
   assert.deepEqual(f.sent.pop(), { status: 200, body: { configured: true, roles: { fast: 'm', smart: 'm', vision: '', code: '' } } });
   assert.equal(f.roles.warmed, true, 'an admin save warms the roles up');
@@ -998,29 +1003,27 @@ test('#1071: GET /api/stats is the Rust front\'s, so Node always refuses it befo
 
 
 
-test('#1849 GET /api/auto-roles lists the models chat roles\' machines serve; nothing on a machine leaves the answer as it was', async () => {
-  const plain = fixture({ initialRoles: { fast: 'm', smart: 'm' } });
-  await plain.call('GET', '/api/auto-roles');
-  const before = plain.sent.pop();
-  const none = fixture({ initialRoles: { fast: 'm', smart: 'm' }, machineModels: () => [] });
-  await none.call('GET', '/api/auto-roles');
-  assert.deepEqual(none.sent.pop(), before, 'no machineModels key when nothing is on a machine');
-  const row = { model: 'synthetic-remote', machine: { id: 'mach-1', name: 'Synthetic Pi' }, roles: ['smart'] };
-  const some = fixture({ initialRoles: { fast: 'm', smart: 'm' }, machineModels: () => [row] });
-  await some.call('GET', '/api/auto-roles');
-  assert.deepEqual(some.sent.pop(), { ...before, body: { ...before.body, machineModels: [row] } });
-  const broken = fixture({ initialRoles: { fast: 'm', smart: 'm' }, machineModels: () => { throw Error('synthetic'); } });
-  await broken.call('GET', '/api/auto-roles');
-  assert.deepEqual(broken.sent.pop(), before, 'an unreadable machine list never breaks the roles answer');
-});
+// #1849/#1855 (the machine models and the served-catalogue filter of GET /api/auto-roles) are published for the Rust front:
+// rust-auto-roles.test.cjs (autoRolesState) here, noevia-rs tests/auto_roles.rs for the answer.
 
-test('#1855 GET /api/auto-roles leaves out machine models the served local catalogue lists (the router\'s own source)', async () => {
-  const local = { model: 'm', machine: { id: 'mach-1', name: 'Synthetic Pi' }, roles: ['fast'] };
-  const remote = { model: 'synthetic-remote', machine: { id: 'mach-1', name: 'Synthetic Pi' }, roles: ['smart'] };
-  const f = fixture({ initialRoles: { fast: 'm', smart: 'm' }, catalogue: [{ name: 'm' }], modelsInstalled: async () => [{ name: 'synthetic-remote', loaded: false }], machineModels: () => [local, remote] });
-  await f.call('GET', '/api/auto-roles');
-  assert.deepEqual(f.sent.pop().body.machineModels, [remote], 'served names go local; the installed list is not the source');
-  const all = fixture({ initialRoles: { fast: 'm', smart: 'm' }, catalogue: [{ name: 'm' }], machineModels: () => [local] });
-  await all.call('GET', '/api/auto-roles');
-  assert.equal('machineModels' in all.sent.pop().body, false, 'nothing left to list: no key, as with no machine');
+test('a model or role write drops the shared reads before it and again once its answer is out, so the front\'s snapshot is rebuilt after the write (#2190 review L2)', async () => {
+  const f = fixture({ env: { MODEL_LOADER_URL: 'http://loader' } });
+  await f.call('PUT', '/api/auto-roles', { fast: 'm', smart: 'm' }, 'admin');
+  assert.equal(f.invalidations.length, 1, 'dropped before the write');
+  f.response().emit('finish');
+  assert.equal(f.invalidations.length, 2, 'dropped again when the answer is out');
+  f.response().emit('close');
+  f.response().emit('finish');
+  assert.equal(f.invalidations.length, 2, 'once, whichever of finish and close comes first');
+  // A client that left first is the same write: close alone drops them again.
+  await f.call('PUT', '/api/auto-roles', { fast: 'm', smart: 'm' }, 'admin');
+  assert.equal(f.invalidations.length, 3);
+  f.response().emit('close');
+  assert.equal(f.invalidations.length, 4);
+  // Reads never register the second drop.
+  await f.call('GET', '/api/models/downloads');
+  assert.equal(f.invalidations.length, 4);
+  f.response().emit('finish');
+  f.response().emit('close');
+  assert.equal(f.invalidations.length, 4, 'a read changes nothing');
 });

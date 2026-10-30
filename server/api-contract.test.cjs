@@ -32,7 +32,7 @@ test('the real HTTP handler marks public readiness and session errors as API v1'
     assert.deepEqual(Object.keys(await ready.json()).sort(), ['ready', 'version']);
 
     // GET /api/profile is the Rust front's (#1071); a Node-owned route answers the signed-out 401.
-    const denied = await fetch(`${base}/api/workspace`);
+    const denied = await fetch(`${base}/api/chats/search`);
     assert.equal(denied.status, 401);
     assert.equal(denied.headers.get('x-noevia-api'), '1');
   } finally {

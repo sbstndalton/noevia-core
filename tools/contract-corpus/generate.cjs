@@ -79,8 +79,9 @@ async function waitReady(base, child) {
 // GETs for client paths no scenario step reaches; {x} params are filled from the run. The Rust
 // front's permanent routes (sbstndalton/noevia#1071: sign-in and the account, usage, stats,
 // sampling, routing mode and default, ChatGPT status, the provider registry's list and writes since
-// #2190 round 6, storage metadata/list/read, export, and since
-// #2185 the Diary source, today, storage-import and workspace export/import, and since #2206 the rest of
+// #2190 round 6, the MCP keys and sign-ins since #2202, storage metadata/list/read, export, and since
+// #2185 the Diary source, today, storage-import and workspace export/import, since the #2190/#2191
+// close-out the health check, the auto-roles read and the workspace list, and since #2206 the rest of
 // the Diary routes but the local exchange: /api/diary, the storage status, the connector endpoint and
 // the connector credentials) are not
 // Node's to record any more;
@@ -88,9 +89,9 @@ async function waitReady(base, child) {
 const PROBES = [
   '/api/account/retention',
   '/api/admin/decision-settings', '/api/admin/features', '/api/admin/mcp-directory', '/api/admin/web-address',
-  '/api/auto-roles', '/api/chat-framing/preferences', '/api/chat-vault-mirror/preferences', '/api/code/active',
+  '/api/chat-framing/preferences', '/api/chat-vault-mirror/preferences', '/api/code/active',
   '/api/connectors', '/api/connectors/nextcloud/policy',
-  '/api/mcp-keys/servers', '/api/mcp-oauth/servers', '/api/model-manager',
+  '/api/model-manager',
   '/api/models/autotune', '/api/models/autotune/settings', '/api/models/autotune/untuned', '/api/models/calibration', '/api/models/capabilities', '/api/models/evidence',
   '/api/models/hardware', '/api/models/inference-budget', '/api/models/installed', '/api/plugins/directory',
   '/api/profile/sharing',
@@ -170,9 +171,11 @@ async function main() {
     secrets.push(...Object.values(seeded).flatMap((a) => [a.session, a.csrf]));
 
     // Signed out, and signed in.
-    await step(anon, 'GET', '/api/health');
-    await step(anon, 'GET', '/api/workspace');
-    await step(admin, 'GET', '/api/workspace', undefined, [200]);
+    // GET /api/health, /api/workspace and /api/auto-roles are the Rust front's (sbstndalton/noevia#2190, #2191 close-out):
+    // Node refuses them, and their exchanges stay in the noevia-rs corpus recorded at its core.ref. A Node-owned
+    // authenticated read stands in for the signed-out and signed-in probes.
+    await step(anon, 'GET', '/api/chats/search');
+    await step(admin, 'GET', '/api/chats/search', undefined, [200]);
     // The feature settings are the Rust front's (sbstndalton/noevia-rs#338): Node refuses them.
     const featureRead = await step(admin, 'GET', '/api/features', undefined, [503]);
     if (featureRead.json?.code !== 'RUST_FEATURES_OWNED') throw new Error('Expected the Rust feature ownership refusal.');
@@ -188,7 +191,10 @@ async function main() {
     const createRefused = await step(admin, 'POST', '/api/projects', projectBody, [503]);
     if (createRefused.json?.code !== 'RUST_PROJECT_LIFECYCLE_OWNED') throw new Error('Expected the Rust project lifecycle ownership refusal.');
     const projectId = createProjectAs(dataDir, seeded.admin.id, projectBody).id;
-    await step(admin, 'GET', '/api/workspace', undefined, [200]);
+    // The recorder numbers an id once it has seen it as a value (a body or query field named like an id). The project
+    // list used to show it here; that read is the Rust front's, so a Node-owned read that names it does, and its
+    // later paths record as <id:N> rather than as the run's literal id (the double recording must be byte-equal).
+    await step(admin, 'GET', `/api/chats/search?projectId=${encodeURIComponent(projectId)}`, undefined, [200]);
     await step(admin, 'POST', `/api/projects/${encodeURIComponent(projectId)}/config`, { instructions: 'Answer very briefly.' });
 
     // A streamed chat turn against the mock model.
@@ -202,7 +208,7 @@ async function main() {
     }
 
     // A second account (seeded above): the tenant boundary is part of the contract.
-    await step(member, 'GET', '/api/workspace');
+    await step(member, 'GET', '/api/chats/search');
     if (chatId) await step(member, 'GET', `/api/chats/${encodeURIComponent(chatId)}/history`);
     // Address GETs are refused before Node's auth: the Rust front owns this read for every role.
     const addressRead = await step(member, 'GET', '/api/admin/web-address', undefined, [503]);
@@ -222,7 +228,6 @@ async function main() {
     // Clean-up is part of the contract too. A chat's delete (#1071 slice 6) and the project delete
     // (#2191) are the Rust front's: Node refuses the delete below, and its exchange stays in the noevia-rs corpus.
     await step(admin, 'DELETE', `/api/projects/${encodeURIComponent(projectId)}`, undefined, [503]);
-    await step(admin, 'GET', '/api/workspace', undefined, [200]);
     if (memberId) await step(admin, 'DELETE', `/api/admin/users/${encodeURIComponent(memberId)}`, { username: MEMBER.username });
 
     // The project image routes, the project chat lists and the free-chat list (M4) are the Rust

@@ -50,7 +50,7 @@ test('keys are encrypted, never listed, templated, single-line, and replaceable'
   assert.deepEqual(dir.headersFor(s.id), { Authorization: 'Bearer SECRET-2' });
 });
 
-test('personal servers keep one key per account and no shared key', () => {
+test('personal servers keep no shared key, and this module holds no account\'s key (the Rust front\'s, #2202)', () => {
   const secrets = { encrypt: (v) => 'enc:' + Buffer.from(v).toString('base64'), decrypt: (v) => Buffer.from(v.slice(4), 'base64').toString() };
   const db = new Database(':memory:');
   const dir = createDirectoryMcp({ db, secrets });
@@ -58,32 +58,16 @@ test('personal servers keep one key per account and no shared key', () => {
   const s = dir.add({ registryName: 'p', title: 'P', url: 'https://p.example/mcp', declaredHeaders: declared, headerValues: { Authorization: 'ADMIN-KEY' }, personal: true }, 'admin');
   assert.equal(dir.asServers()[0].auth, 'personal');
   assert.deepEqual(dir.headersFor(s.id), {}, 'no shared key');
-  assert.deepEqual(dir.userHeadersFor('admin', s.id), { Authorization: 'Bearer ADMIN-KEY' });
-  assert.deepEqual(dir.userHeadersFor('member', s.id), {});
-  assert.throws(() => dir.setUserKey('member', s.id, {}), /Enter Authorization/);
-  dir.setUserKey('member', s.id, { Authorization: 'MEMBER-KEY', Other: 'x' });
-  assert.deepEqual(dir.userHeadersFor('member', s.id), { Authorization: 'Bearer MEMBER-KEY' });
-  assert.equal(dir.hasUserKey('member', s.id), true);
   assert.deepEqual(dir.list()[0].declaredHeaders.map((h) => h.name), ['Authorization']);
-  assert.ok(!JSON.stringify(db.prepare('SELECT * FROM directory_mcp_user_keys').all()).includes('MEMBER-KEY'), 'stored encrypted');
-  dir.clearUserKey('member', s.id); assert.equal(dir.hasUserKey('member', s.id), false);
-  dir.remove(s.id); assert.equal(db.prepare('SELECT COUNT(*) n FROM directory_mcp_user_keys').get().n, 0, 'removing the server drops every key');
-});
-
-test('forgetUser drops one account\'s keys across every server, leaving others intact', () => {
-  const secrets = { encrypt: (v) => 'enc:' + Buffer.from(v).toString('base64'), decrypt: (v) => Buffer.from(v.slice(4), 'base64').toString() };
-  const db = new Database(':memory:');
-  const dir = createDirectoryMcp({ db, secrets });
-  const declared = [{ name: 'Authorization', required: true, secret: true, template: null }];
-  const s1 = dir.add({ registryName: 'p1', title: 'P1', url: 'https://p1.example/mcp', declaredHeaders: declared, headerValues: { Authorization: 'A' }, personal: true }, 'admin');
-  const s2 = dir.add({ registryName: 'p2', title: 'P2', url: 'https://p2.example/mcp', declaredHeaders: declared, headerValues: { Authorization: 'A' }, personal: true }, 'admin');
-  dir.setUserKey('member', s1.id, { Authorization: 'M1' });
-  dir.setUserKey('member', s2.id, { Authorization: 'M2' });
-  dir.setUserKey('other', s1.id, { Authorization: 'O1' });
-  dir.forgetUser('member');
-  assert.equal(dir.hasUserKey('member', s1.id), false);
-  assert.equal(dir.hasUserKey('member', s2.id), false);
-  assert.equal(dir.hasUserKey('other', s1.id), true, 'another account keeps its own key');
+  assert.equal(s.personal, true);
+  // The adding administrator's key is the broker's to store (the route asks it); add() neither
+  // writes nor creates the per-account key table, and the old per-account API is gone.
+  assert.equal(db.prepare("SELECT COUNT(*) n FROM sqlite_master WHERE name='directory_mcp_user_keys'").get().n, 0);
+  assert.ok(!JSON.stringify(db.prepare('SELECT * FROM directory_mcp_servers').all()).includes('ADMIN-KEY'));
+  for (const gone of ['userHeadersFor', 'hasUserKey', 'setUserKey', 'clearUserKey', 'forgetUser']) assert.equal(dir[gone], undefined, gone);
+  assert.doesNotMatch(fs.readFileSync(path.join(__dirname, 'directory-mcp.cjs'), 'utf8'), /(?:INSERT INTO|UPDATE|DELETE FROM)\s+directory_mcp_user_keys/);
+  dir.remove(s.id);
+  assert.deepEqual(dir.list(), []);
 });
 
 test('a "$$" in a key value is not treated as a template replacement pattern', () => {
@@ -93,28 +77,4 @@ test('a "$$" in a key value is not treated as a template replacement pattern', (
   const declared = [{ name: 'Authorization', required: true, secret: true, template: 'Bearer {api_key}' }];
   const s = dir.add({ registryName: 'd', title: 'D', url: 'https://d.example/mcp', declaredHeaders: declared, headerValues: { Authorization: 'k$$ey' } });
   assert.deepEqual(dir.headersFor(s.id), { Authorization: 'Bearer k$$ey' });
-});
-
-test('a personal server key is user-bound: round-trips for its owner, a legacy v1 row still decrypts, a copied row fails elsewhere', (t) => {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'noevia-dirmcp-secrets-'));
-  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
-  const secrets = createSecretStore(root);
-  const db = new Database(':memory:');
-  const dir = createDirectoryMcp({ db, secrets });
-  const declared = [{ name: 'Authorization', required: true, secret: true, template: 'Bearer {api_key}' }];
-  const s = dir.add({ registryName: 'p', title: 'P', url: 'https://p.example/mcp', declaredHeaders: declared, headerValues: { Authorization: 'ADMIN-KEY' }, personal: true }, 'admin');
-  assert.deepEqual(dir.userHeadersFor('admin', s.id), { Authorization: 'Bearer ADMIN-KEY' }, 'round-trips for its owner');
-  const adminRow = db.prepare('SELECT headers_enc FROM directory_mcp_user_keys WHERE user_id=?').get('admin');
-  assert.match(adminRow.headers_enc, /^enc:v2:/, 'new writes are user-bound');
-  // A legacy v1 (unbound) row still decrypts.
-  db.prepare('INSERT INTO directory_mcp_user_keys VALUES(?,?,?,?)').run('legacy-user', s.id, secrets.encrypt(JSON.stringify({ Authorization: 'LEGACY-KEY' })), Date.now());
-  assert.deepEqual(dir.userHeadersFor('legacy-user', s.id), { Authorization: 'LEGACY-KEY' }, 'v1 row still decrypts');
-  // Copying a bound row to another account's slot fails to decrypt there.
-  db.prepare('INSERT INTO directory_mcp_user_keys VALUES(?,?,?,?)').run('member', s.id, adminRow.headers_enc, Date.now());
-  assert.deepEqual(dir.userHeadersFor('member', s.id), {}, 'a row copied to another account fails to decrypt');
-  // Once that account saves its own key, it is re-encrypted user-bound.
-  dir.setUserKey('member', s.id, { Authorization: 'MEMBER-KEY' });
-  const memberRow = db.prepare('SELECT headers_enc FROM directory_mcp_user_keys WHERE user_id=?').get('member');
-  assert.match(memberRow.headers_enc, /^enc:v2:/, 're-encrypted as user-bound on next write');
-  assert.deepEqual(dir.userHeadersFor('member', s.id), { Authorization: 'Bearer MEMBER-KEY' });
 });

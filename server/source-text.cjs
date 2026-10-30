@@ -371,72 +371,9 @@ function migrateOnLoad(wsDir, projects) {
 // (#2191, noevia-rs crates/server-projects sources.rs): it reads the text file itself, without
 // following a symlink, and answers SOURCE_TEXT_MISSING when it is gone.
 
-// #1818: the list (GET /api/workspace) never touches the disk per source. It reports what is known:
-// the `unreadable` set, filled when a read fails and by a background async scan of the sources a
-// list showed, run on the first list of a workspace and then at most every SCAN_MS; cleared when a
-// text is written again, read again, or collected. Unknown (not scanned yet) is not flagged.
-const SCAN_MS = 3 * 60 * 1000;
-let scanMs = SCAN_MS;
-const scans = new Map(); // workspace -> { at, running: Promise|null, seen: Map<key, [full, cacheKey]> }
-const pendingScans = new Set();
-
-/** Remembers `full` for the workspace's next scan, and starts one (async, after this tick) when due. */
-function noteForScan(wsDir, key, full) {
-  const ws = wsKey(wsDir);
-  let st = scans.get(ws);
-  if (!st) { st = { at: -Infinity, running: null, seen: new Map() }; scans.set(ws, st); }
-  if (st.running || Date.now() - st.at < scanMs) return;
-  st.seen.set(key, full);
-  if (pendingScans.has(ws)) return;
-  pendingScans.add(ws);
-  setImmediate(() => {
-    pendingScans.delete(ws);
-    const batch = st.seen; st.seen = new Map();
-    st.at = Date.now();
-    st.running = (async () => {
-      for (const [k, f] of batch) {
-        const gen = generation.get(k) || 0;
-        try { await fs.promises.access(f, fs.constants.R_OK); unreadable.delete(k); }
-        catch (e) {
-          // A write since the check started (a re-upload) wins: its file is there now.
-          if ((generation.get(k) || 0) !== gen) continue;
-          if (e && (e.code === 'ENOENT' || e.code === 'EACCES' || e.code === 'ENOTDIR' || e.code === 'EPERM')) {
-            unreadable.add(k);
-            if (cache.has(f)) { cached -= cache.get(f).length; cache.delete(f); }
-          }
-        }
-      }
-    })().catch(() => {}).finally(() => { st.running = null; });
-  });
-}
-
-/** Whether `file`'s text is known to be missing, without any filesystem call (the list's check). */
-function textMissing(file) {
-  if (!isExternal(file)) return false;
-  const from = origin.get(file);
-  if (!from) return false;
-  const key = missingKey(from.wsDir, from.projectId, file.textRef);
-  noteForScan(from.wsDir, key, path.join(projectDir(from.wsDir, from.projectId), `${file.textRef}.txt`));
-  return unreadable.has(key);
-}
-
-/** Resolves when the workspace's scan (started or about to start) is done. For tests. */
-async function scanSettled(wsDir) {
-  await new Promise((r) => setImmediate(r));
-  const st = scans.get(wsKey(wsDir));
-  if (st && st.running) await st.running;
-}
-
-/** A source as the client gets it in a list: metadata only, never the text; `textMissing: true`
- *  when its text file is gone or unreadable (#1815). */
-function meta(file) {
-  if (!file || typeof file !== 'object') return file;
-  const out = {};
-  for (const k of Object.keys(file)) if (k !== 'content' && k !== 'textMissing') out[k] = file[k];
-  if (!REF.test(String(out.textRef)) && typeof file.content === 'string') out.chars = file.content.length;
-  if (textMissing(file)) out.textMissing = true;
-  return out;
-}
+// The workspace list (GET /api/workspace) is the Rust front's (sbstndalton/noevia#2191 close-out), with its
+// own `textMissing` flag (#1815/#1818: noevia-rs crates/server-projects workspace_scan.rs). This process
+// keeps the `unreadable` set only for its own reads and for what a save must not drop (externalize).
 
 /** Rollback (see the header): projects.json with every text back inline. Server stopped. */
 function inlineAll(wsDir) {
@@ -472,7 +409,7 @@ if (require.main === module) {
 
 module.exports = {
   DIR, backupProjectsFile, refOf, projectDir, readText, readTextStrict, writeText, attachFile, attachAll, externalize, collect, migrateOnLoad,
-  hasInline, isExternal, textLength, cloneFile, sameText, meta, inlineAll, headerNamesSkill,
-  textMissing, scanSettled, SCAN_MS, _setScanMs(ms) { scanMs = ms; }, beginSourceWork, whileSourceWork, sourceWorkInFlight, flushDirs,
-  _cache: { clear() { cache.clear(); cached = 0; warned.clear(); unreadable.clear(); unreferencedSince.clear(); inFlight.clear(); scans.clear(); pendingScans.clear(); generation.clear(); scanMs = SCAN_MS; } }, GRACE_MS, _setGraceMs(ms) { graceDefault = ms; },
+  hasInline, isExternal, textLength, cloneFile, sameText, inlineAll, headerNamesSkill,
+  beginSourceWork, whileSourceWork, sourceWorkInFlight, flushDirs,
+  _cache: { clear() { cache.clear(); cached = 0; warned.clear(); unreadable.clear(); unreferencedSince.clear(); inFlight.clear(); generation.clear(); } }, GRACE_MS, _setGraceMs(ms) { graceDefault = ms; },
 };

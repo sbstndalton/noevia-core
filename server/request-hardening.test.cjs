@@ -120,9 +120,9 @@ test('#781: a malformed cookie escape gets an HTTP answer and does not break a v
   // GET /api/profile and /api/setup/status are the Rust front's (#1071); Node-owned routes here.
   const anonymous = await request('/api/ready', { headers: { cookie: 'a=%E0' } });
   assert.equal(anonymous.status, 200, 'a signed-out request with a bad sibling cookie is answered');
-  const unknown = await request('/api/workspace', { headers: { cookie: 'a=%E0%A4%A' } });
+  const unknown = await request('/api/chats/search', { headers: { cookie: 'a=%E0%A4%A' } });
   assert.equal(unknown.status, 401, 'no session cookie: an ordinary 401, not a reset');
-  const signedIn = await request('/api/workspace', { headers: { cookie: `sibling=%E0%A4%A; ${cookie}` } });
+  const signedIn = await request('/api/chats/search', { headers: { cookie: `sibling=%E0%A4%A; ${cookie}` } });
   assert.equal(signedIn.status, 200, 'the session cookie next to a malformed one still signs in');
 });
 
