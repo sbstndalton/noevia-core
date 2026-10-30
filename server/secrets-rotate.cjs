@@ -104,7 +104,7 @@ async function resealGoogleDrive(gdriveReseal) {
  * Run a rotation and record it in the audit log. Never throws for a bad row. The order is fixed, and every
  * callback is checked before the first await (a missing one must not leave the first passes done):
  *   1. `await resealProviders()`: the front re-seals the provider files (rust-providers-reseal.cjs
- *      `resealProviderKeys`). It throws, before anything is changed, when it cannot: that stops everything.
+ *      `resealProviderKeys`). It throws when it cannot, and then nothing below runs.
  *   2. `await resealMcp()`: the front re-seals the MCP sign-ins, apps and keys (rust-mcp-credentials.cjs
  *      `resealMcpCredentials`). It throws too, and then nothing below runs.
  *   3. `await gdriveReseal()`: the front re-seals the Google Drive token files (SOFT: a front that cannot do
