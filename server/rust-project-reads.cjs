@@ -14,8 +14,8 @@
 // stale and there is no second writer. A direct Node GET for any of the three is refused before
 // authentication, whoever asks, so a stale route table cannot make two processes answer.
 //
-// What stays here, and why: GET /api/projects/{id}/documents/pages (the page reader runs the large
-// document lock and the extraction state of documents.cjs), every write of a source (upload,
+// What stays here, and why (the page reader, GET .../documents/pages, is the front's since round 4:
+// rust-project-document-pages.cjs): every write of a source (upload,
 // documents, sources/sync, the config route, files DELETE: extraction, OCR, storage and the RAG
 // index are this process's in-memory jobs) and every other method of these paths.
 //

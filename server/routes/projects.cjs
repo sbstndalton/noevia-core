@@ -487,20 +487,8 @@ function createProjectRoutes({
       });
     }
 
-    // GET .../documents/original is the Rust front's (#2191, rust-project-reads.cjs, refused before
-    // authentication); the page reader stays here.
-    const docRead = p.match(/^\/api\/projects\/([^/]+)\/documents\/pages$/);
-    if (docRead && req.method === 'GET') {
-      const id = decodeURIComponent(docRead[1]);
-      const project = getProject(id);
-      const file = project?.files?.find(f => f.name === url.searchParams.get('name'));
-      if (!file?.document) return json(res, 404, { error: 'no such document' });
-      try {
-        const start = Number(url.searchParams.get('startPage') || 1);
-        return json(res, 200, documentSources.readPages(currentWorkspace(), id, file, start,
-          Number(url.searchParams.get('endPage') || start), Number(url.searchParams.get('offset') || 0)));
-      } catch (err) { return json(res, err.status || 422, { error: err.status ? err.message : 'Saved document data is unavailable; upload or refresh again.' }); }
-    }
+    // GET .../documents/original (#2191, rust-project-reads.cjs) and GET .../documents/pages (#2191
+    // round 4, rust-project-document-pages.cjs) are the Rust front's, refused before authentication.
 
     // #1805: plan a folder import. The client sends the folder's manifest (relative path, size,
     // SHA-256 of each file); the answer says which files will be uploaded, which are unchanged since

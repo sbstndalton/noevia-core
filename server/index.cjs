@@ -1303,6 +1303,8 @@ async function handleRequestInner(req, res) {
   // And a project's create and delete (#2191 round 2): POST /api/projects, DELETE /api/projects/{id}.
   if (require('./rust-project-lifecycle.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   if (require('./rust-project-files.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
+  // And a stored document's page reader (#2191 round 4).
+  if (require('./rust-project-document-pages.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   await readyFeatures();
   const preAuth = requestAuth.authenticate(req);
   // accountRole: a device token acts as a member, but its account's workspace is the same one.

@@ -98,13 +98,16 @@ test('authenticated upload persists metadata/original/pages and config cannot fo
   // #2191: the original's download is the Rust front's (Node refuses it); what it serves is stored here.
   assert.equal((await request(docUrl(p.id, 'original'), { headers: { cookie } })).status, 503);
   assert.deepEqual(stored.documentOriginal(testDataDir, p.id, 'statement.pdf').bytes, fixture('mixed-pages.pdf'));
-  const read = await request(docUrl(p.id, 'pages') + '&startPage=2', { headers: { cookie } });
+  // #2191 round 4: the page reader is the Rust front's too (Node refuses it); what it reads is stored here.
+  assert.equal((await request(docUrl(p.id, 'pages'), { headers: { cookie } })).status, 503);
+  const pagesOf = (name, query) => stored.documentPages(testDataDir, p.id, `name=${encodeURIComponent(name)}${query}`);
+  const read = pagesOf('statement.pdf', '&startPage=2');
   assert.equal(read.status, 200); assert.match(read.text, /ocr-needed/);
   await post(`/api/projects/${p.id}/config`, { files: [{ name: 'statement.pdf', content: 'forged text', document: { byteHash: '../outside', state: 'ready' } }] });
-  const preserved = await request(docUrl(p.id, 'pages') + '&startPage=1', { headers: { cookie } });
+  const preserved = pagesOf('statement.pdf', '&startPage=1');
   assert.match(preserved.text, /TEXT-P1/); assert.doesNotMatch(preserved.text, /forged text/);
   for (const suffix of ['&startPage=0', '&startPage=1&endPage=6', '&offset=-1', '&startPage=2&endPage=1']) {
-    assert.equal((await request(docUrl(p.id, 'pages') + suffix, { headers: { cookie } })).status, 400);
+    assert.equal(pagesOf('statement.pdf', suffix).status, 400);
   }
   await post(`/api/projects/${p.id}/config`, { files: [] });
   assert.equal(stored.documentOriginal(testDataDir, p.id, 'statement.pdf').status, 404);
@@ -118,7 +121,7 @@ test('legacy PDF upload also saves failures, originals and explicit stale state'
   assert.equal(refused.status, 409); assert.equal(JSON.parse(refused.text).code, 'sourceExists'); // #1454: never a silent replace
   const failed = JSON.parse((await legacy(fixture('encrypted.pdf'), true)).text);
   assert.equal(failed.document.state, 'failed'); assert.equal(failed.document.stale, true);
-  const pages = await request(docUrl(p.id, 'pages'), { headers: { cookie } });
+  const pages = stored.documentPages(testDataDir, p.id, 'name=statement.pdf');
   assert.match(pages.text, /STALE/); assert.match(pages.text, /TEXT-P1/);
   assert.deepEqual(stored.documentOriginal(testDataDir, p.id, 'statement.pdf').bytes, fixture('encrypted.pdf'));
 });
@@ -127,12 +130,14 @@ test('document originals and pages are inaccessible to another authenticated use
   const p = await project('Owner-only PDF');
   await upload(p.id, 'statement.pdf', fixture('text.pdf'));
   const otherProject = await project('Empty project');
-  // #2191: the original is the Rust front's (its owner-only scope: noevia-rs tests/project_reads.rs).
-  assert.equal((await request(docUrl(otherProject.id, 'pages'), { headers: { cookie } })).status, 404);
-  assert.equal((await request(docUrl(p.id, 'pages'))).status, 401);
+  // #2191: the original and (round 4) the pages are the Rust front's, refused here whoever asks; their
+  // owner-only scope is tested there (noevia-rs tests/project_reads.rs). The stored result is per project.
+  assert.equal(stored.documentPages(testDataDir, otherProject.id, 'name=statement.pdf').status, 404);
+  assert.equal(stored.documentPages(testDataDir, p.id, 'name=statement.pdf').status, 200);
+  assert.equal((await request(docUrl(p.id, 'pages'))).status, 503);
   assert.equal((await request(docUrl(p.id, 'original'))).status, 503);
   const otherCookie = seedAccount(testDataDir, { username: 'reader', displayName: 'Reader', role: 'member' }).cookie;
-  assert.equal((await request(docUrl(p.id, 'pages'), { headers: { cookie: otherCookie } })).status, 404);
+  assert.equal((await request(docUrl(p.id, 'pages'), { headers: { cookie: otherCookie } })).status, 503);
 });
 
 

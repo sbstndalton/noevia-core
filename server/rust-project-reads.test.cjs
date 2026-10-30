@@ -86,7 +86,7 @@ async function request(url, { method = 'GET', headers = {}, body } = {}) {
   return { status: res.statusCode, headers: out, text, json: parsed };
 }
 
-test('through the router: the owned GETs are refused signed out and signed in; the page reader still runs here', async () => {
+test('through the router: the owned GETs are refused signed out and signed in; Node\'s gate still runs for the rest', async () => {
   const admin = seedAccount(dataDir, { username: 'reads-admin', displayName: 'Synthetic', role: 'admin', publicOrigin: 'http://localhost' });
   const member = seedAccount(dataDir, { username: 'reads-member', displayName: 'Synthetic', role: 'member' });
   const as = (a) => ({ cookie: a.cookie, origin: 'http://localhost', 'x-csrf-token': a.csrf });
@@ -99,9 +99,8 @@ test('through the router: the owned GETs are refused signed out and signed in; t
       assert.equal(r.headers['x-content-type-options'], 'nosniff', url);
     }
   }
-  // Positive controls: Node's gate and its page reader.
-  assert.equal((await request('/api/projects/p1/documents/pages?name=a.pdf')).status, 401, 'signed out');
-  const pages = await request('/api/projects/p1/documents/pages?name=a.pdf', { headers: as(admin) });
-  assert.deepEqual([pages.status, pages.json], [404, { error: 'no such document' }]);
+  // Positive controls: Node's gate (the page reader is the front's since #2191 round 4,
+  // rust-project-document-pages.test.cjs).
+  assert.equal((await request('/api/projects/p1/documents', { method: 'POST', body: '{}' })).status, 401, 'signed out');
   assert.equal((await request('/api/projects/p1/sources/text', { method: 'POST', headers: as(admin), body: '{}' })).status, 404);
 });
