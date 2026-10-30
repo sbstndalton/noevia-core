@@ -75,8 +75,12 @@ test('a member who has not finished onboarding gets no administrator or global m
   const features = await request('/api/admin/features', { method: 'GET', headers: headers(member), body: '' });
   assert.equal(features.status, 503, '/api/admin/features');
   assert.equal(JSON.parse(features.text).code, 'RUST_FEATURES_OWNED');
-  for (const url of ['/api/models/download', '/api/models/preset/suggest?model=synthetic', '/api/models/calibration', '/api/models/calibration/cancel', '/api/models/presets/reload', '/api/model-manager/sections', '/api/model-manager/backends/cowork-llama-1/logs']) {
-    const method = url.startsWith('/api/models/preset/suggest') || url.endsWith('/logs') ? 'GET' : 'POST';
+  // GET of the preset suggestion is the Rust front's (#2189): Node refuses it whoever asks.
+  const suggestion = await request('/api/models/preset/suggest?model=synthetic', { method: 'GET', headers: headers(member), body: '' });
+  assert.equal(suggestion.status, 503);
+  assert.equal(JSON.parse(suggestion.text).code, 'RUST_MODEL_SIZING_OWNED');
+  for (const url of ['/api/models/download', '/api/models/calibration', '/api/models/calibration/cancel', '/api/models/presets/reload', '/api/model-manager/sections', '/api/model-manager/backends/cowork-llama-1/logs']) {
+    const method = url.endsWith('/logs') ? 'GET' : 'POST';
     assert.equal((await request(url, { method, headers: headers(member), body: method === 'POST' ? '{}' : '' })).status, 403, url);
   }
   assert.equal((await request('/api/providers', { method: 'POST', headers: headers(member), body: JSON.stringify({ label: 'Forbidden shared', baseUrl: 'https://example.test', shared: true }) })).status, 403);
