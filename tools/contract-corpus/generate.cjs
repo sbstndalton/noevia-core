@@ -189,6 +189,10 @@ async function main() {
     const createRefused = await step(admin, 'POST', '/api/projects', projectBody, [503]);
     if (createRefused.json?.code !== 'RUST_PROJECT_LIFECYCLE_OWNED') throw new Error('Expected the Rust project lifecycle ownership refusal.');
     const projectId = createProjectAs(dataDir, seeded.admin.id, projectBody).id;
+    // The recorder numbers an id once it has seen it as a value (a body or query field named like an id). The project
+    // list used to show it here; that read is the Rust front's, so a Node-owned read that names it does, and its
+    // later paths record as <id:N> rather than as the run's literal id (the double recording must be byte-equal).
+    await step(admin, 'GET', `/api/chats/search?projectId=${encodeURIComponent(projectId)}`, undefined, [200]);
     await step(admin, 'POST', `/api/projects/${encodeURIComponent(projectId)}/config`, { instructions: 'Answer very briefly.' });
 
     // A streamed chat turn against the mock model.
