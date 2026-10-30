@@ -1,7 +1,7 @@
 'use strict';
 // sbstndalton/noevia#2191 round 2: what the Rust front's project create needs of this process's
 // runtime state, published as UI_DATA_DIR/project-catalogue.json (noevia-rs crates/server-projects
-// lifecycle.rs `Catalogue`). MCP discovery runs here, so the toolbox ids a project may select
+// lifecycle.rs `Catalogue`; since round 9 also its configuration and instruction-skill routes). MCP discovery runs here, so the toolbox ids a project may select
 // (allToolboxes() without the connector boxes, which is what sanitizeToolboxes accepts) are known
 // here only; the default list and the project icons (contracts/project-icons.json) ride along so
 // both processes validate one list.
@@ -14,8 +14,11 @@ const path = require('node:path');
 
 const FILE = 'project-catalogue.json';
 
-function catalogueOf({ selectable, defaults, icons }) {
-  return { version: 1, selectable: [...selectable], defaults: [...defaults], icons: [...icons] };
+// `known` (#2191 round 9) is every toolbox id the server offers, the connector boxes included
+// (allToolboxes()): the instruction skills the front lists and resolves judge a skill's `requires`
+// against it, while `selectable` is what a project may pick (sanitizeToolboxes).
+function catalogueOf({ selectable, defaults, icons, known = selectable }) {
+  return { version: 1, selectable: [...selectable], defaults: [...defaults], icons: [...icons], known: [...known] };
 }
 
 function createCataloguePublisher({ dataDir, current, warn = console.warn }) {

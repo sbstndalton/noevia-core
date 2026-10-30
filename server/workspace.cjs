@@ -61,7 +61,7 @@ function openProviderKey(row, secrets) {
 // and answer its failure (index.cjs). A failed save leaves memory ahead of the disk: the workspace
 // is then dropped from the cache (the next request reads the files again) and every save still
 // queued on it fails too, so nothing of the failed change reaches the disk later.
-function createWorkspaceStore(rootDir, defaultProvider, secrets, { projectStore = null, onStoreSave = () => {}, onProjectsChanged = () => {} } = {}) {
+function createWorkspaceStore(rootDir, defaultProvider, secrets, { projectStore = null, onStoreSave = () => {}, onProjectsChanged = () => {}, userExists = () => true, now = Date.now } = {}) {
   // #1071: there is no local writer of projects.json or free-chats.json to fall back to.
   if (!projectStore) throw new Error('createWorkspaceStore needs the Rust project store (projectStore): Node never writes projects.json or free-chats.json itself');
   // Per-user workspaces are cached, but shared providers are NEVER baked
@@ -128,6 +128,15 @@ function createWorkspaceStore(rootDir, defaultProvider, secrets, { projectStore 
 
   function get(userId, { claim = false, claimTransaction = null } = {}) {
     if (removed.has(userId)) throw Object.assign(new Error('account no longer exists'), { status: 410 });
+    // The Rust front deletes accounts (rust-admin-users.cjs): it removes the row and then the folder, and tells
+    // this process nothing else. A workspace held for a folder that is gone is revoked and read again; a
+    // workspace is never made for a user the database no longer has (a background writer holding an old id).
+    const held = cache.get(userId);
+    if (held && held.folderGone()) { held.revoked = true; cache.delete(userId); }
+    if (!cache.has(userId) && !userExists(userId)) {
+      removed.add(userId);
+      throw Object.assign(new Error('account no longer exists'), { status: 410 });
+    }
     if (claim && legacyClaim.needsClaim(rootDir, userId)) {
       const runClaim = () => claimLegacy(userId);
       if (claimTransaction) claimTransaction(runClaim);
@@ -251,7 +260,23 @@ function createWorkspaceStore(rootDir, defaultProvider, secrets, { projectStore 
       userId, dir, projects,
       projectsFile,
       freeChatsFile,
-      revoked: false,
+      // Revoked by this process (a removal it knows of), or because the account's folder is gone: the Rust
+      // front removes it when it deletes the account, so a turn in flight stops writing and nothing here makes
+      // the folder again. The folder is looked at at most every 250 ms, and a folder seen gone stays gone.
+      removed: false,
+      folderGone: (() => {
+        let checked = 0, gone = false;
+        return () => {
+          if (gone) return true;
+          const now = Date.now();
+          if (now - checked < 250) return false;
+          checked = now;
+          try { gone = !fs.statSync(dir).isDirectory(); } catch (e) { gone = !!e && e.code === 'ENOENT'; }
+          return gone;
+        };
+      })(),
+      get revoked() { return this.removed || this.folderGone(); },
+      set revoked(value) { this.removed = !!value; },
       /** #1264: the project-store saves still in flight (a promise), or null. */
       pendingStoreWrites() { return storeQueue.pending(); },
       /** #1264: the error of a store save that failed on this view (it is then dropped), or null. */
@@ -394,7 +419,33 @@ function createWorkspaceStore(rootDir, defaultProvider, secrets, { projectStore 
     }
     return done;
   }
-  return { get, remove, claimLegacy, userDir, migrateSourceText, isRemoved: (userId) => removed.has(userId) };
+  // Whether this process must stop working for an account: removed by it, or no longer in the auth database. The Rust
+  // front deletes accounts and tells this process nothing, so the database is asked (#2191 round 9), but not on every
+  // call: rag asks once per chunk, so an "exists" answer is kept for USER_CHECK_MS. "Gone" is latched, like remove(),
+  // and revokes a workspace held for the account at once. An unreadable database is not an answer: the account counts
+  // as there, and the next call asks again.
+  const USER_CHECK_MS = 1000;
+  const checkedAt = new Map();
+  function isRemoved(userId) {
+    if (removed.has(userId)) return true;
+    const t = now();
+    const last = checkedAt.get(userId);
+    if (last !== undefined && t >= last && t - last < USER_CHECK_MS) return false;
+    let exists = true;
+    try { exists = !!userExists(userId); } catch { return false; }
+    if (exists) {
+      if (checkedAt.size >= 4096) checkedAt.clear();
+      checkedAt.set(userId, t);
+      return false;
+    }
+    checkedAt.delete(userId);
+    removed.add(userId);
+    const held = cache.get(userId);
+    if (held) held.revoked = true;
+    cache.delete(userId);
+    return true;
+  }
+  return { get, remove, claimLegacy, userDir, migrateSourceText, isRemoved };
 }
 
 module.exports = { createWorkspaceStore, atomicJson };

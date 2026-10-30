@@ -48,13 +48,10 @@ test('other path shapes are not refused', () => {
   assert.equal(refuse(pages, 'GET', '//['), null);
 });
 
-test('the dead Node handlers are gone; the one library function the Node routes use stays', () => {
+test('the dead Node handlers and the plugin directory library are gone', () => {
   assert.equal(fs.existsSync(path.join(__dirname, 'routes', 'public-pages.cjs')), false);
   assert.equal(fs.existsSync(path.join(__dirname, 'plugin-starters.json')), false);
-  const lib = require('./routes/plugin-directory.cjs');
-  assert.equal(lib.createPluginDirectoryRoutes, undefined);
-  assert.equal(typeof lib.fetchPublishedSkill, 'function');
-  for (const gone of ['mcpItems', 'findRegistryServer', 'installable', 'fallbackServerName', 'RESERVED_HEADERS']) assert.equal(lib[gone], undefined, gone);
+  assert.equal(fs.existsSync(path.join(__dirname, 'routes', 'plugin-directory.cjs')), false, 'its last functions moved with the install route and the admin directory');
   const device = fs.readFileSync(path.join(__dirname, 'routes', 'device-auth.cjs'), 'utf8');
   assert.equal(device.includes('isDevicePage'), false);
 });

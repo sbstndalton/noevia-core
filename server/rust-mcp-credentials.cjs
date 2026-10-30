@@ -168,11 +168,6 @@ function createMcpCredentials({ broker, dataDir, fs = require('node:fs') }) {
       const r = await broker.mcpForgetServer(serverId);
       if (!r.ok) throw refusalError(r);
     },
-    /** A deleted account takes its own sign-ins and keys with it. */
-    async forgetUser(userId) {
-      const r = await broker.mcpForgetUser(userId);
-      if (!r.ok) throw refusalError(r);
-    },
   };
 
   const keys = {

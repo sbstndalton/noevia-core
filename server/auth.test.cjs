@@ -153,10 +153,12 @@ test('empty SSE fallback refuses redirects and reconstructs split SSE lines', as
   assert.match(split.text, /split answer/);
 });
 
-test('large authenticated request is bounded before JSON parsing', async () => {
-  // POST /api/projects is the Rust front's (#2191 round 2); the config route reads with the same default cap.
+test('a large authenticated request to a route the front owns is refused before its body is read', async () => {
+  // POST /api/projects and the config route are the Rust front's (#2191 rounds 2 and 9; their 413 is tested in
+  // noevia-rs): Node answers 503 without reading the body.
   const result = await request('/api/projects/p1/config', {method:'POST', headers:adminHeaders, body:'x'.repeat(1024*1024+1)});
-  assert.equal(result.status, 413);
+  assert.equal(result.status, 503);
+  assert.equal(JSON.parse(result.text).code, 'RUST_PROJECT_CONFIG_OWNED');
 });
 
 test('diary file routes require auth and forward conflicts without losing the error', async (t) => {

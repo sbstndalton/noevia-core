@@ -138,9 +138,11 @@ test('#786: a JSON body of null is a 400 on every route that reads its body', as
   const storage = await request('/api/integrations/storage', { method: 'PUT', headers: writeHeaders(), body: 'null' });
   assert.equal(storage.status, 503);
   assert.equal(JSON.parse(storage.text).code, 'RUST_STORAGE_CONNECTION_OWNED');
-  // A well-formed body is unaffected.
+  // A project's config is the front's too (#2191 round 9; its null-body 500 and well-formed saves are tested in
+  // noevia-rs config.rs): Node refuses it before reading the body, so neither reaches a handler here.
   const control = createProjectAs(testDataDir, adminId, { name: 'Synthetic null-body control' });
-  assert.equal((await request(`/api/projects/${control.id}/config`, { method: 'POST', headers: writeHeaders(), body: JSON.stringify({ pinned: true }) })).status, 200);
+  const config = await request(`/api/projects/${control.id}/config`, { method: 'POST', headers: writeHeaders(), body: 'null' });
+  assert.deepEqual([config.status, JSON.parse(config.text).code], [503, 'RUST_PROJECT_CONFIG_OWNED']);
 });
 
 // #786 (a null body is a 400 on the connector endpoint and on the connector credentials) moved with the

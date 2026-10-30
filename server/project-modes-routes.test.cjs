@@ -76,13 +76,10 @@ test('projects are Chat projects; an old client sending modes is accepted, norma
   assert.deepEqual(plain.modes, ['chat']);
   const code = createProjectAs(testDataDir, frontUserId, { name: 'Synthetic C++', modes: ['code'] });
   assert.deepEqual(code.modes, ['chat', 'code']);
-  // The create's own normalisation and its 400s are the Rust front's (noevia-rs lifecycle.rs tests).
+  // The create's own normalisation and its 400s are the Rust front's (noevia-rs lifecycle.rs tests), and so
+  // is the config route's (config.rs: modes normalised, garbage refused; #2191 round 9).
   const patched = await post(`/api/projects/${plain.id}/config`, { modes: ['code', 'cowork'] });
-  assert.equal(patched.status, 200);
-  // The saved project, as the store left it (the list, GET /api/workspace, is the Rust front's).
-  const saved = JSON.parse(fs.readFileSync(path.join(testDataDir, 'users', frontUserId, 'projects.json'), 'utf8'));
-  assert.deepEqual(saved.projects.find((p) => p.id === plain.id).modes, ['chat', 'cowork', 'code']);
-  assert.equal((await post(`/api/projects/${plain.id}/config`, { modes: 'chat' })).status, 400);
+  assert.deepEqual([patched.status, JSON.parse(patched.text).code], [503, 'RUST_PROJECT_CONFIG_OWNED']);
 });
 
 test('a project once saved without Chat no longer refuses chat turns (#1576)', async () => {

@@ -78,7 +78,7 @@ test('the Node duplicates are gone', () => {
   for (const gone of ['connector(', 'connectors(', "'/api/diary/exchanges'", "'/api/diary/storage-status'", 'diaryConnectors', 'connectorRate', 'readObject', 'automaticStorage', 'diary-jobs.cjs']) {
     assert.equal(routes.includes(gone), false, gone);
   }
-  assert.equal(read('routes', 'projects.cjs').includes("'/api/diary/context' &&"), false);
+  assert.equal(fs.existsSync(path.join(__dirname, 'routes', 'projects.cjs')), false, 'no project route file is left (#2191 round 9), so no Diary context handler in it');
   const jobs = require('./diary-jobs.cjs');
   assert.deepEqual(Object.keys(jobs).sort(), ['SIGNAL', 'start', 'validDay'], 'list and acknowledge are the front\'s');
   const connectors = require('./diary-connectors.cjs');

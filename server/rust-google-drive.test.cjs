@@ -178,7 +178,7 @@ const publish = (dir, doc) => fs.writeFileSync(path.join(dir, gdrive.SIGNAL_FILE
 
 function harness({ answers = [], fetchAnswers = [] } = {}) {
   const dir = temp();
-  const calls = { session: [], reject: [], forget: [], fetch: [] };
+  const calls = { session: [], reject: [], fetch: [] };
   const broker = {
     async gdriveSession(user, admin, rejected) {
       calls.session.push({ user, admin, rejected });
@@ -187,7 +187,6 @@ function harness({ answers = [], fetchAnswers = [] } = {}) {
       return a || { ok: true, session: { accessToken: `tok-${calls.session.length}`, expiresAt: Date.now() + 3_000_000, generation: 'g'.repeat(64) } };
     },
     async gdriveReject(user, admin, generation) { calls.reject.push({ user, admin, generation }); return { ok: true, dropped: true }; },
-    async gdriveForget(user) { calls.forget.push(user); return { ok: true }; },
   };
   const fetchImpl = async (url, init) => {
     calls.fetch.push({ url, auth: init.headers.Authorization });
@@ -318,14 +317,9 @@ test('the broker\'s refusals reach the tool in people\'s words, and an unreachab
   assert.doesNotMatch(MESSAGES.unavailable, /not connected/i);
 });
 
-test('removing an account never throws', async () => {
-  const { accounts, calls, warnings } = harness();
-  await accounts.removeUser(B);
-  assert.deepEqual(calls.forget, [B]);
-  const refusing = createDriveAccounts({ broker: { gdriveForget: async () => ({ ok: false, status: 503 }) }, dataDir: temp(), warn: (m) => warnings.push(m) });
-  await refusing.removeUser(B);
-  assert.equal(warnings.length, 1);
-  assert.doesNotMatch(warnings[0], new RegExp(B));
+test('forgetting an account is the front\'s: the Drive accounts keep no removeUser', () => {
+  const { accounts } = harness();
+  assert.equal(accounts.removeUser, undefined, 'the front forgets a deleted account\'s connection itself (#2190, #2191 round 9)');
 });
 
 // ── the internal store client ────────────────────────────────────────────────────────────────
@@ -356,7 +350,7 @@ test('the store client speaks the broker\'s operations and maps its answers', as
     assert.deepEqual(await client.gdriveReject(B, false, 'gen'), { ok: true, dropped: true });
     reply = { status: 200, body: { ok: true, state: 'disconnected' } };
     assert.deepEqual(await client.gdriveDisconnect(B, false), { ok: true });
-    assert.deepEqual(await client.gdriveForget(B), { ok: true });
+    assert.equal(client.gdriveForget, undefined, 'the front forgets a deleted account\'s connection itself');
     reply = { status: 200, body: { current: 1, rotated: 2, empty: 0, failed: 0 } };
     assert.deepEqual(await client.gdriveReseal(), { ok: true, counts: { current: 1, rotated: 2, empty: 0, failed: 0 } });
     assert.deepEqual(seen.at(-1), { url: '/v1/gdrive/reseal', token: 'synthetic-store-token-0123456789abcdef', body: {} });

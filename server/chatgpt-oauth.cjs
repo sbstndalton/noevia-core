@@ -369,7 +369,7 @@ function upstreamMessage(text, status) {
  * @param {object} deps
  * @param {{ exec(sql:string):void, prepare(sql:string):any }} deps.db   the auth database (read-only use)
  * @param {object} deps.broker   project-store-client.cjs: chatgptSession, chatgptReject, chatgptCatalogue,
- *                               chatgptDisconnect, chatgptForget
+ *                               chatgptDisconnect
  * @param {() => string} [deps.signal]   the broker's change signal (fileSignal of chatgpt-token-changes.json)
  * @param {typeof fetch} [deps.fetchImpl]
  * @param {() => number} [deps.now]
@@ -415,11 +415,6 @@ function createChatGptOAuth({ db, broker, signal = () => '', fetchImpl = (...arg
   async function disconnect(userId) {
     sessions.delete(String(userId));
     const r = await broker.chatgptDisconnect(String(userId));
-    if (!r || !r.ok) throw brokerError(r);
-  }
-  async function forgetUser(userId) {
-    sessions.delete(String(userId));
-    const r = await broker.chatgptForget(String(userId));
     if (!r || !r.ok) throw brokerError(r);
   }
 
@@ -538,7 +533,7 @@ function createChatGptOAuth({ db, broker, signal = () => '', fetchImpl = (...arg
     };
   }
 
-  return { status, disconnect, forgetUser, session, fetchFor };
+  return { status, disconnect, session, fetchFor };
 }
 /** The private provider row that points chats at this account. No credential lives in it. */
 function providerRow() {

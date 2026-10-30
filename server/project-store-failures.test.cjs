@@ -12,7 +12,6 @@ const psc = require('./project-store-client.cjs');
 const http = require('./http.cjs');
 const { createWorkspaceStore } = require('./workspace.cjs');
 const { createProjectStore } = require('./projects.cjs');
-const { createProjectRoutes } = require('./routes/projects.cjs');
 const { createChatListRoutes } = require('./routes/chat-lists.cjs');
 const { createStubStore } = require('../tests/server/project-store-stub.cjs');
 
@@ -53,7 +52,6 @@ function harness({ projects = [], free = [], rag = {} } = {}) {
     reasoningEffort: {}, projectAppearance: () => ({}), rag: ragImpl, storageClient: { isBrowsable: () => false }, documentSources: { prune() {}, directory: (w, id) => path.join(w.dir, 'docs', id) },
     authService: { getStorage: () => ({ kind: 'local' }) }, PROJECT_ROOT_FOLDER: 'Projects', createProjectFolder: async () => null, projectSweep: { afterDelete: async () => [] },
   });
-  const projectRoutes = createProjectRoutes({ rag: ragImpl, projectAppearance: () => ({}), reasoningEffort: { validEffort: () => true }, json: http.json, readBody: http.readBody, readJson: http.readJson, store, PROJECTS, currentWorkspace, DEFAULT_TOOLBOXES: ['core'], diaryExtras: require('./diary-extras.cjs'), fs, path });
   const chatRoutes = createChatListRoutes({ json: http.json, readBody: http.readBody, currentWorkspace, PROJECTS, FREE_CHATS, diaryExtras: { internalProject: () => false }, crypto: require('node:crypto'),
     STORED_HISTORY_BYTES: 1, STORED_HISTORY_CAP: 1, chatLists: () => ({ freeChats: [], projects: [] }), removeChat: () => false, store });
   /** One request as index.cjs runs it: its saves counted, its answer held. */
@@ -73,7 +71,7 @@ function harness({ projects = [], free = [], rag = {} } = {}) {
       const request = { method, headers: {}, async *[Symbol.asyncIterator]() { if (reqBody !== null) yield Buffer.from(JSON.stringify(reqBody)); } };
       const ctx = { path: p, authn: { user: { id: USER, role: 'admin' } }, url: new URL(`http://h${p}`) };
       try {
-        if (!(await projectRoutes(request, res, ctx)) && !(await chatRoutes(request, res, ctx))) throw Error(`${p}: not handled`);
+        if (!(await chatRoutes(request, res, ctx))) throw Error(`${p}: not handled`);
       } catch (err) { const f = http.errorResponse(err); http.json(res, f.status, f.body); }
       ws.storeSaved = save;
     });
@@ -206,22 +204,9 @@ test('#1917: a chat turn\'s generated title is applied again to the view read af
   assert.equal(JSON.parse(fs.readFileSync(path.join(h.dir, 'free-chats.json'), 'utf8'))[0].forceLocal, true);
 });
 
-test('#1919: a deferred index removal spares a source of the same name uploaded again meanwhile', async () => {
-  const files = [{ name: 'a.md', content: 'old text' }];
-  for (const reupload of [true, false]) {
-    const h = harness({ projects: [{ id: 'p1', name: 'P', chats: [], files: JSON.parse(JSON.stringify(files)), instructionSkills: {} }] });
-    let release;
-    h.state.gate = new Promise((r) => { release = r; });
-    const pending = h.call('POST', '/api/projects/p1/config', { files: [] });
-    await new Promise((r) => setTimeout(r, 30)); // the route has saved; the write waits at the gate
-    if (reupload) h.wsStore.get(USER).projects[0].files.push({ name: 'a.md', content: 'new text' });
-    h.state.gate = null; release();
-    const answered = await pending;
-    assert.equal(answered.status, 200);
-    await new Promise((r) => setTimeout(r, 30));
-    assert.deepEqual(h.ragDeletes.filter((d) => d === 'p1/a.md'), reupload ? [] : ['p1/a.md'], reupload ? 'kept for the re-upload' : 'removed when nothing replaced it');
-  }
-});
+// #1919 (a deferred index removal spares a source of the same name uploaded again meanwhile): the config route that
+// removed the source is the Rust front's (#2191 round 9) and queues an `unindex` job; core's executor re-checks the list
+// (rust-index-outbox, index.cjs runJob) and noevia-rs config.rs tests the queueing.
 
 test('#1919: a background writer stops on an account removed meanwhile, and never makes its directory again', async () => {
   let finish;

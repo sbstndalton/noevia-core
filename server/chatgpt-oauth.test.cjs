@@ -234,14 +234,15 @@ test('a refused refresh marks the account "reconnect"; a transient one does not;
   assert.equal(f.oauth.status('user-a').state, 'connected', 'signing in again recovers');
 });
 
-test('forgetUser removes a deleted account through the broker; rotation covers the table', async (t) => {
+test('rotation covers the table; forgetting a deleted account is the front\'s (no forgetUser here)', async (t) => {
   const f = make(t);
   await connect(f);
   const tables = rotationTables({ db: f.db, dataDir: f.dir });
   const table = tables.find((x) => x.name === 'chatgpt_oauth_tokens');
   assert.ok(table, 'secrets rotation re-encrypts ChatGPT tokens');
   assert.deepEqual(table.rows().map((r) => r.userId), ['user-a'], 'bound rows rotate with their owner');
-  await f.oauth.forgetUser('user-a');
+  assert.equal(f.oauth.forgetUser, undefined);
+  await f.b.broker.chatgptDisconnect('user-a'); // the front\'s own removal of the row
   assert.equal(f.oauth.status('user-a').state, 'disconnected');
 });
 
@@ -539,7 +540,7 @@ test('this process holds no refresh token, writes no token row and keeps no devi
   const source = fs.readFileSync(require.resolve('./chatgpt-oauth.cjs'), 'utf8');
   assert.doesNotMatch(source, /refresh_token|refreshToken|deviceauth|secrets\.(en|de)crypt|INSERT INTO chatgpt_oauth_tokens|UPDATE chatgpt_oauth_tokens|DELETE FROM chatgpt_oauth_tokens/);
   const f = make(t);
-  assert.deepEqual(Object.keys(f.oauth).sort(), ['disconnect', 'fetchFor', 'forgetUser', 'session', 'status']);
+  assert.deepEqual(Object.keys(f.oauth).sort(), ['disconnect', 'fetchFor', 'session', 'status']);
   assert.equal(f.oauth.status('nobody').state, 'disconnected');
   f.db.prepare("INSERT INTO chatgpt_oauth_tokens(user_id,data_enc,state,updated_at) VALUES('user-r','enc:v2:x','reconnect',1)").run();
   assert.equal(f.oauth.status('user-r').state, 'reconnect');

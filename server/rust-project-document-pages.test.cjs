@@ -37,7 +37,7 @@ test('an owned request is refused with a 503; the rest falls through', () => {
 });
 
 test('the dead Node handler is gone; the chat tool keeps its page read', () => {
-  const routes = fs.readFileSync(path.join(__dirname, 'routes', 'projects.cjs'), 'utf8');
+  const routes = ''; assert.equal(fs.existsSync(path.join(__dirname, 'routes', 'projects.cjs')), false, 'no project route file is left (#2191 round 9)');
   assert.equal(routes.includes('docRead'), false);
   assert.equal(routes.includes('documentSources.readPages'), false);
   assert.equal(typeof require('./document-sources.cjs').readPages, 'function');
@@ -86,7 +86,7 @@ test('through the router: the page reader is refused signed out and signed in', 
     assert.deepEqual([r.status, r.json], [503, ROUTE_REFUSAL]);
     assert.equal(r.headers['x-content-type-options'], 'nosniff');
   }
-  // Positive control: the project config is still Node's (no such project); the document upload is the
+  // Positive control: the browser route (chat-bound) is still Node's (no such project; the config is the front's since round 9); the document upload is the
   // front's since round 5 (rust-project-documents.test.cjs).
-  assert.equal((await request('/api/projects/p1/config', { method: 'POST', headers: as(admin), body: {} })).status, 404);
+  assert.equal((await request('/api/projects/p1/browser', { method: 'POST', headers: as(admin), body: {} })).status, 404);
 });

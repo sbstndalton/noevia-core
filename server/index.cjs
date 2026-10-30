@@ -195,7 +195,9 @@ const workspaceStore = createWorkspaceStore(DATA_DIR, { id: DEFAULT_PROVIDER_ID,
   // M4: the front saved a project or free-chat write Node's request would have followed with a
   // mirror nudge (chat-vault-mirror.cjs mirrorTrigger: any successful write under /api/projects or
   // /api/freechats).
-  onProjectsChanged: (userId) => projectsChangedElsewhere(userId) });
+  onProjectsChanged: (userId) => projectsChangedElsewhere(userId),
+  // The Rust front deletes accounts (rust-admin-users.cjs): a workspace is never made for a user the database no longer has.
+  userExists: (userId) => !!authService.db.prepare('SELECT 1 FROM users WHERE id=?').get(userId) });
 
 // Per-user throttle for LLM-backed routes. Every hit is a full model call
 // against the shared inference endpoint, so one member (or a runaway client)
@@ -563,6 +565,7 @@ const projectCatalogue = require('./project-catalogue.cjs').createCataloguePubli
   dataDir: DATA_DIR,
   current: () => ({
     selectable: sanitizeToolboxes(allToolboxes().map((b) => b.id)) || [],
+    known: allToolboxes().map((b) => b.id),
     defaults: DEFAULT_TOOLBOXES,
     icons: Object.keys(require('../contracts/project-icons.json')),
   }),
@@ -1097,16 +1100,13 @@ const chatRoutes = require('./routes/chat.cjs').createChatRoutes({
   },
 });
 
-// Project configuration and the Diary context (routes/projects.cjs); uploads, documents and the folder sync are the front's (#2191).
+// A project's configuration and instruction skills, its uploads, documents and folder sync, the Diary context and an
+// account's deletion are the Rust front's (#2191, #2190): there is no project route mount left here.
 // #1429: one hold per account, shared with the front's project source refresh and this process's Diary backup worker.
 // sbstndalton/noevia#2190: the Rust front's folder write and connection test prove a saved login
 // through storage-login-proofs.json, re-read when it changes.
 // #2191 round 8: the hold is UI_DATA_DIR/storage-latch.db, shared with the front's project source sync.
 const storageLatch = require('./storage-latch.cjs').createStorageLatch({ file: require('node:path').join(DATA_DIR, 'storage-latch.db'), proofOf: require('./rust-storage-integrations.cjs').createProofReader(DATA_DIR) });
-const projectRoutes = require('./routes/projects.cjs').createProjectRoutes({
-  json, readBody, readJson, requestScope, dispatch: (req, res) => handleRequestScoped(req, res), currentWorkspace, authService, storageClient, documents, documentSources, rag, fs, path,
-  reasoningEffort, projectAppearance, diaryExtras, PROJECTS, DEFAULT_TOOLBOXES, sanitizeToolboxes, allToolboxes, getProvider, ensureRolesLoaded, servedCatalogue, DEFAULT_PROVIDER_ID, store: projectStore,
-});
 // What is left of the provider registry's mount (routes/providers.cjs): the registry itself is the
 // Rust front's (rust-providers.cjs), so this answers only the other methods on the Sign in with
 // ChatGPT paths (chatgptOAuth, built beside mcpOAuth above) and refuses a bypass.
@@ -1179,8 +1179,7 @@ const deviceAuth = require('./device-auth.cjs').createDeviceAuth({
 const requestAuth = require('./device-auth.cjs').createRequestAuth({ enabled: nativeClientAuth, deviceAuth, authService });
 const deviceRoutes = require('./routes/device-auth.cjs').createDeviceAuthRoutes({ json, enabled: nativeClientAuth });
 const authRoutes = require('./routes/auth.cjs').createAuthRoutes({
-  json, readJson, authService, workspaceStore, driveAccounts, fetchJson, DIARY_BASE, DIARY_TOKEN, diaryTenantHeaders: diary.tenantHeaders,
-  mcpOAuth, chatgptOAuth,
+  json, readJson,
   // POST /api/admin/secrets/rotate (CSRF-checked by the router like every signed-in POST).
   // The provider files, the MCP credentials and the Google Drive token files are the front's: it re-seals them in
   // that order, each awaited (providers and MCP: a throw stops the rotation; Drive: soft), before the rest here.
@@ -1286,6 +1285,10 @@ async function handleRequestInner(req, res) {
   if (require('./rust-source-jobs.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   // And the project source operations themselves: the upload, the folder sync and the folder import's plan (#2191 round 8).
   if (require('./rust-project-source-work.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
+  // And a project's configuration, its instruction skills and a published skill's install (#2191 round 9).
+  if (require('./rust-project-config.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
+  // And an account's deletion, complete (#2190, #2191 round 9): DELETE /api/admin/users/{id}.
+  if (require('./rust-admin-users.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   // And the two read-only sizing reads (#2189): GET /api/models/estimate and /api/models/preset/suggest.
   if (require('./rust-model-sizing.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   // #2190: the public pages and the device approval page, and the plugin directory.
@@ -1378,7 +1381,6 @@ async function handleRequestScoped(req, res) {
     if (authn && p.startsWith('/api/projects/') && await researchRoutes(req, res, { path: p, authn })) return;
     if (authn && (p === '/api/code/active' || p.startsWith('/api/projects/')) && await codeRoutes(req, res, { path: p, authn })) return;
     if (authn && p.startsWith('/api/projects/') && await browserRoutes(req, res, { path: p, authn })) return;
-    if (await projectRoutes(req, res, { path: p, authn, url })) return;
     if (await authRoutes.account(req, res, { path: p, authn })) return;
     if (await storageRoutes(req, res, { path: p, authn })) return;
     if (await approvalRoutes(req, res, { path: p, authn })) return;

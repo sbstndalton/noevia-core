@@ -46,7 +46,7 @@ test('Node keeps no copy of the operations, no worker call and no in-memory file
   for (const gone of ['source-work.cjs', 'folder-import.cjs', 'pdf-reduce.cjs']) {
     assert.equal(fs.existsSync(path.join(__dirname, gone)), false, gone);
   }
-  const routes = fs.readFileSync(path.join(__dirname, 'routes', 'projects.cjs'), 'utf8');
+  const routes = ''; assert.equal(fs.existsSync(path.join(__dirname, 'routes', 'projects.cjs')), false, 'no project route file is left (#2191 round 9)');
   for (const needle of ['x-noevia-source-work', 'application/x-ndjson', "require('../source-work.cjs')", "require('../folder-import.cjs')", "require('../pdf-reduce.cjs')", 'projUpload', 'projSync', 'folderPlan']) {
     assert.equal(routes.includes(needle), false, needle);
   }

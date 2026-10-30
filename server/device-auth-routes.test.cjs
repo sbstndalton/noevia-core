@@ -160,14 +160,11 @@ test('scope limits: a device token never reaches administration or account secur
   const connectors = await asDevice(tokens.access, '/api/profile/diary-connectors', { method: 'POST', body: {} });
   assert.equal(connectors.status, 503);
   assert.equal(connectors.json.code, 'RUST_DIARY_ROUTES_OWNED');
-  const refused = [
-    ['DELETE', `/api/admin/users/${memberId}`, { username: 'memberqa' }],
-  ];
-  for (const [method, url, body] of refused) {
-    const r = await asDevice(tokens.access, url, { method, body });
-    assert.equal(r.status, 403, `${method} ${url} -> ${r.status}`);
-    assert.equal(r.json.code, 'browser_session_required', `${method} ${url}`);
-  }
+  // An account's deletion is the Rust front's too (#2190, #2191 round 9; its gate refuses device tokens on
+  // /api/admin with browser_session_required, and the front's handler is tested in noevia-rs).
+  const deletion = await asDevice(tokens.access, `/api/admin/users/${memberId}`, { method: 'DELETE', body: { username: 'memberqa' } });
+  assert.equal(deletion.status, 503);
+  assert.equal(deletion.json.code, 'RUST_ADMIN_USERS_OWNED');
   // The admin's own browser session still reads the administration routes Node answers, so the
   // refusals above are the device token's scope, not a closed route.
   assert.equal((await admin.read('/api/admin/offsite-backup')).status, 503, 'the admin session reaches the refusal, not a closed route');

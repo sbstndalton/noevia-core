@@ -75,13 +75,6 @@ function createFakeBroker({ db, now = () => Date.now() }) {
       bump();
       return { ok: true };
     },
-    async chatgptForget(user) {
-      calls.push({ op: 'forget', user });
-      db.prepare('DELETE FROM chatgpt_oauth_tokens WHERE user_id=?').run(user);
-      tokens.delete(user);
-      bump();
-      return { ok: true };
-    },
   };
   /** The front finished a device sign-in for `userId`. */
   function connect(userId, { accessToken = 'AT-1', accountId = 'acct-A', fedRamp = false, expiresAt = now() + 3_600_000 } = {}) {

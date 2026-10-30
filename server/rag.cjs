@@ -40,7 +40,7 @@ function makeRagFetch(extra = {}) {
 function setRagFetch(fn) { const prev = netFetch; netFetch = fn; return prev; }
 // #1762: the test seam (setRagFetch swaps the on-this-network fetch) is only exported under the test runner,
 // so production code cannot reach it (same rule as provider-egress.cjs).
-const testSeam = process.env.NODE_TEST_CONTEXT || process.env.NODE_ENV === 'test' ? { _test: { setRagFetch, makeRagFetch, rerankBackend, rerankState: () => rerank } } : {};
+const testSeam = process.env.NODE_TEST_CONTEXT || process.env.NODE_ENV === 'test' ? { _test: { setRagFetch, makeRagFetch, rerankBackend, rerankState: () => rerank, openIndex } } : {};
 // The reranker's backend, built here so a test can drive it without a chat. #1665: `backend` is
 // rerank-target.cjs's 'llamacpp' (POST /v1/rerank) or 'tei' (POST /rerank); both go through ragFetch.
 // #1638: `apiKey` comes from the reranker's effective environment (rerank-settings.cjs), which drops RERANK_API_KEY

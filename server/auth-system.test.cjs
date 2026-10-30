@@ -13,7 +13,8 @@ const { createStubStore } = require('../tests/server/project-store-stub.cjs');
 // Sign-in, invitations, recovery, disabling an account and first-run setup are the Rust front's
 // (sbstndalton/noevia#1071; noevia-rs crates/server-account). The accounts and their tokens are
 // written here through a separate connection, as the front writes them; what is tested is what
-// stays Node's: deleting an account, the origin check, and per-account workspaces.
+// stays Node's: the origin check, and per-account workspaces. Deleting an account is the front's too
+// since #2190/#2191 round 9 (crates/server-account delete.rs carries the deletion tests).
 const Database = require('better-sqlite3');
 const { seedAccount } = require('../tests/server/seed-account.cjs');
 const asFront = (root, fn) => { const db = new Database(path.join(root, 'cowork.db')); try { return fn(db); } finally { db.close(); } };
@@ -27,32 +28,13 @@ function deletionFixture(t) {
   return { root, auth, firstId, secondId };
 }
 
-test('deleting an administrator revokes issued invite/recovery tokens but preserves other users and audit history', t => {
-  const { root, auth, firstId, secondId } = deletionFixture(t);
-  const now = Date.now();
-  asFront(root, (db) => {
-    db.prepare('INSERT INTO invitations(token_hash,created_by,role,expires_at,created_at) VALUES(?,?,?,?,?)').run('synthetic-invite', secondId, 'member', now + 86400000, now);
-    db.prepare('INSERT INTO recoveries(token_hash,user_id,created_by,expires_at,created_at) VALUES(?,?,?,?,?)').run('synthetic-recovery', firstId, secondId, now + 3600000, now);
-    db.prepare("INSERT INTO audit_events(actor_user_id,target_user_id,action,detail,created_at) VALUES(?,NULL,'invite.create','{}',?)").run(secondId, now);
-  });
-  assert.equal(auth.deleteUser(firstId, secondId, 'wrong-name'), false);
-  assert.equal(auth.deleteUser(firstId, secondId, 'second'), true);
-  assert.deepEqual(auth.listUsers().map(u => u.id), [firstId]);
-  assert.equal(auth.db.prepare('SELECT count(*) AS n FROM invitations').get().n, 0, 'the invitation it issued is revoked');
-  assert.equal(auth.db.prepare('SELECT count(*) AS n FROM recoveries').get().n, 0, 'the recovery link it issued is revoked');
-  assert.equal(auth.db.prepare('SELECT count(*) AS n FROM sessions WHERE user_id=?').get(secondId).n, 0);
-  assert.equal(auth.db.prepare('SELECT count(*) AS n FROM sessions WHERE user_id=?').get(firstId).n, 1, 'the other account keeps its session');
-  assert.ok(auth.db.prepare("SELECT 1 FROM audit_events WHERE actor_user_id=? AND action='invite.create'").get(secondId));
-  assert.ok(auth.db.prepare("SELECT 1 FROM audit_events WHERE target_user_id=? AND action='user.delete'").get(secondId));
-});
-
-test('a disabled administrator cannot make deletion of the last active administrator safe', t => {
-  const { root, auth, firstId, secondId } = deletionFixture(t);
-  asFront(root, (db) => db.prepare('UPDATE users SET disabled_at=? WHERE id=?').run(Date.now(), secondId));
-  assert.throws(() => auth.deleteUser(firstId, firstId, 'first'), /last active administrator/);
-  assert.equal(auth.listUsers().length, 2);
-  assert.equal(auth.deleteUser(firstId, secondId, 'second'), true);
-  assert.throws(() => auth.deleteUser(firstId, firstId, 'first'), /last active administrator/);
+test('deleting an account is the Rust front\'s: Node has no deleteUser and its guard refuses any delete of users (#2190, #2191 round 9)', t => {
+  const { auth, firstId, secondId } = deletionFixture(t);
+  assert.equal(auth.deleteUser, undefined);
+  const owned = (e) => e && e.status === 503 && e.code === 'RUST_AUTH_OWNED';
+  assert.throws(() => auth.db.prepare('DELETE FROM users WHERE id=?').run(secondId), owned);
+  assert.throws(() => auth.rustAuth.exempt(() => auth.db.prepare('DELETE FROM users WHERE id=?').run(secondId)), owned, 'not even inside exempt()');
+  assert.deepEqual(auth.listUsers().map((u) => u.id), [firstId, secondId]);
 });
 
 test('the Diary preference is read per account, and workspaces are isolated', (t) => {

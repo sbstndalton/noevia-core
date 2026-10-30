@@ -99,18 +99,12 @@ test('policy: reads default to allow, writes to ask, and the table is read here 
   assert.equal(policy.mode(null, 'read_a', false), 'allow');
 });
 
-test('deleting an account asks the broker to revoke and forget its connection, and never throws', async () => {
-  const { dir, fixture, accounts } = setup();
+test('deleting an account is the front\'s: this process has no removeUser, and the front\'s forget shows through the state file', async () => {
+  const { fixture, accounts } = setup();
   await connect(fixture, member);
-  const before = google.state.revoked.length;
-  await accounts.removeUser('u-member');
-  assert.deepEqual(fixture.calls.forget, ['u-member']);
-  assert.equal(google.state.revoked.length, before + 1);
+  assert.equal(accounts.removeUser, undefined, 'the front revokes and forgets the connection itself (#2190, #2191 round 9)');
+  assert.equal(accounts.connected(member), true);
+  await fixture.broker.gdriveForget('u-member'); // what the front does when it deletes the account
+  assert.equal(accounts.connected(member), false, 'the broker\'s state file shows through, nothing here forgets it');
   assert.equal(fixture.refresh.has('u-member'), false);
-  // A broker that is down does not undo or fail the account's deletion.
-  const warned = [];
-  const down = createDriveAccounts({ broker: { gdriveForget: async () => { throw Object.assign(new Error('x'), { status: 503 }); } }, dataDir: dir, warn: (m) => warned.push(m) });
-  await down.removeUser('u-gone');
-  assert.equal(warned.length, 1);
-  assert.doesNotMatch(warned[0], /u-gone/, 'no account id in the warning');
 });
