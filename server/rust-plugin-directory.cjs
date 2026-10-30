@@ -6,9 +6,9 @@
 // path (405 for all but GET), so every method is refused here, before authentication, whoever
 // asks: a stale route table cannot make two processes answer.
 //
-// What stays in routes/plugin-directory.cjs is the library the Node-owned routes still use: the
-// registry lookup and item mapping for adding a directory MCP server (routes/mcp-directory.cjs)
-// and the SKILL.md fetch for a project skill (routes/projects.cjs).
+// What stays in routes/plugin-directory.cjs is the one function the Node-owned routes still use: the
+// SKILL.md fetch for a project skill (routes/projects.cjs). The registry lookup and item mapping for adding
+// a directory MCP server moved with the admin directory (sbstndalton/noevia#2202 round 2).
 const OWNED_PATHS = Object.freeze(['/api/plugins/directory']);
 const ROUTE_REFUSAL = Object.freeze({ error: 'The plugin directory is owned by the Rust front.', code: 'RUST_PLUGIN_DIRECTORY_OWNED' });
 

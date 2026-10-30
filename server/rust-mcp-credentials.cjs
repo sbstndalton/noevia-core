@@ -7,7 +7,8 @@
 //   GET /api/mcp-keys/servers, PUT|DELETE /api/mcp-keys/{id},
 //   GET /api/mcp-oauth/servers, POST /api/mcp-oauth/{id}/connect, DELETE /api/mcp-oauth/{id},
 //   GET /api/mcp-oauth/callback
-// and is the only writer of mcp_oauth_tokens, mcp_oauth_clients and directory_mcp_user_keys. Node
+// and is the only writer of mcp_oauth_tokens, mcp_oauth_clients and directory_mcp_user_keys (and, since round 2,
+// of directory_mcp_servers: rust-mcp-directory.cjs). Node
 // refuses exactly those methods on those paths before authentication (a stale route table cannot
 // make two processes answer), and its database guard (rust-auth.cjs FRONT_TABLES) refuses every
 // Node write of the three tables, even inside exempt(): there is no allowance, because the secrets
@@ -33,7 +34,8 @@ const ROUTES = Object.freeze([
   ['GET', /^\/api\/mcp-oauth\/callback$/],
 ]);
 const ROUTE_REFUSAL = Object.freeze({ error: 'MCP server keys and sign-ins are owned by the Rust front.', code: 'RUST_MCP_CREDENTIALS_OWNED' });
-const TABLES = Object.freeze(['mcp_oauth_tokens', 'mcp_oauth_clients', 'directory_mcp_user_keys']);
+// directory_mcp_servers is the directory itself (rust-mcp-directory.cjs): the rows, and the administrators' shared key slot.
+const TABLES = Object.freeze(['mcp_oauth_tokens', 'mcp_oauth_clients', 'directory_mcp_user_keys', 'directory_mcp_servers']);
 /** The file the broker rewrites (atomically, 0600) whenever who-is-ready changes. */
 const STATE_FILE = 'mcp-credential-state.json';
 const SCHEMA = `CREATE TABLE IF NOT EXISTS mcp_oauth_clients(server_id TEXT PRIMARY KEY, data_enc TEXT NOT NULL, updated_at INTEGER NOT NULL);
@@ -55,7 +57,8 @@ function refuseOwned(req, res, { parseRequestUrl, json }) {
   return true;
 }
 
-/** Node is the schema migrator: the three tables exist whichever process writes them. */
+/** Node is the schema migrator: the tables exist whichever process writes them (directory-mcp.cjs `migrate` makes
+ *  directory_mcp_servers). */
 function ensureSchema(db) {
   db.exec(SCHEMA);
 }

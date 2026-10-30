@@ -12,11 +12,10 @@
 // changed under a half-rotated registry. This process never writes either file, and so cannot
 // shift or overwrite a row the front deletes or edits meanwhile (a row-index write could).
 //
-// The MCP credential tables (mcp_oauth_tokens, mcp_oauth_clients, directory_mcp_user_keys) are not
-// listed either: the front is their only writer (sbstndalton/noevia#2202), so it re-seals them in
-// one pass under each sign-in's refresh lock (rust-mcp-credentials.cjs, POST /v1/mcp/reseal),
-// awaited before the rest. `directory_mcp_servers.headers_enc` (an administrator's shared key)
-// is still Node's and stays below.
+// The MCP tables (mcp_oauth_tokens, mcp_oauth_clients, directory_mcp_user_keys and, since
+// sbstndalton/noevia#2202 round 2, directory_mcp_servers.headers_enc, an administrator's shared key) are not
+// listed either: the front is their only writer, so it re-seals them in one pass (each sign-in under its
+// refresh lock; rust-mcp-credentials.cjs, POST /v1/mcp/reseal), awaited before the rest.
 //
 // The shell form needs the front's internal store (NOEVIA_PROJECT_STORE_PORT and
 // NOEVIA_PROJECT_STORE_TOKEN, which the web supervisor hands the web process alone and Node removes
@@ -68,7 +67,6 @@ function googleDriveUserFiles(dir, secrets) {
 function rotationTables({ db, dataDir, secrets = null }) {
   const tables = [
     sqlTable(db, 'storage_connections', { table: 'storage_connections', keys: ['user_id'], column: 'secret', bound: true }),
-    sqlTable(db, 'directory_mcp_servers', { table: 'directory_mcp_servers', keys: ['id'], column: 'headers_enc', bound: false }),
     sqlTable(db, 'chatgpt_oauth_tokens', { table: 'chatgpt_oauth_tokens', keys: ['user_id'], column: 'data_enc', bound: true }),
   ];
   if (secrets) tables.push(googleDriveUserFiles(path.join(dataDir, 'google-drive-users'), secrets));

@@ -497,7 +497,9 @@ const {
 } = createToolboxes({
   boxes: [kiwixTools && kiwixTools.box, driveTools.box].filter(Boolean),
   kiwixTools, driveTools,
-  mcpBoxes: () => mcpState.boxes,
+  // A directory server the Rust front added (or removed) meanwhile is rediscovered in the background and shows from
+  // the next look (discoverMcpTools also re-reads the directory itself).
+  mcpBoxes: () => { if (mcpWiring.refreshDirectory()) discoverMcpTools(true).catch(() => undefined); return mcpState.boxes; },
   mcpTools: () => mcpState.tools,
   offered: (id) => toolboxOffered(id),
   prefill,
@@ -507,42 +509,14 @@ const {
   workspace: () => currentWorkspace(),
   executeMcp: (name, args, signal, serverId) => executeMcpToolCall(name, args, signal, serverId),
 });
-// The per-turn permitted-tools view is cached for 30 s; every write that changes what it shows
-// (a tool permission, a project's toolbox selection) clears it so the picker is never stale (#796).
-// sbstndalton/noevia#2190 round 7: the Rust front writes tool_policies (rust-google-drive.cjs), so no Node
-// code path sees a write to clear this cache. It also empties itself when the table's content
-// fingerprint changes (toolboxes-permitted.cjs createFingerprintedCache, shared-reread.cjs): a tool permission,
-// or a Drive sign-in completing or disconnecting (the broker's state file moves), whichever process caused it
-// (#796, #831, #845).
-const permittedToolsCache = require('./toolboxes-permitted.cjs').createFingerprintedCache({ ttlMs: 30000, fingerprint: () => `${toolPolicy.fingerprint()}|${driveAccounts.fingerprint()}` });
+// GET /api/toolboxes/permitted is the Rust front's (sbstndalton/noevia#2202 round 2, rust-toolboxes-permitted.cjs):
+// it reads every account-level fact itself at the time of the request, so there is no cache to clear here.
 const { nextcloudStorageConnected } = require('./tools-mode.cjs');
 // #1550: whether Automatic may add a box for this account (a Nextcloud box needs its own usable connection).
 const automaticToolsReady = require('./tools-mode.cjs').createAutomaticToolsReady({
   getStorage: (userId) => authService.getStorage(userId, true), originAllowed: (url) => mcpCredentialOriginAllowed(url) });
-const connectorRoutes = require('./routes/connectors.cjs').createConnectorRoutes({
-  onPolicyChange: () => permittedToolsCache.clear(),
-  accounts: driveAccounts, policy: toolPolicy, toolPolicy: { set: (userId, tools, writes, mode) => PROJECT_STORE.toolPolicySet(userId, tools, writes, mode) },
-  isWrite: (name) => isWriteTool(name), json, readBody: (req) => readJson(req),
-  // Nextcloud's tools ride on the account's storage connection, so this only reports what that
-  // connection allows and owns the per-tool permissions.
-  nextcloud: {
-    state(user) {
-      const storage = authService.getStorage(user.id, true);
-      const connected = nextcloudStorageConnected(storage);
-      if (!MCP_SERVERS.some((sv) => sv.auth === 'nextcloud')) {
-        return { configured: false, state: 'not-configured', message: 'This server has no Nextcloud MCP server configured, so there are no Nextcloud tools to offer.' };
-      }
-      if (!connected) return { configured: true, state: 'disconnected', message: 'Connect Nextcloud under Settings → Diary & storage; its tools then use that same connection.' };
-      if (!mcpCredentialOriginAllowed(storage.baseUrl)) {
-        return { configured: true, state: 'error', account: storage.username, baseUrl: storage.baseUrl,
-          message: 'Your Nextcloud address is not on this server\'s allowed list (MCP_NEXTCLOUD_ORIGINS), so noevia will not send your credential to it.' };
-      }
-      return { configured: true, state: 'connected', account: storage.username, baseUrl: storage.baseUrl, message: '' };
-    },
-    boxes: () => allToolboxes().filter((b) => b.server === 'nextcloud').map((b) => ({ id: b.id, label: b.label, toolCount: b.tools.length })),
-    tools: () => allToolboxes().filter((b) => b.server === 'nextcloud').flatMap((b) => b.tools.map((t) => t.function.name)),
-  },
-});
+// GET /api/connectors and PUT /api/connectors/nextcloud/policy are the Rust front's (sbstndalton/noevia#2202 round 2,
+// rust-connectors.cjs); the Nextcloud tools it lists come from the discovery snapshot published below.
 // Account-level connectors are not a project choice: they join every chat of an account that
 // connected them, and never appear in a project's toolbox picker.
 // Skill auto-loading shares the router's switch and embedding model (chat-skill-routing.cjs).
@@ -829,7 +803,8 @@ const MCP_INTERNAL_SERVER = MCP_SERVERS.find((sv) => sv.auth === 'internal') || 
 // credential-disclosure bug.
 const MCP_INTERNAL_KEY = secretStore.derive('mcp-internal-token');
 
-const directoryMcp = require('./directory-mcp.cjs').createDirectoryMcp({ db: authService.db, secrets: secretStore, audit: (action, actor, detail) => authService.audit(action, actor, actor, detail) });
+// The directory table is the Rust front's (sbstndalton/noevia#2202 round 2, rust-mcp-directory.cjs); this process re-reads it.
+const directoryMcp = require('./directory-mcp.cjs').createDirectoryMcp({ db: authService.db, secrets: secretStore });
 const directoryUrlAllowed = createDirectoryUrlAllowed({ isPublicUrl, allowLoopback: process.env.NOEVIA_QA_ALLOW_LOOPBACK_MCP === '1' });
 // Every request to a directory/custom server and its OAuth endpoints: the address is checked
 // again at connect time, so a name that re-resolves after directoryUrlAllowed (DNS rebinding,
@@ -867,7 +842,7 @@ const mcpWiring = createMcpWiring({
   reduceToolResult, resultCap: TOOL_RESULT_CAP,
   isUserDisabled: (userId) => !!authService.listUsers().find((u) => u.id === userId)?.disabled,
 });
-const { state: mcpState, oauthServerIds, accountReady, probeMcpAuth, syncDirectoryServers, discoverOneServer, discoverMcpTools, executeMcpToolCall, operatorServerFor, executeOperatorToolCall } = mcpWiring;
+const { state: mcpState, oauthServerIds, accountReady, discoverMcpTools, executeMcpToolCall, operatorServerFor, executeOperatorToolCall } = mcpWiring;
 
 // The approval gate's state lives in approvals.cjs; the chat loop below and the
 // /api/tool-approvals route are its only callers.
@@ -1131,7 +1106,6 @@ const storageLatch = require('./storage-latch.cjs').createStorageLatch({ file: r
 const projectRoutes = require('./routes/projects.cjs').createProjectRoutes({
   json, readBody, readJson, requestScope, dispatch: (req, res) => handleRequestScoped(req, res), currentWorkspace, authService, storageClient, documents, documentSources, rag, fs, path,
   reasoningEffort, projectAppearance, diaryExtras, PROJECTS, DEFAULT_TOOLBOXES, sanitizeToolboxes, allToolboxes, getProvider, ensureRolesLoaded, servedCatalogue, DEFAULT_PROVIDER_ID, store: projectStore,
-  onToolboxesChange: () => permittedToolsCache.clear(),
 });
 // What is left of the provider registry's mount (routes/providers.cjs): the registry itself is the
 // Rust front's (rust-providers.cjs), so this answers only the other methods on the Sign in with
@@ -1232,36 +1206,25 @@ const readyRoutes = require('./routes/health.cjs').createReadyRoutes({
 });
 // GET /api/toolboxes: the picker view (routes/toolboxes.cjs). MCP state is read at call time.
 const toolboxRoutes = require('./routes/toolboxes.cjs').createToolboxRoutes({
-  discoverMcpTools: () => discoverMcpTools(), toolboxSummaries, connectedBoxes, json, cache: permittedToolsCache,
-  // What the cached view shows and another process can change (#2202): the Diary preference, the project's
-  // toolbox selection (the Rust front's project routes write projects.json without clearing this cache),
-  // the account's connected connectors (Drive, and Nextcloud through the storage connection the front
-  // saves), the MCP credentials' readiness (the broker's published file) and what discovery last found.
-  cacheKeyExtra: (authn, projectId) => {
-    const project = projectId ? getProject(projectId) : null;
-    return [authService.diaryEnabled(authn.user.id), connectedBoxes(authn.user), mcpCredentials.signal(), mcpState.discoveredAt,
-      project ? [project.toolsMode ?? null, project.docsToolboxDefaulted === true, Array.isArray(project.toolboxes) ? project.toolboxes : null] : null];
-  },
+  discoverMcpTools: () => discoverMcpTools(), toolboxSummaries, connectedBoxes, json,
   prefill: { targetMs: TOOL_PREFILL_TARGET_MS, stats: () => prefill.stats() },
   mcp: () => ({ enabled: mcpWiring.enabled(), state: mcpState, servers: MCP_SERVERS, manifest: MCP_TOOLBOX_MANIFEST }),
-  // The per-turn catalogue (#237). getProject is scoped to the signed-in account's workspace.
-  permitted: ({ authn, projectId, mode }) => {
-    const project = projectId ? getProject(projectId) : null;
-    if (projectId && !project) return null;
-    return { project, boxes: require('./toolboxes-permitted.cjs').computePermittedTools({
-      user: authn.user, project, mode, boxes: allToolboxes(),
-      manifest: mcpWiring.enabled() ? MCP_TOOLBOX_MANIFEST.filter((b) => toolboxOffered(b.id)) : [],
-      defaultToolboxes: DEFAULT_TOOLBOXES, connectorBoxes: CONNECTOR_BOXES, connected: connectedBoxes(authn.user),
-      oauthServerIds: oauthServerIds(), accountReady, policyMode: (u, t, w) => toolPolicy.mode(u, t, w), isWriteTool,
-      diaryEnabled: authService.diaryEnabled(authn.user.id), harnessEnabled: features.enabled('codeHarness'),
-      repositories: codeService.repositories().map((r) => r.id),
-    }) };
-  },
 });
-const mcpDirectoryRoutes = require('./routes/mcp-directory.cjs').createMcpDirectoryRoutes({
-  json, readJson, auth: authService, servers: MCP_SERVERS, mcpState, directoryMcp, mcpOAuth, mcpKeys,
-  discoverOneServer, discoverMcpTools, probeMcpAuth, syncDirectoryServers, directoryUrlAllowed,
-  onToolsChange: () => permittedToolsCache.clear(),
+// What only this process's live MCP client knows, for the Rust front's permitted-tools view, connectors page
+// and admin directory listing (sbstndalton/noevia#2202 round 2): published while the front asks.
+const mcpDiscoveryPublisher = require('./mcp-discovery-snapshot.cjs').createMcpDiscoveryPublisher({
+  dataDir: DATA_DIR,
+  discoverMcpTools: () => discoverMcpTools(),
+  catalogue: () => require('./mcp-discovery-snapshot.cjs').buildCatalogue({
+    allToolboxes: () => allToolboxes(),
+    manifest: MCP_TOOLBOX_MANIFEST.filter((b) => toolboxOffered(b.id)),
+    mcpEnabled: () => mcpWiring.enabled(), servers: MCP_SERVERS, state: mcpState,
+    isWriteTool: (name) => isWriteTool(name),
+    harnessEnabled: () => features.enabled('codeHarness'),
+    hasRepositories: () => codeService.repositories().length > 0,
+    nextcloudOrigins: require('./mcp-wiring.cjs').parseNextcloudOrigins(process.env.MCP_NEXTCLOUD_ORIGINS),
+    defaultToolboxes: DEFAULT_TOOLBOXES, connectorBoxes: CONNECTOR_BOXES,
+  }),
 });
 
 // The headers every page and API reply carries, the refusals answered before authentication too.
@@ -1320,6 +1283,10 @@ async function handleRequestInner(req, res) {
   if (require('./rust-provider-models.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   if (require('./rust-providers.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   if (require('./rust-mcp-credentials.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
+  // And the admin MCP directory, the permitted-tools view and the connectors list (#2202 round 2).
+  if (require('./rust-mcp-directory.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
+  if (require('./rust-toolboxes-permitted.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
+  if (require('./rust-connectors.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   if (require('./rust-vault-mirror-preferences.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   if (require('./rust-google-drive.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   if (require('./rust-offsite-backup.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
@@ -1389,8 +1356,6 @@ async function handleRequestScoped(req, res) {
     if (authn && await exportRoutes(req, res, { path: p, authn })) return;
     if (authn && await importRoutes(req, res, { path: p, authn })) return;
     if (authn && await accountRoutes(req, res, { path: p, authn })) return;
-    if (authn && await connectorRoutes(req, res, { path: p, authn })) return;
-    if (await mcpDirectoryRoutes(req, res, { path: p, authn })) return;
     if (authn && await webAddressRoutes(req, res, { path: p, authn })) return;
     if (authn && p.startsWith('/api/projects/') && await researchRoutes(req, res, { path: p, authn })) return;
     if (authn && (p === '/api/code/active' || p.startsWith('/api/projects/')) && await codeRoutes(req, res, { path: p, authn })) return;
@@ -1603,6 +1568,8 @@ if (require.main === module) {
     // Never blocks startup: a side-car that is still booting must not stop
     // noevia from serving.
     discoverMcpTools().catch(() => undefined);
+    // ... and the front's views of it (permitted tools, connectors, the admin directory) are published while it asks.
+    mcpDiscoveryPublisher.start();
     // A calibration interrupted by a restart restores the preset it was testing.
     modelManager.calibration?.recover().catch(() => undefined);
     modelManager.autotune?.recover().catch(() => undefined);

@@ -51,12 +51,10 @@ const PASS = Symbol('unhandled');
  * @param {() => Promise<{name:string, labels:string[]}[]|null>} deps.servedCatalogue
  * @param {string} deps.DEFAULT_PROVIDER_ID
  * @param {object} deps.store   projects.cjs
- * @param {() => void} [deps.onToolboxesChange]  called after a project's toolbox selection changes (clears the permitted-tools cache)
  */
 function createProjectRoutes({
   json, readBody, readJson, requestScope, dispatch, currentWorkspace, authService, storageClient, documents, documentSources, rag, fs, path,
   reasoningEffort, projectAppearance, diaryExtras, PROJECTS, DEFAULT_TOOLBOXES, sanitizeToolboxes, allToolboxes = () => [{ id: 'core' }], getProvider, ensureRolesLoaded, servedCatalogue, DEFAULT_PROVIDER_ID, store,
-  onToolboxesChange = () => {},
 }) {
   const {
     getProject, saveProjects, whenSaved = (fn) => fn(), pruneDocuments, withSourceLock, ensureProjectFolder, indexSource,
@@ -240,7 +238,6 @@ function createProjectRoutes({
       if (patch.toolsMode !== undefined) {
         if (patch.toolsMode !== 'auto' && patch.toolsMode !== 'manual') return json(res, 400, { error: "toolsMode must be 'auto' or 'manual'" });
         project.toolsMode = patch.toolsMode;
-        onToolboxesChange();
       }
       if (typeof patch.provider === 'string' && patch.provider) {
         // getProvider also resolves unknown IDs to the default for chat. An explicit
@@ -265,7 +262,6 @@ function createProjectRoutes({
         const boxes = sanitizeToolboxes(patch.toolboxes);
         if (!boxes) return json(res, 400, { error: 'toolboxes must be an array of toolbox ids' });
         project.toolboxes = boxes;
-        onToolboxesChange();
       }
       if (Array.isArray(patch.memories)) {
         project.memories = patch.memories.filter((m) => typeof m === 'string' && m.trim()).map((m) => m.trim().slice(0, 500)).slice(0, 50);

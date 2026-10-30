@@ -79,21 +79,22 @@ async function waitReady(base, child) {
 // GETs for client paths no scenario step reaches; {x} params are filled from the run. The Rust
 // front's permanent routes (sbstndalton/noevia#1071: sign-in and the account, usage, stats,
 // sampling, routing mode and default, ChatGPT status, the provider registry's list and writes since
-// #2190 round 6, the MCP keys and sign-ins since #2202, storage metadata/list/read, export, and since
+// #2190 round 6, the MCP keys and sign-ins since #2202 and the MCP directory, the permitted tools and the
+// connectors list since #2202 round 2, storage metadata/list/read, export, and since
 // #2185 the Diary source, today, storage-import and workspace export/import) are not
 // Node's to record any more;
 // their exchanges stay in the noevia-rs corpus recorded at its contracts/http/core.ref.
 const PROBES = [
   '/api/account/retention',
-  '/api/admin/decision-settings', '/api/admin/features', '/api/admin/mcp-directory', '/api/admin/web-address',
+  '/api/admin/decision-settings', '/api/admin/features', '/api/admin/web-address',
   '/api/auto-roles', '/api/chat-framing/preferences', '/api/chat-vault-mirror/preferences', '/api/code/active',
-  '/api/connectors', '/api/connectors/nextcloud/policy', '/api/diary', '/api/diary-connector', '/api/diary/storage-status',
+  '/api/diary', '/api/diary-connector', '/api/diary/storage-status',
   '/api/model-manager',
   '/api/models/autotune', '/api/models/autotune/settings', '/api/models/autotune/untuned', '/api/models/calibration', '/api/models/capabilities', '/api/models/evidence',
   '/api/models/hardware', '/api/models/inference-budget', '/api/models/installed', '/api/plugins/directory',
   '/api/profile/diary-connectors', '/api/profile/sharing',
   '/api/providers/{providerId}/models', '/api/reasoning-settings',
-  '/api/toolboxes', '/api/toolboxes/permitted',
+  '/api/toolboxes',
   '/api/projects/{projectId}/browser', '/api/projects/{projectId}/code', '/api/projects/{projectId}/instruction-skills', '/api/projects/{projectId}/instruction-skills/manifests', '/api/projects/{projectId}/research',
 ];
 
@@ -103,7 +104,7 @@ const PROBES = [
 // backup and the Google Drive connector writes are the Rust front's since #2190 round 7 (their
 // exchanges stay in the noevia-rs corpus recorded at its core.ref; Node refuses them now).
 const WRITE_PROBES = [
-  ['POST', '/api/admin/decision-settings/test', {}], ['POST', '/api/admin/mcp-directory/custom/preview', {}],
+  ['POST', '/api/admin/decision-settings/test', {}],
   ['POST', '/api/chat-framing/suggest', {}],
   ['POST', '/api/integrations/storage/test', { kind: 'local' }], ['POST', '/api/models/estimate', {}],
   ['POST', '/api/models/presets/reload', {}], ['POST', '/api/models/autotune/cancel', {}], ['POST', '/api/models/calibration/cancel', {}],

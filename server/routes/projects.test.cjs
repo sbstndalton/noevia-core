@@ -12,7 +12,7 @@ const { AsyncLocalStorage } = require('node:async_hooks');
 const { createProjectRoutes } = require('./projects.cjs');
 const { createProviderRegistry } = require('../providers.cjs');
 
-function fixture({ projects = [], diary = true, catalogue = null, onToolboxesChange } = {}) {
+function fixture({ projects = [], diary = true, catalogue = null } = {}) {
   const sent = [];
   const dispatched = [];
   const requestScope = new AsyncLocalStorage();
@@ -49,7 +49,7 @@ function fixture({ projects = [], diary = true, catalogue = null, onToolboxesCha
     PROJECTS: projects, DEFAULT_TOOLBOXES: ['core'], sanitizeToolboxes: (b) => (Array.isArray(b) ? b : null),
     getProvider, ensureRolesLoaded() {},
     servedCatalogue: async () => catalogue, DEFAULT_PROVIDER_ID: 'default',
-    store, onToolboxesChange,
+    store,
   });
   const streamed = [];
   const call = (method, path, body, search = '', role = 'member', extra = {}) => {
@@ -312,15 +312,12 @@ test('a model on a non-default (cloud) provider is never checked against the loc
 
 
 
-test('#796: saving a project\'s toolbox selection clears the cached permitted-tools view', async () => {
-  let cleared = 0;
-  const f = fixture({ projects: [{ id: 'p1', files: [], toolboxes: ['core'] }], onToolboxesChange: () => { cleared += 1; } });
+test('a project\'s toolbox selection is saved (the permitted-tools view is the front\'s, read fresh: #2202 round 2)', async () => {
+  const f = fixture({ projects: [{ id: 'p1', files: [], toolboxes: ['core'] }] });
   await f.call('POST', '/api/projects/p1/config', { name: 'Renamed' });
-  assert.equal(cleared, 0, 'a patch that leaves the toolboxes alone keeps the cache');
   await f.call('POST', '/api/projects/p1/config', { toolboxes: 'core' });
-  assert.equal(cleared, 0, 'a refused selection keeps the cache');
+  assert.deepEqual(f.projects[0].toolboxes, ['core'], 'a refused selection changes nothing');
   await f.call('POST', '/api/projects/p1/config', { toolboxes: ['core', 'web'] });
-  assert.equal(cleared, 1);
   assert.deepEqual(f.projects[0].toolboxes, ['core', 'web']);
 });
 
