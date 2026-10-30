@@ -366,22 +366,9 @@ function migrateOnLoad(wsDir, projects) {
   return true;
 }
 
-/** #1815: whether `file` points at a text file that is gone or cannot be read, checked on the file
- *  itself now (one sync call; used by the sources/text route). Its pointer is kept (nothing is
- *  dropped or rewritten); this only reports it. A source with inline text is never missing. */
-function textMissingNow(file) {
-  if (!isExternal(file)) return false;
-  const from = origin.get(file);
-  if (!from) return false;
-  const full = path.join(projectDir(from.wsDir, from.projectId), `${file.textRef}.txt`);
-  const key = missingKey(from.wsDir, from.projectId, file.textRef);
-  // The file itself is checked even when its text is cached: a cached copy must not hide a deletion.
-  try { fs.accessSync(full, fs.constants.R_OK); }
-  catch { unreadable.add(key); if (cache.has(full)) { cached -= cache.get(full).length; cache.delete(full); } return true; }
-  // Readable now; one that failed before (a restore since) is read once to be sure, which clears it.
-  if (unreadable.has(key)) { readText(from.wsDir, from.projectId, file.textRef); return unreadable.has(key); }
-  return false;
-}
+// #1815's per-source check (textMissingNow) moved with GET .../sources/text to the Rust front
+// (#2191, noevia-rs crates/server-projects sources.rs): it reads the text file itself, without
+// following a symlink, and answers SOURCE_TEXT_MISSING when it is gone.
 
 // #1818: the list (GET /api/workspace) never touches the disk per source. It reports what is known:
 // the `unreadable` set, filled when a read fails and by a background async scan of the sources a
@@ -485,6 +472,6 @@ if (require.main === module) {
 module.exports = {
   DIR, backupProjectsFile, refOf, projectDir, readText, readTextStrict, writeText, attachFile, attachAll, externalize, collect, migrateOnLoad,
   hasInline, isExternal, textLength, cloneFile, sameText, meta, inlineAll, headerNamesSkill,
-  textMissing, textMissingNow, scanSettled, SCAN_MS, _setScanMs(ms) { scanMs = ms; }, beginSourceWork, whileSourceWork, sourceWorkInFlight, flushDirs,
+  textMissing, scanSettled, SCAN_MS, _setScanMs(ms) { scanMs = ms; }, beginSourceWork, whileSourceWork, sourceWorkInFlight, flushDirs,
   _cache: { clear() { cache.clear(); cached = 0; warned.clear(); unreadable.clear(); unreferencedSince.clear(); inFlight.clear(); scans.clear(); pendingScans.clear(); generation.clear(); scanMs = SCAN_MS; } }, GRACE_MS, _setGraceMs(ms) { graceDefault = ms; },
 };
