@@ -303,10 +303,6 @@ function createClient({ port, token, fetchImpl = globalThis.fetch, timeoutMs = T
       const { status, body } = await call('chatgpt/disconnect', { user }, CHATGPT_WAIT_MS);
       return status === 200 && body?.ok === true ? { ok: true } : chatgptRefusal(status, body);
     },
-    async chatgptForget(user) {
-      const { status, body } = await call('chatgpt/forget', { user }, CHATGPT_WAIT_MS);
-      return status === 200 && body?.ok === true ? { ok: true } : chatgptRefusal(status, body);
-    },
     /** sbstndalton/noevia#2202: the MCP credential broker (the Rust front, mcp_routes.rs). Each answers
      *  { ok: true, ... } or { ok: false, status, error, code? } (the broker's refusal, written for
      *  people). A session may refresh at the sign-in service, a start may discover and register at
@@ -344,10 +340,6 @@ function createClient({ port, token, fetchImpl = globalThis.fetch, timeoutMs = T
       const { status, body } = await call('mcp/forget', { server }, MCP_WAIT_MS);
       return status === 200 && body?.ok === true ? { ok: true } : mcpRefusal(status, body);
     },
-    async mcpForgetUser(user) {
-      const { status, body } = await call('mcp/forget', { user }, MCP_WAIT_MS);
-      return status === 200 && body?.ok === true ? { ok: true } : mcpRefusal(status, body);
-    },
     async mcpKeySet(user, server, headers) {
       const { status, body } = await call('mcp/key-set', { user, server, headers }, MCP_WAIT_MS);
       return status === 200 && body?.ok === true ? { ok: true } : mcpRefusal(status, body);
@@ -375,10 +367,6 @@ function createClient({ port, token, fetchImpl = globalThis.fetch, timeoutMs = T
     },
     async gdriveDisconnect(user, admin) {
       const { status, body } = await call('gdrive/disconnect', { user, admin: admin === true }, CHATGPT_WAIT_MS);
-      return status === 200 && body?.ok === true ? { ok: true } : chatgptRefusal(status, body);
-    },
-    async gdriveForget(user) {
-      const { status, body } = await call('gdrive/forget', { user }, CHATGPT_WAIT_MS);
       return status === 200 && body?.ok === true ? { ok: true } : chatgptRefusal(status, body);
     },
     /** secrets:rotate (round 7 review): the front re-seals every account's token file under the current

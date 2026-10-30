@@ -77,7 +77,7 @@ test('#1071: Node refuses exactly the sign-in and account routes the Rust front 
   for (const [p, methods] of RUST_ROUTES) {
     for (const m of METHODS) assert.equal(ownedRoute(m, p), methods === null || methods.includes(m), `${m} ${p}`);
   }
-  // What stays Node's: account deletion, Settings -> Web address, (the Diary connectors are rust-diary-routes.cjs's),
+  // What stays Node's (an account's deletion is rust-admin-users.cjs's, a separate refuser): Settings -> Web address, (the Diary connectors are rust-diary-routes.cjs's),
   // retention's PUT, the feature switches, the device approval page (rust-public-pages.cjs's since #2190),
   // and look-alike paths.
   for (const [m, p] of [
@@ -149,8 +149,13 @@ test('settings: only the owned keys, literal or bound', () => {
 test('exempt writers run, and only inside exempt()', () => {
   const guard = on();
   const db = guard.install(fakeDb());
-  const del = db.prepare('DELETE FROM users WHERE id=?');
+  // The DAV listener's app_passwords.last_used_at is the exemption that is left; deleting an account was the other and is
+  // the front's now (#2190, #2191 round 9): `users` is refused to every Node statement, exempt or not.
+  const del = db.prepare('DELETE FROM app_passwords WHERE id=?');
   assert.equal(guard.exempt(() => del.run('u').changes), 1);
+  const users = db.prepare('DELETE FROM users WHERE id=?');
+  assert.throws(() => users.run('u'), (e) => e.code === 'RUST_AUTH_OWNED');
+  assert.throws(() => guard.exempt(() => users.run('u')), (e) => e.status === 503 && e.code === 'RUST_AUTH_OWNED' && /users is written by the Rust front/.test(e.message));
   assert.throws(() => del.run('u'), (e) => e.code === 'RUST_AUTH_OWNED');
   // Nested and throwing exemptions restore the guard.
   assert.throws(() => guard.exempt(() => guard.exempt(() => { throw new Error('boom'); })), /boom/);
@@ -342,7 +347,7 @@ test('settings: an old "off" option guards anyway, and the front\'s keys stay re
 test('sbstndalton/noevia#2190 round 4: storage_connections is refused exempt or not, but for the exact reseal', () => {
   const { RESEAL_SQL, ROUTE_REFUSAL } = require('./rust-storage-connection.cjs');
   // The set of front-owned tables, not their order (each round that moves a table adds one in its own place).
-  assert.deepEqual(Object.keys(FRONT_TABLES).sort(), ['chatgpt_oauth_tokens', 'diary_connectors', 'directory_mcp_user_keys', 'mcp_oauth_clients', 'mcp_oauth_tokens', 'storage_connections', 'tool_policies']);
+  assert.deepEqual(Object.keys(FRONT_TABLES).sort(), ['chatgpt_oauth_tokens', 'diary_connectors', 'directory_mcp_user_keys', 'mcp_oauth_clients', 'mcp_oauth_tokens', 'storage_connections', 'tool_policies', 'users']);
   assert.equal(FRONT_TABLES.storage_connections.code, ROUTE_REFUSAL.code);
   const guard = on();
   const db = guard.install(fakeDb());

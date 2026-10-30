@@ -224,11 +224,10 @@ test('the broker is asked for one call\'s access token or key, a refusal is none
   assert.equal(await creds.oauth.start({ userId: A, serverId: 's', serverUrl: 'https://s.example/mcp' }), 'https://as.example/authorize?x=1');
   answers.push({ ok: false, status: 503 });
   await assert.rejects(creds.oauth.forget('s'), (e) => e.status === 503 && /unavailable/.test(e.message));
-  answers.push({ ok: true });
-  await creds.oauth.forgetUser(A);
+  assert.equal(creds.oauth.forgetUser, undefined, 'the front forgets a deleted account\'s sign-ins and keys itself (#2202, #2191 round 9)');
   answers.push({ ok: true });
   await creds.keys.set(A, 's', { K: 'v' });
-  assert.deepEqual(calls.slice(-2), [['mcpForgetUser', A], ['mcpKeySet', A, 's', { K: 'v' }]]);
+  assert.deepEqual(calls.slice(-1), [['mcpKeySet', A, 's', { K: 'v' }]]);
   answers.push({ ok: true, client: { manual: true, clientId: 'id', hasSecret: false, redirectUri: 'r', issuer: 'i' } });
   assert.equal((await creds.oauth.clientInfo('s')).clientId, 'id');
   answers.push({ ok: false, status: 400, error: 'Enter the client ID the service gave you (one word, no spaces).' });
@@ -270,9 +269,7 @@ test('the store client speaks the MCP broker protocol: the secret, the ops, refu
   answers.push([200, { ok: true }]);
   assert.deepEqual(await client.mcpForgetServer('s'), { ok: true });
   assert.deepEqual(seen.pop().body, { server: 's' });
-  answers.push([200, { ok: true }]);
-  await client.mcpForgetUser('u');
-  assert.deepEqual(seen.pop().body, { user: 'u' });
+  assert.equal(client.mcpForgetUser, undefined);
   answers.push([200, { ok: true }]);
   await client.mcpSetClient({ server: 's', serverUrl: 'https://s.example/mcp', clientId: 'id', clientSecret: 'sec' });
   assert.deepEqual(seen.pop().body, { server: 's', serverUrl: 'https://s.example/mcp', clientId: 'id', clientSecret: 'sec', challenge: '' });

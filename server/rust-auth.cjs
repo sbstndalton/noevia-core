@@ -21,8 +21,9 @@ const FEATURE_CONTEXT_SOURCE_WRITE_SQL = require('./feature-setting-source.cjs')
 //   - the public address is re-read from settings on every use, since first-run setup now runs in
 //     Rust (auth.cjs).
 //
-// What stays Node's and runs inside exempt(): deleting an account (its cleanup spans Node's own
-// stores) and the DAV listener's app_passwords.last_used_at. Feature/device-off writes are native. audit_events is
+// What stays Node's and runs inside exempt(): the DAV listener's app_passwords.last_used_at. (Deleting an account was
+// the other, because its cleanup spanned Node's own stores; the Rust front deletes accounts since #2190/#2191 round 9,
+// rust-admin-users.cjs, and `users` is refused to every Node statement.) Feature/device-off writes are native. audit_events is
 // shared, append-only, by both. noevia-rs crates/server-store OWNED_TABLES is the other half of
 // this list; keep them equal.
 
@@ -204,6 +205,10 @@ const FRONT_TABLES = Object.freeze({
     code: require('./rust-diary-routes.cjs').ROUTE_REFUSAL.code,
     allowed: null,
   }),
+  // sbstndalton/noevia#2190, #2191 round 9: the Rust front deletes accounts (rust-admin-users.cjs), the one write of
+  // `users` that was Node's under exempt(). No Node statement of any kind writes the table now, exempt or not
+  // (the code stays RUST_AUTH_OWNED: it is the same single-writer rule as the rest of the account's tables).
+  users: Object.freeze({ message: 'users is written by the Rust front', code: 'RUST_AUTH_OWNED', allowed: null }),
 });
 /** The guard. It takes no options: Rust always owns these tables (sbstndalton/noevia#1071). */
 function createRustAuthGuard() {

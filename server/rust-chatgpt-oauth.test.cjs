@@ -153,8 +153,8 @@ test('the store client speaks the broker protocol: the secret, the ops, refusals
   assert.deepEqual(await client.chatgptCatalogue('u'), { ok: true, models: [{ slug: 'm' }] });
   answers.push([200, { marked: true }]);
   assert.deepEqual(await client.chatgptReject('u', 'g'), { ok: true, marked: true });
-  answers.push([200, { ok: true }], [200, { ok: true }]);
+  answers.push([200, { ok: true }]);
   assert.deepEqual(await client.chatgptDisconnect('u'), { ok: true });
-  assert.deepEqual(await client.chatgptForget('u'), { ok: true });
-  assert.deepEqual(seen.slice(-2).map((x) => x.url.split('/').pop()), ['disconnect', 'forget']);
+  assert.equal(client.chatgptForget, undefined, 'the front forgets a deleted account\'s tokens itself');
+  assert.equal(seen.slice(-1)[0].url.split('/').pop(), 'disconnect');
 });

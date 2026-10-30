@@ -195,7 +195,9 @@ const workspaceStore = createWorkspaceStore(DATA_DIR, { id: DEFAULT_PROVIDER_ID,
   // M4: the front saved a project or free-chat write Node's request would have followed with a
   // mirror nudge (chat-vault-mirror.cjs mirrorTrigger: any successful write under /api/projects or
   // /api/freechats).
-  onProjectsChanged: (userId) => projectsChangedElsewhere(userId) });
+  onProjectsChanged: (userId) => projectsChangedElsewhere(userId),
+  // The Rust front deletes accounts (rust-admin-users.cjs): a workspace is never made for a user the database no longer has.
+  userExists: (userId) => !!authService.db.prepare('SELECT 1 FROM users WHERE id=?').get(userId) });
 
 // Per-user throttle for LLM-backed routes. Every hit is a full model call
 // against the shared inference endpoint, so one member (or a runaway client)
@@ -1185,8 +1187,7 @@ const deviceAuth = require('./device-auth.cjs').createDeviceAuth({
 const requestAuth = require('./device-auth.cjs').createRequestAuth({ enabled: nativeClientAuth, deviceAuth, authService });
 const deviceRoutes = require('./routes/device-auth.cjs').createDeviceAuthRoutes({ json, enabled: nativeClientAuth });
 const authRoutes = require('./routes/auth.cjs').createAuthRoutes({
-  json, readJson, authService, workspaceStore, driveAccounts, fetchJson, DIARY_BASE, DIARY_TOKEN, diaryTenantHeaders: diary.tenantHeaders,
-  mcpOAuth, chatgptOAuth,
+  json, readJson,
   // POST /api/admin/secrets/rotate (CSRF-checked by the router like every signed-in POST).
   // The provider files, the MCP credentials and the Google Drive token files are the front's: it re-seals them in
   // that order, each awaited (providers and MCP: a throw stops the rotation; Drive: soft), before the rest here.
@@ -1321,6 +1322,8 @@ async function handleRequestInner(req, res) {
   if (require('./rust-project-source-work.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   // And a project's configuration, its instruction skills and a published skill's install (#2191 round 9).
   if (require('./rust-project-config.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
+  // And an account's deletion, complete (#2190, #2191 round 9): DELETE /api/admin/users/{id}.
+  if (require('./rust-admin-users.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   // And the two read-only sizing reads (#2189): GET /api/models/estimate and /api/models/preset/suggest.
   if (require('./rust-model-sizing.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   // #2190: the public pages and the device approval page, and the plugin directory.

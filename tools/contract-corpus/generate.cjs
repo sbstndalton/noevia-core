@@ -231,7 +231,11 @@ async function main() {
     // Clean-up is part of the contract too. A chat's delete (#1071 slice 6) and the project delete
     // (#2191) are the Rust front's: Node refuses the delete below, and its exchange stays in the noevia-rs corpus.
     await step(admin, 'DELETE', `/api/projects/${encodeURIComponent(projectId)}`, undefined, [503]);
-    if (memberId) await step(admin, 'DELETE', `/api/admin/users/${encodeURIComponent(memberId)}`, { username: MEMBER.username });
+    // An account's deletion is the front's (#2190, #2191 round 9): Node refuses it, and its exchange stays in the noevia-rs corpus.
+    if (memberId) {
+      const deleteRefused = await step(admin, 'DELETE', `/api/admin/users/${encodeURIComponent(memberId)}`, { username: MEMBER.username }, [503]);
+      if (deleteRefused.json?.code !== 'RUST_ADMIN_USERS_OWNED') throw new Error('Expected the Rust account deletion ownership refusal.');
+    }
 
     // The project image routes, the project chat lists and the free-chat list (M4) are the Rust
     // front's since sbstndalton/noevia#1071: Node refuses them, and their exchanges stay in the

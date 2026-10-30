@@ -321,14 +321,10 @@ test('the broker\'s refusals reach the tool in people\'s words, and an unreachab
   assert.doesNotMatch(MESSAGES.unavailable, /not connected/i);
 });
 
-test('removing an account never throws, and the Google Drive half of the page degrades instead of failing', async () => {
-  const { accounts, calls, warnings } = harness();
-  await accounts.removeUser(B);
-  assert.deepEqual(calls.forget, [B]);
-  const refusing = createDriveAccounts({ broker: { gdriveForget: async () => ({ ok: false, status: 503 }), gdriveView: async () => { throw new Error('down'); } }, dataDir: temp(), warn: (m) => warnings.push(m) });
-  await refusing.removeUser(B);
-  assert.equal(warnings.length, 1);
-  assert.doesNotMatch(warnings[0], new RegExp(B));
+test('the Google Drive half of the page degrades instead of failing; forgetting an account is the front\'s (no removeUser here)', async () => {
+  const { accounts, warnings } = harness();
+  assert.equal(accounts.removeUser, undefined, 'the front forgets a deleted account\'s connection itself (#2190, #2191 round 9)');
+  const refusing = createDriveAccounts({ broker: { gdriveView: async () => { throw new Error('down'); } }, dataDir: temp(), warn: (m) => warnings.push(m) });
   const view = await refusing.view({ id: B, role: 'member' });
   assert.deepEqual([view.id, view.state, view.backup, view.tools], ['gdrive', 'error', null, []]);
   assert.equal(view.message, MESSAGES.unavailable);
@@ -407,7 +403,7 @@ test('the store client speaks the broker\'s operations and maps its answers', as
     assert.deepEqual(await client.gdriveReject(B, false, 'gen'), { ok: true, dropped: true });
     reply = { status: 200, body: { ok: true, state: 'disconnected' } };
     assert.deepEqual(await client.gdriveDisconnect(B, false), { ok: true });
-    assert.deepEqual(await client.gdriveForget(B), { ok: true });
+    assert.equal(client.gdriveForget, undefined, 'the front forgets a deleted account\'s connection itself');
     reply = { status: 200, body: { id: 'gdrive', name: 'Google Drive' } };
     assert.deepEqual(await client.gdriveView(B, false), { ok: true, view: { id: 'gdrive', name: 'Google Drive' } });
     reply = { status: 200, body: { current: 1, rotated: 2, empty: 0, failed: 0 } };
