@@ -40,7 +40,7 @@ const sourceText = require('../source-text.cjs');
 // Shared with projects.cjs's createProject and the create/edit dialogs (src/project-limits.ts,
 // #398) so a name is capped identically everywhere it can be set.
 const { nameMaxLength: PROJECT_NAME_MAX_LENGTH } = require('../../contracts/project-limits.json');
-const { isJsonObject, saveFailureReply } = require('../http.cjs');
+const { isJsonObject } = require('../http.cjs');
 // #409: the composer's Manual model pick had no server-side guard at all — unlike PUT
 // /api/auto-roles (#343) and benchmark/start, which both already reject an embedding,
 // reranking or Laya (routing) model through this same helper.
@@ -84,7 +84,7 @@ function createProjectRoutes({
   storageLatch = require('../storage-latch.cjs').createStorageLatch(),
 }) {
   const {
-    getProject, saveProjects, whenSaved = (fn) => fn(), pruneDocuments, withSourceLock, ensureProjectFolder, indexSource, ownsFile,
+    getProject, saveProjects, whenSaved = (fn) => fn(), pruneDocuments, withSourceLock, ensureProjectFolder, indexSource,
   } = store;
   // #849: a rejected storage login is its own answer, not "could not create the folder". The
   // wording is the one the refresh toast and the Settings save already use (#770); `code` lets the
@@ -725,49 +725,8 @@ function createProjectRoutes({
       });
     }
 
-    // Delete one source file from the project's folder. This removes the file
-    // from the user's storage, not merely from the project, so it is confined
-    // to the project's OWN folder: a source pulled from a folder the user
-    // attached for reading must never be deletable from here.
-    // GET .../sources/text (#1806, #1815) is the Rust front's (#2191, rust-project-reads.cjs).
-
-    const projFileDel = p.match(/^\/api\/projects\/([^/]+)\/files$/);
-    if (projFileDel && req.method === 'DELETE') {
-      const id = decodeURIComponent(projFileDel[1]);
-      const project = getProject(id);
-      if (!project) return json(res, 404, { error: 'no such project' });
-      const body = await readJson(req);
-      if (!isJsonObject(body)) return json(res, 400, { error: 'request body must be a JSON object' });
-      const target = String(body.path || '');
-      if (!target) return json(res, 400, { error: 'a path is required' });
-      if (!ownsFile(project, target)) {
-        return json(res, 400, { error: 'That file is not in any folder attached to this project, so it cannot be deleted from here.' });
-      }
-      return await withSourceLock(project, async () => {
-        if (getProject(id) !== project || !ownsFile(project, target)) return json(res, 409, { error: 'Source changed; retry.' });
-        const connection = authService.getStorage(authn.user.id, true);
-        if (!storageClient.isBrowsable(connection)) return json(res, 400, { error: 'no browsable storage connected' });
-        try {
-          await storageClient.deleteFile(connection, target);
-        } catch (e) {
-          if (replyStorageFailure(res, storageClient.storageFailure?.(e))) return;
-          return json(res, (e && e.status) || 502, { error: (e && e.message) || 'could not delete the file' });
-        }
-        project.files = (project.files || []).filter((f) => f.name !== target);
-        saveProjects(PROJECTS);
-        // #1914: its upload original, document pages, assets and index entries go only once the
-        // list without it is on disk; the lists that cleanup trims are saved after it.
-        try {
-          await whenSaved(() => {
-            pruneDocuments(project);
-            require('../uploads.cjs').prune(currentWorkspace(), project);
-            for (const name of stillGone(id, [target])) rag.deleteProjectFile(id, name, currentWorkspace().userId);
-          });
-        } catch (e) { return saveFailureReply(json, res, e, 'could not remove the file from the project; nothing was changed'); }
-        saveProjects(PROJECTS);
-        return json(res, 200, { ok: true, path: target });
-      });
-    }
+    // DELETE .../files (a source file's delete from storage) is the Rust front's (#2191 round 3,
+    // rust-project-files.cjs); its RAG rows are an `unindex` job of the index outbox, run here.
 
     // GET .../uploads/original (#786) is the Rust front's (#2191, rust-project-reads.cjs).
 

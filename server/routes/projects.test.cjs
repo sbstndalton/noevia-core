@@ -204,8 +204,8 @@ test('uploads refuse what they always refused', async () => {
   // A project's images are the Rust front's (#1071): not this mount's.
   assert.equal(await f.call('POST', '/api/projects/p1/assets', { name: 'a', mime: 'image/bmp' }), false);
   for (const m of ['GET', 'DELETE']) assert.equal(await f.call(m, '/api/projects/p1/assets/img-1'), false, m);
-  await f.call('DELETE', '/api/projects/p1/files', { path: 'Elsewhere/x.txt' });
-  assert.deepEqual(f.sent.pop(), { status: 400, body: { error: 'That file is not in any folder attached to this project, so it cannot be deleted from here.' } });
+  // A source file's delete is the Rust front's (#2191 round 3, rust-project-files.cjs): not this mount's.
+  assert.equal(await f.call('DELETE', '/api/projects/p1/files', { path: 'Elsewhere/x.txt' }), false);
   assert.equal(DOCUMENT_UPLOAD_CAP, 25 * 1024 * 1024);
 });
 

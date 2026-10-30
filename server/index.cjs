@@ -599,7 +599,8 @@ const {
 } = projectStore;
 // #2191 round 2: the Rust front creates and deletes projects (rust-project-lifecycle.cjs). It reads the
 // toolbox catalogue published here (MCP discovery is this process's), and leaves the RAG index of
-// create-time files and the storage folder sweep in the user's index outbox, which this executor drains;
+// create-time files in the user's index outbox, which this executor drains (round 3: the storage folder
+// sweep and #687's create-time storage step are the front's own, rust-project-storage.cjs);
 // a delete's tombstone stops an index run of that project still in flight (rag.cjs lifecycle guard).
 const projectCatalogue = require('./project-catalogue.cjs').createCataloguePublisher({
   dataDir: DATA_DIR,
@@ -610,6 +611,8 @@ const projectCatalogue = require('./project-catalogue.cjs').createCataloguePubli
   }),
 });
 const indexOutbox = require('./rust-index-outbox.cjs').createIndexOutbox({
+  // #2191 round 3: only this process's job kinds; the front runs its own (the storage sweep).
+  kinds: require('./rust-project-storage.cjs').CORE_KINDS,
   userDir: (userId) => workspaceStore.userDir(userId),
   userIds: () => authService.db.prepare('SELECT id FROM users').all().map((r) => r.id).filter((id) => !workspaceStore.isRemoved(id)),
   runAs: (userId, fn) => {
@@ -627,11 +630,14 @@ const indexOutbox = require('./rust-index-outbox.cjs').createIndexOutbox({
       await indexSource(project, file);
       return;
     }
-    if (job.kind === 'sweep') {
-      let connection = null;
-      try { connection = authService.getStorage(userId, true); } catch { connection = null; }
-      await projectSweep.afterDelete({ projectId: job.project, tenantRoot: workspace.dir, localDirs: [], connection,
-        folder: String(job.payload?.folder || ''), root: PROJECT_ROOT_FOLDER, groups: require('./uploads.cjs').GROUPS });
+    if (job.kind === 'unindex') {
+      // #2191 round 3 (rust-project-files.cjs): a source file the front removed. Its rows go unless a
+      // file of that name is listed again by now (#1919: a re-upload's fresh rows stay), or the project
+      // is gone (its delete removed the whole index; opening it here would make it again).
+      if (workspace.projectsFile) workspace.projectsFile.refresh(workspace.projects);
+      const project = getProject(job.project);
+      if (!project || (project.files || []).some((f) => f && f.name === job.file)) return;
+      rag.deleteProjectFile(job.project, job.file, userId);
       return;
     }
     throw new Error(`unknown outbox job kind ${job.kind}`);
@@ -1294,6 +1300,7 @@ async function handleRequestInner(req, res) {
   if (require('./rust-project-reads.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   // And a project's create and delete (#2191 round 2): POST /api/projects, DELETE /api/projects/{id}.
   if (require('./rust-project-lifecycle.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
+  if (require('./rust-project-files.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   // And the two read-only sizing reads (#2189): GET /api/models/estimate and /api/models/preset/suggest.
   if (require('./rust-model-sizing.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   // #2190: the public pages and the device approval page, and the plugin directory.

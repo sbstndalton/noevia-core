@@ -2,8 +2,10 @@
 // sbstndalton/noevia#2191 round 2: the executor of the Rust front's index outbox
 // (users/<id>/index-outbox.db, noevia-rs crates/server-projects outbox.rs). The front owns the
 // project writes (create, delete: rust-project-lifecycle.cjs) and records in the same request what
-// they leave to do where its engine is: here, the RAG index (sqlite-vec is loaded by rag.cjs only)
-// and the empty storage folder sweep (project-sweep.cjs sweepRemote).
+// they leave to do where its engine is: here, the RAG index (sqlite-vec is loaded by rag.cjs only).
+// Round 3 (rust-project-storage.cjs): the front has a storage write client and runs the `sweep` jobs
+// (the empty storage folder sweep) itself. This side claims, recovers and counts only CORE_KINDS; a
+// job of another kind is the front's and is never touched here.
 //
 // Contract with the front (both sides keep it):
 //   - jobs(key PRIMARY KEY, kind, project, file, payload, generation, state, attempts, claimed_at):
@@ -12,7 +14,7 @@
 //     for again meanwhile stays pending and runs again: nothing is lost, nothing runs twice at once.
 //   - A `running` row at this process's start was cut short by a crash or restart: it is pending again
 //     (at least once; every job is idempotent: an index run indexes the file's text as it is now,
-//     rag.cjs replaces the file's rows in one transaction, a sweep removes empty folders only).
+//     rag.cjs replaces the file's rows in one transaction).
 //   - A job that keeps failing is retried up to MAX_ATTEMPTS times, then kept as `failed` for review.
 //   - tombstones(project, generation): a project the front deleted at that generation. An index run
 //     started before it (rag.cjs captures `generation()` when it is queued) stops at its next step and
@@ -26,6 +28,12 @@ const path = require('node:path');
 const { createStampedReader } = require('./rust-generation.cjs');
 
 const OUTBOX_FILE = 'index-outbox.db';
+const { CORE_KINDS } = require('./rust-project-storage.cjs');
+// `kind IN ('index')`: the kinds are fixed identifiers (checked), never user input.
+function kindSql(kinds) {
+  if (!Array.isArray(kinds) || !kinds.length || !kinds.every((k) => typeof k === 'string' && /^[a-z]+$/.test(k))) throw new Error('outbox kinds must be lower-case identifiers');
+  return `kind IN (${kinds.map((k) => `'${k}'`).join(', ')})`;
+}
 const MAX_ATTEMPTS = 5;
 
 function defaultOpen(file) {
@@ -38,7 +46,8 @@ function defaultOpen(file) {
   return db;
 }
 
-function createIndexOutbox({ userDir, userIds = () => [], runAs = (_userId, fn) => fn(), runJob, open = defaultOpen, warn = console.warn, maxAttempts = MAX_ATTEMPTS }) {
+function createIndexOutbox({ userDir, userIds = () => [], runAs = (_userId, fn) => fn(), runJob, open = defaultOpen, warn = console.warn, maxAttempts = MAX_ATTEMPTS, kinds = CORE_KINDS }) {
+  const KIND_SQL = kindSql(kinds);
   const users = new Map(); // userId -> { file, reader, recovered, draining }
 
   function stateFor(userId) {
@@ -59,7 +68,7 @@ function createIndexOutbox({ userDir, userIds = () => [], runAs = (_userId, fn) 
           try {
             const generation = Number(db.prepare("SELECT value FROM meta WHERE key = 'generation'").get()?.value || 0);
             const tombstones = new Map(db.prepare('SELECT project, generation FROM tombstones').all().map((r) => [r.project, Number(r.generation)]));
-            const pending = Number(db.prepare("SELECT COUNT(*) AS n FROM jobs WHERE state IN ('pending', 'running')").get()?.n || 0);
+            const pending = Number(db.prepare(`SELECT COUNT(*) AS n FROM jobs WHERE state IN ('pending', 'running') AND ${KIND_SQL}`).get()?.n || 0);
             return { generation, tombstones, pending };
           } finally { db.close(); }
         },
@@ -109,10 +118,10 @@ function createIndexOutbox({ userDir, userIds = () => [], runAs = (_userId, fn) 
       try {
         if (!s.recovered) {
           // A claim this process never acknowledged (it restarted): pending again.
-          db.prepare("UPDATE jobs SET state = 'pending', claimed_at = NULL WHERE state = 'running'").run();
+          db.prepare(`UPDATE jobs SET state = 'pending', claimed_at = NULL WHERE state = 'running' AND ${KIND_SQL}`).run();
           s.recovered = true;
         }
-        const rows = db.prepare("SELECT key, kind, project, file, payload, generation, attempts FROM jobs WHERE state = 'pending' ORDER BY generation, key").all();
+        const rows = db.prepare(`SELECT key, kind, project, file, payload, generation, attempts FROM jobs WHERE state = 'pending' AND ${KIND_SQL} ORDER BY generation, key`).all();
         for (const row of rows) {
           const r = await runOne(userId, db, row);
           if (r === 'done') out.done += 1; else if (r === 'failed') out.failed += 1;

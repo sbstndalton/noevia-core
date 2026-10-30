@@ -10,8 +10,9 @@
 // Both write projects.json under its lock (the front is its only writer; this process re-reads it
 // at each request start, rust-projects.cjs). What a create or delete leaves to do here, because the
 // engine lives here, is queued in the user's index outbox (users/<id>/index-outbox.db): the RAG index
-// of create-time files (sqlite-vec is loaded by rag.cjs only) and the empty storage folder sweep
-// (project-sweep.cjs sweepRemote). rust-index-outbox.cjs drains it; a delete's tombstone stops an index
+// of create-time files (sqlite-vec is loaded by rag.cjs only); since round 3 the empty storage folder
+// sweep and #687's storage step are the front's (rust-project-storage.cjs). rust-index-outbox.cjs
+// drains the index jobs; a delete's tombstone stops an index
 // run of that project that is still in flight here (rag.cjs), so it never recreates the index.
 // The front reads the toolbox ids a project may select from project-catalogue.cjs's published file:
 // MCP discovery stays here.
