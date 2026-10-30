@@ -135,3 +135,31 @@ test('through the router: the GET is refused whoever asks; the PUT still reaches
   assert.equal(put.status, 400);
   assert.equal((await request('/api/auto-roles', { method: 'PUT' })).status, 401, 'signed out is the gate\'s');
 });
+
+test('the catalogue is read only while a signed-in page has asked: an idle installation reads no engines (#2190 review M1)', async () => {
+  const { createDemand, DEMAND_FILE } = require('./published-snapshot.cjs');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'noevia-autoroles-demand-'));
+  test.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  let reads = 0;
+  const demand = createDemand({ dir, windowMs: 400, pollMs: 30 });
+  const p = roles.createAutoRolesPublisher({ dataDir: dir, servedCatalogue: async () => { reads += 1; return served('a'); }, remoteRoles: () => ({}), machineModels: () => [], demand, env: { AUTO_ROLES_PUBLISH_MS: '1000' } });
+  const service = { invalidateModelReads() {} };
+  p.watch(service);
+  p.start();
+  demand.start();
+  await wait(200);
+  service.invalidateModelReads();
+  await wait(150);
+  assert.equal(reads, 0, 'nobody asked: the engines are not read, not even after a model write');
+  assert.equal(fs.existsSync(p.file), false);
+  fs.writeFileSync(path.join(dir, DEMAND_FILE), String(Date.now()), { mode: 0o600 });
+  await wait(250);
+  assert.ok(reads >= 1);
+  assert.deepEqual(JSON.parse(fs.readFileSync(p.file, 'utf8')).catalogue, [{ name: 'a', missingFile: false }]);
+  await wait(700);
+  const seen = reads;
+  await wait(300);
+  assert.equal(reads, seen, 'idle again: no more reads');
+  p.stop();
+  demand.stop();
+});

@@ -122,7 +122,10 @@ test('a build that never finishes is abandoned after two intervals and the next 
     build: () => { n += 1; return n === 1 ? new Promise(() => {}) : { n }; } });
   assert.equal(createPublisher({ file, kind: 'thing', everyMs: 7000, build: () => ({}) }).buildDeadlineMs, 14000, 'the default is two intervals');
   const started = Date.now();
+  // The deadline timer does not keep a process alive (as in production, where something else does): this test holds one.
+  const keepAlive = setTimeout(() => {}, 5000);
   await p.publish();
+  clearTimeout(keepAlive);
   assert.ok(Date.now() - started >= 55 && Date.now() - started < 1500, `${Date.now() - started} ms`);
   assert.equal(fs.existsSync(file), false, 'nothing was written');
   assert.equal(errors.length, 1);

@@ -113,3 +113,35 @@ test('through the router: the GET is refused whoever asks, and no other method f
   // /api/ready is still Node-answered and unauthenticated.
   assert.equal((await request('/api/ready')).status, 200);
 });
+
+test('retrieval is probed only while a signed-in page has asked: an idle installation runs no embeddings probe (#2190 review M1)', async () => {
+  const { createDemand, DEMAND_FILE } = require('./published-snapshot.cjs');
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'noevia-health-demand-'));
+  test.after(() => fs.rmSync(dataDir, { recursive: true, force: true }));
+  let probes = 0;
+  const rag = { ragAvailable: () => true, retrievalStatus: async () => { probes += 1; return 'available'; } };
+  const demand = createDemand({ dir: dataDir, windowMs: 400, pollMs: 30 });
+  const p = health.createRagStatusPublisher({ dataDir, rag, demand, env: { RAG_STATUS_PUBLISH_MS: '1000' } });
+  const marker = path.join(dataDir, DEMAND_FILE);
+  p.start();
+  demand.start();
+  await wait(200);
+  assert.equal(probes, 0, 'nobody asked: not one probe');
+  assert.equal(fs.existsSync(p.file), false);
+  p.changed();
+  await wait(150);
+  assert.equal(probes, 0, 'a change nobody will read is not published');
+  // The front touches the marker (a rename of a new file, as it does): the first snapshot comes at once.
+  fs.writeFileSync(`${marker}.1.tmp`, String(Date.now()), { mode: 0o600 });
+  fs.renameSync(`${marker}.1.tmp`, marker);
+  await wait(250);
+  assert.ok(probes >= 1, 'asked: probed');
+  assert.equal(JSON.parse(fs.readFileSync(p.file, 'utf8')).retrieval, 'available');
+  // Nobody asks any more: the probes stop.
+  await wait(700);
+  const seen = probes;
+  await wait(300);
+  assert.equal(probes, seen, 'idle again: no more probes');
+  p.stop();
+  demand.stop();
+});
