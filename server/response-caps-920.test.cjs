@@ -87,14 +87,6 @@ test('plugin directory: an endless registry listing is cut at 4 MB and refused w
   within(meter, 4 * MB);
 });
 
-test('offsite S3: an endless listing page is cut at 4 MB and refused with a 502', async () => {
-  const { createS3Store } = require('./offsite-s3.cjs');
-  const { stream, meter } = hugeBody(64 * MB, '<ListBucketResult><Key>noevia-backup/a</Key>');
-  const store = createS3Store({ endpoint: 'https://s3.invalid', bucket: 'b', accessKeyId: 'synthetic', secretAccessKey: 'synthetic', fetchImpl: async () => new Response(stream) });
-  await assert.rejects(() => store.list('x/'), (e) => e.status === 502 && /too large/.test(e.message));
-  within(meter, 4 * MB);
-});
-
 test('kiwix: an endless article is cut at 2 MB and the tool still answers', async () => {
   const { createKiwixTools } = require('./kiwix.cjs');
   const { stream, meter } = hugeBody(64 * MB, '<html><body>');

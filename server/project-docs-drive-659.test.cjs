@@ -13,8 +13,8 @@ const { EventEmitter } = require('node:events');
 const { AsyncLocalStorage } = require('node:async_hooks');
 const { applyProjectDocsDefault } = require('./project-docs-default.cjs');
 const { createProjectRoutes } = require('./routes/projects.cjs');
-const { createGoogleDrive } = require('./gdrive.cjs');
-const { createDriveAccounts } = require('./drive-accounts.cjs');
+const { createDriveAccounts } = require('./gdrive-broker.cjs');
+const { startBrokerFixture } = require('./gdrive-broker-fixture.cjs');
 const { createDriveTools } = require('./gdrive-tools.cjs');
 const { driveFiles } = require('./gdrive-files.cjs');
 const { createChatHandler } = require('./chat.cjs');
@@ -149,17 +149,14 @@ test('an existing project that already had uploads keeps its toolboxes after a s
 });
 
 // ── (b)-(d) Google Drive writes ───────────────────────────────────────────────────────────
-const key = crypto.randomBytes(32);
 const member = { id: 'u-member', role: 'member' };
 async function connectedDrive() {
   const dir = temp('noevia-659-drive-');
-  const makeDrive = ({ tokenFile, backupKey }) => createGoogleDrive({ clientId: 'fake-client', clientSecret: 'fake-secret', tokenFile, backupKey,
-    oauthBase: google.base, apiBase: `${google.base}/drive`, uploadBase: `${google.base}/upload` });
-  const backupDrive = makeDrive({ tokenFile: path.join(dir, 'google-drive.sealed'), backupKey: () => key });
-  const accounts = createDriveAccounts({ backupDrive, dataDir: dir, userKey: () => key, makeDrive });
+  // The Rust front is the token authority; a stand-in broker signs the account in against the fake Google.
+  const fixture = startBrokerFixture({ google, dataDir: dir });
+  const accounts = createDriveAccounts({ broker: fixture.broker, dataDir: dir, apiBase: `${google.base}/drive`, uploadBase: `${google.base}/upload` });
+  await fixture.connect(member);
   const { drive } = accounts.forUser(member);
-  await drive.connect(() => {}, { owner: member.id });
-  for (let i = 0; i < 100 && drive.state().state !== 'connected'; i++) await new Promise((r) => setTimeout(r, 50));
   return { accounts, drive, tools: createDriveTools({ accounts, cap: 8000 }) };
 }
 const idOf = (text) => /id ([\w-]+)/.exec(text)[1];

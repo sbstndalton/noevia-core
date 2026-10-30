@@ -6,8 +6,9 @@
 // (tests/server/oracle/auth-tokens.cjs and tool-policy.cjs; synthetic tokens only). Here every row runs through dav-parse.wasm's auth_tokens and
 // tool_policy: auth and set must agree exactly; mode must agree wherever the stored mode is one
 // the table allows, and be `block` (never weaker) otherwise. Then a real database against the JS
-// reference, seeded live JS-vs-wasm tokens, and the fail-closed paths: mode() blocks, set() writes
-// nothing, startup stops, and no error ever carries a token. The WebAssembly half needs
+// reference, seeded live JS-vs-wasm tokens, and the fail-closed paths: mode() blocks, startup stops,
+// and no error ever carries a token. set() left Node in #2190 round 7 (the Rust front is the writer of
+// tool_policies); its checks still run here through the wasm port, the front's policy-leaves crate. The WebAssembly half needs
 // server/wasm/dav-parse.wasm (or DAV_PARSE_WASM); skipped without it unless DAV_PARSE_WASM_REQUIRED=1.
 
 const assert = require('node:assert/strict');
@@ -99,21 +100,25 @@ test('mode rows: never weaker than the JS; exact for every stored mode the table
   assert.equal(createToolPolicy({ db: fakeDb('block') }).mode('', 'tool', false), 'allow');
 });
 
-test('set rows: the same refusal (400, public message) or the same write', { skip: skipWasm }, () => {
+// set()'s checks as the Rust front makes them (policy-leaves check_set): the words core always showed.
+const SET_MESSAGES = { mode: 'Choose allow, ask or block.', empty: 'Choose a tool.', write: 'Writes always ask first, so they cannot be set to Always allow.' };
+function setThroughWasm(value, isWrite, tools) {
+  // Write flags matter only for allow, so isWrite runs only then, as it always has.
+  const writes = value === 'allow' ? tools.map((t) => !!isWrite(t)) : tools.map(() => false);
+  const r = davParseWasm.toolPolicySet(value, writes);
+  return r.ok ? 'ok' : SET_MESSAGES[r.reason];
+}
+
+test('set rows: the same refusal (the public message) or the same write, through the port the front uses', { skip: skipWasm }, () => {
   for (const row of fixtures.set) {
     const tools = row.writes.map((_, i) => `t${i}`);
     const isWrite = (t) => row.writes[Number(t.slice(1))];
     const value = row.value === null ? undefined : str(row.value);
-    const db = fakeDb(null);
-    const policy = createToolPolicy({ db });
-    let got = 'ok';
-    try { policy.set('user-1', tools, value, isWrite); } catch (e) {
-      assert.equal(e.status, 400);
-      assert.equal(e.publicMessage, e.message);
-      got = e.message;
-    }
-    assert.equal(got, row.want, JSON.stringify(row));
-    assert.equal(db.writes.length, got === 'ok' ? tools.length : 0);
+    const oracle = createToolPolicyJs({ db: fakeDb(null) });
+    let want = 'ok';
+    try { oracle.set('user-1', tools, value, isWrite); } catch (e) { want = e.message; }
+    assert.equal(want, row.want, JSON.stringify(row));
+    assert.equal(setThroughWasm(value, isWrite, tools), row.want, JSON.stringify(row));
   }
 });
 
@@ -128,32 +133,27 @@ test('a real table behaves the same through Rust as through the JS reference', {
     const db = new Database(':memory:');
     db.exec("CREATE TABLE users(id TEXT PRIMARY KEY); INSERT INTO users VALUES('u1'),('u2');");
     const policy = make({ db });
-    const isWrite = (t) => !t.startsWith('read');
+    // The front writes the table (connector_routes.rs); these are its upserts.
+    const put = (user, tool, mode) => db.prepare('INSERT INTO tool_policies VALUES(?,?,?,?) ON CONFLICT(user_id, tool) DO UPDATE SET mode=excluded.mode, updated_at=excluded.updated_at').run(user, tool, mode, 1);
     assert.equal(policy.mode('u1', 'read_a', false), 'allow');
     assert.equal(policy.mode('u1', 'write_a', true), 'ask');
-    policy.set('u1', ['read_a'], 'ask', isWrite);
+    put('u1', 'read_a', 'ask');
     assert.equal(policy.mode('u1', 'read_a', false), 'ask');
     assert.equal(policy.mode('u2', 'read_a', false), 'allow', impl);
-    assert.throws(() => policy.set('u1', ['read_a', 'write_a'], 'allow', isWrite), /Writes always ask first/);
-    assert.equal(policy.mode('u1', 'read_a', false), 'ask');
-    policy.set('u1', ['write_a'], 'block', isWrite);
+    put('u1', 'write_a', 'block');
     assert.equal(policy.mode('u1', 'write_a', true), 'block');
-    policy.set('u1', ['read_b'], 'allow', isWrite);
+    put('u1', 'read_b', 'allow');
     assert.equal(policy.mode('u1', 'read_b', true), 'ask');
-    assert.throws(() => policy.set('u1', ['read_a'], 'sometimes', isWrite), /Choose allow, ask or block/);
-    assert.throws(() => policy.set('u1', [], 'ask', isWrite), /Choose a tool/);
     assert.deepEqual(policy.stored('u1'), { read_a: 'ask', write_a: 'block', read_b: 'allow' });
   }
 });
 
-test('fails closed: mode() blocks, set() writes nothing, auth stops without echoing a token', (t) => {
+test('fails closed: mode() blocks, auth stops without echoing a token', (t) => {
   t.mock.method(console, 'warn', () => {});
   const broken = () => { throw new davParseWasm.DavParseError('dav-parse module failed', 'trap'); };
   const db = fakeDb('allow');
   const policy = createToolPolicy({ db, wasmLoader: () => ({ toolPolicyMode: broken, toolPolicySet: broken }) });
   assert.equal(policy.mode('u1', 'read_a', false), 'block');
-  assert.throws(() => policy.set('u1', ['read_a'], 'ask', () => false), (e) => e.status === 500 && !e.publicMessage);
-  assert.equal(db.writes.length, 0);
   // A reply of the wrong shape is a fault too.
   const odd = createToolPolicy({ db: fakeDb(null), wasmLoader: () => ({ toolPolicyMode: () => { throw new davParseWasm.DavParseError('x', 'reply'); } }) });
   assert.equal(odd.mode('u1', 'x', false), 'block');
@@ -166,25 +166,6 @@ test('fails closed: mode() blocks, set() writes nothing, auth stops without echo
     assert.match(e.message, /Auth tokens could not be checked/);
     return true;
   });
-});
-
-test('set(): a refusal with an unknown reason fails closed with a fixed message, never a 400 with none (#1109)', (t) => {
-  t.mock.method(console, 'warn', () => {});
-  const db = fakeDb(null);
-  for (const reply of [{ ok: false, reason: 'future_reason' }, { ok: false, reason: 'toString' }, { ok: false }, undefined, { ok: 'yes' }]) {
-    const policy = createToolPolicy({ db, wasmLoader: () => ({ toolPolicySet: () => reply }) });
-    assert.throws(() => policy.set('user-1', ['read_a'], 'ask', () => false), (e) => {
-      assert.equal(e.status, 500, JSON.stringify(reply));
-      assert.equal(e.message, 'The tool permission could not be checked.');
-      assert.equal(e.publicMessage, undefined);
-      return true;
-    });
-  }
-  assert.equal(db.writes.length, 0);
-  // The known refusals keep their 400 and public message.
-  const refusing = createToolPolicy({ db, wasmLoader: () => ({ toolPolicySet: () => ({ ok: false, reason: 'write' }) }) });
-  assert.throws(() => refusing.set('user-1', ['w'], 'allow', () => true), (e) => e.status === 400 && e.publicMessage === 'Writes always ask first, so they cannot be set to Always allow.');
-  assert.equal(db.writes.length, 0);
 });
 
 test('loader: refusals and shape checks never carry a token', { skip: skipWasm }, () => {

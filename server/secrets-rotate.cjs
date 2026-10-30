@@ -6,7 +6,7 @@
 const fs = require('node:fs');
 const path = require('node:path');
 const { atomicJson } = require('./workspace.cjs');
-const { resealTokenFile } = require('./gdrive.cjs');
+const { resealTokenFile } = require('./gdrive-seal.cjs');
 
 const hasTable = (db, name) => !!db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?").get(name);
 
@@ -45,7 +45,7 @@ function providerFile(name, file) {
   };
 }
 
-// Members' Google Drive refresh tokens (google-drive-users/<id>.sealed) are sealed by gdrive.cjs under
+// Members' Google Drive refresh tokens (google-drive-users/<id>.sealed) are sealed by gdrive-seal.cjs (the Rust front's format) under
 // a key derived from secrets.key, not as enc: strings, so they bring their own re-seal (#866).
 function googleDriveUserFiles(dir, secrets) {
   return {

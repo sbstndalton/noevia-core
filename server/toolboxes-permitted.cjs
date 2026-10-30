@@ -67,6 +67,24 @@ function createTtlCache({ ttlMs = 30000, now = Date.now, max = 500 } = {}) {
   };
 }
 
+/**
+ * A TTL cache that also empties itself when `fingerprint()` changes between two lookups. For data a
+ * process other than this one writes (tool_policies, whose only writer is the Rust front since
+ * sbstndalton/noevia#2190 round 7): no Node code path sees such a write to call clear(). The fingerprint is
+ * compared through shared-reread.cjs, so a failing fingerprint empties the cache and is retried at the
+ * next lookup rather than serving what was cached before it.
+ */
+function createFingerprintedCache({ fingerprint, ...options }) {
+  const { createReread } = require('./shared-reread.cjs');
+  const cache = createTtlCache(options);
+  const watch = createReread({
+    signal: fingerprint,
+    load: () => { cache.clear(); return true; },
+    fallback: () => { cache.clear(); return false; },
+  });
+  return { ...cache, get(key) { watch.current(); return cache.get(key); }, watch };
+}
+
 const defaultLoader = () => require('./dav-parse-wasm.cjs');
 const seenPort = new Map();
 function portWarn(event, reason) {
@@ -254,4 +272,4 @@ function permittedProjection(input, calls) {
   };
 }
 
-module.exports = { projectToolboxIds, REASONS, computePermittedTools, createTtlCache, CODE_BOX_ID, selectedToolboxIds, projectProjection, permittedProjection, idsProjection };
+module.exports = { projectToolboxIds, REASONS, computePermittedTools, createTtlCache, createFingerprintedCache, CODE_BOX_ID, selectedToolboxIds, projectProjection, permittedProjection, idsProjection };

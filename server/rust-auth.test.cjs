@@ -337,7 +337,7 @@ test('settings: an old "off" option guards anyway, and the front\'s keys stay re
 });
 test('sbstndalton/noevia#2190 round 4: storage_connections is refused exempt or not, but for the exact reseal', () => {
   const { RESEAL_SQL, ROUTE_REFUSAL } = require('./rust-storage-connection.cjs');
-  assert.deepEqual(Object.keys(FRONT_TABLES), ['storage_connections', 'chatgpt_oauth_tokens']);
+  assert.deepEqual(Object.keys(FRONT_TABLES), ['storage_connections', 'chatgpt_oauth_tokens', 'tool_policies']);
   assert.equal(FRONT_TABLES.storage_connections.code, ROUTE_REFUSAL.code);
   const guard = on();
   const db = guard.install(fakeDb());
