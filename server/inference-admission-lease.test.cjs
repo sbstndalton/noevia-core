@@ -110,3 +110,23 @@ test('a caller that goes away while queued aborts the wait and holds nothing', a
   assert.equal(released, 1, 'and the gate gets its lease back');
   assert.equal(left, 1);
 });
+
+test('a machine turn granted after the caller left is given straight back', async (t) => {
+  let readyNow, ended = 0;
+  const chatMachines = {
+    target: () => ({ machine: { id: 'm1' }, model: 'm' }),
+    ready: () => new Promise((resolve) => { readyNow = () => resolve({ ok: true }); }),
+    beginTurn: () => () => { ended++; },
+  };
+  const { base, routes } = await serve(t, { chatMachines });
+  const controller = new AbortController();
+  const pending = ask(base, { role: 'smart', machine: 'm1', model: 'm' }, undefined, PREFIX, 'POST', controller.signal).catch(() => 'gone');
+  await settled();
+  controller.abort();
+  assert.equal(await pending, 'gone');
+  await settled();
+  readyNow();
+  await settled();
+  assert.equal(routes.leases.size(), 0);
+  assert.equal(ended, 1);
+});
