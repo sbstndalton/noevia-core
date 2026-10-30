@@ -358,6 +358,54 @@ function createClient({ port, token, fetchImpl = globalThis.fetch, timeoutMs = T
       if (status === 200 && body && body.ok === true) return body;
       throw failure(status, body);
     },
+    /** sbstndalton/noevia#2190 round 7: Google Drive's token broker (the Rust front, gdrive.rs and
+     *  connector_routes.rs). `admin` is the authenticated account's role (the backup slot doubles as
+     *  an administrator's Drive). Each answers { ok: true, ... } or { ok: false, status, error, code }.
+     *  `session` hands out an access token, never a refresh token. */
+    async gdriveSession(user, admin, rejected = null) {
+      const { status, body } = await call('gdrive/session', { user, admin: admin === true, ...(rejected ? { rejected: String(rejected) } : {}) }, CHATGPT_WAIT_MS);
+      if (status === 200 && body && typeof body.accessToken === 'string' && typeof body.generation === 'string') {
+        return { ok: true, session: { accessToken: body.accessToken, expiresAt: Number.isFinite(body.expiresAt) ? body.expiresAt : null, generation: body.generation } };
+      }
+      return chatgptRefusal(status, body);
+    },
+    async gdriveReject(user, admin, generation) {
+      const { status, body } = await call('gdrive/reject', { user, admin: admin === true, generation: String(generation || '') }, CHATGPT_WAIT_MS);
+      return status === 200 && body ? { ok: true, dropped: body.dropped === true } : chatgptRefusal(status, body);
+    },
+    async gdriveDisconnect(user, admin) {
+      const { status, body } = await call('gdrive/disconnect', { user, admin: admin === true }, CHATGPT_WAIT_MS);
+      return status === 200 && body?.ok === true ? { ok: true } : chatgptRefusal(status, body);
+    },
+    async gdriveForget(user) {
+      const { status, body } = await call('gdrive/forget', { user }, CHATGPT_WAIT_MS);
+      return status === 200 && body?.ok === true ? { ok: true } : chatgptRefusal(status, body);
+    },
+    /** secrets:rotate (round 7 review): the front re-seals every account's token file under the current
+     *  secrets.key, under its own fence. { ok: true, counts: { current, rotated, empty, failed } } or a refusal
+     *  (a 404 is an older front without the op). Counts only: no name, id or token. */
+    async gdriveReseal() {
+      const { status, body } = await call('gdrive/reseal', {}, CHATGPT_WAIT_MS);
+      const n = (k) => (Number.isInteger(body?.[k]) && body[k] >= 0 ? body[k] : null);
+      if (status === 200 && body && ['current', 'rotated', 'empty', 'failed'].every((k) => n(k) !== null)) {
+        return { ok: true, counts: { current: body.current, rotated: body.rotated, empty: body.empty, failed: body.failed } };
+      }
+      return chatgptRefusal(status, body);
+    },
+    /** The Google Drive half of GET /api/connectors, as the front would answer it. */
+    async gdriveView(user, admin) {
+      const { status, body } = await call('gdrive/view', { user, admin: admin === true }, CHATGPT_WAIT_MS);
+      return status === 200 && body && body.id === 'gdrive' ? { ok: true, view: body } : chatgptRefusal(status, body);
+    },
+    /** The one write of tool_policies, on Node's behalf (the Nextcloud permissions: Node knows the live
+     *  MCP tools and which of them write). `writes[i]` is whether `tools[i]` is a write. 400 carries the
+     *  words core always showed. */
+    async toolPolicySet(user, tools, writes, mode) {
+      const { status, body } = await call('gdrive/policy', { user, tools: [].concat(tools), writes: [].concat(writes).map((w) => w === true), mode }, CHATGPT_WAIT_MS);
+      if (status === 200 && body?.ok === true) return { ok: true };
+      if (status === 400 && body && typeof body.error === 'string') return { ok: false, status: 400, error: body.error };
+      return chatgptRefusal(status, body);
+    },
     /** sbstndalton/noevia#2153: the user's chat change journal after `after` (chat-change-journal.cjs):
      *  { entries, oldestSeq, latestSeq, more, start }, or { unsupported: true } from a store
      *  without the op (404: an older Rust front). */

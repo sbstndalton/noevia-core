@@ -1,30 +1,21 @@
 'use strict';
 // Settings → Connectors, for every signed-in account (each sees and changes only its own).
 // GET  /api/connectors                          -> the account's connectors and tool permissions
-// POST /api/connectors/gdrive/connect           -> start Google's device sign-in for this account
-// POST /api/connectors/gdrive/disconnect        -> revoke and forget this account's connection
-// PUT  /api/connectors/gdrive/policy            -> {tools:[name…], mode:'allow'|'ask'|'block'}
-// PUT  /api/connectors/gdrive/backup-copy       -> {enabled} (the administrator whose Drive holds backups)
 // PUT  /api/connectors/nextcloud/policy         -> {tools:[name…], mode} for the Nextcloud toolboxes
+//
+// The Google Drive writes are the Rust front's since sbstndalton/noevia#2190 round 7 (rust-google-drive.cjs
+// refuses them, 503 RUST_GOOGLE_DRIVE_OWNED, before anything else runs): POST …/gdrive/connect and
+// …/disconnect, PUT …/gdrive/policy and …/gdrive/backup-copy. What stays here needs the live MCP servers:
+// the Nextcloud half lists the toolbox tools they offer and which of them write, so this route builds that
+// half itself and asks the front for the Google Drive half (`accounts.view`), and for the one write of
+// tool_policies (`toolPolicy.set`), whose only writer is the front.
 //
 // Nextcloud has no connect button of its own: its tools use the account's storage connection
 // (Settings → Diary & storage), which is where it is connected and disconnected. This page says
 // whether that credential can be used, and owns what each of its tools may do.
-// onPolicyChange clears the cached permitted-tools view; it runs after every write that changes what
-// that view shows: a tool permission, a connect or a disconnect (#796, #831).
-function createConnectorRoutes({ accounts, driveTools, policy, offsite, isWrite, json, readBody, nextcloud = null, onPolicyChange = () => {} }) {
-  function view(user) {
-    const { drive, backup } = accounts.forUser(user);
-    const s = drive.state();
-    const status = backup ? offsite.status() : null;
-    return {
-      id: 'gdrive', name: 'Google Drive',
-      configured: s.configured, state: s.state, email: s.email || null, connectedAt: s.connectedAt || null,
-      userCode: s.userCode, verificationUrl: s.verificationUrl, expiresAt: s.expiresAt, message: s.message,
-      backup: backup && status?.google ? { enabled: status.enabled, copyEnabled: status.google.copyEnabled, copy: status.google.copy, lastBackup: status.lastBackup } : null,
-      tools: [...driveTools.names].map((name) => ({ name, label: driveTools.labels[name], write: isWrite(name), mode: policy.mode(user.id, name, isWrite(name)) })),
-    };
-  }
+// onPolicyChange clears the cached permitted-tools view after a write (the cache also re-reads by the
+// table's fingerprint, so the front's own writes reach it too).
+function createConnectorRoutes({ accounts, policy, toolPolicy, isWrite, json, readBody, nextcloud = null, onPolicyChange = () => {} }) {
   function nextcloudView(user) {
     const s = nextcloud.state(user);
     const tools = nextcloud.tools();
@@ -42,40 +33,20 @@ function createConnectorRoutes({ accounts, driveTools, policy, offsite, isWrite,
     if (!authn?.user) return send(401, { error: 'Sign in first.' });
     const user = authn.user;
     try {
-      if (path === '/api/connectors') return req.method === 'GET' ? send(200, { connectors: [view(user), ...(nextcloud ? [nextcloudView(user)] : [])] }) : send(405, { error: 'method not allowed' });
+      if (path === '/api/connectors') return req.method === 'GET' ? send(200, { connectors: [await accounts.view(user), ...(nextcloud ? [nextcloudView(user)] : [])] }) : send(405, { error: 'method not allowed' });
       if (path === '/api/connectors/nextcloud/policy' && req.method === 'PUT') {
         if (!nextcloud) return send(404, { error: 'not found' });
         const body = await readBody(req);
         const offered = new Set(nextcloud.tools());
-        policy.set(user.id, [].concat(body.tools || []).filter((t) => offered.has(t)), body.mode, isWrite);
+        const tools = [].concat(body.tools || []).filter((t) => offered.has(t));
+        const r = await toolPolicy.set(user.id, tools, tools.map((t) => !!isWrite(t)), body.mode);
+        if (!r || !r.ok) return send(Number.isInteger(r?.status) ? r.status : 502, { error: typeof r?.error === 'string' ? r.error : 'The tool permission could not be saved. Try again in a moment.' });
         onPolicyChange();
         return send(200, nextcloudView(user));
       }
-      const action = path.slice('/api/connectors/gdrive/'.length);
-      if (!path.startsWith('/api/connectors/gdrive/')) return send(404, { error: 'not found' });
-      if (action === 'connect' && req.method === 'POST') {
-        const { drive, backup } = accounts.forUser(user);
-        // The sign-in completes later, on Google's page: clear the permitted-tools view then too (#831).
-        await (backup ? offsite.connectGoogle(user.id, () => onPolicyChange()) : drive.connect(() => onPolicyChange(), { owner: user.id }));
-        onPolicyChange();
-        return send(200, view(user));
-      }
-      if (action === 'disconnect' && req.method === 'POST') { await accounts.forUser(user).drive.disconnect(); onPolicyChange(); return send(200, view(user)); }
-      if (action === 'policy' && req.method === 'PUT') {
-        const body = await readBody(req);
-        const tools = [].concat(body.tools || []).filter((t) => driveTools.names.has(t));
-        policy.set(user.id, tools, body.mode, isWrite);
-        onPolicyChange();
-        return send(200, view(user));
-      }
-      if (action === 'backup-copy' && req.method === 'PUT') {
-        if (!accounts.forUser(user).backup) return send(403, { error: 'Only the administrator whose Drive holds the backups can change this.' });
-        offsite.setDriveCopy((await readBody(req)).enabled === true);
-        return send(200, view(user));
-      }
       return send(404, { error: 'not found' });
     } catch (error) {
-      return send(error.status || 502, { error: error.publicMessage || 'Google Drive could not be reached.' });
+      return send(error.status || 502, { error: error.publicMessage || 'The connectors could not be loaded.' });
     }
   };
 }

@@ -180,6 +180,58 @@ test('M1: the front re-seals the provider files first, awaited, and this process
   assert.equal(failing.tables.shared_providers.failed, 1);
 });
 
+test('settings 7 x MCP 1: resealProviders, resealMcp and gdriveReseal are all awaited, in that order, before secrets.rotate; a hard failure stops what follows', async (t) => {
+  const root = tmp(t);
+  const old = createSecretStore(root, noPrev);
+  const auth = createAuth({ dataDir: root, publicOrigin: 'https://noevia.example.test', secrets: old });
+  retire(root);
+  const secrets = createSecretStore(root, noPrev);
+  const calls = [];
+  const realRotate = secrets.rotate.bind(secrets);
+  secrets.rotate = (...a) => { calls.push('rotate'); return realRotate(...a); };
+  const slow = async (name, value) => { calls.push(`${name}-start`); await new Promise((r) => setTimeout(r, 15)); calls.push(`${name}-done`); return value; };
+  const drive = { ok: true, counts: { current: 0, rotated: 0, empty: 0, failed: 0 } };
+  await runRotation({
+    secrets, db: auth.db, dataDir: root, audit: () => calls.push('audit'),
+    resealProviders: () => slow('providers', { tables: {}, failures: [] }),
+    resealMcp: () => slow('mcp', { tables: {}, failures: [] }),
+    gdriveReseal: () => slow('gdrive', drive),
+  });
+  assert.deepEqual(calls, ['providers-start', 'providers-done', 'mcp-start', 'mcp-done', 'gdrive-start', 'gdrive-done', 'rotate', 'audit']);
+
+  // A provider failure throws before the MCP and Drive re-seals are asked for, and before anything is rotated.
+  const after = [];
+  secrets.rotate = (...a) => { after.push('rotate'); return realRotate(...a); };
+  await assert.rejects(runRotation({
+    secrets, db: auth.db, dataDir: root,
+    resealProviders: async () => { after.push('providers'); throw new Error('credential store unavailable'); },
+    resealMcp: async () => { after.push('mcp'); return { tables: {}, failures: [] }; },
+    gdriveReseal: async () => { after.push('gdrive'); return drive; },
+  }), /credential store unavailable/);
+  assert.deepEqual(after, ['providers']);
+
+  // An MCP failure throws before the Drive re-seal is asked for, and before anything is rotated.
+  after.length = 0;
+  await assert.rejects(runRotation({
+    secrets, db: auth.db, dataDir: root,
+    resealProviders: async () => { after.push('providers'); return { tables: {}, failures: [] }; },
+    resealMcp: async () => { after.push('mcp'); throw new Error('credential store unavailable'); },
+    gdriveReseal: async () => { after.push('gdrive'); return drive; },
+  }), /credential store unavailable/);
+  assert.deepEqual(after, ['providers', 'mcp']);
+
+  // A Drive failure is soft: the rotation goes on and secrets.rotate still runs.
+  after.length = 0;
+  const soft = await runRotation({
+    secrets, db: auth.db, dataDir: root,
+    resealProviders: async () => ({ tables: {}, failures: [] }),
+    resealMcp: async () => ({ tables: {}, failures: [] }),
+    gdriveReseal: async () => { after.push('gdrive'); throw new Error('unreachable'); },
+  });
+  assert.deepEqual(after, ['gdrive', 'rotate']);
+  assert.equal(soft.totals.failed, 0);
+});
+
 test('M1: a rotation the front cannot take part in changes nothing else, and says so', async (t) => {
   const root = tmp(t);
   const old = createSecretStore(root, noPrev);
@@ -330,7 +382,6 @@ test('R: the shell form calls every re-seal the store client offers, in that ord
   });
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
   t.after(() => server.close());
-  const offered = typeof require('./project-store-client.cjs').createClient({ port: 1, token }).gdriveReseal === 'function';
   const child = require('node:child_process').spawn(process.execPath, [path.join(__dirname, 'secrets-rotate.cjs')], {
     env: { ...process.env, UI_DATA_DIR: root, NOEVIA_PROJECT_STORE_PORT: String(server.address().port), NOEVIA_PROJECT_STORE_TOKEN: token },
   });
@@ -338,7 +389,7 @@ test('R: the shell form calls every re-seal the store client offers, in that ord
   child.stdout.on('data', (d) => { stdout += d; }); child.stderr.on('data', (d) => { stderr += d; });
   const code = await new Promise((resolve) => { const timer = setTimeout(() => { child.kill(); resolve('timeout'); }, 60000); child.on('close', (c) => { clearTimeout(timer); resolve(c); }); });
   assert.equal(code, 0, stderr);
-  assert.deepEqual(hits, ['/v1/providers/reseal', '/v1/mcp/reseal', ...(offered ? ['/v1/gdrive/reseal'] : [])]);
+  assert.deepEqual(hits, ['/v1/providers/reseal', '/v1/mcp/reseal', '/v1/gdrive/reseal'], 'one store client, every re-seal, in order');
   const report = JSON.parse(stdout);
   assert.equal(report.tables.shared_providers.current, 1);
   assert.equal(report.tables.mcp_oauth_tokens.current, 2);

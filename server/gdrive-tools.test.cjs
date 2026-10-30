@@ -4,8 +4,8 @@
 const test = require('node:test'), assert = require('node:assert/strict');
 const fs = require('node:fs'), os = require('node:os'), path = require('node:path'), crypto = require('node:crypto');
 const Database = require('better-sqlite3');
-const { createGoogleDrive } = require('./gdrive.cjs');
-const { createDriveAccounts } = require('./drive-accounts.cjs');
+const { createDriveAccounts } = require('./gdrive-broker.cjs');
+const { startBrokerFixture } = require('./gdrive-broker-fixture.cjs');
 const { createDriveTools } = require('./gdrive-tools.cjs');
 const { createToolPolicy } = require('./tool-policy.cjs');
 const { quote } = require('./gdrive-files.cjs');
@@ -17,54 +17,24 @@ let google;
 test.before(async () => { google = await startFakeGoogle({ autoApprove: true }); });
 test.after(async () => { await google.close(); for (const d of temps) fs.rmSync(d, { recursive: true, force: true }); });
 
-const key = crypto.randomBytes(32);
-const makeDrive = ({ tokenFile, backupKey }) => createGoogleDrive({
-  clientId: 'fake-client', clientSecret: 'fake-secret', tokenFile, backupKey,
-  oauthBase: google.base, apiBase: `${google.base}/drive`, uploadBase: `${google.base}/upload`,
-});
 const until = async (fn) => { for (let i = 0; i < 100; i++) { if (await fn()) return; await new Promise((r) => setTimeout(r, 50)); } throw new Error('timed out'); };
-const admin = { id: 'u-admin', role: 'admin' }, member = { id: 'u-member', role: 'member' }, other = { id: 'u-other', role: 'member' };
+const member = { id: 'u-member', role: 'member' }, other = { id: 'u-other', role: 'member' };
 
+// The Rust front is the token authority (noevia-rs tests/gdrive.rs covers it); here a stand-in broker
+// signs accounts in against the fake Google, so these tests are about the tools.
 function setup() {
   const dir = temp();
-  const backupDrive = makeDrive({ tokenFile: path.join(dir, 'google-drive.sealed'), backupKey: () => key });
-  const accounts = createDriveAccounts({ backupDrive, dataDir: dir, userKey: () => key, makeDrive });
-  return { dir, backupDrive, accounts, tools: createDriveTools({ accounts, cap: 200 }) };
+  const fixture = startBrokerFixture({ google, dataDir: dir });
+  const accounts = createDriveAccounts({ broker: fixture.broker, dataDir: dir, apiBase: `${google.base}/drive`, uploadBase: `${google.base}/upload` });
+  return { dir, fixture, accounts, tools: createDriveTools({ accounts, cap: 200 }) };
 }
-async function connect(accounts, user) {
-  const { drive } = accounts.forUser(user);
-  await drive.connect(() => {}, { owner: user.id });
-  await until(() => drive.state().state === 'connected');
-}
-
-test('an administrator fills the backup slot; members get their own sealed connection', async () => {
-  const { dir, accounts, backupDrive } = setup();
-  assert.equal(accounts.forUser(admin).backup, true);
-  assert.equal(accounts.forUser(member).backup, false);
-  await connect(accounts, admin);
-  assert.equal(backupDrive.state().owner, 'u-admin');
-  // A second administrator does not inherit the first one's Drive.
-  assert.equal(accounts.forUser({ id: 'u-admin2', role: 'admin' }).backup, false);
-  await connect(accounts, member);
-  assert.ok(fs.existsSync(path.join(dir, 'google-drive-users', 'u-member.sealed')));
-  assert.equal(accounts.forUser(other).drive.state().state, 'disconnected');
-  assert.throws(() => accounts.forUser(null), /Sign in/);
-});
-
-test('a backup connection saved before owners were recorded belongs to any administrator', async () => {
-  const { accounts, backupDrive } = setup();
-  await backupDrive.connect();
-  await until(() => backupDrive.state().state === 'connected');
-  assert.equal(backupDrive.state().owner, null);
-  assert.equal(accounts.forUser(admin).backup, true);
-  assert.equal(accounts.forUser(member).backup, false);
-});
+async function connect(fixture, user) { await fixture.connect(user); }
 
 test('the tools create, find, read, update and trash files in the caller\'s own Drive only', async () => {
-  const { accounts, tools } = setup();
+  const { fixture, accounts, tools } = setup();
   assert.match(await tools.execute(member, 'drive_list_recent', {}), /not connected/);
   assert.equal(tools.connected(member), false);
-  await connect(accounts, member);
+  await connect(fixture, member);
   assert.equal(tools.connected(member), true);
 
   const created = await tools.execute(member, 'drive_create_file', { name: 'plan.md', content: 'Kiwix ZIM goes to the array', mimeType: 'text/markdown' });
@@ -86,8 +56,8 @@ test('the tools create, find, read, update and trash files in the caller\'s own 
 });
 
 test('bad arguments and binary files come back as readable errors, never a throw', async () => {
-  const { accounts, tools } = setup();
-  await connect(accounts, member);
+  const { fixture, accounts, tools } = setup();
+  await connect(fixture, member);
   assert.match(await tools.execute(member, 'drive_read_file', {}), /^ERROR: fileId is required/);
   assert.match(await tools.execute(member, 'drive_read_file', { fileId: '../etc' }), /^ERROR: fileId is not a Drive file id/);
   assert.match(await tools.execute(member, 'drive_read_file', { fileId: 'nope' }), /^ERROR: Google Drive has no such file/);
@@ -103,35 +73,46 @@ test('search quotes the query, so a stray quote cannot end the Drive literal', (
   assert.equal(quote('a\\b'), "'a\\\\b'");
 });
 
-test('policy: reads default to allow, writes to ask, and writes can never be allowed', () => {
+test('policy: reads default to allow, writes to ask, and the table is read here on every call', () => {
   const db = new Database(':memory:');
   db.exec("CREATE TABLE users(id TEXT PRIMARY KEY); INSERT INTO users VALUES('u1'),('u2');");
-  const audits = [];
-  const policy = createToolPolicy({ db, audit: (...a) => audits.push(a) });
-  const isWrite = (t) => !t.startsWith('read');
+  const policy = createToolPolicy({ db });
+  // The Rust front is the writer (noevia-rs tests/gdrive.rs); this stands in for one of its upserts.
+  const put = (user, tool, mode, at = 1) => db.prepare('INSERT INTO tool_policies VALUES(?,?,?,?) ON CONFLICT(user_id, tool) DO UPDATE SET mode=excluded.mode, updated_at=excluded.updated_at').run(user, tool, mode, at);
   assert.equal(policy.mode('u1', 'read_a', false), 'allow');
   assert.equal(policy.mode('u1', 'write_a', true), 'ask');
-  policy.set('u1', ['read_a'], 'ask', isWrite);
-  assert.equal(policy.mode('u1', 'read_a', false), 'ask');
+  assert.equal(typeof policy.set, 'undefined', 'Node has no writer left');
+  const empty = policy.fingerprint();
+  put('u1', 'read_a', 'ask');
+  assert.equal(policy.mode('u1', 'read_a', false), 'ask', 'a write by another process is seen at once');
   assert.equal(policy.mode('u2', 'read_a', false), 'allow', 'one account\'s choice never applies to another');
-  assert.throws(() => policy.set('u1', ['read_a', 'write_a'], 'allow', isWrite), /Writes always ask first/);
-  assert.equal(policy.mode('u1', 'read_a', false), 'ask', 'a refused batch changes nothing');
-  policy.set('u1', ['write_a'], 'block', isWrite);
+  assert.notEqual(policy.fingerprint(), empty, 'and moves the content fingerprint');
+  const one = policy.fingerprint();
+  put('u1', 'read_a', 'block', 2);
+  assert.notEqual(policy.fingerprint(), one);
+  put('u1', 'read_a', 'ask', 1);
+  assert.equal(policy.fingerprint(), one, 'the fingerprint is of the content, not a counter');
+  put('u1', 'write_a', 'block');
   assert.equal(policy.mode('u1', 'write_a', true), 'block');
-  // A read stored as allow that is later reclassified as a write asks.
-  policy.set('u1', ['read_b'], 'allow', isWrite);
+  // A write stored as allow before it became a write asks; an unknown stored mode blocks.
+  db.pragma('ignore_check_constraints = ON');
+  put('u1', 'read_b', 'allow');
   assert.equal(policy.mode('u1', 'read_b', true), 'ask');
-  assert.throws(() => policy.set('u1', ['read_a'], 'sometimes', isWrite), /Choose allow, ask or block/);
-  assert.throws(() => policy.set('u1', [], 'ask', isWrite), /Choose a tool/);
   assert.equal(policy.mode(null, 'read_a', false), 'allow');
-  assert.deepEqual(audits.at(-1), ['tool.policy', 'u1', { tools: ['read_b'], mode: 'allow' }]);
 });
 
-test('deleting an account revokes its Drive connection', async () => {
-  const { dir, accounts } = setup();
-  await connect(accounts, member);
+test('deleting an account asks the broker to revoke and forget its connection, and never throws', async () => {
+  const { dir, fixture, accounts } = setup();
+  await connect(fixture, member);
   const before = google.state.revoked.length;
   await accounts.removeUser('u-member');
+  assert.deepEqual(fixture.calls.forget, ['u-member']);
   assert.equal(google.state.revoked.length, before + 1);
-  assert.equal(fs.existsSync(path.join(dir, 'google-drive-users', 'u-member.sealed')), false);
+  assert.equal(fixture.refresh.has('u-member'), false);
+  // A broker that is down does not undo or fail the account's deletion.
+  const warned = [];
+  const down = createDriveAccounts({ broker: { gdriveForget: async () => { throw Object.assign(new Error('x'), { status: 503 }); } }, dataDir: dir, warn: (m) => warned.push(m) });
+  await down.removeUser('u-gone');
+  assert.equal(warned.length, 1);
+  assert.doesNotMatch(warned[0], /u-gone/, 'no account id in the warning');
 });

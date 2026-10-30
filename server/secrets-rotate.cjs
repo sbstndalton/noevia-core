@@ -25,7 +25,7 @@
 // administrator. That keeps the front the single writer of the provider files with no second path.
 const fs = require('node:fs');
 const path = require('node:path');
-const { resealTokenFile } = require('./gdrive.cjs');
+const { checkTokenFile } = require('./gdrive-seal.cjs');
 
 const hasTable = (db, name) => !!db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?").get(name);
 
@@ -47,8 +47,11 @@ function sqlTable(db, name, { table, keys, column, bound }) {
   };
 }
 
-// Members' Google Drive refresh tokens (google-drive-users/<id>.sealed) are sealed by gdrive.cjs under
-// a key derived from secrets.key, not as enc: strings, so they bring their own re-seal (#866).
+// Members' Google Drive refresh tokens (google-drive-users/<id>.sealed) are sealed in the Rust front's format under a
+// key derived from secrets.key, not as enc: strings. The front is their only writer (round 7 review): runRotation
+// asks it to re-seal them first (POST /v1/gdrive/reseal, under its own fence) and this table only CHECKS, read-only,
+// that every file now opens under the current key. It never writes one, so a rotation can not bring back an
+// account that disconnected while it ran, nor drop a folder the front remembered.
 function googleDriveUserFiles(dir, secrets) {
   return {
     name: 'google_drive_users',
@@ -57,8 +60,7 @@ function googleDriveUserFiles(dir, secrets) {
       return fs.readdirSync(dir).filter((f) => f.endsWith('.sealed')).sort().map((f) => ({ ref: f, value: f }));
     },
     reseal(row) {
-      const status = resealTokenFile(path.join(dir, row.ref), secrets.derive('google-drive-user'), secrets.derivePrevious('google-drive-user'));
-      return { status };
+      return { status: checkTokenFile(path.join(dir, row.ref), secrets.derive('google-drive-user')) };
     },
   };
 }
@@ -83,11 +85,11 @@ function mergeProviderPass(report, pass) {
 }
 
 /**
- * The Rust front re-seals the Google Drive token files (it is their only writer, settings 7 /
- * sbstndalton/noevia#2200) before the rest is rotated. `gdriveReseal` is the broker call
- * (`project-store-client` gdriveReseal): `{ ok, counts }` or `{ ok: false, ... }`. SOFT: a front that cannot do
- * it (down, an older build) is `{ error }`, never a throw - the files are left as they were, still readable by
- * the front under the retired key, and the operator keeps the previous key and runs the rotation again.
+ * The Rust front re-seals the Google Drive token files (it is their only writer) before the rest is
+ * rotated. `gdriveReseal` is the broker call (`project-store-client` gdriveReseal): `{ ok, counts }` or
+ * `{ ok: false, ... }`. A front that cannot do it (down, an older build) is a failure of that table, recorded
+ * in the report: the files are left as they were, still readable by the front under the retired key, so the
+ * operator must keep the previous key and run the rotation again.
  */
 async function resealGoogleDrive(gdriveReseal) {
   if (!gdriveReseal) return { error: 'the Rust front was not asked to re-seal the Google Drive token files (run the rotation from the admin page of the running server)' };
@@ -101,11 +103,14 @@ async function resealGoogleDrive(gdriveReseal) {
 /**
  * Run a rotation and record it in the audit log. Never throws for a bad row. The order is fixed, and every
  * callback is checked before the first await (a missing one must not leave the first passes done):
- *   1. `await resealProviders()`: the front re-seals the provider files (rust-providers-reseal.cjs).
- *   2. `await resealMcp()`: the front re-seals the MCP sign-ins, apps and keys (rust-mcp-credentials.cjs).
- *   3. `await gdriveReseal()`, when given: the front re-seals the Google Drive token files. SOFT (above).
+ *   1. `await resealProviders()`: the front re-seals the provider files (rust-providers-reseal.cjs
+ *      `resealProviderKeys`). It throws, before anything is changed, when it cannot: that stops everything.
+ *   2. `await resealMcp()`: the front re-seals the MCP sign-ins, apps and keys (rust-mcp-credentials.cjs
+ *      `resealMcpCredentials`). It throws too, and then nothing below runs.
+ *   3. `await gdriveReseal()`: the front re-seals the Google Drive token files (SOFT: a front that cannot do
+ *      it is a failure of that table in the report, and the rotation goes on).
  *   4. `secrets.rotate`: the rest, in this process.
- *   5. the passes are merged into the report.
+ *   5. the passes are merged into the report and the Drive check is relabelled.
  * Steps 1 and 2 throw when the front cannot do them, and then THIS process has changed nothing. The front's own
  * passes may have run in part (the providers' before a failing MCP pass, or some rows of one): each re-seal is
  * idempotent and per row, so a rotation can simply be run again.
@@ -116,13 +121,22 @@ async function runRotation({ secrets, db, dataDir, audit = () => {}, actorId = n
   if (gdriveReseal !== null && gdriveReseal !== undefined && typeof gdriveReseal !== 'function') throw new Error('gdriveReseal, when given, must be a function');
   const providers = await resealProviders();
   const mcpCredentials = await resealMcp();
-  // Awaited too: the front's re-seal is a step of the rotation, not a race with it. (Settings 7 reads this
-  // result to reconcile the report's google_drive_users counts; on this base Node's own table still re-seals
-  // those files, so the result is not needed yet.)
-  await resealGoogleDrive(gdriveReseal);
+  // Awaited too: the front's re-seal is a step of the rotation, not a race with it.
+  const front = await resealGoogleDrive(gdriveReseal);
   const report = secrets.rotate({ tables: rotationTables({ db, dataDir, secrets }) });
   mergeProviderPass(report, providers);
   mergeProviderPass(report, mcpCredentials);
+  if (report.tables.google_drive_users) {
+    const t = report.tables.google_drive_users;
+    if (front.counts) {
+      // The files the front re-sealed were 'current' when this check read them; they are reported as rotated.
+      const moved = Math.min(front.counts.rotated || 0, t.current);
+      t.current -= moved; t.rotated += moved; report.totals.current -= moved; report.totals.rotated += moved;
+    } else if (t.failed > 0) {
+      // Files the check could not open and a front that did not re-seal them: say why (the files are the count).
+      report.failures.push({ table: 'google_drive_users', ref: null, error: front.error });
+    }
+  }
   report.previousKey = secrets.hasPreviousKey();
   audit('secrets.rotate', actorId, actorId, { totals: report.totals, failed: report.failures.map((f) => ({ table: f.table, ref: f.ref })).slice(0, 50) });
   return report;
@@ -136,12 +150,11 @@ if (require.main === module) {
     console.error('secrets rotation was not started and nothing was changed: the provider keys are re-sealed by the Rust front, which this shell cannot reach (the internal store\'s port and secret belong to the web process). Rotate through the running app instead: sign in as an administrator and POST /api/admin/secrets/rotate.');
     process.exit(2);
   }
-  // Every re-seal the front's store client offers, as the admin route passes them (index.cjs): a client from before
-  // the Drive broker has no gdriveReseal, which runRotation allows (the providers' and the MCP pass are required).
+  // ONE store client, and every re-seal it offers, as the admin route passes them (index.cjs).
   const front = store.clientFromEnv(process.env);
   const resealProviders = () => require('./rust-providers-reseal.cjs').resealProviderKeys(front);
   const resealMcp = () => require('./rust-mcp-credentials.cjs').resealMcpCredentials(front);
-  const gdriveReseal = typeof front.gdriveReseal === 'function' ? () => front.gdriveReseal() : null;
+  const gdriveReseal = () => front.gdriveReseal();
   const dataDir = process.env.UI_DATA_DIR || path.join(__dirname, 'ui-data');
   const { createSecretStore } = require('./secrets.cjs');
   const Database = require('better-sqlite3');

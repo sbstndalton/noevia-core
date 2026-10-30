@@ -189,6 +189,13 @@ const FRONT_TABLES = Object.freeze({
     code: require('./rust-chatgpt-oauth.cjs').ROUTE_REFUSAL.code,
     allowed: require('./rust-chatgpt-oauth.cjs').RESEAL_SQL,
   }),
+  // sbstndalton/noevia#2190 round 7: Settings -> Connectors' per-tool permissions; the front writes them
+  // (rust-google-drive.cjs). No Node statement is allowed: not even inside exempt().
+  tool_policies: Object.freeze({
+    message: require('./rust-google-drive.cjs').ROUTE_REFUSAL.error,
+    code: require('./rust-google-drive.cjs').ROUTE_REFUSAL.code,
+    allowed: null,
+  }),
 });
 /** The guard. It takes no options: Rust always owns these tables (sbstndalton/noevia#1071). */
 function createRustAuthGuard() {

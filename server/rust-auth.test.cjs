@@ -338,7 +338,7 @@ test('settings: an old "off" option guards anyway, and the front\'s keys stay re
 test('sbstndalton/noevia#2190 round 4: storage_connections is refused exempt or not, but for the exact reseal', () => {
   const { RESEAL_SQL, ROUTE_REFUSAL } = require('./rust-storage-connection.cjs');
   // The set of front-owned tables, not their order (each round that moves a table adds one in its own place).
-  assert.deepEqual(Object.keys(FRONT_TABLES).sort(), ['storage_connections', 'mcp_oauth_tokens', 'mcp_oauth_clients', 'directory_mcp_user_keys', 'chatgpt_oauth_tokens'].sort());
+  assert.deepEqual(Object.keys(FRONT_TABLES).sort(), ['chatgpt_oauth_tokens', 'directory_mcp_user_keys', 'mcp_oauth_clients', 'mcp_oauth_tokens', 'storage_connections', 'tool_policies']);
   assert.equal(FRONT_TABLES.storage_connections.code, ROUTE_REFUSAL.code);
   const guard = on();
   const db = guard.install(fakeDb());
