@@ -27,10 +27,13 @@ function build({ servers, catalogues, directoryServers = [], env = {}, storage =
   const mcp = mcpOverride || fakeMcp(catalogues);
   const scope = new AsyncLocalStorage();
   const minted = [];
+  // The directory is the Rust front's table, re-read through `signal` (directory-mcp.cjs): a test moves it by bumping `version`.
+  const dirState = { version: 0, servers: directoryServers, looks: 0 };
   const wiring = createMcpWiring({
     servers, manifest, mcp,
     bindBoxes: ({ manifest, perServer }) => manifest.map((m) => ({ id: m.id, tools: [...(perServer.get(m.server) || new Map()).values()].map((e) => e.tool), server: m.server })),
-    directoryMcp: { asServers: () => directoryServers, boxFor: (sv, names) => ({ id: sv.id, server: sv.id, tools: [...names] }), headersFor: () => ({ 'X-Key': 'dir' }) },
+    directoryCheckMs: 0,
+    directoryMcp: { signal: () => { dirState.looks += 1; return dirState.version; }, asServers: () => dirState.servers, boxFor: (sv, names) => ({ id: sv.id, server: sv.id, tools: [...names] }), headersFor: () => ({ 'X-Key': 'dir' }) },
     // The brokers (rust-mcp-credentials.cjs): one call's key headers / access token, asked per call.
     mcpKeys: mcpKeys || { hasKey: (uid) => uid === 'keyed', headers: async (uid) => (uid === 'keyed' ? { 'X-Key': 'mine' } : null) },
     mcpOAuth: mcpOAuth || { connected: (uid) => uid === 'signed', tokenFor: async (uid) => (uid === 'signed' ? 'oauth-token' : null) },
@@ -44,7 +47,7 @@ function build({ servers, catalogues, directoryServers = [], env = {}, storage =
     ...(discoveryTtlMs !== undefined ? { discoveryTtlMs } : {}),
     ...(discoveryRetryMs !== undefined ? { discoveryRetryMs } : {}),
   });
-  return { wiring, mcp, scope, minted };
+  return { wiring, mcp, scope, minted, dirState };
 }
 
 const asUser = (scope, userId, fn) => scope.run({ workspace: { userId }, authn: { user: { id: userId } } }, fn);
@@ -427,4 +430,69 @@ test('#2202: a sign-in or key the Rust front stored since the last discovery is 
   signedIn = false;
   state = await wiring.discoverMcpTools();
   assert.equal(state.tools.has('o_read'), false);
+});
+
+// ── #2202 round 2: the directory is the Rust front's table, re-read ──────────────────────────────
+test('a directory server the Rust front adds is discovered on the next use, and one it removes is dropped', async () => {
+  const servers = [];
+  const dir = { id: 'dir-x', url: 'https://x.example/mcp', auth: 'none', directory: true, title: 'X', addedBy: 'admin' };
+  const { wiring, dirState } = build({ servers, catalogues: { 'https://x.example/mcp': [rawTool('x_tool', true)] } });
+  assert.equal(wiring.enabled(), false);
+  await wiring.discoverMcpTools();
+  assert.deepEqual([...wiring.state.tools.keys()], []);
+  // The front inserted a row: the signal moves, nothing else tells this process.
+  dirState.servers = [dir]; dirState.version++;
+  const state = await wiring.discoverMcpTools();
+  assert.equal(wiring.enabled(), true);
+  assert.deepEqual(servers.map((sv) => sv.id), ['dir-x']);
+  assert.deepEqual([...state.tools.keys()], ['x_tool'], 'rediscovered without a forced discovery');
+  assert.deepEqual(state.boxes.map((b) => b.id), ['dir-x']);
+  // The front removed it.
+  dirState.servers = []; dirState.version++;
+  await wiring.discoverMcpTools();
+  assert.deepEqual(servers, []);
+  assert.deepEqual([...wiring.state.tools.keys()], []);
+  assert.deepEqual(wiring.state.boxes, []);
+});
+
+test('a directory the table cannot give is no servers: a removed server is not called, and the account is asked nothing of it', async () => {
+  const dir = { id: 'dir-x', url: 'https://x.example/mcp', auth: 'oauth', directory: true, title: 'X', addedBy: 'admin' };
+  const { wiring, scope, mcp, dirState } = build({ servers: [], directoryServers: [dir], catalogues: { 'https://x.example/mcp': [rawTool('x_tool', true)] },
+    mcpOAuth: { connected: () => true, session: async () => ({ accessToken: 't', generation: 'g' }), tokenFor: async () => 't' } });
+  await wiring.discoverMcpTools();
+  assert.ok(wiring.oauthServerIds().has('dir-x'));
+  assert.equal(wiring.accountReady('u', 'dir-x'), true);
+  // The table becomes unreadable (the re-reader answers nothing at all).
+  dirState.servers = []; dirState.version = 'unreadable';
+  assert.equal(wiring.oauthServerIds().has('dir-x'), false);
+  assert.equal(wiring.accountReady('u', 'dir-x'), false);
+  const out = await asUser(scope, 'u', () => wiring.executeMcpToolCall('x_tool', {}, undefined, 'dir-x'));
+  assert.match(out, /no longer configured|unknown tool/);
+  assert.equal(mcp.calls.length, 0, 'nothing was sent to a server the table no longer lists');
+});
+
+test('the hot paths look at the table at most once per interval; a discovery always looks', async () => {
+  const dir = { id: 'dir-x', url: 'https://x.example/mcp', auth: 'oauth', directory: true, title: 'X', addedBy: 'admin' };
+  const { wiring, dirState } = build({ servers: [], catalogues: { 'https://x.example/mcp': [] } });
+  // build() runs with no throttle; make a throttled one over the same pieces.
+  const throttled = createMcpWiring({
+    servers: [], manifest: [], mcp: fakeMcp({}), bindBoxes: () => [], directoryCheckMs: 60000,
+    directoryMcp: { signal: () => { dirState.looks += 1; return dirState.version; }, asServers: () => dirState.servers, boxFor: () => ({}), headersFor: () => ({}) },
+    mcpOAuth: { connected: () => false }, directoryUrlAllowed: async () => true, credentialOriginAllowed: () => false,
+    scope: new AsyncLocalStorage(), storageFor: () => ({}), isWriteTool: () => false, internal: {}, internalKey: 'k', reduceToolResult: (t) => ({ text: t }), logger: { log() {}, warn() {} },
+  });
+  assert.ok(wiring);
+  dirState.looks = 0;
+  for (let i = 0; i < 50; i++) { throttled.oauthServerIds(); throttled.accountReady('u', 'x'); }
+  assert.ok(dirState.looks <= 1, `at most one look for 100 hot-path calls, saw ${dirState.looks}`);
+  dirState.servers = [dir]; dirState.version++;
+  await throttled.discoverMcpTools();
+  assert.equal(throttled.servers.length, 1, 'a discovery looks now, whatever the interval says');
+});
+
+test('the probe and the admin routes\' pending keys are gone: this client only calls and lists (#2202 round 2)', () => {
+  const { wiring } = build({ servers: [], catalogues: {} });
+  assert.equal(wiring.probeMcpAuth, undefined);
+  const code = require('node:fs').readFileSync(require('node:path').join(__dirname, 'mcp-wiring.cjs'), 'utf8').split('\n').filter((l) => !/^\s*(\/\/|\*)/.test(l)).join('\n');
+  assert.doesNotMatch(code, /pendingHeaders|probeMcpAuth/);
 });

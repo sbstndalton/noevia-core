@@ -63,7 +63,7 @@ test('the dead Node handlers and their library halves are gone; chat keeps what 
   const skills = require('./instruction-skills.cjs');
   for (const gone of ['setSelection', 'listForClient', 'resolve']) assert.equal(skills[gone], undefined, gone);
   for (const kept of ['inspect', 'list', 'manifests', 'resolvePinned', 'reconcile', 'snapshot', 'enabled', 'sources', 'read']) assert.equal(typeof skills[kept], 'function', kept);
-  assert.equal(require('./routes/plugin-directory.cjs').fetchPublishedSkill, undefined);
+  assert.equal(fs.existsSync(path.join(__dirname, 'routes', 'plugin-directory.cjs')), false);
   const index = fs.readFileSync(path.join(__dirname, 'index.cjs'), 'utf8');
   assert.equal(index.includes("routes/projects.cjs"), false);
   assert.ok(index.includes("require('./rust-project-config.cjs').refuseOwned("), 'the marker the supervisor and the assembler pair with the capability');

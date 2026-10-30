@@ -197,22 +197,17 @@ test('bearer tokens cannot carry cookies, and a cookie session cannot borrow a b
 
 test('F2: a device token cannot link connectors or change their tool policy', async () => {
   const tokens = deviceFor(adminId, 'Connector Mac');
-  for (const [method, url, body] of [
-    ['PUT', '/api/connectors/nextcloud/policy', { tools: [], mode: 'allow' }],
-  ]) {
-    const r = await asDevice(tokens.access, url, { method, body });
-    assert.equal(r.status, 403, `${method} ${url} -> ${r.status}`);
-    assert.equal(r.json.code, 'browser_session_required');
-  }
-  assert.notEqual((await asDevice(tokens.access, '/api/connectors')).status, 403, 'reading the connector list stays allowed');
-  // The Google Drive writes are the Rust front's (#2190 round 7): Node refuses them before authentication, and
-  // the front's gate refuses a device token on them (noevia-rs tests/offsite.rs checks its browser-only list).
-  for (const [method, url, body] of [
-    ['POST', '/api/connectors/gdrive/connect', {}], ['POST', '/api/connectors/gdrive/disconnect', {}],
-    ['PUT', '/api/connectors/gdrive/policy', { tools: ['drive_write'], mode: 'allow' }], ['PUT', '/api/connectors/gdrive/backup-copy', { enabled: true }],
+  // The connector writes are the Rust front's (the Google Drive ones since #2190 round 7, the Nextcloud permissions since
+  // #2202 round 2): Node refuses them before authentication, and the front's gate refuses a device token on them (noevia-rs
+  // tests/offsite.rs and tests/toolboxes_connectors.rs check its browser-only list). The list is the front's too.
+  for (const [method, url, body, code] of [
+    ['PUT', '/api/connectors/nextcloud/policy', { tools: [], mode: 'allow' }, 'RUST_CONNECTORS_OWNED'],
+    ['POST', '/api/connectors/gdrive/connect', {}, 'RUST_GOOGLE_DRIVE_OWNED'], ['POST', '/api/connectors/gdrive/disconnect', {}, 'RUST_GOOGLE_DRIVE_OWNED'],
+    ['PUT', '/api/connectors/gdrive/policy', { tools: ['drive_write'], mode: 'allow' }, 'RUST_GOOGLE_DRIVE_OWNED'], ['PUT', '/api/connectors/gdrive/backup-copy', { enabled: true }, 'RUST_GOOGLE_DRIVE_OWNED'],
   ]) {
     const r = await asDevice(tokens.access, url, { method, body });
     assert.equal(r.status, 503, `${method} ${url} -> ${r.status}`);
-    assert.equal(r.json.code, 'RUST_GOOGLE_DRIVE_OWNED');
+    assert.equal(r.json.code, code);
   }
+  assert.equal((await asDevice(tokens.access, '/api/connectors')).json.code, 'RUST_CONNECTORS_OWNED', 'the list is the front\'s, which lets a device token read it');
 });

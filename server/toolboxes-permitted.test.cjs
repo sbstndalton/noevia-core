@@ -3,85 +3,11 @@ const skipWasm = !require('node:fs').existsSync(process.env.DAV_PARSE_WASM || re
 // Guards a wrong test signature (options passed twice makes node:test take the second object as the body, so the body never runs and the
 // test reports ok): when the module is there, every guarded body must have run.
 let ran = 0;
-// #237: the per-turn view of permitted tools. Synthetic boxes only.
+// The toolbox ids a request carries (#237, #354, #1006). The per-turn view of permitted tools is the Rust front's since
+// sbstndalton/noevia#2202 round 2 (noevia-rs bins/noevia-server toolbox_routes.rs, tested there). Synthetic only.
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { computePermittedTools, createTtlCache, selectedToolboxIds } = require('./toolboxes-permitted.cjs');
-
-const fn = (name, description = '') => ({ type: 'function', function: { name, description, parameters: {} } });
-const BOXES = [
-  { id: 'core', label: 'Core', description: 'Built-ins', source: 'builtin', tools: [fn('get_current_time')], reads: ['get_current_time'] },
-  { id: 'web-search', label: 'Web search', description: 'Search the web', source: 'mcp', tools: [fn('tavily_search')] },
-  { id: 'nextcloud-notes', label: 'Notes', description: 'Notes', source: 'mcp', tools: [fn('nc_notes_search_notes'), fn('nc_notes_create_note')] },
-  { id: 'diary', label: 'Diary', description: 'Diary', source: 'mcp', tools: [fn('diary_read')] },
-  { id: 'gdrive', label: 'Google Drive', description: 'Drive', source: 'builtin', tools: [fn('gdrive_search')] },
-];
-const WRITES = new Set(['nc_notes_create_note']);
-function input(overrides = {}) {
-  return {
-    user: { id: 'u-member', role: 'member' }, project: { id: 'p1', toolboxes: ['core', 'web-search'] }, mode: 'chat',
-    boxes: BOXES, manifest: [{ id: 'nextcloud-calendar', label: 'Calendar', description: 'Calendar' }],
-    defaultToolboxes: ['core'], connectorBoxes: new Set(['gdrive']), connected: [],
-    oauthServerIds: new Set(['nextcloud-notes']), accountReady: () => true,
-    policyMode: (_u, name, write) => (name === 'tavily_search' ? 'ask' : write ? 'ask' : 'allow'),
-    isWriteTool: (name) => WRITES.has(name), diaryEnabled: true, harnessEnabled: true, repositories: ['demo'],
-    ...overrides,
-  };
-}
-const byId = (boxes) => Object.fromEntries(boxes.map((b) => [b.id, b]));
-
-test('reads are allowed, writes and Ask reads need approval, and the project selection is marked active', { skip: skipWasm }, () => {
-  ran++;
-  const boxes = byId(computePermittedTools(input()));
-  assert.equal(boxes.core.tools[0].permission, 'allowed');
-  assert.equal(boxes.core.active, true);
-  assert.equal(boxes['web-search'].tools[0].permission, 'needs-approval', 'a read set to Ask still asks');
-  const notes = Object.fromEntries(boxes['nextcloud-notes'].tools.map((t) => [t.name, t]));
-  assert.equal(notes.nc_notes_search_notes.permission, 'allowed');
-  assert.equal(notes.nc_notes_create_note.permission, 'needs-approval', 'writes always pass the approval card');
-  assert.equal(boxes['nextcloud-notes'].active, false, 'available but not selected: offered for a turn, not on by default');
-});
-
-test('a blocked tool is unavailable with a reason, and a tool policy is read for this account only', { skip: skipWasm }, () => {
-  ran++;
-  const seen = [];
-  const boxes = byId(computePermittedTools(input({ policyMode: (u, name) => { seen.push(u); return name === 'get_current_time' ? 'block' : 'allow'; } })));
-  assert.deepEqual(boxes.core.tools[0], { name: 'get_current_time', description: '', write: false, permission: 'unavailable', reason: 'Blocked in your tool permissions.', reasonCode: 'blocked' });
-  assert.ok(seen.every((u) => u === 'u-member'));
-});
-
-test('an unconnected connector, a signed-out OAuth service, and a disabled Diary are unavailable with reasons', { skip: skipWasm }, () => {
-  ran++;
-  const boxes = byId(computePermittedTools(input({ accountReady: () => false, diaryEnabled: false })));
-  assert.equal(boxes.gdrive.state, 'unavailable');
-  assert.match(boxes.gdrive.reason, /Connect/);
-  assert.equal(boxes['nextcloud-notes'].state, 'unavailable');
-  assert.ok(boxes['nextcloud-notes'].tools.every((t) => t.permission === 'unavailable'), 'an unavailable box offers nothing, even its reads');
-  assert.equal(boxes.diary.state, 'unavailable');
-  const connected = byId(computePermittedTools(input({ connected: ['gdrive'] })));
-  assert.equal(connected.gdrive.state, 'available');
-  assert.equal(connected.gdrive.active, true, 'a connected account box is on for every chat');
-});
-
-test('configured but undiscovered services are listed as unavailable and never offered', { skip: skipWasm }, () => {
-  ran++;
-  const boxes = byId(computePermittedTools(input()));
-  assert.deepEqual([boxes['nextcloud-calendar'].state, boxes['nextcloud-calendar'].tools.length], ['unavailable', 0]);
-});
-
-test('the coding harness: Cowork-only, admin-only, harness on, project and repository required', { skip: skipWasm }, () => {
-  ran++;
-  const code = (o) => byId(computePermittedTools(input(o))).code;
-  assert.match(code({}).reason, /Cowork/);
-  assert.match(code({ mode: 'cowork' }).reason, /administrators/, 'a member never gets code tools');
-  const admin = { id: 'u-admin', role: 'admin' };
-  assert.match(code({ mode: 'cowork', user: admin, harnessEnabled: false }).reason, /off/);
-  assert.match(code({ mode: 'cowork', user: admin, project: null }).reason, /project/);
-  assert.match(code({ mode: 'cowork', user: admin, repositories: [] }).reason, /repository/);
-  const on = code({ mode: 'cowork', user: admin });
-  assert.equal(on.state, 'available');
-  assert.deepEqual(on.tools.map((t) => t.permission), ['allowed', 'needs-approval', 'needs-approval']);
-});
+const { selectedToolboxIds } = require('./toolboxes-permitted.cjs');
 
 test('selectedToolboxIds (#354): the shared union chat.cjs, this catalogue and the picker must all agree on', { skip: skipWasm }, () => {
   ran++;
@@ -103,25 +29,6 @@ test('selectedToolboxIds (#354): the shared union chat.cjs, this catalogue and t
     selectedToolboxIds({ project: null, defaultToolboxes: ['core'], connectorBoxes, connected: ['gdrive'] }),
     ['core', 'gdrive'],
   );
-});
-
-test('a free chat (no project) uses the default selection', { skip: skipWasm }, () => {
-  ran++;
-  const boxes = byId(computePermittedTools(input({ project: null })));
-  assert.equal(boxes.core.active, true);
-  assert.equal(boxes['web-search'].active, false);
-});
-
-test('the TTL cache expires and evicts', () => {
-  let t = 0;
-  const cache = createTtlCache({ ttlMs: 100, now: () => t, max: 2 });
-  cache.set('a', 1);
-  assert.equal(cache.get('a'), 1);
-  t = 101;
-  assert.equal(cache.get('a'), undefined);
-  cache.set('a', 1); cache.set('b', 2); cache.set('c', 3);
-  assert.equal(cache.get('a'), undefined);
-  assert.equal(cache.get('c'), 3);
 });
 
 test('#1006: Tools Automatic uses the default set; Manual (or no mode) the project list', { skip: skipWasm }, () => {
@@ -147,4 +54,4 @@ test('#1006 review: an Automatic project keeps the Project documents box its fir
   assert.deepEqual(projectToolboxIds({ toolsMode: 'auto', toolboxes: ['web'], docsToolboxDefaulted: true }, ['core']), ['core']);
 });
 
-test.after(() => { if (!skipWasm) assert.equal(ran, 9, 'a wasm-guarded test body did not run'); });
+test.after(() => { if (!skipWasm) assert.equal(ran, 3, 'a wasm-guarded test body did not run'); });

@@ -4,11 +4,12 @@
 //
 // Returns true when it handled the request. Auth runs before routes are mounted; the box
 // list itself is toolboxes.cjs and the MCP server summary is mcp-status.cjs.
-// GET /api/toolboxes/permitted?projectId=&mode=chat|cowork -> the tools this account could use
-// THIS turn, with permission state (#237). Computed in toolboxes-permitted.cjs, cached per
-// account/project/mode for a short TTL; the client refetches on project or mode change.
+//
+// GET /api/toolboxes/permitted (the tools this account could use THIS turn, #237) is the Rust front's since
+// sbstndalton/noevia#2202 round 2 (rust-toolboxes-permitted.cjs refuses it before authentication). This route
+// stays here because it needs what only this process has: prefill samples from the chat stream and the MCP
+// block from the live discovery.
 const { describeMcpServers } = require('../mcp-status.cjs');
-const { createTtlCache } = require('../toolboxes-permitted.cjs');
 
 /**
  * @param {object} deps
@@ -19,35 +20,9 @@ const { createTtlCache } = require('../toolboxes-permitted.cjs');
  * @param {() => { enabled:boolean, state:object, servers:object[], manifest:object[] }} deps.mcp
  *        read at call time: MCP_ENABLED and the server list change when directory servers sync
  * @param {(res, status, body) => any} deps.json
- * @param {(input:{ authn:object, projectId:string|null, mode:'chat'|'cowork' }) => ({ project:object|null, boxes:object[] } | null)} [deps.permitted]
- *        null when the project is not this account's (the caller's getProject is tenant-scoped)
- * @param {{ get:(k:string)=>any, set:(k:string, v:any)=>void }} [deps.cache]
- * @param {(authn:object, projectId:string|null) => unknown} [deps.cacheKeyExtra]  JSON-serialisable state the cached view depends on that this process does not clear the cache for
  */
-function createToolboxRoutes({ discoverMcpTools, toolboxSummaries, connectedBoxes = () => [], prefill, mcp, json, permitted = null, cache = createTtlCache({ ttlMs: 30000 }), cacheKeyExtra = () => null }) {
-  return async function toolboxRoutes(req, res, { path, authn, url }) {
-    if (path === '/api/toolboxes/permitted' && permitted) {
-      if (req.method !== 'GET') return json(res, 405, { error: 'method not allowed' }), true;
-      if (!authn) return json(res, 401, { error: 'sign in first' }), true;
-      const params = url && url.searchParams ? url.searchParams : new URLSearchParams();
-      const projectId = params.get('projectId') || null;
-      const mode = params.get('mode') || 'chat';
-      if (mode !== 'chat' && mode !== 'cowork') return json(res, 400, { error: 'mode must be "chat" or "cowork"' }), true;
-      // cacheKeyExtra: the state this view shows that another process may change without clearing this
-      // cache - the Diary preference, a project's toolbox selection and the account's connections (the
-      // Rust front writes all of these, #1071/#2190/#2191), the MCP credentials' readiness (#2202) - so a
-      // change shows at once instead of after the TTL. It is given the project asked about.
-      const key = JSON.stringify([authn.user.id, authn.user.role, projectId, mode, cacheKeyExtra(authn, projectId)]);
-      let view = cache.get(key);
-      if (!view) {
-        await discoverMcpTools();
-        const result = permitted({ authn, projectId, mode });
-        if (!result) return json(res, 404, { error: 'project not found' }), true;
-        view = { mode, projectId, boxes: result.boxes, computedAt: Date.now() };
-        cache.set(key, view);
-      }
-      return json(res, 200, view), true;
-    }
+function createToolboxRoutes({ discoverMcpTools, toolboxSummaries, connectedBoxes = () => [], prefill, mcp, json }) {
+  return async function toolboxRoutes(req, res, { path, authn }) {
     if (path !== '/api/toolboxes') return false;
     if (req.method !== 'GET') return json(res, 405, { error: 'method not allowed' }), true;
     // Await discovery: on a cold start the picker would otherwise show only the built-in
