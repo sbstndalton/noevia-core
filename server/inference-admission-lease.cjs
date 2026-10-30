@@ -14,27 +14,13 @@
 // dies frees chat and tune. Only the front may ask (the same check as its other loopback calls), and a caller that
 // goes away while waiting holds nothing.
 const crypto = require('node:crypto');
+const { trustedFront } = require('./trusted-front.cjs');
 
 const PREFIX = '/internal/inference-admission/lease';
 const TTL_MS = 30000;
 const HARD_MS = 6 * 60 * 60 * 1000;
 const MAX_WAIT_MS = 120000;
-const LOOPBACK = /^(127\.|::1$|::ffff:127\.)/;
 const BUSY = 'The model is busy. Try again shortly.';
-
-function sameSecret(given, secret) {
-  if (typeof given !== 'string' || !secret) return false;
-  const a = crypto.createHash('sha256').update(given).digest();
-  const b = crypto.createHash('sha256').update(secret).digest();
-  return crypto.timingSafeEqual(a, b);
-}
-
-/** The front's own direct loopback call: never a request it is proxying, which carries the client's address. */
-function trustedFront(req, secret) {
-  return LOOPBACK.test(req.socket?.remoteAddress || '')
-    && !req.headers['x-noevia-client-ip'] && !req.headers['x-forwarded-for']
-    && sameSecret(req.headers['x-noevia-store-token'], secret);
-}
 
 /** Aborts when the caller goes away before this answer has been sent. */
 function callerGone(req, res) {
@@ -174,4 +160,4 @@ function createAdmissionRoutes({ secret, modelManager, admitEngineModel, chatMac
   return { handle, leases };
 }
 
-module.exports = { createAdmissionRoutes, createAdmission, createLeases, trustedFront, callerGone, PREFIX, TTL_MS, MAX_WAIT_MS };
+module.exports = { createAdmissionRoutes, createAdmission, createLeases, callerGone, PREFIX, TTL_MS, MAX_WAIT_MS };

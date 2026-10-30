@@ -10,7 +10,8 @@
 // Only the two search tools, only with the shapes research sends, and only from the operator's own server, with no
 // fallback to a directory server (#865, #891). A call runs as that user, and the project is looked up as that user,
 // so one account's job cannot read another's sources. A caller that goes away aborts the tool call.
-const { trustedFront, callerGone } = require('./inference-admission-lease.cjs');
+const { callerGone } = require('./inference-admission-lease.cjs');
+const { trustedFront } = require('./trusted-front.cjs');
 
 const PREFIX = '/internal/research/';
 const TEXT_CAP = 8192;

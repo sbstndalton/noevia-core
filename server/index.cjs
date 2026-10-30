@@ -105,7 +105,8 @@ if (!require('./project-store-client.cjs').enabledFrom(process.env)) {
   console.error('FATAL: the Rust project store is required (NOEVIA_PROJECT_STORE_PORT and NOEVIA_PROJECT_STORE_TOKEN, set by the web supervisor): Node writes projects.json and free-chats.json only through it (sbstndalton/noevia#1071).');
   process.exit(2);
 }
-// sbstndalton/noevia#2210: kept in this closure only: the front proves itself with it when it asks for a maintenance lease.
+// sbstndalton/noevia#2210, #2218: kept in this closure only: the front proves itself with it (trusted-front.cjs) when it asks for a
+// maintenance lease, an admission lease or the research bridge. Taken here, before clientFromEnv deletes it from process.env.
 const FRONT_SECRET = String(process.env.NOEVIA_PROJECT_STORE_TOKEN || '');
 const PROJECT_STORE = require('./project-store-client.cjs').clientFromEnv(process.env); // #1916: the secret leaves process.env here
 const authService = createAuth({
@@ -761,7 +762,6 @@ const browserRoutes = require('./routes/browser.cjs').createBrowserRoutes({
 const usageRoutes = require('./routes/usage.cjs').createUsageRoutes({ json });
 
 // ── Deep research (#2218): the Rust front's (rust-research.cjs); what its jobs still need from this process ──
-// FRONT_SECRET was taken before clientFromEnv deleted it from process.env (reading the env here gave '', so every call was a 404).
 const inferenceAdmission = require('./inference-admission-lease.cjs').createAdmissionRoutes({
   secret: FRONT_SECRET, modelManager, admitEngineModel, chatMachines, json, readJson,
 });

@@ -18,20 +18,12 @@
 // (a proxied request carries the client's address). Anything else is the same 404 as an unknown path, because with
 // file sharing on this listener is not bound to loopback alone. A front that cannot get a lease changes nothing.
 const crypto = require('node:crypto');
+const { trustedFront } = require('./trusted-front.cjs');
 
 const PREFIX = '/internal/model-maintenance/lease';
 const TTL_MS = 180000;
 const RENEW_MS = 10000;
 const HARD_MS = 60 * 60 * 1000;
-const LOOPBACK = /^(127\.|::1$|::ffff:127\.)/;
-
-function sameSecret(given, secret) {
-  if (typeof given !== 'string' || !secret) return false;
-  const a = crypto.createHash('sha256').update(given).digest();
-  const b = crypto.createHash('sha256').update(secret).digest();
-  return crypto.timingSafeEqual(a, b);
-}
-
 function createLeases({ hold, ttlMs = TTL_MS, hardMs = HARD_MS, log = (m) => console.warn(m), now = () => Date.now() }) {
   const leases = new Map();
   function end(id, why) {
@@ -74,11 +66,7 @@ function createLeases({ hold, ttlMs = TTL_MS, hardMs = HARD_MS, log = (m) => con
 /** The route, answered before authentication and the request gate. True when it was this route's. */
 function createLeaseRoutes({ secret, hold, json, ...options }) {
   const leases = hold ? createLeases({ hold, ...options }) : null;
-  function trusted(req) {
-    return LOOPBACK.test(req.socket?.remoteAddress || '')
-      && !req.headers['x-noevia-client-ip'] && !req.headers['x-forwarded-for']
-      && sameSecret(req.headers['x-noevia-store-token'], secret);
-  }
+  const trusted = (req) => trustedFront(req, secret);
   async function handle(req, res) {
     const target = String(req.url || '').split('?')[0];
     if (target !== PREFIX && !target.startsWith(`${PREFIX}/`)) return false;
