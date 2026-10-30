@@ -61,7 +61,7 @@ function openProviderKey(row, secrets) {
 // and answer its failure (index.cjs). A failed save leaves memory ahead of the disk: the workspace
 // is then dropped from the cache (the next request reads the files again) and every save still
 // queued on it fails too, so nothing of the failed change reaches the disk later.
-function createWorkspaceStore(rootDir, defaultProvider, secrets, { projectStore = null, onStoreSave = () => {}, onProjectsChanged = () => {}, userExists = () => true } = {}) {
+function createWorkspaceStore(rootDir, defaultProvider, secrets, { projectStore = null, onStoreSave = () => {}, onProjectsChanged = () => {}, userExists = () => true, now = Date.now } = {}) {
   // #1071: there is no local writer of projects.json or free-chats.json to fall back to.
   if (!projectStore) throw new Error('createWorkspaceStore needs the Rust project store (projectStore): Node never writes projects.json or free-chats.json itself');
   // Per-user workspaces are cached, but shared providers are NEVER baked
@@ -419,7 +419,33 @@ function createWorkspaceStore(rootDir, defaultProvider, secrets, { projectStore 
     }
     return done;
   }
-  return { get, remove, claimLegacy, userDir, migrateSourceText, isRemoved: (userId) => removed.has(userId) };
+  // Whether this process must stop working for an account: removed by it, or no longer in the auth database. The Rust
+  // front deletes accounts and tells this process nothing, so the database is asked (#2191 round 9), but not on every
+  // call: rag asks once per chunk, so an "exists" answer is kept for USER_CHECK_MS. "Gone" is latched, like remove(),
+  // and revokes a workspace held for the account at once. An unreadable database is not an answer: the account counts
+  // as there, and the next call asks again.
+  const USER_CHECK_MS = 1000;
+  const checkedAt = new Map();
+  function isRemoved(userId) {
+    if (removed.has(userId)) return true;
+    const t = now();
+    const last = checkedAt.get(userId);
+    if (last !== undefined && t >= last && t - last < USER_CHECK_MS) return false;
+    let exists = true;
+    try { exists = !!userExists(userId); } catch { return false; }
+    if (exists) {
+      if (checkedAt.size >= 4096) checkedAt.clear();
+      checkedAt.set(userId, t);
+      return false;
+    }
+    checkedAt.delete(userId);
+    removed.add(userId);
+    const held = cache.get(userId);
+    if (held) held.revoked = true;
+    cache.delete(userId);
+    return true;
+  }
+  return { get, remove, claimLegacy, userDir, migrateSourceText, isRemoved };
 }
 
 module.exports = { createWorkspaceStore, atomicJson };
