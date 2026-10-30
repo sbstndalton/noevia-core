@@ -290,3 +290,23 @@ test('the warning for a missing admin token names the key, says what stops worki
   assert.match(text, /unload anyway/);
   assert.equal(/[0-9a-f]{16,}/i.test(text), false);
 });
+
+test('#2210 maintenanceHeld: the gate\'s status says whether any client holds the maintenance hold', async (t) => {
+  for (const [reply, expected] of [
+    [{ status: 200, body: { maintenance: { held: true, reason: 'x' } } }, true],
+    [{ status: 200, body: { maintenance: { held: false } } }, false],
+    [{ status: 200, body: { scheduler: {} } }, null],
+    [{ status: 200, body: { maintenance: { held: 'yes' } } }, null],
+    [{ status: 404, body: { error: 'nope' } }, null],
+    [{ status: 200, text: 'not json' }, null],
+  ]) {
+    const g = await gate(t, (req, res) => { res.writeHead(reply.status, { 'content-type': 'application/json' }); res.end(reply.text ?? JSON.stringify(reply.body)); });
+    const client = createGateClient({ baseUrl: g.base + '/v1', log: () => {} });
+    assert.equal(await client.maintenanceHeld(), expected, JSON.stringify(reply));
+    assert.equal(g.seen[0].url, '/gate/v1/status');
+    assert.equal(g.seen[0].headers['x-noevia-gate-admin'], undefined, 'it needs no admin token and sends none');
+  }
+  // No answer at all.
+  const client = createGateClient({ baseUrl: 'http://127.0.0.1:9', log: () => {} });
+  assert.equal(await client.maintenanceHeld(), null);
+});

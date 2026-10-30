@@ -189,6 +189,17 @@ function createStore(dir, { maxBytes = 1024 * 1024, keepPerKey = 50, maxKeys = 2
   return { list, append, appendIfChanged, appendReportedRate, file };
 }
 
+// sbstndalton/noevia#2210: the Rust front is the evidence store's only writer (noevia-rs bins/noevia-server
+// model_maint/evidence.rs); what this process still needs is a read of the log it writes.
+function createReader(dir) {
+  const file = path.join(dir, 'evidence.jsonl');
+  function list() {
+    try { return fs.readFileSync(file, 'utf8').split('\n').filter(Boolean).map((l) => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean); }
+    catch { return []; }
+  }
+  return { list, file };
+}
+
 const CATEGORIES = ['context_capacity', 'vision', 'mtp_acceptance', 'throughput'];
 
 function derive(records, { model, category, liveHash }) {
@@ -204,4 +215,4 @@ function derive(records, { model, category, liveHash }) {
   return { category, state: 'unverified', record: null };
 }
 
-module.exports = { identityHash, fileFingerprint, presetHash, createStore, derive, CATEGORIES };
+module.exports = { identityHash, fileFingerprint, presetHash, createStore, createReader, derive, CATEGORIES };
