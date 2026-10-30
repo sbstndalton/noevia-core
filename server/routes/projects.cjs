@@ -194,9 +194,9 @@ function createProjectRoutes({
     }
 
     // POST /api/projects and DELETE /api/projects/{projectId} are the Rust front's (#2191 round 2,
-    // rust-project-lifecycle.cjs, refused before authentication); the conversation import still
-    // creates through store.createProject, and a chat's attachments project is still deleted through
-    // store.deleteProject.
+    // rust-project-lifecycle.cjs, refused before authentication); so is the conversation import
+    // (round 4, rust-conversation-import.cjs), and a chat's attachments project is still deleted
+    // through store.deleteProject.
 
     const skillManifestRoute = p.match(/^\/api\/projects\/([^/]+)\/instruction-skills\/manifests$/);
     const skillContentRoute = p.match(/^\/api\/projects\/([^/]+)\/instruction-skills\/manifests\/([^/]+)\/content$/);

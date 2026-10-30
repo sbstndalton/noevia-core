@@ -19,8 +19,8 @@
 //
 // A direct Node request for either route is refused before authentication, whoever asks, so a stale
 // route table cannot make two processes answer. Every other method of these paths falls through as
-// before. The conversation import still creates projects through projects.cjs createProject (its
-// route has not moved), as do the free chat attachments and Diary context paths.
+// before. The conversation import creates projects through the front's create too since round 4
+// (rust-conversation-import.cjs); the free chat attachments and Diary context paths stay here.
 //
 // METHOD path-pattern in routes.toml's spelling: noevia's deploy/tools/assemble-release.sh reads this
 // list beside rust-projects.cjs OWNED_ROUTES and refuses a front that owns a project route neither lists.

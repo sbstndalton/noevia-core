@@ -15,8 +15,8 @@
 // FRONT_KINDS are the front's and are never touched here, which keeps one executor per job. No route
 // moves with this group (OWNED_ROUTES is empty): the pairing is the job split, which an unpaired
 // release would break (an old front's sweeps would never run; an old core would run the front's).
-// projects.cjs keeps storeCreateFiles and project-sweep.cjs for the paths still here (conversation
-// import's createProject, the orphan attachments reaper's deleteProject).
+// projects.cjs keeps storeCreateFiles and project-sweep.cjs for the paths still here (the orphan
+// attachments reaper's deleteProject; the conversation import is the front's since round 4).
 const OWNED_ROUTES = Object.freeze(new Set());
 // `unindex` (round 3, rust-project-files.cjs): a removed source file's RAG rows.
 const CORE_KINDS = Object.freeze(['index', 'unindex']);
