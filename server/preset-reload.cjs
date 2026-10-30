@@ -34,21 +34,62 @@ function engineView(rows) {
   return JSON.stringify(Object.keys(out).sort().map((id) => [id, out[id]]));
 }
 
-function createReloadGuard({ stateFile = null, check = (req) => require('./dav-parse-wasm.cjs').presetReload(req), log = () => {} } = {}) {
-  let baseline = null; // { text, view }
+// sbstndalton/noevia#2210: the Rust front also makes reloads (POST /api/models/presets/reload,
+// noevia-rs bins/noevia-server model_maint/reload.rs) and records its baseline in this same file. So
+// with a state file this guard keeps nothing in memory: every use reads the file, and every write
+// takes the lock file `<stateFile>.lock` (created exclusively; a lock older than LOCK_STALE_MS belongs
+// to a writer that died and is taken over) and replaces the file atomically (temp file, rename). The
+// front does the same, so neither side overwrites the other's half-written state, and a baseline one
+// of them records is the other's next baseline. Without a state file (tests) the baseline is in memory.
+const LOCK_STALE_MS = 30000;
+const LOCK_WAIT_MS = 5000;
+const pause = (ms) => { try { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms); } catch { /* no wait available */ } };
+
+function readBaseline(stateFile) {
   try {
-    if (stateFile) {
-      const saved = JSON.parse(fs.readFileSync(stateFile, 'utf8'));
-      if (typeof saved?.text === 'string' && typeof saved?.view === 'string') baseline = { text: saved.text, view: saved.view };
-      // `{}` is the tombstone forget() leaves: unknown.
-    }
+    const saved = JSON.parse(fs.readFileSync(stateFile, 'utf8'));
+    // `{}` is the tombstone forget() leaves: unknown.
+    if (typeof saved?.text === 'string' && typeof saved?.view === 'string') return { text: saved.text, view: saved.view };
   } catch { /* first run, or unreadable: unknown */ }
-  const persist = () => {
-    if (!stateFile) return;
+  return null;
+}
+
+function writeLocked(stateFile, text, { staleMs = LOCK_STALE_MS, waitMs = LOCK_WAIT_MS } = {}) {
+  const lock = `${stateFile}.lock`;
+  const started = Date.now();
+  let fd = null;
+  for (;;) {
+    try { fd = fs.openSync(lock, 'wx', 0o600); break; }
+    catch (e) {
+      if (e?.code !== 'EEXIST') throw e;
+      let age = 0;
+      try { age = Date.now() - fs.statSync(lock).mtimeMs; } catch { continue; }
+      if (age > staleMs) { try { fs.unlinkSync(lock); } catch { /* another writer took it over */ } continue; }
+      if (Date.now() - started > waitMs) throw e;
+      pause(20);
+    }
+  }
+  const temporary = `${stateFile}.${process.pid}.tmp`;
+  try {
+    fs.writeSync(fd, String(process.pid));
+    fs.writeFileSync(temporary, text, { mode: 0o600 });
+    fs.renameSync(temporary, stateFile);
+  } finally {
+    try { fs.closeSync(fd); } catch { /* closed */ }
+    try { fs.unlinkSync(lock); } catch { /* gone */ }
+    try { fs.rmSync(temporary, { force: true }); } catch { /* gone */ }
+  }
+}
+
+function createReloadGuard({ stateFile = null, check = (req) => require('./dav-parse-wasm.cjs').presetReload(req), log = () => {}, lock = {} } = {}) {
+  let memory = null; // { text, view }, used only without a state file
+  const current = () => (stateFile ? readBaseline(stateFile) : memory);
+  const persist = (next) => {
+    if (!stateFile) { memory = next; return; }
     try {
       // Forgetting writes a tombstone instead of deleting, so a failed delete can never leave an
       // old baseline behind for the next start (#1040).
-      fs.writeFileSync(stateFile, JSON.stringify(baseline || {}), { mode: 0o600 });
+      writeLocked(stateFile, JSON.stringify(next || {}), lock);
     } catch (e) { log(`[models] could not save the preset reload baseline: ${e?.message || e}`); }
   };
   return {
@@ -56,21 +97,22 @@ function createReloadGuard({ stateFile = null, check = (req) => require('./dav-p
      *  `textAfter` is the file re-read after the rows; if it moved, the router may have read either. */
     record(textBefore, rows, textAfter) {
       const view = engineView(rows);
-      baseline = typeof textBefore === 'string' && textBefore === textAfter && view !== null ? { text: textBefore, view } : null;
-      persist();
+      persist(typeof textBefore === 'string' && textBefore === textAfter && view !== null ? { text: textBefore, view } : null);
     },
-    forget() { baseline = null; persist(); },
-    known: () => !!baseline,
+    forget() { persist(null); },
+    known: () => !!current(),
     /** noevia#1863: the models.ini text the router last read, when that is still knowable: the
      *  baseline of noevia's last reload, while the router's own view is unchanged since. A router
      *  that re-read on its own (restart, another client) makes it unknown (null). */
     routerText(rows) {
+      const baseline = current();
       if (!baseline) return null;
       const view = engineView(rows);
       return view !== null && view === baseline.view ? baseline.text : null;
     },
     /** May the router reload `currentText` now without unloading any of `loadedIds`? */
     verdict(currentText, rows, loadedIds) {
+      const baseline = current();
       if (!baseline) return { safe: false, reason: 'unknown' };
       const view = engineView(rows);
       if (view === null) return { safe: false, reason: 'unknown' };
@@ -87,4 +129,4 @@ function createReloadGuard({ stateFile = null, check = (req) => require('./dav-p
   };
 }
 
-module.exports = { createReloadGuard, engineView, liveIds, LIVE };
+module.exports = { createReloadGuard, engineView, liveIds, LIVE, LOCK_STALE_MS };

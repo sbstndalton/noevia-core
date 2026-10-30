@@ -231,3 +231,56 @@ test('#1863 routerText is the last reload text while the router has not re-read'
   g.forget();
   assert.equal(g.routerText(rows([])), null);
 });
+
+// ── #2210: the Rust front is the other writer of the baseline file ─────────────────────────────────────────
+const { LOCK_STALE_MS } = require('./preset-reload.cjs');
+test('#2210 the baseline is read from the file on every use: what the other process records is seen, and forgotten', (t) => {
+  const stateFile = path.join(tmp(t), 'state.json');
+  const mine = createReloadGuard({ stateFile, check: fakeCheck }), theirs = createReloadGuard({ stateFile, check: fakeCheck });
+  const router = rows(['loaded-model']);
+  assert.equal(mine.known(), false);
+  theirs.record(BASE, router, BASE);
+  assert.equal(mine.known(), true, 'a baseline the front recorded is mine too');
+  assert.equal(mine.verdict(BASE, router, ['loaded-model']).safe, true);
+  assert.equal(mine.routerText(router), BASE);
+  mine.forget();
+  assert.equal(theirs.known(), false, 'and a baseline I forgot is forgotten for the front');
+  assert.equal(theirs.verdict(BASE, router, ['loaded-model']).reason, 'unknown');
+});
+
+test('#2210 the file the front writes and the file Core writes are the same shape', (t) => {
+  const stateFile = path.join(tmp(t), 'state.json');
+  const router = rows(['loaded-model']);
+  // The front writes {"text","view"} with serde_json's key order (alphabetical: text, view) and mode 0600.
+  fs.writeFileSync(stateFile, JSON.stringify({ text: BASE, view: engineView(router) }), { mode: 0o600 });
+  const guard = createReloadGuard({ stateFile, check: fakeCheck });
+  assert.equal(guard.verdict(BASE, router, ['loaded-model']).safe, true);
+  guard.record(BASE, router, BASE);
+  assert.equal(fs.readFileSync(stateFile, 'utf8'), JSON.stringify({ text: BASE, view: engineView(router) }));
+  assert.equal(fs.statSync(stateFile).mode & 0o777, 0o600);
+  assert.equal(fs.existsSync(`${stateFile}.lock`), false, 'the lock is released');
+  assert.deepEqual(fs.readdirSync(path.dirname(stateFile)).sort(), ['state.json']);
+});
+
+test('#2210 a write waits for the other writer\'s lock, takes over a dead one, and never half-writes', (t) => {
+  const dir = tmp(t), stateFile = path.join(dir, 'state.json'), lock = `${stateFile}.lock`;
+  const logs = [];
+  const router = rows(['loaded-model']);
+  // A live lock (the front is writing): the write gives up after its wait, logs it, and changes nothing.
+  const first = createReloadGuard({ stateFile, check: fakeCheck, log: (m) => logs.push(m), lock: { waitMs: 150 } });
+  first.record(BASE, router, BASE);
+  const before = fs.readFileSync(stateFile, 'utf8');
+  fs.writeFileSync(lock, '4242');
+  first.forget();
+  assert.equal(fs.readFileSync(stateFile, 'utf8'), before, 'the file the other writer is replacing is left alone');
+  assert.equal(logs.length, 1);
+  assert.match(logs[0], /could not save the preset reload baseline/);
+  assert.equal(fs.existsSync(lock), true, 'a lock that is not mine is not removed');
+  // A lock older than the stale limit belongs to a writer that died: taken over.
+  const old = new Date(Date.now() - LOCK_STALE_MS - 5000);
+  fs.utimesSync(lock, old, old);
+  first.forget();
+  assert.equal(fs.readFileSync(stateFile, 'utf8'), '{}');
+  assert.equal(fs.existsSync(lock), false);
+  assert.equal(logs.length, 1);
+});

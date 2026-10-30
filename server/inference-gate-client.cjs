@@ -293,6 +293,21 @@ function createGateClient({ baseUrl, fetch = (url, init) => globalThis.fetch(url
     } catch { return null; }
   }
 
+  /**
+   * Whether any client holds the gate's maintenance hold now (GET /gate/v1/status, which needs no admin token):
+   * true or false, or null when the gate does not answer or is not one. sbstndalton/noevia#2210: a hold the
+   * Rust front took for a reload, a calibration or a tune is invisible to this process's in-process gate.
+   */
+  async function maintenanceHeld() {
+    try {
+      const limit = AbortSignal.timeout(RELEASE_TIMEOUT_MS);
+      const response = await fetch(`${base}/gate/v1/status`, { method: 'GET', headers: { [CLIENT_HEADER]: holder }, signal: limit, redirect: 'error' });
+      if (!response.ok) { await response.body?.cancel?.().catch(() => {}); return null; }
+      const parsed = JSON.parse((await readCappedText(response, MAX_EVENT_BYTES)).text);
+      return typeof parsed?.maintenance?.held === 'boolean' ? parsed.maintenance.held : null;
+    } catch { return null; }
+  }
+
   /** Gives the hold back. Never throws (the gate ends a hold that is not renewed on its own). */
   async function releaseMaintenance(holdToken) {
     try { await gateJson(`/gate/v1/maintenance/${holdToken}`, { method: 'DELETE' }); } catch { /* expires on its own */ }
@@ -303,6 +318,7 @@ function createGateClient({ baseUrl, fetch = (url, init) => globalThis.fetch(url
     holdMaintenance,
     renewMaintenance,
     releaseMaintenance,
+    maintenanceHeld,
     /** Gives back every lease still held (a shutdown); best effort, bounded by `timeoutMs`. Never throws. */
     releaseAll: async ({ timeoutMs = 2000 } = {}) => {
       const open = [...held];

@@ -79,7 +79,11 @@ test('a member who has not finished onboarding gets no administrator or global m
   const suggestion = await request('/api/models/preset/suggest?model=synthetic', { method: 'GET', headers: headers(member), body: '' });
   assert.equal(suggestion.status, 503);
   assert.equal(JSON.parse(suggestion.text).code, 'RUST_MODEL_SIZING_OWNED');
-  for (const url of ['/api/models/download', '/api/models/calibration', '/api/models/calibration/cancel', '/api/models/presets/reload', '/api/model-manager/sections', '/api/model-manager/backends/cowork-llama-1/logs']) {
+  // So is the preset reload (#2210): Node refuses its POST before authentication, whoever asks.
+  const reload = await request('/api/models/presets/reload', { method: 'POST', headers: headers(member), body: '{}' });
+  assert.equal(reload.status, 503);
+  assert.equal(JSON.parse(reload.text).code, 'RUST_MODEL_MAINTENANCE_OWNED');
+  for (const url of ['/api/models/download', '/api/models/calibration', '/api/models/calibration/cancel', '/api/model-manager/sections', '/api/model-manager/backends/cowork-llama-1/logs']) {
     const method = url.endsWith('/logs') ? 'GET' : 'POST';
     assert.equal((await request(url, { method, headers: headers(member), body: method === 'POST' ? '{}' : '' })).status, 403, url);
   }

@@ -1324,6 +1324,8 @@ async function handleRequestInner(req, res) {
   if (require('./rust-project-source-work.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   // And the two read-only sizing reads (#2189): GET /api/models/estimate and /api/models/preset/suggest.
   if (require('./rust-model-sizing.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
+  // And the model maintenance authorities (#2210): POST /api/models/presets/reload.
+  if (require('./rust-model-maintenance.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   // #2190: the public pages and the device approval page, and the plugin directory.
   if (require('./rust-public-pages.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   if (require('./rust-plugin-directory.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;

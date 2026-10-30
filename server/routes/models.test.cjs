@@ -347,12 +347,16 @@ test('any write under /api/models/ drops the scan, and pull/delete/load keep the
 
 test('engine-specific routes say what is unavailable and guard the method', async () => {
   const f = fixture();
+  // POST /api/models/presets/reload is the Rust front's (#2210; rust-model-maintenance.cjs refuses it before
+  // authentication). A POST that reaches this route anyway gets the administrator check and a 405, not a reload.
   await f.call('POST', '/api/models/presets/reload', {}, 'admin');
-  assert.deepEqual(f.sent.pop(), { status: 404, body: { error: 'This engine does not use a preset file' } });
+  assert.deepEqual(f.sent.pop(), { status: 405, body: { error: 'Method not allowed' } });
+  await f.call('POST', '/api/models/presets/reload', {}, 'member');
+  assert.deepEqual(f.sent.pop(), { status: 403, body: { error: 'administrator required' } });
   await f.call('GET', '/api/models/presets/reload', undefined, 'admin');
   assert.deepEqual(f.sent.pop(), { status: 405, body: { error: 'Method not allowed' } });
-  await f.call('GET', '/api/models/evidence', undefined, 'member', '?model=m');
-  assert.deepEqual(f.sent.pop(), { status: 404, body: { error: 'Qualification evidence needs the native engine' } });
+  await f.call('GET', '/api/models/presets/reload', undefined, 'member');
+  assert.deepEqual(f.sent.pop(), { status: 403, body: { error: 'Administrator required for shared model profiles' } });
   await f.call('GET', '/api/models/autotune', undefined, 'admin');
   assert.deepEqual(f.sent.pop(), { status: 404, body: { error: 'Auto-tune is unavailable' } });
   await f.call('GET', '/api/models/preset', undefined, 'member');
@@ -671,38 +675,16 @@ test('GET of the estimate and the suggestion is the Rust front\'s; their other m
   assert.deepEqual(seen, [], 'no manager sizing call is left in the route');
 });
 
-test('evidence import (#266) is admin-only, validates the model, and always reports current evidence back', async () => {
+test('evidence import (#266, #2210) is the Rust front\'s: a POST that reaches this route is not imported', async () => {
   const calls = [];
-  const f = fixture({
-    manager: {
-      importEvidence: async (model, opts) => { calls.push([model, opts]); return { ok: true }; },
-      evidence: async (model) => ({ status: 200, body: { model, external: { category: 'external_model_card', state: 'reported' } } }),
-    },
-  });
+  const f = fixture({ manager: { importEvidence: async (model, opts) => { calls.push([model, opts]); return { ok: true }; }, evidence: async (model) => ({ status: 200, body: { model } }) } });
   await f.call('POST', '/api/models/evidence/import', { model: 'm' }, 'member');
   assert.deepEqual(f.sent.pop(), { status: 403, body: { error: 'administrator required' } });
   await f.call('GET', '/api/models/evidence/import', { model: 'm' }, 'admin');
   assert.deepEqual(f.sent.pop(), { status: 405, body: { error: 'Method not allowed' } });
-  await f.call('POST', '/api/models/evidence/import', {}, 'admin');
-  assert.deepEqual(f.sent.pop(), { status: 400, body: { error: 'Choose a model' } });
-  await f.call('POST', '/api/models/evidence/import', { model: 'm', checkpoint: 'acme/model-7b' }, 'admin');
-  assert.deepEqual(f.sent.pop(), { status: 200, body: { model: 'm', external: { category: 'external_model_card', state: 'reported' } } });
-  assert.deepEqual(calls, [['m', { checkpoint: 'acme/model-7b' }]]);
-
-  const none = fixture();
-  await none.call('POST', '/api/models/evidence/import', { model: 'm' }, 'admin');
-  assert.deepEqual(none.sent.pop(), { status: 404, body: { error: 'Model evidence import needs the native engine' } });
-});
-
-test('evidence import never throws through the route when the source lookup fails', async () => {
-  const f = fixture({
-    manager: {
-      importEvidence: async () => { throw Error('source unavailable'); },
-      evidence: async (model) => ({ status: 200, body: { model, external: { state: 'unavailable' } } }),
-    },
-  });
   await f.call('POST', '/api/models/evidence/import', { model: 'm' }, 'admin');
-  assert.deepEqual(f.sent.pop(), { status: 200, body: { model: 'm', external: { state: 'unavailable' } } });
+  assert.deepEqual(f.sent.pop(), { status: 405, body: { error: 'Method not allowed' } });
+  assert.deepEqual(calls, [], 'the front does the import, not this route');
 });
 
 test('#548: load and unload refuse Laya and the in-use sidecar models with 409 and never reach the engine', async () => {
