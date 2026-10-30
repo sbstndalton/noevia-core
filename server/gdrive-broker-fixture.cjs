@@ -8,10 +8,11 @@
 const fs = require('node:fs'), path = require('node:path');
 const crypto = require('node:crypto');
 const { SIGNAL_FILE } = require('./rust-google-drive.cjs');
+const { readCappedJson } = require('./http.cjs');
 
 async function form(url, fields) {
   const r = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: new URLSearchParams(fields).toString() });
-  return { status: r.status, body: await r.json().catch(() => ({})) };
+  return { status: r.status, body: await readCappedJson(r, 64 * 1024).catch(() => ({})) };
 }
 
 function startBrokerFixture({ google, dataDir, usable = false }) {
