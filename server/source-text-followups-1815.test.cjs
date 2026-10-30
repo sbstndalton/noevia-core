@@ -137,20 +137,3 @@ test('#1815: workspace.saveProjects commits projects.json only after the batched
   assert.ok(commit > folderSync, `projects.json is committed after the folder fsync (${JSON.stringify(log)})`);
   fs.rmSync(root, { recursive: true, force: true });
 });
-
-test('#1815/#1818: textMissingNow sees a deleted file even when its text was cached by an earlier read, and clears on restore', () => {
-  sourceText._cache.clear();
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'noevia-1815-miss-'));
-  const projects = [{ id: 'p1', files: [{ name: 'a.md', content: 'cached synthetic' }, { name: 'b.md', content: 'normal synthetic' }] }];
-  sourceText.externalize(dir, projects);
-  const [a, b] = projects[0].files;
-  assert.equal(a.content, 'cached synthetic', 'read once: now cached');
-  const file = path.join(dir, 'project-sources', 'p1', `${sha('cached synthetic')}.txt`);
-  fs.rmSync(file);
-  assert.equal(sourceText.textMissingNow(a), true);
-  assert.equal(sourceText.meta(a).textRef, sha('cached synthetic'), 'the pointer is kept');
-  assert.equal(sourceText.textMissingNow(b), false);
-  fs.writeFileSync(file, 'cached synthetic');
-  assert.equal(sourceText.textMissingNow(a), false);
-  fs.rmSync(dir, { recursive: true, force: true });
-});

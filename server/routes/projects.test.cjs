@@ -115,20 +115,14 @@ test('an unchanged source patch retains published provenance; a local edit clear
   assert.equal(project.files[0].skillOrigin, undefined);
 });
 
-test('creating and deleting a project keeps the original status codes and messages', async () => {
-  const f = fixture();
-  assert.equal(await f.call('POST', '/api/projects', '{oops'), true);
-  assert.deepEqual(f.sent.pop(), { status: 400, body: { error: 'invalid JSON' } });
-  await f.call('POST', '/api/projects', {});
-  assert.deepEqual(f.sent.pop(), { status: 400, body: { error: 'name required' } });
-  await f.call('POST', '/api/projects', { name: 'New' });
-  assert.equal(f.sent.pop().status, 200);
-  await f.call('DELETE', '/api/projects/missing');
-  assert.deepEqual(f.sent.pop(), { status: 404, body: { error: 'no such project' } });
-  await f.call('DELETE', '/api/projects/proj-new');
-  assert.deepEqual(f.sent.pop(), { status: 200, body: { ok: true } });
-  assert.equal(f.store.deleted, 'proj-new', "the route hands the delete to the store's deleteProject (chats purged there, #554)");
-  assert.deepEqual(f.projects, []);
+// #2191 round 2: a project's create and delete are the Rust front's (rust-project-lifecycle.cjs refuses
+// them before this mount; noevia-rs tests/project_lifecycle.rs keeps their status codes and messages).
+test('the project create and delete are no longer handled here', async () => {
+  const f = fixture({ projects: [{ id: 'p1', files: [] }] });
+  assert.equal(await f.call('POST', '/api/projects', { name: 'New' }), false);
+  assert.equal(await f.call('DELETE', '/api/projects/p1'), false);
+  assert.deepEqual(f.sent, []);
+  assert.deepEqual(f.projects.map((p) => p.id), ['p1']);
 });
 
 test('the config patch validates each field with the same words as before', async () => {

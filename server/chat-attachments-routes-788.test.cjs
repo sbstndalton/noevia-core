@@ -6,6 +6,8 @@ const os = require('node:os');
 const path = require('node:path');
 const { Readable, Writable } = require('node:stream');
 const test = require('node:test');
+// #2191 round 2: POST /api/projects is the Rust front's; fixtures are written as its create leaves them.
+const { createProjectAs } = require('../tests/server/front-projects.cjs');
 
 const testDataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'noevia-788-route-test-'));
 process.env.DIARY_AUTH_TOKEN = 'test-cowork-token';
@@ -56,9 +58,10 @@ async function request(url, { method = 'GET', headers = {}, body = '' } = {}) {
 
 let cookie = '';
 let csrf = '';
+let frontUserId = '';
 test.before(async () => {
   // Sign-in is the Rust front's (#1071): the account and its session are seeded directly.
-  ({ cookie, csrf } = require('../tests/server/seed-account.cjs').seedAccount(testDataDir, { username: 'admin', displayName: 'Admin', publicOrigin: 'http://localhost' }));
+  ({ cookie, csrf, id: frontUserId } = require('../tests/server/seed-account.cjs').seedAccount(testDataDir, { username: 'admin', displayName: 'Admin', publicOrigin: 'http://localhost' }));
 });
 
 const mutationHeaders = () => ({ origin: 'http://localhost', cookie, 'content-type': 'application/json', 'x-csrf-token': csrf });
@@ -125,7 +128,7 @@ async function openWithImage(chatId) {
 const gone = async ({ assetDir, rag }) => { await until(() => !fs.existsSync(assetDir)); return !fs.existsSync(assetDir) && !fs.existsSync(rag); };
 
 test('deleting a free chat removes its attachments project, and a stale tab cannot recreate it (#788)', async () => {
-  const regular = JSON.parse((await post('/api/projects', { name: 'Synthetic regular' })).text);
+  const regular = createProjectAs(testDataDir, frontUserId, { name: 'Synthetic regular' });
   const kept = await openWithImage('c788-keep');
   const doomed = await openWithImage('c788-delete');
   frontSaveFree([{ id: 'c788-delete', title: 'a' }, { id: 'c788-keep', title: 'b', archived: true }]);
@@ -153,7 +156,7 @@ test('deleting a free chat removes its attachments project, and a stale tab cann
 });
 
 test('a moved chat and Delete old chats take their attachments projects along (#788)', async () => {
-  const host = JSON.parse((await post('/api/projects', { name: 'Synthetic host' })).text);
+  const host = createProjectAs(testDataDir, frontUserId, { name: 'Synthetic host' });
   const moved = await openWithImage('c788-moved');
   frontSaveFree([{ id: 'c788-moved', title: 'm' }]);
   assert.equal((await frontMove('/api/chats/c788-moved/move', { projectId: host.id })).status, 200);

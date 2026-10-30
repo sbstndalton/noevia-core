@@ -84,7 +84,7 @@ function createProjectRoutes({
   storageLatch = require('../storage-latch.cjs').createStorageLatch(),
 }) {
   const {
-    getProject, saveProjects, createProject, deleteProject, whenSaved = (fn) => fn(), pruneDocuments, withSourceLock, ensureProjectFolder, indexSource, ownsFile,
+    getProject, saveProjects, whenSaved = (fn) => fn(), pruneDocuments, withSourceLock, ensureProjectFolder, indexSource, ownsFile,
   } = store;
   // #849: a rejected storage login is its own answer, not "could not create the folder". The
   // wording is the one the refresh toast and the Settings save already use (#770); `code` lets the
@@ -193,29 +193,10 @@ function createProjectRoutes({
       return json(res, 200, { project });
     }
 
-    if (p === '/api/projects' && req.method === 'POST') {
-      const raw = await readBody(req);
-      let body;
-      try {
-        body = JSON.parse(raw);
-      } catch {
-        return json(res, 400, { error: 'invalid JSON' });
-      }
-      try { return json(res, 200, await createProject(body)); }
-      catch (e) { if (e.status === 400) return json(res, 400, { error: e.message }); throw e; }
-    }
-
-    const projMatch = p.match(/^\/api\/projects\/([^/]+)$/);
-    if (projMatch && req.method === 'DELETE') {
-      // The whole cleanup (record, local uploads/documents/assets, RAG index, chats, empty-dir
-      // sweep) lives in the store so a deleted chat's attachments project shares it (#788).
-      // #1914: awaited, so a failed save answers its error and nothing of the project is removed.
-      let removed;
-      try { removed = await deleteProject(decodeURIComponent(projMatch[1])); }
-      catch (e) { if (e && e.status && e.status < 500 && e.status !== 410) throw e; return saveFailureReply(json, res, e, 'could not delete the project; nothing was changed'); }
-      if (!removed) return json(res, 404, { error: 'no such project' });
-      return json(res, 200, { ok: true });
-    }
+    // POST /api/projects and DELETE /api/projects/{projectId} are the Rust front's (#2191 round 2,
+    // rust-project-lifecycle.cjs, refused before authentication); the conversation import still
+    // creates through store.createProject, and a chat's attachments project is still deleted through
+    // store.deleteProject.
 
     const skillManifestRoute = p.match(/^\/api\/projects\/([^/]+)\/instruction-skills\/manifests$/);
     const skillContentRoute = p.match(/^\/api\/projects\/([^/]+)\/instruction-skills\/manifests\/([^/]+)\/content$/);
@@ -506,22 +487,18 @@ function createProjectRoutes({
       });
     }
 
-    const docRead = p.match(/^\/api\/projects\/([^/]+)\/documents\/(pages|original)$/);
+    // GET .../documents/original is the Rust front's (#2191, rust-project-reads.cjs, refused before
+    // authentication); the page reader stays here.
+    const docRead = p.match(/^\/api\/projects\/([^/]+)\/documents\/pages$/);
     if (docRead && req.method === 'GET') {
       const id = decodeURIComponent(docRead[1]);
       const project = getProject(id);
       const file = project?.files?.find(f => f.name === url.searchParams.get('name'));
       if (!file?.document) return json(res, 404, { error: 'no such document' });
       try {
-        if (docRead[2] === 'pages') {
-          const start = Number(url.searchParams.get('startPage') || 1);
-          return json(res, 200, documentSources.readPages(currentWorkspace(), id, file, start,
-            Number(url.searchParams.get('endPage') || start), Number(url.searchParams.get('offset') || 0)));
-        }
-        const bytes = documentSources.readOriginal(currentWorkspace(), id, file);
-        res.writeHead(200, { 'Content-Type': 'application/pdf', 'Content-Disposition': "attachment; filename*=UTF-8''" + encodeURIComponent(file.name.split('/').pop()),
-          'Content-Length': bytes.length, 'Cache-Control': 'private, no-store' });
-        return res.end(bytes);
+        const start = Number(url.searchParams.get('startPage') || 1);
+        return json(res, 200, documentSources.readPages(currentWorkspace(), id, file, start,
+          Number(url.searchParams.get('endPage') || start), Number(url.searchParams.get('offset') || 0)));
       } catch (err) { return json(res, err.status || 422, { error: err.status ? err.message : 'Saved document data is unavailable; upload or refresh again.' }); }
     }
 
@@ -752,25 +729,7 @@ function createProjectRoutes({
     // from the user's storage, not merely from the project, so it is confined
     // to the project's OWN folder: a source pulled from a folder the user
     // attached for reading must never be deletable from here.
-    // #1806: one source's text, on demand. Lists (GET /api/workspace) carry metadata only. The same
-    // scope as every project route: the signed-in user's own workspace, and only a project the
-    // workspace list shows (never an internal one); an unknown project or source is a 404.
-    const sourceTextRoute = p.match(/^\/api\/projects\/([^/]+)\/sources\/text$/);
-    if (sourceTextRoute && req.method === 'GET') {
-      const id = decodeURIComponent(sourceTextRoute[1]);
-      const project = getProject(id);
-      const internal = !!project && (typeof diaryExtras?.internalProject === 'function' && diaryExtras.internalProject(project));
-      if (!project || internal) return json(res, 404, { error: 'no such project' });
-      const name = url.searchParams.get('name');
-      if (!name) return json(res, 400, { error: 'a source name is required' });
-      const file = (project.files || []).find((f) => f && f.name === name);
-      if (!file) return json(res, 404, { error: 'no such source' });
-      const content = typeof file.content === 'string' ? file.content : '';
-      // #1815: a text file that is gone or unreadable is a 404 with its own code, never an empty 200.
-      // The source and its pointer are kept; re-uploading or refreshing it writes the text again.
-      if (sourceText.textMissingNow(file)) return json(res, 404, { error: 'The text of this source is missing. Re-upload or refresh it.', code: 'SOURCE_TEXT_MISSING', name: file.name });
-      return json(res, 200, { name: file.name, content, chars: content.length });
-    }
+    // GET .../sources/text (#1806, #1815) is the Rust front's (#2191, rust-project-reads.cjs).
 
     const projFileDel = p.match(/^\/api\/projects\/([^/]+)\/files$/);
     if (projFileDel && req.method === 'DELETE') {
@@ -810,21 +769,7 @@ function createProjectRoutes({
       });
     }
 
-    const originalUpload = p.match(/^\/api\/projects\/([^/]+)\/uploads\/original$/);
-    if (originalUpload && req.method === 'GET') {
-      const project = getProject(decodeURIComponent(originalUpload[1]));
-      const file = project?.files.find(f => f.name === url.searchParams.get('name') && f.attachment);
-      if (!file) return json(res, 404, { error: 'No such original' });
-      // A row without a stored original, or one whose file is gone from disk, is a 404, not a 500 (#786).
-      let bytes;
-      try { bytes = fs.readFileSync(require('../uploads.cjs').original(currentWorkspace(), project.id, file)); }
-      catch (e) {
-        if (e?.code === 'ENOENT' || e?.message === 'Original not available') return json(res, 404, { error: 'No such original' });
-        throw e;
-      }
-      res.writeHead(200, { 'Content-Type': 'application/octet-stream', 'Content-Disposition': `attachment; filename*=UTF-8''${encodeURIComponent(file.name.split('/').pop())}`, 'Cache-Control': 'private, no-store', 'Content-Length': bytes.length });
-      return res.end(bytes);
-    }
+    // GET .../uploads/original (#786) is the Rust front's (#2191, rust-project-reads.cjs).
 
     // A project's images (POST /api/projects/{id}/assets, GET and DELETE .../assets/{assetId}) are
     // the Rust front's (sbstndalton/noevia#1071): index.cjs refuses them before this mount
