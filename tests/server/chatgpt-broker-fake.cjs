@@ -67,11 +67,6 @@ function createFakeBroker({ db, now = () => Date.now() }) {
       if (state.catalogueDown) return { ok: false, status: 502, error: 'ChatGPT returned 503: down' };
       return { ok: true, models: state.catalogue };
     },
-    async chatgptModels(user, refresh = false) {
-      calls.push({ op: 'models', user, refresh });
-      if (!rowState(user)) return refusal('disconnected');
-      return { ok: true, body: { models: state.catalogue.map((m) => m.slug), cached: false, fetchedAt: now() } };
-    },
     async chatgptDisconnect(user) {
       calls.push({ op: 'disconnect', user });
       if (state.down) throw Object.assign(new Error('The project store is busy. Try again shortly.'), { status: 503, code: 'PROJECTS_BUSY' });

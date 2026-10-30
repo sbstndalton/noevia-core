@@ -151,9 +151,6 @@ test('the store client speaks the broker protocol: the secret, the ops, refusals
   assert.deepEqual(await client.chatgptCatalogue('u'), { ok: false, status: 503 });
   answers.push([200, { models: [{ slug: 'm' }] }]);
   assert.deepEqual(await client.chatgptCatalogue('u'), { ok: true, models: [{ slug: 'm' }] });
-  answers.push([200, { models: ['m'], cached: true, fetchedAt: 1 }]);
-  assert.deepEqual(await client.chatgptModels('u', true), { ok: true, body: { models: ['m'], cached: true, fetchedAt: 1 } });
-  assert.deepEqual(seen.at(-1).body, { user: 'u', refresh: true });
   answers.push([200, { marked: true }]);
   assert.deepEqual(await client.chatgptReject('u', 'g'), { ok: true, marked: true });
   answers.push([200, { ok: true }], [200, { ok: true }]);

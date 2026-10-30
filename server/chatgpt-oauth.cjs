@@ -369,7 +369,7 @@ function upstreamMessage(text, status) {
  * @param {object} deps
  * @param {{ exec(sql:string):void, prepare(sql:string):any }} deps.db   the auth database (read-only use)
  * @param {object} deps.broker   project-store-client.cjs: chatgptSession, chatgptReject, chatgptCatalogue,
- *                               chatgptModels, chatgptDisconnect, chatgptForget
+ *                               chatgptDisconnect, chatgptForget
  * @param {() => string} [deps.signal]   the broker's change signal (fileSignal of chatgpt-token-changes.json)
  * @param {typeof fetch} [deps.fetchImpl]
  * @param {() => number} [deps.now]
@@ -462,14 +462,6 @@ function createChatGptOAuth({ db, broker, signal = () => '', fetchImpl = (...arg
     if (!r || !r.ok) throw brokerError(r);
     return r.models;
   }
-  /** #1306: the picker's view of the catalogue, cached, throttled and shared by the broker. */
-  async function modelList(userId, { refresh = false } = {}) {
-    const r = await broker.chatgptModels(String(userId), refresh === true);
-    if (!r || !r.ok) throw brokerError(r);
-    return r.body;
-  }
-  async function listModels(userId) { return (await modelList(userId)).models; }
-
   /** A fetch for the chat loop: /chat/completions in, /chat/completions out, the user's bearer on the wire. */
   function fetchFor(userId, { conversation = null } = {}) {
     // An opaque, stable id per (account, conversation): the session the backend caches prompts
@@ -546,7 +538,7 @@ function createChatGptOAuth({ db, broker, signal = () => '', fetchImpl = (...arg
     };
   }
 
-  return { status, disconnect, forgetUser, session, fetchFor, listModels, modelList };
+  return { status, disconnect, forgetUser, session, fetchFor };
 }
 /** The private provider row that points chats at this account. No credential lives in it. */
 function providerRow() {

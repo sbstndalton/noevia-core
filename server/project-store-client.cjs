@@ -299,8 +299,8 @@ function createClient({ port, token, fetchImpl = globalThis.fetch, timeoutMs = T
     },
     /** sbstndalton/noevia#2190 round 5: Sign in with ChatGPT's token broker (the Rust front,
      *  chatgpt_oauth_routes.rs). Each answers { ok: true, ... } or { ok: false, status, error, code }
-     *  (the broker's refusal, written for people). A session may refresh and a model list may fetch
-     *  the catalogue upstream (15 s each), so these wait longer than the file operations.
+     *  (the broker's refusal, written for people). A session may refresh and a catalogue read may
+     *  fetch upstream (15 s each), so these wait longer than the file operations.
      *  `session` hands out an access token, never a refresh token. */
     async chatgptSession(user, rejected = null) {
       const { status, body } = await call('chatgpt/session', { user, ...(rejected ? { rejected: String(rejected) } : {}) }, CHATGPT_WAIT_MS);
@@ -317,10 +317,6 @@ function createClient({ port, token, fetchImpl = globalThis.fetch, timeoutMs = T
     async chatgptCatalogue(user) {
       const { status, body } = await call('chatgpt/catalogue', { user }, CHATGPT_WAIT_MS);
       return status === 200 && body && Array.isArray(body.models) ? { ok: true, models: body.models } : chatgptRefusal(status, body);
-    },
-    async chatgptModels(user, refresh = false) {
-      const { status, body } = await call('chatgpt/models', { user, refresh: refresh === true }, CHATGPT_WAIT_MS);
-      return status === 200 && body && Array.isArray(body.models) ? { ok: true, body } : chatgptRefusal(status, body);
     },
     async chatgptDisconnect(user) {
       const { status, body } = await call('chatgpt/disconnect', { user }, CHATGPT_WAIT_MS);

@@ -56,11 +56,6 @@ function make(t, fake = fakeOpenAI(), clock = { t: 1_800_000_000_000 }) {
     b.calls.push({ op: 'catalogue', user });
     return fake.state.modelsDown ? { ok: false, status: 502, error: 'ChatGPT returned 503: down' } : { ok: true, models: project(fake.state.catalogue || DEFAULT_RAW) };
   };
-  b.broker.chatgptModels = async (user) => {
-    b.calls.push({ op: 'models', user });
-    if (!db.prepare('SELECT 1 FROM chatgpt_oauth_tokens WHERE user_id=?').get(user)) return { ok: false, status: 401, code: 'disconnected', error: 'ChatGPT is not connected. Sign in with ChatGPT in Settings → AI providers.' };
-    return { ok: true, body: { models: project(fake.state.catalogue || DEFAULT_RAW).map((m) => m.slug), cached: false, fetchedAt: clock.t } };
-  };
   const oauth = chatgpt.createChatGptOAuth({ db, broker: b.broker, signal: b.signal, fetchImpl: fake.fetchImpl, now: () => clock.t, config: { codexBaseUrl: CODEX } });
   return { oauth, db, fake, clock, dir, b };
 }
@@ -239,11 +234,9 @@ test('a refused refresh marks the account "reconnect"; a transient one does not;
   assert.equal(f.oauth.status('user-a').state, 'connected', 'signing in again recovers');
 });
 
-test('the model list is the account’s public models; forgetUser removes a deleted account; rotation covers the table', async (t) => {
+test('forgetUser removes a deleted account through the broker; rotation covers the table', async (t) => {
   const f = make(t);
   await connect(f);
-  assert.deepEqual(await f.oauth.listModels('user-a'), ['gpt-synthetic', 'gpt-thinker', 'gpt-plain', 'gpt-quiet']);
-  await assert.rejects(f.oauth.listModels('user-b'), (e) => e.status === 401);
   const tables = rotationTables({ db: f.db, dataDir: f.dir });
   const table = tables.find((x) => x.name === 'chatgpt_oauth_tokens');
   assert.ok(table, 'secrets rotation re-encrypts ChatGPT tokens');
@@ -412,11 +405,10 @@ test('catalogue compatibility #1310: published GPT-6 metadata uses the exact new
     { slug: 'synthetic-api-disabled', visibility: 'list', supported_in_api: false },
   ] };
   assert.equal(publicCatalogue1310.source.revision, 'cc7ba33601286a751477832b01de7b6f8de0dd9c');
-  const ids = await f.oauth.listModels('user-a');
+  const ids = (await f.b.broker.chatgptCatalogue('user-a')).models.map((m) => m.slug);
   assert.deepEqual(ids, ['gpt-6-astra', 'gpt-6.1-sol', 'gpt-6-sol', 'gpt-6-luna']);
   assert.ok(ids.every((id) => typeof id === 'string'));
   assert.doesNotMatch(JSON.stringify({ ids, status: f.oauth.status('user-a') }), /AT-1/);
-  await assert.rejects(f.oauth.listModels('user-b'), (e) => e.status === 401);
 
   // Exercise the existing catalogue-default adapter with fake Response objects only.
   for (const row of publicCatalogue1310.models) {
@@ -547,7 +539,7 @@ test('this process holds no refresh token, writes no token row and keeps no devi
   const source = fs.readFileSync(require.resolve('./chatgpt-oauth.cjs'), 'utf8');
   assert.doesNotMatch(source, /refresh_token|refreshToken|deviceauth|secrets\.(en|de)crypt|INSERT INTO chatgpt_oauth_tokens|UPDATE chatgpt_oauth_tokens|DELETE FROM chatgpt_oauth_tokens/);
   const f = make(t);
-  assert.deepEqual(Object.keys(f.oauth).sort(), ['disconnect', 'fetchFor', 'forgetUser', 'listModels', 'modelList', 'session', 'status']);
+  assert.deepEqual(Object.keys(f.oauth).sort(), ['disconnect', 'fetchFor', 'forgetUser', 'session', 'status']);
   assert.equal(f.oauth.status('nobody').state, 'disconnected');
   f.db.prepare("INSERT INTO chatgpt_oauth_tokens(user_id,data_enc,state,updated_at) VALUES('user-r','enc:v2:x','reconnect',1)").run();
   assert.equal(f.oauth.status('user-r').state, 'reconnect');

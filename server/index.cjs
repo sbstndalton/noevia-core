@@ -1099,7 +1099,7 @@ const projectRoutes = require('./routes/projects.cjs').createProjectRoutes({
 // The provider registry's routes: list, connect, test and remove (routes/providers.cjs), plus
 // Sign in with ChatGPT (chatgptOAuth, built beside mcpOAuth above) while features.chatgptOAuth is on.
 const providerRoutes = require('./routes/providers.cjs').createProviderRoutes({
-  json, readBody, readJson, fetchJson, endpointApproved, PROVIDERS, PROJECTS, DEFAULT_PROVIDER_ID, modelManager, currentWorkspace, saveProjects, registry: providerRegistry,
+  json, readBody, readJson, endpointApproved, PROVIDERS, PROJECTS, DEFAULT_PROVIDER_ID, modelManager, currentWorkspace, saveProjects, registry: providerRegistry,
   chatgptOAuth, chatgptEnabled: () => features.enabled('chatgptOAuth'),
 });
 // Statistics, the auto-router roles, the model manager proxy and /api/models/* (routes/models.cjs).
@@ -1248,6 +1248,7 @@ async function handleRequestInner(req, res) {
   if (require('./rust-storage-connection.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   if (require('./rust-provider-test.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   if (require('./rust-chatgpt-oauth.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
+  if (require('./rust-provider-models.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   if (require('./rust-vault-mirror-preferences.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   await readyFeatures();
   const preAuth = requestAuth.authenticate(req);

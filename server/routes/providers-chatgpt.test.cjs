@@ -91,18 +91,13 @@ test('flag on: a finished sign-in adds a private, external row for that account 
   assert.equal(/AT-secret|acct-synthetic|enc:v2/.test(JSON.stringify(list.body)), false);
   await a.call('GET', '/api/providers');
   assert.equal(a.saved.private, 1, 'listed again: still one row, no second save');
-  // The row's model list is the broker's catalogue.
-  assert.deepEqual((await a.call('GET', '/api/providers/chatgpt-oauth/models')).body, { models: ['gpt-synthetic', 'gpt-thinker', 'gpt-plain', 'gpt-quiet'], cached: false, fetchedAt: f.clock.t });
-  assert.deepEqual(f.fake.calls.filter((c) => c.op === 'models').map((c) => [c.user, c.refresh]), [['user-a', false]]);
+  // The row's model list is the Rust front's (rust-provider-models.cjs): refused here.
+  assert.deepEqual(await a.call('GET', '/api/providers/chatgpt-oauth/models'), { status: 503, body: { error: 'The provider model list is owned by the Rust front.', code: 'RUST_PROVIDER_MODELS_OWNED' } });
 
   // user B: separate workspace, no row, not connected.
   const b = f.routesFor('user-b');
   assert.equal(f.oauth.status('user-b').state, 'disconnected');
   assert.deepEqual((await b.call('GET', '/api/providers')).body.providers.map((p) => p.id), ['default']);
-  b.providers.push(chatgpt.providerRow());
-  const models = await b.call('GET', '/api/providers/chatgpt-oauth/models');
-  assert.equal(models.status, 401);
-  assert.match(models.body.error, /not connected/);
 });
 
 test('connecting twice keeps one row; disconnect deletes the tokens, the row and project links', async (t) => {
@@ -174,7 +169,6 @@ function nativeStatusFixture({ env: _env, enabled = () => true } = {}) {
   const oauth = {
     status: () => { calls.status++; return { state: 'disconnected' }; },
     disconnect: async () => { calls.disconnect++; },
-    modelList: async () => { calls.models++; return { models: ['sentinel-model'] }; },
   };
   const routes = createProviderRoutes({
     json: (_res, status, body) => { sent.push({ status, body }); },
