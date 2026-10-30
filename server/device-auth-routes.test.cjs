@@ -105,25 +105,26 @@ test('the device flow is the Rust front\'s: Node refuses every device endpoint, 
     }
   }
   // Nothing was written: the grant is still there and still works.
-  assert.equal((await asDevice(tokens.access, '/api/workspace')).status, 200);
+  assert.equal((await asDevice(tokens.access, '/api/chats/search')).status, 200);
 });
 
 test('a device token acts as its own account, as a member, and reads without writing', async () => {
   const tokens = deviceFor(adminId, 'Workspace Mac');
-  const free = await asDevice(tokens.access, '/api/workspace');
-  assert.equal(free.status, 200);
-  const ids = free.json.freeChats.map((c) => c.id);
-  assert.ok(ids.includes('admin-chat') && !ids.includes('member-chat'), JSON.stringify(ids));
+  // "Its" workspace is observable through the chat export, which reads only the caller's own lists
+  // (GET /api/workspace, which showed the lists, is the Rust front's since the #2191 close-out).
+  const exportStatus = async (token, chat) => (await asDevice(token, `/api/chats/${chat}/export`)).status;
+  assert.equal(await exportStatus(tokens.access, 'admin-chat'), 200);
+  assert.equal(await exportStatus(tokens.access, 'member-chat'), 404);
   const memberTokens = deviceFor(memberId, 'Member phone');
-  const memberIds = (await asDevice(memberTokens.access, '/api/workspace')).json.freeChats.map((c) => c.id);
-  assert.ok(memberIds.includes('member-chat') && !memberIds.includes('admin-chat'), JSON.stringify(memberIds));
+  assert.equal(await exportStatus(memberTokens.access, 'member-chat'), 200);
+  assert.equal(await exportStatus(memberTokens.access, 'admin-chat'), 404);
   // Role-gated routes outside /api/admin see a member.
   assert.equal((await asDevice(tokens.access, '/api/models/unload', { method: 'POST', body: { name: 'synthetic' } })).status, 403);
   // The gate is read-only here: the front moves last_used_at before it proxies (server-auth upkeep).
   const db = new (require('better-sqlite3'))(path.join(dataDir, 'cowork.db'), { readonly: true });
   try {
     const before = db.prepare('SELECT last_used_at FROM device_grants WHERE id=?').get(tokens.grantId).last_used_at;
-    await asDevice(tokens.access, '/api/workspace');
+    await asDevice(tokens.access, '/api/chats/search');
     assert.equal(db.prepare('SELECT last_used_at FROM device_grants WHERE id=?').get(tokens.grantId).last_used_at, before);
   } finally { db.close(); }
 });
@@ -175,7 +176,7 @@ test('scope limits: a device token never reaches administration or account secur
 
 test('bearer tokens cannot carry cookies, and a cookie session cannot borrow a bearer', async () => {
   const tokens = deviceFor(adminId, 'Mixed credentials');
-  const both = await request('/api/workspace', { headers: { ...bearer(tokens.access), cookie: admin.cookie } });
+  const both = await request('/api/chats/search', { headers: { ...bearer(tokens.access), cookie: admin.cookie } });
   assert.equal(both.status, 400);
   assert.equal(both.json.code, 'ambiguous_credentials');
   // A cookie-authenticated write with a bearer attached is refused before any route runs, so a
@@ -183,11 +184,11 @@ test('bearer tokens cannot carry cookies, and a cookie session cannot borrow a b
   const smuggled = await request('/api/workspace/model', { method: 'PUT', body: {}, headers: { ...bearer(tokens.access), cookie: admin.cookie, origin: ORIGIN } });
   assert.equal(smuggled.status, 400);
   // A csrf cookie alone alongside a bearer is refused too.
-  assert.equal((await request('/api/workspace', { headers: { ...bearer(tokens.access), cookie: `cowork_csrf=${admin.csrf}` } })).status, 400);
+  assert.equal((await request('/api/chats/search', { headers: { ...bearer(tokens.access), cookie: `cowork_csrf=${admin.csrf}` } })).status, 400);
   // Unknown, malformed and query-string tokens are 401.
-  assert.equal((await asDevice('nva_not-a-real-token', '/api/workspace')).status, 401);
-  assert.equal((await asDevice(tokens.refresh, '/api/workspace')).status, 401, 'a refresh token is not an access token');
-  assert.equal((await request(`/api/workspace?access_token=${tokens.access}`)).status, 401);
+  assert.equal((await asDevice('nva_not-a-real-token', '/api/chats/search')).status, 401);
+  assert.equal((await asDevice(tokens.refresh, '/api/chats/search')).status, 401, 'a refresh token is not an access token');
+  assert.equal((await request(`/api/chats/search?access_token=${tokens.access}`)).status, 401);
   // The approval page is the Rust front's (#2190): Node refuses it, feature on or off.
   const page = await request('/device');
   assert.equal(page.status, 503);

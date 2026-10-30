@@ -1115,10 +1115,24 @@ const providerRoutes = require('./routes/providers.cjs').createProviderRoutes({
 });
 // Statistics, the auto-router roles, the model manager proxy and /api/models/* (routes/models.cjs).
 const modelRoutes = require('./routes/models.cjs').createModelRoutes({
-  json, readBody, readJson, fetchJson, env: process.env, modelManager, getProvider, providerHeaders, DEFAULT_PROVIDER_ID, createVisionProbe: engineVisionProbe, missingRoles, currentWorkspace, service: modelService, inferenceBudget, idleUnload, decisionSettings, rerankSettings,
-  localRoles: (roles) => chatMachines.localRoles(roles),
-  machineModels: () => chatMachines.machineModels(), // #1849
+  json, readBody, readJson, fetchJson, env: process.env, modelManager, getProvider, providerHeaders, DEFAULT_PROVIDER_ID, createVisionProbe: engineVisionProbe, currentWorkspace, service: modelService, inferenceBudget, idleUnload, decisionSettings, rerankSettings,
 });
+// State only this process knows, published for the Rust front (published-snapshot.cjs): the retrieval
+// status behind GET /api/health (rust-health.cjs) and the served catalogue and machine models behind
+// GET /api/auto-roles (rust-auto-roles.cjs). Both files age out when this process stops publishing.
+{
+  // Both run only while the front's demand marker is young: it touches it on each signed-in GET of the two routes.
+  const snapshots = require('./published-snapshot.cjs');
+  const demand = snapshots.createDemand({ dir: DATA_DIR, pollMs: snapshots.intervalFrom(process.env.SNAPSHOT_DEMAND_POLL_MS, snapshots.DEMAND_POLL_MS, 200, 10000) });
+  const ragStatus = require('./rust-health.cjs').createRagStatusPublisher({ dataDir: DATA_DIR, rag, demand });
+  ragStatus.watch(embeddingService);
+  const autoRolesSnapshot = require('./rust-auto-roles.cjs').createAutoRolesPublisher({
+    dataDir: DATA_DIR, servedCatalogue: () => modelService.servedCatalogue(),
+    remoteRoles: () => chatMachines.remoteRoles(), machineModels: () => chatMachines.machineModels(), demand,
+  });
+  autoRolesSnapshot.watch(modelService);
+  afterNativeReady(() => { ragStatus.start(); autoRolesSnapshot.start(); demand.start(); });
+}
 // ── Routing ────────────────────────────────────────────────────────────────
 
 const diaryConnectors = require('./diary-connectors.cjs').createCredentials(authService);
@@ -1165,7 +1179,7 @@ const approvalRoutes = require('./routes/approvals.cjs').createApprovalRoutes({ 
 // runs the delete-old-chats sweep as the workspace loads, at most hourly.
 const chatListRoutes = require('./routes/chat-lists.cjs').createChatListRoutes({
   json, readBody, currentWorkspace, PROJECTS, FREE_CHATS, diaryExtras, crypto, STORED_HISTORY_BYTES, STORED_HISTORY_CAP,
-  chatLists: retentionLists, removeChat: removeRetainedChat, store: projectStore,
+  store: projectStore,
 });
 // The routing configuration and the sampling-presets switch are the Rust front's (#1071): these
 // mounts only refuse a bypass. Chat still reads both settings (routing-modes.cjs, chat.cjs).
@@ -1174,7 +1188,6 @@ const routingModeRoutes = require('./routes/routing-mode.cjs').createRoutingMode
 // is the Rust front's.
 const reasoningSettingsRoutes = require('./routes/reasoning-settings.cjs').createReasoningSettingsRoutes({ json, authService, getProject, getProvider, reasoningEffort, DEFAULT_PROVIDER_ID });
 const samplingSettingsRoutes = require('./routes/sampling-settings.cjs').createSamplingSettingsRoutes({ json });
-// GET /api/health: the default provider, the Diary sidecar and retrieval (routes/health.cjs).
 // The embedding model of retrieval, for administrators (routes/embedding.cjs, #1636).
 const embeddingRoutes = require('./routes/embedding.cjs').createEmbeddingRoutes({ json, readJson, migration: embeddingMigration, authService, fetchJson, DIARY_BASE, diaryServiceHeaders: diary.serviceHeaders,
   service: embeddingService, resolveFile: (model) => require('./embedding-service.cjs').resolveModelFile({ env: process.env, fetchJson, model }) });
@@ -1198,7 +1211,6 @@ const inferenceMachineRoutes = require('./routes/inference-machines.cjs').create
     embedding: () => require('./embedding-config.cjs').current()?.active()?.baseUrl || null,
     reranker: () => { const t = require('./rerank-target.cjs').rerankTarget(rerankSettings.effectiveEnv()); return t.enabled ? t.baseUrl : null; },
   } });
-const healthRoutes = require('./routes/health.cjs').createHealthRoutes({ json, fetchJson, getProvider, providerHeaders, DEFAULT_PROVIDER_ID, DIARY_BASE, diaryHeaders, authService, rag });
 // GET /api/ready (#297): unauthenticated, mounted before the session gate below alongside the
 // sign-in routes. isReady is set once startup wiring under require.main finishes (see below).
 const readyRoutes = require('./routes/health.cjs').createReadyRoutes({
@@ -1290,6 +1302,9 @@ async function handleRequestInner(req, res) {
   if (require('./rust-vault-mirror-preferences.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   if (require('./rust-google-drive.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   if (require('./rust-offsite-backup.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
+  if (require('./rust-health.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
+  if (require('./rust-auto-roles.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
+  if (require('./rust-workspace.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   await readyFeatures();
   const preAuth = requestAuth.authenticate(req);
   // accountRole: a device token acts as a member, but its account's workspace is the same one.
@@ -1377,7 +1392,6 @@ async function handleRequestScoped(req, res) {
     if (await routingModeRoutes(req, res, { path: p, authn, url })) return;
     if (await samplingSettingsRoutes(req, res, { path: p, authn, url })) return;
 
-    if (await healthRoutes(req, res, { path: p, authn })) return;
     if (await embeddingRoutes(req, res, { path: p, authn })) return;
     if (await inferenceMachineRoutes(req, res, { path: p, authn, url })) return;
 

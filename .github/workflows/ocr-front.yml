@@ -25,10 +25,10 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           repository: sbstndalton/noevia-rs
-          # sbstndalton/noevia#2191 round 8: the front runs the upload, the sync and the folder plan itself (the Docling
-          # extraction, the OCR worker and the source jobs); acceptance input only. The head of noevia-rs PR 349, merged
-          # to main (reachable from it).
-          ref: 21615f668ee9f8a7956e557d28a1c88062df8295
+          # sbstndalton/noevia#2191 close-out: the front answers GET /api/workspace itself (this Core refuses it), beside
+          # the upload, the sync and the folder plan of round 8; acceptance input only. A head of the noevia-rs
+          # close-out branch, which the merged PR contains (reachable from main).
+          ref: 124ecbb2b7803bd2385ebdd12b78aab544b49aba
           path: rs
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:

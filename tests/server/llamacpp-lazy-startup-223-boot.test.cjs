@@ -23,7 +23,7 @@ const skipWasm = noSqlite || (!fs.existsSync(process.env.DAV_PARSE_WASM || davPa
 const SERVER = path.join(__dirname, '..', '..', 'server', 'index.cjs');
 const SERVER_DIR = path.dirname(SERVER);
 const BOOT_FAULT = /could not be evaluated at startup/;
-const EXPECTED_RAN = 28;
+const EXPECTED_RAN = 32;
 
 let ran = 0;
 test.after(() => { assert.equal(ran, skipWasm ? 0 : EXPECTED_RAN, 'every guarded step must have run'); });
@@ -188,9 +188,14 @@ for (const mode of Object.keys(EXPECT)) {
     if (want.bootFaults) assert.match(s.log(), /Autoconfig: the container memory limit \(LLAMACPP_MEMORY_LIMIT\) could not be evaluated at startup/);
 
     // Unrelated routes keep working under every fault.
-    const health = await s.call('GET', '/api/health');
+    // (GET /api/health, which this used, is the Rust front's since the #2190 close-out: Node refuses it.)
+    const health = await s.call('GET', '/api/chats/search');
     ran++;
     assert.equal(health.status, 200);
+    const refusedHealth = await s.call('GET', '/api/health');
+    ran++;
+    assert.equal(refusedHealth.status, 503);
+    assert.equal(refusedHealth.json.code, 'RUST_HEALTH_OWNED');
     const budget = await s.call('GET', '/api/models/inference-budget');
     ran++;
     assert.equal(budget.status, 200, budget.text.slice(0, 300));

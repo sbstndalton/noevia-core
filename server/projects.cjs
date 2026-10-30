@@ -167,7 +167,7 @@ function createProjectStore({
   // is request-scoped), never a regular project: chatProjectId only ever yields the context prefix.
   // Its chat list is NOT purged (a context project is not meant to hold chats; if one somehow
   // does, those chats are not this delete's to remove). Best effort: the chat delete has already
-  // committed, and a failure here leaves an orphan that removeOrphanChatContexts retries.
+  // committed, and a failure here leaves an orphan that the Rust front's workspace list removes later.
   function removeChatAttachments(chatId) {
     const id = require('./diary-extras.cjs').chatProjectId(chatId);
     if (!id || !PROJECTS.some((p) => p && p.id === id)) return false;
@@ -176,31 +176,9 @@ function createProjectStore({
     catch (err) { return warn(err); }
   }
 
-  // Attachments projects left behind by chats deleted before #788. Orphan-ness is proven only by
-  // a tombstone: a deleted chat's id is tombstoned and can never come back (mergeChats and moveChat
-  // refuse it), and ids are random, so a tombstoned id is gone for good. A context whose chat is
-  // merely absent from every list is NOT removed: a new chat creates its context when it opens,
-  // before its first message saves the meta, so absence alone may be a chat open in a tab right
-  // now. Idempotent; bounded per call (default 10, each one a full projects.json rewrite) so a large
-  // backlog drains over a few workspace loads instead of stalling the first request that runs it.
-  function removeOrphanChatContexts({ limit = 10 } = {}) {
-    const prefix = 'cowork-chat-context-';
-    const contexts = PROJECTS.filter((p) => p && typeof p.id === 'string' && p.id.startsWith(prefix));
-    if (!contexts.length) return 0;
-    const tombstones = require('./chat-lists.cjs').readTombstones(currentWorkspace().dir);
-    const listed = new Set();
-    for (const c of FREE_CHATS) if (c && typeof c.id === 'string') listed.add(c.id);
-    for (const p of PROJECTS) for (const c of (p && p.chats) || []) if (c && typeof c.id === 'string') listed.add(c.id);
-    let removed = 0;
-    for (const context of contexts) {
-      if (removed >= limit) break;
-      const chatId = context.id.slice(prefix.length);
-      if (!tombstones.has(chatId) || listed.has(chatId)) continue;
-      if (require('./diary-extras.cjs').chatProjectId(chatId) !== context.id) continue;
-      if (removeChatAttachments(chatId)) removed += 1;
-    }
-    return removed;
-  }
+  // The attachments projects of chats deleted before #788 are removed by the Rust front's workspace list
+  // (noevia-rs crates/server-projects workspace.rs reap_orphan_contexts, rust-workspace.cjs): tombstone-proven,
+  // ten per list, through the project delete without its chats.
 
   // Deleting a project deletes its chats too (#554): each one through the store's delete as a chat
   // no list holds any more (kind 'unlisted', #1071 slice 6: tombstone, transcript, context meter,
@@ -993,7 +971,7 @@ function createProjectStore({
   return {
     refreshDocumentFigures, completeUploadedDocument,
     saveProjects, whenSaved, getProject, sanitizeChats, loadChats, saveChats, chatIdsElsewhere, deleteChat, purgeProjectChats, saveFreeChats, deleteFreeChat, setChatFlags, setChatTitle, chatAutoNamed, createProject,
-    deleteProject, removeChatAttachments, removeOrphanChatContexts,
+    deleteProject, removeChatAttachments,
     historyPath, readHistory,
     ownsFile, ensureProjectFolder, ensureProjectFolderDetailed, withSourceLock, pruneDocuments, researchReportTarget, writeProjectTextFile, sweepDeletedProject, indexSource,
   };

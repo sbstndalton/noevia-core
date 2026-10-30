@@ -71,26 +71,26 @@ test.before(() => {
 });
 
 test('rejects API requests without a token', async () => {
-  const response = await request('/api/workspace');
+  const response = await request('/api/chats/search');
   assert.equal(response.status, 401);
   assert.match(response.headers['WWW-Authenticate'] || '', /^Bearer /);
   assert.deepEqual(JSON.parse(response.text), { error: 'unauthorized' });
 });
 
 test('rejects API requests with the wrong token', async () => {
-  const response = await request('/api/workspace', {
+  const response = await request('/api/chats/search', {
     headers: { authorization: 'Bearer wrong-token' },
   });
   assert.equal(response.status, 401);
 });
 
 test('accepts a valid bearer token', async () => {
-  const response = await request('/api/workspace', {
+  const response = await request('/api/chats/search', {
     headers: { authorization: 'Bearer test-cowork-token' },
   });
   assert.equal(response.status, 200);
   const body = JSON.parse(response.text);
-  assert.ok(Array.isArray(body.projects));
+  assert.ok(Array.isArray(body.chats));
 });
 
 test('provider creation is the Rust front\'s: Node refuses it before authentication and creates nothing', async () => {

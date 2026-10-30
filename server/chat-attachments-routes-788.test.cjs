@@ -72,7 +72,8 @@ const frontMove=(url,body)=>require('../tests/server/project-store-server.cjs').
 const realFetch = global.fetch;
 
 
-// #788 through Node lifecycle wiring: free-chat delete, Delete old chats, moved-chat delete and /api/workspace orphan sweep. Context creation is Rust-owned and seeded here.
+// #788 through Node lifecycle wiring: free-chat delete, Delete old chats, and moved-chat delete. The orphan sweep (the attachments projects of chats the front deleted) is the Rust workspace list's since the
+// #2191 close-out (noevia-rs tests/workspace.rs). Context creation is Rust-owned and seeded here.
 // Synthetic chats and bytes only.
 const usersDir = () => path.join(testDataDir, 'users');
 const workspaceDir = () => {
@@ -112,7 +113,7 @@ function frontSaveFree(metas) {
 const frontDelete = (projectId, chatId) => require('../tests/server/project-store-server.cjs').rustChatDelete(testDataDir, path.basename(workspaceDir()), projectId, chatId);
 
 async function openWithImage(chatId) {
-  await request('/api/workspace', { headers: { cookie } });
+  await request('/api/chats/search', { headers: { cookie } }); // the account's directory exists
   const file = path.join(workspaceDir(), 'projects.json');
   const data = JSON.parse(fs.readFileSync(file, 'utf8'));
   data.projects.push({ id: ctx(chatId), name: 'Synthetic context', files: [], assets: [], chats: [] });
@@ -134,15 +135,14 @@ test('deleting a free chat removes its attachments project, and a stale tab cann
   frontSaveFree([{ id: 'c788-delete', title: 'a' }, { id: 'c788-keep', title: 'b', archived: true }]);
 
   // #1071 slice 6: the delete is the Rust front's (Node refuses it); the front's store operation
-  // tombstones the chat and Node's reaper frees its attachments project on the next workspace load.
+  // tombstones the chat and the front's workspace list frees its attachments project on its next load.
   const refused = await request('/api/freechats/c788-delete', { method: 'DELETE', headers: mutationHeaders() });
   assert.equal(refused.status, 503);
   assert.equal(JSON.parse(refused.text).code, 'RUST_PROJECTS_OWNED');
   const deleted = frontDelete(null, 'c788-delete');
   assert.equal(deleted.status, 200);
-  assert.equal((await request('/api/workspace', { headers: { cookie } })).status, 200);
-  assert.ok(await gone(doomed), 'local assets and RAG index are gone');
-  assert.ok(!projectIds().includes(ctx('c788-delete')), 'the record is gone from projects.json');
+  assert.ok(require('./chat-lists.cjs').readTombstones(workspaceDir()).has('c788-delete'));
+  assert.ok(fs.existsSync(doomed.assetDir), 'the front\'s list, not Node, frees the project of a chat the front deleted');
   assert.ok(projectIds().includes(ctx('c788-keep')), 'an archived chat keeps its attachments');
   assert.ok(projectIds().includes(regular.id), 'a regular project is untouched');
   assert.ok(fs.existsSync(kept.assetDir) && fs.existsSync(kept.rag));
@@ -150,7 +150,6 @@ test('deleting a free chat removes its attachments project, and a stale tab cann
   const again = await post('/api/chats/c788-delete/context', {});
   assert.equal(again.status, 503, 'Node has no context fallback; Rust route tests retain the 410 contract');
   assert.ok(require('./chat-lists.cjs').readTombstones(workspaceDir()).has('c788-delete'), 'the actual delete publishes the tombstone Rust reads');
-  assert.ok(!projectIds().includes(ctx('c788-delete')));
   const read = await request('/api/chats/c788-delete/context', { headers: { cookie } });
   assert.equal(read.status, 503, 'context reads are also Rust-owned');
 });
@@ -162,9 +161,7 @@ test('a moved chat and Delete old chats take their attachments projects along (#
   assert.equal((await frontMove('/api/chats/c788-moved/move', { projectId: host.id })).status, 200);
   assert.equal((await request(`/api/projects/${host.id}/chats/c788-moved`, { method: 'DELETE', headers: mutationHeaders() })).status, 503);
   assert.equal(frontDelete(host.id, 'c788-moved').status, 200);
-  assert.equal((await request('/api/workspace', { headers: { cookie } })).status, 200);
-  assert.ok(await gone(moved));
-  assert.ok(!projectIds().includes(ctx('c788-moved')));
+  assert.ok(require('./chat-lists.cjs').readTombstones(workspaceDir()).has('c788-moved'));
 
   const old = await openWithImage('c788-old');
   const fresh = await openWithImage('c788-fresh');
@@ -181,19 +178,4 @@ test('a moved chat and Delete old chats take their attachments projects along (#
   assert.ok(!projectIds().includes(ctx('c788-old')));
   assert.ok(projectIds().includes(ctx('c788-fresh')) && fs.existsSync(fresh.assetDir));
   assert.equal((await request('/api/account/retention', { method: 'PUT', headers: mutationHeaders(), body: JSON.stringify({ days: 0 }) })).status, 200);
-});
-
-test('loading the workspace removes attachments projects of chats deleted before #788, and only those (#788)', async () => {
-  const orphan = await openWithImage('c788-orphan');
-  const unsaved = await openWithImage('c788-unsaved');
-  // Simulate a delete made by the old code: the chat is tombstoned, its project was left behind.
-  const file = path.join(workspaceDir(), 'deleted-chats.json');
-  const ids = fs.existsSync(file) ? JSON.parse(fs.readFileSync(file, 'utf8')) : [];
-  fs.writeFileSync(file, JSON.stringify([...ids, 'c788-orphan']));
-  const workspace = await request('/api/workspace', { headers: { cookie } });
-  assert.equal(workspace.status, 200);
-  assert.ok(!JSON.parse(workspace.text).projects.some((p) => p.id.startsWith('cowork-chat-context-')), 'hidden projects never reach the client');
-  assert.ok(await gone(orphan));
-  assert.ok(!projectIds().includes(ctx('c788-orphan')));
-  assert.ok(projectIds().includes(ctx('c788-unsaved')) && fs.existsSync(unsaved.assetDir), 'a chat open but not yet saved keeps its attachments');
 });

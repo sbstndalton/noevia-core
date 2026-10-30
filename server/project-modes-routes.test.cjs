@@ -79,8 +79,9 @@ test('projects are Chat projects; an old client sending modes is accepted, norma
   // The create's own normalisation and its 400s are the Rust front's (noevia-rs lifecycle.rs tests).
   const patched = await post(`/api/projects/${plain.id}/config`, { modes: ['code', 'cowork'] });
   assert.equal(patched.status, 200);
-  const workspace = JSON.parse((await request('/api/workspace', { headers: mutationHeaders() })).text);
-  assert.deepEqual(workspace.projects.find((p) => p.id === plain.id).modes, ['chat', 'cowork', 'code']);
+  // The saved project, as the store left it (the list, GET /api/workspace, is the Rust front's).
+  const saved = JSON.parse(fs.readFileSync(path.join(testDataDir, 'users', frontUserId, 'projects.json'), 'utf8'));
+  assert.deepEqual(saved.projects.find((p) => p.id === plain.id).modes, ['chat', 'cowork', 'code']);
   assert.equal((await post(`/api/projects/${plain.id}/config`, { modes: 'chat' })).status, 400);
 });
 
