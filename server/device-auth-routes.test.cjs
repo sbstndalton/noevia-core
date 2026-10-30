@@ -151,8 +151,11 @@ test('scope limits: a device token never reaches administration or account secur
   const save = await asDevice(tokens.access, '/api/integrations/storage', { method: 'PUT', body: { kind: 'local' } });
   assert.equal(save.status, 503);
   assert.equal(save.json.code, 'RUST_STORAGE_CONNECTION_OWNED');
+  // The off-site backup is the Rust front's too (#2190 round 7; its gate refuses device tokens on /api/admin).
+  const backup = await asDevice(tokens.access, '/api/admin/offsite-backup', { method: 'GET' });
+  assert.equal(backup.status, 503);
+  assert.equal(backup.json.code, 'RUST_OFFSITE_BACKUP_OWNED');
   const refused = [
-    ['GET', '/api/admin/offsite-backup'],
     ['DELETE', `/api/admin/users/${memberId}`, { username: 'memberqa' }],
     ['POST', '/api/profile/diary-connectors', {}],
   ];
@@ -163,7 +166,7 @@ test('scope limits: a device token never reaches administration or account secur
   }
   // The admin's own browser session still reads the administration routes Node answers, so the
   // refusals above are the device token's scope, not a closed route.
-  assert.equal((await admin.read('/api/admin/offsite-backup')).status, 200);
+  assert.equal((await admin.read('/api/admin/offsite-backup')).status, 503, 'the admin session reaches the refusal, not a closed route');
   // The admin's own browser session no longer reads feature administration from Node either.
   const own = await admin.read('/api/admin/features');
   assert.equal(own.status, 503);
@@ -194,10 +197,6 @@ test('bearer tokens cannot carry cookies, and a cookie session cannot borrow a b
 test('F2: a device token cannot link connectors or change their tool policy', async () => {
   const tokens = deviceFor(adminId, 'Connector Mac');
   for (const [method, url, body] of [
-    ['POST', '/api/connectors/gdrive/connect', {}],
-    ['POST', '/api/connectors/gdrive/disconnect', {}],
-    ['PUT', '/api/connectors/gdrive/policy', { tools: ['drive_write'], mode: 'allow' }],
-    ['PUT', '/api/connectors/gdrive/backup-copy', { enabled: true }],
     ['PUT', '/api/connectors/nextcloud/policy', { tools: [], mode: 'allow' }],
   ]) {
     const r = await asDevice(tokens.access, url, { method, body });
@@ -205,4 +204,14 @@ test('F2: a device token cannot link connectors or change their tool policy', as
     assert.equal(r.json.code, 'browser_session_required');
   }
   assert.notEqual((await asDevice(tokens.access, '/api/connectors')).status, 403, 'reading the connector list stays allowed');
+  // The Google Drive writes are the Rust front's (#2190 round 7): Node refuses them before authentication, and
+  // the front's gate refuses a device token on them (noevia-rs tests/offsite.rs checks its browser-only list).
+  for (const [method, url, body] of [
+    ['POST', '/api/connectors/gdrive/connect', {}], ['POST', '/api/connectors/gdrive/disconnect', {}],
+    ['PUT', '/api/connectors/gdrive/policy', { tools: ['drive_write'], mode: 'allow' }], ['PUT', '/api/connectors/gdrive/backup-copy', { enabled: true }],
+  ]) {
+    const r = await asDevice(tokens.access, url, { method, body });
+    assert.equal(r.status, 503, `${method} ${url} -> ${r.status}`);
+    assert.equal(r.json.code, 'RUST_GOOGLE_DRIVE_OWNED');
+  }
 });

@@ -5,19 +5,21 @@ const { createConnectorRoutes } = require('./connectors.cjs');
 const { createDriveTools } = require('../gdrive-tools.cjs');
 const { createToolboxes } = require('../toolboxes.cjs');
 
+// GET /api/connectors and the Nextcloud permissions are what Node still answers (sbstndalton/noevia#2190
+// round 7); the Google Drive writes are the Rust front's (noevia-rs tests/gdrive.rs) and refused here
+// (rust-google-drive.test.cjs).
 const WRITES = new Set(['nc_notes_create', 'drive_create_file']);
 const isWrite = (name) => WRITES.has(name);
+const DRIVE_VIEW = { id: 'gdrive', name: 'Google Drive', configured: true, state: 'disconnected', email: null, connectedAt: null, backup: null, tools: [] };
 
-function harness({ state, modes = {}, onPolicyChange, drive = { state: () => ({ configured: false, state: 'not-configured' }) } } = {}) {
+function harness({ state, modes = {}, onPolicyChange, setResult = { ok: true }, view = DRIVE_VIEW } = {}) {
   const set = [];
-  const policy = {
-    mode: (_u, tool, write) => (modes[tool] ? modes[tool] : write ? 'ask' : 'allow'),
-    set: (user, tools, mode) => { set.push({ user, tools, mode }); for (const t of tools) modes[t] = mode; },
-  };
+  const policy = { mode: (_u, tool, write) => (modes[tool] ? modes[tool] : write ? 'ask' : 'allow') };
+  const toolPolicy = { set: async (user, tools, writes, mode) => { set.push({ user, tools, writes, mode }); if (setResult.ok) for (const t of tools) modes[t] = mode; return setResult; } };
+  const asked = [];
   const routes = createConnectorRoutes({
-    accounts: { forUser: () => ({ drive, backup: null }) },
-    driveTools: { names: new Set(['drive_create_file']), labels: { drive_create_file: 'Create file' } },
-    policy, offsite: { status: () => null }, isWrite, onPolicyChange,
+    accounts: { view: async (user) => { asked.push(user.id); return view; } },
+    policy, toolPolicy, isWrite, onPolicyChange,
     json: (res, status, body) => { res.status = status; res.body = body; },
     readBody: async (req) => req.body,
     nextcloud: {
@@ -26,18 +28,21 @@ function harness({ state, modes = {}, onPolicyChange, drive = { state: () => ({ 
       tools: () => ['nc_notes_search', 'nc_notes_create'],
     },
   });
-  return { routes, set, modes };
+  return { routes, set, modes, asked };
 }
 const run = async (routes, req, path) => { const res = {}; await routes(req, res, { path, authn: { user: { id: 'u1' } } }); return res; };
 
-test('the account sees Nextcloud beside Drive, with its state, boxes and tools', async () => {
-  const { routes } = harness({ state: { configured: true, state: 'connected', account: 'sam', baseUrl: 'https://cloud.example/', message: '' } });
+test('the account sees Nextcloud beside Drive (which the front answers), with its state, boxes and tools', async () => {
+  const { routes, asked } = harness({ state: { configured: true, state: 'connected', account: 'sam', baseUrl: 'https://cloud.example/', message: '' } });
   const res = await run(routes, { method: 'GET' }, '/api/connectors');
+  assert.deepEqual(res.body.connectors.map((c) => c.id), ['gdrive', 'nextcloud']);
+  assert.deepEqual(asked, ['u1'], 'the Drive half comes from the broker for this account');
   const nc = res.body.connectors.find((c) => c.id === 'nextcloud');
   assert.equal(nc.state, 'connected');
   assert.equal(nc.account, 'sam');
   assert.deepEqual(nc.boxes.map((b) => b.id), ['nextcloud-notes']);
   assert.deepEqual(nc.tools.map((t) => [t.name, t.write, t.mode]), [['nc_notes_search', false, 'allow'], ['nc_notes_create', true, 'ask']]);
+  assert.equal((await run(routes, { method: 'POST' }, '/api/connectors')).status, 405);
 });
 
 test('a disconnected or refused connection says so instead of offering a connect button', async () => {
@@ -54,19 +59,48 @@ test('a disconnected or refused connection says so instead of offering a connect
   }
 });
 
-test('permissions change only tools this connector offers, and a write can never be allowed', async () => {
+test('permissions change only tools this connector offers, and are written by the front with the write flags', async () => {
   const { routes, set } = harness({ state: { configured: true, state: 'connected', account: 'sam' } });
   const ok = await run(routes, { method: 'PUT', body: { tools: ['nc_notes_search', 'drive_create_file', 'made_up'], mode: 'block' } }, '/api/connectors/nextcloud/policy');
   assert.equal(ok.status, 200);
-  assert.deepEqual(set[0].tools, ['nc_notes_search'], 'another connector’s tool is not touched');
-  const blocked = ok.body.tools.find((t) => t.name === 'nc_notes_search');
-  assert.equal(blocked.mode, 'block');
+  assert.deepEqual(set, [{ user: 'u1', tools: ['nc_notes_search'], writes: [false], mode: 'block' }], 'another connector’s tool is not touched');
+  assert.equal(ok.body.tools.find((t) => t.name === 'nc_notes_search').mode, 'block');
+  const w = await run(routes, { method: 'PUT', body: { tools: ['nc_notes_search', 'nc_notes_create'], mode: 'ask' } }, '/api/connectors/nextcloud/policy');
+  assert.equal(w.status, 200);
+  assert.deepEqual(set.at(-1).writes, [false, true], 'the live classifier decides which tools write; the front enforces "a write never allows"');
+});
+
+test('the front\'s refusal reaches the page in core\'s words; an unreachable front is refused with its own status, never a silent success', async () => {
+  let cleared = 0;
+  const refused = harness({ state: { configured: true, state: 'connected' }, onPolicyChange: () => { cleared += 1; }, setResult: { ok: false, status: 400, error: 'Writes always ask first, so they cannot be set to Always allow.' } });
+  const r = await run(refused.routes, { method: 'PUT', body: { tools: ['nc_notes_create'], mode: 'allow' } }, '/api/connectors/nextcloud/policy');
+  assert.deepEqual([r.status, r.body], [400, { error: 'Writes always ask first, so they cannot be set to Always allow.' }]);
+  assert.equal(cleared, 0, 'a refused save changed nothing, so nothing is cleared');
+  const down = harness({ state: { configured: true, state: 'connected' }, setResult: { ok: false, status: 503 } });
+  const d = await run(down.routes, { method: 'PUT', body: { tools: ['nc_notes_search'], mode: 'block' } }, '/api/connectors/nextcloud/policy');
+  assert.equal(d.status, 503);
+  assert.match(d.body.error, /could not be saved/);
+  const ok = harness({ state: { configured: true, state: 'connected' }, onPolicyChange: () => { cleared += 1; } });
+  await run(ok.routes, { method: 'PUT', body: { tools: ['nc_notes_search'], mode: 'block' } }, '/api/connectors/nextcloud/policy');
+  assert.equal(cleared, 1, '#796: a saved permission clears the cached permitted-tools view');
+});
+
+test('the Google Drive paths are not Node\'s any more: its writes are the front\'s and refused earlier, anything else is a 404', async () => {
+  const { routes, set } = harness({ state: { configured: true, state: 'connected' } });
+  for (const [method, p] of [['POST', '/api/connectors/gdrive/connect'], ['PUT', '/api/connectors/gdrive/policy'], ['GET', '/api/connectors/gdrive/connect'], ['POST', '/api/connectors/other']]) {
+    const res = await run(routes, { method, body: { tools: ['drive_create_file'], mode: 'block' } }, p);
+    assert.equal(res.status, 404, `${method} ${p}`);
+  }
+  assert.deepEqual(set, [], 'nothing was written');
+  assert.equal(await routes({ method: 'GET' }, {}, { path: '/api/other', authn: { user: { id: 'u1' } } }), false);
+  const res = {};
+  await routes({ method: 'GET' }, res, { path: '/api/connectors', authn: null });
+  assert.equal(res.status, 401);
 });
 
 test('without a Nextcloud MCP server the connector is not offered at all', async () => {
   const routes = createConnectorRoutes({
-    accounts: { forUser: () => ({ drive: { state: () => ({ configured: false, state: 'not-configured' }) }, backup: null }) },
-    driveTools: { names: new Set(), labels: {} }, policy: { mode: () => 'allow', set: () => {} }, offsite: { status: () => null },
+    accounts: { view: async () => DRIVE_VIEW }, policy: { mode: () => 'allow' }, toolPolicy: { set: async () => ({ ok: true }) },
     isWrite, json: (res, status, body) => { res.status = status; res.body = body; }, readBody: async () => ({}),
   });
   const res = await run(routes, { method: 'GET' }, '/api/connectors');
@@ -75,84 +109,14 @@ test('without a Nextcloud MCP server the connector is not offered at all', async
   assert.equal(denied.status, 404);
 });
 
-test('Drive connector reports four reads and three writes with the real classifier when omitted from operator boxes', async () => {
-  const accounts = { forUser: () => ({ drive: { state: () => ({ configured: true, state: 'connected' }) }, backup: null }) };
+test('the Drive tools are four reads and three writes with the real classifier, in the order and words the front lists', () => {
+  const accounts = { forUser: () => ({ drive: { state: () => ({ state: 'connected' }) }, backup: null }) };
   const driveTools = createDriveTools({ accounts });
   const toolbox = createToolboxes({ boxes: [driveTools.box], driveTools, offered: (id) => id !== 'gdrive' });
-  const saved = { drive_read_file: 'ask', drive_list_recent: 'block' };
-  const routes = createConnectorRoutes({
-    accounts, driveTools, offsite: { status: () => null }, isWrite: toolbox.isWriteTool,
-    policy: { mode: (_user, name, write) => write ? 'ask' : saved[name] || 'allow' },
-    json: (res, status, body) => { res.status = status; res.body = body; }, readBody: async () => ({}),
-  });
-  const res = await run(routes, { method: 'GET' }, '/api/connectors');
-  assert.equal(res.status, 200);
-  const tools = res.body.connectors[0].tools;
-  assert.deepEqual(tools.filter((t) => !t.write).map((t) => t.name),
-    ['drive_search_files', 'drive_read_file', 'drive_get_metadata', 'drive_list_recent']);
-  assert.deepEqual(tools.filter((t) => t.write).map((t) => t.name),
-    ['drive_create_file', 'drive_update_file', 'drive_trash_file']);
-  assert.equal(tools.find((t) => t.name === 'drive_search_files').mode, 'allow');
-  assert.equal(tools.find((t) => t.name === 'drive_read_file').mode, 'ask');
-  assert.equal(tools.find((t) => t.name === 'drive_list_recent').mode, 'block');
-  assert.equal(tools.find((t) => t.name === 'drive_trash_file').mode, 'ask');
-});
-
-test('#796: a saved tool permission clears the cached permitted-tools view; a refused one does not', async () => {
-  let cleared = 0;
-  const { routes } = harness({ state: { configured: true, state: 'connected', account: 'sam' }, onPolicyChange: () => { cleared += 1; } });
-  await run(routes, { method: 'PUT', body: { tools: ['nc_notes_search'], mode: 'block' } }, '/api/connectors/nextcloud/policy');
-  assert.equal(cleared, 1, 'the Nextcloud policy save clears it');
-  await run(routes, { method: 'PUT', body: { tools: ['drive_create_file'], mode: 'block' } }, '/api/connectors/gdrive/policy');
-  assert.equal(cleared, 2, 'the Drive policy save clears it');
-  await run(routes, { method: 'GET' }, '/api/connectors');
-  assert.equal(cleared, 2, 'reads leave it alone');
-  const refusing = createConnectorRoutes({
-    accounts: { forUser: () => ({ drive: { state: () => ({ configured: false, state: 'not-configured' }) }, backup: null }) },
-    driveTools: { names: new Set(['drive_create_file']), labels: {} }, offsite: { status: () => null }, isWrite,
-    policy: { mode: () => 'ask', set: () => { throw Object.assign(Error('no'), { status: 400 }); } },
-    onPolicyChange: () => { cleared += 1; }, json: (res, status, body) => { res.status = status; res.body = body; }, readBody: async (req) => req.body,
-  });
-  const refused = await run(refusing, { method: 'PUT', body: { tools: ['drive_create_file'], mode: 'allow' } }, '/api/connectors/gdrive/policy');
-  assert.equal(refused.status, 400);
-  assert.equal(cleared, 2, 'a refused save changed nothing, so nothing is cleared');
-});
-
-test('#831: Drive connect (and its later completion) and disconnect clear the cached permitted-tools view', async () => {
-  let cleared = 0, onConnected = null;
-  const drive = {
-    state: () => ({ configured: true, state: 'pending' }),
-    connect: async (cb) => { onConnected = cb; return { state: 'pending' }; },
-    disconnect: async () => ({ state: 'disconnected' }),
-  };
-  const { routes } = harness({ drive, onPolicyChange: () => { cleared += 1; } });
-  const res = await run(routes, { method: 'POST' }, '/api/connectors/gdrive/connect');
-  assert.equal(res.status, 200);
-  assert.equal(cleared, 1, 'starting the sign-in clears it');
-  await onConnected();
-  assert.equal(cleared, 2, 'so does the sign-in completing on Google\'s page');
-  await run(routes, { method: 'POST' }, '/api/connectors/gdrive/disconnect');
-  assert.equal(cleared, 3, 'disconnecting clears it');
-});
-
-test('#845: the backup administrator\'s Drive sign-in clears the permitted-tools view when it completes, not only on the start request', async () => {
-  let cleared = 0;
-  let finish;
-  const offsite = {
-    status: () => null,
-    // The real service hands its caller's hook to the Drive connection, which runs it once the sign-in is approved.
-    connectGoogle: (owner, onConnected) => { finish = onConnected; return { ok: true }; },
-  };
-  const routes = createConnectorRoutes({
-    accounts: { forUser: () => ({ drive: { state: () => ({ configured: true, state: 'connected' }) }, backup: true }) },
-    driveTools: { names: new Set(), labels: {} }, policy: { mode: () => 'ask', set() {} }, offsite, isWrite: () => false,
-    onPolicyChange: () => { cleared += 1; },
-    json: (res, status, body) => { res.status = status; res.body = body; }, readBody: async () => ({}),
-  });
-  const res = await run(routes, { method: 'POST' }, '/api/connectors/gdrive/connect');
-  assert.equal(res.status, 200);
-  const afterStart = cleared;
-  assert.equal(typeof finish, 'function', 'the route passes a completion hook to the backup connection');
-  finish();
-  assert.equal(cleared, afterStart + 1, 'completion clears the view');
+  const listed = [...driveTools.names].map((name) => ({ name, label: driveTools.labels[name], write: toolbox.isWriteTool(name) }));
+  // noevia-rs connector_routes.rs TOOLS and is_write are tested against this same file.
+  const shared = JSON.parse(require('node:fs').readFileSync(require('node:path').join(__dirname, '..', 'gdrive-tools-list.v1.json'), 'utf8'));
+  assert.deepEqual(listed, shared.tools);
+  assert.deepEqual(listed.filter((t) => !t.write).map((t) => t.name), ['drive_search_files', 'drive_read_file', 'drive_get_metadata', 'drive_list_recent']);
+  assert.deepEqual(listed.filter((t) => t.write).map((t) => t.name), ['drive_create_file', 'drive_update_file', 'drive_trash_file']);
 });

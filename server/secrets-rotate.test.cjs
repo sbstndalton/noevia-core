@@ -165,6 +165,44 @@ test('M1: the front re-seals the provider files first, awaited, and this process
   assert.equal(failing.tables.shared_providers.failed, 1);
 });
 
+test('settings 7 x 6: resealProviders, then gdriveReseal, both awaited, before secrets.rotate; a provider failure stops everything', async (t) => {
+  const root = tmp(t);
+  const old = createSecretStore(root, noPrev);
+  const auth = createAuth({ dataDir: root, publicOrigin: 'https://noevia.example.test', secrets: old });
+  retire(root);
+  const secrets = createSecretStore(root, noPrev);
+  const calls = [];
+  const realRotate = secrets.rotate.bind(secrets);
+  secrets.rotate = (...a) => { calls.push('rotate'); return realRotate(...a); };
+  const slow = async (name, value) => { calls.push(`${name}-start`); await new Promise((r) => setTimeout(r, 15)); calls.push(`${name}-done`); return value; };
+  await runRotation({
+    secrets, db: auth.db, dataDir: root, audit: () => calls.push('audit'),
+    resealProviders: () => slow('providers', { tables: {}, failures: [] }),
+    gdriveReseal: () => slow('gdrive', { ok: true, counts: { current: 0, rotated: 0, empty: 0, failed: 0 } }),
+  });
+  assert.deepEqual(calls, ['providers-start', 'providers-done', 'gdrive-start', 'gdrive-done', 'rotate', 'audit']);
+
+  // A provider failure throws before the Drive re-seal is asked for, and before anything is rotated.
+  const after = [];
+  secrets.rotate = (...a) => { after.push('rotate'); return realRotate(...a); };
+  await assert.rejects(runRotation({
+    secrets, db: auth.db, dataDir: root,
+    resealProviders: async () => { after.push('providers'); throw new Error('credential store unavailable'); },
+    gdriveReseal: async () => { after.push('gdrive'); return { ok: true, counts: { current: 0, rotated: 0, empty: 0, failed: 0 } }; },
+  }), /credential store unavailable/);
+  assert.deepEqual(after, ['providers']);
+
+  // A Drive failure is soft: the rotation goes on and secrets.rotate still runs.
+  after.length = 0;
+  const soft = await runRotation({
+    secrets, db: auth.db, dataDir: root,
+    resealProviders: async () => ({ tables: {}, failures: [] }),
+    gdriveReseal: async () => { after.push('gdrive'); throw new Error('unreachable'); },
+  });
+  assert.deepEqual(after, ['gdrive', 'rotate']);
+  assert.equal(soft.totals.failed, 0);
+});
+
 test('M1: a rotation the front cannot take part in changes nothing else, and says so', async (t) => {
   const root = tmp(t);
   const old = createSecretStore(root, noPrev);
