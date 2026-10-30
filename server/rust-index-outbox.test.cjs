@@ -30,7 +30,7 @@ function front(dir) {
       .run(JSON.stringify(['index', project, f]), project, f, g); }),
     tombstone: (project, folder) => tx((db, g) => {
       db.prepare('INSERT INTO tombstones (project, generation, at) VALUES (?, ?, 1) ON CONFLICT(project) DO UPDATE SET generation = excluded.generation').run(project, g);
-      db.prepare("DELETE FROM jobs WHERE project = ? AND kind = 'index'").run(project);
+      db.prepare("DELETE FROM jobs WHERE project = ? AND kind IN ('index', 'unindex')").run(project);
       if (folder) db.prepare("INSERT INTO jobs (key, kind, project, file, payload, generation, created_at) VALUES (?, 'sweep', ?, NULL, ?, ?, 1)").run(JSON.stringify(['sweep', project]), project, JSON.stringify({ folder }), g);
     }),
     rows: () => { const db = new DatabaseSync(file); try { return db.prepare('SELECT key, kind, project, file, generation, state, attempts FROM jobs ORDER BY key').all().map((r) => ({ ...r })); } finally { db.close(); } },
@@ -139,10 +139,26 @@ test('the front\'s job kinds are never claimed, recovered or counted here (round
   assert.deepEqual(ran, [['index', 'p1']]);
 });
 
+test('an unindex job (a removed source file, round 3) is claimed and run here; a delete drops it', async (t) => {
+  const ran = [];
+  const w = world(t, async (job) => { ran.push([job.kind, job.project, job.file]); });
+  const outbox = w.make();
+  const unindex = (project, file) => { const db = new DatabaseSync(w.f1.file); db.prepare("UPDATE meta SET value = value + 1 WHERE key = 'generation'").run();
+    const g = Number(db.prepare("SELECT value FROM meta WHERE key = 'generation'").get().value);
+    db.prepare("INSERT INTO jobs (key, kind, project, file, payload, generation, created_at) VALUES (?, 'unindex', ?, ?, NULL, ?, 1)").run(JSON.stringify(['unindex', project, file]), project, file, g); db.close(); };
+  w.f1.index('p1', ['keep.md']);
+  unindex('p1', 'gone.md');
+  unindex('p2', 'x.md');
+  w.f1.tombstone('p2');
+  await outbox.drain('u1');
+  assert.deepEqual(ran.sort(), [['index', 'p1', 'keep.md'], ['unindex', 'p1', 'gone.md']]);
+  assert.deepEqual(w.f1.rows(), []);
+});
+
 test('rust-project-storage.cjs splits the kinds and owns no route', () => {
   const { OWNED_ROUTES, CORE_KINDS, FRONT_KINDS } = require('./rust-project-storage.cjs');
   assert.equal(OWNED_ROUTES.size, 0);
-  assert.deepEqual([...CORE_KINDS], ['index']);
+  assert.deepEqual([...CORE_KINDS], ['index', 'unindex']);
   assert.deepEqual([...FRONT_KINDS], ['sweep']);
   assert.ok(CORE_KINDS.every((k) => /^[a-z]+$/.test(k) && !FRONT_KINDS.includes(k)));
 });

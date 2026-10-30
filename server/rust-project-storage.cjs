@@ -18,7 +18,8 @@
 // projects.cjs keeps storeCreateFiles and project-sweep.cjs for the paths still here (conversation
 // import's createProject, the orphan attachments reaper's deleteProject).
 const OWNED_ROUTES = Object.freeze(new Set());
-const CORE_KINDS = Object.freeze(['index']);
+// `unindex` (round 3, rust-project-files.cjs): a removed source file's RAG rows.
+const CORE_KINDS = Object.freeze(['index', 'unindex']);
 const FRONT_KINDS = Object.freeze(['sweep']);
 
 module.exports = { OWNED_ROUTES, CORE_KINDS, FRONT_KINDS };

@@ -161,10 +161,13 @@ const createProject = async (name) => {
   return project;
 };
 
-test('#786: deleting a project file with a null body is a 400', async () => {
+// #786 (deleting a project file with a null body is a 400) moved with DELETE .../files to the Rust
+// front (#2191 round 3): noevia-rs tests/project_lifecycle.rs. Node refuses it before reading the body.
+test('#2191: Node refuses the project file delete before authentication', async () => {
   const project = await createProject('Synthetic hardening delete');
   const del = await request(`/api/projects/${project.id}/files`, { method: 'DELETE', headers: writeHeaders(), body: 'null' });
-  assert.equal(del.status, 400, del.text);
+  assert.equal(del.status, 503, del.text);
+  assert.equal(del.json.code, 'RUST_PROJECT_FILES_OWNED');
 });
 
 // #786 (a stored upload whose original is gone answers 404) moved with GET .../uploads/original to

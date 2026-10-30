@@ -621,7 +621,7 @@ const indexOutbox = require('./rust-index-outbox.cjs').createIndexOutbox({
     const user = authService.publicUser(authService.db.prepare('SELECT * FROM users WHERE id=?').get(userId));
     return requestScope.run({ workspace: workspaceStore.get(userId), authn: { user, legacy: false } }, fn);
   },
-  runJob: async (job) => {
+  runJob: async (job, userId) => {
     const workspace = currentWorkspace();
     if (job.kind === 'index') {
       // The project as the front saved it (re-read when projects.json changed), the file's text as it is now.
@@ -630,6 +630,16 @@ const indexOutbox = require('./rust-index-outbox.cjs').createIndexOutbox({
       const file = (project?.files || []).find((f) => f && f.name === job.file);
       if (!project || !file) return; // removed or replaced since: nothing left to index
       await indexSource(project, file);
+      return;
+    }
+    if (job.kind === 'unindex') {
+      // #2191 round 3 (rust-project-files.cjs): a source file the front removed. Its rows go unless a
+      // file of that name is listed again by now (#1919: a re-upload's fresh rows stay), or the project
+      // is gone (its delete removed the whole index; opening it here would make it again).
+      if (workspace.projectsFile) workspace.projectsFile.refresh(workspace.projects);
+      const project = getProject(job.project);
+      if (!project || (project.files || []).some((f) => f && f.name === job.file)) return;
+      rag.deleteProjectFile(job.project, job.file, userId);
       return;
     }
     throw new Error(`unknown outbox job kind ${job.kind}`);
@@ -1292,6 +1302,7 @@ async function handleRequestInner(req, res) {
   if (require('./rust-project-reads.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   // And a project's create and delete (#2191 round 2): POST /api/projects, DELETE /api/projects/{id}.
   if (require('./rust-project-lifecycle.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
+  if (require('./rust-project-files.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   await readyFeatures();
   const preAuth = requestAuth.authenticate(req);
   // accountRole: a device token acts as a member, but its account's workspace is the same one.
