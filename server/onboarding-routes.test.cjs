@@ -83,7 +83,8 @@ test('a member who has not finished onboarding gets no administrator or global m
     const method = url.endsWith('/logs') ? 'GET' : 'POST';
     assert.equal((await request(url, { method, headers: headers(member), body: method === 'POST' ? '{}' : '' })).status, 403, url);
   }
-  assert.equal((await request('/api/providers', { method: 'POST', headers: headers(member), body: JSON.stringify({ label: 'Forbidden shared', baseUrl: 'https://example.test', shared: true }) })).status, 403);
+  // Connecting a shared provider is the Rust front's (#2190 round 6; its 403 for a member is asserted in noevia-rs tests/providers.rs): Node refuses it.
+  assert.equal((await request('/api/providers', { method: 'POST', headers: headers(member), body: JSON.stringify({ label: 'Forbidden shared', baseUrl: 'https://example.test', shared: true }) })).status, 503);
 });
 test('a member\'s storage choice stays within the authenticated account', async () => {
   // Saving is the Rust front's (#2190 round 4), which saves for the session's account only (the body's

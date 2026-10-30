@@ -78,7 +78,8 @@ async function waitReady(base, child) {
 
 // GETs for client paths no scenario step reaches; {x} params are filled from the run. The Rust
 // front's permanent routes (sbstndalton/noevia#1071: sign-in and the account, usage, stats,
-// sampling, routing mode and default, ChatGPT status, storage metadata/list/read, export, and since
+// sampling, routing mode and default, ChatGPT status, the provider registry's list and writes since
+// #2190 round 6, storage metadata/list/read, export, and since
 // #2185 the Diary source, today, storage-import and workspace export/import) are not
 // Node's to record any more;
 // their exchanges stay in the noevia-rs corpus recorded at its contracts/http/core.ref.
@@ -91,7 +92,7 @@ const PROBES = [
   '/api/models/autotune', '/api/models/autotune/settings', '/api/models/autotune/untuned', '/api/models/calibration', '/api/models/capabilities', '/api/models/evidence',
   '/api/models/hardware', '/api/models/inference-budget', '/api/models/installed', '/api/plugins/directory',
   '/api/profile/diary-connectors', '/api/profile/sharing',
-  '/api/providers', '/api/providers/{providerId}/models', '/api/reasoning-settings',
+  '/api/providers/{providerId}/models', '/api/reasoning-settings',
   '/api/toolboxes', '/api/toolboxes/permitted',
   '/api/projects/{projectId}/browser', '/api/projects/{projectId}/code', '/api/projects/{projectId}/instruction-skills', '/api/projects/{projectId}/instruction-skills/manifests', '/api/projects/{projectId}/research',
 ];

@@ -123,18 +123,24 @@ test('getStorage warns with the user id, never the secret, when decryption fails
   assert.doesNotMatch(warned[0], /synthetic-secret|enc:v2/);
 });
 
-test('encrypt callers re-save plaintext, so repeated saves never double-encrypt', (t) => {
+test('encrypt callers re-save plaintext, so repeated saves never double-encrypt', async (t) => {
   const { root, secrets, auth, addUser, save } = authFixture(t);
   const { createWorkspaceStore } = require('./workspace.cjs');
   const WS_USER = '0b6c2d7e-1f4a-4c3b-9e8d-7a6b5c4d3e2f';
   const def = { id: 'default', label: 'Default', baseUrl: 'http://localhost', apiKey: '', shared: true };
-  const ws = createWorkspaceStore(root, def, secrets, { projectStore: createStubStore(root) }).get(WS_USER);
-  ws.providers.push({ id: 'p1', label: 'P', baseUrl: 'https://llm.example.test', apiKey: 'synthetic-key' });
-  ws.saveProviders(); ws.saveProviders();
-  const reloaded = createWorkspaceStore(root, def, secrets, { projectStore: createStubStore(root) }).get(WS_USER);
-  assert.equal(reloaded.providers.find((p) => p.id === 'p1').apiKey, 'synthetic-key');
-  reloaded.saveProviders();
-  assert.equal(createWorkspaceStore(root, def, secrets, { projectStore: createStubStore(root) }).get(WS_USER).providers.find((p) => p.id === 'p1').apiKey, 'synthetic-key');
+  const stub = createStubStore(root);
+  const ws = createWorkspaceStore(root, def, secrets, { projectStore: stub }).get(WS_USER);
+  // The front writes the rows; a plaintext key it never sealed is sealed by Node's one write, once.
+  const file = path.join(ws.dir, 'providers.json');
+  fs.writeFileSync(file, JSON.stringify({ providers: [{ id: 'p1', label: 'P', baseUrl: 'https://llm.example.test', apiKey: 'synthetic-key' }] }));
+  const fresh = () => createWorkspaceStore(root, def, secrets, { projectStore: stub }).get(WS_USER);
+  await fresh().sealLegacyProviders(); await fresh().sealLegacyProviders();
+  const sealedOnce = fs.readFileSync(file, 'utf8');
+  assert.match(sealedOnce, /enc:v1:/);
+  assert.equal(fresh().providers.find((p) => p.id === 'p1').apiKey, 'synthetic-key');
+  await fresh().sealLegacyProviders();
+  assert.equal(fs.readFileSync(file, 'utf8'), sealedOnce, 'a sealed key is never sealed again');
+  assert.equal(fresh().providers.find((p) => p.id === 'p1').apiKey, 'synthetic-key');
   addUser('u2');
   save('u2', { ...S3 });
   auth.getStorage('u2', true);

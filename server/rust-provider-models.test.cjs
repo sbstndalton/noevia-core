@@ -35,12 +35,7 @@ test('index.cjs refuses the route before authentication; the Node list and its c
   assert.doesNotMatch(routes, /modelLists|lastRefresh|providerModels|modelIdsFrom|\/v1\/models/);
   const { createProviderRoutes } = require('./routes/providers.cjs');
   const sent = [];
-  const routesFn = createProviderRoutes({
-    json: (_res, status, body) => { sent.push({ status, body }); }, readBody: async () => '', readJson: async () => ({}),
-    endpointApproved: () => true, PROVIDERS: [{ id: 'mine', baseUrl: 'https://x.invalid', apiKey: 'sk-synthetic' }], PROJECTS: [], DEFAULT_PROVIDER_ID: 'default',
-    modelManager: { enabled: false }, currentWorkspace: () => ({ removeProvider: () => false }), saveProjects: () => {},
-    registry: { saveProviders() {}, saveSharedProviders() {}, maskKey: () => null },
-  });
+  const routesFn = createProviderRoutes({ json: (_res, status, body) => { sent.push({ status, body }); } });
   return routesFn({ method: 'GET' }, {}, { path: '/api/providers/mine/models', authn: { user: { id: 'u', role: 'admin' } } }).then((handled) => {
     assert.equal(handled, true);
     assert.deepEqual(sent.pop(), { status: 503, body: owned.ROUTE_REFUSAL }, 'a bypass is refused, never fetched');

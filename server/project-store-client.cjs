@@ -29,7 +29,9 @@ const TIMEOUT_MS = 10000;
 // fetch the catalogue after a refresh (the broker's 15 s each).
 const CHATGPT_WAIT_MS = 45000;
 const REPLY_CAP = 2 * 32 * 1024 * 1024 + 64 * 1024;
-const FILES = new Set(['projects.json', 'free-chats.json']);
+// providers.json (sbstndalton/noevia#2190 round 6) is the account's private provider rows: the Rust
+// front's routes are its writer; Node saves only its seal-on-load migration here.
+const FILES = new Set(['projects.json', 'free-chats.json', 'providers.json']);
 
 /** Whether the environment hands over the Rust store (see the header): its port and secret. */
 function enabledFrom(env = process.env, warn = console.warn) {

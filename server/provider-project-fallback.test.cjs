@@ -10,15 +10,13 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const crypto = require('node:crypto');
-const { Readable } = require('node:stream');
 const { EventEmitter } = require('node:events');
 const { createProviderRegistry } = require('./providers.cjs');
-const { createProviderRoutes } = require('./routes/providers.cjs');
 const { createChatHandler } = require('./chat.cjs');
 const { createToolboxes } = require('./toolboxes.cjs');
 const { createToolExchange } = require('./tool-exchange.cjs');
 
-test('removing a provider lets the next manual chat use the loaded default model', async (t) => {
+test('after a provider is removed (and its projects cleared) the next manual chat uses the loaded default model', async (t) => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'noevia-provider-fallback-'));
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
   const providers = [
@@ -27,29 +25,13 @@ test('removing a provider lets the next manual chat use the loaded default model
   ];
   const project = { id: 'p1', name: 'Synthetic', routing: 'manual', provider: 'prov-cloud', model: 'cloud-only-model', files: [], toolboxes: [] };
   const projects = [project];
-  const workspace = {
-    userId: 'synthetic-user', dir, providers,
-    removeProvider(id) {
-      const index = providers.findIndex((provider) => provider.id === id);
-      if (index < 0) return false;
-      providers.splice(index, 1);
-      return true;
-    },
-    saveProviders() {}, saveShared() {},
-  };
-  const registry = createProviderRegistry({ currentWorkspace: () => workspace, PROVIDERS: providers, DEFAULT_PROVIDER_ID: 'default' });
-  const responses = [];
-  const route = createProviderRoutes({
-    json: (_res, status, body) => responses.push({ status, body }),
-    readBody: async () => '', readJson: async () => ({}), fetchJson: async () => { throw Error('unexpected probe'); }, endpointApproved: () => true,
-    PROVIDERS: providers, PROJECTS: projects, DEFAULT_PROVIDER_ID: 'default', modelManager: { enabled: true }, currentWorkspace: () => workspace,
-    saveProjects: () => {}, registry,
-  });
-  await route(Object.assign(Readable.from([]), { method: 'DELETE' }), {}, { path: '/api/providers/prov-cloud', authn: { user: { id: workspace.userId } } });
-  assert.deepEqual(responses, [{ status: 200, body: { ok: true } }]);
-  assert.equal(project.provider, undefined);
-  assert.equal(project.model, undefined);
-
+  const workspace = { userId: 'synthetic-user', dir, providers };
+  const registry = createProviderRegistry({ PROVIDERS: providers, DEFAULT_PROVIDER_ID: 'default' });
+  // The Rust front removes the row and clears the provider and model of the account's projects that
+  // used it (noevia-rs provider_routes.rs, tested there); the workspace re-reads both files.
+  providers.splice(1, 1);
+  delete project.provider;
+  delete project.model;
   const requestScope = { getStore: () => ({ workspace, authn: { user: { id: workspace.userId } } }), run: (_scope, fn) => fn() };
   const toolbox = createToolboxes({
     boxes: [], driveTools: { box: { id: 'gdrive', tools: [] }, connected: () => false, execute: async () => 'unused' }, offered: () => false,

@@ -479,8 +479,8 @@ const diaryFiles = {
 const PROJECTS = arrayProxy('projects');
 
 const PROVIDERS = arrayProxy('providers');
-// The provider registry: persistence, lookup, key masking and request headers (providers.cjs).
-const providerRegistry = require('./providers.cjs').createProviderRegistry({ currentWorkspace, PROVIDERS, DEFAULT_PROVIDER_ID });
+// The provider registry: lookup and request headers (providers.cjs). The files are the Rust front's.
+const providerRegistry = require('./providers.cjs').createProviderRegistry({ PROVIDERS, DEFAULT_PROVIDER_ID });
 const { getProvider, providerHeaders } = providerRegistry;
 
 const FREE_CHATS = arrayProxy('freeChats');
@@ -1129,11 +1129,11 @@ const projectRoutes = require('./routes/projects.cjs').createProjectRoutes({
   reasoningEffort, projectAppearance, diaryExtras, PROJECTS, DEFAULT_TOOLBOXES, sanitizeToolboxes, allToolboxes, getProvider, ensureRolesLoaded, servedCatalogue, DEFAULT_PROVIDER_ID, store: projectStore,
   onToolboxesChange: () => permittedToolsCache.clear(),
 });
-// The provider registry's routes: list, connect, test and remove (routes/providers.cjs), plus
-// Sign in with ChatGPT (chatgptOAuth, built beside mcpOAuth above) while features.chatgptOAuth is on.
+// What is left of the provider registry's mount (routes/providers.cjs): the registry itself is the
+// Rust front's (rust-providers.cjs), so this answers only the other methods on the Sign in with
+// ChatGPT paths (chatgptOAuth, built beside mcpOAuth above) and refuses a bypass.
 const providerRoutes = require('./routes/providers.cjs').createProviderRoutes({
-  json, readBody, readJson, endpointApproved, PROVIDERS, PROJECTS, DEFAULT_PROVIDER_ID, modelManager, currentWorkspace, saveProjects, registry: providerRegistry,
-  chatgptOAuth, chatgptEnabled: () => features.enabled('chatgptOAuth'),
+  json, chatgptOAuth, chatgptEnabled: () => features.enabled('chatgptOAuth'),
 });
 // Statistics, the auto-router roles, the model manager proxy and /api/models/* (routes/models.cjs).
 const modelRoutes = require('./routes/models.cjs').createModelRoutes({
@@ -1302,6 +1302,7 @@ async function handleRequestInner(req, res) {
   if (require('./rust-provider-test.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   if (require('./rust-chatgpt-oauth.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   if (require('./rust-provider-models.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
+  if (require('./rust-providers.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   if (require('./rust-vault-mirror-preferences.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   await readyFeatures();
   const preAuth = requestAuth.authenticate(req);

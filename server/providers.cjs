@@ -5,51 +5,23 @@
 //
 // The registry is the workspace's merged view (shared rows plus the user's
 // private ones); PROVIDERS is the request-scoped array index.cjs builds over
-// it. This module owns the two persistence paths, the lookup with its legacy
-// alias, key masking for the client, and the request headers a provider gets.
-
-// Keys shorter than this show no characters at all when masked (#1482).
-const MASK_MIN_LENGTH = 12;
+// it. This module owns the lookup with its legacy alias, key masking for the
+// client, and the request headers a provider gets. Both provider files are the
+// Rust front's to write (sbstndalton/noevia#2190 round 6, rust-providers.cjs):
+// the routes live there, with these definitions (validation, capabilities,
+// context window) ported to noevia-rs provider_routes.rs.
 
 /**
  * @param {object} deps
- * @param {() => object} deps.currentWorkspace
  * @param {object[]} deps.PROVIDERS   request-scoped view of the workspace's providers
  * @param {string} deps.DEFAULT_PROVIDER_ID
  */
-function createProviderRegistry({ currentWorkspace, PROVIDERS, DEFAULT_PROVIDER_ID }) {
-  // Syncs the private half of the registry from the current merged view and
-  // persists ONLY the user's private provider file. Shared rows are excluded:
-  // a per-user save must never rewrite shared-providers.json (checkpoint 1c —
-  // a stale snapshot could erase another admin's shared provider).
-  function saveProviders() {
-    const ws = currentWorkspace();
-    ws.privateProviders = Array.from(ws.providers).filter((p) => !p.shared && p.id !== DEFAULT_PROVIDER_ID);
-    ws.saveProviders();
-  }
-
-  // Admin path: persists the shared row `id` from the current merged view onto a fresh read
-  // of the shared file (#785), so a concurrent admin's shared change is never overwritten by
-  // this request's stale view. Private rows are synced in memory only, untouched on disk.
-  function saveSharedProviders(id) {
-    const ws = currentWorkspace();
-    ws.privateProviders = Array.from(ws.providers).filter((p) => !p.shared && p.id !== DEFAULT_PROVIDER_ID);
-    ws.saveShared(id);
-  }
-
+function createProviderRegistry({ PROVIDERS, DEFAULT_PROVIDER_ID }) {
   function getProvider(id) {
     const normalized = id === 'lemonade' ? DEFAULT_PROVIDER_ID : id;
     const row = PROVIDERS.find((pr) => pr.id === normalized) || PROVIDERS.find((pr) => pr.id === DEFAULT_PROVIDER_ID) || null;
     // Effective capabilities travel on the row the chat sees, so consumers read data only.
     return row ? { ...row, capabilities: effectiveCapabilities(row) } : null;
-  }
-
-  // What the client may show of a stored key (#1482): the last four characters and nothing else.
-  // No vendor prefix (it reveals the key family) and no leading characters. A key too short for
-  // its last four to be a small share of it shows only the placeholder, never any characters.
-  function maskKey(key) {
-    if (!key || key === 'local') return null;
-    return key.length >= MASK_MIN_LENGTH ? `…${key.slice(-4)}` : '••••';
   }
 
   function providerHeaders(provider, extra) {
@@ -58,22 +30,13 @@ function createProviderRegistry({ currentWorkspace, PROVIDERS, DEFAULT_PROVIDER_
     return h;
   }
 
-  return { saveProviders, saveSharedProviders, getProvider, maskKey, providerHeaders };
+  return { getProvider, providerHeaders };
 }
 
-// A provider's context window, as a person states it (#536): a whole number of tokens in
-// [CONTEXT_TOKENS_MIN, CONTEXT_TOKENS_MAX]. null, undefined or '' clear it (the chat falls back
-// to its default for that kind of provider). Anything else is an error, never silently clamped.
+// A provider's context window (#536): a whole number of tokens in [CONTEXT_TOKENS_MIN,
+// CONTEXT_TOKENS_MAX]. Stating it is the Rust front's (provider_routes.rs); the chat reads it.
 const CONTEXT_TOKENS_MIN = 2048;
 const CONTEXT_TOKENS_MAX = 2000000;
-function parseContextTokens(value) {
-  if (value === undefined || value === null || value === '') return { value: null };
-  const n = typeof value === 'string' && /^\s*\d+\s*$/.test(value) ? Number(value) : value;
-  if (typeof n !== 'number' || !Number.isInteger(n) || n < CONTEXT_TOKENS_MIN || n > CONTEXT_TOKENS_MAX) {
-    return { error: `contextTokens must be a whole number from ${CONTEXT_TOKENS_MIN} to ${CONTEXT_TOKENS_MAX}` };
-  }
-  return { value: n };
-}
 /** A stored contextTokens that is still in bounds, else null (hand-edited files included). */
 function validContextTokens(value) {
   return typeof value === 'number' && Number.isInteger(value) && value >= CONTEXT_TOKENS_MIN && value <= CONTEXT_TOKENS_MAX ? value : null;
@@ -160,4 +123,4 @@ function effectiveCapabilities(row) {
   return legacyPresetCapabilities(row?.baseUrl);
 }
 
-module.exports = { parseCapabilities, effectiveCapabilities, engineCapabilities, createProviderRegistry, parseContextTokens, validContextTokens, CONTEXT_TOKENS_MIN, CONTEXT_TOKENS_MAX };
+module.exports = { parseCapabilities, effectiveCapabilities, engineCapabilities, createProviderRegistry, validContextTokens, CONTEXT_TOKENS_MIN, CONTEXT_TOKENS_MAX };
