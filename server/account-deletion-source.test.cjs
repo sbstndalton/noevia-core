@@ -111,18 +111,18 @@ test('an active account still saves document originals, extraction and project m
   }
 });
 
-test('a detached source job cannot recreate its journal or extracted source after account deletion', async () => {
+test('a detached source operation cannot recreate its extracted source after account deletion', async () => {
   const f = fixture();
   const entered = deferred(), release = deferred(), completed = deferred();
   const original = documents.extractDocumentText;
   documents.extractDocumentText = async () => { entered.resolve(); await release.promise; return extracted; };
   try {
-    const jobs = require('./source-jobs.cjs');
-    await jobs.start(f.workspace, 'p1', async () => {
+    // #2191 round 6: the front owns the job; the operation this process runs for it is tracked here.
+    require('./source-work.cjs').track(f.workspace, 'p1', async () => {
       try { await documentSources.ingest(f.workspace, 'p1', 'background.pdf', Buffer.from('%PDF synthetic background'), null); }
       finally { completed.resolve(); }
       return { status: 200, body: { ok: true } };
-    });
+    }).catch(() => undefined);
     await entered.promise;
     assert.ok(fs.existsSync(documentSources.directory(f.workspace, 'p1')));
     f.workspaces.remove(DELETED_ID);

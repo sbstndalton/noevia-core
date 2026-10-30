@@ -289,8 +289,6 @@ function valid(file, text) {
 function createHandler(dataDir, token, writes = [], failures = [], { changes = false } = {}) {
   // Reuse the existing test-only source journal stand-in across HTTP calls. Production
   // clients still have no Node journal fallback; Rust tests cover the actual store.
-  const sourceOps = new Set(['recover', 'start', 'abandon', 'progress', 'finish', 'read']);
-  const sourceClients = new Map();
   // Test-only transport stand-in for unrelated index fixtures. It never claims
   // native cleanup/lease/ownership qualification; real Rust two-process tests do.
   const contextIncarnation=crypto.randomBytes(16).toString('hex');
@@ -312,8 +310,7 @@ function createHandler(dataDir, token, writes = [], failures = [], { changes = f
     req.on('data', (c) => chunks.push(c));
     req.on('end', async () => {
       try {
-        const sourceOp = req.url.startsWith('/v1/source-jobs/') ? req.url.slice('/v1/source-jobs/'.length) : null;
-        if (req.method !== 'POST' || !(['/v1/read', '/v1/write','/v1/features/context'].includes(req.url) || HISTORY_OPS.has(req.url) || sourceOps.has(sourceOp))) return send(res, 404, { error: 'not found' });
+        if (req.method !== 'POST' || !(['/v1/read', '/v1/write','/v1/features/context'].includes(req.url) || HISTORY_OPS.has(req.url))) return send(res, 404, { error: 'not found' });
         if (req.url === '/v1/changes/read' && !changes) return send(res, 404, { error: 'not found' });
         if (req.headers['x-noevia-store-token'] !== token) return send(res, 401, { error: 'unauthorised' });
         const planned = failures.find((f) => f.url === req.url && f.times > 0);
@@ -322,33 +319,10 @@ function createHandler(dataDir, token, writes = [], failures = [], { changes = f
         try { body = JSON.parse(Buffer.concat(chunks).toString('utf8')); } catch { return send(res, 400, { error: 'invalid JSON' }); }
         if(req.url==='/v1/features/context')return send(res,200,contextReply(body));
         if (!body || typeof body.user !== 'string') return send(res, 400, { error: 'user required' });
-        if (!sourceOps.has(sourceOp) && !HISTORY_OPS.has(req.url) && !FILES.has(body.file)) return send(res, 400, { error: 'file must be projects.json or free-chats.json' });
+        if (!HISTORY_OPS.has(req.url) && !FILES.has(body.file)) return send(res, 400, { error: 'file must be projects.json or free-chats.json' });
         if (!USER.test(body.user)) return send(res, 400, { error: 'invalid user' });
         const dir = path.join(dataDir, 'users', body.user);
         if (!fs.existsSync(dir)) return send(res, 410, { error: 'account no longer exists' });
-        if (sourceOps.has(sourceOp)) {
-          if (!sourceClients.has(body.user)) sourceClients.set(body.user,
-            require("./project-store-stub.cjs").createStubStore(dataDir).sourceJobsFor(body.user));
-          const jobs = sourceClients.get(body.user);
-          const owner = { start: body.start, born: body.born, owner: body.owner };
-          try {
-            let answer;
-            switch (sourceOp) {
-              case "recover": answer = await jobs.recover(owner); break;
-              case "start": answer = await jobs.start(owner, body.projectId, body.request); break;
-              case "abandon": answer = await jobs.abandon(owner, body.request); break;
-              case "progress": answer = await jobs.progress(owner, body.id, body.run, body.stage, body.n); break;
-              case "finish": answer = await jobs.finish(owner, body.id, body.run, body.ok, body.result, body.error); break;
-              case "read":
-                answer = await jobs.read(body.projectId, body.id);
-                if (!answer) return send(res, 404, { error: "source job or project not found" });
-                break;
-            }
-            return send(res, 200, answer);
-          } catch (error) {
-            return send(res, error.status || 500, { error: error.message });
-          }
-        }
         if (HISTORY_OPS.has(req.url)) {
           const [status, answer] = historyOp(req.url, body, dir);
           return send(res, status, answer);

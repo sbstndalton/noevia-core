@@ -144,47 +144,67 @@ test('document originals and pages are inaccessible to another authenticated use
 });
 
 
-test('background upload survives a short response and polling remains authenticated and project scoped', async () => {
+// #2191 round 6: the background start and its poll are the Rust front's (rust-source-jobs.cjs; noevia-rs
+// tests/source_jobs.rs runs the job against a synthetic worker). This process answers the front's worker
+// call: the synchronous route with X-Noevia-Source-Work: 1, as NDJSON progress and a final result.
+const work = (url, body) => post(url, body, { ...mutationHeaders(), 'x-noevia-source-work': '1' });
+const lines = (text) => text.trim().split('\n').map((l) => JSON.parse(l));
+
+test('a background start and its poll reaching Node are refused before authentication', async () => {
   const p = await project('Background synthetic upload');
-  const other = await project('Other background project');
-  const up = await post(`/api/projects/${p.id}/upload?background=1`, { name: 'statement.pdf', dataBase64: fixture('text.pdf').toString('base64') });
-  assert.equal(up.status, 202);
-  const { poll } = JSON.parse(up.text);
-  assert.equal((await request(poll)).status, 401);
-  assert.equal((await request(poll.replace(p.id, other.id), { headers: { cookie } })).status, 404);
-  let job;
-  for (let i = 0; i < 100; i++) {
-    job = JSON.parse((await request(poll, { headers: { cookie } })).text);
-    if (job.done) break;
-    await new Promise(resolve => setTimeout(resolve, 10));
+  for (const url of [`/api/projects/${p.id}/upload?background=1`, `/api/projects/${p.id}/sources/sync?background=1`]) {
+    const up = await request(url, { method: 'POST', body: '{}' });
+    assert.equal(up.status, 503, url);
+    assert.equal(JSON.parse(up.text).code, 'RUST_SOURCE_JOBS_OWNED');
   }
-  assert.equal(job.done, true); assert.equal(job.status, 200, JSON.stringify(job));
-  assert.equal(job.body.document.state, 'ready');
-  assert.deepEqual(stored.documentOriginal(testDataDir, p.id, 'statement.pdf').bytes, fixture('text.pdf'));
+  const poll = await request(`/api/projects/${p.id}/source-jobs/11111111-1111-4111-8111-111111111111`);
+  assert.equal(poll.status, 503);
+  assert.equal(JSON.parse(poll.text).code, 'RUST_SOURCE_JOBS_OWNED');
 });
 
-test('a chat turn sent right after a 202 background upload waits for that upload to finish (#1441)', async () => {
+test('the front\'s worker call streams accepted, progress and the synchronous result; the worker call stays authenticated', async () => {
+  const p = await project('Worker synthetic upload');
+  const anonymous = await request(`/api/projects/${p.id}/upload`, { method: 'POST', headers: { 'x-noevia-source-work': '1' }, body: '{}' });
+  assert.equal(anonymous.status, 401);
+  const up = await work(`/api/projects/${p.id}/upload`, { name: 'statement.pdf', dataBase64: fixture('text.pdf').toString('base64') });
+  assert.equal(up.status, 200);
+  assert.equal(up.headers['Content-Type'], 'application/x-ndjson');
+  const out = lines(up.text);
+  assert.deepEqual(out[0], { accepted: true });
+  const done = out.at(-1).done;
+  assert.equal(done.status, 200, JSON.stringify(out));
+  assert.equal(done.body.document.state, 'ready');
+  assert.ok(out.slice(1, -1).every((l) => typeof l.stage === 'string'));
+  assert.deepEqual(stored.documentOriginal(testDataDir, p.id, 'statement.pdf').bytes, fixture('text.pdf'));
+  // A refusal before the work is taken is a plain JSON answer the front passes on.
+  const ghost = await work('/api/projects/ghost-project/upload', { name: 'x.txt' });
+  assert.equal(ghost.status, 404);
+  assert.deepEqual(JSON.parse(ghost.text), { error: 'project not found' });
+  const broken = await request(`/api/projects/${p.id}/upload`, { method: 'POST', headers: { ...mutationHeaders(), 'x-noevia-source-work': '1' }, body: '{broken' });
+  assert.equal(broken.status, 400);
+  assert.deepEqual(JSON.parse(broken.text), { error: 'invalid JSON' });
+});
+
+test('a chat turn sent while the front\'s upload worker call runs waits for that upload to finish (#1441)', async () => {
   const p = await project('Race synthetic upload');
-  const up = await post(`/api/projects/${p.id}/upload?background=1`, { name: 'statement.pdf', dataBase64: fixture('text.pdf').toString('base64') });
-  assert.equal(up.status, 202);
-  const { poll } = JSON.parse(up.text);
+  let finished = false;
+  const running = work(`/api/projects/${p.id}/upload`, { name: 'statement.pdf', dataBase64: fixture('text.pdf').toString('base64') }).then((r) => { finished = true; return r; });
+  await new Promise((r) => setImmediate(r));
   // The turn itself may be refused later (no model is served in this test); what matters is that it
-  // was not built until the file job had finished, so the first poll afterwards is already done.
+  // was not built until the file operation had finished.
   await post('/api/chat', { spaceId: 'project', projectId: p.id, message: 'Summarize this file in one sentence.', history: [] });
-  const job = JSON.parse((await request(poll, { headers: { cookie } })).text);
-  assert.equal(job.done, true, 'the turn was prepared before the attached file was ingested');
-  assert.equal(job.status, 200, JSON.stringify(job));
+  const up = await running;
+  assert.equal(finished, true, 'the turn was prepared before the attached file was ingested');
+  assert.equal(lines(up.text).at(-1).done.status, 200);
 });
 
 test('unified uploads accept DOCX, preserve opaque bytes, protect metadata and expose authenticated downloads', async () => {
   const p = await project('Opaque synthetic uploads');
   // Larger than the old background wrapper's accidental 1 MB limit.
   const bytes = Buffer.alloc(2 * 1024 * 1024, 65); bytes.set([0x50,0x4b,3,4]);
-  const up = await post(`/api/projects/${p.id}/upload?background=1`, { organized: true, name: 'fixture.docx', dataBase64: bytes.toString('base64') });
-  assert.equal(up.status, 202);
-  const poll = JSON.parse(up.text).poll;
-  let job;
-  for (let i=0;i<100;i++) { job=JSON.parse((await request(poll,{headers:{cookie}})).text); if(job.done) break; await new Promise(r=>setTimeout(r,10)); }
+  const up = await work(`/api/projects/${p.id}/upload`, { organized: true, name: 'fixture.docx', dataBase64: bytes.toString('base64') });
+  assert.equal(up.status, 200);
+  const job = lines(up.text).at(-1).done;
   assert.equal(job.status,200,JSON.stringify(job)); assert.equal(job.body.attachment.state,'stored');
   // #2191: the download is the Rust front's (Node refuses it; noevia-rs tests/project_reads.rs covers
   // its scope, headers and traversal refusals); the stored original is what it serves.

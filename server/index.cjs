@@ -1290,6 +1290,8 @@ async function handleRequestInner(req, res) {
   if (require('./rust-conversation-import.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   // And a project document's upload, on the front's Docling pipeline (#2191 round 5).
   if (require('./rust-project-documents.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
+  // And the background source jobs, whose store the front owns (#2191 round 6).
+  if (require('./rust-source-jobs.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   await readyFeatures();
   const preAuth = requestAuth.authenticate(req);
   // accountRole: a device token acts as a member, but its account's workspace is the same one.

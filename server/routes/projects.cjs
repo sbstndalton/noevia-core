@@ -157,29 +157,45 @@ function createProjectRoutes({
   };
 
   async function handle(req, res, { path: p, authn, url }) {
-    // Opt-in asynchronous source processing; the synchronous API remains compatible.
-    const sourceJob = p.match(/^\/api\/projects\/([^/]+)\/source-jobs\/([^/]+)$/);
-    if (sourceJob && req.method === 'GET') {
-      const projectId = decodeURIComponent(sourceJob[1]);
+    // #2191 round 6 (rust-source-jobs.cjs): the asynchronous source routes (`?background=1` and
+    // GET .../source-jobs/{jobId}) are the Rust front's, which owns the source-job store. It runs
+    // the operation here by sending the synchronous route with `X-Noevia-Source-Work: 1`; the
+    // answer is NDJSON: `{"accepted":true}` once the request is taken (a refusal before that is a
+    // plain JSON answer, which the front passes on and starts no work for), one `{"stage":...}`
+    // per progress step, then `{"done":{status,body}}` or `{"failed":{status}}`.
+    const sourceWork = p.match(/^\/api\/projects\/([^/]+)\/(upload|sources\/sync)$/);
+    if (sourceWork && req.method === 'POST' && req.headers?.['x-noevia-source-work'] === '1') {
+      const projectId = decodeURIComponent(sourceWork[1]);
       if (!getProject(projectId)) return json(res, 404, { error: 'project not found' });
-      const job = await require('../source-jobs.cjs').read(currentWorkspace(), projectId, sourceJob[2]);
-      return json(res, job ? 200 : 404, job || { error: 'Processing status expired or the server restarted; refresh or re-upload to retry.' });
-    }
-    const backgroundSource = p.match(/^\/api\/projects\/([^/]+)\/(upload|sources\/sync)$/);
-    if (backgroundSource && req.method === 'POST' && url.searchParams.get('background') === '1') {
-      const projectId = decodeURIComponent(backgroundSource[1]);
-      if (!getProject(projectId)) return json(res, 404, { error: 'project not found' });
-      const hold = backgroundSource[2] === 'sources/sync' ? automaticHold(authn, req) : null;
+      const hold = sourceWork[2] === 'sources/sync' ? automaticHold(authn, req) : null;
       if (hold) return holdReply(res, hold);
-      const body = await readJson(req, Math.ceil((backgroundSource[2] === 'upload' ? require('../pdf-reduce.cjs').INPUT_CAP : DOCUMENT_UPLOAD_CAP) / 3) * 4 + 512 * 1024);
-      const jobId = await require('../source-jobs.cjs').start(currentWorkspace(), projectId, async (progress) => {
+      const body = await readJson(req, Math.ceil((sourceWork[2] === 'upload' ? require('../pdf-reduce.cjs').INPUT_CAP : DOCUMENT_UPLOAD_CAP) / 3) * 4 + 512 * 1024);
+      res.writeHead(200, { 'Content-Type': 'application/x-ndjson', 'Cache-Control': 'no-store' });
+      const line = (value) => { if (!res.destroyed && !res.writableEnded) res.write(`${JSON.stringify(value)}\n`); };
+      line({ accepted: true });
+      const headers = { ...req.headers };
+      delete headers['x-noevia-source-work'];
+      const operation = async () => {
         const inner = require('node:stream').Readable.from([Buffer.from(JSON.stringify(body))]);
-        Object.assign(inner, { method: req.method, url: p, headers: req.headers, socket: req.socket });
+        Object.assign(inner, { method: req.method, url: p, headers, socket: req.socket });
         let status = 500, data = '';
+        const progress = (stage) => line({ stage: String(stage) });
         await requestScope.run({ ...requestScope.getStore(), sourceProgress: progress }, () => dispatch(inner, { setHeader() {}, writeHead(code) { status = code; }, end(value) { data = String(value || '{}'); } }));
+        // The result is final only once the list change it made is on disk: the front persists it
+        // and the client reads the workspace next (the old background job could report done first).
+        // A save that failed throws, as the synchronous answer would have been that failure.
+        await whenSaved(() => undefined);
         return { status, body: JSON.parse(data) };
-      }, { name: backgroundSource[2] === 'sources/sync' ? null : String(body?.name || '').split('/').pop() });
-      return json(res, 202, { poll: `/api/projects/${encodeURIComponent(projectId)}/source-jobs/${jobId}` });
+      };
+      try {
+        const done = await require('../source-work.cjs').track(currentWorkspace(), projectId, operation,
+          { name: sourceWork[2] === 'sources/sync' ? null : String(body?.name || '').split('/').pop() });
+        line({ done });
+      } catch (err) {
+        line({ failed: { status: err?.status || 500 } });
+      }
+      if (!res.destroyed && !res.writableEnded) res.end();
+      return;
     }
 
     if (p === '/api/diary/context' && ['GET', 'POST'].includes(req.method)) {
