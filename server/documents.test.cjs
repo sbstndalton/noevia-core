@@ -223,20 +223,13 @@ test('concurrent source operations serialize so a stale refresh cannot overwrite
   } finally { documentSources.ingest = ingest; }
 });
 
-test('file deletion waits for refresh and removes the source and cached original', async () => {
+// #2191 round 3: DELETE /api/projects/{id}/files is the Rust front's (rust-project-files.cjs refuses
+// it before auth; noevia-rs crates/server-projects files.rs prunes the source, original and images).
+test('file deletion is no longer answered by the Node projects routes', async () => {
   const h = harness(true);
   await h.upload('a.pdf', fixture('text.pdf'));
-  const ingest = documentSources.ingest;
-  let release; const wait = new Promise(resolve => { release = resolve; });
-  let entered; const started = new Promise(resolve => { entered = resolve; });
-  documentSources.ingest = async (...args) => { entered(); await wait; return ingest(...args); };
-  try {
-    const refresh = h.sync(); await started;
-    const remove = h.remove('fixture/a.pdf');
-    release(); await Promise.all([refresh, remove]);
-    assert.equal(h.project.files.length, 0); assert.equal(h.stored.size, 0);
-    assert.equal(fs.readdirSync(documentSources.directory(h.workspace, h.project.id)).length, 0);
-  } finally { documentSources.ingest = ingest; }
+  assert.equal(await h.remove('fixture/a.pdf'), undefined);
+  assert.equal(h.project.files.length, 1); assert.equal(h.stored.size, 1);
 });
 
 
@@ -252,9 +245,6 @@ test('organized remote refresh preserves opaque files and images, and exact mana
   assert.equal(h.project.files.length, 3);
   assert.equal(h.project.files.find(f => f.name.endsWith('.docx')).attachment.state, 'stored');
   assert.equal(h.project.assets.length, 1);
-  const image = h.project.files.find(f => f.name.endsWith('.png'));
-  assert.equal((await h.remove(image.name)).status, 200);
-  assert.equal(h.project.assets.length, 0);
 });
 
 
