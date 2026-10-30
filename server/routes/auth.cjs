@@ -30,7 +30,7 @@ const PASS = Symbol('unhandled');
  * @param {{ forgetUser: (userId:string) => void }} [deps.mcpOAuth]      OAuth sign-ins, keyed per (user, server)
  * @param {{ forgetUser: (userId:string) => void }} [deps.directoryMcp]  directory server keys, keyed per (user, server)
  * @param {{ forgetUser: (userId:string) => Promise<void> }} [deps.chatgptOAuth]  Sign in with ChatGPT tokens (the Rust broker's), keyed per user
- * @param {(actorId:string) => object} [deps.rotateSecrets]  re-encrypts stored credentials under the current key
+ * @param {(actorId:string) => object|Promise<object>} [deps.rotateSecrets]  re-encrypts stored credentials under the current key
  */
 function createAuthRoutes({ json, readJson: readAnyJson, authService, workspaceStore, driveAccounts, fetchJson, DIARY_BASE, DIARY_TOKEN, diaryTenantHeaders = null, mcpOAuth, directoryMcp, chatgptOAuth = null, rotateSecrets }) {
   // Every body these routes read is a JSON object; `null`, an array or a number is a 400 (#786).

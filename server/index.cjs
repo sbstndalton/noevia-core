@@ -475,8 +475,8 @@ const diaryFiles = {
 const PROJECTS = arrayProxy('projects');
 
 const PROVIDERS = arrayProxy('providers');
-// The provider registry: persistence, lookup, key masking and request headers (providers.cjs).
-const providerRegistry = require('./providers.cjs').createProviderRegistry({ currentWorkspace, PROVIDERS, DEFAULT_PROVIDER_ID });
+// The provider registry: lookup and request headers (providers.cjs). The files are the Rust front's.
+const providerRegistry = require('./providers.cjs').createProviderRegistry({ PROVIDERS, DEFAULT_PROVIDER_ID });
 const { getProvider, providerHeaders } = providerRegistry;
 
 const FREE_CHATS = arrayProxy('freeChats');
@@ -1120,22 +1120,22 @@ const chatRoutes = require('./routes/chat.cjs').createChatRoutes({
   },
 });
 
-// Projects, sources and uploads (routes/projects.cjs). Background source jobs re-enter the router.
-// #1429: one latch per process, shared by the project source refresh and the Diary backup worker.
+// Project configuration and the Diary context (routes/projects.cjs); uploads, documents and the folder sync are the front's (#2191).
+// #1429: one hold per account, shared with the front's project source refresh and this process's Diary backup worker.
 // sbstndalton/noevia#2190: the Rust front's folder write and connection test prove a saved login
 // through storage-login-proofs.json, re-read when it changes.
-const storageLatch = require('./storage-latch.cjs').createStorageLatch({ proofOf: require('./rust-storage-integrations.cjs').createProofReader(DATA_DIR) });
+// #2191 round 8: the hold is UI_DATA_DIR/storage-latch.db, shared with the front's project source sync.
+const storageLatch = require('./storage-latch.cjs').createStorageLatch({ file: require('node:path').join(DATA_DIR, 'storage-latch.db'), proofOf: require('./rust-storage-integrations.cjs').createProofReader(DATA_DIR) });
 const projectRoutes = require('./routes/projects.cjs').createProjectRoutes({
-  storageLatch,
   json, readBody, readJson, requestScope, dispatch: (req, res) => handleRequestScoped(req, res), currentWorkspace, authService, storageClient, documents, documentSources, rag, fs, path,
   reasoningEffort, projectAppearance, diaryExtras, PROJECTS, DEFAULT_TOOLBOXES, sanitizeToolboxes, allToolboxes, getProvider, ensureRolesLoaded, servedCatalogue, DEFAULT_PROVIDER_ID, store: projectStore,
   onToolboxesChange: () => permittedToolsCache.clear(),
 });
-// The provider registry's routes: list, connect, test and remove (routes/providers.cjs), plus
-// Sign in with ChatGPT (chatgptOAuth, built beside mcpOAuth above) while features.chatgptOAuth is on.
+// What is left of the provider registry's mount (routes/providers.cjs): the registry itself is the
+// Rust front's (rust-providers.cjs), so this answers only the other methods on the Sign in with
+// ChatGPT paths (chatgptOAuth, built beside mcpOAuth above) and refuses a bypass.
 const providerRoutes = require('./routes/providers.cjs').createProviderRoutes({
-  json, readBody, readJson, endpointApproved, PROVIDERS, PROJECTS, DEFAULT_PROVIDER_ID, modelManager, currentWorkspace, saveProjects, registry: providerRegistry,
-  chatgptOAuth, chatgptEnabled: () => features.enabled('chatgptOAuth'),
+  json, chatgptOAuth, chatgptEnabled: () => features.enabled('chatgptOAuth'),
 });
 // Statistics, the auto-router roles, the model manager proxy and /api/models/* (routes/models.cjs).
 const modelRoutes = require('./routes/models.cjs').createModelRoutes({
@@ -1175,7 +1175,9 @@ const authRoutes = require('./routes/auth.cjs').createAuthRoutes({
   json, readJson, authService, workspaceStore, driveAccounts, fetchJson, DIARY_BASE, DIARY_TOKEN, diaryTenantHeaders: diary.tenantHeaders,
   mcpOAuth, directoryMcp, chatgptOAuth,
   // POST /api/admin/secrets/rotate (CSRF-checked by the router like every signed-in POST).
-  rotateSecrets: (actorId) => require('./secrets-rotate.cjs').runRotation({ secrets: secretStore, db: authService.db, dataDir: DATA_DIR, audit: authService.audit, actorId, gdriveReseal: () => PROJECT_STORE.gdriveReseal() }),
+  // The provider files and the Google Drive token files are the front's: it re-seals both first, awaited
+  // (providers: a throw stops the rotation; Drive: soft), before the rest is rotated here.
+  rotateSecrets: (actorId) => require('./secrets-rotate.cjs').runRotation({ secrets: secretStore, db: authService.db, dataDir: DATA_DIR, audit: authService.audit, actorId, resealProviders: () => require('./rust-providers-reseal.cjs').resealProviderKeys(PROJECT_STORE), gdriveReseal: () => PROJECT_STORE.gdriveReseal() }),
 });
 // The user's own storage connection is the Rust front's in full (reading, browsing, the folder write,
 // the test, the Nextcloud sign-in and the save, #1071/sbstndalton/noevia#2190): routes/storage.cjs
@@ -1293,6 +1295,8 @@ async function handleRequestInner(req, res) {
   if (require('./rust-project-documents.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   // And the background source jobs, whose store the front owns (#2191 round 6).
   if (require('./rust-source-jobs.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
+  // And the project source operations themselves: the upload, the folder sync and the folder import's plan (#2191 round 8).
+  if (require('./rust-project-source-work.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   // And the two read-only sizing reads (#2189): GET /api/models/estimate and /api/models/preset/suggest.
   if (require('./rust-model-sizing.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   // #2190: the public pages and the device approval page, and the plugin directory.
@@ -1304,6 +1308,7 @@ async function handleRequestInner(req, res) {
   if (require('./rust-provider-test.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   if (require('./rust-chatgpt-oauth.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   if (require('./rust-provider-models.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
+  if (require('./rust-providers.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   if (require('./rust-vault-mirror-preferences.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   if (require('./rust-google-drive.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   if (require('./rust-offsite-backup.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;

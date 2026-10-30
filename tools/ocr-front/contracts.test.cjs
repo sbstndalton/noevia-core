@@ -2,12 +2,13 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const { requireScan } = require('./contracts.cjs');
-const upload = { document: { state: 'ready', pageStatus: [{ number: 1, status: 'ocr' }] } };
+const upload = { document: { state: 'ready', pageStatus: [{ number: 1, status: 'ocr', retry: { outcome: 'recovered' } }] } };
 const text = '[OCR transcription — verify numbers against original]\nREF-2042\n2042-01-02 UTILITIES 42.15\n2042-01-03 REFUND -7.20\nTOTAL 34.95';
 test('scan oracle requires OCR status and exact synthetic rows', () => {
   requireScan(upload, { text });
   assert.throws(() => requireScan({ document: { state: 'failed' } }, {}), /native OCR must make/);
   assert.throws(() => requireScan({ document: { state: 'ready', pageStatus: [{ number: 1, status: 'native' }] } }, { text }), /scan must be labelled OCR/);
+  assert.throws(() => requireScan({ document: { state: 'ready', pageStatus: [{ number: 1, status: 'ocr', retry: { outcome: 'failed' } }] } }, { text }), /scan must be labelled OCR/);
   assert.throws(() => requireScan(upload, { text: text.replace('34.95', '34.96') }), /native OCR must recover synthetic row: TOTAL 34.95/);
   assert.throws(() => requireScan(upload, { text: '' }), /native OCR must recover/);
 });
@@ -64,4 +65,16 @@ test('download hash, version, PDF signature, cap and exact extracted text are ma
   assert.throws(() => validate(text), /exact synthetic text/);
   const pages = reducedFixture(); pages.extracted.pages = 2;
   assert.throws(() => validate(pages), /preserve the synthetic page/);
+});
+
+const fs = require('node:fs');
+const path = require('node:path');
+const { sourceWorkDenials } = require('./contracts.cjs');
+test('a second person is refused the upload, the sync and the folder-import plan, and the harness makes all three calls', () => {
+  const calls = sourceWorkDenials('/api/projects/p1', { name: 'a.pdf' });
+  assert.deepEqual(calls.map(([method, route]) => `${method} ${route}`), [
+    'POST /api/projects/p1/upload', 'POST /api/projects/p1/sources/sync', 'POST /api/projects/p1/folder-import/plan']);
+  const run = fs.readFileSync(path.join(__dirname, 'run.cjs'), 'utf8');
+  // The member's calls go through the list, each expecting a 404 (README: tenant refusals precede the worker).
+  assert.match(run, /for \(const \[method, denied, body\] of sourceWorkDenials\([^\n]*member\.call\(method, denied, body, 404\)/);
 });

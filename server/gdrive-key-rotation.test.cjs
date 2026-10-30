@@ -18,6 +18,8 @@ test.after(() => { for (const d of temps) fs.rmSync(d, { recursive: true, force:
 
 const noPrev = { env: {} };
 const member = { id: 'u-member' }, other = { id: 'u-other' };
+// The provider files are the Rust front's (rust-providers-reseal.cjs): no front, no provider rows here.
+const noProviders = async () => ({ tables: {}, failures: [] });
 // No database tables here: rotationTables skips tables that do not exist.
 const noDb = { prepare: () => ({ get: () => undefined, all: () => [] }) };
 const retire = (dir) => fs.renameSync(path.join(dir, 'secrets.key'), path.join(dir, 'secrets.key.previous'));
@@ -61,7 +63,7 @@ test('the rotation has the front re-seal every member file so the previous key c
   const { dir, fresh, files } = connectedBeforeRotation();
   assert.equal(fresh.hasPreviousKey(), true);
   assert.equal(opens(path.join(files, `${member.id}.sealed`), fresh.derive('google-drive-user')), null, 'not yet readable with the new key alone');
-  const report = await runRotation({ secrets: fresh, db: noDb, dataDir: dir, gdriveReseal: frontReseal(dir, fresh) });
+  const report = await runRotation({ resealProviders: noProviders, secrets: fresh, db: noDb, dataDir: dir, gdriveReseal: frontReseal(dir, fresh) });
   assert.deepEqual(report.tables.google_drive_users, { current: 0, rotated: 2, upgraded: 0, empty: 0, failed: 0 });
   assert.equal(report.totals.failed, 0);
   assert.ok(!JSON.stringify(report).includes('synthetic-refresh'), 'the report never carries a token');
@@ -71,7 +73,7 @@ test('the rotation has the front re-seal every member file so the previous key c
   assert.equal(only.hasPreviousKey(), false);
   for (const user of [member, other]) assert.deepEqual(opens(path.join(files, `${user.id}.sealed`), only.derive('google-drive-user')), record(user));
   // Idempotent: a second run finds everything current.
-  const again = await runRotation({ secrets: only, db: noDb, dataDir: dir, gdriveReseal: frontReseal(dir, only) });
+  const again = await runRotation({ resealProviders: noProviders, secrets: only, db: noDb, dataDir: dir, gdriveReseal: frontReseal(dir, only) });
   assert.deepEqual(again.tables.google_drive_users, { current: 2, rotated: 0, upgraded: 0, empty: 0, failed: 0 });
 });
 
@@ -80,7 +82,7 @@ test('a file sealed under neither key is counted as failed, never rewritten, and
   const lost = path.join(files, `${other.id}.sealed`);
   const text = fs.readFileSync(path.join(files, `${member.id}.sealed`), 'utf8');
   fs.writeFileSync(lost, 'AAAA' + text.slice(4)); // tampered: opens under neither key
-  const report = await runRotation({ secrets: fresh, db: noDb, dataDir: dir, gdriveReseal: frontReseal(dir, fresh) });
+  const report = await runRotation({ resealProviders: noProviders, secrets: fresh, db: noDb, dataDir: dir, gdriveReseal: frontReseal(dir, fresh) });
   assert.deepEqual(report.tables.google_drive_users, { current: 0, rotated: 1, upgraded: 0, empty: 0, failed: 1 });
   assert.equal(report.failures[0].ref, `${other.id}.sealed`);
   assert.match(report.failures[0].error, /not sealed under the current key/);
@@ -102,7 +104,7 @@ test('Node writes none of the files: with no front, a failing front or a throwin
   for (const gdriveReseal of [null, async () => ({ ok: false, status: 503 }), async () => ({ ok: false, status: 404 }), async () => { throw new Error('connect ECONNREFUSED'); }]) {
     const { dir, fresh, files } = connectedBeforeRotation();
     const before = fs.readdirSync(files).map((f) => fs.readFileSync(path.join(files, f), 'utf8'));
-    const report = await runRotation({ secrets: fresh, db: noDb, dataDir: dir, gdriveReseal });
+    const report = await runRotation({ resealProviders: noProviders, secrets: fresh, db: noDb, dataDir: dir, gdriveReseal });
     assert.deepEqual(fs.readdirSync(files).map((f) => fs.readFileSync(path.join(files, f), 'utf8')), before, 'not one byte written by Node');
     const t = report.tables.google_drive_users;
     assert.equal(t.rotated, 0);
@@ -120,7 +122,7 @@ test('the front\'s re-seal is awaited first: the check runs after it, and an acc
     await new Promise((r) => setTimeout(r, 50));
     fs.rmSync(path.join(f, `${other.id}.sealed`)); // the account disconnects while the rotation runs
   });
-  const report = await runRotation({ secrets: fresh, db: noDb, dataDir: dir, gdriveReseal: async () => { const r = await slow(); finished = true; return r; } });
+  const report = await runRotation({ resealProviders: noProviders, secrets: fresh, db: noDb, dataDir: dir, gdriveReseal: async () => { const r = await slow(); finished = true; return r; } });
   assert.equal(finished, true);
   assert.equal(fs.existsSync(gone), false, 'Node did not resurrect it');
   assert.deepEqual(report.tables.google_drive_users, { current: 0, rotated: 1, upgraded: 0, empty: 0, failed: 0 });

@@ -93,12 +93,23 @@ test('additionalOrigins lets a second origin (e.g. a LAN IP) pass the origin che
   } finally { auth.db.close(); fs.rmSync(root, { recursive: true, force: true }); }
 });
 
-test('provider secrets are encrypted on disk and decrypt for their owner', () => {
+test('provider secrets the front sealed decrypt for their owner, and a plaintext key left on disk is sealed through the store', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cowork-secrets-'));
   const secrets = createSecretStore(root); const id = '22222222-2222-4222-8222-222222222222';
-  const store = createWorkspaceStore(root, { id: 'default', label: 'Default', baseUrl: 'http://localhost', apiKey: '' }, secrets, { projectStore: createStubStore(root) });
-  const workspace = store.get(id); workspace.providers.push({ id: 'private', label: 'Private', baseUrl: 'https://example.test/v1', apiKey: 'super-secret-key' }); workspace.saveProviders();
-  const raw = fs.readFileSync(path.join(workspace.dir, 'providers.json'), 'utf8');
+  const stub = createStubStore(root);
+  const store = createWorkspaceStore(root, { id: 'default', label: 'Default', baseUrl: 'http://localhost', apiKey: '' }, secrets, { projectStore: stub });
+  const workspace = store.get(id);
+  const file = path.join(workspace.dir, 'providers.json');
+  // The Rust front writes the rows (noevia-rs provider_routes.rs): sealed enc:v1.
+  fs.writeFileSync(file, JSON.stringify({ providers: [{ id: 'private', label: 'Private', baseUrl: 'https://example.test/v1', apiKey: secrets.encrypt('super-secret-key') }] }));
+  assert.equal(store.get(id).providers.find((p) => p.id === 'private').apiKey, 'super-secret-key');
+  // A file from before sealing: usable, then sealed by the one write Node keeps, through the store.
+  fs.writeFileSync(file, JSON.stringify({ providers: [{ id: 'private', label: 'Private', baseUrl: 'https://example.test/v1', apiKey: 'super-secret-key' }] }));
+  const ws = store.get(id);
+  assert.equal(ws.providers.find((p) => p.id === 'private').apiKey, 'super-secret-key');
+  await ws.sealLegacyProviders();
+  const raw = fs.readFileSync(file, 'utf8');
   assert.doesNotMatch(raw, /super-secret-key/); assert.match(raw, /enc:v1:/);
+  assert.deepEqual(stub.writes, ['providers.json']);
   fs.rmSync(root, { recursive: true, force: true });
 });

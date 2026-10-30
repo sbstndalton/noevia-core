@@ -19,7 +19,7 @@ jobs:
       # A noevia-shaped workspace: noevia main (integration files: deploy/, docs/, tools/,
       # release/versions.lock), the sibling split repos at main, then this checkout on top, each at
       # its monorepo path (the inverse of tools/repo-split's map). Tests that cross repo lines
-      # (server tests reading src/, the OCR test reading server/pdf-reduce.cjs) run unchanged.
+      # (server tests reading src/) run unchanged.
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           path: self
@@ -247,7 +247,7 @@ jobs:
       # A noevia-shaped workspace: noevia main (integration files: deploy/, docs/, tools/,
       # release/versions.lock), the sibling split repos at main, then this checkout on top, each at
       # its monorepo path (the inverse of tools/repo-split's map). Tests that cross repo lines
-      # (server tests reading src/, the OCR test reading server/pdf-reduce.cjs) run unchanged.
+      # (server tests reading src/) run unchanged.
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           path: self
@@ -402,7 +402,7 @@ jobs:
       # A noevia-shaped workspace: noevia main (integration files: deploy/, docs/, tools/,
       # release/versions.lock), the sibling split repos at main, then this checkout on top, each at
       # its monorepo path (the inverse of tools/repo-split's map). Tests that cross repo lines
-      # (server tests reading src/, the OCR test reading server/pdf-reduce.cjs) run unchanged.
+      # (server tests reading src/) run unchanged.
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           path: self

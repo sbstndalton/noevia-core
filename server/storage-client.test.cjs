@@ -489,22 +489,6 @@ async function workspaceProject(id) {
   return JSON.parse(result.text).projects.find((p) => p.id === id);
 }
 
-test('same-name projects receive distinct storage folders', async () => {
-  const one = await createTestProject('Same name');
-  const two = await createTestProject('Same name');
-  // Created before any upload: no folder yet (#589), but the path is already reserved and distinct.
-  assert.equal(one.projectFolder, undefined);
-  assert.ok(one.reservedFolder && two.reservedFolder);
-  assert.notEqual(one.reservedFolder, two.reservedFolder);
-  const upload = (p) => request(`/api/projects/${p.id}/upload`, { method: 'POST', headers: mutationHeaders(), body: JSON.stringify({ name: 'a.md', dataBase64: Buffer.from('hello').toString('base64') }) });
-  // Upload in the opposite order: each project still lands exactly on its own reserved path.
-  assert.equal((await upload(two)).status, 200);
-  assert.equal((await upload(one)).status, 200);
-  const [a, b] = [await workspaceProject(one.id), await workspaceProject(two.id)];
-  assert.equal(a.projectFolder, one.reservedFolder);
-  assert.equal(b.projectFolder, two.reservedFolder);
-  assert.notEqual(a.projectFolder, b.projectFolder);
-});
 
 test('a rejected config patch leaves every previous field unchanged', async () => {
   const project = await createTestProject('Atomic settings');
@@ -513,156 +497,9 @@ test('a rejected config patch leaves every previous field unchanged', async () =
   assert.equal((await workspaceProject(project.id)).name, 'Atomic settings');
 });
 
-test('a temporary folder failure preserves its sources, while explicit detachment removes them', async () => {
-  const project = await createTestProject('Resilient sources');
-  await request(`/api/projects/${project.id}/config`, { method: 'POST', headers: mutationHeaders(), body: JSON.stringify({ sourceFolders: ['Cowork/Docs'] }) });
-  const syncUrl = `/api/projects/${project.id}/sources/sync`;
-  assert.equal((await request(syncUrl, { method: 'POST', headers: mutationHeaders() })).status, 200);
-  const before = await workspaceProject(project.id);
-  assert.ok(before.files.some((f) => f.name.endsWith('notes.md')));
-  // Inject a transient transport failure at the storage boundary, not in the route.
-  const client = require('./storage-client.cjs');
-  const list = client.listFiles;
-  client.listFiles = async () => { throw new Error('storage offline'); };
-  try {
-    const sync = JSON.parse((await request(syncUrl, { method: 'POST', headers: mutationHeaders() })).text);
-    assert.equal(sync.skipped.length, 1);
-    assert.deepEqual((await workspaceProject(project.id)).files, before.files);
-  } finally { client.listFiles = list; }
-  await request(`/api/projects/${project.id}/config`, { method: 'POST', headers: mutationHeaders(), body: JSON.stringify({ sourceFolders: [] }) });
-  await request(syncUrl, { method: 'POST', headers: mutationHeaders() });
-  assert.deepEqual((await workspaceProject(project.id)).files, []);
-});
 
-test('#1429 at the route: a refresh without the Retry header is held after a refused login, and the Retry header runs and clears the hold', async (t) => {
-  const storage = saveStorage;
-  t.after(async () => { await storage('webdav'); });
-  assert.equal((await storage('nextcloud')).status, 200);
-  const { tree, bodies, listingStatuses } = sharedDav;
-  tree.SyntheticLatch = ['notes.md']; bodies['SyntheticLatch/notes.md'] = 'latch knowledge';
-  const project = await createTestProject('Latch hold');
-  const config = patch => request(`/api/projects/${project.id}/config`, { method: 'POST', headers: mutationHeaders(), body: JSON.stringify(patch) });
-  const refresh = (retry) => request(`/api/projects/${project.id}/sources/sync`, { method: 'POST', headers: retry ? { ...mutationHeaders(), 'x-cowork-storage-retry': '1' } : mutationHeaders() });
-  await config({ sourceFolders: ['SyntheticLatch'] });
-  const first = await refresh(true);
-  assert.equal(first.status, 200, first.text);
-  assert.deepEqual(JSON.parse(first.text).skipped, []);
-  assert.ok((await workspaceProject(project.id)).files.some((f) => f.name.endsWith('notes.md')));
-  // The saved login is refused: the explicit refresh runs, reports the refusal and keeps the sources.
-  const client = require('./storage-client.cjs'), list = client.listFiles;
-  let calls = 0;
-  client.listFiles = async (...args) => { calls++; return list(...args); };
-  try {
-    listingStatuses.set('SyntheticLatch', 401);
-    const refused = JSON.parse((await refresh(true)).text);
-    assert.equal(refused.skipped[0].code, 'storageLoginRejected');
-    assert.ok(refused.skipped[0].retained);
-    // Automatic (headerless) refreshes now stop: a 502 with the login code, and no storage call at all.
-    calls = 0;
-    const held = await refresh(false);
-    assert.equal(held.status, 502);
-    assert.equal(JSON.parse(held.text).code, 'storageLoginRejected');
-    assert.equal(calls, 0, 'a held refresh makes no storage call');
-    assert.ok((await workspaceProject(project.id)).files.some((f) => f.name.endsWith('notes.md')), 'sources are kept while held');
-    // The explicit Retry always runs; once the login works again it clears the hold for automatic refreshes.
-    listingStatuses.delete('SyntheticLatch');
-    const retried = await refresh(true);
-    assert.equal(retried.status, 200, retried.text);
-    assert.deepEqual(JSON.parse(retried.text).skipped, []);
-    assert.ok(calls >= 1, 'the explicit Retry made the storage call');
-    const automatic = await refresh(false);
-    assert.equal(automatic.status, 200, 'a working call cleared the latch, so automatic refreshes run again');
-  } finally {
-    client.listFiles = list;
-    listingStatuses.delete('SyntheticLatch');
-  }
-});
 
-test('DAV HTTP listing failures retain attached project sources and cached originals (#1313)', async (t) => {
-  const storage = saveStorage;
-  t.after(async () => { await storage('webdav'); });
-  assert.equal((await storage('nextcloud')).status, 200);
-  const { tree, bodies, listingStatuses } = sharedDav;
-  tree.SyntheticLinked = ['notes.md']; bodies['SyntheticLinked/notes.md'] = 'linked knowledge';
-  tree.SyntheticOther = ['other.md']; bodies['SyntheticOther/other.md'] = 'other knowledge';
-  const project = await createTestProject('DAV retention');
-  const config = patch => request(`/api/projects/${project.id}/config`, { method: 'POST', headers: mutationHeaders(), body: JSON.stringify(patch) });
-  // #1429: a refresh without the explicit Retry header is held after a refused login (see the route's
-  // automaticHold). Every refresh here is an explicit one, so the earlier 401 below cannot hold the case under test.
-  const sync = async () => {
-    const response = await request(`/api/projects/${project.id}/sources/sync`, { method: 'POST', headers: { ...mutationHeaders(), 'x-cowork-storage-retry': '1' } });
-    assert.equal(response.status, 200); return JSON.parse(response.text);
-  };
-  await config({ files: [{ name: 'local.txt', content: 'unrelated local upload' }] });
-  const upload = await request(`/api/projects/${project.id}/upload`, { method: 'POST', headers: mutationHeaders(), body: JSON.stringify({ name: 'remote.txt', organized: true, dataBase64: Buffer.from('original remote bytes').toString('base64') }) });
-  assert.equal(upload.status, 200, upload.text);
-  const owned = (await workspaceProject(project.id)).projectFolder;
-  await config({ sourceFolders: [owned, 'SyntheticLinked', 'SyntheticOther'] });
-  await sync();
-  const before = await workspaceProject(project.id);
-  const original = before.files.find(f => f.attachment);
-  assert.ok(original && original.name === `${owned}/Text/remote.txt`);
-  const user = fs.readdirSync(path.join(testDataDir, 'users')).find(id => /^[a-f0-9-]{36}$/.test(id));
-  const cacheDir = path.join(testDataDir, 'users', user, 'project-uploads', require('node:crypto').createHash('sha256').update(project.id).digest('hex'));
-  const cache = () => Object.fromEntries(fs.readdirSync(cacheDir).sort().map(name => [name, fs.readFileSync(path.join(cacheDir, name)).toString('base64')]));
-  const previousCache = cache(); assert.ok(Object.keys(previousCache).length);
-  const rag = require('./rag.cjs'), deleteFile = rag.deleteProjectFile, deleted = [];
-  rag.deleteProjectFile = (...args) => { deleted.push(args[1]); return deleteFile(...args); };
-  try {
-    for (const [folder, status] of [[owned, 404], ['SyntheticLinked', 404], ['SyntheticLinked', 401], ['SyntheticLinked', 403], ['SyntheticLinked', 503], [`${owned}/Text`, 404]]) {
-      listingStatuses.set(folder, status); deleted.length = 0;
-      const result = await sync();
-      assert.deepEqual((await workspaceProject(project.id)).files, before.files, `HTTP ${status} at ${folder} must retain exact sources`);
-      assert.deepEqual(result.files.map(f => [f.name, f.bytes]), before.files.map(f => [f.name, f.chars]));
-      assert.deepEqual((await workspaceProject(project.id)).sourceFolders, before.sourceFolders);
-      assert.ok(result.skipped.some(s => (s.folder === folder || s.file === folder) && s.retained === true));
-      assert.deepEqual(deleted, [], 'failed listing must not delete RAG entries');
-      assert.deepEqual(cache(), previousCache, 'failed listing must not prune original cache bytes');
-      listingStatuses.delete(folder);
-    }
-    bodies[original.name] = 'recovered remote bytes';
-    const recovered = await sync(); assert.deepEqual(recovered.skipped, []);
-    assert.equal(await sourceText(project.id, original.name), 'recovered remote bytes');
-    tree.SyntheticLinked = []; deleted.length = 0;
-    const empty = await sync(); assert.deepEqual(empty.skipped, []);
-    const afterEmpty = await workspaceProject(project.id);
-    assert.ok(afterEmpty.sourceFolders.includes('SyntheticLinked'), 'valid empty folder stays attached');
-    assert.ok(!afterEmpty.files.some(f => f.source === 'SyntheticLinked'), 'valid 207 emptiness remains authoritative');
-    assert.deepEqual(deleted, ['SyntheticLinked/notes.md']);
-    deleted.length = 0;
-    await config({ sourceFolders: [owned, 'SyntheticLinked'] });
-    await sync();
-    const detached = await workspaceProject(project.id);
-    assert.ok(!detached.files.some(f => f.source === 'SyntheticOther'));
-    assert.ok(detached.files.some(f => f.name === 'local.txt'));
-    assert.ok(detached.files.some(f => f.name === original.name));
-    assert.deepEqual(deleted, ['SyntheticOther/other.md'], 'explicit detach removes only selected folder');
-  } finally {
-    rag.deleteProjectFile = deleteFile; listingStatuses.clear();
-    delete tree.SyntheticLinked; delete tree.SyntheticOther;
-    delete bodies['SyntheticLinked/notes.md']; delete bodies['SyntheticOther/other.md'];
-  }
-});
 
-test('uploads work without remote storage and gain a folder after connecting it', async () => {
-  const client = require('./storage-client.cjs');
-  const browsable = client.isBrowsable;
-  client.isBrowsable = () => false;
-  let project;
-  try {
-    project = await createTestProject('Local uploads');
-    assert.equal(project.projectFolder, undefined);
-    const result = await request(`/api/projects/${project.id}/upload`, { method: 'POST', headers: mutationHeaders(), body: JSON.stringify({ name: 'local.txt', dataBase64: Buffer.from('local knowledge').toString('base64') }) });
-    assert.equal(result.status, 200, result.text);
-    assert.equal(await sourceText(project.id, (await workspaceProject(project.id)).files[0].name), 'local knowledge');
-  } finally { client.isBrowsable = browsable; }
-  const result = await request(`/api/projects/${project.id}/upload`, { method: 'POST', headers: mutationHeaders(), body: JSON.stringify({ name: 'remote.txt', dataBase64: Buffer.from('remote knowledge').toString('base64') }) });
-  assert.equal(result.status, 200, result.text);
-  const after = await workspaceProject(project.id);
-  assert.ok(after.projectFolder);
-  assert.ok(after.sourceFolders.includes(after.projectFolder));
-  assert.ok(after.files.some((f) => f.name === 'local.txt'));
-});
 
 test('repeated tool calls in separate inference rounds keep distinct UI identities', async () => {
   const project = await createTestProject('Multi-round tools', { model: 'test-model' });
@@ -685,37 +522,10 @@ test('repeated tool calls in separate inference rounds keep distinct UI identiti
   } finally { global.fetch = originalFetch; }
 });
 
-test('an in-flight sync preserves concurrent uploads and does not restore detached folders', async () => {
-  const project = await createTestProject('Concurrent sources');
-  const config = (patch) => request(`/api/projects/${project.id}/config`, { method: 'POST', headers: mutationHeaders(), body: JSON.stringify(patch) });
-  await config({ sourceFolders: ['Cowork/Docs'] });
-  const client = require('./storage-client.cjs');
-  const list = client.listFiles;
-  let release; let started;
-  const blocked = new Promise((r) => { release = r; });
-  const entered = new Promise((r) => { started = r; });
-  client.listFiles = async (...args) => { started(); await blocked; return list(...args); };
-  try {
-    const syncing = request(`/api/projects/${project.id}/sources/sync`, { method: 'POST', headers: mutationHeaders() });
-    await entered;
-    await config({ sourceFolders: [], files: [{ name: 'during.txt', content: 'uploaded while syncing' }] });
-    release();
-    assert.equal((await syncing).status, 200);
-    const files = (await workspaceProject(project.id)).files;
-    assert.deepEqual(files.map((f) => [f.name, f.chars, 'content' in f]), [['during.txt', 'uploaded while syncing'.length, false]]);
-    assert.equal(await sourceText(project.id, 'during.txt'), 'uploaded while syncing');
-  } finally { release(); client.listFiles = list; }
-});
 
 // Project image assets (and their 8 MB cap) are the Rust front's routes since
 // sbstndalton/noevia#1071; noevia-rs tests them.
 
-test('folder sync counts other sources against the 60 cap and reports every file it leaves out', async () => {
-  // #1806 raised the default to 1000; the counting is the same at any cap.
-  const savedLimit = process.env.PROJECT_SOURCE_LIMIT;
-  process.env.PROJECT_SOURCE_LIMIT = '60';
-  try { await sourceCapCase(); } finally { if (savedLimit === undefined) delete process.env.PROJECT_SOURCE_LIMIT; else process.env.PROJECT_SOURCE_LIMIT = savedLimit; }
-});
 
 async function sourceCapCase() {
   const project = await createTestProject('Source cap');

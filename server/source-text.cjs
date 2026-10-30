@@ -291,7 +291,8 @@ async function whileSourceWork(wsDir, fn) {
   const end = beginSourceWork(wsDir);
   try { return await fn(); } finally { end(); }
 }
-const sourceWorkInFlight = (wsDir) => (inFlight.get(wsKey(wsDir)) || 0) > 0;
+// #2191 round 8: a sync or a folder import the Rust front runs counts too (rust-source-ops.cjs).
+const sourceWorkInFlight = (wsDir) => (inFlight.get(wsKey(wsDir)) || 0) > 0 || require('./rust-source-ops.cjs').inFlight(wsDir);
 
 function collect(wsDir, projects, { now = Date.now(), graceMs = graceDefault } = {}) {
   if (sourceWorkInFlight(wsDir)) return;

@@ -67,11 +67,6 @@ test('#1815: no collection while a folder import or sync is in flight for that w
   assert.equal(sourceText.sourceWorkInFlight(c.dir), false);
 });
 
-test('#1815: the sync and folder-import routes register source work for the workspace while they run', () => {
-  const src = fs.readFileSync(path.join(__dirname, 'routes', 'projects.cjs'), 'utf8');
-  assert.match(src, /whileSourceWork\(folderImport && sourceWorkDir\(\), \(\) => withSourceLock\(/, 'folder import upload');
-  assert.match(src, /whileSourceWork\(sourceWorkDir\(\), \(\) => withSourceLock\(/, 'attached-folder sync');
-});
 
 test('#1815: a save fsyncs each text file before its rename and each folder once, after every rename', () => {
   sourceText._cache.clear();

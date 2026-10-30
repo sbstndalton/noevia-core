@@ -405,15 +405,18 @@ test('an ordinary manual project model is unaffected by the #409 guard', async (
 });
 
 // #1441: a file attached to a new chat whose upload was accepted (202) but not yet ingested.
+// #2191 round 8: the front runs the operation and lists it in users/<id>/source-file-ops.json, which the
+// chat re-reads (rust-source-ops.cjs); this stands in for the front's writes.
 const attachDuringTurn = ({ name, after = 40, fail = false, never = false }) => async ({ project, workspace }) => {
-  // #2191 round 6: the front starts the job; this process tracks the operation it runs for it.
-  require('./source-work.cjs').track(workspace, project.id, async () => {
-    if (never) return new Promise(() => {});
-    await new Promise((r) => setTimeout(r, after));
-    if (fail) throw Object.assign(new Error('ocr crashed at /secret/path with synthetic body'), { status: 422 });
-    project.files = [...project.files, { name, content: 'Synthetic attached body.' }];
-    return { status: 200, body: { name } };
-  }, { name }).catch(() => undefined);
+  const file = require('node:path').join(workspace.dir, 'source-file-ops.json');
+  const entry = { id: `op-${name}`, project: project.id, kind: 'upload', name, at: Date.now() };
+  const save = (state) => { require('node:fs').writeFileSync(`${file}.tmp`, JSON.stringify({ version: 1, ops: [{ ...entry, state }] })); require('node:fs').renameSync(`${file}.tmp`, file); };
+  save('running');
+  if (never) return;
+  setTimeout(() => {
+    if (!fail) project.files = [...project.files, { name, content: 'Synthetic attached body.' }];
+    save(fail ? 'failed' : 'ready');
+  }, after);
 };
 const seeFiles = () => { const seen = []; return { seen, ragOverride: { filesContext: async (_p, readable) => { seen.push(readable.map((f) => f.name)); return null; } } }; };
 

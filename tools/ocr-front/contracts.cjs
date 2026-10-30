@@ -5,7 +5,9 @@ const { createHash } = require('node:crypto');
 // omitted page, empty response, or plausible but incorrect OCR must fail it.
 function requireScan(upload, pages) {
   assert.equal(upload.document?.state, 'ready', 'native OCR must make the scan ready');
-  assert.deepEqual(upload.document.pageStatus, [{ number: 1, status: 'ocr' }], 'scan must be labelled OCR');
+  // Docling reads the page as "ocr-needed", the native OCR worker recovers it, and the front records both: the
+  // page is labelled OCR and carries the retry's outcome (sbstndalton/noevia#2191 round 8).
+  assert.deepEqual(upload.document.pageStatus, [{ number: 1, status: 'ocr', retry: { outcome: 'recovered' } }], 'scan must be labelled OCR');
   for (const text of ['REF-2042', '2042-01-02 UTILITIES 42.15', '2042-01-03 REFUND -7.20', 'TOTAL 34.95']) {
     assert.ok(pages.text?.includes(text), `native OCR must recover synthetic row: ${text}`);
   }
@@ -41,4 +43,13 @@ function requireReducedPdf(large, reduced, downloaded, extracted) {
   const stable = value => ({ ...value, attachment: { ...value.attachment, bytes: '<reduced-length>' }, document: { ...value.document, bytes: '<reduced-length>' } });
   return { large: { ...stable(large), bytes: '<reduced-length>' }, reduced: stable(reduced) };
 }
-module.exports = { requireScan, requireReducedPdf, REDUCED_CAP, REDUCED_TEXT };
+// The source-work requests a second person must get a 404 on, with the bodies they send (the front's own
+// tenant refusal, before any worker is called): the upload, the sync and the folder-import plan.
+function sourceWorkDenials(route, uploadBody) {
+  return [
+    ['POST', route + '/upload', uploadBody],
+    ['POST', route + '/sources/sync', {}],
+    ['POST', route + '/folder-import/plan', { entries: [{ path: 'docs/a.md', size: 3 }] }],
+  ];
+}
+module.exports = { requireScan, requireReducedPdf, sourceWorkDenials, REDUCED_CAP, REDUCED_TEXT };

@@ -82,17 +82,32 @@ test('rotate re-encrypts every stored kind, upgrades plaintext, counts failures,
   fs.mkdirSync(path.join(root, 'users', U1), { recursive: true });
   fs.writeFileSync(path.join(root, 'users', U1, 'providers.json'), JSON.stringify({ providers: [{ id: 'mine', apiKey: old.encrypt('private-key') }] }));
 
+  // The provider files are the Rust front's: it re-seals them (noevia-rs tests/providers.rs checks
+  // the files); here a stand-in front answers with the counts it would, and the rotation must
+  // leave both files exactly as they are.
+  const providerBytes = () => [path.join(root, 'shared-providers.json'), path.join(root, 'users', U1, 'providers.json')].map((f) => fs.readFileSync(f, 'utf8'));
+  const providersBefore = providerBytes();
+  const front = (current = false) => async () => ({
+    tables: {
+      shared_providers: { current: current ? 2 : 0, rotated: current ? 0 : 1, upgraded: current ? 0 : 1, empty: 0, failed: 0 },
+      [`user_providers:${U1}`]: { current: current ? 1 : 0, rotated: current ? 0 : 1, upgraded: 0, empty: 0, failed: 0 },
+    },
+    failures: [],
+  });
+
   retire(root);
   const secrets = createSecretStore(root, noPrev);
   const audits = [];
-  const report = await runRotation({ secrets, db, dataDir: root, actorId: U1, audit: (...a) => audits.push(a) });
+  const report = await runRotation({ secrets, db, dataDir: root, actorId: U1, audit: (...a) => audits.push(a), resealProviders: front() });
   assert.deepEqual(report.totals, { current: 0, rotated: 7, upgraded: 2, empty: 0, failed: 1 });
   assert.equal(report.failures[0].table, 'mcp_oauth_tokens');
   assert.deepEqual(report.failures[0].ref, [U2, 'srv']);
   assert.equal(report.tables.directory_mcp_user_keys.rotated, 1);
+  assert.deepEqual(report.tables.shared_providers, { current: 0, rotated: 1, upgraded: 1, empty: 0, failed: 0 });
   assert.equal(audits[0][0], 'secrets.rotate');
+  assert.deepEqual(providerBytes(), providersBefore, 'this process wrote neither provider file');
 
-  // The previous key is gone: everything must open with the current key alone.
+  // The previous key is gone: everything this process rotated must open with the current key alone.
   fs.rmSync(path.join(root, 'secrets.key.previous'));
   const only = createSecretStore(root, noPrev);
   const val = (sql, ...a) => db.prepare(sql).get(...a).v;
@@ -105,14 +120,97 @@ test('rotate re-encrypts every stored kind, upgrades plaintext, counts failures,
   const userKey = val('SELECT headers_enc v FROM directory_mcp_user_keys WHERE user_id=?', U1);
   assert.match(userKey, /^enc:v2:/, 'a v1 value in a bound table is upgraded to v2');
   assert.equal(JSON.parse(only.decrypt(userKey, U1)).Authorization, 'mine');
-  const shared = JSON.parse(fs.readFileSync(path.join(root, 'shared-providers.json'), 'utf8')).providers;
-  assert.deepEqual(shared.map((p) => only.decrypt(p.apiKey)), ['shared-key', 'plain-shared']);
-  assert.match(shared[1].apiKey, /^enc:v1:/);
-  const mine = JSON.parse(fs.readFileSync(path.join(root, 'users', U1, 'providers.json'), 'utf8')).providers;
-  assert.equal(only.decrypt(mine[0].apiKey), 'private-key');
 
-  const again = await runRotation({ secrets: only, db, dataDir: root });
+  const again = await runRotation({ secrets: only, db, dataDir: root, resealProviders: front(true) });
   assert.deepEqual(again.totals, { current: 9, rotated: 0, upgraded: 0, empty: 0, failed: 1 });
+});
+
+test('M1: the front re-seals the provider files first, awaited, and this process never writes them', async (t) => {
+  const root = tmp(t);
+  const old = createSecretStore(root, noPrev);
+  const auth = createAuth({ dataDir: root, publicOrigin: 'https://noevia.example.test', secrets: old });
+  seedUsers(root, [[U1, U1]]);
+  saveStorageAsFront(root, null, U1, { kind: 'webdav', baseUrl: 'https://dav.example.test', username: 'a', secret: 'plain-old' });
+  const A = old.encrypt('key-of-row-a'), B = old.encrypt('key-of-row-b');
+  const file = path.join(root, 'users', U1, 'providers.json');
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, JSON.stringify({ providers: [{ id: 'a', apiKey: A }, { id: 'b', apiKey: B }] }));
+  retire(root);
+  const secrets = createSecretStore(root, noPrev);
+  const row = () => auth.db.prepare('SELECT secret v FROM storage_connections WHERE user_id=?').get(U1).v;
+  const calls = [];
+  // The front deletes row a while the rotation runs (an interleaved Rust delete). A rotation that
+  // wrote the file itself by row position would now put a's key on b, or resurrect a.
+  const front = async () => {
+    calls.push('front-start');
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(row(), 'plain-old', 'the table pass has not started while the front\'s pass is awaited');
+    const doc = JSON.parse(fs.readFileSync(file, 'utf8'));
+    fs.writeFileSync(file, JSON.stringify({ providers: doc.providers.filter((p) => p.id !== 'a') }));
+    calls.push('front-done');
+    return { tables: { [`user_providers:${U1}`]: { current: 0, rotated: 1, upgraded: 0, empty: 0, failed: 0 } }, failures: [] };
+  };
+  const report = await runRotation({ secrets, db: auth.db, dataDir: root, resealProviders: front, audit: () => calls.push('audit') });
+  assert.deepEqual(calls, ['front-start', 'front-done', 'audit']);
+  assert.match(row(), /^enc:v2:/, 'the table pass ran after it');
+  assert.deepEqual(JSON.parse(fs.readFileSync(file, 'utf8')).providers, [{ id: 'b', apiKey: B }], 'row b is untouched and row a stays deleted');
+  assert.equal(report.tables[`user_providers:${U1}`].rotated, 1);
+  // The front's failures are in the report, with the row's position and no key.
+  const failing = await runRotation({ secrets, db: auth.db, dataDir: root, resealProviders: async () => ({
+    tables: { shared_providers: { current: 0, rotated: 0, upgraded: 0, empty: 0, failed: 1 } },
+    failures: [{ table: 'shared_providers', ref: 3, error: 'no key opens it' }],
+  }) });
+  assert.deepEqual(failing.failures.at(-1), { table: 'shared_providers', ref: 3, error: 'no key opens it' });
+  assert.equal(failing.totals.failed, 1);
+  assert.equal(failing.tables.shared_providers.failed, 1);
+});
+
+test('M1: a rotation the front cannot take part in changes nothing else, and says so', async (t) => {
+  const root = tmp(t);
+  const old = createSecretStore(root, noPrev);
+  const auth = createAuth({ dataDir: root, publicOrigin: 'https://noevia.example.test', secrets: old });
+  seedUsers(root, [[U1, U1]]);
+  saveStorageAsFront(root, null, U1, { kind: 'webdav', baseUrl: 'https://dav.example.test', username: 'a', secret: 'plain-old' });
+  const secrets = createSecretStore(root, noPrev);
+  const audits = [];
+  await assert.rejects(runRotation({ secrets, db: auth.db, dataDir: root, audit: (...a) => audits.push(a), resealProviders: async () => { throw new Error('project store answered 503: credential store unavailable'); } }), /credential store unavailable/);
+  await assert.rejects(runRotation({ secrets, db: auth.db, dataDir: root, audit: (...a) => audits.push(a) }), /needs resealProviders/);
+  assert.equal(auth.db.prepare('SELECT secret v FROM storage_connections WHERE user_id=?').get(U1).v, 'plain-old', 'no table was touched');
+  assert.deepEqual(audits, []);
+  // The client side: a front without the op, or one that answers something else, is a refusal.
+  const { resealProviderKeys } = require('./rust-providers-reseal.cjs');
+  await assert.rejects(resealProviderKeys({}), /not available/);
+  await assert.rejects(resealProviderKeys({ providersReseal: async () => ({ ok: true, tables: { x: { current: 1 } }, failures: [] }) }), /unexpected/);
+  await assert.rejects(resealProviderKeys({ providersReseal: async () => ({ ok: false }) }), /unexpected/);
+  const ok = await resealProviderKeys({ providersReseal: async (scope) => ({ ok: true, scope, tables: { shared_providers: { current: 1, rotated: 2, upgraded: 3, empty: 0, failed: 4, extra: 9 } }, failures: [{ table: 'shared_providers', ref: 0, error: 'x'.repeat(500), key: 'sk-secret' }] }) });
+  assert.deepEqual(ok.tables.shared_providers, { current: 1, rotated: 2, upgraded: 3, empty: 0, failed: 4 });
+  assert.equal(ok.failures[0].error.length, 200);
+  assert.deepEqual(Object.keys(ok.failures[0]), ['table', 'ref', 'error']);
+});
+
+test('M1: the store client asks POST /v1/providers/reseal with the secret and the scope, and maps the answers', async () => {
+  const { createClient } = require('./project-store-client.cjs');
+  const seen = [];
+  const answer = (status, body) => async (url, init) => { seen.push({ url, method: init.method, token: init.headers['x-noevia-store-token'], body: JSON.parse(init.body) }); return new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } }); };
+  const token = 'synthetic-store-token-'.padEnd(40, 'x');
+  const ok = await createClient({ port: 4321, token, fetchImpl: answer(200, { ok: true, tables: {}, failures: [] }) }).providersReseal('shared');
+  assert.deepEqual(ok, { ok: true, tables: {}, failures: [] });
+  assert.deepEqual(seen, [{ url: 'http://127.0.0.1:4321/v1/providers/reseal', method: 'POST', token, body: { scope: 'shared' } }]);
+  await assert.rejects(createClient({ port: 4321, token, fetchImpl: answer(503, { error: 'credential store unavailable' }) }).providersReseal(), /503: credential store unavailable/);
+  await assert.rejects(createClient({ port: 4321, token, fetchImpl: answer(404, { error: 'not found' }) }).providersReseal(), /404/);
+  await assert.rejects(createClient({ port: 4321, token, fetchImpl: answer(503, { error: 'busy', code: 'PROJECTS_BUSY' }) }).providersReseal(), (e) => e.code === 'PROJECTS_BUSY');
+});
+
+test('M1: the shell form refuses without the front\'s internal store, before it changes anything', (t) => {
+  const root = tmp(t);
+  const env = { ...process.env, UI_DATA_DIR: root };
+  delete env.NOEVIA_PROJECT_STORE_PORT; delete env.NOEVIA_PROJECT_STORE_TOKEN;
+  const r = require('node:child_process').spawnSync(process.execPath, [path.join(__dirname, 'secrets-rotate.cjs')], { env, encoding: 'utf8', timeout: 60000 });
+  assert.equal(r.status, 2, r.stderr);
+  assert.match(r.stderr, /nothing was changed/);
+  assert.match(r.stderr, /POST \/api\/admin\/secrets\/rotate/);
+  assert.equal(fs.existsSync(path.join(root, 'secrets.key')), false, 'it did not even create a key');
+  assert.equal(r.stdout, '');
 });
 
 test('an undecryptable token or storage secret reports needs re-auth, not connected', (t) => {
@@ -160,6 +258,19 @@ test('POST /api/admin/secrets/rotate is administrator-only and runs the rotation
   assert.deepEqual(ran, ['u-admin']);
   await call('admin', 'GET');
   assert.equal(sent.at(-1).status, 404);
+});
+
+test('POST /api/admin/secrets/rotate waits for the rotation, and answers a refused one as an error', async () => {
+  const sent = [];
+  const make = (rotateSecrets) => createAuthRoutes({
+    json: (_res, status, body) => sent.push({ status, body }), readJson: async () => ({}),
+    authService: {}, workspaceStore: {}, driveAccounts: {}, fetchJson: async () => ({}), DIARY_BASE: '', DIARY_TOKEN: '', rotateSecrets,
+  });
+  const post = (routes) => { const req = Readable.from([]); Object.assign(req, { method: 'POST', headers: {} }); return routes.account(req, {}, { path: '/api/admin/secrets/rotate', authn: { user: { id: 'u-admin', role: 'admin' } } }); };
+  await post(make(async () => { await new Promise((resolve) => setImmediate(resolve)); return { totals: { rotated: 2 } }; }));
+  assert.deepEqual(sent.pop(), { status: 200, body: { totals: { rotated: 2 } } }, 'the report, not a promise');
+  await post(make(async () => { throw new Error('project store answered 503: credential store unavailable'); }));
+  assert.deepEqual(sent.pop(), { status: 500, body: { error: 'project store answered 503: credential store unavailable' } });
 });
 
 test('sbstndalton/noevia#2190 round 4: a rotation never overwrites a value saved after it read the row', (t) => {

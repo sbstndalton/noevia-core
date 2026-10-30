@@ -11,10 +11,14 @@
 // 429) keeps that login's strikes (#1607): when the throttle has run its course the login latch is back, so the
 // next probe that is refused doubles the wait instead of starting again at the base.
 //
-// The latch is per account (userId), in memory: a restart allows one automatic attempt per account,
-// which is the bounded cost this design accepts. It stores a fingerprint of the connection
-// (kind, server, username and app password), never the secret itself, so a change of credentials
-// clears it on its own.
+// The latch is per account (userId). Since sbstndalton/noevia#2191 round 8 it is a durable file both
+// processes use, not this process's memory: the project source refresh is the Rust front's now (noevia-rs
+// crates/server-projects storage_latch.rs), and the Diary backup worker is still Node's, so they must share
+// one hold. UI_DATA_DIR/storage-latch.db has one row per account; every transition here is a
+// BEGIN IMMEDIATE read-modify-write, and the Rust side does the same transitions on the same rows, so
+// neither keeps a copy of a row. Without a `file` (a unit test) the same code runs on a private in-memory
+// database. It stores a fingerprint of the connection (kind, server, bucket, username and app password),
+// never the secret itself, so a change of credentials clears it on its own.
 
 const crypto = require('node:crypto');
 
@@ -32,55 +36,93 @@ function fingerprintOf(connection) {
   ])).digest('hex');
 }
 
-function createStorageLatch({ now = Date.now, proofOf = null } = {}) {
-  // userId -> { fingerprint, kind, until, strikes, probing, since }. `since` is when the hold was last set. A throttle over a refused login also has
-  // `login: { strikes, until }`, what the login latch is restored to when the throttle has passed (#1607).
-  const latches = new Map();
+function openDatabase(file) {
+  let DatabaseSync = null;
+  try { ({ DatabaseSync } = require('node:sqlite')); } catch { /* older runtime */ }
+  if (DatabaseSync) { const db = new DatabaseSync(file); db.exec('PRAGMA busy_timeout = 5000'); return db; }
+  const Database = require('better-sqlite3');
+  const db = new Database(file, { timeout: 5000 });
+  return db;
+}
+
+const SCHEMA = `CREATE TABLE IF NOT EXISTS latch (
+  user_id TEXT PRIMARY KEY, fingerprint TEXT NOT NULL, kind TEXT NOT NULL, until INTEGER NOT NULL,
+  strikes INTEGER NOT NULL, probing INTEGER NOT NULL, since INTEGER NOT NULL, login_strikes INTEGER, login_until INTEGER)`;
+
+function createStorageLatch({ now = Date.now, proofOf = null, file = ':memory:' } = {}) {
+  let db = null;
+  const handle = () => {
+    if (!db) { db = openDatabase(file); db.exec(SCHEMA); }
+    return db;
+  };
+  const rowOf = (r) => (r ? {
+    fingerprint: r.fingerprint, kind: r.kind, until: Number(r.until), strikes: Number(r.strikes), probing: Number(r.probing) !== 0, since: Number(r.since),
+    ...(r.login_strikes !== null && r.login_strikes !== undefined && r.login_until !== null && r.login_until !== undefined ? { login: { strikes: Number(r.login_strikes), until: Number(r.login_until) } } : {}),
+  } : null);
+  const read = (userId) => rowOf(handle().prepare('SELECT * FROM latch WHERE user_id = ?').get(userId));
+  const write = (userId, l) => handle().prepare(`INSERT OR REPLACE INTO latch (user_id, fingerprint, kind, until, strikes, probing, since, login_strikes, login_until)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(userId, l.fingerprint, l.kind, l.until, l.strikes, l.probing ? 1 : 0, l.since, l.login ? l.login.strikes : null, l.login ? l.login.until : null);
+  const drop = (userId) => handle().prepare('DELETE FROM latch WHERE user_id = ?').run(userId);
+  /** One transition as a read-modify-write that no other process can interleave with. */
+  const transaction = (fn) => {
+    const d = handle();
+    d.exec('BEGIN IMMEDIATE');
+    try { const out = fn(); d.exec('COMMIT'); return out; } catch (error) { try { d.exec('ROLLBACK'); } catch { /* the original error matters */ } throw error; }
+  };
 
   /** A throttle that has run its course is dropped, or, when it sat on a refused login of the same
    *  credentials, gives way to that login latch with the strikes it had. A login that is already due
    *  is still the probe in flight, so a refusal that follows counts as the probe's. */
   function settle(userId) {
+    const before = read(userId);
+    if (!before) return null;
     // sbstndalton/noevia#2190: an explicit call the Rust front ran with the saved login (a folder write,
     // Test connection) and that worked proves the login, as `clear` does here; its proof ends a hold
     // that was set before it, never a later one. A proof that cannot be read changes nothing.
-    if (proofOf && latches.has(userId)) {
+    if (proofOf) {
       let at = null;
       try { at = proofOf(userId); } catch { at = null; }
-      if (Number.isFinite(at) && at >= latches.get(userId).since) latches.delete(userId);
+      if (Number.isFinite(at) && at >= before.since) { drop(userId); return null; }
     }
-    const latch = latches.get(userId);
-    if (latch && latch.kind === 'throttled' && now() >= latch.until) {
-      if (latch.login) latches.set(userId, { fingerprint: latch.fingerprint, kind: 'login', until: latch.login.until, strikes: latch.login.strikes, probing: latch.login.until <= now(), since: latch.since });
-      else latches.delete(userId);
+    if (before.kind === 'throttled' && now() >= before.until) {
+      if (before.login) {
+        const next = { fingerprint: before.fingerprint, kind: 'login', until: before.login.until, strikes: before.login.strikes, probing: before.login.until <= now(), since: before.since };
+        write(userId, next);
+        return next;
+      }
+      drop(userId);
+      return null;
     }
-    return latches.get(userId) || null;
+    return before;
   }
 
   /** Records a failure of a call made with `connection`. Only login and throttle failures latch;
    *  anything else (a 404, a timeout, a network failure) is left for the next call to find out. */
   function note(userId, connection, failure) {
     if (!userId || !failure) return;
+    if (failure.kind !== 'login' && failure.kind !== 'throttled') return;
     const fingerprint = fingerprintOf(connection);
-    const before = settle(userId);
-    if (failure.kind === 'login') {
-      const sameLogin = before && before.fingerprint === fingerprint && before.kind === 'login';
-      const sameThrottle = before && before.fingerprint === fingerprint && before.kind === 'throttled' && before.login;
-      // A probe that was refused again doubles the wait; an explicit press that was refused only renews it.
-      const strikes = sameLogin ? (before.probing ? before.strikes + 1 : before.strikes) : sameThrottle ? before.login.strikes : 1;
-      const wait = Math.min(LOGIN_PROBE_MAX_MS, LOGIN_PROBE_BASE_MS * 2 ** Math.min(strikes - 1, 16));
-      latches.set(userId, { fingerprint, kind: 'login', until: now() + wait, strikes, probing: false, since: now() });
-    } else if (failure.kind === 'throttled') {
-      const wait = Number.isFinite(failure.retryAfter) && failure.retryAfter > 0 ? failure.retryAfter * 1000 : DEFAULT_THROTTLE_WAIT_MS;
-      // The login strikes survive a throttle on the same credentials. A probe was past its base wait, so
-      // the login is due again the moment the throttle ends; any other 429 leaves the login hold as it was.
-      let login = null;
-      if (before && before.fingerprint === fingerprint) {
-        if (before.kind === 'login') login = { strikes: before.strikes, until: before.probing ? 0 : before.until };
-        else if (before.kind === 'throttled' && before.login) login = before.login;
+    transaction(() => {
+      const before = settle(userId);
+      if (failure.kind === 'login') {
+        const sameLogin = before && before.fingerprint === fingerprint && before.kind === 'login';
+        const sameThrottle = before && before.fingerprint === fingerprint && before.kind === 'throttled' && before.login;
+        // A probe that was refused again doubles the wait; an explicit press that was refused only renews it.
+        const strikes = sameLogin ? (before.probing ? before.strikes + 1 : before.strikes) : sameThrottle ? before.login.strikes : 1;
+        const wait = Math.min(LOGIN_PROBE_MAX_MS, LOGIN_PROBE_BASE_MS * 2 ** Math.min(strikes - 1, 16));
+        write(userId, { fingerprint, kind: 'login', until: now() + wait, strikes, probing: false, since: now() });
+      } else {
+        const wait = Number.isFinite(failure.retryAfter) && failure.retryAfter > 0 ? failure.retryAfter * 1000 : DEFAULT_THROTTLE_WAIT_MS;
+        // The login strikes survive a throttle on the same credentials. A probe was past its base wait, so
+        // the login is due again the moment the throttle ends; any other 429 leaves the login hold as it was.
+        let login = null;
+        if (before && before.fingerprint === fingerprint) {
+          if (before.kind === 'login') login = { strikes: before.strikes, until: before.probing ? 0 : before.until };
+          else if (before.kind === 'throttled' && before.login) login = before.login;
+        }
+        write(userId, { fingerprint, kind: 'throttled', until: now() + wait, strikes: 0, probing: false, since: now(), ...(login ? { login } : {}) });
       }
-      latches.set(userId, { fingerprint, kind: 'throttled', until: now() + wait, strikes: 0, probing: false, since: now(), ...(login ? { login } : {}) });
-    }
+    });
   }
 
   /** The latch holding this account, or null. A latch for other credentials is dropped; a throttle that
@@ -88,7 +130,7 @@ function createStorageLatch({ now = Date.now, proofOf = null } = {}) {
   function inspect(userId, connection) {
     const latch = settle(userId);
     if (!latch) return null;
-    if (latch.fingerprint !== fingerprintOf(connection)) { latches.delete(userId); return null; }
+    if (latch.fingerprint !== fingerprintOf(connection)) { drop(userId); return null; }
     return latch;
   }
 
@@ -96,26 +138,28 @@ function createStorageLatch({ now = Date.now, proofOf = null } = {}) {
    *  passed lets this one call through as a probe and holds the others for a minute; if the probe works
    *  the caller clears the latch, and if it is refused again `note` renews it with a longer wait. */
   function blocked(userId, connection) {
-    const latch = inspect(userId, connection);
-    if (!latch) return null;
-    if (latch.kind === 'login' && now() >= latch.until) {
-      latch.probing = true;
-      latch.until = now() + PROBE_HOLD_MS;
-      return null;
-    }
-    return { kind: latch.kind, ...(latch.kind === 'throttled' ? { retryAfter: Math.max(1, Math.ceil((latch.until - now()) / 1000)) } : {}) };
+    return transaction(() => {
+      const latch = inspect(userId, connection);
+      if (!latch) return null;
+      if (latch.kind === 'login' && now() >= latch.until) {
+        write(userId, { ...latch, probing: true, until: now() + PROBE_HOLD_MS });
+        return null;
+      }
+      return { kind: latch.kind, ...(latch.kind === 'throttled' ? { retryAfter: Math.max(1, Math.ceil((latch.until - now()) / 1000)) } : {}) };
+    });
   }
 
   /** What a status view shows about an account's held automatic calls, or null: the kind, and when the
    *  next automatic attempt is due (epoch ms). Reading it never lets a probe through. */
   function status(userId, connection) {
-    const latch = inspect(userId, connection);
-    if (!latch) return null;
-    return { kind: latch.kind, nextAttemptAt: latch.until };
+    return transaction(() => {
+      const latch = inspect(userId, connection);
+      return latch ? { kind: latch.kind, nextAttemptAt: latch.until } : null;
+    });
   }
 
   /** A call that worked proves the credentials are good again. */
-  function clear(userId) { latches.delete(userId); }
+  function clear(userId) { transaction(() => { drop(userId); }); }
 
   /** The saved connection of an account, or null when there is none (or it cannot be read). */
   function connectionOf(readConnection, userId) {
@@ -156,11 +200,12 @@ function createStorageLatch({ now = Date.now, proofOf = null } = {}) {
    *  caller (the project refresh) gets it instead of the backup worker taking it every tick (#1615). Only a
    *  login latch whose probe is out is touched; a hold still inside its wait is never shortened. */
   function giveBackProbe(userId, conn) {
-    const latch = latches.get(userId);
-    if (latch && latch.kind === 'login' && latch.probing && latch.fingerprint === fingerprintOf(conn)) {
-      latch.until = now();
-      latch.probing = false;
-    }
+    transaction(() => {
+      const latch = read(userId);
+      if (latch && latch.kind === 'login' && latch.probing && latch.fingerprint === fingerprintOf(conn)) {
+        write(userId, { ...latch, until: now(), probing: false });
+      }
+    });
   }
 
   return { note, blocked, status, statusFor, clear, fingerprintOf, suspendedFor, noteDiaryReply };

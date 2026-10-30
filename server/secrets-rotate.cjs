@@ -3,9 +3,22 @@
 // Used by POST /api/admin/secrets/rotate and by operators from a shell:
 //   UI_DATA_DIR=/path/to/ui-data node server/secrets-rotate.cjs   (or: npm run secrets:rotate)
 // Every place that holds a secrets.encrypt() value is listed here; a new one belongs here too.
+//
+// The provider files (users/<id>/providers.json, shared-providers.json) are not listed: the Rust
+// front is their only writer (sbstndalton/noevia#2190 round 6), so their keys are re-sealed by the
+// front itself, in one pass per file under the file's own lock, with the current and the previous
+// key (rust-providers-reseal.cjs, POST /v1/providers/reseal on the internal store). runRotation
+// awaits that pass first and refuses the whole rotation when it cannot be done, so nothing else is
+// changed under a half-rotated registry. This process never writes either file, and so cannot
+// shift or overwrite a row the front deletes or edits meanwhile (a row-index write could).
+//
+// The shell form needs the front's internal store (NOEVIA_PROJECT_STORE_PORT and
+// NOEVIA_PROJECT_STORE_TOKEN, which the web supervisor hands the web process alone and Node removes
+// from its environment at start), so it refuses to run without them, before it changes anything,
+// and says to rotate through the running app instead: POST /api/admin/secrets/rotate as an
+// administrator. That keeps the front the single writer of the provider files with no second path.
 const fs = require('node:fs');
 const path = require('node:path');
-const { atomicJson } = require('./workspace.cjs');
 const { checkTokenFile } = require('./gdrive-seal.cjs');
 
 const hasTable = (db, name) => !!db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?").get(name);
@@ -24,23 +37,6 @@ function sqlTable(db, name, { table, keys, column, bound }) {
     write(ref, value, old) {
       const changed = db.prepare(`UPDATE ${table} SET ${column}=? WHERE ${keys.map((k) => `${k}=?`).join(' AND ')} AND ${column}=?`).run(value, ...ref, old).changes;
       if (!changed) throw new Error('changed while rotating; run the rotation again');
-    },
-  };
-}
-
-// Provider keys in JSON files are unbound (workspace.cjs decrypts them without a userId).
-function providerFile(name, file) {
-  return {
-    name,
-    rows() {
-      if (!fs.existsSync(file)) return [];
-      const data = JSON.parse(fs.readFileSync(file, 'utf8'));
-      return (data.providers || []).map((p, i) => ({ ref: i, value: p.apiKey })).filter((r) => r.value);
-    },
-    write(index, value) {
-      const data = JSON.parse(fs.readFileSync(file, 'utf8'));
-      data.providers[index].apiKey = value;
-      atomicJson(file, data);
     },
   };
 }
@@ -71,17 +67,18 @@ function rotationTables({ db, dataDir, secrets = null }) {
     sqlTable(db, 'directory_mcp_servers', { table: 'directory_mcp_servers', keys: ['id'], column: 'headers_enc', bound: false }),
     sqlTable(db, 'directory_mcp_user_keys', { table: 'directory_mcp_user_keys', keys: ['user_id', 'server_id'], column: 'headers_enc', bound: true }),
     sqlTable(db, 'chatgpt_oauth_tokens', { table: 'chatgpt_oauth_tokens', keys: ['user_id'], column: 'data_enc', bound: true }),
-    providerFile('shared_providers', path.join(dataDir, 'shared-providers.json')),
   ];
   if (secrets) tables.push(googleDriveUserFiles(path.join(dataDir, 'google-drive-users'), secrets));
-  const usersDir = path.join(dataDir, 'users');
-  if (fs.existsSync(usersDir)) {
-    for (const id of fs.readdirSync(usersDir).sort()) {
-      const file = path.join(usersDir, id, 'providers.json');
-      if (fs.existsSync(file)) tables.push(providerFile(`user_providers:${id}`, file));
-    }
-  }
   return tables;
+}
+
+/** Adds the front's provider pass (`{ tables, failures }`, rust-providers-reseal.cjs) to `report`. */
+function mergeProviderPass(report, pass) {
+  for (const [name, counts] of Object.entries(pass.tables)) {
+    report.tables[name] = counts;
+    for (const k of Object.keys(report.totals)) report.totals[k] += counts[k] || 0;
+  }
+  report.failures.push(...pass.failures);
 }
 
 /**
@@ -100,11 +97,21 @@ async function resealGoogleDrive(gdriveReseal) {
   } catch { return { error: 'the Rust front could not re-seal the Google Drive token files (unreachable)' }; }
 }
 
-/** Run a rotation and record it in the audit log. Never throws for a bad row. */
-async function runRotation({ secrets, db, dataDir, audit = () => {}, actorId = null, gdriveReseal = null }) {
-  // Before anything else, and awaited: the front's re-seal is a step of the rotation, not a race with it.
+/**
+ * Run a rotation and record it in the audit log. Never throws for a bad row. The order is fixed:
+ *   1. `await resealProviders()`: the front re-seals the provider files (rust-providers-reseal.cjs
+ *      `resealProviderKeys`). It throws, before anything is changed, when it cannot: that stops everything.
+ *   2. `await gdriveReseal()`: the front re-seals the Google Drive token files (SOFT: a front that cannot do
+ *      it is a failure of that table in the report, and the rotation goes on).
+ *   3. `secrets.rotate`: the rest, in this process.
+ */
+async function runRotation({ secrets, db, dataDir, audit = () => {}, actorId = null, resealProviders, gdriveReseal = null }) {
+  if (typeof resealProviders !== 'function') throw new Error('the provider keys are re-sealed by the Rust front: runRotation needs resealProviders');
+  const providers = await resealProviders();
+  // Awaited too: the front's re-seal is a step of the rotation, not a race with it.
   const front = await resealGoogleDrive(gdriveReseal);
   const report = secrets.rotate({ tables: rotationTables({ db, dataDir, secrets }) });
+  mergeProviderPass(report, providers);
   if (report.tables.google_drive_users) {
     const t = report.tables.google_drive_users;
     if (front.counts) {
@@ -124,6 +131,14 @@ async function runRotation({ secrets, db, dataDir, audit = () => {}, actorId = n
 module.exports = { rotationTables, runRotation };
 
 if (require.main === module) {
+  const store = require('./project-store-client.cjs');
+  if (!store.enabledFrom(process.env, () => {})) {
+    console.error('secrets rotation was not started and nothing was changed: the provider keys are re-sealed by the Rust front, which this shell cannot reach (the internal store\'s port and secret belong to the web process). Rotate through the running app instead: sign in as an administrator and POST /api/admin/secrets/rotate.');
+    process.exit(2);
+  }
+  const front = store.clientFromEnv(process.env);
+  const resealProviders = () => require('./rust-providers-reseal.cjs').resealProviderKeys(front);
+  const gdriveReseal = () => front.gdriveReseal();
   const dataDir = process.env.UI_DATA_DIR || path.join(__dirname, 'ui-data');
   const { createSecretStore } = require('./secrets.cjs');
   const Database = require('better-sqlite3');
@@ -133,12 +148,12 @@ if (require.main === module) {
   const audit = (action, actor, target, detail) => {
     if (hasTable(db, 'audit_events')) db.prepare('INSERT INTO audit_events(actor_user_id,target_user_id,action,detail,created_at) VALUES(?,?,?,?,?)').run(actor, target, action, JSON.stringify({ ...detail, via: 'cli' }), Date.now());
   };
-  // The Rust front owns the Google Drive token files and re-seals them through the running server; a shell has no
-  // route to it, so those files are only checked here (and reported as failed while they are still under the old key).
-  runRotation({ secrets, db, dataDir, audit }).then((report) => {
+  runRotation({ secrets, db, dataDir, audit, resealProviders, gdriveReseal }).then((report) => {
     console.log(JSON.stringify(report, null, 2));
     if (!report.previousKey) console.error('note: no previous key is configured; only legacy/plaintext values could be upgraded.');
-    if (report.failures.some((f) => f.table === 'google_drive_users')) console.error('note: the Google Drive token files are re-sealed by the running server: use Settings -> Security -> rotate (POST /api/admin/secrets/rotate).');
     process.exitCode = report.totals.failed ? 2 : 0;
+  }, (e) => {
+    console.error(`secrets rotation stopped before any other credential was changed (the front's provider pass may have run in part; a rotation can be run again): ${String(e && e.message || e).slice(0, 300)}`);
+    process.exitCode = 2;
   });
 }
