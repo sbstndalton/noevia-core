@@ -328,6 +328,7 @@ jobs:
           python3 code-sandbox/tests/verify-native-source.test.py
           node --test code-sandbox/tests/native-verifier-assertions.test.cjs code-sandbox/tests/native-verifier-output.test.cjs
           node --test --test-timeout=2000 code-sandbox/tests/native-verifier-cancel.test.cjs
+          node --test code-sandbox/native-supervisor-entrypoint.test.cjs
       - name: The fixture table is what the generator makes from the JS references
         working-directory: self
         run: node tools/gen-sandbox-bridge-fixtures.cjs | cmp - tests/fixtures/sandbox-bridge.v1.json
@@ -370,7 +371,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           repository: sbstndalton/noevia
-          ref: 06f96d8a1ad023414a513eed3a2ba3358687bea8
+          ref: 7e4d51faa7cab2b4e87bd07eb43cc8b7575ddaa5
           path: native-verifier-profile
       - name: Required native verifier namespace and measured-caller qualification
         working-directory: .
@@ -383,6 +384,13 @@ jobs:
             -f native-verifier-profile/compose.yaml -f native-verifier-profile/deploy/examples/code-sandbox.override.yml \
             config --format json > "$profile"
           node self/code-sandbox/tests/qualify-native-verifier.cjs "$profile" noevia-code-sandbox:ci "$GITHUB_WORKSPACE/self" noevia-code-sandbox:verifier-fixtures
+      - name: Required native supervisor image ACP and lifecycle qualification
+        working-directory: .
+        env:
+          NOEVIA_NATIVE_SUPERVISOR_QUALIFICATION: '1'
+        run: |
+          set -euo pipefail
+          node self/code-sandbox/tests/qualify-native-supervisor.cjs "$RUNNER_TEMP/native-verifier-profile.json" noevia-code-sandbox:ci "$GITHUB_WORKSPACE/self"
       - name: The shipped image loads sandbox-bridge.wasm
         run: |
           set -euo pipefail
