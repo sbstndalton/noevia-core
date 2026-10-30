@@ -25,10 +25,10 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           repository: sbstndalton/noevia-rs
-          # sbstndalton/noevia#2191 round 9: the front answers a project's configuration, its instruction skills, the
-          # skill install and an account's deletion itself (this Core refuses them); acceptance input only. A head of
-          # the noevia-rs models round B branch, which the merged PR contains (reachable from main).
-          ref: 5f79d0d9f4260eb0a01c4dfa6d4f09292678e0dd
+          # sbstndalton/noevia#2218: the front answers deep research itself (this Core refuses its paths) and the models
+          # round's maintenance routes; acceptance input only. The head of the noevia-rs research round branch, which
+          # the merged PR contains (reachable from main).
+          ref: b32da3d7be05f2f7c74425520a297e142a594de0
           path: rs
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
