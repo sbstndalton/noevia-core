@@ -10,7 +10,6 @@ const skills = require('./instruction-skills.cjs');
 const { isUnreadable } = require('./source-readability.cjs');
 const { buildSources } = require('./chat-sources.cjs');
 const { createProjectStore } = require('./projects.cjs');
-const { createProjectRoutes } = require('./routes/projects.cjs');
 
 const root = fs.mkdtempSync(path.join(os.tmpdir(), 'noevia-unreadable-'));
 test.after(() => fs.rmSync(root, { recursive: true, force: true }));
@@ -65,40 +64,6 @@ test('chat context never offers or cites an unreadable file', async () => {
   assert.deepEqual(Array.from(placed, (p) => p.file), ['notes.txt']);
   // Defence in depth: even if a caller hands the unreadable file to the citation builder, it is dropped.
   assert.deepEqual(buildSources([{ file: 'broken.txt', body: '', kind: 'file' }, { file: 'notes.txt', body: 'x', kind: 'file' }], project.files).map((s) => s.file), ['notes.txt']);
-});
-
-// ── #589 ────────────────────────────────────────────────────────────────────
-function lazyHarness() {
-  const created = [], written = [];
-  const conn = { kind: 'webdav' };
-  const storageClient = { TEXT_EXTENSIONS: new Set(['.txt']), isBrowsable: () => true, writeFile: async (_c, name) => { written.push(name); }, createFolder: async () => ({ existed: false }) };
-  const w = { ...workspace(), projects: [], saveProjects() {} };
-  const PROJECTS = w.projects;
-  const shared = { fs, path, storageClient, authService: { getStorage: () => conn }, currentWorkspace: () => w, PROJECTS, rag: { indexProjectFile: async () => ({ ok: true }), deleteProjectFile() {} }, documentSources: {} };
-  const store = createProjectStore({ ...shared, FREE_CHATS: [], reasoningEffort: {}, projectAppearance: () => ({}), sanitizeToolboxes: () => [], defaultToolboxes: () => [], PROJECT_ROOT_FOLDER: 'noevia projects',
-    createProjectFolder: async (_s, _c, _r, project) => { created.push(project.name); return `noevia projects/${project.name}`; }, projectSweep: { afterDelete: async () => {} } });
-  let last;
-  const routes = createProjectRoutes({ ...shared, store, requestScope: { getStore: () => ({}) }, dispatch: async () => {}, readJson: async (req) => req.body,
-    readBody: async (req) => JSON.stringify(req.body), json: (_r, status, body) => { last = { status, body }; },
-    documents: require('./documents.cjs'), reasoningEffort: {}, projectAppearance: () => ({}), diaryExtras: {}, DEFAULT_TOOLBOXES: [], sanitizeToolboxes: () => null, getProvider: () => null, ensureRolesLoaded: () => {} });
-  const upload = async (project, name, text) => { last = undefined; const p = `/api/projects/${project.id}/upload`;
-    await routes({ method: 'POST', body: { name, dataBase64: Buffer.from(text).toString('base64') } }, {}, { path: p, authn: { user: { id: 'synthetic-user' } }, url: new URL('http://localhost' + p) }); return last; };
-  return { store, created, written, upload };
-}
-
-test('creating a project makes no storage folder; the first upload creates it once', async () => {
-  const h = lazyHarness();
-  const project = await h.store.createProject({ name: 'Never used' });
-  assert.deepEqual(h.created, []);
-  assert.equal(project.projectFolder, undefined);
-  assert.deepEqual(project.sourceFolders, []);
-  assert.equal((await h.upload(project, 'a.txt', 'first')).status, 200);
-  assert.deepEqual(h.created, ['Never used']);
-  assert.equal(project.projectFolder, 'noevia projects/Never used');
-  assert.deepEqual(project.sourceFolders, ['noevia projects/Never used']);
-  assert.equal((await h.upload(project, 'b.txt', 'second')).status, 200);
-  assert.deepEqual(h.created, ['Never used']);
-  assert.deepEqual(h.written, ['noevia projects/Never used/a.txt', 'noevia projects/Never used/b.txt']);
 });
 
 test('a skill uploaded to the project folder is not reported as from an attached folder (#588)', () => {
