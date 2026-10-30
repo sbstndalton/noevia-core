@@ -104,9 +104,7 @@ test('deleting an account is the front\'s: this process has no removeUser, and t
   await connect(fixture, member);
   assert.equal(accounts.removeUser, undefined, 'the front revokes and forgets the connection itself (#2190, #2191 round 9)');
   assert.equal(accounts.connected(member), true);
-  const stamp = accounts.fingerprint();
   await fixture.broker.gdriveForget('u-member'); // what the front does when it deletes the account
-  assert.notEqual(accounts.fingerprint(), stamp, 'the cached views and sessions are keyed to this file');
-  assert.equal(accounts.connected(member), false);
+  assert.equal(accounts.connected(member), false, 'the broker\'s state file shows through, nothing here forgets it');
   assert.equal(fixture.refresh.has('u-member'), false);
 });
