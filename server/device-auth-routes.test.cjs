@@ -147,11 +147,14 @@ test('scope limits: a device token never reaches administration or account secur
     assert.equal(r.status, 503, `POST ${url} -> ${r.status}`);
     assert.equal(r.json.code, 'RUST_STORAGE_INTEGRATIONS_OWNED', url);
   }
+  // Saving the storage connection too (#2190 round 4; the front's gate refuses device tokens on it).
+  const save = await asDevice(tokens.access, '/api/integrations/storage', { method: 'PUT', body: { kind: 'local' } });
+  assert.equal(save.status, 503);
+  assert.equal(save.json.code, 'RUST_STORAGE_CONNECTION_OWNED');
   const refused = [
     ['GET', '/api/admin/offsite-backup'],
     ['DELETE', `/api/admin/users/${memberId}`, { username: 'memberqa' }],
     ['POST', '/api/profile/diary-connectors', {}],
-    ['PUT', '/api/integrations/storage', { kind: 'local' }],
   ];
   for (const [method, url, body] of refused) {
     const r = await asDevice(tokens.access, url, { method, body });

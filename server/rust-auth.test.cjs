@@ -5,7 +5,7 @@
 // auth-rust-mode.test.cjs covers the same on createAuth's real database and the real router.
 const assert = require('node:assert/strict');
 const test = require('node:test');
-const { createRustAuthGuard, ownedRoute, refuseOwned, OWNED_ROUTES, ROUTE_REFUSAL, writeTarget, writeTargets, OWNED_TABLES, FRONT_SETTING_KEYS } = require('./rust-auth.cjs');
+const { createRustAuthGuard, ownedRoute, refuseOwned, OWNED_ROUTES, ROUTE_REFUSAL, writeTarget, writeTargets, OWNED_TABLES, FRONT_SETTING_KEYS, FRONT_TABLES } = require('./rust-auth.cjs');
 
 function fakeDb() {
   const ran = [];
@@ -120,7 +120,8 @@ test('while on, owned writes throw 503 when they run; reads and other tables do 
   for (const t of OWNED_TABLES) assert.throws(() => db.prepare(`DELETE FROM ${t}`).run(), (e) => e.code === 'RUST_AUTH_OWNED', t);
   db.prepare('SELECT * FROM sessions WHERE id_hash=?').get('h');
   db.prepare('INSERT INTO audit_events(action,created_at) VALUES(?,?)').run('x', 1);
-  db.prepare('INSERT INTO storage_connections(user_id) VALUES(?)').run('u');
+  // sbstndalton/noevia#2190 round 4: the storage row is the front's too (its own code).
+  assert.throws(() => db.prepare('INSERT INTO storage_connections(user_id) VALUES(?)').run('u'), (e) => e.status === 503 && e.code === 'RUST_STORAGE_CONNECTION_OWNED');
   db.prepare('DELETE FROM diary_connectors WHERE user_id=?').run('u');
   db.exec('CREATE TABLE IF NOT EXISTS x(y)');
   assert.throws(() => db.exec('CREATE TABLE a(b); DELETE FROM sessions'), (e) => e.code === 'RUST_AUTH_OWNED');
@@ -333,4 +334,58 @@ test('settings: an old "off" option guards anyway, and the front\'s keys stay re
     assert.throws(() => guard.exempt(() => guarded.prepare('INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)').bind('auto_sampling_presets_enabled','false').run()),{code:'RUST_SAMPLING_SETTINGS_OWNED'});
     assert.equal(guarded.prepare('SELECT value FROM settings').get().value,'true');
   } finally { guarded.close(); }
+});
+test('sbstndalton/noevia#2190 round 4: storage_connections is refused exempt or not, but for the exact reseal', () => {
+  const { RESEAL_SQL, ROUTE_REFUSAL } = require('./rust-storage-connection.cjs');
+  assert.deepEqual(Object.keys(FRONT_TABLES), ['storage_connections']);
+  assert.equal(FRONT_TABLES.storage_connections.code, ROUTE_REFUSAL.code);
+  const guard = on();
+  const db = guard.install(fakeDb());
+  const refused = (e) => e.status === 503 && e.code === 'RUST_STORAGE_CONNECTION_OWNED';
+  const writes = [
+    'INSERT INTO storage_connections(user_id,kind) VALUES(?,?) ON CONFLICT(user_id) DO UPDATE SET kind=excluded.kind',
+    'REPLACE INTO storage_connections(user_id) VALUES(?)',
+    'UPDATE storage_connections SET secret=? WHERE user_id=?',
+    `${RESEAL_SQL} OR 1=1`,
+    'UPDATE storage_connections SET secret=?, kind=? WHERE user_id=? AND secret=?',
+    'DELETE FROM "storage_connections" WHERE user_id=?',
+    'WITH x AS (SELECT 1) UPDATE main.storage_connections SET kind=? WHERE user_id=?',
+  ];
+  for (const sql of writes) {
+    assert.throws(() => db.prepare(sql).run('a', 'b'), refused, sql);
+    assert.throws(() => guard.exempt(() => db.prepare(sql).run('a', 'b')), refused, `exempt: ${sql}`);
+  }
+  assert.throws(() => db.exec('DELETE FROM storage_connections'), refused);
+  assert.throws(() => guard.exempt(() => db.exec('DELETE FROM storage_connections')), refused);
+  // The reseal (and with a trailing semicolon) and reads run.
+  assert.equal(db.prepare(RESEAL_SQL).run('new', 'u', 'old').changes, 1);
+  assert.equal(db.prepare(`${RESEAL_SQL};`).run('new', 'u', 'old').changes, 1);
+  db.prepare('SELECT * FROM storage_connections WHERE user_id=?').get('u');
+  assert.ok(!db.ran.some(([, sql]) => writes.includes(sql) || /^DELETE FROM storage_connections/.test(sql)), 'no refused write reached the database');
+});
+
+test('sbstndalton/noevia#2190 round 4: no Node source writes storage_connections but the reseal', () => {
+  const fs = require('node:fs');
+  const path = require('node:path');
+  const { RESEAL_SQL } = require('./rust-storage-connection.cjs');
+  const files = [];
+  const walk = (dir) => {
+    for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
+      const f = path.join(dir, e.name);
+      if (e.isDirectory()) { if (e.name !== 'node_modules') walk(f); } else if (/\.c?js$/.test(e.name) && !/\.test\.c?js$/.test(e.name)) files.push(f);
+    }
+  };
+  walk(__dirname);
+  const offenders = [];
+  for (const f of files) {
+    const src = fs.readFileSync(f, 'utf8');
+    if (/\bsaveStorage\s*\(/.test(src)) offenders.push(`${path.relative(__dirname, f)}: saveStorage(`);
+    for (const m of src.matchAll(/(?:INSERT|REPLACE|UPDATE|DELETE)[^`'"\n]*storage_connections[^`'"]*/gi)) {
+      if (m[0].trim() !== RESEAL_SQL) offenders.push(`${path.relative(__dirname, f)}: ${m[0].slice(0, 80)}`);
+    }
+  }
+  assert.deepEqual(offenders, []);
+  // secrets-rotate.cjs builds its statement: for this table it is exactly the reseal.
+  const rotate = fs.readFileSync(path.join(__dirname, 'secrets-rotate.cjs'), 'utf8');
+  assert.match(rotate, /UPDATE \$\{table\} SET \$\{column\}=\? WHERE \$\{keys\.map\(\(k\) => `\$\{k\}=\?`\)\.join\(' AND '\)\} AND \$\{column\}=\?/);
 });

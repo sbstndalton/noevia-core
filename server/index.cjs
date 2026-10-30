@@ -1139,13 +1139,10 @@ const authRoutes = require('./routes/auth.cjs').createAuthRoutes({
   // POST /api/admin/secrets/rotate (CSRF-checked by the router like every signed-in POST).
   rotateSecrets: (actorId) => require('./secrets-rotate.cjs').runRotation({ secrets: secretStore, db: authService.db, dataDir: DATA_DIR, audit: authService.audit, actorId }),
 });
-// The user's own storage connection: read, save, test, browse, one folder, the Nextcloud login flow
-// (routes/storage.cjs). fetch is resolved per call: tests swap the global at runtime.
-// Saving the storage connection (PUT). The Nextcloud sign-in (its sealed pending flows), the folder
-// write and the connection test are the Rust front's (sbstndalton/noevia#2190).
-const storageRoutes = require('./routes/storage.cjs').createStorageRoutes({ json, readJson, authService, endpointApproved, fetch: (...args) => globalThis.fetch(...args),
-  storageLatch,
-});
+// The user's own storage connection is the Rust front's in full (reading, browsing, the folder write,
+// the test, the Nextcloud sign-in and the save, #1071/sbstndalton/noevia#2190): routes/storage.cjs
+// only refuses a request that bypassed it.
+const storageRoutes = require('./routes/storage.cjs').createStorageRoutes({ json });
 // The human's answer to a pending write (routes/approvals.cjs); the gate itself is approvals.cjs.
 const approvalRoutes = require('./routes/approvals.cjs').createApprovalRoutes({ json, readBody, pendingApprovals, requestScope });
 // The workspace view, free-chat metas, context meters and transcripts (routes/chat-lists.cjs); it also
@@ -1245,6 +1242,7 @@ async function handleRequestInner(req, res) {
   if (require('./rust-plugin-directory.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   if (require('./rust-decision-settings.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   if (require('./rust-storage-integrations.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
+  if (require('./rust-storage-connection.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   if (require('./rust-vault-mirror-preferences.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   await readyFeatures();
   const preAuth = requestAuth.authenticate(req);
@@ -1264,7 +1262,11 @@ async function handleRequestInner(req, res) {
   }) : null;
   if (workspace && preAuth.user.role === 'admin' && authService.diaryEnabled(preAuth.user.id) && fs.existsSync(path.join(workspace.dir, 'migration.json')) &&
       process.env.CORPUS_BACKEND === 'webdav' && authService.getStorage(preAuth.user.id).kind === 'local') {
-    authService.saveStorage(preAuth.user.id, { kind: 'webdav', baseUrl: process.env.WEBDAV_BASE_URL || '', username: process.env.WEBDAV_USERNAME || '', secret: process.env.WEBDAV_PASSWORD || '', corpusRoot: process.env.CORPUS_ROOT || '' });
+    // The Rust front saves the row (sbstndalton/noevia#2190 round 4), and only while the account still
+    // has none or a local one. A failure leaves the setup for the next request, as before.
+    try {
+      await PROJECT_STORE.storageLegacyWebdav(preAuth.user.id, { baseUrl: process.env.WEBDAV_BASE_URL || '', username: process.env.WEBDAV_USERNAME || '', secret: process.env.WEBDAV_PASSWORD || '', corpusRoot: process.env.CORPUS_ROOT || '' });
+    } catch (err) { console.warn(`legacy WebDAV storage setup was not saved (${err && err.code ? err.code : 'error'})`); }
   }
   const storeSaves = PROJECT_STORE ? [] : null;
   if (storeSaves) require('./project-store-client.cjs').holdForStoreSaves(res, storeSaves);

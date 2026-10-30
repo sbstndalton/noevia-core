@@ -8,13 +8,12 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
-const { Readable } = require('node:stream');
 const { AsyncLocalStorage } = require('node:async_hooks');
 const { createAuth } = require('./auth.cjs');
 const { createSecretStore } = require('./secrets.cjs');
 const { createDiary } = require('./diary.cjs');
-const { createStorageRoutes } = require('./routes/storage.cjs');
 const storageClient = require('./storage-client.cjs');
+const { saveStorageAsFront, frontRun } = require('../tests/server/storage-row-front.cjs');
 
 function authFixture(t) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'noevia-region-'));
@@ -29,25 +28,27 @@ function authFixture(t) {
         VALUES(?,?,?,?,'member','x',?,0,0)`).run(id, id, id, id, `w-${id}`);
     } finally { front.close(); }
   };
-  return { root, secrets, auth, addUser };
+  // The row is the Rust front's to write (sbstndalton/noevia#2190 round 4): saved as the front does.
+  const save = (id, value) => { saveStorageAsFront(root, secrets, id, value); return auth.getStorage(id); };
+  return { root, secrets, auth, addUser, save };
 }
 
 const S3 = { kind: 's3', baseUrl: 'https://s3.eu-west-1.example.test', bucket: 'synthetic', username: 'AKIDEXAMPLE', secret: 'synthetic-secret', corpusRoot: 'Diary' };
 
 test('region is saved, returned, and defaults for legacy rows and bad input', (t) => {
-  const { auth, addUser } = authFixture(t);
+  const { auth, addUser, save } = authFixture(t);
   addUser('u1'); addUser('u2');
-  assert.equal(auth.saveStorage('u1', { ...S3, region: 'eu-west-1' }).region, 'eu-west-1');
+  assert.equal(save('u1', { ...S3, region: 'eu-west-1' }).region, 'eu-west-1');
   assert.equal(auth.getStorage('u1', true).region, 'eu-west-1');
-  assert.equal(auth.saveStorage('u2', { ...S3 }).region, 'us-east-1');
-  assert.equal(auth.saveStorage('u2', { ...S3, region: 'EU WEST' }).region, 'us-east-1');
+  assert.equal(save('u2', { ...S3 }).region, 'us-east-1');
+  assert.equal(save('u2', { ...S3, region: 'EU WEST' }).region, 'us-east-1');
   assert.equal(auth.getStorage('nobody').region, 'us-east-1');
 });
 
 test('a pre-region database migrates with us-east-1 and keeps its secret', (t) => {
-  const { root, auth, addUser } = authFixture(t);
+  const { root, auth, addUser, save } = authFixture(t);
   addUser('u1');
-  auth.saveStorage('u1', { ...S3 });
+  save('u1', { ...S3 });
   auth.db.exec('ALTER TABLE storage_connections DROP COLUMN region');
   auth.db.close();
   const reopened = createAuth({ dataDir: root, publicOrigin: 'https://noevia.example.test', secrets: createSecretStore(root) });
@@ -57,9 +58,9 @@ test('a pre-region database migrates with us-east-1 and keeps its secret', (t) =
 });
 
 test('X-Cowork-Storage carries the saved region to the Diary sidecar', (t) => {
-  const { auth, addUser, root } = authFixture(t);
+  const { auth, addUser, root, save } = authFixture(t);
   addUser('u1');
-  auth.saveStorage('u1', { ...S3, region: 'ap-southeast-2' });
+  save('u1', { ...S3, region: 'ap-southeast-2' });
   const requestScope = new AsyncLocalStorage();
   const diary = createDiary({ fs, path, fetchJson: async () => ({}), DIARY_BASE: 'http://diary.invalid', DIARY_TOKEN: '', DIARY_SOURCE: 'sidecar',
     requestScope, authService: auth, endpointApproved: () => true, workspaceStore: { get: (id) => ({ userId: id, dir: path.join(root, id) }) } });
@@ -86,58 +87,34 @@ test('storage-client signs list, read and binary reads with the connection regio
   assert.deepEqual(seen, ['eu-central-1', 'eu-central-1', 'eu-central-1', 'us-east-1']);
 });
 
-function routeFixture(storage) {
-  const sent = [], saved = [], requests = [];
-  const routes = createStorageRoutes({
-    json: (res, status, body) => { sent.push({ status, body }); },
-    readJson: async (req) => { let s = ''; for await (const c of req) s += c; return s ? JSON.parse(s) : {}; },
-    authService: { getStorage: () => storage, saveStorage: (_id, body) => { saved.push(body); return body; } },
-    endpointApproved: () => true,
-    fetch: async (url, init) => { requests.push({ url, init }); return { ok: true, status: 200, json: async () => ({}) }; },
-  });
-  const call = (method, p, body) => {
-    const req = Readable.from([Buffer.from(JSON.stringify(body))]); req.method = method;
-    return routes(req, {}, { path: p, authn: { user: { id: 'u1', role: 'member' } } });
-  };
-  return { call, sent, saved, requests };
-}
-
-// The S3 probe (POST /test) and its region scope are the Rust front's since sbstndalton/noevia#2190
-// (noevia-rs tests/storage_integrations.rs); the save keeps its region rule here.
-test('an invalid region is refused on save', async () => {
-  const f = routeFixture({ ...S3, region: 'eu-west-2' });
-  await f.call('PUT', '/api/integrations/storage', { ...S3, region: 'eu west/1' });
-  assert.equal(f.sent.pop().status, 400);
-  assert.equal(f.saved.length, 0);
-  await f.call('PUT', '/api/integrations/storage', { ...S3, region: 'eu-west-1' });
-  assert.equal(f.saved[0].region, 'eu-west-1');
-});
+// The S3 probe (POST /test) and the save's region rule are the Rust front's since
+// sbstndalton/noevia#2190 (noevia-rs tests/storage_integrations.rs).
 
 test('storage secrets are bound to the account and never stored verbatim', (t) => {
-  const { auth, secrets, addUser } = authFixture(t);
+  const { auth, secrets, addUser, root, save } = authFixture(t);
   addUser('victim'); addUser('attacker');
-  auth.saveStorage('victim', { ...S3 });
+  save('victim', { ...S3 });
   const victimCipher = auth.db.prepare('SELECT secret FROM storage_connections WHERE user_id=?').get('victim').secret;
   assert.match(victimCipher, /^enc:v2:/);
   // Replaying the victim's ciphertext as a "secret" stores it as plaintext, not as a ciphertext.
-  auth.saveStorage('attacker', { ...S3, secret: victimCipher });
+  save('attacker', { ...S3, secret: victimCipher });
   assert.equal(auth.getStorage('attacker', true).secret, victimCipher);
   // Even a row forged to hold the victim's ciphertext does not decrypt for another account.
-  auth.db.prepare('UPDATE storage_connections SET secret=? WHERE user_id=?').run(victimCipher, 'attacker');
+  frontRun(root, 'UPDATE storage_connections SET secret=? WHERE user_id=?', victimCipher, 'attacker');
   assert.equal(auth.getStorage('attacker', true).secret, '');
   assert.equal(auth.getStorage('attacker').secretConfigured, false);
-  // A legacy v1 row still decrypts and is upgraded to v2 on read.
-  auth.db.prepare('UPDATE storage_connections SET secret=? WHERE user_id=?').run(secrets.encrypt('legacy-secret'), 'victim');
+  // A legacy v1 row still decrypts and is upgraded to v2 on read (the guard's one allowed reseal).
+  frontRun(root, 'UPDATE storage_connections SET secret=? WHERE user_id=?', secrets.encrypt('legacy-secret'), 'victim');
   assert.equal(auth.getStorage('victim', true).secret, 'legacy-secret');
   assert.match(auth.db.prepare('SELECT secret FROM storage_connections WHERE user_id=?').get('victim').secret, /^enc:v2:/);
   assert.equal(auth.getStorage('victim', true).secret, 'legacy-secret');
 });
 
 test('getStorage warns with the user id, never the secret, when decryption fails', (t) => {
-  const { auth, addUser } = authFixture(t);
+  const { auth, addUser, save, root } = authFixture(t);
   addUser('u1');
-  auth.saveStorage('u1', { ...S3 });
-  auth.db.prepare("UPDATE storage_connections SET secret='enc:v2:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA' WHERE user_id='u1'").run();
+  save('u1', { ...S3 });
+  frontRun(root, "UPDATE storage_connections SET secret='enc:v2:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA' WHERE user_id='u1'");
   const warned = [];
   t.mock.method(console, 'warn', (...a) => warned.push(a.join(' ')));
   assert.equal(auth.getStorage('u1', true).secret, '');
@@ -147,7 +124,7 @@ test('getStorage warns with the user id, never the secret, when decryption fails
 });
 
 test('encrypt callers re-save plaintext, so repeated saves never double-encrypt', (t) => {
-  const { root, secrets, auth, addUser } = authFixture(t);
+  const { root, secrets, auth, addUser, save } = authFixture(t);
   const { createWorkspaceStore } = require('./workspace.cjs');
   const WS_USER = '0b6c2d7e-1f4a-4c3b-9e8d-7a6b5c4d3e2f';
   const def = { id: 'default', label: 'Default', baseUrl: 'http://localhost', apiKey: '', shared: true };
@@ -159,8 +136,40 @@ test('encrypt callers re-save plaintext, so repeated saves never double-encrypt'
   reloaded.saveProviders();
   assert.equal(createWorkspaceStore(root, def, secrets, { projectStore: createStubStore(root) }).get(WS_USER).providers.find((p) => p.id === 'p1').apiKey, 'synthetic-key');
   addUser('u2');
-  auth.saveStorage('u2', { ...S3 });
+  save('u2', { ...S3 });
   auth.getStorage('u2', true);
-  auth.saveStorage('u2', { ...auth.getStorage('u2', true), bucket: 'renamed' });
+  save('u2', { ...auth.getStorage('u2', true), bucket: 'renamed' });
   assert.equal(auth.getStorage('u2', true).secret, 'synthetic-secret');
+});
+
+test('sbstndalton/noevia#2190 round 4: Node cannot write the storage row, but for the same-plaintext reseal', (t) => {
+  const { auth, secrets, addUser, root, save } = authFixture(t);
+  addUser('u1');
+  assert.equal(auth.saveStorage, undefined, 'saveStorage is gone');
+  save('u1', { ...S3 });
+  const refused = (e) => e.code === 'RUST_STORAGE_CONNECTION_OWNED' && e.status === 503;
+  for (const [sql, args] of [
+    ["INSERT INTO storage_connections(user_id,kind,base_url,bucket,region,username,secret,corpus_root,updated_at) VALUES('u1','local','','','us-east-1','','','',1)", []],
+    ['INSERT OR REPLACE INTO storage_connections(user_id,kind,base_url,bucket,region,username,secret,corpus_root,updated_at) VALUES(?,?,?,?,?,?,?,?,?)', ['u1', 'local', '', '', 'us-east-1', '', '', '', 1]],
+    ['UPDATE storage_connections SET secret=? WHERE user_id=?', ['x', 'u1']],
+    ['UPDATE storage_connections SET base_url=? WHERE user_id=? AND secret=?', ['x', 'u1', 'y']],
+    ['DELETE FROM storage_connections WHERE user_id=?', ['u1']],
+    ['UPDATE main."storage_connections" SET kind=? WHERE user_id=?', ['local', 'u1']],
+  ]) {
+    assert.throws(() => auth.db.prepare(sql).run(...args), refused, sql);
+  }
+  assert.throws(() => auth.db.prepare('DELETE FROM storage_connections').run(), refused);
+  assert.throws(() => auth.db.exec("UPDATE storage_connections SET kind='local'"), refused);
+  assert.equal(auth.getStorage('u1').kind, 's3');
+  // The reseal runs, and only replaces the value it read (compare-and-swap).
+  const { RESEAL_SQL } = require('./rust-storage-connection.cjs');
+  const before = auth.db.prepare('SELECT secret FROM storage_connections WHERE user_id=?').get('u1').secret;
+  assert.equal(auth.db.prepare(RESEAL_SQL).run(secrets.encrypt('synthetic-secret', 'u1'), 'u1', 'not-the-value').changes, 0);
+  assert.equal(auth.db.prepare('SELECT secret FROM storage_connections WHERE user_id=?').get('u1').secret, before);
+  // Reads are untouched.
+  assert.equal(auth.getStorage('u1', true).secret, 'synthetic-secret');
+  // A legacy row upgraded by getStorage keeps a front save that landed in between.
+  frontRun(root, 'UPDATE storage_connections SET secret=? WHERE user_id=?', secrets.encrypt('legacy-secret'), 'u1');
+  assert.equal(auth.getStorage('u1', true).secret, 'legacy-secret');
+  assert.match(auth.db.prepare('SELECT secret FROM storage_connections WHERE user_id=?').get('u1').secret, /^enc:v2:/);
 });

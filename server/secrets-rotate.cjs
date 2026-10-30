@@ -18,8 +18,12 @@ function sqlTable(db, name, { table, keys, column, bound }) {
       return db.prepare(`SELECT ${keys.join(',')}, ${column} AS value FROM ${table} WHERE ${column} IS NOT NULL AND ${column} != ''`).all()
         .map((r) => ({ ref: keys.map((k) => r[k]), value: r.value, userId: bound ? r.user_id : undefined }));
     },
-    write(ref, value) {
-      db.prepare(`UPDATE ${table} SET ${column}=? WHERE ${keys.map((k) => `${k}=?`).join(' AND ')}`).run(value, ...ref);
+    // Compare-and-swap on the value just read: the same plaintext under the current key, never a
+    // value another writer saved meanwhile (the Rust front writes storage_connections, #2190; for
+    // that table this is exactly rust-storage-connection.cjs RESEAL_SQL, the guard's one allowance).
+    write(ref, value, old) {
+      const changed = db.prepare(`UPDATE ${table} SET ${column}=? WHERE ${keys.map((k) => `${k}=?`).join(' AND ')} AND ${column}=?`).run(value, ...ref, old).changes;
+      if (!changed) throw new Error('changed while rotating; run the rotation again');
     },
   };
 }

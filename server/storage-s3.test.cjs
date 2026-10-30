@@ -63,18 +63,15 @@ test.before(async () => {
 
 const mutationHeaders = () => ({ origin: 'http://localhost', cookie, 'content-type': 'application/json', 'x-csrf-token': csrf });
 
-test('S3 storage connection round-trips bucket through the encrypted row', async () => {
+test('saving an S3 connection is the Rust front\'s: Node refuses it before reading the body (#2190 round 4)', async () => {
+  // The bucket/region round trip, the sealed secret and the reply (no secret) are asserted in
+  // noevia-rs tests/storage_integrations.rs (put_connection_validates_checks_and_saves).
   const saved = await request('/api/integrations/storage', {
     method: 'PUT', headers: mutationHeaders(),
     body: JSON.stringify({ kind: 's3', baseUrl: 'https://s3.example.com', bucket: 'my-bucket', username: 'AKIA...', secret: 'shhh', corpusRoot: 'Notes/Diary' }),
   });
-  assert.equal(saved.status, 200);
-  const savedBody = JSON.parse(saved.text);
-  assert.equal(savedBody.kind, 's3');
-  assert.equal(savedBody.bucket, 'my-bucket');
-  assert.equal(savedBody.secretConfigured, true);
-  assert.equal(savedBody.corpusRoot, 'Notes/Diary');
-  assert.ok(!('secret' in savedBody), 'the secret is never returned');
+  assert.equal(saved.status, 503);
+  assert.equal(JSON.parse(saved.text).code, 'RUST_STORAGE_CONNECTION_OWNED');
   // Reading the connection back (GET) is the Rust front's since #1071; Node refuses it.
   const fetched = await request('/api/integrations/storage', { headers: { cookie } });
   assert.equal(fetched.status, 503);

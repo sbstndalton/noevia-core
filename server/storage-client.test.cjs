@@ -414,6 +414,7 @@ async function request(url, { method = 'GET', headers = {}, body = '' } = {}) {
 
 let cookie = '';
 let csrf = '';
+let accountId = '';
 let sharedDav = null;
 
 test.before(async () => {
@@ -422,15 +423,26 @@ test.before(async () => {
   process.env.EMBEDDING_BASE_URL = `http://127.0.0.1:${sharedDav.port}/dav`;
   ({ handleRequest } = require('./index.cjs'));
   // Sign-in is the Rust front's (#1071): the account and its session are seeded directly.
-  ({ cookie, csrf } = require('../tests/server/seed-account.cjs').seedAccount(testDataDir, { username: 'admin', displayName: 'Admin', publicOrigin: 'http://localhost' }));
-  // Connect the fake WebDAV as the user's storage.
-  const save = await request('/api/integrations/storage', {
+  ({ cookie, csrf, id: accountId } = require('../tests/server/seed-account.cjs').seedAccount(testDataDir, { username: 'admin', displayName: 'Admin', publicOrigin: 'http://localhost' }));
+  // Connect the fake WebDAV as the user's storage. Saving it is the Rust front's (#2190 round 4):
+  // Node refuses the PUT, and the row is written as the front writes it.
+  const refused = await request('/api/integrations/storage', {
     method: 'PUT',
     headers: { origin: 'http://localhost', cookie, 'content-type': 'application/json', 'x-csrf-token': csrf },
     body: JSON.stringify({ kind: 'webdav', baseUrl: `http://127.0.0.1:${sharedDav.port}/dav`, username: 'u', secret: 'p', corpusRoot: 'Cowork' }),
   });
-  assert.equal(save.status, 200);
+  assert.equal(refused.status, 503);
+  assert.equal(JSON.parse(refused.text).code, 'RUST_STORAGE_CONNECTION_OWNED');
+  assert.equal((await saveStorage('webdav')).status, 200);
 });
+
+// The front's save of the shared fake DAV as `kind` (#2190 round 4: Rust is the row's only writer).
+async function saveStorage(kind) {
+  const { saveStorageAsFront } = require('../tests/server/storage-row-front.cjs');
+  saveStorageAsFront(testDataDir, require('./secrets.cjs').createSecretStore(testDataDir), accountId,
+    { kind, baseUrl: `http://127.0.0.1:${sharedDav.port}/dav`, username: 'u', secret: 'p', corpusRoot: 'Cowork' });
+  return { status: 200 };
+}
 
 const mutationHeaders = () => ({ origin: 'http://localhost', cookie, 'content-type': 'application/json', 'x-csrf-token': csrf });
 
@@ -515,7 +527,7 @@ test('a temporary folder failure preserves its sources, while explicit detachmen
 });
 
 test('#1429 at the route: a refresh without the Retry header is held after a refused login, and the Retry header runs and clears the hold', async (t) => {
-  const storage = kind => request('/api/integrations/storage', { method: 'PUT', headers: mutationHeaders(), body: JSON.stringify({ kind, baseUrl: `http://127.0.0.1:${sharedDav.port}/dav`, username: 'u', secret: 'p', corpusRoot: 'Cowork' }) });
+  const storage = saveStorage;
   t.after(async () => { await storage('webdav'); });
   assert.equal((await storage('nextcloud')).status, 200);
   const { tree, bodies, listingStatuses } = sharedDav;
@@ -559,7 +571,7 @@ test('#1429 at the route: a refresh without the Retry header is held after a ref
 });
 
 test('DAV HTTP listing failures retain attached project sources and cached originals (#1313)', async (t) => {
-  const storage = kind => request('/api/integrations/storage', { method: 'PUT', headers: mutationHeaders(), body: JSON.stringify({ kind, baseUrl: `http://127.0.0.1:${sharedDav.port}/dav`, username: 'u', secret: 'p', corpusRoot: 'Cowork' }) });
+  const storage = saveStorage;
   t.after(async () => { await storage('webdav'); });
   assert.equal((await storage('nextcloud')).status, 200);
   const { tree, bodies, listingStatuses } = sharedDav;
