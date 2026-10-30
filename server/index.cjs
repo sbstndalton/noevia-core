@@ -1243,6 +1243,7 @@ async function handleRequestInner(req, res) {
   if (require('./rust-decision-settings.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   if (require('./rust-storage-integrations.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   if (require('./rust-storage-connection.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
+  if (require('./rust-provider-test.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   if (require('./rust-vault-mirror-preferences.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   await readyFeatures();
   const preAuth = requestAuth.authenticate(req);

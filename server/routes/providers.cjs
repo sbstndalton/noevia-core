@@ -2,7 +2,7 @@
 // The provider registry's HTTP surface (providers.cjs holds the registry):
 //   GET    /api/providers        list, with keys masked
 //   POST   /api/providers        connect one (shared rows are admin-only)
-//   POST   /api/providers/test   probe an endpoint's /v1/models before saving it
+//   POST   /api/providers/test   the Rust front's (sbstndalton/noevia#2190 round 4, rust-provider-test.cjs)
 //   PUT    /api/providers/:id    edit one in place (#535); projects on it keep their provider/model
 //   DELETE /api/providers/:id    remove one; projects on it fall back to the default
 //   GET    /api/providers/:id/models[?refresh=1]  that provider's model ids (#1009), fetched with
@@ -274,33 +274,9 @@ function createProviderRoutes({ json, readBody, readJson, fetchJson, endpointApp
       if (shared) saveSharedProviders(id); else saveProviders();
       return json(res, 200, { id, label, baseUrl, defaultModel, apiKeyMasked: maskKey(apiKey), ...(context.value ? { contextTokens: context.value } : {}) });
     }
-    if (p === '/api/providers/test' && req.method === 'POST') {
-      const body = await readJson(req);
-      const baseUrl = String(body.baseUrl || '').trim().replace(/\/+$/, '');
-      if (!/^https?:\/\//.test(baseUrl)) return json(res, 400, { error: 'valid baseUrl required' });
-      if (baseUrl.length > MAX_BASE_URL) return json(res, 400, { error: 'baseUrl is too long' });
-      // Same SSRF guard as registration: the test route must not become a
-      // prober for internal addresses on behalf of a member.
-      if (!endpointApproved(authn, baseUrl)) {
-        return json(res, 400, { error: 'Provider origin is not approved for member connections; contact an administrator.' });
-      }
-      const headers = { 'Content-Type': 'application/json' };
-      let probeKey = String(body.apiKey || '');
-      // Editing (#535): with no key typed, an existing provider's stored key may be used, but only
-      // by someone allowed to edit that row and only against the same origin it is stored for.
-      if (!probeKey && typeof body.providerId === 'string' && body.providerId) {
-        const row = Array.from(PROVIDERS).find((pr) => pr.id === body.providerId);
-        if (row && !editRefusal(body.providerId, row, authn) && hasRealKey(row.apiKey) && originOf(baseUrl) !== null && originOf(row.baseUrl) === originOf(baseUrl)) probeKey = row.apiKey;
-      }
-      if (probeKey) headers.Authorization = `Bearer ${probeKey}`;
-      try {
-        // redirect:'error' — same rationale as the storage client: a member-
-        // registered endpoint must not bounce the request inward.
-        const result = await fetchJson(`${baseUrl.replace(/\/v1$/, '')}/v1/models`, { headers, redirect: 'error' }, 8000);
-        const models = modelIdsFrom(result.body, 100);
-        return json(res, result.ok ? 200 : 502, result.ok ? { ok: true, models } : { error: `provider returned ${result.status}` });
-      } catch (e) { return json(res, 502, { error: e.message }); }
-    }
+    // sbstndalton/noevia#2190 round 4: the probe is the Rust front's (rust-provider-test.cjs; normally
+    // refused before authentication). One that reaches this mount is a bypass.
+    if (p === '/api/providers/test' && req.method === 'POST') return json(res, 503, require('../rust-provider-test.cjs').ROUTE_REFUSAL);
     const provDel = p.match(/^\/api\/providers\/([^/]+)$/);
     if (provDel && req.method === 'PUT') {
       const id = decodeURIComponent(provDel[1]);

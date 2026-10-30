@@ -250,13 +250,14 @@ test('member cannot register a private-range provider', async () => {
   assert.match(JSON.parse(response.text).error, /approved/i);
 });
 
-test('member cannot probe a private target through the provider test route', async () => {
+test('the provider test route is the Rust front\'s: Node refuses it for a member (#2190 round 4)', async () => {
+  // The member-origin rule on the probe is asserted in noevia-rs tests/storage_integrations.rs.
   const response = await request('/api/providers/test', {
     method: 'POST', headers: memberHeaders(),
     body: JSON.stringify({ baseUrl: 'http://10.9.8.7:8080/v1' }),
   });
-  assert.equal(response.status, 400);
-  assert.match(JSON.parse(response.text).error, /approved/i);
+  assert.equal(response.status, 503);
+  assert.equal(JSON.parse(response.text).code, 'RUST_PROVIDER_TEST_OWNED');
 });
 
 test('member cannot register an unapproved public-IP provider', async () => {
@@ -277,9 +278,8 @@ test('admin is exempt from the denylist (local inference targets private address
   assert.ok(JSON.parse(response.text).id);
 });
 
-test('admin can still test a private target (same exemption)', async (t) => {
-  // Probe a disposable fixture, not an arbitrary host-local port. A 502 from
-  // the fixture proves that the request passed the member-origin guard.
+test('the provider test route is the Rust front\'s for an administrator too (#2190 round 4)', async (t) => {
+  // The administrator's exemption on the probe is asserted in noevia-rs tests/storage_integrations.rs.
   let probed = false;
   const server = http.createServer((_req, res) => { probed = true; res.writeHead(503); res.end('{}'); });
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
@@ -288,8 +288,9 @@ test('admin can still test a private target (same exemption)', async (t) => {
     method: 'POST', headers: adminHeaders,
     body: JSON.stringify({ baseUrl: `http://127.0.0.1:${server.address().port}/v1` }),
   });
-  assert.equal(response.status, 502);
-  assert.equal(probed, true);
+  assert.equal(response.status, 503);
+  assert.equal(JSON.parse(response.text).code, 'RUST_PROVIDER_TEST_OWNED');
+  assert.equal(probed, false);
 });
 
 // ── storage endpoints: same policy, more fetch points ────────────────────────

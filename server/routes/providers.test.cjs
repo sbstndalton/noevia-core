@@ -82,20 +82,12 @@ test('registering validates, guards the origin for members and saves to the righ
   assert.equal(f.providers.at(-1).shared, true);
 });
 
-test('the probe applies the same origin guard and returns the model ids', async () => {
-  const f = fixture();
-  await f.call('POST', '/api/providers/test', { baseUrl: 'nope' });
-  assert.deepEqual(f.sent.pop(), { status: 400, body: { error: 'valid baseUrl required' } });
-  await f.call('POST', '/api/providers/test', { baseUrl: 'http://192.168.1.2' });
-  assert.equal(f.sent.pop().status, 400);
+test('sbstndalton/noevia#2190 round 4: the probe is the Rust front\'s; a bypass is refused before anything', async () => {
+  // Its validation, origin guard, key reuse and failures are asserted in noevia-rs
+  // tests/storage_integrations.rs (provider_test_probes_with_node_rules).
+  const f = fixture({ probe: async () => assert.fail('a refused probe fetched') });
   await f.call('POST', '/api/providers/test', { baseUrl: 'https://approved.example/v1' });
-  assert.deepEqual(f.sent.pop(), { status: 200, body: { ok: true, models: ['m-a', 'm-b'] } });
-  const down = fixture({ probe: async () => ({ ok: false, status: 503, body: '' }) });
-  await down.call('POST', '/api/providers/test', { baseUrl: 'https://approved.example' });
-  assert.deepEqual(down.sent.pop(), { status: 502, body: { error: 'provider returned 503' } });
-  const broken = fixture({ probe: async () => { throw new Error('connect ECONNREFUSED'); } });
-  await broken.call('POST', '/api/providers/test', { baseUrl: 'https://approved.example' });
-  assert.deepEqual(broken.sent.pop(), { status: 502, body: { error: 'connect ECONNREFUSED' } });
+  assert.deepEqual(f.sent.pop(), { status: 503, body: { error: 'The provider test is owned by the Rust front.', code: 'RUST_PROVIDER_TEST_OWNED' } });
 });
 
 test('removal protects the default, keeps shared rows for admins, and detaches projects', async () => {
