@@ -27,8 +27,8 @@ jobs:
           repository: sbstndalton/noevia-rs
           # sbstndalton/noevia#2191 round 9: the front answers a project's configuration, its instruction skills, the
           # skill install and an account's deletion itself (this Core refuses them); acceptance input only. A head of
-          # the noevia-rs round 9 branch, which the merged PR contains (reachable from main).
-          ref: 8429ef09b8f376b78e46ec1cb18dac89b4b5795b
+          # the noevia-rs models round B branch, which the merged PR contains (reachable from main).
+          ref: 5f79d0d9f4260eb0a01c4dfa6d4f09292678e0dd
           path: rs
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
