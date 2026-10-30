@@ -98,46 +98,8 @@ test('#902: removeEmptyFolder stops reading an endless 207 after ~4 MB and never
   assert.deepEqual(seen.map((s) => s.method), ['PROPFIND'], 'no DELETE after a cut-off listing');
 });
 
-// ── #902: the Nextcloud login flow replies ─────────────────────────────────
-function storageRoutes(network) {
-  const { createStorageRoutes } = require('./routes/storage.cjs');
-  const sent = [];
-  const routes = createStorageRoutes({
-    json: (_res, status, body) => { sent.push({ status, body }); },
-    readJson: async (req) => { let s = ''; for await (const c of req) s += c; return s ? JSON.parse(s) : {}; },
-    authService: { getStorage: () => ({ kind: 'local' }), saveStorage: (_id, body) => ({ ok: true, kind: body.kind }) },
-    storageClient: { isBrowsable: () => false },
-    endpointApproved: () => true,
-    fetch: async (url, init) => network(String(url), init),
-    crypto: { randomUUID: () => 'flow-1' },
-  });
-  const call = (p, body) => {
-    const req = Readable.from([Buffer.from(JSON.stringify(body))]);
-    req.method = 'POST';
-    return routes(req, {}, { path: p, authn: { user: { id: 'u1', role: 'member' } } });
-  };
-  return { call, sent };
-}
-
-test('#902: an endless Nextcloud login/v2 reply is cut at 64 KB and answered 502', async () => {
-  const { stream, meter } = hugeBody(64 * MB, '{"login":"');
-  const f = storageRoutes(async () => new Response(stream, { status: 200 }));
-  await f.call('/api/integrations/storage/nextcloud/start', { baseUrl: 'https://cloud.invalid' });
-  assert.equal(f.sent.at(-1).status, 502);
-  assert.ok(meter.pulled <= 64 * 1024 + 2 * CHUNK, `pulled ${meter.pulled} bytes`);
-});
-
-test('#902: an endless Nextcloud poll reply is cut at 64 KB and answered 502', async () => {
-  const { stream, meter } = hugeBody(64 * MB, '{"server":"');
-  const f = storageRoutes(async (url) => (url.endsWith('/index.php/login/v2')
-    ? new Response(JSON.stringify({ login: 'https://cloud.invalid/login/flow/x', poll: { endpoint: 'https://cloud.invalid/login/v2/poll', token: 'synthetic' } }), { status: 200 })
-    : new Response(stream, { status: 200 })));
-  await f.call('/api/integrations/storage/nextcloud/start', { baseUrl: 'https://cloud.invalid' });
-  assert.equal(f.sent.at(-1).status, 200);
-  await f.call('/api/integrations/storage/nextcloud/poll', { flowId: 'flow-1' });
-  assert.deepEqual(f.sent.at(-1), { status: 502, body: { error: 'Nextcloud reply too large' } });
-  assert.ok(meter.pulled <= 64 * 1024 + 2 * CHUNK, `pulled ${meter.pulled} bytes`);
-});
+// ── #902: the Nextcloud login flow replies moved with the sign-in to the Rust front (sbstndalton/noevia#2190:
+// noevia-rs tests/storage_integrations.rs, the 64 KiB cap on the start and poll replies).
 
 // ── #903: chat.cjs provider bodies ──────────────────────────────────────────
 async function chatWith(t, fetch, reqBody) {

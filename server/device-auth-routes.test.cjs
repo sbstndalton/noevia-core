@@ -137,13 +137,24 @@ test('scope limits: a device token never reaches administration or account secur
     assert.equal(r.status, 503, `${method} ${url} -> ${r.status}`);
     assert.equal(r.json.code, 'RUST_FEATURES_OWNED', `${method} ${url}`);
   }
+  // Decision settings are the Rust front's too (#2190): refused before authentication.
+  const decision = await asDevice(tokens.access, '/api/admin/decision-settings', { method: 'GET' });
+  assert.equal(decision.status, 503);
+  assert.equal(decision.json.code, 'RUST_DECISION_SETTINGS_OWNED');
+  // The Nextcloud sign-in is the Rust front's too (#2190; its gate refuses device tokens the same way).
+  for (const url of ['/api/integrations/storage/nextcloud/start', '/api/integrations/storage/nextcloud/cancel']) {
+    const r = await asDevice(tokens.access, url, { method: 'POST', body: {} });
+    assert.equal(r.status, 503, `POST ${url} -> ${r.status}`);
+    assert.equal(r.json.code, 'RUST_STORAGE_INTEGRATIONS_OWNED', url);
+  }
+  // Saving the storage connection too (#2190 round 4; the front's gate refuses device tokens on it).
+  const save = await asDevice(tokens.access, '/api/integrations/storage', { method: 'PUT', body: { kind: 'local' } });
+  assert.equal(save.status, 503);
+  assert.equal(save.json.code, 'RUST_STORAGE_CONNECTION_OWNED');
   const refused = [
-    ['GET', '/api/admin/decision-settings'],
+    ['GET', '/api/admin/offsite-backup'],
     ['DELETE', `/api/admin/users/${memberId}`, { username: 'memberqa' }],
     ['POST', '/api/profile/diary-connectors', {}],
-    ['PUT', '/api/integrations/storage', { kind: 'local' }],
-    ['POST', '/api/integrations/storage/nextcloud/start', {}],
-    ['POST', '/api/integrations/storage/nextcloud/cancel', {}],
   ];
   for (const [method, url, body] of refused) {
     const r = await asDevice(tokens.access, url, { method, body });
@@ -152,7 +163,7 @@ test('scope limits: a device token never reaches administration or account secur
   }
   // The admin's own browser session still reads the administration routes Node answers, so the
   // refusals above are the device token's scope, not a closed route.
-  assert.equal((await admin.read('/api/admin/decision-settings')).status, 200);
+  assert.equal((await admin.read('/api/admin/offsite-backup')).status, 200);
   // The admin's own browser session no longer reads feature administration from Node either.
   const own = await admin.read('/api/admin/features');
   assert.equal(own.status, 503);
@@ -174,9 +185,10 @@ test('bearer tokens cannot carry cookies, and a cookie session cannot borrow a b
   assert.equal((await asDevice('nva_not-a-real-token', '/api/workspace')).status, 401);
   assert.equal((await asDevice(tokens.refresh, '/api/workspace')).status, 401, 'a refresh token is not an access token');
   assert.equal((await request(`/api/workspace?access_token=${tokens.access}`)).status, 401);
-  // The approval page is served while the feature is on.
+  // The approval page is the Rust front's (#2190): Node refuses it, feature on or off.
   const page = await request('/device');
-  assert.notEqual(page.status, 404);
+  assert.equal(page.status, 503);
+  assert.equal(page.json.code, 'RUST_PUBLIC_PAGES_OWNED');
 });
 
 test('F2: a device token cannot link connectors or change their tool policy', async () => {

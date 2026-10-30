@@ -129,7 +129,7 @@ test('M4_ENTRY/complete_original_index', { concurrency: false }, async t => {
     const { createAuth } = require('./auth.cjs');
     const secrets = createSecretStore(dir);
     // The genuine auth constructor (migrations), before index installs its own. No fake
-    // authenticate/getStorage/saveStorage implementation.
+    // authenticate/getStorage implementation.
     const realWarn = console.warn;
     try {
       console.warn = (...args) => {
@@ -147,8 +147,9 @@ test('M4_ENTRY/complete_original_index', { concurrency: false }, async t => {
     });
     assert.equal(auth.authenticate(request('/api/integrations/storage', { cookie }).req)?.user.id, id, 'M4_ENTRY/valid_identity');
     // Deliberately legacy plaintext/local state: if an early refusal moves after
-    // migration, actual getStorage can reseal and saveStorage can migrate it.
-    auth.db.prepare('INSERT INTO storage_connections(user_id,kind,secret,updated_at) VALUES(?,?,?,?)').run(id, 'local', 'synthetic-legacy-secret', 1);
+    // migration, actual getStorage can reseal and the legacy setup can migrate it. The row is the
+    // Rust front's to write (sbstndalton/noevia#2190 round 4), so it is seeded on its connection.
+    require('../tests/server/storage-row-front.cjs').frontRun(dir, 'INSERT INTO storage_connections(user_id,kind,secret,updated_at) VALUES(?,?,?,?)', id, 'local', 'synthetic-legacy-secret', 1);
     const workspace = path.join(dir, 'users', id);
     fs.mkdirSync(workspace, { recursive: true, mode: 0o700 });
     fs.writeFileSync(path.join(workspace, 'migration.json'), '{"version":1,"source":"synthetic"}', { flag: 'wx', mode: 0o600 });
@@ -191,9 +192,14 @@ test('M4_ENTRY/complete_original_index', { concurrency: false }, async t => {
     });
 
     await t.test('M4_ENTRY/method_and_path_neighbors_keep_auth_gate', async () => {
-      for (const method of ['HEAD', 'PUT', 'POST', 'OPTIONS', 'DELETE', 'get']) {
+      for (const method of ['HEAD', 'POST', 'OPTIONS', 'DELETE', 'get']) {
         assert.equal((await invoke('/api/integrations/storage', { method })).status, 401, 'M4_ENTRY/method_not_owned');
       }
+      // sbstndalton/noevia#2190 round 4: the save is the front's, refused before identity too.
+      const put = await invoke('/api/integrations/storage', { method: 'PUT' });
+      assert.equal(put.status, 503, 'M4_ENTRY/save_owned');
+      assert.equal(put.body.code, 'RUST_STORAGE_CONNECTION_OWNED', 'M4_ENTRY/save_owned');
+      assert.deepEqual(put.reads, [], 'M4_ENTRY/save_pre_identity');
       for (const target of ['/api/integrations/storage/', '/api/integrations/storage/files', '/api/integrations/%73torage', '/api/integrations/storage-other']) {
         assert.equal((await invoke(target)).status, 401, 'M4_ENTRY/path_not_owned');
       }

@@ -21,6 +21,7 @@ const rm = require('./routing-modes.cjs');
 const qualification = require('./decision-qualification.cjs');
 const { createDecisions } = require('./decision/index.cjs');
 const { createDecisionSettings } = require('./decision-settings.cjs');
+const { rustSavesDecision } = require('../tests/server/rust-decision-row.cjs');
 const { createDecisionEndpoint } = require('./decision-endpoint.cjs');
 const { createApprovals } = require('./approvals.cjs');
 
@@ -60,7 +61,7 @@ async function fakeService(t, answer) {
 function productionCheck(url, extra = {}) {
   const kv = new Map();
   const settings = createDecisionSettings({ store: { get: (k) => kv.get(k), set: (k, v) => kv.set(k, v) }, env: {} });
-  settings.save({ url, timeoutMs: 1500 }, 'admin');
+  rustSavesDecision({ set: (k, v) => kv.set(k, v) }, { url, timeoutMs: 1500 });
   const decisions = createDecisions({ backends: { configured: settings.backend() }, chains: { 'routing.sensitivity': ['configured'] } });
   const logs = [];
   const check = rm.createSensitivity({ decide: decisions.decide, log: (e) => logs.push(e), ...extra });

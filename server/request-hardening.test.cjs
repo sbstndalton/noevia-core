@@ -133,9 +133,12 @@ test('#781: parseCookies keeps a malformed value raw and still decodes the rest'
 
 test('#786: a JSON body of null is a 400 on every route that reads its body', async () => {
   // The sign-in and account routes in this list moved to the Rust front (#1071).
+  // Saving the storage connection is the Rust front's (#2190 round 4; its null-body 400 is asserted in
+  // noevia-rs tests/storage_integrations.rs): Node refuses it before reading the body.
+  const storage = await request('/api/integrations/storage', { method: 'PUT', headers: writeHeaders(), body: 'null' });
+  assert.equal(storage.status, 503);
+  assert.equal(JSON.parse(storage.text).code, 'RUST_STORAGE_CONNECTION_OWNED');
   const routes = [
-    ['PUT', '/api/integrations/storage', writeHeaders()],
-    ['POST', '/api/integrations/storage/folder', writeHeaders()],
     ['POST', '/api/profile/diary-connectors', writeHeaders()],
   ];
   for (const [method, url, headers] of routes) {

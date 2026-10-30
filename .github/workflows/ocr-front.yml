@@ -25,8 +25,8 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           repository: sbstndalton/noevia-rs
-          # Reviewed sbstndalton/noevia#1273 upload-bound fix; acceptance input only.
-          ref: 00885e594c77c529f9fd034064852faf104ce5ea
+          # Reviewed sbstndalton/noevia#2191 project lifecycle (the front owns project create); acceptance input only.
+          ref: 47f7f10f36ef71d65d5e20ba7f35f58e51943921
           path: rs
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:

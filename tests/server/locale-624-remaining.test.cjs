@@ -112,11 +112,18 @@ test('decision-service reasons, test messages and refusals have a key in every l
   assert.ok(endpoint.includes(core.translate('en-GB', 'features.unavailable.decisionUrl')));
   assert.ok(settings.includes(core.translate('en-GB', 'features.unavailable.decisionSetup')));
   assert.ok(router.includes(core.translate('en-GB', 'features.unavailable.systemOneUrl')));
-  const messageIds = [...settings.matchAll(/messageId:'(\w+)'/g)].map((m) => m[1]).sort();
-  assert.deepEqual(messageIds, ['invalidInput', 'invalidModel', 'invalidUrl', 'notReady', 'ready']);
-  for (const id of messageIds) {
+  // #2190: the save and the connection test are the Rust front's (noevia-rs
+  // bins/noevia-server/src/decision_settings_routes.rs); these are the exact English strings it sends.
+  const sent = {
+    invalidInput: 'Enter a private decision-service URL and a deadline from 100 to 2000 ms.',
+    invalidModel: 'Choose a decision model from the list, or automatic.',
+    invalidUrl: 'Use a private HTTP address such as http://192.168.1.20:8040, with no path, login or query string.',
+    notReady: 'The decision service is not ready or could not be reached. Check the URL and service status.',
+    ready: 'Decision service is ready. No inference was run.',
+  };
+  for (const [id, english] of Object.entries(sent)) {
     for (const l of ['en-GB', ...Object.keys(FILES)]) assert.ok(has(l, `decision.msg.${id}`), `${l} decision.msg.${id}`);
-    assert.ok(settings.includes(core.translate('en-GB', `decision.msg.${id}`)), `the server's English for ${id} is the catalogue's`);
+    assert.equal(core.translate('en-GB', `decision.msg.${id}`), english, `the server's English for ${id} is the catalogue's`);
   }
   assert.equal(core.translate('de-DE', 'decision.msg.ready'), 'Der Entscheidungsdienst ist bereit. Es wurde keine Inferenz ausgeführt.');
   // #1499: the address a refusal offers as an example is one the server accepts, in every locale.

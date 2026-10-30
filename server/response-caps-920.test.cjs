@@ -78,13 +78,12 @@ test('plugin directory: an endless SKILL.md is cut at 32 KiB and refused with th
   within(meter, 32 * 1024);
 });
 
-test('plugin directory: an endless registry listing is cut at 4 MB and answered 502', async () => {
-  const { createPluginDirectoryRoutes } = require('./routes/plugin-directory.cjs');
+test('plugin directory: an endless registry listing is cut at 4 MB and refused with a 502', async () => {
+  // The listing route is the Rust front's (#2190, its 4 MiB cap tested there); the registry lookup
+  // the MCP directory route still uses keeps the same cap here.
+  const { findRegistryServer } = require('./routes/plugin-directory.cjs');
   const { stream, meter } = hugeBody(64 * MB, '{"servers":[');
-  const sent = [];
-  const routes = createPluginDirectoryRoutes({ json: (_res, status, body) => sent.push({ status, body }), fetchImpl: async () => new Response(stream) });
-  await routes({ method: 'GET', url: '/api/plugins/directory?kind=mcp' }, {}, { path: '/api/plugins/directory', url: new URL('http://l/api/plugins/directory?kind=mcp') });
-  assert.equal(sent.at(-1).status, 502);
+  await assert.rejects(() => findRegistryServer('synthetic/server', { fetchImpl: async () => new Response(stream) }), (e) => e.status === 502);
   within(meter, 4 * MB);
 });
 

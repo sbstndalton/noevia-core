@@ -117,6 +117,8 @@ function writeTargets(sql) {
   for (const m of clean.matchAll(WRITE_RE)) {
     const table = unquote(m[1]);
     if (table === 'set') continue; // ON CONFLICT DO UPDATE SET
+    // sbstndalton/noevia#2190 round 4: the storage row's one allowed statement is matched exactly.
+    if (table === 'storage_connections') { out.push(Object.defineProperty({ table, key: null }, 'sql', { value: raw })); continue; }
     if (table !== 'settings') { out.push({ table, key: null }); continue; }
     const k = SETTING_KEY_RE.exec(raw);
     out.push(Object.defineProperty({ table, key: k ? (k[1] ?? k[2]) : null }, 'sql', { value: raw }));
@@ -163,6 +165,17 @@ const FRONT_SETTING_KEYS = Object.freeze({
   routing_modes_allowed: ['Routing settings are owned by the Rust front.', 'RUST_ROUTING_MODE_OWNED'],
   reasoning_effort_default: ['Reasoning settings are written by the Rust front', 'RUST_REASONING_SETTINGS_OWNED'],
   auto_sampling_presets_enabled: ['Sampling settings are written by the Rust front', 'RUST_SAMPLING_SETTINGS_OWNED'],
+  // #2190: Settings -> Models -> Decision service; decision-settings.cjs only re-reads it.
+  'decision:configuration': ['Decision settings are owned by the Rust front.', 'RUST_DECISION_SETTINGS_OWNED'],
+});
+// Tables only the Rust front writes, each refused with its own code even inside exempt(); `allowed`
+// is the one exact statement Node may still run on it.
+const FRONT_TABLES = Object.freeze({
+  storage_connections: Object.freeze({
+    message: require('./rust-storage-connection.cjs').ROUTE_REFUSAL.error,
+    code: require('./rust-storage-connection.cjs').ROUTE_REFUSAL.code,
+    allowed: require('./rust-storage-connection.cjs').RESEAL_SQL,
+  }),
 });
 /** The guard. It takes no options: Rust always owns these tables (sbstndalton/noevia#1071). */
 function createRustAuthGuard() {
@@ -180,6 +193,12 @@ function createRustAuthGuard() {
   }
 
   function checkOne(target, args) {
+    // sbstndalton/noevia#2190 round 4: the Rust front is the only writer of the storage connection
+    // (rust-storage-connection.cjs); refused even inside exempt(), but for the same-plaintext reseal.
+    if (Object.hasOwn(FRONT_TABLES, target.table) && String(target.sql || '').trim().replace(/;$/, '').trim() !== FRONT_TABLES[target.table].allowed) {
+      const { message, code } = FRONT_TABLES[target.table];
+      throw Object.assign(new Error(message), { status: 503, code });
+    }
     if (['device_authorizations','device_grants','device_tokens'].includes(target.table) || (exemptDepth === 0 && OWNED_TABLES.has(target.table))) refuse(target.table);
     if (target.table === 'settings') {
       const key = singleSettingKey(target.sql, args);
@@ -265,4 +284,4 @@ function createRustAuthGuard() {
   };
 }
 
-module.exports = { createRustAuthGuard, ownedRoute, refuseOwned, OWNED_ROUTES, ROUTE_REFUSAL, writeTarget, writeTargets, OWNED_TABLES, OWNED_SETTING_KEYS, FRONT_SETTING_KEYS };
+module.exports = { createRustAuthGuard, ownedRoute, refuseOwned, OWNED_ROUTES, ROUTE_REFUSAL, writeTarget, writeTargets, OWNED_TABLES, OWNED_SETTING_KEYS, FRONT_SETTING_KEYS, FRONT_TABLES };

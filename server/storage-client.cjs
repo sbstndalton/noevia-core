@@ -2,7 +2,7 @@
 
 // Browse/read access to a user's connected external storage, for pulling
 // knowledge files into projects (and any future consumer of the same
-// capability). Uses the connection shapes stored by authService.saveStorage:
+// capability). Uses the connection shapes the Rust front stores (auth.cjs getStorage reads them):
 //   { kind: 'webdav'|'nextcloud', baseUrl, username, secret, corpusRoot }
 //   { kind: 's3', baseUrl (endpoint), bucket, username, secret, corpusRoot }
 //   { kind: 'local' }  -> not browsable (it is this server's own disk; files

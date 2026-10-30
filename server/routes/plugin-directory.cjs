@@ -1,16 +1,11 @@
 'use strict';
 const { readCappedText, readCappedJson } = require('../http.cjs');
-// GET /api/plugins/directory?kind=mcp|skills&q=  -> { items, source }   any signed-in user
-//
-// Read-only browsing of what other people publish: MCP servers from the public MCP registry
-// and skills from Anthropic's public skills repository. Only these two fixed hosts are ever
-// fetched, the query is the only user input, and nothing is installed from here.
-const SOURCES = {
-  mcp: { label: 'MCP registry', home: 'https://registry.modelcontextprotocol.io' },
-  skills: { label: 'anthropics/skills on GitHub', home: 'https://github.com/anthropics/skills' },
-};
-const TTL = 60 * 60 * 1000;
-const STARTERS = (() => { const { mcp, skills } = require('../plugin-starters.json'); return { mcp, skills }; })();
+// The plugin directory library the Node-owned routes still use. GET /api/plugins/directory itself
+// (the MCP registry and skills listings, the starters, the cache) is the Rust front's
+// (sbstndalton/noevia#2190, noevia-rs bins/noevia-server plugin_directory_routes.rs; Node refuses it
+// in rust-plugin-directory.cjs). What stays: `findRegistryServer` and `mcpItems` for adding a
+// directory MCP server (routes/mcp-directory.cjs), `RESERVED_HEADERS` for its header names, and
+// `fetchPublishedSkill` for a project skill (routes/projects.cjs). Only fixed hosts are fetched.
 
 // A hosted server noevia can add as-is: a streamable-HTTP remote at a fixed https URL that needs
 // no sign-in headers. Anything else (a package to run here, SSE, templated URLs, API keys) is
@@ -86,76 +81,9 @@ function mcpItems(body) {
   }));
 }
 
-function skillItems(body) {
-  return (Array.isArray(body) ? body : []).filter((d) => d?.type === 'dir' && typeof d.name === 'string').map((d) => ({
-    id: d.name,
-    name: d.name.replace(/[-_]+/g, ' ').replace(/^./, (c) => c.toUpperCase()),
-    publisher: 'Anthropic',
-    description: '',
-    version: '',
-    url: typeof d.html_url === 'string' && d.html_url.startsWith('https://github.com/') ? d.html_url : '',
-    remote: false,
-  }));
-}
-
 // A directory listing of 40 servers or one repo's skill folders; 4 MB is far above that (#920).
 const DIRECTORY_CAP = 4 * 1024 * 1024;
 
-function createPluginDirectoryRoutes({ json, fetchImpl = globalThis.fetch, now = () => Date.now() }) {
-  const cache = new Map();
-  async function load(kind, q) {
-    const key = `${kind}:${q}`;
-    const hit = cache.get(key);
-    if (hit && now() - hit.at < TTL) return hit.items;
-    const url = kind === 'mcp'
-      ? `https://registry.modelcontextprotocol.io/v0/servers?limit=40${q ? `&search=${encodeURIComponent(q)}` : ''}`
-      : 'https://api.github.com/repos/anthropics/skills/contents/skills';
-    const r = await fetchImpl(url, { headers: { accept: 'application/json', 'user-agent': 'noevia' }, redirect: 'error', signal: AbortSignal.timeout(8000) });
-    if (!r.ok) throw Object.assign(new Error(`The directory answered ${r.status}`), { status: 502 });
-    const listing = await readCappedJson(r, DIRECTORY_CAP);
-    let items = kind === 'mcp' ? mcpItems(listing) : skillItems(listing);
-    if (kind === 'skills' && q) items = items.filter((i) => i.name.toLowerCase().includes(q.toLowerCase()));
-    if (cache.size > 200) cache.clear();
-    cache.set(key, { at: now(), items });
-    return items;
-  }
-  /** noevia's curated starters (plugin-starters.json), each resolved against the live directory. */
-  async function starters(kind) {
-    const key = `starters:${kind}`;
-    const hit = cache.get(key);
-    if (hit && now() - hit.at < TTL) return hit.items;
-    const picks = STARTERS[kind];
-    let found;
-    if (kind === 'skills') {
-      const all = await load('skills', '');
-      found = picks.map((p) => all.find((i) => i.id === p.id)).map((item, n) => item && { ...item, why: picks[n].why });
-    } else {
-      found = await Promise.all(picks.map(async (p) => {
-        const item = await findRegistryServer(p.id, { fetchImpl }).catch(() => null);
-        return item && { ...item, why: p.why };
-      }));
-    }
-    const items = found.filter(Boolean);
-    cache.set(key, { at: now(), items });
-    return items;
-  }
-  return async function pluginDirectoryRoutes(req, res, { path, url }) {
-    if (path !== '/api/plugins/directory') return false;
-    if (req.method !== 'GET') return json(res, 405, { error: 'method not allowed' }), true;
-    const params = url?.searchParams ?? new URL(req.url, 'http://local').searchParams;
-    const kind = params.get('kind') === 'skills' ? 'skills' : 'mcp';
-    const q = String(params.get('q') || '').trim().slice(0, 80);
-    if (params.get('starters') === '1') {
-      try { return json(res, 200, { items: await starters(kind), source: SOURCES[kind] }), true; }
-      catch { return json(res, 502, { error: 'The directory could not be reached right now.', source: SOURCES[kind] }), true; }
-    }
-    try {
-      return json(res, 200, { items: await load(kind, q), source: SOURCES[kind] }), true;
-    } catch (error) {
-      return json(res, 502, { error: 'The directory could not be reached right now.', source: SOURCES[kind] }), true;
-    }
-  };
-}
 /**
  * Fetch one published skill's SKILL.md (only SKILL.md: scripts and assets are never fetched or
  * run). Fixed host, validated name, 32 KiB cap, and the result must be valid skill frontmatter.
@@ -180,4 +108,4 @@ async function findRegistryServer(name, { fetchImpl = globalThis.fetch } = {}) {
   return mcpItems(await readCappedJson(r, DIRECTORY_CAP)).find((i) => i.id === name) || null;
 }
 
-module.exports = { createPluginDirectoryRoutes, mcpItems, skillItems, fetchPublishedSkill, findRegistryServer, installable, RESERVED_HEADERS, fallbackServerName };
+module.exports = { mcpItems, fetchPublishedSkill, findRegistryServer, installable, RESERVED_HEADERS, fallbackServerName };

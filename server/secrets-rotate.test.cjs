@@ -1,4 +1,5 @@
 'use strict';
+const { saveStorageAsFront, frontRun } = require('../tests/server/storage-row-front.cjs');
 // Secrets-key rotation (#111): the previous key still decrypts, rotate() re-encrypts every
 // stored credential kind under the current key (and upgrades plaintext), is idempotent and
 // counts bad rows instead of aborting; an unreadable token reports "needs re-auth"; the
@@ -66,9 +67,11 @@ test('rotate re-encrypts every stored kind, upgrades plaintext, counts failures,
   createMcpOAuth({ db, secrets: old, urlAllowed: async () => true, redirectUri: () => 'https://noevia.example.test/cb' });
   createDirectoryMcp({ db, secrets: old });
   const S3 = { kind: 's3', baseUrl: 'https://s3.example.test', bucket: 'b', username: 'AKID', corpusRoot: 'x' };
-  auth.saveStorage(U1, { ...S3, secret: 'storage-one' });
-  auth.saveStorage(U2, { ...S3, secret: 'x' });
-  db.prepare('UPDATE storage_connections SET secret=? WHERE user_id=?').run('plain-storage-two', U2); // legacy plaintext
+  // The storage row is the Rust front's to write (sbstndalton/noevia#2190 round 4); the rotation
+  // below runs on the guarded connection, whose one allowed statement is the CAS reseal.
+  saveStorageAsFront(root, old, U1, { ...S3, secret: 'storage-one' });
+  saveStorageAsFront(root, old, U2, { ...S3, secret: 'x' });
+  frontRun(root, 'UPDATE storage_connections SET secret=? WHERE user_id=?', 'plain-storage-two', U2); // legacy plaintext
   db.prepare('INSERT INTO mcp_oauth_tokens VALUES(?,?,?,?)').run(U1, 'srv', old.encrypt(JSON.stringify({ access_token: 'tok-1' }), U1), 0);
   db.prepare('INSERT INTO mcp_oauth_tokens VALUES(?,?,?,?)').run(U2, 'srv', 'enc:v2:garbage', 0);
   db.prepare('INSERT INTO mcp_oauth_clients VALUES(?,?,?)').run('srv', old.encrypt(JSON.stringify({ clientId: 'c' })), 0);
@@ -126,13 +129,13 @@ test('an undecryptable token or storage secret reports needs re-auth, not connec
   assert.equal(oauth.status(U1, 'ok'), 'connected');
   assert.equal(oauth.status(U1, 'none'), 'disconnected');
 
-  auth.saveStorage(U1, { kind: 's3', baseUrl: 'https://s3.example.test', username: 'a', secret: 'x' });
-  auth.db.prepare('UPDATE storage_connections SET secret=? WHERE user_id=?').run(foreign.encrypt('x', U1), U1);
+  saveStorageAsFront(root, secrets, U1, { kind: 's3', baseUrl: 'https://s3.example.test', username: 'a', secret: 'x' });
+  frontRun(root, 'UPDATE storage_connections SET secret=? WHERE user_id=?', foreign.encrypt('x', U1), U1);
   const st = auth.getStorage(U1);
   assert.equal(st.secretConfigured, false);
   assert.equal(st.secretNeedsReauth, true);
   // A plaintext secret is upgraded to v2 on the next read.
-  auth.db.prepare('UPDATE storage_connections SET secret=? WHERE user_id=?').run('plain', U1);
+  frontRun(root, 'UPDATE storage_connections SET secret=? WHERE user_id=?', 'plain', U1);
   assert.equal(auth.getStorage(U1, true).secret, 'plain');
   assert.match(auth.db.prepare('SELECT secret FROM storage_connections WHERE user_id=?').get(U1).secret, /^enc:v2:/);
 });
@@ -157,4 +160,24 @@ test('POST /api/admin/secrets/rotate is administrator-only and runs the rotation
   assert.deepEqual(ran, ['u-admin']);
   await call('admin', 'GET');
   assert.equal(sent.at(-1).status, 404);
+});
+
+test('sbstndalton/noevia#2190 round 4: a rotation never overwrites a value saved after it read the row', (t) => {
+  const root = tmp(t);
+  const secrets = createSecretStore(root, noPrev);
+  const auth = createAuth({ dataDir: root, publicOrigin: 'https://noevia.example.test', secrets });
+  seedUsers(root, [[U1, U1]]);
+  saveStorageAsFront(root, null, U1, { kind: 'webdav', baseUrl: 'https://dav.example.test', username: 'a', secret: 'plain-old' });
+  const { rotationTables } = require('./secrets-rotate.cjs');
+  const table = rotationTables({ db: auth.db, dataDir: root }).find((x) => x.name === 'storage_connections');
+  const [row] = table.rows();
+  assert.equal(row.value, 'plain-old');
+  // The front saves a new connection between the rotation's read and its write.
+  saveStorageAsFront(root, secrets, U1, { kind: 'webdav', baseUrl: 'https://dav.example.test', username: 'a', secret: 'newer' });
+  assert.throws(() => table.write(row.ref, secrets.encrypt('plain-old', U1), row.value), /changed while rotating/);
+  assert.equal(auth.getStorage(U1, true).secret, 'newer');
+  // With the value unchanged the reseal lands, on the guarded connection.
+  const [now] = table.rows();
+  table.write(now.ref, secrets.encrypt('newer', U1), now.value);
+  assert.equal(auth.getStorage(U1, true).secret, 'newer');
 });

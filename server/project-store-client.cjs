@@ -244,6 +244,14 @@ function createClient({ port, token, fetchImpl = globalThis.fetch, timeoutMs = T
       if (status === 409 && body && body.code === 'CHAT_LISTED') return { deleted: false, swept: false, leftovers: 0, listed: true };
       throw historyFailure(status, body);
     },
+    /** sbstndalton/noevia#2190 round 4: the legacy WebDAV storage setup, saved by the Rust front (the
+     *  only writer of storage_connections) only while the account has no row or a local one.
+     *  { saved }. Throws the store's failure otherwise. */
+    async storageLegacyWebdav(user, { baseUrl = '', username = '', secret = '', corpusRoot = '' } = {}) {
+      const { status, body } = await call('storage/legacy-webdav', { user, baseUrl: String(baseUrl), username: String(username), secret: String(secret), corpusRoot: String(corpusRoot) });
+      if (status === 200 && body && typeof body.saved === 'boolean') return { saved: body.saved };
+      throw failure(status, body);
+    },
     /** sbstndalton/noevia#2153: the user's chat change journal after `after` (chat-change-journal.cjs):
      *  { entries, oldestSeq, latestSeq, more, start }, or { unsupported: true } from a store
      *  without the op (404: an older Rust front). */

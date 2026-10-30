@@ -31,6 +31,7 @@ const { MARKER } = require('../../server/contract-record.cjs');
 const { MODEL, SERVER, GUARD, startMocks, serverEnv } = require('./mocks.cjs');
 const { seedAccount } = require('../../tests/server/seed-account.cjs');
 const { startProjectStore } = require('../../tests/server/project-store-server.cjs');
+const { createProjectAs } = require('../../tests/server/front-projects.cjs');
 // Synthetic accounts for a throwaway data dir; the recorder writes their cookies as placeholders only.
 const ADMIN = { username: 'synthetic-admin', displayName: 'Synthetic Admin' };
 const MEMBER = { username: 'synthetic-member', displayName: 'Synthetic Member', role: 'member' };
@@ -177,9 +178,13 @@ async function main() {
     await step(noCsrf, 'POST', '/api/projects', { name: 'no csrf' });
 
     // Projects.
-    const created = await step(admin, 'POST', '/api/projects', { name: 'Synthetic project', goal: 'Contract corpus', instructions: 'Answer briefly.', model: MODEL, files: [{ name: 'notes.md', content: '# Synthetic notes\n\nAlpha beta gamma.' }] }, [200, 201]);
-    const projectId = created.json?.id || created.json?.project?.id;
-    if (!projectId) throw new Error(`project id missing from ${created.text.slice(0, 200)}`);
+    // A project's create and delete are the Rust front's (sbstndalton/noevia#2191): Node refuses them
+    // before auth, and their exchanges stay in the noevia-rs corpus recorded at its core.ref. The
+    // project is seeded the way the front's create writes it (tests/server/front-projects.cjs).
+    const projectBody = { name: 'Synthetic project', goal: 'Contract corpus', instructions: 'Answer briefly.', model: MODEL, files: [{ name: 'notes.md', content: '# Synthetic notes\n\nAlpha beta gamma.' }] };
+    const createRefused = await step(admin, 'POST', '/api/projects', projectBody, [503]);
+    if (createRefused.json?.code !== 'RUST_PROJECT_LIFECYCLE_OWNED') throw new Error('Expected the Rust project lifecycle ownership refusal.');
+    const projectId = createProjectAs(dataDir, seeded.admin.id, projectBody).id;
     await step(admin, 'GET', '/api/workspace', undefined, [200]);
     await step(admin, 'POST', `/api/projects/${encodeURIComponent(projectId)}/config`, { instructions: 'Answer very briefly.' });
 
@@ -211,9 +216,9 @@ async function main() {
 
     for (const [method, p, body] of WRITE_PROBES) await step(admin, method, p, body);
 
-    // Clean-up is part of the contract too. A chat's delete is the Rust front's (#1071 slice 6; its
-    // exchange stays in the noevia-rs corpus): the project delete below removes the chat with it.
-    await step(admin, 'DELETE', `/api/projects/${encodeURIComponent(projectId)}`);
+    // Clean-up is part of the contract too. A chat's delete (#1071 slice 6) and the project delete
+    // (#2191) are the Rust front's: Node refuses the delete below, and its exchange stays in the noevia-rs corpus.
+    await step(admin, 'DELETE', `/api/projects/${encodeURIComponent(projectId)}`, undefined, [503]);
     await step(admin, 'GET', '/api/workspace', undefined, [200]);
     if (memberId) await step(admin, 'DELETE', `/api/admin/users/${encodeURIComponent(memberId)}`, { username: MEMBER.username });
 

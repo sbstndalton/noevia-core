@@ -175,7 +175,14 @@ test('the front\'s worker call streams accepted, progress and the synchronous re
   assert.equal(done.status, 200, JSON.stringify(out));
   assert.equal(done.body.document.state, 'ready');
   assert.ok(out.slice(1, -1).every((l) => typeof l.stage === 'string'));
-  assert.deepEqual(stored.documentOriginal(testDataDir, p.id, 'statement.pdf').bytes, fixture('text.pdf'));
+  // projects.json reaches disk through the project store just after the result is streamed (it raced
+  // the store write in CI on main), so the stored original is awaited, bounded at 2 s.
+  let original = null;
+  for (let i = 0; i < 200 && !original?.bytes; i++) {
+    original = stored.documentOriginal(testDataDir, p.id, 'statement.pdf');
+    if (!original.bytes) await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  assert.deepEqual(original.bytes, fixture('text.pdf'));
   // A refusal before the work is taken is a plain JSON answer the front passes on.
   const ghost = await work('/api/projects/ghost-project/upload', { name: 'x.txt' });
   assert.equal(ghost.status, 404);
