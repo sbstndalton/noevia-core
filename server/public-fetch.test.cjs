@@ -224,64 +224,8 @@ test('wiring refuses a publicFetch it cannot use rather than silently skipping i
   }), /withFetch/);
 });
 
-// ── OAuth endpoints of a directory server (mcp-oauth.cjs gets the same fetch) ──
-
-async function oauthFixture(t, { tokenHost = '127.0.0.1', pad = 0 } = {}) {
-  const crypto = require('node:crypto');
-  const codes = new Map();
-  const hits = [];
-  const server = http.createServer((req, res) => {
-    let raw = '';
-    req.on('data', (c) => { raw += c; });
-    req.on('end', () => {
-      hits.push(req.url);
-      const base = `http://127.0.0.1:${server.address().port}`;
-      const json = (o, st = 200) => { res.writeHead(st, { 'content-type': 'application/json' }); res.end(JSON.stringify(o)); };
-      if (req.url === '/.well-known/oauth-protected-resource/mcp') return json({ resource: `${base}/mcp`, authorization_servers: [`${base}/as`] });
-      if (req.url === '/.well-known/oauth-authorization-server/as') {
-        return json({ ...(pad ? { pad: 'x'.repeat(pad) } : {}), issuer: `${base}/as`, authorization_endpoint: `${base}/as/authorize`, token_endpoint: `http://${tokenHost}:${server.address().port}/as/token`, registration_endpoint: `${base}/as/register`, code_challenge_methods_supported: ['S256'] });
-      }
-      if (req.url === '/as/register') return json({ client_id: 'client-1' }, 201);
-      if (req.url === '/as/token') {
-        const q = new URLSearchParams(raw);
-        const ok = req.headers['content-type'].startsWith('application/x-www-form-urlencoded')
-          && crypto.createHash('sha256').update(q.get('code_verifier') || '').digest('base64url') === codes.get(q.get('code'));
-        return ok ? json({ access_token: 'AT-1', expires_in: 3600 }) : json({ error: 'invalid_grant' }, 400);
-      }
-      return json({}, 404);
-    });
-  });
-  await new Promise((r) => server.listen(0, '127.0.0.1', r));
-  t.after(() => { server.closeAllConnections?.(); return new Promise((r) => server.close(r)); });
-  return { port: server.address().port, hits, codes };
-}
-function oauthWith(publicFetch) {
-  const Database = require('better-sqlite3');
-  const secrets = { encrypt: (v) => 'enc:' + Buffer.from(v).toString('base64'), decrypt: (v) => Buffer.from(v.slice(4), 'base64').toString() };
-  return require('./mcp-oauth.cjs').createMcpOAuth({ db: new Database(':memory:'), secrets, fetchImpl: publicFetch, urlAllowed: async () => true, redirectUri: () => 'https://noevia.example/api/mcp-oauth/callback' });
-}
-async function signIn(oauth, fx) {
-  const url = new URL(await oauth.start({ userId: 'u1', serverId: 'dir-x', serverUrl: `http://127.0.0.1:${fx.port}/mcp` }));
-  const code = `CODE-${Math.random()}`;
-  fx.codes.set(code, url.searchParams.get('code_challenge'));
-  await oauth.finish({ userId: 'u1', state: url.searchParams.get('state'), code });
-}
-
-test('OAuth sign-in to a directory server works through the public fetch (QA loopback)', async (t) => {
-  const fx = await oauthFixture(t);
-  const oauth = oauthWith(createPublicFetch({ allowLoopbackLiteral: true }));
-  await signIn(oauth, fx);
-  assert.equal(await oauth.tokenFor('u1', 'dir-x'), 'AT-1');
-  assert.ok(fx.hits.includes('/as/token'));
-});
-
-test('an OAuth endpoint whose name resolves privately is refused at connect', async (t) => {
-  // The metadata names its token endpoint by a name ("localhost") that resolves to loopback.
-  const fx = await oauthFixture(t, { tokenHost: 'localhost' });
-  const oauth = oauthWith(createPublicFetch({ allowLoopbackLiteral: true }));
-  await assert.rejects(signIn(oauth, fx), { code: 'EPRIVATEADDR' });
-  assert.equal(fx.hits.includes('/as/token'), false);
-});
+// The OAuth endpoints of a directory server are the Rust front's since sbstndalton/noevia#2202 (their
+// guarded fetch and cases are noevia-rs tests/mcp_credentials.rs and src/mcp_egress.rs).
 
 // ── a hostile server cannot crash the process ────────────────────────────
 
@@ -322,13 +266,4 @@ test('a throw while building the Response rejects the request and is never uncau
   globalThis.Response = RealResponse;
   await new Promise((r) => setImmediate(r));
   assert.deepEqual(uncaught, []);
-});
-
-test('an OAuth metadata body past the size cap is treated as no metadata', async (t) => {
-  // Valid metadata in every respect except its size: under the cap it signs in, over it it does not.
-  const small = await oauthFixture(t, { pad: 100 * 1024 });
-  await signIn(oauthWith(createPublicFetch({ allowLoopbackLiteral: true })), small);
-  const big = await oauthFixture(t, { pad: 300 * 1024 });
-  await assert.rejects(oauthWith(createPublicFetch({ allowLoopbackLiteral: true })).start({ userId: 'u1', serverId: 'dir-x', serverUrl: `http://127.0.0.1:${big.port}/mcp` }), /did not describe itself/);
-  assert.equal(big.hits.includes('/as/register'), false);
 });

@@ -141,3 +141,30 @@ test('M3: a Diary preference written elsewhere (the Rust front) shows at once: i
   await f.get(A, '?projectId=pa&mode=chat');
   assert.equal(f.calls.length, 2, 'a changed preference is not served from the old entry');
 });
+
+test('#2202: the key is given the project asked about, so a project edit made by the Rust front shows at once', async () => {
+  const projects = { pa: ['search'], pb: ['search'] };
+  const seen = [];
+  const f = permittedFixture({ cacheKeyExtra: (authn, projectId) => { seen.push([authn.user.id, projectId]); return projects[projectId] ?? null; } });
+  await f.get(A, '?projectId=pa&mode=chat');
+  await f.get(A, '?projectId=pa&mode=chat');
+  assert.equal(f.calls.length, 1);
+  assert.deepEqual(seen.at(-1), [A.id, 'pa']);
+  projects.pa = ['search', 'files']; // PUT /api/projects/pa is the front's: nothing here cleared the cache
+  await f.get(A, '?projectId=pa&mode=chat');
+  assert.equal(f.calls.length, 2, 'the project\'s new toolboxes are not served from the old entry');
+  await f.get(A, '?projectId=pb&mode=chat');
+  assert.equal(f.calls.length, 3, 'another project is another entry');
+  await f.get(A, '?mode=chat');
+  assert.deepEqual(seen.at(-1), [A.id, null], 'a project-less view asks with no project');
+});
+
+test('#2202: index.cjs keys the view on the project\'s selection, the connected connectors and the MCP readiness', () => {
+  const index = require('node:fs').readFileSync(require('node:path').join(__dirname, '..', 'index.cjs'), 'utf8');
+  const at = index.indexOf('cacheKeyExtra: (authn, projectId) => {');
+  assert.ok(at > 0);
+  const body = index.slice(at, index.indexOf('},\n', at));
+  for (const needle of ['authService.diaryEnabled(authn.user.id)', 'connectedBoxes(authn.user)', 'mcpCredentials.signal()', 'mcpState.discoveredAt', 'project.toolsMode', 'project.docsToolboxDefaulted', 'project.toolboxes', 'getProject(projectId)']) {
+    assert.ok(body.includes(needle), needle);
+  }
+});

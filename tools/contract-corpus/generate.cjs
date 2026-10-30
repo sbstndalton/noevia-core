@@ -79,7 +79,7 @@ async function waitReady(base, child) {
 // GETs for client paths no scenario step reaches; {x} params are filled from the run. The Rust
 // front's permanent routes (sbstndalton/noevia#1071: sign-in and the account, usage, stats,
 // sampling, routing mode and default, ChatGPT status, the provider registry's list and writes since
-// #2190 round 6, storage metadata/list/read, export, and since
+// #2190 round 6, the MCP keys and sign-ins since #2202, storage metadata/list/read, export, and since
 // #2185 the Diary source, today, storage-import and workspace export/import) are not
 // Node's to record any more;
 // their exchanges stay in the noevia-rs corpus recorded at its contracts/http/core.ref.
@@ -88,7 +88,7 @@ const PROBES = [
   '/api/admin/decision-settings', '/api/admin/features', '/api/admin/mcp-directory', '/api/admin/web-address',
   '/api/auto-roles', '/api/chat-framing/preferences', '/api/chat-vault-mirror/preferences', '/api/code/active',
   '/api/connectors', '/api/connectors/nextcloud/policy', '/api/diary', '/api/diary-connector', '/api/diary/storage-status',
-  '/api/mcp-keys/servers', '/api/mcp-oauth/servers', '/api/model-manager',
+  '/api/model-manager',
   '/api/models/autotune', '/api/models/autotune/settings', '/api/models/autotune/untuned', '/api/models/calibration', '/api/models/capabilities', '/api/models/evidence',
   '/api/models/hardware', '/api/models/inference-budget', '/api/models/installed', '/api/plugins/directory',
   '/api/profile/diary-connectors', '/api/profile/sharing',
