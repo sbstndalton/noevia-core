@@ -1,7 +1,10 @@
 'use strict';
+// What a chat turn needs of a project's instruction skills: inspecting a file, the manifests and the
+// pinned invocation, the enabled list and the reconcile that every save runs. The routes that list, enable and
+// install skills and serve their manifests are the Rust front's (sbstndalton/noevia#2191 round 9,
+// rust-project-config.cjs; noevia-rs crates/server-projects instruction_skills.rs applies the same rules).
 const crypto = require('node:crypto');
 const sourceText = require('./source-text.cjs');
-const { formatSkillIndex } = require('./skill-index.cjs');
 const MAX_BODY = 32768;
 const hash = content => crypto.createHash('sha256').update(String(content || '')).digest('hex');
 const owns = (obj, key) => Object.prototype.hasOwnProperty.call(obj || {}, key);
@@ -103,16 +106,6 @@ function manifests(project, knownToolboxes = []) {
     };
   });
 }
-function resolve(project, id, version, knownToolboxes = []) {
-  const manifest = manifests(project, knownToolboxes).find(s => s.id === id);
-  if (!manifest) throw Object.assign(Error('No such instruction skill in this project.'), { status: 404 });
-  if (!/^[a-f0-9]{64}$/.test(String(version || ''))) throw Object.assign(Error('A SHA-256 version is required.'), { status: 400 });
-  if (manifest.version !== version || manifest.status !== 'enabled') throw Object.assign(Error('The skill changed, is disabled, or awaits review.'), { status: 409 });
-  if (manifest.requirements.scripts.length) throw Object.assign(Error(SCRIPTS_REFUSED), { status: 422 });
-  if (!manifest.resolvable) throw Object.assign(Error('This skill declares unsupported toolbox requirements.'), { status: 422 });
-  const file = (project.files || []).find(f => f.name === manifest.file);
-  return { manifest, content: file.content };
-}
 // Explicit, version-pinned invocation (#272). A pin names one Skill by its project-scoped id and
 // one exact artifact by SHA-256: `skill_<id>@<sha256>` or `{ id, version, contentHash }`, where
 // `version` is either the SHA-256 manifest version or the human label (then `contentHash` is
@@ -187,15 +180,6 @@ function revoked(current, loaded) {
 // Whether a pinned record ({ file, contentHash, name }) is still the enabled, reviewed content of `current`.
 const pinActive = (current, record) => !!record?.file && SHA.test(String(record.contentHash || '')) &&
   revoked(current, new Map([[record.file, { hash: record.contentHash, name: record.name }]])).length === 0;
-// The Sources list (GET/PUT /instruction-skills), with the portable id, origin and bundled scripts
-// so the web client shows where each skill came from and why it cannot be invoked.
-function listForClient(project, knownToolboxes = []) {
-  const byFile = new Map(manifests(project, knownToolboxes).map(m => [m.file, m]));
-  return list(project).map(row => {
-    const m = byFile.get(row.file);
-    return { ...row, id: m?.id, origin: m?.origin, scripts: m?.requirements.scripts || [] };
-  });
-}
 function enabled(project) { return list(project).filter(skill => skill.status === 'enabled'); }
 // The files a chat may read: not an unreviewed skill, and not an unreadable original (#586).
 function sources(project) { return (project.files || []).filter(file => !inspect(file, project) && !require('./source-readability.cjs').isUnreadable(file)); }
@@ -212,23 +196,6 @@ function reconcile(project) {
   }
   project.instructionSkills = next;
   return before !== JSON.stringify(next);
-}
-function setSelection(project, body) {
-  if (typeof body.file !== 'string' || typeof body.enabled !== 'boolean') throw Object.assign(Error('File and enabled boolean required.'), { status: 400 });
-  const skill = list(project).find(s => s.file === body.file);
-  if (!skill) throw Object.assign(Error('No such instruction skill in this project.'), { status: 404 });
-  if (body.enabled && !skill.valid) throw Object.assign(Error(skill.error), { status: 400 });
-  if (body.enabled && body.hash !== skill.hash) throw Object.assign(Error('The file changed. Inspect the current version before enabling it.'), { status: 409 });
-  // #567: chat never runs Skill scripts, so a skill that bundles any can never be used there. Refuse
-  // to enable it (rather than show "Enabled" for something no chat can load); disabling stays allowed.
-  if (body.enabled) {
-    const scripts = assets(project, body.file).filter(a => a.executable).map(a => a.file);
-    if (scripts.length) throw Object.assign(Error(`${SCRIPTS_REFUSED} Bundled scripts: ${scripts.join(', ')}.`), { status: 422, code: 'skill_scripts_unsupported' });
-  }
-  const next = { ...project, instructionSkills: { ...project.instructionSkills,
-    [body.file]: { enabled: body.enabled, reviewedHash: body.enabled ? skill.hash : (project.instructionSkills?.[body.file]?.reviewedHash || skill.hash), reviewedAt: Date.now() } } };
-  if (formatSkillIndex(enabled(next)).includes('additional skill metadata entries omitted')) throw Object.assign(Error('Enabled skill metadata exceeds the context limit. Disable another skill first.'), { status: 400 });
-  project.instructionSkills = next.instructionSkills;
 }
 function read(project, file, current = project, offset = 0, cap = 8000) {
   const skill = inspect(file, project);
@@ -254,4 +221,4 @@ function snapshot(project) {
   copy.files = project.files.map((f) => sourceText.cloneFile(f));
   return copy;
 }
-module.exports = { snapshot, inspect, list, listForClient, enabled, sources, reconcile, setSelection, read, hash, skillId, manifests, assets, resolve, parsePin, resolvePinned, unmetRequirements, revoked, pinActive, MAX_BODY };
+module.exports = { snapshot, inspect, list, enabled, sources, reconcile, read, hash, skillId, manifests, assets, parsePin, resolvePinned, unmetRequirements, revoked, pinActive, MAX_BODY };

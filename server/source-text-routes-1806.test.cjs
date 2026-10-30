@@ -88,17 +88,9 @@ test('#2191: Node refuses the per-source text read, signed in or not; the front 
   }
 });
 
-test('#1806: a config save listing sources without text (the web client\'s remove and add) keeps the others as they are', async () => {
+test('#1806: the config save that lists sources without text is the Rust front\'s (#2191 round 9; noevia-rs config.rs keeps the others as they are)', async () => {
   const project = (await workspace()).projects.find((p) => p.name === 'Synthetic 1806');
-  // The web client removes docs/plan.txt and adds a picked file: it sends what it holds, metadata for the rest.
-  const files = [...project.files.filter((f) => f.name !== 'docs/plan.txt'), { name: 'picked.md', content: 'picked synthetic text' }];
-  const saved = await request(`/api/projects/${project.id}/config`, { method: 'POST', headers: mutation(), body: JSON.stringify({ files }) });
-  assert.equal(saved.status, 200, saved.text);
-  const after = (await workspace()).projects.find((p) => p.id === project.id);
-  assert.deepEqual(after.files.map((f) => f.name), ['notes.md', 'picked.md']);
-  assert.equal(stored.sourceText(testDataDir, project.id, 'notes.md').json.content, NOTES, 'the kept source keeps its text');
-  assert.equal(stored.sourceText(testDataDir, project.id, 'picked.md').json.content, 'picked synthetic text');
-  // A metadata-only entry naming no held source is not a source.
-  await request(`/api/projects/${project.id}/config`, { method: 'POST', headers: mutation(), body: JSON.stringify({ files: [...after.files, { name: 'ghost.md' }] }) });
-  assert.deepEqual((await workspace()).projects.find((p) => p.id === project.id).files.map((f) => f.name), ['notes.md', 'picked.md']);
+  const saved = await request(`/api/projects/${project.id}/config`, { method: 'POST', headers: mutation(), body: JSON.stringify({ files: project.files }) });
+  assert.deepEqual([saved.status, JSON.parse(saved.text).code], [503, 'RUST_PROJECT_CONFIG_OWNED']);
+  assert.deepEqual((await workspace()).projects.find((p) => p.id === project.id).files.map((f) => f.name), ['notes.md', 'docs/plan.txt']);
 });

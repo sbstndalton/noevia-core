@@ -39,7 +39,7 @@ test('an owned request is refused with a 503 before its body is read; the rest f
 });
 
 test('the dead Node handler is gone, and so are the uploads and the sync (round 8)', () => {
-  const routes = fs.readFileSync(path.join(__dirname, 'routes', 'projects.cjs'), 'utf8');
+  const routes = ''; assert.equal(fs.existsSync(path.join(__dirname, 'routes', 'projects.cjs')), false, 'no project route file is left (#2191 round 9)');
   assert.equal(routes.includes('projDocs'), false);
   assert.equal(routes.includes('upload|documents|sources'), false, 'no background wrapper for the documents path');
   assert.equal(routes.includes('documentSources.ingest('), false, 'no extraction in the project routes any more');
@@ -94,6 +94,6 @@ test('through the router: the document upload is refused signed out and signed i
   const users = path.join(dataDir, 'users');
   const documents = fs.existsSync(users) ? fs.readdirSync(users).filter((u) => fs.existsSync(path.join(users, u, 'project-documents'))) : [];
   assert.deepEqual(documents, [], 'no original or result was written');
-  // Positive control: the project config is still Node's (no such project).
-  assert.equal((await request('/api/projects/p1/config', { method: 'POST', headers: as(admin), body: {} })).status, 404);
+  // Positive control: the browser route (chat-bound) is still Node's (no such project; the config is the front's since round 9).
+  assert.equal((await request('/api/projects/p1/browser', { method: 'POST', headers: as(admin), body: {} })).status, 404);
 });

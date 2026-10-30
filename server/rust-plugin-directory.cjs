@@ -8,7 +8,7 @@
 //
 // What stays in routes/plugin-directory.cjs is the library the Node-owned routes still use: the
 // registry lookup and item mapping for adding a directory MCP server (routes/mcp-directory.cjs)
-// and the SKILL.md fetch for a project skill (routes/projects.cjs).
+// (the SKILL.md fetch for a project skill moved with the install route, #2191 round 9).
 const OWNED_PATHS = Object.freeze(['/api/plugins/directory']);
 const ROUTE_REFUSAL = Object.freeze({ error: 'The plugin directory is owned by the Rust front.', code: 'RUST_PLUGIN_DIRECTORY_OWNED' });
 

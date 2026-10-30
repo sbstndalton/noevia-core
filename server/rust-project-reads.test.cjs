@@ -47,7 +47,7 @@ test('what Node keeps is not refused: the page reader, writes, other segments an
 });
 
 test('the dead Node handlers are gone', () => {
-  const routes = fs.readFileSync(path.join(__dirname, 'routes', 'projects.cjs'), 'utf8');
+  const routes = ''; assert.equal(fs.existsSync(path.join(__dirname, 'routes', 'projects.cjs')), false, 'no project route file is left (#2191 round 9)');
   for (const gone of ['sourceTextRoute', 'originalUpload', 'documentSources.readOriginal', '(pages|original)']) assert.equal(routes.includes(gone), false, gone);
   assert.equal(require('./source-text.cjs').textMissingNow, undefined);
 });
@@ -101,6 +101,6 @@ test('through the router: the owned GETs are refused signed out and signed in; N
   }
   // Positive controls: Node's gate (the page reader is the front's since #2191 round 4,
   // rust-project-document-pages.test.cjs).
-  assert.equal((await request('/api/projects/p1/config', { method: 'POST', body: '{}' })).status, 401, 'signed out');
+  assert.equal((await request('/api/projects/p1/browser', { method: 'POST', body: '{}' })).status, 401, 'signed out');
   assert.equal((await request('/api/projects/p1/sources/text', { method: 'POST', headers: as(admin), body: '{}' })).status, 404);
 });

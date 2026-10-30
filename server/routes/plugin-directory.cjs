@@ -1,11 +1,12 @@
 'use strict';
-const { readCappedText, readCappedJson } = require('../http.cjs');
+const { readCappedJson } = require('../http.cjs');
 // The plugin directory library the Node-owned routes still use. GET /api/plugins/directory itself
 // (the MCP registry and skills listings, the starters, the cache) is the Rust front's
 // (sbstndalton/noevia#2190, noevia-rs bins/noevia-server plugin_directory_routes.rs; Node refuses it
 // in rust-plugin-directory.cjs). What stays: `findRegistryServer` and `mcpItems` for adding a
-// directory MCP server (routes/mcp-directory.cjs), `RESERVED_HEADERS` for its header names, and
-// `fetchPublishedSkill` for a project skill (routes/projects.cjs). Only fixed hosts are fetched.
+// directory MCP server (routes/mcp-directory.cjs) and `RESERVED_HEADERS` for its header names. The SKILL.md
+// fetch for a project skill moved with the install route (#2191 round 9, rust-project-config.cjs). Only
+// fixed hosts are fetched.
 
 // A hosted server noevia can add as-is: a streamable-HTTP remote at a fixed https URL that needs
 // no sign-in headers. Anything else (a package to run here, SSE, templated URLs, API keys) is
@@ -84,20 +85,6 @@ function mcpItems(body) {
 // A directory listing of 40 servers or one repo's skill folders; 4 MB is far above that (#920).
 const DIRECTORY_CAP = 4 * 1024 * 1024;
 
-/**
- * Fetch one published skill's SKILL.md (only SKILL.md: scripts and assets are never fetched or
- * run). Fixed host, validated name, 32 KiB cap, and the result must be valid skill frontmatter.
- */
-async function fetchPublishedSkill(name, { fetchImpl = globalThis.fetch } = {}) {
-  if (!/^[a-z0-9][a-z0-9-]{0,79}$/.test(String(name || ''))) throw Object.assign(new Error('Unknown skill'), { status: 400 });
-  const r = await fetchImpl(`https://raw.githubusercontent.com/anthropics/skills/main/skills/${name}/SKILL.md`, { headers: { 'user-agent': 'noevia' }, redirect: 'error', signal: AbortSignal.timeout(8000) });
-  if (r.status === 404) throw Object.assign(new Error('That skill has no SKILL.md'), { status: 404 });
-  if (!r.ok) throw Object.assign(new Error('The skills repository could not be reached right now.'), { status: 502 });
-  const { text: content, capped } = await readCappedText(r, 32768);
-  if (capped) throw Object.assign(new Error('That skill is larger than the 32 KiB limit for project skills.'), { status: 422 });
-  return content;
-}
-
 /** Look one server up in the public registry by its exact name; returns the mapped item or null. */
 async function findRegistryServer(name, { fetchImpl = globalThis.fetch } = {}) {
   if (typeof name !== 'string' || !name || name.length > 200) return null;
@@ -108,4 +95,4 @@ async function findRegistryServer(name, { fetchImpl = globalThis.fetch } = {}) {
   return mcpItems(await readCappedJson(r, DIRECTORY_CAP)).find((i) => i.id === name) || null;
 }
 
-module.exports = { mcpItems, fetchPublishedSkill, findRegistryServer, installable, RESERVED_HEADERS, fallbackServerName };
+module.exports = { mcpItems, findRegistryServer, installable, RESERVED_HEADERS, fallbackServerName };

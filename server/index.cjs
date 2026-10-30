@@ -589,6 +589,7 @@ const projectCatalogue = require('./project-catalogue.cjs').createCataloguePubli
   dataDir: DATA_DIR,
   current: () => ({
     selectable: sanitizeToolboxes(allToolboxes().map((b) => b.id)) || [],
+    known: allToolboxes().map((b) => b.id),
     defaults: DEFAULT_TOOLBOXES,
     icons: Object.keys(require('../contracts/project-icons.json')),
   }),
@@ -1122,17 +1123,13 @@ const chatRoutes = require('./routes/chat.cjs').createChatRoutes({
   },
 });
 
-// Project configuration and the Diary context (routes/projects.cjs); uploads, documents and the folder sync are the front's (#2191).
+// A project's configuration and instruction skills, its uploads, documents and folder sync, the Diary context and an
+// account's deletion are the Rust front's (#2191, #2190): there is no project route mount left here.
 // #1429: one hold per account, shared with the front's project source refresh and this process's Diary backup worker.
 // sbstndalton/noevia#2190: the Rust front's folder write and connection test prove a saved login
 // through storage-login-proofs.json, re-read when it changes.
 // #2191 round 8: the hold is UI_DATA_DIR/storage-latch.db, shared with the front's project source sync.
 const storageLatch = require('./storage-latch.cjs').createStorageLatch({ file: require('node:path').join(DATA_DIR, 'storage-latch.db'), proofOf: require('./rust-storage-integrations.cjs').createProofReader(DATA_DIR) });
-const projectRoutes = require('./routes/projects.cjs').createProjectRoutes({
-  json, readBody, readJson, requestScope, dispatch: (req, res) => handleRequestScoped(req, res), currentWorkspace, authService, storageClient, documents, documentSources, rag, fs, path,
-  reasoningEffort, projectAppearance, diaryExtras, PROJECTS, DEFAULT_TOOLBOXES, sanitizeToolboxes, allToolboxes, getProvider, ensureRolesLoaded, servedCatalogue, DEFAULT_PROVIDER_ID, store: projectStore,
-  onToolboxesChange: () => permittedToolsCache.clear(),
-});
 // What is left of the provider registry's mount (routes/providers.cjs): the registry itself is the
 // Rust front's (rust-providers.cjs), so this answers only the other methods on the Sign in with
 // ChatGPT paths (chatgptOAuth, built beside mcpOAuth above) and refuses a bypass.
@@ -1322,6 +1319,8 @@ async function handleRequestInner(req, res) {
   if (require('./rust-source-jobs.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   // And the project source operations themselves: the upload, the folder sync and the folder import's plan (#2191 round 8).
   if (require('./rust-project-source-work.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
+  // And a project's configuration, its instruction skills and a published skill's install (#2191 round 9).
+  if (require('./rust-project-config.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   // And the two read-only sizing reads (#2189): GET /api/models/estimate and /api/models/preset/suggest.
   if (require('./rust-model-sizing.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   // #2190: the public pages and the device approval page, and the plugin directory.
@@ -1412,7 +1411,6 @@ async function handleRequestScoped(req, res) {
     if (authn && p.startsWith('/api/projects/') && await researchRoutes(req, res, { path: p, authn })) return;
     if (authn && (p === '/api/code/active' || p.startsWith('/api/projects/')) && await codeRoutes(req, res, { path: p, authn })) return;
     if (authn && p.startsWith('/api/projects/') && await browserRoutes(req, res, { path: p, authn })) return;
-    if (await projectRoutes(req, res, { path: p, authn, url })) return;
     if (await authRoutes.account(req, res, { path: p, authn })) return;
     if (await storageRoutes(req, res, { path: p, authn })) return;
     if (await approvalRoutes(req, res, { path: p, authn })) return;

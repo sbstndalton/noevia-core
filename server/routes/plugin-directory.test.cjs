@@ -2,7 +2,7 @@
 const test = require('node:test');
 const assert = require('node:assert');
 // GET /api/plugins/directory is the Rust front's (#2190; its listing, cache and starters are tested
-// there). These cover the mapping and lookups the Node-owned MCP directory and project skill routes use.
+// there). These cover the mapping and lookups the Node-owned MCP directory route uses.
 const { mcpItems, fallbackServerName, findRegistryServer } = require('./plugin-directory.cjs');
 
 test('maps both registry shapes and drops non-https links', () => {
@@ -61,14 +61,3 @@ test('the registry lookup reads only the fixed registry host and finds the exact
   } finally { if (prior !== undefined) process.env.NOEVIA_QA_MCP_REGISTRY = prior; }
 });
 
-test('a published skill is fetched from the fixed raw host only, by a validated name, within 32 KiB', async () => {
-  const { fetchPublishedSkill } = require('./plugin-directory.cjs');
-  const urls = [];
-  const ok = (text, status = 200) => async (u) => { urls.push(u); return { ok: status < 300, status, text: async () => text }; };
-  assert.equal(await fetchPublishedSkill('frontend-design', { fetchImpl: ok('---\nname: x\n---') }), '---\nname: x\n---');
-  assert.equal(urls[0], 'https://raw.githubusercontent.com/anthropics/skills/main/skills/frontend-design/SKILL.md');
-  for (const bad of ['../etc', 'a/b', '', 'X'.repeat(3), 'a b']) await assert.rejects(fetchPublishedSkill(bad, { fetchImpl: ok('') }), /Unknown skill/);
-  await assert.rejects(fetchPublishedSkill('big', { fetchImpl: ok('x'.repeat(40000)) }), /32 KiB/);
-  await assert.rejects(fetchPublishedSkill('gone', { fetchImpl: ok('', 404) }), /no SKILL.md/);
-  assert.equal(urls.length, 3, 'invalid names never reach the network');
-});

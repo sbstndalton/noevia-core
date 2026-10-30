@@ -1,6 +1,6 @@
 'use strict';
 // #398: the create/edit project name fields silently let a user type past what the server keeps
-// — createProject (projects.cjs) and the PATCH handler (routes/projects.cjs) both truncate to
+// — createProject (projects.cjs) and the config route (the Rust front's since #2191 round 9) both truncate to
 // 120 characters with no feedback. The fix adds a client-side maxLength/counter reading the same
 // cap; these tests pin the server side of that parity: one JSON file (project-limits.json) is the
 // only place the number 120 is allowed to live, and both server call sites read it rather than a
@@ -64,13 +64,6 @@ test('projects.cjs reads the shared constant rather than a hardcoded 120', () =>
   assert.match(src, /require\(['"]\.\.\/contracts\/project-limits\.json['"]\)/);
   assert.match(src, /slice\(0, PROJECT_NAME_MAX_LENGTH\)/);
   assert.doesNotMatch(src, /slice\(0, 120\)/, 'the literal 120 must not reappear once the shared constant exists');
-});
-
-test('routes/projects.cjs\'s PATCH handler reads the same shared constant, not its own literal 120', () => {
-  const src = fs.readFileSync(path.join(__dirname, 'routes/projects.cjs'), 'utf8');
-  assert.match(src, /require\(['"]\.\.\/\.\.\/contracts\/project-limits\.json['"]\)/);
-  assert.match(src, /slice\(0, PROJECT_NAME_MAX_LENGTH\)/);
-  assert.doesNotMatch(src, /patch\.name\.trim\(\)\.slice\(0, 120\)/, 'the PATCH path must not keep its own hardcoded 120');
 });
 
 test('the client reads the identical JSON file (src/project-limits.ts), so the dialogs cannot drift from the server cap', () => {

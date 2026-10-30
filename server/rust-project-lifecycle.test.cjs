@@ -33,14 +33,14 @@ test('an owned request is refused with a 503 before its body is read; the rest f
     assert.deepEqual(res, { status: 503, body: ROUTE_REFUSAL });
   }
   for (const [method, url] of [
-    ['POST', '/api/projects/'], ['POST', '/api/projects/p1/config'], ['DELETE', '/api/projects/p1/files'], ['DELETE', '/api/projects/'],
+    ['POST', '/api/projects/'], ['POST', '/api/projects/p1/browser'], ['DELETE', '/api/projects/p1/files'], ['DELETE', '/api/projects/'],
     ['DELETE', '/api/projects/p1/chats/c1'], ['POST', '/API/PROJECTS'], ['DELETE', '/api/projects//'], ['POST', '/api/import/conversations'],
   ]) assert.equal(refuseOwned({ url, method, headers: {} }, {}, { parseRequestUrl, json }), false, `${method} ${url}`);
   assert.equal(refuseOwned({ url: '//[', method: 'POST', headers: {} }, {}, { parseRequestUrl, json }), false);
 });
 
 test('the dead Node handlers are gone; the store keeps createProject and deleteProject for its other callers', () => {
-  const routes = fs.readFileSync(path.join(__dirname, 'routes', 'projects.cjs'), 'utf8');
+  const routes = ''; assert.equal(fs.existsSync(path.join(__dirname, 'routes', 'projects.cjs')), false, 'no project route file is left (#2191 round 9)');
   assert.equal(routes.includes("p === '/api/projects' && req.method === 'POST'"), false);
   assert.equal(routes.includes("projMatch && req.method === 'DELETE'"), false);
   const store = fs.readFileSync(path.join(__dirname, 'projects.cjs'), 'utf8');
@@ -99,6 +99,6 @@ test('through the router: create and delete are refused signed out and signed in
   assert.ok(catalogue.selectable.includes('core'));
   assert.ok(!catalogue.selectable.includes('gdrive'), 'connector boxes are not selectable');
   assert.deepEqual(catalogue.icons, Object.keys(require('../contracts/project-icons.json')));
-  // Positive control: the config route is still Node's.
-  assert.equal((await request('/api/projects/p1/config', { method: 'POST', headers: as(admin), body: {} })).status, 404);
+  // Positive control: the browser route (chat-bound) is still Node's (a project's config is the front's since round 9).
+  assert.equal((await request('/api/projects/p1/browser', { method: 'POST', headers: as(admin), body: {} })).status, 404);
 });

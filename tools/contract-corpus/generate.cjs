@@ -83,7 +83,8 @@ async function waitReady(base, child) {
 // #2185 the Diary source, today, storage-import and workspace export/import, since the #2190/#2191
 // close-out the health check, the auto-roles read and the workspace list, and since #2206 the rest of
 // the Diary routes but the local exchange: /api/diary, the storage status, the connector endpoint and
-// the connector credentials) are not
+// the connector credentials, and since #2191 round 9 a project's instruction skills and its manifests)
+// are not
 // Node's to record any more;
 // their exchanges stay in the noevia-rs corpus recorded at its contracts/http/core.ref.
 const PROBES = [
@@ -97,7 +98,7 @@ const PROBES = [
   '/api/profile/sharing',
   '/api/providers/{providerId}/models', '/api/reasoning-settings',
   '/api/toolboxes', '/api/toolboxes/permitted',
-  '/api/projects/{projectId}/browser', '/api/projects/{projectId}/code', '/api/projects/{projectId}/instruction-skills', '/api/projects/{projectId}/instruction-skills/manifests', '/api/projects/{projectId}/research',
+  '/api/projects/{projectId}/browser', '/api/projects/{projectId}/code', '/api/projects/{projectId}/research',
 ];
 
 // Validation-path probes for writes no scenario step makes: an empty or minimal body on the
@@ -195,7 +196,9 @@ async function main() {
     // list used to show it here; that read is the Rust front's, so a Node-owned read that names it does, and its
     // later paths record as <id:N> rather than as the run's literal id (the double recording must be byte-equal).
     await step(admin, 'GET', `/api/chats/search?projectId=${encodeURIComponent(projectId)}`, undefined, [200]);
-    await step(admin, 'POST', `/api/projects/${encodeURIComponent(projectId)}/config`, { instructions: 'Answer very briefly.' });
+    // A project's config is the Rust front's too (#2191 round 9): its exchange stays in the noevia-rs corpus.
+    const configRefused = await step(admin, 'POST', `/api/projects/${encodeURIComponent(projectId)}/config`, { instructions: 'Answer very briefly.' }, [503]);
+    if (configRefused.json?.code !== 'RUST_PROJECT_CONFIG_OWNED') throw new Error('Expected the Rust project config ownership refusal.');
 
     // A streamed chat turn against the mock model.
     const chat = await step(admin, 'POST', '/api/chat', { spaceId: projectId, projectId, chatId: null, message: 'Say hello.', history: [] });

@@ -212,8 +212,8 @@ test('Node refuses native framing preference reads and writes without changing l
 
 test('the move never puts a chat into an archived project; a once Code-only project takes it (#810, #1576)', async () => {
   const code = createProjectAs(testDataDir, userId, { name: 'Synthetic code only', modes: ['code'] });
-  const archived = createProjectAs(testDataDir, userId, { name: 'Synthetic archived' });
-  assert.equal((await post(`/api/projects/${archived.id}/config`, { archived: true })).status, 200);
+  // Archiving is the config route's, the Rust front's since #2191 round 9: the project is stored archived.
+  const archived = createProjectAs(testDataDir, userId, { name: 'Synthetic archived', extra: { archived: true } });
   await frontSaveFree([meta('c-810')]);
   const refused = await frontMove('/api/chats/c-810/move', { projectId: archived.id, frame: frame({ projectId: archived.id }) });
   assert.equal(refused.status, 404);

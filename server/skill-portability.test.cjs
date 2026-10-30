@@ -50,7 +50,6 @@ test('bundled executable assets are listed and refuse pinned, content and automa
   assert.equal(m.status, 'enabled', 'enabling is still the owner\'s review; only use is refused');
   assert.equal(m.resolvable, false);
   assert.deepEqual(code(() => skills.resolvePinned(p, pinOf(p), ['core'])), [422, 'skill_scripts_unsupported']);
-  assert.equal(code(() => skills.resolve(p, m.id, m.version, ['core']))[0], 422);
   const read = skills.read(p, p.files[0], p);
   assert.match(read, /Bundled scripts are never run from chat: synthetic-helper\/scripts\/fill\.txt/);
   // Only non-executable references: still usable.
@@ -59,26 +58,8 @@ test('bundled executable assets are listed and refuse pinned, content and automa
   assert.equal(skills.resolvePinned(plain, pinOf(plain), ['core']).record.file, FILE);
 });
 
-test('#567: a skill with bundled scripts cannot be enabled, and can still be disabled', () => {
-  const p = project({ extraFiles: [{ name: 'synthetic-helper/scripts/run.sh', content: 'echo synthetic' }] });
-  p.instructionSkills = {};
-  const hash = skills.hash(p.files[0].content);
-  const err = (() => { try { skills.setSelection(p, { file: FILE, enabled: true, hash }); } catch (e) { return e; } return null; })();
-  assert.equal(err?.status, 422);
-  assert.equal(err.code, 'skill_scripts_unsupported');
-  assert.match(err.message, /chat never runs Skill scripts/i);
-  assert.match(err.message, /synthetic-helper\/scripts\/run\.sh/);
-  assert.notEqual(skills.list(p)[0].status, 'enabled', 'the refused enable changed nothing');
-  // A skill that was enabled before scripts appeared can still be turned off.
-  p.instructionSkills = { [FILE]: { enabled: true, reviewedHash: hash } };
-  skills.setSelection(p, { file: FILE, enabled: false });
-  assert.equal(skills.list(p)[0].status, 'disabled');
-  // Without scripts the same call enables normally.
-  const plain = project({ extraFiles: [{ name: 'synthetic-helper/reference.md', content: 'text' }] });
-  plain.instructionSkills = {};
-  skills.setSelection(plain, { file: FILE, enabled: true, hash });
-  assert.equal(skills.list(plain)[0].status, 'enabled');
-});
+// #567 (a skill with bundled scripts cannot be enabled, and can still be disabled) is the Rust front's PUT
+// (noevia-rs crates/server-projects instruction_skills.rs `set_selection`, tested there; #2191 round 9).
 
 test('a root SKILL.md or single-file skill owns no directory and so no assets', () => {
   const p = { id: 'p', files: [{ name: 'SKILL.md', content: body() }, { name: 'tool.py', content: 'print(1)' }, { name: 'weekly.md', content: body({ name: 'weekly' }) }] };
@@ -118,19 +99,8 @@ test('unmetRequirements and revoked', () => {
   assert.equal(skills.pinActive(p, { ...record, contentHash: 'nope' }), false);
 });
 
-test('the Sources list carries the portable id, origin and bundled scripts', () => {
-  const content = body();
-  const p = project({ content, extraFiles: [{ name: 'synthetic-helper/scripts/a.sh', content: 'echo' }] });
-  p.files[0].skillOrigin = { kind: 'published', publisher: 'Synthetic', repository: 'https://example.invalid/skills', sourceRef: 'main', sourcePath: 'skills/synthetic-helper/SKILL.md', digest: skills.hash(content), retrievedAt: '2026-09-01T00:00:00.000Z' };
-  const [row] = skills.listForClient(p, ['core']);
-  assert.equal(row.id, skills.skillId(p, FILE));
-  assert.equal(row.origin.kind, 'published'); assert.equal(row.origin.publisher, 'Synthetic');
-  assert.deepEqual(row.scripts, ['synthetic-helper/scripts/a.sh']);
-  assert.equal(row.content, content, 'the review body is still there for Sources');
-  // Edited bytes lose the published origin.
-  p.files[0].content = body({ text: 'edited' });
-  assert.equal(skills.listForClient(p, ['core'])[0].origin.kind, 'project-file');
-});
+// The Sources list (id, origin, bundled scripts) is the Rust front's GET /instruction-skills (noevia-rs
+// crates/server-projects skill_routes.rs, tested there; #2191 round 9).
 
 // ── Chat loop ──
 
@@ -515,8 +485,7 @@ test('history (#546 review): one common line and a code fence shared with a revo
 test('history (#546 review): switching off a skill that was never enabled leaves history unchanged', async (t) => {
   const content = body({ text: A_TEXT });
   const fixture = project({ content });
-  fixture.instructionSkills[FILE] = { enabled: false, reviewedHash: null }; // awaiting review
-  skills.setSelection(fixture, { file: FILE, enabled: false }); // switched off from review
+  fixture.instructionSkills[FILE] = { enabled: false, reviewedHash: skills.hash(content), reviewedAt: 1 }; // switched off from review (what the front's PUT stores)
   assert.equal(skills.list(fixture)[0].status, 'disabled');
   const r = await run(t, { fixture, dir: account(t), router: noRouter, reqBody: { history: echoHistory } });
   assert.equal(nonSystem(r.requests[0])[1].content, echo);
