@@ -22,7 +22,7 @@
 //
 // #1849: the same machine, under the same rules, also answers a Manual pick of the model it serves (manualTarget;
 // a name this machine's catalogue lists stays here), the auto-router classifier when Fast is on a machine
-// (auto-router.cjs) and Deep Research when Smart is (research-model.cjs). #1853: the Code pipeline follows the Code
+// (auto-router.cjs) and Deep Research when Smart is (noevia-rs research_routes.rs). #1853: the Code pipeline follows the Code
 // role (Smart as its fallback) too: the role engine pins on the machine (ready(), no residency lock), and the sandbox
 // harness reaches it only through web's relay (code-machine.cjs), never by a route of its own.
 // #1850: the template tools gate reads a machine model's chat template from that machine's /props (propsSource) and

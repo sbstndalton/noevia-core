@@ -307,20 +307,21 @@ test('job.lifecycle is null, never a throw, when a journal implies an illegal li
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
 
-test('only a failed deep-research job that still holds its result accepts a late artifact (#796)', async () => {
+test('only a cancelled job accepts a late artifact; a failed one, even holding a finished report, does not (#796, #2218)', async () => {
   const dir = tmp();
   try {
     const jobs = createJobs({ dir });
     const fail = (kind, result) => jobs.run(jobs.create({ kind }), async () => { throw Object.assign(Error('save failed'), { result }); });
+    // The deep-research retry save moved to the Rust front's journal: Node's store no longer reopens such a job.
     const research = await fail('deep_research', { markdown: '# r', sources: [] });
-    jobs.append(research.id, 'artifact.created', { name: 'r.md' });
-    assert.equal(jobs.get(research.id).status, 'failed');
-    assert.deepEqual(jobs.get(research.id).artifacts, [{ name: 'r.md' }]);
-    const bare = await fail('deep_research', null);
-    assert.throws(() => jobs.append(bare.id, 'artifact.created', { name: 'x' }), /already finished/);
-    const junk = await fail('deep_research', { status: 500 });
-    assert.throws(() => jobs.append(junk.id, 'artifact.created', { name: 'x' }), /already finished/, 'a result that is not a finished report is refused');
+    assert.equal(research.status, 'failed');
+    assert.throws(() => jobs.append(research.id, 'artifact.created', { name: 'r.md' }), /already finished/);
     const other = await fail('source', { x: 1 });
     assert.throws(() => jobs.append(other.id, 'artifact.created', { name: 'x' }), /already finished/);
+    const cancelled = jobs.create({ kind: 'code' });
+    jobs.append(cancelled, 'job.started');
+    jobs.append(cancelled, 'job.cancelled', {});
+    jobs.append(cancelled, 'artifact.created', { name: 'partial.md' });
+    assert.deepEqual(jobs.get(cancelled).artifacts, [{ name: 'partial.md' }]);
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });

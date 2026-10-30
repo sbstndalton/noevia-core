@@ -22,7 +22,7 @@ const { createInferenceMachines } = require('./inference-machines.cjs');
 const { createChatMachines } = require('./chat-machines.cjs');
 const { createMachineHealth } = require('./machine-health.cjs');
 const { createAutoRouter } = require('./auto-router.cjs');
-const { createResearchModel } = require('./research-model.cjs');
+const { createAdmission } = require('./inference-admission-lease.cjs');
 const templateCaps = require('./chat-template-caps.cjs');
 const { readCappedJson } = require('./http.cjs');
 
@@ -254,57 +254,23 @@ test('#1849 classifier default: Fast here sends exactly the local request it did
   assert.deepEqual(b.admitted, a.admitted);
 });
 
-// ── #1849 Deep Research ──
+// ── #1849 Deep Research (the step itself is the Rust front's; its lease comes from here) ──
 
-function research({ chatMachines = null, log }) {
-  return createResearchModel({
-    autoRoles: () => ROLES, lastLoadedModel: () => null, chatMachines,
-    getProvider: () => ({ id: 'default', baseUrl: 'http://default.invalid', apiKey: LOCAL_KEY }), DEFAULT_PROVIDER_ID: 'default',
-    providerHeaders: (p, extra) => ({ ...extra, Authorization: `Bearer ${p.apiKey}` }),
-    fetch: async (url, init) => { log.local.push({ url, init: { ...init, signal: undefined } }); return new Response(JSON.stringify({ choices: [{ message: { content: 'Local note.' }, finish_reason: 'stop' }] }), { status: 200 }); },
-    modelManager: { enterInference: () => { log.entered++; return () => { log.left++; }; } },
-    admitEngineModel: async (m) => { log.admitted.push(m); },
-    readCappedJson,
-  });
-}
-const researchLog = () => ({ local: [], admitted: [], entered: 0, left: 0 });
+const admissionFor = (chatMachines, modelManager = { enterInference: () => { throw Error('the local gate is not taken'); } }) =>
+  createAdmission({ modelManager, admitEngineModel: async () => { throw Error('nothing is loaded here'); }, chatMachines });
 
-test('#1849 Research: with Smart on a machine a research step runs there (its model, no key, no local gate or load)', async (t) => {
+test('#1849 Research: Smart on a machine takes no local gate or load, and is refused in the machine\'s own words when it is down or serves the wrong model', async (t) => {
   const fake = await fakeServer(t);
-  const log = researchLog();
-  const r = research({ chatMachines: await machinesFor({ assign: [{ service: 'chatSmart', port: fake.port, model: REMOTE_MODEL }] }), log });
-  assert.equal(r.model({ model: 'synthetic-fast' }), REMOTE_MODEL);
-  const text = await r.complete({}, [{ role: 'user', content: 'QA-SYNTH-1849 summarise' }], { signal: new AbortController().signal, maxTokens: 64 });
-  assert.equal(text, 'Synthetic research note.');
-  assert.equal(log.local.length, 0);
-  assert.deepEqual(log.admitted, []);
-  assert.equal(log.entered, 0, 'the maintenance gate of this engine is not taken');
-  const [chat] = fake.chats();
-  assert.equal(chat.body.model, REMOTE_MODEL);
-  assert.equal(chat.body.max_tokens, 64);
-  assert.equal(chat.headers.authorization, undefined);
-});
-
-test('#1849 Research: unreachable and wrong-model machines fail the step with the clear text', async (t) => {
-  const signal = new AbortController().signal;
-  const down = research({ chatMachines: await machinesFor({ assign: [{ service: 'chatSmart', port: await closedPort(), model: REMOTE_MODEL }] }), log: researchLog() });
-  await assert.rejects(down.complete({}, [], { signal, maxTokens: 8 }), (e) => /^Smart model’s machine \(Synthetic Pi\) is unreachable/.test(e.publicMessage) && e.code === 'machineUnreachable');
+  const ok = await machinesFor({ assign: [{ service: 'chatSmart', port: fake.port, model: REMOTE_MODEL }] });
+  const remote = ok.target('smart');
+  const held = await admissionFor(ok)({ role: 'smart', machine: remote.machine.id, model: REMOTE_MODEL }, new AbortController().signal);
+  held.release();
+  const down = await machinesFor({ assign: [{ service: 'chatSmart', port: await closedPort(), model: REMOTE_MODEL }] });
+  await assert.rejects(admissionFor(down)({ role: 'smart', machine: down.target('smart').machine.id, model: REMOTE_MODEL }), (e) => e.status === 409 && e.code === 'machineUnreachable');
   const other = await fakeServer(t, { models: ['synthetic-other'] });
-  const wrong = research({ chatMachines: await machinesFor({ assign: [{ service: 'chatSmart', port: other.port, model: REMOTE_MODEL }] }), log: researchLog() });
-  await assert.rejects(wrong.complete({}, [], { signal, maxTokens: 8 }), (e) => /serves synthetic-other/.test(e.publicMessage) && e.code === 'machineWrongModel');
-  assert.equal(other.chats().length, 0);
-});
-
-test('#1849 Research default: Smart here sends exactly the local request it did before', async () => {
-  const a = researchLog(), b = researchLog();
-  const signal = new AbortController().signal;
-  const messages = [{ role: 'user', content: 'QA-SYNTH-1849 summarise' }];
-  assert.equal(await research({ chatMachines: null, log: a }).complete({}, messages, { signal, maxTokens: 32 }), 'Local note.');
-  assert.equal(await research({ chatMachines: await machinesFor(), log: b }).complete({}, messages, { signal, maxTokens: 32 }), 'Local note.');
-  assert.deepEqual(b.local.map((x) => [x.url, x.init.body, x.init.headers, x.init.redirect]), a.local.map((x) => [x.url, x.init.body, x.init.headers, x.init.redirect]));
-  assert.equal(a.local[0].init.body, JSON.stringify({ model: 'synthetic-smart', stream: false, max_tokens: 32, messages }));
-  assert.deepEqual([b.admitted, b.entered, b.left], [a.admitted, a.entered, a.left]);
-  assert.deepEqual(a.admitted, ['synthetic-smart']);
+  const wrong = await machinesFor({ assign: [{ service: 'chatSmart', port: other.port, model: REMOTE_MODEL }] });
+  await assert.rejects(admissionFor(wrong)({ role: 'smart', machine: wrong.target('smart').machine.id, model: REMOTE_MODEL }), (e) => e.status === 409 && e.code === 'machineWrongModel');
+  await assert.rejects(admissionFor(ok)({ role: 'smart', machine: 'moved-away', model: REMOTE_MODEL }), (e) => e.status === 409);
 });
 
 // ── #1850 the template tools gate per machine ──

@@ -23,7 +23,6 @@ const MAX_ATTEMPTS = 8;
 const CHAT_DELETE_CLIENT_MARKER = 'noevia-chat-delete-client/1';
 // Release pairing requires foundation + generation-aware Node enforcement.
 const CHAT_MOVE_CLIENT_MARKER = 'noevia-chat-move-client/1';
-const RESEARCH_JOBS_CLIENT_MARKER = 'noevia-research-jobs-client/1';
 const TIMEOUT_MS = 10000;
 // sbstndalton/noevia#2190 round 5: a ChatGPT session may refresh upstream and a model list may
 // fetch the catalogue after a refresh (the broker's 15 s each).
@@ -84,34 +83,6 @@ function createClient({ port, token, fetchImpl = globalThis.fetch, timeoutMs = T
     try { body = await require('./http.cjs').readCappedJson(res, REPLY_CAP); } catch { /* empty, non-JSON or over the cap */ }
     return { status: res.status, body };
   }
-  async function researchCall(op, user, payload) {
-    const request = () => call(`research-jobs/${op}`, { user, ...payload });
-    const mutating = !['read', 'list', 'recover'].includes(op);
-    let response;
-    for (let attempt = 0; attempt < (mutating ? 2 : 1); attempt++) {
-      try { response = await request(); }
-      catch (error) { if (!mutating || attempt) throw error; continue; }
-      const { status, body } = response;
-      const valid = status === 200 && body && typeof body === 'object'
-        && (op !== 'start' || (typeof body.id === 'string' && typeof body.run === 'string'))
-        && (op !== 'recover' || Number.isSafeInteger(body.count))
-        && (op !== 'list' || Array.isArray(body.jobs))
-        && (op !== 'read' || (body.id === payload.id && body.projectId === payload.projectId && body.kind === 'deep_research'))
-        && (op !== 'cancel' || (body.id === payload.id && body.projectId === payload.projectId && body.kind === 'deep_research' && ['running', 'completed', 'failed', 'cancelled', 'interrupted'].includes(body.status)))
-        && (!['abandon','event','finish','report','prepare','artifact','clear'].includes(op) || body.ok === true);
-      if (valid) return body;
-      if (mutating && attempt === 0 && (status === 200 || status >= 500)) continue;
-      break;
-    }
-    const { status, body } = response;
-    if (status === 404 && op === 'read') return null;
-    const message = status === 409 ? (body?.error || 'Research job changed; refresh and retry.')
-      : status === 404 ? 'No such research job.'
-      : status === 410 ? 'account no longer exists'
-      : status === 400 ? 'Invalid research job request.'
-      : 'The research job store is unavailable; retry shortly.';
-    throw Object.assign(Error(message), { status: [400,404,409,410].includes(status) ? status : 503 });
-  }
   // Dedicated bounded context exchange over the existing private store capability. Never
   // reuse the project-file 32 MiB reply cap or export the token back into process.env.
   async function featureContext(body, { timeoutMs = 2500 } = {}) {
@@ -156,22 +127,6 @@ function createClient({ port, token, fetchImpl = globalThis.fetch, timeoutMs = T
   }
   return {
     featureContext,
-    researchJobsFor(user) {
-      return {
-        recover: (owner) => researchCall('recover', user, owner),
-        start: (owner, projectId, request, question, mode, questions) => researchCall('start', user, { ...owner, projectId, request, question, mode, questions }),
-        abandon: (owner, request) => researchCall('abandon', user, { ...owner, request }),
-        event: (owner, id, run, n, kind, data) => researchCall('event', user, { ...owner, id, run, n, kind, data }),
-        cancel: (owner, projectId, id, run) => researchCall('cancel', user, { ...owner, projectId, id, run }),
-        finish: (owner, id, run, ok, result, error) => researchCall('finish', user, { ...owner, id, run, ok, result, error }),
-        report: (owner, id, run, result) => researchCall('report', user, { ...owner, id, run, result }),
-        prepare: (owner, projectId, id, run, name, hash, bytes, target) => researchCall('prepare', user, { ...owner, projectId, id, run, name, hash, bytes, target }),
-        artifact: (owner, projectId, id, run, name, hash, bytes) => researchCall('artifact', user, { ...owner, projectId, id, run, name, hash, bytes }),
-        clear: (owner, projectId, id, run, name, hash) => researchCall('clear', user, { ...owner, projectId, id, run, name, hash }),
-        read: (projectId, id) => researchCall('read', user, { projectId, id }),
-        list: (projectId) => researchCall('list', user, { projectId }).then((body) => body.jobs),
-      };
-    },
     async grantContext(user, chat) {
       const { status, body } = await call('chat/grant-context', { user, chat });
       if (status !== 200) throw moveFailure(status, body);
@@ -514,4 +469,4 @@ function holdForStoreSaves(res, saves) {
   };
 }
 
-module.exports = { CHAT_MOVE_CLIENT_MARKER, CHAT_DELETE_CLIENT_MARKER, RESEARCH_JOBS_CLIENT_MARKER, HISTORY_ORIGINS, enabledFrom, createClient, clientFromEnv, createQueue, busy, failureReply, holdForStoreSaves, transcriptsFor, MAX_ATTEMPTS, TIMEOUT_MS };
+module.exports = { CHAT_MOVE_CLIENT_MARKER, CHAT_DELETE_CLIENT_MARKER, HISTORY_ORIGINS, enabledFrom, createClient, clientFromEnv, createQueue, busy, failureReply, holdForStoreSaves, transcriptsFor, MAX_ATTEMPTS, TIMEOUT_MS };

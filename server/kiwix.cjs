@@ -3,7 +3,7 @@ const { frameUntrusted } = require('./prompt-framing.cjs');
 // D9: offline Wikipedia (or any ZIM) through an internal kiwix-serve, as a read-only built-in
 // toolbox. Off unless features.kiwix is on and KIWIX_URL names the internal service.
 // Content is untrusted data: results are plain text, bounded, and labelled as reference.
-const { stripBoilerplate } = require('./research-sources.cjs');
+const { stripBoilerplate } = require('./strip-boilerplate.cjs');
 const { readCappedText } = require('./http.cjs');
 
 const ID = 'offline-wikipedia';
