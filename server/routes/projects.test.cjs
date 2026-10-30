@@ -199,8 +199,9 @@ test('uploads refuse what they always refused', async () => {
   assert.deepEqual(f.sent.pop(), { status: 400, body: { error: 'photo.png is not a supported source (text file or PDF).' } });
   await f.call('POST', '/api/projects/p1/upload', { name: 'notes.txt', dataBase64: '' });
   assert.deepEqual(f.sent.pop(), { status: 400, body: { error: 'file was empty' } });
-  await f.call('POST', '/api/projects/p1/documents', { name: 'notes.txt' });
-  assert.deepEqual(f.sent.pop(), { status: 400, body: { error: 'notes.txt is not a supported document (PDF).' } });
+  // A document upload is the Rust front's (#2191 round 5, rust-project-documents.cjs): not this mount's.
+  assert.equal(await f.call('POST', '/api/projects/p1/documents', { name: 'notes.txt' }), false);
+  assert.equal(await f.call('POST', '/api/projects/p1/documents', { name: 'x.pdf' }, '?background=1'), false);
   // A project's images are the Rust front's (#1071): not this mount's.
   assert.equal(await f.call('POST', '/api/projects/p1/assets', { name: 'a', mime: 'image/bmp' }), false);
   for (const m of ['GET', 'DELETE']) assert.equal(await f.call(m, '/api/projects/p1/assets/img-1'), false, m);
@@ -342,10 +343,12 @@ test('a model on a non-default (cloud) provider is never checked against the loc
 
 test('malformed background source JSON is 400 before any job is dispatched', async () => {
   const f = fixture({ projects: [{ id: 'p1' }] });
-  for (const suffix of ['upload', 'documents', 'sources/sync']) {
+  for (const suffix of ['upload', 'sources/sync']) {
     await assert.rejects(f.call('POST', `/api/projects/p1/${suffix}`, '{broken', '?background=1'),
       { status: 400, message: 'invalid JSON' });
   }
+  // The document upload is the Rust front's (#2191 round 5): no background job for it here.
+  assert.equal(await f.call('POST', '/api/projects/p1/documents', '{broken', '?background=1'), false);
   assert.deepEqual(f.dispatched, []);
 });
 

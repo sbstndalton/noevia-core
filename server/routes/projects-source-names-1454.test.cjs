@@ -139,12 +139,12 @@ test('#1454: without storage a same-name upload is refused too, and replace:true
   assert.equal(f.project.files[0].content, 'NEW');
 });
 
-test('#1454: the document route refuses a PDF whose name an upload already has, and keeps the old one', async (t) => {
+test('#1454: the document route is the Rust front\'s (#2191 round 5), which keeps the sourceExists refusal', async (t) => {
+  // noevia-rs bins/noevia-server tests/project_documents.rs: the same name again without replace is 409 sourceExists.
   const old = { name: 'paper.pdf', content: 'old text', document: { state: 'ready', pages: 1 } };
   const f = fixture(t, { baseUrl: 'http://127.0.0.1:1/unused', remote: false, project: { id: 'p1', name: 'Alpha', files: [old], assets: [] } });
   const r = await f.upload({ name: 'paper.pdf', dataBase64: Buffer.from('%PDF-1.4 synthetic').toString('base64') }, 'documents');
-  assert.equal(r.status, 409);
-  assert.equal(r.body.code, 'sourceExists');
+  assert.equal(r, undefined, 'not this mount\'s');
   assert.equal(f.project.files[0], old);
 });
 

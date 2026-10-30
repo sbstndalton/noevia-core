@@ -57,7 +57,8 @@ function fixture() {
     DEFAULT_PROVIDER_ID: 'default', store,
   });
   const upload = (bytes) => {
-    const url = '/api/projects/p1/documents';
+    // #2191 round 5: POST .../documents is the Rust front's; the local /upload runs the same ingest here.
+    const url = '/api/projects/p1/upload';
     const req = Readable.from([JSON.stringify({ name: 'synthetic.pdf', dataBase64: bytes.toString('base64') })]);
     Object.assign(req, { method: 'POST', url, headers: {} });
     return scope.run({ workspace }, () => routes(req, {}, { path: url, authn: { user: { id: DELETED_ID } }, url: new URL(`http://localhost${url}`) }));

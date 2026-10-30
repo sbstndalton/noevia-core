@@ -165,7 +165,7 @@ function createProjectRoutes({
       const job = await require('../source-jobs.cjs').read(currentWorkspace(), projectId, sourceJob[2]);
       return json(res, job ? 200 : 404, job || { error: 'Processing status expired or the server restarted; refresh or re-upload to retry.' });
     }
-    const backgroundSource = p.match(/^\/api\/projects\/([^/]+)\/(upload|documents|sources\/sync)$/);
+    const backgroundSource = p.match(/^\/api\/projects\/([^/]+)\/(upload|sources\/sync)$/);
     if (backgroundSource && req.method === 'POST' && url.searchParams.get('background') === '1') {
       const projectId = decodeURIComponent(backgroundSource[1]);
       if (!getProject(projectId)) return json(res, 404, { error: 'project not found' });
@@ -450,42 +450,8 @@ function createProjectRoutes({
     // ever read. Images are different: the model can genuinely see them, so
     // they are stored as bytes and attached to the conversation as image
     // parts rather than being decoded into replacement characters.
-    // A document uploaded from disk. It is converted to text on arrival and
-    // stored as an ordinary source, so everything downstream — RAG, the
-    // read_project_file tool, the manifest — treats it like any other file.
-    const projDocs = p.match(/^\/api\/projects\/([^/]+)\/documents$/);
-    if (projDocs && req.method === 'POST') {
-      const id = decodeURIComponent(projDocs[1]);
-      const project = getProject(id);
-      if (!project) return json(res, 404, { error: 'no such project' });
-      let body;
-      try {
-        body = JSON.parse(await readBody(req, Math.ceil(DOCUMENT_UPLOAD_CAP / 3) * 4 + 512 * 1024));
-      } catch (e) {
-        if (e && e.status === 413) return json(res, 413, { error: `That document is larger than the ${Math.round(DOCUMENT_UPLOAD_CAP / (1024 * 1024))} MB limit.` });
-        return json(res, 400, { error: 'invalid JSON' });
-      }
-      const name = String(body.name || '').slice(0, 200);
-      if (!documents.isDocument(name)) return json(res, 400, { error: `${name || 'that file'} is not a supported document (PDF).` });
-      let bytes;
-      try { bytes = Buffer.from(String(body.dataBase64 || ''), 'base64'); } catch { bytes = null; }
-      if (!bytes || !bytes.length) return json(res, 400, { error: 'document data was empty' });
-      if (bytes.length > DOCUMENT_UPLOAD_CAP) {
-        return json(res, 413, { error: `That document is ${Math.round(bytes.length / 1024 / 1024)} MB, over the ${Math.round(DOCUMENT_UPLOAD_CAP / (1024 * 1024))} MB limit.` });
-      }
-      return await withSourceLock(project, async () => {
-        if (getProject(id) !== project) return json(res, 409, { error: 'Project changed; retry.' });
-        const uploads = (project.files || []).filter(f => !f.source);
-        if (uploads.length >= 20 && !uploads.some(f => f.name === name)) return json(res, 400, { error: 'A project holds at most 20 uploaded sources.' });
-        const previous = uploads.find(f => f.name === name);
-        if (previous && body.replace !== true) return sourceExistsReply(res, name);
-        const file = await documentSources.ingest(currentWorkspace(), id, name, bytes, previous);
-        if (getProject(id) !== project || !sameSource(project.files.find(f => !f.source && f.name === name), previous)) return json(res, 409, { error: 'Project changed; retry.' });
-        project.files = [...(project.files || []).filter(f => f.source || f.name !== name), file];
-        indexSource(project, file); saveProjects(PROJECTS);
-        return json(res, 200, { name, pages: file.document.pages, characters: file.content.length, truncated: file.document.truncated, document: file.document });
-      });
-    }
+    // POST .../documents (a document uploaded from disk) is the Rust front's (#2191 round 5,
+    // rust-project-documents.cjs), read by Docling through its durable extraction queue.
 
     // GET .../documents/original (#2191, rust-project-reads.cjs) and GET .../documents/pages (#2191
     // round 4, rust-project-document-pages.cjs) are the Rust front's, refused before authentication.

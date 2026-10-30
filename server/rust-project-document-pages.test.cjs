@@ -86,6 +86,7 @@ test('through the router: the page reader is refused signed out and signed in', 
     assert.deepEqual([r.status, r.json], [503, ROUTE_REFUSAL]);
     assert.equal(r.headers['x-content-type-options'], 'nosniff');
   }
-  // Positive control: the document upload is still Node's (no such project).
-  assert.equal((await request('/api/projects/p1/documents', { method: 'POST', headers: as(admin), body: {} })).status, 404);
+  // Positive control: the file upload is still Node's (no such project); the document upload is the
+  // front's since round 5 (rust-project-documents.test.cjs).
+  assert.equal((await request('/api/projects/p1/upload', { method: 'POST', headers: as(admin), body: {} })).status, 404);
 });

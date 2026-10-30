@@ -101,6 +101,6 @@ test('through the router: the owned GETs are refused signed out and signed in; N
   }
   // Positive controls: Node's gate (the page reader is the front's since #2191 round 4,
   // rust-project-document-pages.test.cjs).
-  assert.equal((await request('/api/projects/p1/documents', { method: 'POST', body: '{}' })).status, 401, 'signed out');
+  assert.equal((await request('/api/projects/p1/upload', { method: 'POST', body: '{}' })).status, 401, 'signed out');
   assert.equal((await request('/api/projects/p1/sources/text', { method: 'POST', headers: as(admin), body: '{}' })).status, 404);
 });

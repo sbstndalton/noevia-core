@@ -113,9 +113,12 @@ test('authenticated upload persists metadata/original/pages and config cannot fo
   assert.equal(stored.documentOriginal(testDataDir, p.id, 'statement.pdf').status, 404);
 });
 
-test('legacy PDF upload also saves failures, originals and explicit stale state', async () => {
+test('a local PDF upload also saves failures, originals and explicit stale state', async () => {
   const p = await project('Legacy document upload');
-  const legacy = (bytes, replace) => post(`/api/projects/${p.id}/documents`, { name: 'statement.pdf', ...(replace ? { replace: true } : {}), dataBase64: bytes.toString('base64') });
+  // #2191 round 5: POST .../documents is the Rust front's (rust-project-documents.cjs, refused here before
+  // authentication); its Docling pipeline is tested in noevia-rs. The same ingest is the local /upload's.
+  assert.equal((await post(`/api/projects/${p.id}/documents`, { name: 'statement.pdf', dataBase64: fixture('text.pdf').toString('base64') })).status, 503);
+  const legacy = (bytes, replace) => post(`/api/projects/${p.id}/upload`, { name: 'statement.pdf', ...(replace ? { replace: true } : {}), dataBase64: bytes.toString('base64') });
   assert.equal((await legacy(fixture('text.pdf'))).status, 200);
   const refused = await legacy(fixture('encrypted.pdf'));
   assert.equal(refused.status, 409); assert.equal(JSON.parse(refused.text).code, 'sourceExists'); // #1454: never a silent replace
