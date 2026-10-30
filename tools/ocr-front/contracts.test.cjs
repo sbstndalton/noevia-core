@@ -66,3 +66,15 @@ test('download hash, version, PDF signature, cap and exact extracted text are ma
   const pages = reducedFixture(); pages.extracted.pages = 2;
   assert.throws(() => validate(pages), /preserve the synthetic page/);
 });
+
+const fs = require('node:fs');
+const path = require('node:path');
+const { sourceWorkDenials } = require('./contracts.cjs');
+test('a second person is refused the upload, the sync and the folder-import plan, and the harness makes all three calls', () => {
+  const calls = sourceWorkDenials('/api/projects/p1', { name: 'a.pdf' });
+  assert.deepEqual(calls.map(([method, route]) => `${method} ${route}`), [
+    'POST /api/projects/p1/upload', 'POST /api/projects/p1/sources/sync', 'POST /api/projects/p1/folder-import/plan']);
+  const run = fs.readFileSync(path.join(__dirname, 'run.cjs'), 'utf8');
+  // The member's calls go through the list, each expecting a 404 (README: tenant refusals precede the worker).
+  assert.match(run, /for \(const \[method, denied, body\] of sourceWorkDenials\([^\n]*member\.call\(method, denied, body, 404\)/);
+});

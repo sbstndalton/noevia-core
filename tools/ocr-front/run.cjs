@@ -10,7 +10,7 @@ const { spawn, spawnSync } = require('node:child_process');
 const { once } = require('node:events');
 const { SERVER, GUARD, startMocks, serverEnv } = require('../contract-corpus/mocks.cjs');
 const { bindProjectStore } = require('./boot.cjs');
-const { requireScan, requireReducedPdf, REDUCED_CAP } = require('./contracts.cjs');
+const { requireScan, requireReducedPdf, sourceWorkDenials, REDUCED_CAP } = require('./contracts.cjs');
 const { seedAccount } = require('../../tests/server/seed-account.cjs');
 const { startProjectStore } = require('../../tests/server/project-store-server.cjs');
 const { createProjectAs } = require('../../tests/server/front-projects.cjs');
@@ -224,7 +224,9 @@ async function scenario(front, mode, workerBase, fixtures, root, calls, { doclin
     // so it is checked through the front and kept out of the reference comparison.
     if (front) await member.call('GET', route + '/documents/original?name=scan.pdf', undefined, 404);
     else await member.call('GET', route + '/documents/original?name=scan.pdf', undefined, 503);
-    const deniedUpload = await member.call('POST', route + '/upload', { name: 'scan.pdf', organized: true, dataBase64: fs.readFileSync(path.join(fixtures, 'scan.pdf')).toString('base64') }, 404);
+    const denials = [];
+    for (const [method, denied, body] of sourceWorkDenials(route, { name: 'scan.pdf', organized: true, dataBase64: fs.readFileSync(path.join(fixtures, 'scan.pdf')).toString('base64') })) denials.push(await member.call(method, denied, body, 404));
+    const deniedUpload = denials[0];
     assert.equal(calls.length, before, 'tenant refusal must precede worker dispatch');
     // Docling reads the PDFs and (as in production) a DOCX when it is configured, so the worker's /extract-docx is
     // the DOCX run's alone (below); here it reads the scan's page and reduces the oversized PDF.
