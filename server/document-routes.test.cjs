@@ -152,7 +152,14 @@ test('background upload survives a short response and polling remains authentica
   }
   assert.equal(job.done, true); assert.equal(job.status, 200, JSON.stringify(job));
   assert.equal(job.body.document.state, 'ready');
-  assert.deepEqual(stored.documentOriginal(testDataDir, p.id, 'statement.pdf').bytes, fixture('text.pdf'));
+  // The job is done once the upload is answered; projects.json reaches disk through the project store
+  // just after, so the stored original (what the front's read serves, #2191) is awaited, bounded at 2 s.
+  let original = null;
+  for (let i = 0; i < 200 && !original?.bytes; i++) {
+    original = stored.documentOriginal(testDataDir, p.id, 'statement.pdf');
+    if (!original.bytes) await new Promise(resolve => setTimeout(resolve, 10));
+  }
+  assert.deepEqual(original.bytes, fixture('text.pdf'));
 });
 
 test('a chat turn sent right after a 202 background upload waits for that upload to finish (#1441)', async () => {

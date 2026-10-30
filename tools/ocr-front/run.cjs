@@ -14,6 +14,7 @@ const { requireScan, requireReducedPdf, REDUCED_CAP } = require('./contracts.cjs
 const { seedAccount } = require('../../tests/server/seed-account.cjs');
 const { startProjectStore } = require('../../tests/server/project-store-server.cjs');
 const { createProjectAs } = require('../../tests/server/front-projects.cjs');
+const stored = require('../../tests/server/stored-sources.cjs');
 const required = name => { assert.ok(process.env[name], `${name} is required; this gate cannot skip`); return path.resolve(process.env[name]); };
 const children = new Set();
 function child(command, args, env) {
@@ -150,13 +151,21 @@ async function scenario(front, mode, workerBase, fixtures, root, calls) {
     const files = project.files; assert.ok(Array.isArray(files));
     // #1806: the workspace lists sources without their text; each text is read per source.
     assert.ok(files.every(file => !('content' in file)), 'the workspace carries no source text');
-    const text = async name => (await admin.call('GET', `${route}/sources/text?name=${encodeURIComponent(name)}`)).content;
+    // The stored-source reads are the Rust front's too (#2191; Node refuses them with 503): the Node
+    // reference reads the same files the front reads (tests/server/stored-sources.cjs).
+    const text = async name => {
+      if (front) return (await admin.call('GET', `${route}/sources/text?name=${encodeURIComponent(name)}`)).content;
+      const read = stored.sourceText(dataDir, id, name); assert.equal(read.status, 200); return read.json.content;
+    };
     assert.ok(files.some(file => file.name === 'body.docx') && (await text('body.docx')).includes('SYNTHETIC DOCX REF 1271'));
     assert.ok(files.some(file => file.name === large.path) && (await text(large.path)).includes('SYNTHETIC NATIVE TEXT FOR REDUCTION'));
     signIn(member, { username: 'synthetic-member', displayName: 'Synthetic Member', role: 'member' });
     const before = calls.length;
     const deniedPages = await member.call('GET', route + '/documents/pages?name=scan.pdf', undefined, 404);
-    const deniedOriginal = await member.call('GET', route + '/documents/original?name=scan.pdf', undefined, 404);
+    // The tenant refusal of the original is the front's (Node alone refuses it with 503 before auth),
+    // so it is checked through the front and kept out of the reference comparison.
+    if (front) await member.call('GET', route + '/documents/original?name=scan.pdf', undefined, 404);
+    else await member.call('GET', route + '/documents/original?name=scan.pdf', undefined, 503);
     const deniedUpload = await member.call('POST', route + '/upload', { name: 'scan.pdf', organized: true, dataBase64: fs.readFileSync(path.join(fixtures, 'scan.pdf')).toString('base64') }, 404);
     assert.equal(calls.length, before, 'tenant refusal must precede worker dispatch');
     assert.deepEqual(calls.map(call => call.path).sort(), ['/extract', '/extract-docx', '/reduce-pdf']);
@@ -171,7 +180,10 @@ async function scenario(front, mode, workerBase, fixtures, root, calls) {
     const reduced = files.find(file => file.name === large.path);
     let comparedLarge = large, comparedReduced = reduced;
     if (large.attachment.reduction.kind === 'pdf') {
-      const downloaded = await admin.download(route + '/documents/original?name=' + encodeURIComponent(large.path));
+      const downloaded = front ? await admin.download(route + '/documents/original?name=' + encodeURIComponent(large.path)) : (() => {
+        const read = stored.documentOriginal(dataDir, id, large.path); assert.equal(read.status, 200);
+        return { bytes: read.bytes, contentLength: String(read.bytes.length), contentType: 'application/pdf' };
+      })();
       const saved = path.join(dataDir, 'downloaded-reduced-contract.pdf');
       fs.writeFileSync(saved, downloaded.bytes);
       const text = spawnSync('pdftotext', [saved, '-'], { encoding: 'utf8', timeout: 30000, maxBuffer: 1024 * 1024 });
@@ -191,7 +203,7 @@ async function scenario(front, mode, workerBase, fixtures, root, calls) {
       for (const [identity, replacement] of identities) item = item.replaceAll(identity, replacement);
       return key === 'notice' ? item.replace(/; index: [a-z]+\.$/, '; index: <progress>.') : item;
     });
-    return stable({ scan, pages, docx, large: comparedLarge, files: files.map(file => file === reduced ? comparedReduced : file).map(({ name, content, document, attachment }) => ({ name, content, document, attachment })), deniedPages, deniedOriginal, deniedUpload });
+    return stable({ scan, pages, docx, large: comparedLarge, files: files.map(file => file === reduced ? comparedReduced : file).map(({ name, content, document, attachment }) => ({ name, content, document, attachment })), deniedPages, deniedUpload });
   } finally {
     await stop(rust); await stop(node); mocks.close(); await store.close(); relay.closeAllConnections(); await new Promise(resolve => relay.close(resolve));
     fs.rmSync(dataDir, { recursive: true, force: true });
