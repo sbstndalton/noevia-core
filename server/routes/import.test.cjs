@@ -1,166 +1,22 @@
 'use strict';
-const test=require('node:test'),assert=require('node:assert/strict'),fs=require('node:fs'),os=require('node:os'),path=require('node:path');
-const psc=require('../project-store-client.cjs'),{startProjectStore}=require('../../tests/server/project-store-server.cjs');
-const {createWorkspaceStore}=require('../workspace.cjs'),{createProjectStore}=require('../projects.cjs'),{createImportRoutes}=require('./import.cjs'),{persistedChatIds}=require('../conversation-import.cjs'),{FORMAT}=require('../chat-export.cjs'),lists=require('../chat-lists.cjs');
-const { createStubStore } = require('../../tests/server/project-store-stub.cjs');
-const uid='aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa';
-const payload={format:FORMAT,chats:[{id:'c-free',title:'Free',history:[{role:'user',content:'Synthetic free'}]},{id:'c-existing',title:'Existing',project:{name:'Existing'},history:[{role:'user',content:'Synthetic existing'}]},{id:'c-new',title:'New',project:{name:'New'},history:[{role:'user',content:'Synthetic new'}]}]};
-function fixture(root,user=uid,projectStore=createStubStore(root)){
- const hooks={};
- const w=createWorkspaceStore(root,{id:'default'}, null, { projectStore }).get(user);
- const proxy=field=>new Proxy([],{get(_t,k){const v=w[field][k];return typeof v==='function'?v.bind(w[field]):v;},set(_t,k,v){w[field][k]=v;return true;}});
- const store=createProjectStore({fs,path,currentWorkspace:()=>w,PROJECTS:proxy('projects'),FREE_CHATS:proxy('freeChats'),reasoningEffort:{validEffort:()=>true},projectAppearance:()=>({}),rag:{},storageClient:{isBrowsable:()=>false},documentSources:{},authService:{getStorage:()=>({kind:'local'})},sanitizeToolboxes:x=>x,defaultToolboxes:()=>['core'],PROJECT_ROOT_FOLDER:'projects',createProjectFolder:async()=>'',projectSweep:{}});
- let serial=0;const audited=[],failures={};
- const context=()=>({directory:w.dir,transcripts:w.transcripts,persistedChatIds:()=>persistedChatIds(w.dir),projects:()=>w.projects.map(p=>({id:p.id,name:p.name})),existingChatIds:()=>new Set([...w.freeChats,...w.projects.flatMap(p=>p.chats||[])].map(c=>c.id)),tombstones:()=>lists.readTombstones(w.dir),addFreeChats:chats=>store.saveFreeChats(lists.mergeChats(w.freeChats,chats,lists.readTombstones(w.dir))),addProjectChats:(id,chats)=>store.saveChats(id,chats),whenSaved:async()=>{await store.whenSaved(()=>{});if(hooks.afterSaved){hooks.afterSaved();await store.whenSaved(()=>{});}},createProject:body=>store.createProject(body)});
- const route=createImportRoutes({json:(res,status,body)=>Object.assign(res,{status,body}),readBody:async req=>JSON.stringify(req.data),context,newId:()=>`c-generated-${++serial}`,audit:(...args)=>{if(failures.audit)throw Error('Synthetic audit interruption');audited.push(args);}});
- return {w,store,hooks,audited,failures,request:async(data=payload)=>{const res={};await route({method:'POST',data},res,{path:'/api/import/conversations',authn:{user:{id:user}}});return res;}};
-}
-function put(w,id,history){fs.writeFileSync(w.historyPath(id),JSON.stringify({history},null,2));}// a transcript as the Rust store wrote it
-function temporary(t){const root=fs.mkdtempSync(path.join(os.tmpdir(),'noevia-import-'));t.after(()=>fs.rmSync(root,{recursive:true,force:true}));return root;}
-function historyIds(w){return fs.readdirSync(w.dir).filter(n=>/^history-c-.*\.json$/.test(n)).map(n=>n.slice(8,-5)).sort();}
-function assertComplete(f){assert.deepEqual([...persistedChatIds(f.w.dir)].sort(),['c-existing','c-free','c-new']);assert.deepEqual(historyIds(f.w),['c-existing','c-free','c-new']);assert.deepEqual(fs.readdirSync(path.join(f.w.dir,'conversation-imports')),[]);}
-for(const fault of ['free','existing','create','attach'])test(`import recovers real ${fault} persistence failure after restart`,async t=>{
- const root=temporary(t),f=fixture(root);await f.store.createProject({name:'Existing',toolboxes:[]});
- const save=f.w.saveProjects.bind(f.w),free=f.w.saveFreeChats.bind(f.w);let calls=0;
- f.w.saveProjects=()=>{if(++calls===({existing:1,create:2,attach:3}[fault]))throw Error('Synthetic disk full');save();};f.w.saveFreeChats=()=>{if(fault==='free')throw Error('Synthetic disk full');free();};
- const failed=await f.request();assert.equal(failed.status,503);assert.match(failed.body.error,/Retry the same file/);assert.equal(f.audited.length,0);
- const pending=fs.readdirSync(path.join(f.w.dir,'conversation-imports'));assert.equal(pending.length,1);assert.ok(fs.existsSync(path.join(f.w.dir,'conversation-imports',pending[0],'manifest.json')));
- const restarted=fixture(root);const success=await restarted.request();assert.equal(success.status,200);assert.equal(success.body.imported,3);assertComplete(restarted);
- const again=await restarted.request();assert.equal(again.body.imported,0);assertComplete(restarted);
-});
-test('same-process retry persists metadata already mutated in cache',async t=>{
- const f=fixture(temporary(t));await f.store.createProject({name:'Existing',toolboxes:[]});const save=f.w.saveFreeChats.bind(f.w);f.w.saveFreeChats=()=>{throw Error('disk');};
- assert.equal((await f.request()).status,503);assert.equal(f.w.freeChats.length,1);assert.equal(persistedChatIds(f.w.dir).size,0);f.w.saveFreeChats=save;assert.equal((await f.request()).status,200);assertComplete(f);
-});
-test('retry preserves unrelated edits, tombstones and pre-existing transcript paths',async t=>{
- const root=temporary(t),f=fixture(root);await f.store.createProject({name:'Existing',toolboxes:[]});put(f.w,'c-new',[{role:'user',content:'Pre-existing unlisted transcript'}]);
- f.w.saveProjects=()=>{throw Error('disk');};assert.equal((await f.request()).status,503);
- const next=fixture(root);next.store.deleteFreeChat('c-free');put(next.w,'c-other',[{role:'user',content:'Other concurrent conversation'}]);next.store.saveFreeChats([{id:'c-other',title:'Unrelated',updatedAt:1}]);
- const existing=next.w.projects.find(p=>p.name==='Existing');existing.goal='Concurrent edit';next.w.saveProjects();
- const r=await next.request();assert.equal(r.status,200);assert.equal(r.body.imported,2);assert.match(r.body.skipped[0].reason,/deleted/);assert.equal(next.w.projects.find(p=>p.name==='Existing').goal,'Concurrent edit');assert.ok(persistedChatIds(next.w.dir).has('c-other'));assert.ok(!persistedChatIds(next.w.dir).has('c-free'));
- assert.equal(next.store.readHistory('c-new')[0].content,'Pre-existing unlisted transcript');const generated=[...persistedChatIds(next.w.dir)].find(id=>id.startsWith('c-generated-'));assert.ok(generated);assert.equal(next.store.readHistory(generated)[0].content,'Synthetic new');
-});
-test('serialized imports are idempotent and tenants remain independent',async t=>{
- const root=temporary(t),a=fixture(root),b=fixture(root,'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb');const results=await Promise.all([a.request(),a.request(),b.request()]);assert.deepEqual(results.map(r=>r.status),[200,200,200]);assert.deepEqual(results.map(r=>r.body.imported),[3,0,3]);assertComplete(a);assertComplete(b);
-});
-test('incomplete staging is discarded before promotion; invalid input makes no journal',async t=>{
- const f=fixture(temporary(t));assert.equal((await f.request({format:'wrong'})).status,400);assert.ok(!fs.existsSync(path.join(f.w.dir,'conversation-imports')));
- const staging=path.join(f.w.dir,'conversation-imports','0'.repeat(64));fs.mkdirSync(staging,{recursive:true});fs.writeFileSync(path.join(staging,'0.json'),'unfinished');assert.equal((await f.request()).status,200);assertComplete(f);
-});
+// #2191 round 4: POST /api/import/conversations is the Rust front's (noevia-rs crates/server-projects import.rs:
+// planImport, the recovery journal, transcripts and lists; rust-conversation-import.test.cjs covers the refusal).
+// What stays here is the path's answer for every other method.
+const test = require('node:test');
+const assert = require('node:assert/strict');
+const { createImportRoutes } = require('./import.cjs');
 
-test('restart after metadata commit preserves later transcript edits and finishes journal cleanup',async t=>{
- const root=temporary(t),f=fixture(root);f.failures.audit=true;assert.equal((await f.request()).status,503);
- assert.deepEqual([...persistedChatIds(f.w.dir)].sort(),['c-existing','c-free','c-new']);
- const next=fixture(root);put(next.w,'c-free',[{role:'user',content:'Edited after partial response'}]);
- assert.equal((await next.request()).status,200);assertComplete(next);assert.equal(next.store.readHistory('c-free')[0].content,'Edited after partial response');
-});
-test('another valid import request recovers pending work before planning its own additions',async t=>{
- const root=temporary(t),f=fixture(root);f.w.saveFreeChats=()=>{throw Error('disk');};assert.equal((await f.request()).status,503);
- const next=fixture(root);const result=await next.request({format:FORMAT,chats:[{id:'c-other',title:'Other',history:[]}]});
- assert.equal(result.status,200);assert.equal(result.body.imported,1);assert.deepEqual([...persistedChatIds(next.w.dir)].sort(),['c-existing','c-free','c-new','c-other']);assert.equal(next.audited.length,2);
-});
-test('a chat dropped by the list cap is skipped and cannot block later imports',async t=>{
- const f=fixture(temporary(t)),existing=Array.from({length:lists.LIST_CAP},(_,i)=>({id:`c-kept-${i}`,title:`Kept ${i}`,updatedAt:i+1}));
- f.store.saveFreeChats(existing);
- const overflow={format:FORMAT,chats:[{id:'c-overflow',title:'Too old',updatedAt:0,history:[{role:'user',content:'Must not become orphaned'}]}]};
- const first=await f.request(overflow);assert.equal(first.status,200);assert.equal(first.body.imported,0);assert.match(first.body.skipped[0].reason,/list is full/);
- assert.equal(fs.existsSync(f.w.historyPath('c-overflow')),false);assert.deepEqual(fs.readdirSync(path.join(f.w.dir,'conversation-imports')),[]);
- const second=await f.request({format:FORMAT,chats:[{id:'c-later',title:'Later',updatedAt:2000,history:[]}]});
- assert.equal(second.status,200);assert.equal(second.body.imported,1);assert.ok(persistedChatIds(f.w.dir).has('c-later'));
-});
-test('project and free groups classify their own list-cap results independently',async t=>{
- const f=fixture(temporary(t)),project=await f.store.createProject({name:'Full project',toolboxes:[]});
- f.store.saveChats(project.id,Array.from({length:lists.LIST_CAP},(_,i)=>({id:`c-project-kept-${i}`,title:`Kept ${i}`,updatedAt:i+1})));
- const result=await f.request({format:FORMAT,chats:[
-  {id:'c-free-room',title:'Free room',updatedAt:0,history:[]},
-  {id:'c-project-overflow',title:'Project overflow',updatedAt:0,project:{name:'Full project'},history:[]},
- ]});
- assert.equal(result.status,200);assert.equal(result.body.imported,1);assert.equal(result.body.skipped.length,1);
- assert.match(result.body.skipped[0].reason,/list is full/);assert.ok(persistedChatIds(f.w.dir).has('c-free-room'));
- assert.equal(persistedChatIds(f.w.dir).has('c-project-overflow'),false);assert.equal(fs.existsSync(f.w.historyPath('c-project-overflow')),false);
-});
-test('#1071 slice 4: transcripts are published through the store, which needs no hard links and never overwrites',async t=>{
- const f=fixture(temporary(t)),link=fs.linkSync;
- fs.linkSync=()=>{const error=Error('synthetic unsupported hard link');error.code='EPERM';throw error;};
- t.after(()=>{fs.linkSync=link;});
- const calls=[];const transcripts=f.w.transcripts;f.w.transcripts={...transcripts,write:(...a)=>{calls.push(a);return transcripts.write(...a);}};
- const r=await f.request({format:FORMAT,chats:[{id:'c-copy',title:'Copied',history:[{role:'user',content:'Synthetic'}]}]});
- assert.equal(r.status,200);assert.equal(r.body.imported,1);assert.equal(f.store.readHistory('c-copy')[0].content,'Synthetic');
- assert.deepEqual(calls.map(([id,,o])=>[id,o]),[['c-copy',{ifAbsent:true,origin:'import'}]]);
- fs.linkSync=link;
-});
-test('#1071 slice 4: without the transcript store nothing is imported and no transcript is written',async t=>{
- const f=fixture(temporary(t));f.w.transcripts=undefined;
- const r=await f.request({format:FORMAT,chats:[{id:'c-none',title:'None',history:[{role:'user',content:'Synthetic'}]}]});
- assert.notEqual(r.status,200);assert.equal(fs.existsSync(f.w.historyPath('c-none')),false);assert.equal(persistedChatIds(f.w.dir).size,0);
-});
-test('#1071 slice 4: a chat deleted after publishing is taken back only while it is still the imported transcript',async t=>{
- const f=fixture(temporary(t));await f.store.createProject({name:'Existing',toolboxes:[]});
- f.hooks.afterSaved=()=>{f.hooks.afterSaved=null;f.store.deleteFreeChat('c-free');};
- // A late writer saves another transcript under the deleted id just before the import takes its own back.
- const transcripts=f.w.transcripts,removed=[];
- f.w.transcripts={...transcripts,removeIf:async(id,history)=>{put(f.w,id,[{role:'user',content:'Saved since'}]);const r=await transcripts.removeIf(id,history);removed.push([id,r]);return r;}};
- const r=await f.request();assert.equal(r.status,200);
- assert.deepEqual(removed,[['c-free',false]]);
- assert.equal(f.store.readHistory('c-free')[0].content,'Saved since','a transcript saved since is never removed by the import');
-});
+const json = (res, status, body) => Object.assign(res, { status, body });
 
-test('a chat deleted while the import waits is reported as deleted, not as a full list',async t=>{
- const f=fixture(temporary(t));await f.store.createProject({name:'Existing',toolboxes:[]});
- f.hooks.afterSaved=()=>{f.hooks.afterSaved=null;f.store.deleteFreeChat('c-free');};
- const r=await f.request();assert.equal(r.status,200);
- assert.equal(r.body.imported,2);
- const gone=r.body.skipped.filter(s=>s.title==='Free');assert.equal(gone.length,1);assert.match(gone[0].reason,/deleted while import was pending/);
- assert.ok(!r.body.skipped.some(s=>/list is full/.test(s.reason)));
- assert.equal(fs.existsSync(f.w.historyPath('c-free')),false);assert.ok(!persistedChatIds(f.w.dir).has('c-free'));
- assert.deepEqual(fs.readdirSync(path.join(f.w.dir,'conversation-imports')),[]);
-});
-test('an import against a busy project store fails, unlinks nothing and keeps transcript and journal',async t=>{
- const root=temporary(t);fs.mkdirSync(path.join(root,'users',uid),{recursive:true});
- const store=await startProjectStore(root);t.after(()=>store.close());
- const client=psc.createClient({port:store.port,token:store.token});
- const f=fixture(root,uid,client);await f.store.createProject({name:'Existing',toolboxes:[]});await f.store.whenSaved(()=>{});
- store.failNext(503,{error:'The project store is busy. Try again shortly.',code:'PROJECTS_BUSY'},{times:20});
- const failed=await f.request();assert.equal(failed.status,503);assert.match(failed.body.error,/Retry the same file/);assert.equal(f.audited.length,0);
- assert.equal(persistedChatIds(f.w.dir).size,0);
- assert.deepEqual(historyIds(f.w),['c-free']);// the free group was published before its list save failed; the rest is still staged
- const pending=fs.readdirSync(path.join(f.w.dir,'conversation-imports'));assert.equal(pending.length,1);assert.ok(fs.existsSync(path.join(f.w.dir,'conversation-imports',pending[0],'manifest.json')));
- store.clearFailures();
- // The store recovers; after a restart a retry of the same file completes it.
- const ok=await fixture(root,uid,psc.createClient({port:store.port,token:store.token})).request();assert.equal(ok.status,200);assert.equal(ok.body.imported,3);
-});
-
-test('#2153: an import publishes with origin import and takes back with origin remove',async t=>{
- const f=fixture(temporary(t));await f.store.createProject({name:'Existing',toolboxes:[]});
- f.hooks.afterSaved=()=>{f.hooks.afterSaved=null;f.store.deleteFreeChat('c-free');};
- const transcripts=f.w.transcripts,origins=[];
- f.w.transcripts={...transcripts,write:async(id,h,o)=>{origins.push(['write',id,o&&o.origin]);return transcripts.write(id,h,o);},removeIf:async(id,h,o)=>{origins.push(['removeIf',id,o&&o.origin]);return transcripts.removeIf(id,h,o);}};
- const r=await f.request();assert.equal(r.status,200);
- assert.deepEqual(origins.filter(o=>o[0]==='write').map(o=>o[2]),['import','import','import']);
- assert.deepEqual(origins.filter(o=>o[0]==='removeIf'),[['removeIf','c-free','remove']]);
-});
-
-test('#2153 end to end: over the store journal a history save queues exactly one brain build and an import none',async t=>{
- const root=temporary(t);
- const standin=await startProjectStore(root,{changes:true});t.after(()=>standin.close());
- const client=psc.createClient({port:standin.port,token:standin.token,timeoutMs:5000});
- const f=fixture(root,uid,client);await f.store.createProject({name:'Existing',toolboxes:[]});
- const {createChangeJournalReader,scheduleMirrorAndBrain}=require('../chat-change-journal.cjs');
- const mirror=[],brain=[];
- const reader=createChangeJournalReader({read:(u,a)=>client.changesRead(u,a),onChange:scheduleMirrorAndBrain({chatVaultMirror:{schedule:(u,c)=>mirror.push(c)},chatBrains:{schedule:(u,c)=>brain.push(c)}}),log:()=>{},setTimer:()=>null,clearTimer:()=>{}});
- await reader.poll(uid);// the first read takes the (empty) journal's start
- const r=await f.request();assert.equal(r.status,200);
- await reader.poll(uid);
- assert.deepEqual(mirror.slice().sort(),['c-existing','c-free','c-new'],'the import is mirrored');
- assert.deepEqual(brain,[],'an import builds no brain');
- // #1071 slice 5: the history POST is the Rust front's; its save (in process over the same store) journals origin history.
- const saved=require('../../tests/server/project-store-server.cjs').rustHistorySave(root,uid,'c-new',{history:[{role:'user',content:'Synthetic new'},{role:'assistant',content:'Synthetic reply'}]});
- assert.equal(saved.status,200,saved.text);
- await reader.poll(uid);
- assert.deepEqual(brain,['c-new'],'one history save, one brain build');
- const {entries}=await client.changesRead(uid,0);
- assert.deepEqual(entries.at(-1),{...entries.at(-1),chatId:'c-new',op:'write',origin:'history'});
- assert.ok(entries.slice(0,-1).every(e=>e.op==='write'&&e.origin==='import'),JSON.stringify(entries));
- assert.equal(entries.filter(e=>e.origin==='history').length,1);
- assert.equal(entries.filter(e=>e.origin==='import').length,3);
+test('other methods keep their 405; other paths are not this mount\'s', async () => {
+  const route = createImportRoutes({ json });
+  for (const method of ['GET', 'PUT', 'DELETE', 'PATCH']) {
+    const res = {};
+    assert.equal(await route({ method }, res, { path: '/api/import/conversations', authn: { user: { id: 'u1' } } }), true);
+    assert.deepEqual(res, { status: 405, body: { error: 'method not allowed' } }, method);
+  }
+  const signedOut = {};
+  assert.equal(await route({ method: 'GET' }, signedOut, { path: '/api/import/conversations', authn: null }), true);
+  assert.deepEqual(signedOut, { status: 401, body: { error: 'Sign in first' } });
+  assert.equal(await route({ method: 'POST' }, {}, { path: '/api/import/conversations/', authn: { user: { id: 'u1' } } }), false);
 });

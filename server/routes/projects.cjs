@@ -157,29 +157,45 @@ function createProjectRoutes({
   };
 
   async function handle(req, res, { path: p, authn, url }) {
-    // Opt-in asynchronous source processing; the synchronous API remains compatible.
-    const sourceJob = p.match(/^\/api\/projects\/([^/]+)\/source-jobs\/([^/]+)$/);
-    if (sourceJob && req.method === 'GET') {
-      const projectId = decodeURIComponent(sourceJob[1]);
+    // #2191 round 6 (rust-source-jobs.cjs): the asynchronous source routes (`?background=1` and
+    // GET .../source-jobs/{jobId}) are the Rust front's, which owns the source-job store. It runs
+    // the operation here by sending the synchronous route with `X-Noevia-Source-Work: 1`; the
+    // answer is NDJSON: `{"accepted":true}` once the request is taken (a refusal before that is a
+    // plain JSON answer, which the front passes on and starts no work for), one `{"stage":...}`
+    // per progress step, then `{"done":{status,body}}` or `{"failed":{status}}`.
+    const sourceWork = p.match(/^\/api\/projects\/([^/]+)\/(upload|sources\/sync)$/);
+    if (sourceWork && req.method === 'POST' && req.headers?.['x-noevia-source-work'] === '1') {
+      const projectId = decodeURIComponent(sourceWork[1]);
       if (!getProject(projectId)) return json(res, 404, { error: 'project not found' });
-      const job = await require('../source-jobs.cjs').read(currentWorkspace(), projectId, sourceJob[2]);
-      return json(res, job ? 200 : 404, job || { error: 'Processing status expired or the server restarted; refresh or re-upload to retry.' });
-    }
-    const backgroundSource = p.match(/^\/api\/projects\/([^/]+)\/(upload|documents|sources\/sync)$/);
-    if (backgroundSource && req.method === 'POST' && url.searchParams.get('background') === '1') {
-      const projectId = decodeURIComponent(backgroundSource[1]);
-      if (!getProject(projectId)) return json(res, 404, { error: 'project not found' });
-      const hold = backgroundSource[2] === 'sources/sync' ? automaticHold(authn, req) : null;
+      const hold = sourceWork[2] === 'sources/sync' ? automaticHold(authn, req) : null;
       if (hold) return holdReply(res, hold);
-      const body = await readJson(req, Math.ceil((backgroundSource[2] === 'upload' ? require('../pdf-reduce.cjs').INPUT_CAP : DOCUMENT_UPLOAD_CAP) / 3) * 4 + 512 * 1024);
-      const jobId = await require('../source-jobs.cjs').start(currentWorkspace(), projectId, async (progress) => {
+      const body = await readJson(req, Math.ceil((sourceWork[2] === 'upload' ? require('../pdf-reduce.cjs').INPUT_CAP : DOCUMENT_UPLOAD_CAP) / 3) * 4 + 512 * 1024);
+      res.writeHead(200, { 'Content-Type': 'application/x-ndjson', 'Cache-Control': 'no-store' });
+      const line = (value) => { if (!res.destroyed && !res.writableEnded) res.write(`${JSON.stringify(value)}\n`); };
+      line({ accepted: true });
+      const headers = { ...req.headers };
+      delete headers['x-noevia-source-work'];
+      const operation = async () => {
         const inner = require('node:stream').Readable.from([Buffer.from(JSON.stringify(body))]);
-        Object.assign(inner, { method: req.method, url: p, headers: req.headers, socket: req.socket });
+        Object.assign(inner, { method: req.method, url: p, headers, socket: req.socket });
         let status = 500, data = '';
+        const progress = (stage) => line({ stage: String(stage) });
         await requestScope.run({ ...requestScope.getStore(), sourceProgress: progress }, () => dispatch(inner, { setHeader() {}, writeHead(code) { status = code; }, end(value) { data = String(value || '{}'); } }));
+        // The result is final only once the list change it made is on disk: the front persists it
+        // and the client reads the workspace next (the old background job could report done first).
+        // A save that failed throws, as the synchronous answer would have been that failure.
+        await whenSaved(() => undefined);
         return { status, body: JSON.parse(data) };
-      }, { name: backgroundSource[2] === 'sources/sync' ? null : String(body?.name || '').split('/').pop() });
-      return json(res, 202, { poll: `/api/projects/${encodeURIComponent(projectId)}/source-jobs/${jobId}` });
+      };
+      try {
+        const done = await require('../source-work.cjs').track(currentWorkspace(), projectId, operation,
+          { name: sourceWork[2] === 'sources/sync' ? null : String(body?.name || '').split('/').pop() });
+        line({ done });
+      } catch (err) {
+        line({ failed: { status: err?.status || 500 } });
+      }
+      if (!res.destroyed && !res.writableEnded) res.end();
+      return;
     }
 
     if (p === '/api/diary/context' && ['GET', 'POST'].includes(req.method)) {
@@ -194,9 +210,9 @@ function createProjectRoutes({
     }
 
     // POST /api/projects and DELETE /api/projects/{projectId} are the Rust front's (#2191 round 2,
-    // rust-project-lifecycle.cjs, refused before authentication); the conversation import still
-    // creates through store.createProject, and a chat's attachments project is still deleted through
-    // store.deleteProject.
+    // rust-project-lifecycle.cjs, refused before authentication); so is the conversation import
+    // (round 4, rust-conversation-import.cjs), and a chat's attachments project is still deleted
+    // through store.deleteProject.
 
     const skillManifestRoute = p.match(/^\/api\/projects\/([^/]+)\/instruction-skills\/manifests$/);
     const skillContentRoute = p.match(/^\/api\/projects\/([^/]+)\/instruction-skills\/manifests\/([^/]+)\/content$/);
@@ -450,57 +466,11 @@ function createProjectRoutes({
     // ever read. Images are different: the model can genuinely see them, so
     // they are stored as bytes and attached to the conversation as image
     // parts rather than being decoded into replacement characters.
-    // A document uploaded from disk. It is converted to text on arrival and
-    // stored as an ordinary source, so everything downstream — RAG, the
-    // read_project_file tool, the manifest — treats it like any other file.
-    const projDocs = p.match(/^\/api\/projects\/([^/]+)\/documents$/);
-    if (projDocs && req.method === 'POST') {
-      const id = decodeURIComponent(projDocs[1]);
-      const project = getProject(id);
-      if (!project) return json(res, 404, { error: 'no such project' });
-      let body;
-      try {
-        body = JSON.parse(await readBody(req, Math.ceil(DOCUMENT_UPLOAD_CAP / 3) * 4 + 512 * 1024));
-      } catch (e) {
-        if (e && e.status === 413) return json(res, 413, { error: `That document is larger than the ${Math.round(DOCUMENT_UPLOAD_CAP / (1024 * 1024))} MB limit.` });
-        return json(res, 400, { error: 'invalid JSON' });
-      }
-      const name = String(body.name || '').slice(0, 200);
-      if (!documents.isDocument(name)) return json(res, 400, { error: `${name || 'that file'} is not a supported document (PDF).` });
-      let bytes;
-      try { bytes = Buffer.from(String(body.dataBase64 || ''), 'base64'); } catch { bytes = null; }
-      if (!bytes || !bytes.length) return json(res, 400, { error: 'document data was empty' });
-      if (bytes.length > DOCUMENT_UPLOAD_CAP) {
-        return json(res, 413, { error: `That document is ${Math.round(bytes.length / 1024 / 1024)} MB, over the ${Math.round(DOCUMENT_UPLOAD_CAP / (1024 * 1024))} MB limit.` });
-      }
-      return await withSourceLock(project, async () => {
-        if (getProject(id) !== project) return json(res, 409, { error: 'Project changed; retry.' });
-        const uploads = (project.files || []).filter(f => !f.source);
-        if (uploads.length >= 20 && !uploads.some(f => f.name === name)) return json(res, 400, { error: 'A project holds at most 20 uploaded sources.' });
-        const previous = uploads.find(f => f.name === name);
-        if (previous && body.replace !== true) return sourceExistsReply(res, name);
-        const file = await documentSources.ingest(currentWorkspace(), id, name, bytes, previous);
-        if (getProject(id) !== project || !sameSource(project.files.find(f => !f.source && f.name === name), previous)) return json(res, 409, { error: 'Project changed; retry.' });
-        project.files = [...(project.files || []).filter(f => f.source || f.name !== name), file];
-        indexSource(project, file); saveProjects(PROJECTS);
-        return json(res, 200, { name, pages: file.document.pages, characters: file.content.length, truncated: file.document.truncated, document: file.document });
-      });
-    }
+    // POST .../documents (a document uploaded from disk) is the Rust front's (#2191 round 5,
+    // rust-project-documents.cjs), read by Docling through its durable extraction queue.
 
-    // GET .../documents/original is the Rust front's (#2191, rust-project-reads.cjs, refused before
-    // authentication); the page reader stays here.
-    const docRead = p.match(/^\/api\/projects\/([^/]+)\/documents\/pages$/);
-    if (docRead && req.method === 'GET') {
-      const id = decodeURIComponent(docRead[1]);
-      const project = getProject(id);
-      const file = project?.files?.find(f => f.name === url.searchParams.get('name'));
-      if (!file?.document) return json(res, 404, { error: 'no such document' });
-      try {
-        const start = Number(url.searchParams.get('startPage') || 1);
-        return json(res, 200, documentSources.readPages(currentWorkspace(), id, file, start,
-          Number(url.searchParams.get('endPage') || start), Number(url.searchParams.get('offset') || 0)));
-      } catch (err) { return json(res, err.status || 422, { error: err.status ? err.message : 'Saved document data is unavailable; upload or refresh again.' }); }
-    }
+    // GET .../documents/original (#2191, rust-project-reads.cjs) and GET .../documents/pages (#2191
+    // round 4, rust-project-document-pages.cjs) are the Rust front's, refused before authentication.
 
     // #1805: plan a folder import. The client sends the folder's manifest (relative path, size,
     // SHA-256 of each file); the answer says which files will be uploaded, which are unchanged since

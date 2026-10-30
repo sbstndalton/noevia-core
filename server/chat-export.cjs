@@ -1,6 +1,6 @@
 'use strict';
 // The conversation export's shared pieces: the Markdown a chat is written as (also the single-chat
-// download and the vault mirror), the format name conversations.json carries (chat-import.cjs
+// download and the vault mirror), the format name conversations.json carries (noevia-rs crates/server-projects import.rs
 // reads it) and a stored-entry ZIP writer. The export itself (GET /api/export/conversations) is
 // the Rust front's since sbstndalton/noevia#1071 (noevia-rs crates/server-export).
 // Reasoning text is left out on purpose: it is scratch work, not part of the conversation.

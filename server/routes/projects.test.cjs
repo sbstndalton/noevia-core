@@ -1,6 +1,6 @@
 'use strict';
 // The project routes against a fake store: what is left alone, what is refused and with which
-// words, and that a background source job re-enters the router with the same headers. The
+// words, and that the front's source worker call re-enters the router with the same headers. The
 // store is projects.test.cjs; uploads end to end are document-routes.test.cjs.
 const test = require('node:test');
 const assert = require('node:assert/strict');
@@ -17,8 +17,7 @@ function fixture({ projects = [], diary = true, catalogue = null, onToolboxesCha
   const dispatched = [];
   const requestScope = new AsyncLocalStorage();
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'noevia-project-routes-'));
-  const sourceJobs = require('../../tests/server/project-store-stub.cjs').createStubStore(dir, { flat: true }).sourceJobsFor('stub');
-  const workspace = { dir, userId: 'u1', ragDir: () => path.join(dir, 'rag'), assetDir: () => path.join(dir, 'assets'), sourceJobs };
+  const workspace = { dir, userId: 'u1', ragDir: () => path.join(dir, 'rag'), assetDir: () => path.join(dir, 'assets') };
   const providers = [{ id: 'default' }, { id: 'prov-cloud' }];
   // Use production fallback semantics: an unknown ID resolves to default.
   const { getProvider } = createProviderRegistry({ currentWorkspace: () => ({}), PROVIDERS: providers, DEFAULT_PROVIDER_ID: 'default' });
@@ -52,12 +51,14 @@ function fixture({ projects = [], diary = true, catalogue = null, onToolboxesCha
     servedCatalogue: async () => catalogue, DEFAULT_PROVIDER_ID: 'default',
     store, onToolboxesChange,
   });
-  const call = (method, path, body, search = '', role = 'member') => {
+  const streamed = [];
+  const call = (method, path, body, search = '', role = 'member', extra = {}) => {
     const req = Readable.from(body === undefined ? [] : [Buffer.from(typeof body === 'string' ? body : JSON.stringify(body))]);
-    Object.assign(req, { method, url: path + search, headers: { cookie: 'session=x' }, socket: {} });
-    return routes(req, { writeHead() {}, end() {} }, { path, authn: { user: { id: 'u1', role } }, url: new URL(`http://localhost${path}${search}`) });
+    Object.assign(req, { method, url: path + search, headers: { cookie: 'session=x', ...extra }, socket: {} });
+    const res = { writeHead(status, headers) { streamed.push({ status, headers }); }, write(text) { streamed.push(JSON.parse(text)); }, end() { streamed.push('end'); } };
+    return routes(req, res, { path, authn: { user: { id: 'u1', role } }, url: new URL(`http://localhost${path}${search}`) });
   };
-  return { call, sent, dispatched, store, projects, providers, dir };
+  return { call, sent, dispatched, streamed, store, projects, providers, dir };
 }
 
 test('paths and methods outside the project surface fall through', async () => {
@@ -199,8 +200,9 @@ test('uploads refuse what they always refused', async () => {
   assert.deepEqual(f.sent.pop(), { status: 400, body: { error: 'photo.png is not a supported source (text file or PDF).' } });
   await f.call('POST', '/api/projects/p1/upload', { name: 'notes.txt', dataBase64: '' });
   assert.deepEqual(f.sent.pop(), { status: 400, body: { error: 'file was empty' } });
-  await f.call('POST', '/api/projects/p1/documents', { name: 'notes.txt' });
-  assert.deepEqual(f.sent.pop(), { status: 400, body: { error: 'notes.txt is not a supported document (PDF).' } });
+  // A document upload is the Rust front's (#2191 round 5, rust-project-documents.cjs): not this mount's.
+  assert.equal(await f.call('POST', '/api/projects/p1/documents', { name: 'notes.txt' }), false);
+  assert.equal(await f.call('POST', '/api/projects/p1/documents', { name: 'x.pdf' }, '?background=1'), false);
   // A project's images are the Rust front's (#1071): not this mount's.
   assert.equal(await f.call('POST', '/api/projects/p1/assets', { name: 'a', mime: 'image/bmp' }), false);
   for (const m of ['GET', 'DELETE']) assert.equal(await f.call(m, '/api/projects/p1/assets/img-1'), false, m);
@@ -209,19 +211,25 @@ test('uploads refuse what they always refused', async () => {
   assert.equal(DOCUMENT_UPLOAD_CAP, 25 * 1024 * 1024);
 });
 
-test('a background source job re-enters the router with the caller\'s headers and a progress hook', async () => {
+test('the front\'s worker call re-enters the router with the caller\'s headers and streams its progress (#2191 round 6)', async () => {
   const f = fixture({ projects: [{ id: 'p1', files: [] }] });
-  assert.equal(await f.call('POST', '/api/projects/p1/upload', { name: 'x.txt' }, '?background=1'), true);
-  const reply = f.sent.pop();
-  assert.equal(reply.status, 202);
-  assert.match(reply.body.poll, /^\/api\/projects\/p1\/source-jobs\//);
-  await new Promise((r) => setTimeout(r, 30));
+  // The background start and the poll are the Rust front's (rust-source-jobs.cjs refuses them before
+  // this mount): the poll has no handler here, and nothing re-enters the router without the header.
+  assert.equal(await f.call('GET', '/api/projects/p1/source-jobs/11111111-1111-4111-8111-111111111111'), false);
+  assert.deepEqual(f.dispatched, []);
+  const work = { 'x-noevia-source-work': '1' };
+  assert.equal(await f.call('POST', '/api/projects/p1/upload', { name: 'x.txt' }, '', 'member', work), true);
   assert.equal(f.dispatched.length, 1);
   assert.equal(f.dispatched[0].url, '/api/projects/p1/upload');
   assert.equal(f.dispatched[0].headers.cookie, 'session=x');
+  assert.equal(f.dispatched[0].headers['x-noevia-source-work'], undefined, 'the inner call is the plain synchronous route');
   assert.equal(typeof f.dispatched[0].progress, 'function');
-  await f.call('POST', '/api/projects/ghost/upload', { name: 'x.txt' }, '?background=1');
+  assert.deepEqual(f.streamed, [
+    { status: 200, headers: { 'Content-Type': 'application/x-ndjson', 'Cache-Control': 'no-store' } },
+    { accepted: true }, { done: { status: 200, body: { ok: true } } }, 'end']);
+  await f.call('POST', '/api/projects/ghost/upload', { name: 'x.txt' }, '', 'member', work);
   assert.deepEqual(f.sent.pop(), { status: 404, body: { error: 'project not found' } });
+  assert.equal(f.streamed.length, 4, 'a refusal is plain JSON, not a stream');
 });
 
 test('Diary context remains Node-owned and respects the add-on permission', async () => {
@@ -340,12 +348,15 @@ test('a model on a non-default (cloud) provider is never checked against the loc
   assert.equal(f.projects[0].model, 'laya_multilingual_f16');
 });
 
-test('malformed background source JSON is 400 before any job is dispatched', async () => {
+test('malformed source JSON on the front\'s worker call is 400 before any work is dispatched', async () => {
   const f = fixture({ projects: [{ id: 'p1' }] });
-  for (const suffix of ['upload', 'documents', 'sources/sync']) {
-    await assert.rejects(f.call('POST', `/api/projects/p1/${suffix}`, '{broken', '?background=1'),
+  for (const suffix of ['upload', 'sources/sync']) {
+    await assert.rejects(f.call('POST', `/api/projects/p1/${suffix}`, '{broken', '', 'member', { 'x-noevia-source-work': '1' }),
       { status: 400, message: 'invalid JSON' });
   }
+  assert.deepEqual(f.streamed, []);
+  // The document upload is the Rust front's (#2191 round 5): no background job for it here.
+  assert.equal(await f.call('POST', '/api/projects/p1/documents', '{broken', '?background=1'), false);
   assert.deepEqual(f.dispatched, []);
 });
 
