@@ -76,3 +76,19 @@ test('another process changing the file is seen at once, and a proof the front w
   const other = createStorageLatch({ now: () => 8, file: f });
   assert.deepEqual(other.blocked('u3', CONN), { kind: 'login' }, 'a hold set by another process holds here');
 });
+
+// The fingerprint is how a change of credentials clears a hold, and both processes must agree on it. These
+// digests are computed by fingerprintOf and the same table is asserted by the Rust side (noevia-rs
+// crates/server-projects storage_latch.rs, `the_fingerprint_is_the_one_cores_function_gives_the_same_row`):
+// quotes and backslashes, control characters, DEL, U+2028, non-BMP text and empty fields exercise
+// JSON.stringify's escapes.
+test('the connection fingerprint is the one the Rust front computes for the same row (#2191 round 8 review)', () => {
+  const rows = [
+    [{ kind: 'nextcloud', baseUrl: 'https://cloud.example/remote.php/dav/files/ada', bucket: '', username: 'ada', secret: 'synthetic-app-pw' }, '376c824306ea55b08290b7b2521e766fe39afff0757b891649d850c05bbdd256'],
+    [{ kind: 's3', baseUrl: 'https://s3.example', bucket: 'bkt', username: 'AKIASYNTH', secret: 'a"b\\c' }, '209700f4ed745b523d6a56309e9648f12b6de049d726e0538f7751872c35fe12'],
+    [{ kind: 'webdav', baseUrl: 'https://dav.example/\u00e9', bucket: '', username: '\u65e5\u672c\u8a9e', secret: '\ud83d\ude00 line\nbreak\ttab \u0001 \u007f \u2028 </script>' }, '7170827e27c9ba8d1dcc86c74f8e8e744a9b53722a41d56a75cf2e1410f7dde8'],
+    [{ kind: '', baseUrl: '', bucket: '', username: '', secret: '' }, '6cfebf804e787d7f6f42ab4ec170a33635fc041b4fc37ad1e2f3c4a2b5bc8ece'],
+  ];
+  for (const [row, digest] of rows) assert.equal(fingerprintOf(row), digest, JSON.stringify(row));
+});
+

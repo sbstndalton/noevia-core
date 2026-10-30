@@ -50,6 +50,38 @@ async function ready(base, route, proc) {
   }
   throw Error(`readiness failed: ${proc.failure()}`);
 }
+// A synthetic Docling (the front's only extraction engine since sbstndalton/noevia#2191 round 8: with none
+// configured every document is queued, not read). POST /extract reads the PDF's text layer with Poppler, one
+// entry per page the way Docling answers; a page with no text layer, as the synthetic scan has none, is
+// "ocr-needed", so the front sends it to the native OCR worker (through the recording relay) and reads the
+// rows from there. GET /health says it has no page ranges. Nothing is stored; the bytes live in `dir` only for
+// the Poppler call.
+async function startDocling(dir) {
+  fs.mkdirSync(dir, { recursive: true });
+  let n = 0;
+  const server = await listen(async (req, res) => {
+    const reply = (status, body) => { res.writeHead(status, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(body)); };
+    try {
+      if (req.method === 'GET' && req.url === '/health') return reply(200, { status: 'ok', ranges: false });
+      if (req.method !== 'POST' || req.url !== '/extract') return reply(404, { error: 'synthetic docling: no such route' });
+      const parts = []; for await (const part of req) parts.push(part);
+      const file = path.join(dir, `in-${++n}.pdf`);
+      fs.writeFileSync(file, Buffer.concat(parts));
+      const info = spawnSync('pdfinfo', [file], { encoding: 'utf8', timeout: 30000 });
+      if (info.status !== 0) return reply(422, { error: 'synthetic docling: not a readable PDF' });
+      const total = Number(/^Pages:\s+(\d+)$/m.exec(info.stdout)?.[1]);
+      const pages = [];
+      for (let number = 1; number <= total; number++) {
+        const read = spawnSync('pdftotext', ['-f', String(number), '-l', String(number), file, '-'], { encoding: 'utf8', timeout: 30000, maxBuffer: 8 * 1024 * 1024 });
+        const text = read.status === 0 ? read.stdout.replace(/\f/g, '').trim() : '';
+        pages.push({ number, text, status: text ? 'native' : 'ocr-needed', method: 'docling' });
+      }
+      fs.rmSync(file, { force: true });
+      return reply(200, { total, pages });
+    } catch (error) { return reply(500, { error: 'synthetic docling failure' }); }
+  });
+  return server;
+}
 class Client {
   constructor(base) { this.base = base; this.cookies = new Map(); }
   async call(method, route, body, status = 200) {
@@ -78,7 +110,7 @@ class Client {
   }
 
 }
-async function scenario(front, mode, workerBase, fixtures, root, calls) {
+async function scenario(front, mode, workerBase, fixtures, root, calls, { docling = true, only = null } = {}) {
   const dataDir = fs.mkdtempSync(path.join(root, 'data-'));
   const mocks = await startMocks();
   // Relay records real worker calls. Controls alter only OCR; all authentication,
@@ -87,15 +119,20 @@ async function scenario(front, mode, workerBase, fixtures, root, calls) {
     try {
       const parts = []; for await (const part of req) parts.push(part);
       const bytes = Buffer.concat(parts);
-      calls.push({ path: req.url, bytes: bytes.length, pages: req.headers['x-ocr-pages'] });
+      // The front asks the worker what it can do (GET /health, cached for minutes): forwarded, not counted.
+      if (req.url !== '/health') calls.push({ path: req.url, bytes: bytes.length, pages: req.headers['x-ocr-pages'] });
       if (req.url === '/extract' && mode !== 'good') {
-        res.writeHead(mode === 'unavailable' ? 503 : 200, { 'Content-Type': 'application/json' });
+        // A 502, not a 503: the front waits and retries a busy (503) OCR worker, which is not an outage.
+        res.writeHead(mode === 'unavailable' ? 502 : 200, { 'Content-Type': 'application/json' });
         return res.end(JSON.stringify(mode === 'unavailable' ? { error: 'synthetic worker outage' } : { pages: [{ number: 1, text: 'REF-9999 TOTAL 00.00', truncated: false }] }));
       }
-      const result = await fetch(workerBase + req.url, { method: req.method, headers: { 'Content-Type': req.headers['content-type'], ...(req.headers['x-ocr-pages'] ? { 'X-OCR-Pages': req.headers['x-ocr-pages'] } : {}) }, body: bytes, signal: AbortSignal.timeout(200000) });
+      const result = await fetch(workerBase + req.url, { method: req.method, headers: { 'Content-Type': req.headers['content-type'], ...(req.headers['x-ocr-pages'] ? { 'X-OCR-Pages': req.headers['x-ocr-pages'] } : {}) }, body: ['GET', 'HEAD'].includes(req.method) ? undefined : bytes, signal: AbortSignal.timeout(200000) });
       res.writeHead(result.status, { 'Content-Type': 'application/json' }); res.end(Buffer.from(await result.arrayBuffer()));
     } catch { res.writeHead(502); res.end('{"error":"synthetic relay failure"}'); }
   });
+  // The Docling stand-in the front reads PDFs with (absent in the DOCX run, where the front reads a DOCX
+  // with the OCR worker's /extract-docx: with Docling configured Docling reads it, as in production).
+  const doclingServer = docling ? await startDocling(path.join(dataDir, 'docling-stand-in')) : null;
   const nodePort = await port(); const frontPort = front ? await port() : nodePort;
   const base = `http://127.0.0.1:${frontPort}`;
   const env = serverEnv({ port: nodePort, dataDir, origin: base, mocks });
@@ -112,7 +149,13 @@ async function scenario(front, mode, workerBase, fixtures, root, calls) {
   try {
     await ready(`http://127.0.0.1:${nodePort}`, '/api/ready', node);
     if (front) {
-      rust = child(front, [], { PATH: process.env.PATH, UI_PORT: String(frontPort), UI_HOST: '127.0.0.1', UI_DATA_DIR: dataDir, PUBLIC_ORIGIN: base, NOEVIA_FRONT: 'rust', NOEVIA_START_ID: startId, NOEVIA_LEGACY_UPSTREAM: `http://127.0.0.1:${nodePort}` });
+      // The front runs the upload itself (#2191 round 8), so it reaches the OCR worker (through the relay that
+      // records the calls) and Docling by the same variables Core's worker clients read.
+      rust = child(front, [], {
+        PATH: process.env.PATH, UI_PORT: String(frontPort), UI_HOST: '127.0.0.1', UI_DATA_DIR: dataDir, PUBLIC_ORIGIN: base, NOEVIA_FRONT: 'rust', NOEVIA_START_ID: startId, NOEVIA_LEGACY_UPSTREAM: `http://127.0.0.1:${nodePort}`,
+        OCR_BASE_URL: env.OCR_BASE_URL,
+        ...(doclingServer ? { DOCLING_BASE_URL: `http://127.0.0.1:${doclingServer.address().port}` } : {}),
+      });
       await ready(base, '/api/ready', rust);
     }
     const admin = new Client(base); const member = new Client(base);
@@ -127,6 +170,24 @@ async function scenario(front, mode, workerBase, fixtures, root, calls) {
     const id = created.id || created.project?.id; assert.ok(id);
     const route = `/api/projects/${encodeURIComponent(id)}`;
     const upload = async name => admin.call('POST', route + '/upload', { name, organized: true, dataBase64: fs.readFileSync(path.join(fixtures, name)).toString('base64') });
+    // The stored-source reads are the Rust front's too (#2191; Node refuses them with 503): the Node
+    // reference reads the same files the front reads (tests/server/stored-sources.cjs).
+    const text = async name => {
+      if (front) return (await admin.call('GET', `${route}/sources/text?name=${encodeURIComponent(name)}`)).content;
+      const read = stored.sourceText(dataDir, id, name); assert.equal(read.status, 200); return read.json.content;
+    };
+    if (only === 'docx') {
+      // No Docling here: the front reads a DOCX with the OCR worker's /extract-docx (through the relay).
+      const docx = await upload('body.docx');
+      assert.equal(docx.attachment.state, 'partial');
+      assert.ok((await text('body.docx')).includes('SYNTHETIC DOCX REF 1271'));
+      console.log(`PASS: ${front ? 'Rust front' : 'Node reference'} dispatched DOCX extraction`);
+      assert.deepEqual(calls.map(call => call.path), ['/extract-docx']);
+      signIn(member, { username: 'synthetic-member', displayName: 'Synthetic Member', role: 'member' });
+      await member.call('POST', route + '/upload', { name: 'body.docx', organized: true, dataBase64: fs.readFileSync(path.join(fixtures, 'body.docx')).toString('base64') }, 404);
+      assert.equal(calls.length, 1, 'tenant refusal must precede worker dispatch');
+      return { docx };
+    }
     const scan = await upload('scan.pdf');
     let pages;
     // The page reader is the Rust front's too (#2191 round 4; Node alone refuses it with 503): the Node
@@ -143,9 +204,6 @@ async function scenario(front, mode, workerBase, fixtures, root, calls) {
     }
     requireScan(scan, pages);
     console.log(`PASS: ${front ? 'Rust front' : 'Node reference'} recovered every scan row via native OCR`);
-    const docx = await upload('body.docx');
-    assert.equal(docx.attachment.state, 'partial');
-    console.log(`PASS: ${front ? 'Rust front' : 'Node reference'} dispatched DOCX extraction`);
     const large = await upload('large.pdf');
     assert.ok(large.bytes <= 25 * 1024 * 1024);
     assert.equal(large.attachment.reduction.originalBytes, fs.statSync(path.join(fixtures, 'large.pdf')).size);
@@ -156,13 +214,6 @@ async function scenario(front, mode, workerBase, fixtures, root, calls) {
     const files = project.files; assert.ok(Array.isArray(files));
     // #1806: the workspace lists sources without their text; each text is read per source.
     assert.ok(files.every(file => !('content' in file)), 'the workspace carries no source text');
-    // The stored-source reads are the Rust front's too (#2191; Node refuses them with 503): the Node
-    // reference reads the same files the front reads (tests/server/stored-sources.cjs).
-    const text = async name => {
-      if (front) return (await admin.call('GET', `${route}/sources/text?name=${encodeURIComponent(name)}`)).content;
-      const read = stored.sourceText(dataDir, id, name); assert.equal(read.status, 200); return read.json.content;
-    };
-    assert.ok(files.some(file => file.name === 'body.docx') && (await text('body.docx')).includes('SYNTHETIC DOCX REF 1271'));
     assert.ok(files.some(file => file.name === large.path) && (await text(large.path)).includes('SYNTHETIC NATIVE TEXT FOR REDUCTION'));
     signIn(member, { username: 'synthetic-member', displayName: 'Synthetic Member', role: 'member' });
     const before = calls.length;
@@ -175,7 +226,9 @@ async function scenario(front, mode, workerBase, fixtures, root, calls) {
     else await member.call('GET', route + '/documents/original?name=scan.pdf', undefined, 503);
     const deniedUpload = await member.call('POST', route + '/upload', { name: 'scan.pdf', organized: true, dataBase64: fs.readFileSync(path.join(fixtures, 'scan.pdf')).toString('base64') }, 404);
     assert.equal(calls.length, before, 'tenant refusal must precede worker dispatch');
-    assert.deepEqual(calls.map(call => call.path).sort(), ['/extract', '/extract-docx', '/reduce-pdf']);
+    // Docling reads the PDFs and (as in production) a DOCX when it is configured, so the worker's /extract-docx is
+    // the DOCX run's alone (below); here it reads the scan's page and reduces the oversized PDF.
+    assert.deepEqual(calls.map(call => call.path).sort(), ['/extract', '/reduce-pdf']);
     assert.equal(calls.find(call => call.path === '/extract').pages, '[1]');
     assert.ok(calls.find(call => call.path === '/reduce-pdf').bytes > 25 * 1024 * 1024);
     // Compare complete upload and page response bodies, plus persisted source
@@ -210,9 +263,10 @@ async function scenario(front, mode, workerBase, fixtures, root, calls) {
       for (const [identity, replacement] of identities) item = item.replaceAll(identity, replacement);
       return key === 'notice' ? item.replace(/; index: [a-z]+\.$/, '; index: <progress>.') : item;
     });
-    return stable({ scan, pages, docx, large: comparedLarge, files: files.map(file => file === reduced ? comparedReduced : file).map(({ name, content, document, attachment }) => ({ name, content, document, attachment })), deniedUpload });
+    return stable({ scan, pages, large: comparedLarge, files: files.map(file => file === reduced ? comparedReduced : file).map(({ name, content, document, attachment }) => ({ name, content, document, attachment })), deniedUpload });
   } finally {
     await stop(rust); await stop(node); mocks.close(); await store.close(); relay.closeAllConnections(); await new Promise(resolve => relay.close(resolve));
+    if (doclingServer) { doclingServer.closeAllConnections(); await new Promise(resolve => doclingServer.close(resolve)); }
     fs.rmSync(dataDir, { recursive: true, force: true });
   }
 }
@@ -248,6 +302,8 @@ async function main() {
     // scenario (the scan oracle, the DOCX state, the reduction's relationships, the stored text, the tenant
     // refusals) are the gate, on the front alone.
     await scenario(front, 'good', workerBase, fixtures, root, []);
+    // The DOCX run: no Docling configured, so the front reads the DOCX with the worker's /extract-docx.
+    await scenario(front, 'good', workerBase, fixtures, root, [], { docling: false, only: 'docx' });
     console.log('PASS: native OCR/DOCX/reduction through Rust front; contracts asserted; tenant isolation');
   } finally { await stop(native); fs.rmSync(root, { recursive: true, force: true }); }
 }

@@ -47,6 +47,23 @@ test('an aborted wait, a missing file, an unreadable file and a stale entry wait
   assert.deepEqual(await ops.settle(ws, 'p1', { signal: abort.signal, timeoutMs: 5000 }), { notReady: [], aborted: true });
 });
 
+test('the collector fails closed: a list that cannot be read counts as an operation in flight, a missing one as none (#2191 round 8 review)', () => {
+  const ws = workspace();
+  assert.equal(ops.inFlight(ws.dir), false, 'no file: nothing runs');
+  fs.writeFileSync(path.join(ws.dir, ops.FILE), '{not json');
+  assert.equal(ops.inFlight(ws.dir), true, 'a torn list');
+  assert.equal(require('./source-text.cjs').sourceWorkInFlight(ws.dir), true);
+  write(ws, [op({ kind: 'sync' })]);
+  assert.equal(ops.inFlight(ws.dir), true);
+  write(ws, []);
+  assert.equal(ops.inFlight(ws.dir), false, 'the list reads again: nothing runs');
+  const dir = workspace();
+  fs.mkdirSync(path.join(dir.dir, ops.FILE));
+  assert.equal(ops.inFlight(dir.dir), true, 'a list that is not a file (EISDIR)');
+  // A chat still waits for nothing it cannot read.
+  return ops.settle(dir, 'p1', { timeoutMs: 50, pollMs: 10 }).then((settled) => assert.deepEqual(settled, { notReady: [], aborted: false }));
+});
+
 test('a sync or a folder import in flight is seen; a plain upload or a finished one is not (#1815)', () => {
   const ws = workspace();
   assert.equal(ops.inFlight(ws.dir), false);

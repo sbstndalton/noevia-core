@@ -11,8 +11,13 @@
 //     folder import runs in the workspace.
 //
 // Names are as the front listed them; nothing here is written. A `running` entry older than STALE_MS is not
-// waited for (the front fails a dead process's entries itself at its next write; this bounds a front that
-// was never restarted).
+// waited for (the front fails a dead process's entries itself at its next write, and ends an operation past its
+// own bound, 2 h for a sync and 30 min for an upload; this bounds a front that was never restarted).
+//
+// The two readers differ on purpose when the list cannot be read. A chat's wait (settle) waits for nothing it
+// cannot read: a turn is never held up by a broken file. The collector's check (inFlight) fails closed: it
+// removes files, so a list it cannot read (anything but a missing file) counts as an operation in flight and
+// nothing is swept until the list reads again.
 const fs = require('node:fs');
 const path = require('node:path');
 const { createReread, fileSignal } = require('./shared-reread.cjs');
@@ -23,25 +28,29 @@ const TIMED_OUT_FORGET_MS = 10 * 60 * 1000;
 const POLL_MS = 100;
 
 const readers = new Map();
-const readerFor = (file) => {
-  let r = readers.get(file);
+const load = (file) => () => {
+  let text;
+  try { text = fs.readFileSync(file, 'utf8'); } catch (error) { if (error && error.code === 'ENOENT') return []; throw error; }
+  const doc = JSON.parse(text);
+  return Array.isArray(doc && doc.ops) ? doc.ops.filter((o) => o && typeof o === 'object') : [];
+};
+const readerFor = (file, strict) => {
+  const key = `${strict ? 'strict' : 'lenient'}\0${file}`;
+  let r = readers.get(key);
   if (!r) {
     r = createReread({
       signal: () => fileSignal(file),
-      load: () => {
-        let text;
-        try { text = fs.readFileSync(file, 'utf8'); } catch (error) { if (error && error.code === 'ENOENT') return []; throw error; }
-        const doc = JSON.parse(text);
-        return Array.isArray(doc && doc.ops) ? doc.ops.filter((o) => o && typeof o === 'object') : [];
-      },
-      // A file that cannot be read tells nothing: no operation is waited for.
-      fallback: () => [],
+      load: load(file),
+      // A file that cannot be read tells nothing to a wait (no operation is waited for); the strict
+      // reader lets the failure out for the caller that must not guess.
+      fallback: strict ? (error) => { throw error; } : () => [],
     });
-    readers.set(file, r);
+    readers.set(key, r);
   }
   return r;
 };
-const opsOf = (dir) => readerFor(path.join(dir, FILE)).current();
+const opsOf = (dir) => readerFor(path.join(dir, FILE), false).current();
+const opsOfStrict = (dir) => readerFor(path.join(dir, FILE), true).current();
 
 // An operation that already outlasted one wait is reported as not ready without making every later turn
 // wait the full bound again.
@@ -50,8 +59,9 @@ const timedOut = new Map();
 /** Whether a sync or a folder import is running for the workspace folder `dir`. */
 function inFlight(dir, now = Date.now()) {
   if (!dir) return false;
-  try { return opsOf(dir).some((o) => o.state === 'running' && (o.kind === 'sync' || o.kind === 'import') && now - Number(o.at) < STALE_MS); }
-  catch { return false; }
+  try { return opsOfStrict(dir).some((o) => o.state === 'running' && (o.kind === 'sync' || o.kind === 'import') && now - Number(o.at) < STALE_MS); }
+  // Fail closed: only a missing list (ENOENT, which the reader answers as empty before it gets here) is "none".
+  catch (error) { return !(error && error.code === 'ENOENT'); }
 }
 
 /** Waits for the project's running file operations. Resolves { notReady: [{ name, reason: 'failed' | 'timeout' }], aborted }. */
