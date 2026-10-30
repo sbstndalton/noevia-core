@@ -36,13 +36,14 @@ function createDirectoryMcp({ db, audit = () => {}, secrets = null }) {
     title TEXT NOT NULL, url TEXT NOT NULL, added_by TEXT, added_at INTEGER NOT NULL);`);
   // Sign-in headers (2026-09-19): encrypted JSON {name: value}; never returned to a browser.
   if (!db.prepare("SELECT 1 FROM pragma_table_info('directory_mcp_servers') WHERE name='headers_enc'").get()) db.exec('ALTER TABLE directory_mcp_servers ADD COLUMN headers_enc TEXT');
-  // OAuth servers (2026-09-19): each account signs in for itself; see mcp-oauth.cjs.
+  // OAuth servers (2026-09-19): each account signs in for itself; the Rust front is the broker of
+  // the sign-ins and of every account's own key (rust-mcp-credentials.cjs, sbstndalton/noevia#2202).
   if (!db.prepare("SELECT 1 FROM pragma_table_info('directory_mcp_servers') WHERE name='oauth'").get()) db.exec('ALTER TABLE directory_mcp_servers ADD COLUMN oauth INTEGER NOT NULL DEFAULT 0');
   // Per-account keys (2026-09-19): `personal` servers take each account's own key; the declared
   // header list (names, hints, templates — no values) is kept so the key form needs no registry.
   if (!db.prepare("SELECT 1 FROM pragma_table_info('directory_mcp_servers') WHERE name='personal'").get()) db.exec("ALTER TABLE directory_mcp_servers ADD COLUMN personal INTEGER NOT NULL DEFAULT 0; ALTER TABLE directory_mcp_servers ADD COLUMN declared_json TEXT NOT NULL DEFAULT '[]'");
-  db.exec(`CREATE TABLE IF NOT EXISTS directory_mcp_user_keys(user_id TEXT NOT NULL, server_id TEXT NOT NULL, headers_enc TEXT NOT NULL, updated_at INTEGER NOT NULL,
-    PRIMARY KEY(user_id, server_id));`);
+  // directory_mcp_user_keys is the broker's table (rust-mcp-credentials.cjs ensureSchema makes it);
+  // this module never reads or writes it.
   const rows = () => db.prepare('SELECT id, registry_name AS registryName, title, url, added_by AS addedBy, added_at AS addedAt, headers_enc AS headersEnc, oauth, personal, declared_json AS declaredJson FROM directory_mcp_servers ORDER BY added_at').all();
   // A shared server's key has no owning user (decode/encode with no userId, v1). A
   // personal server's per-account key is bound to its owner: secrets.decrypt only
@@ -66,7 +67,8 @@ function createDirectoryMcp({ db, audit = () => {}, secrets = null }) {
     const declared = JSON.stringify(declaredHeaders.map((h) => ({ name: h.name, required: !!h.required, secret: h.secret !== false, description: String(h.description || '').slice(0, 300), template: h.template || null })));
     // A personal server keeps no shared key: the adding admin's key is stored as theirs.
     db.prepare('INSERT INTO directory_mcp_servers(id, registry_name, title, url, added_by, added_at, headers_enc, oauth, personal, declared_json) VALUES(?,?,?,?,?,?,?,?,?,?)').run(id, registryName, String(title || registryName).slice(0, 80), url, actorId || null, Date.now(), personal ? null : encode(headers), oauth ? 1 : 0, personal ? 1 : 0, declared);
-    if (personal) db.prepare('INSERT INTO directory_mcp_user_keys VALUES(?,?,?,?)').run(actorId, id, encode(headers, actorId), Date.now());
+    // A personal server keeps no shared key; the adding administrator's key is stored as theirs by the
+    // broker (the route asks it, with the values it has just checked), never from here.
     audit('mcp.directory.add', actorId, { registryName, url, keyHeaders: Object.keys(headers) });
     return list().find((s) => s.id === id);
   }
@@ -79,32 +81,11 @@ function createDirectoryMcp({ db, audit = () => {}, secrets = null }) {
   }
   const headersFor = (id) => decode(rows().find((r) => r.id === id)?.headersEnc);
 
-  // ── Each account's own key for a personal server ──
-  const userHeadersFor = (userId, id) => { if (!userId) return {}; const r = db.prepare('SELECT headers_enc FROM directory_mcp_user_keys WHERE user_id=? AND server_id=?').get(userId, id); return r ? decode(r.headers_enc, userId) : {}; };
-  const hasUserKey = (userId, id) => !!(userId && db.prepare('SELECT 1 FROM directory_mcp_user_keys WHERE user_id=? AND server_id=?').get(userId, id));
-  function setUserKey(userId, id, headerValues) {
-    const s = list().find((x) => x.id === id && x.personal);
-    if (!s) throw Object.assign(new Error('No such server.'), { status: 404 });
-    const headers = checkHeaderValues(s.declaredHeaders, headerValues);
-    if (!Object.keys(headers).length) throw Object.assign(new Error('Enter your key.'), { status: 400 });
-    db.prepare('INSERT INTO directory_mcp_user_keys VALUES(?,?,?,?) ON CONFLICT(user_id, server_id) DO UPDATE SET headers_enc=excluded.headers_enc, updated_at=excluded.updated_at').run(userId, id, encode(headers, userId), Date.now());
-    audit('mcp.directory.user-key', userId, { id, keyHeaders: Object.keys(headers) });
-  }
-  function clearUserKey(userId, id) {
-    db.prepare('DELETE FROM directory_mcp_user_keys WHERE user_id=? AND server_id=?').run(userId, id);
-    audit('mcp.directory.user-key.remove', userId, { id });
-  }
-
-  /** A deleted account takes its own per-server keys with it (every server). */
-  function forgetUser(userId) {
-    db.prepare('DELETE FROM directory_mcp_user_keys WHERE user_id=?').run(userId);
-  }
-
   function remove(id, actorId) {
     const row = list().find((s) => s.id === id);
     if (!row) throw Object.assign(new Error('No such server.'), { status: 404 });
     db.prepare('DELETE FROM directory_mcp_servers WHERE id=?').run(id);
-    db.prepare('DELETE FROM directory_mcp_user_keys WHERE server_id=?').run(id);
+    // Every account's sign-in, app and key for it go with it: the route asks the broker (forget) first.
     audit('mcp.directory.remove', actorId, { registryName: row.registryName });
     return row;
   }
@@ -114,7 +95,7 @@ function createDirectoryMcp({ db, audit = () => {}, secrets = null }) {
   const boxFor = (server, toolNames) => ({ id: server.id, server: server.id, label: server.title, directory: true,
     description: `Added from the MCP directory. Every call asks first.`, tools: [...toolNames] });
 
-  return { list, add, remove, setKeys, headersFor, userHeadersFor, hasUserKey, setUserKey, clearUserKey, forgetUser, asServers, boxFor, idFor };
+  return { list, add, remove, setKeys, headersFor, asServers, boxFor, idFor };
 }
 
 module.exports = { createDirectoryMcp, hostedUrlOk, checkHeaderValues };

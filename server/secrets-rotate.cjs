@@ -12,6 +12,12 @@
 // changed under a half-rotated registry. This process never writes either file, and so cannot
 // shift or overwrite a row the front deletes or edits meanwhile (a row-index write could).
 //
+// The MCP credential tables (mcp_oauth_tokens, mcp_oauth_clients, directory_mcp_user_keys) are not
+// listed either: the front is their only writer (sbstndalton/noevia#2202), so it re-seals them in
+// one pass under each sign-in's refresh lock (rust-mcp-credentials.cjs, POST /v1/mcp/reseal),
+// awaited before the rest. `directory_mcp_servers.headers_enc` (an administrator's shared key)
+// is still Node's and stays below.
+//
 // The shell form needs the front's internal store (NOEVIA_PROJECT_STORE_PORT and
 // NOEVIA_PROJECT_STORE_TOKEN, which the web supervisor hands the web process alone and Node removes
 // from its environment at start), so it refuses to run without them, before it changes anything,
@@ -62,17 +68,14 @@ function googleDriveUserFiles(dir, secrets) {
 function rotationTables({ db, dataDir, secrets = null }) {
   const tables = [
     sqlTable(db, 'storage_connections', { table: 'storage_connections', keys: ['user_id'], column: 'secret', bound: true }),
-    sqlTable(db, 'mcp_oauth_tokens', { table: 'mcp_oauth_tokens', keys: ['user_id', 'server_id'], column: 'data_enc', bound: true }),
-    sqlTable(db, 'mcp_oauth_clients', { table: 'mcp_oauth_clients', keys: ['server_id'], column: 'data_enc', bound: false }),
     sqlTable(db, 'directory_mcp_servers', { table: 'directory_mcp_servers', keys: ['id'], column: 'headers_enc', bound: false }),
-    sqlTable(db, 'directory_mcp_user_keys', { table: 'directory_mcp_user_keys', keys: ['user_id', 'server_id'], column: 'headers_enc', bound: true }),
     sqlTable(db, 'chatgpt_oauth_tokens', { table: 'chatgpt_oauth_tokens', keys: ['user_id'], column: 'data_enc', bound: true }),
   ];
   if (secrets) tables.push(googleDriveUserFiles(path.join(dataDir, 'google-drive-users'), secrets));
   return tables;
 }
 
-/** Adds the front's provider pass (`{ tables, failures }`, rust-providers-reseal.cjs) to `report`. */
+/** Adds a front pass (`{ tables, failures }`: the providers' or the MCP credentials') to `report`. */
 function mergeProviderPass(report, pass) {
   for (const [name, counts] of Object.entries(pass.tables)) {
     report.tables[name] = counts;
@@ -98,20 +101,31 @@ async function resealGoogleDrive(gdriveReseal) {
 }
 
 /**
- * Run a rotation and record it in the audit log. Never throws for a bad row. The order is fixed:
+ * Run a rotation and record it in the audit log. Never throws for a bad row. The order is fixed, and every
+ * callback is checked before the first await (a missing one must not leave the first passes done):
  *   1. `await resealProviders()`: the front re-seals the provider files (rust-providers-reseal.cjs
- *      `resealProviderKeys`). It throws, before anything is changed, when it cannot: that stops everything.
- *   2. `await gdriveReseal()`: the front re-seals the Google Drive token files (SOFT: a front that cannot do
+ *      `resealProviderKeys`). It throws when it cannot, and then nothing below runs.
+ *   2. `await resealMcp()`: the front re-seals the MCP sign-ins, apps and keys (rust-mcp-credentials.cjs
+ *      `resealMcpCredentials`). It throws too, and then nothing below runs.
+ *   3. `await gdriveReseal()`: the front re-seals the Google Drive token files (SOFT: a front that cannot do
  *      it is a failure of that table in the report, and the rotation goes on).
- *   3. `secrets.rotate`: the rest, in this process.
+ *   4. `secrets.rotate`: the rest, in this process.
+ *   5. the passes are merged into the report and the Drive check is relabelled.
+ * Steps 1 and 2 throw when the front cannot do them, and then THIS process has changed nothing. The front's own
+ * passes may have run in part (the providers' before a failing MCP pass, or some rows of one): each re-seal is
+ * idempotent and per row, so a rotation can simply be run again.
  */
-async function runRotation({ secrets, db, dataDir, audit = () => {}, actorId = null, resealProviders, gdriveReseal = null }) {
+async function runRotation({ secrets, db, dataDir, audit = () => {}, actorId = null, resealProviders, resealMcp, gdriveReseal = null }) {
   if (typeof resealProviders !== 'function') throw new Error('the provider keys are re-sealed by the Rust front: runRotation needs resealProviders');
+  if (typeof resealMcp !== 'function') throw new Error('the MCP credentials are re-sealed by the Rust front: runRotation needs resealMcp');
+  if (gdriveReseal !== null && gdriveReseal !== undefined && typeof gdriveReseal !== 'function') throw new Error('gdriveReseal, when given, must be a function');
   const providers = await resealProviders();
+  const mcpCredentials = await resealMcp();
   // Awaited too: the front's re-seal is a step of the rotation, not a race with it.
   const front = await resealGoogleDrive(gdriveReseal);
   const report = secrets.rotate({ tables: rotationTables({ db, dataDir, secrets }) });
   mergeProviderPass(report, providers);
+  mergeProviderPass(report, mcpCredentials);
   if (report.tables.google_drive_users) {
     const t = report.tables.google_drive_users;
     if (front.counts) {
@@ -136,8 +150,10 @@ if (require.main === module) {
     console.error('secrets rotation was not started and nothing was changed: the provider keys are re-sealed by the Rust front, which this shell cannot reach (the internal store\'s port and secret belong to the web process). Rotate through the running app instead: sign in as an administrator and POST /api/admin/secrets/rotate.');
     process.exit(2);
   }
+  // ONE store client, and every re-seal it offers, as the admin route passes them (index.cjs).
   const front = store.clientFromEnv(process.env);
   const resealProviders = () => require('./rust-providers-reseal.cjs').resealProviderKeys(front);
+  const resealMcp = () => require('./rust-mcp-credentials.cjs').resealMcpCredentials(front);
   const gdriveReseal = () => front.gdriveReseal();
   const dataDir = process.env.UI_DATA_DIR || path.join(__dirname, 'ui-data');
   const { createSecretStore } = require('./secrets.cjs');
@@ -148,12 +164,12 @@ if (require.main === module) {
   const audit = (action, actor, target, detail) => {
     if (hasTable(db, 'audit_events')) db.prepare('INSERT INTO audit_events(actor_user_id,target_user_id,action,detail,created_at) VALUES(?,?,?,?,?)').run(actor, target, action, JSON.stringify({ ...detail, via: 'cli' }), Date.now());
   };
-  runRotation({ secrets, db, dataDir, audit, resealProviders, gdriveReseal }).then((report) => {
+  runRotation({ secrets, db, dataDir, audit, resealProviders, resealMcp, gdriveReseal }).then((report) => {
     console.log(JSON.stringify(report, null, 2));
     if (!report.previousKey) console.error('note: no previous key is configured; only legacy/plaintext values could be upgraded.');
     process.exitCode = report.totals.failed ? 2 : 0;
   }, (e) => {
-    console.error(`secrets rotation stopped before any other credential was changed (the front's provider pass may have run in part; a rotation can be run again): ${String(e && e.message || e).slice(0, 300)}`);
+    console.error(`secrets rotation stopped before this process changed any credential (the front's passes may have run in part; a rotation can be run again): ${String(e && e.message || e).slice(0, 300)}`);
     process.exitCode = 2;
   });
 }
