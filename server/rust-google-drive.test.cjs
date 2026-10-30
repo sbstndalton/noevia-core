@@ -49,8 +49,9 @@ test('Google Drive: exactly the four methods the front answers are refused, befo
   assert.equal(refuse(gdrive, 'POST', '/api/connectors/gdrive/../gdrive/connect').handled, true);
 });
 
-test('the off-site backup: every method of the seven paths is refused, and no other path', () => {
-  assert.equal(offsite.OWNED_PATHS.length, 7);
+test('the off-site backup: every method of the eight paths is refused, and no other path', () => {
+  assert.equal(offsite.OWNED_PATHS.length, 8);
+  assert.ok(offsite.OWNED_PATHS.includes('/api/admin/offsite-backup/new-store'), 'the new-store action is the front\'s too');
   for (const p of offsite.OWNED_PATHS) for (const m of ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'HEAD']) {
     const r = refuse(offsite, m, p);
     assert.equal(r.handled, true, `${m} ${p}`);
