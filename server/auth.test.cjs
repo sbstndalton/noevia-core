@@ -93,23 +93,14 @@ test('accepts a valid bearer token', async () => {
   assert.ok(Array.isArray(body.projects));
 });
 
-test('protects provider creation with the same API guard', async () => {
-  const denied = await request('/api/providers', {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ label: 'Untrusted', baseUrl: 'https://example.invalid/v1' }),
-  });
-  assert.equal(denied.status, 401);
-
-  const allowed = await request('/api/providers', {
-    method: 'POST',
-    headers: {
-      authorization: 'Bearer test-cowork-token',
-      'content-type': 'application/json',
-    },
-    body: JSON.stringify({ label: 'Trusted test', baseUrl: 'https://example.invalid/v1' }),
-  });
-  assert.equal(allowed.status, 200);
+test('provider creation is the Rust front\'s: Node refuses it before authentication and creates nothing', async () => {
+  // The same API guard (401 signed out, then the shared and address rules) is asserted where the
+  // route lives: noevia-rs tests/providers.rs. Node's mount cannot be reached by a stale route table.
+  for (const headers of [{ 'content-type': 'application/json' }, { authorization: 'Bearer test-cowork-token', 'content-type': 'application/json' }]) {
+    const refused = await request('/api/providers', { method: 'POST', headers, body: JSON.stringify({ label: 'Untrusted', baseUrl: 'https://example.invalid/v1' }) });
+    assert.equal(refused.status, 503);
+    assert.equal(JSON.parse(refused.text).code, 'RUST_PROVIDERS_OWNED');
+  }
 });
 
 test('does not require auth for the static application shell', async () => {
@@ -119,15 +110,11 @@ test('does not require auth for the static application shell', async () => {
 
 const adminHeaders = { authorization: 'Bearer test-cowork-token', 'content-type': 'application/json' };
 
-test('provider DELETE removes private and shared providers through the real route', async () => {
-  for (const shared of [false, true]) {
-    const created = await request('/api/providers', {method:'POST', headers:adminHeaders, body:JSON.stringify({label:'Disposable', baseUrl:'https://example.invalid', shared})});
-    const id = JSON.parse(created.text).id;
-    assert.ok(id);
-    const deleted = await request(`/api/providers/${id}`, {method:'DELETE', headers:adminHeaders});
-    assert.equal(deleted.status, 200);
-    const listed = await request('/api/providers', {headers:adminHeaders});
-    assert.ok(!JSON.parse(listed.text).providers.some(p => p.id === id));
+test('the provider registry\'s other methods are refused too (the Rust front removes and edits rows)', async () => {
+  for (const [method, url] of [['GET', '/api/providers'], ['PUT', '/api/providers/p1'], ['DELETE', '/api/providers/p1'], ['DELETE', '/api/providers/chatgpt']]) {
+    const refused = await request(url, { method, headers: adminHeaders, body: method === 'PUT' ? '{}' : '' });
+    assert.equal(refused.status, 503, `${method} ${url}`);
+    assert.equal(JSON.parse(refused.text).code, 'RUST_PROVIDERS_OWNED');
   }
 });
 

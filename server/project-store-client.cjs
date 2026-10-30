@@ -28,8 +28,13 @@ const TIMEOUT_MS = 10000;
 // sbstndalton/noevia#2190 round 5: a ChatGPT session may refresh upstream and a model list may
 // fetch the catalogue after a refresh (the broker's 15 s each).
 const CHATGPT_WAIT_MS = 45000;
+// sbstndalton/noevia#2190 round 6: the provider keys' re-seal walks every account's providers.json
+// under its lock, so it may wait for a busy one.
+const RESEAL_WAIT_MS = 120000;
 const REPLY_CAP = 2 * 32 * 1024 * 1024 + 64 * 1024;
-const FILES = new Set(['projects.json', 'free-chats.json']);
+// providers.json (sbstndalton/noevia#2190 round 6) is the account's private provider rows: the Rust
+// front's routes are its writer; Node saves only its seal-on-load migration here.
+const FILES = new Set(['projects.json', 'free-chats.json', 'providers.json']);
 
 /** Whether the environment hands over the Rust store (see the header): its port and secret. */
 function enabledFrom(env = process.env, warn = console.warn) {
@@ -253,6 +258,16 @@ function createClient({ port, token, fetchImpl = globalThis.fetch, timeoutMs = T
     async storageLegacyWebdav(user, { baseUrl = '', username = '', secret = '', corpusRoot = '' } = {}) {
       const { status, body } = await call('storage/legacy-webdav', { user, baseUrl: String(baseUrl), username: String(username), secret: String(secret), corpusRoot: String(corpusRoot) });
       if (status === 200 && body && typeof body.saved === 'boolean') return { saved: body.saved };
+      throw failure(status, body);
+    },
+    /** sbstndalton/noevia#2190 round 6: re-seals the provider keys in the files the front alone
+     *  writes, in one pass per file under its lock (`scope`: `user`, `shared` or `all`), with the
+     *  current and the previous key. { ok: true, tables, failures } (counts per file; a row that
+     *  no key opens is a failure, not an error). Throws the store's failure otherwise (503 when
+     *  the credential keys cannot be loaded). Used by the secrets rotation (secrets-rotate.cjs). */
+    async providersReseal(scope = 'all') {
+      const { status, body } = await call('providers/reseal', { scope: String(scope) }, RESEAL_WAIT_MS);
+      if (status === 200 && body && body.ok === true) return body;
       throw failure(status, body);
     },
     /** sbstndalton/noevia#2190 round 5: Sign in with ChatGPT's token broker (the Rust front,

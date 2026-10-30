@@ -241,13 +241,13 @@ test.before(() => {
   ({ cookie: memberCookie, csrf: memberCsrf } = seedAccount(testDataDir, { username: 'member', displayName: 'Member', role: 'member' }));
 });
 
-test('member cannot register a private-range provider', async () => {
+test('member cannot register a private-range provider: the rule is the Rust front\'s (noevia-rs tests/providers.rs); Node refuses the route', async () => {
   const response = await request('/api/providers', {
     method: 'POST', headers: memberHeaders(),
     body: JSON.stringify({ label: 'Evil', baseUrl: 'http://169.254.169.254/v1' }),
   });
-  assert.equal(response.status, 400);
-  assert.match(JSON.parse(response.text).error, /approved/i);
+  assert.equal(response.status, 503);
+  assert.equal(JSON.parse(response.text).code, 'RUST_PROVIDERS_OWNED');
 });
 
 test('the provider test route is the Rust front\'s: Node refuses it for a member (#2190 round 4)', async () => {
@@ -260,22 +260,22 @@ test('the provider test route is the Rust front\'s: Node refuses it for a member
   assert.equal(JSON.parse(response.text).code, 'RUST_PROVIDER_TEST_OWNED');
 });
 
-test('member cannot register an unapproved public-IP provider', async () => {
+test('member cannot register an unapproved public-IP provider: refused here, decided by the front', async () => {
   // IP literal: no DNS, fully deterministic offline.
   const response = await request('/api/providers', {
     method: 'POST', headers: memberHeaders(),
     body: JSON.stringify({ label: 'Cloud provider', baseUrl: 'https://93.184.216.34/v1' }),
   });
-  assert.equal(response.status, 400);
+  assert.equal(response.status, 503);
 });
 
-test('admin is exempt from the denylist (local inference targets private addresses)', async () => {
+test('admin registers local inference targets through the front; Node refuses the route and registers nothing', async () => {
   const response = await request('/api/providers', {
     method: 'POST', headers: adminHeaders,
     body: JSON.stringify({ label: 'Local model host', baseUrl: 'http://host.docker.internal:11434/v1' }),
   });
-  assert.equal(response.status, 200);
-  assert.ok(JSON.parse(response.text).id);
+  assert.equal(response.status, 503);
+  assert.equal(JSON.parse(response.text).code, 'RUST_PROVIDERS_OWNED');
 });
 
 test('the provider test route is the Rust front\'s for an administrator too (#2190 round 4)', async (t) => {
@@ -364,12 +364,12 @@ test('member cannot browse or read through a saved private connection (Node refu
   db.close();
 });
 
-test('member can connect an operator-approved origin, but not a lookalike origin', async () => {
+test('the operator-approved origin rule for a provider is the Rust front\'s (noevia-rs tests/providers_members.rs)', async () => {
   process.env.MEMBER_OUTBOUND_ORIGINS = 'https://approved.example.com';
   try {
-    for (const [baseUrl, status] of [['https://approved.example.com/v1', 200], ['https://approved.example.com.evil.test/v1', 400], ['https://approved.example.com:8443/v1', 400]]) {
+    for (const baseUrl of ['https://approved.example.com/v1', 'https://approved.example.com.evil.test/v1']) {
       const response = await request('/api/providers', {method:'POST', headers:memberHeaders(), body:JSON.stringify({label:'Approved', baseUrl})});
-      assert.equal(response.status, status);
+      assert.equal(response.status, 503, 'Node decides nothing and creates nothing');
     }
   } finally { delete process.env.MEMBER_OUTBOUND_ORIGINS; }
 });
