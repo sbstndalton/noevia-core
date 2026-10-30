@@ -3,7 +3,6 @@ const skipWasm = !require('node:fs').existsSync(process.env.DAV_PARSE_WASM || re
 const test=require('node:test'),assert=require('node:assert/strict'),fs=require('node:fs'),os=require('node:os'),path=require('node:path');
 const {readSummaryWasm}=require('./gguf-meta.cjs');
 const {suggest,estimateInputs,estimateFootprint,parseMemoryLimit,CTX_CANDIDATES,kvCacheBytes}=require('./llamacpp-autoconfig.cjs');
-const {createModelManager}=require('./model-manager.cjs');
 
 // Synthetic GGUF v3 writer: header only, no tensors.
 function gguf(kv){
@@ -74,23 +73,8 @@ test('suggestion picks the largest fitting context and adds projector and MTP se
   assert.equal(parseMemoryLimit('14g'),14);assert.equal(parseMemoryLimit('512m'),0.5);assert.equal(parseMemoryLimit('lots'),null);
 });
 
-test('manager suggestion reads only files inside the read-only model mount and never writes presets',async t=>{
-  const models=write(t,'x',Buffer.alloc(0)).dir;
-  fs.writeFileSync(path.join(models,'q.gguf'),gguf(HYBRID_HEADER));
-  const outside=write(t,'secret.gguf',gguf(HYBRID_HEADER));
-  const ini=path.join(models,'models.ini');
-  fs.writeFileSync(ini,`version = 1\n[good]\nmodel = /models/q.gguf\nc = 4096\n[escape]\nmodel = /models/../${path.relative(path.dirname(models),outside.file)}\n[foreign]\nmodel = ${outside.file}\n[missing-projector]\nmodel = /models/q.gguf\nmmproj = /models/none.gguf\n`);
-  const before=fs.readFileSync(ini,'utf8');
-  const make=autoconfig=>createModelManager({kind:'llamacpp',baseUrl:'http://synthetic',presetPath:ini,fetchJson:async()=>{throw Error('no router call expected');},autoconfig});
-  const manager=make({modelsPath:models,budgetGib:14});
-  const good=await manager.suggestPreset('good');
-  assert.equal(good.status,200);assert.equal(good.body.arch,HYBRID_ARCH);assert.ok(Number(good.body.values['ctx-size'])>=4096);
-  for(const name of ['escape','foreign','missing-projector'])assert.equal((await manager.suggestPreset(name)).status,404,name);
-  assert.equal((await manager.suggestPreset('absent')).status,404);
-  assert.equal((await make({budgetGib:14}).suggestPreset('good')).status,501);
-  assert.equal((await make({modelsPath:models}).suggestPreset('good')).status,501);
-  assert.equal(fs.readFileSync(ini,'utf8'),before);
-});
+// The manager's suggestion and Will-it-fit reads (file mounts, budget, never a write) are the Rust
+// front's since #2189: noevia-rs bins/noevia-server tests/model_sizing.rs replays core's own answers.
 
 test('the context ladder matches the Python planner exactly', () => {
   // These two lists are the same list in two languages. The planner
@@ -156,17 +140,4 @@ test('estimate inputs are read-only facts: q8 KV rows, pinned projector memory, 
   assert.ok(vision.pinnedGib>1.3&&vision.pinnedGib<2,'projector plus its compute scratch');
   const embed=estimateInputs({meta:{arch:'nomic-bert',hasChatTemplate:false},modelBytes:gib});
   assert.equal(embed.chat,false);assert.equal(embed.sizeable,false);assert.deepEqual(embed.rows,[]);
-  // The manager reads only the mounted file and never writes the preset file.
-  const models=write(t,'x',Buffer.alloc(0)).dir;
-  fs.writeFileSync(path.join(models,'q.gguf'),gguf(HYBRID_HEADER));
-  const ini=path.join(models,'models.ini');
-  fs.writeFileSync(ini,'version = 1\n[good]\nmodel = /models/q.gguf\nc = 8192\n');
-  const before=fs.readFileSync(ini,'utf8');
-  const make=autoconfig=>createModelManager({kind:'llamacpp',baseUrl:'http://synthetic',presetPath:ini,fetchJson:async()=>{throw Error('no router call expected');},autoconfig});
-  const r=await make({modelsPath:models,budgetGib:14}).estimateMemory('good');
-  assert.equal(r.status,200);assert.equal(r.body.budgetGib,14);assert.equal(r.body.model,'good');assert.ok(r.body.rows.length>10);
-  assert.equal((await make({modelsPath:models}).estimateMemory('good')).body.budgetGib,null,'no budget is not an error');
-  assert.equal((await make({budgetGib:14}).estimateMemory('good')).status,501);
-  assert.equal((await make({modelsPath:models}).estimateMemory('absent')).status,404);
-  assert.equal(fs.readFileSync(ini,'utf8'),before);
 });

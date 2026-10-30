@@ -467,16 +467,27 @@ function indexExists(projectId, userId) {
   try { return fs.existsSync(path.join(indexDir(userId), `${projectId}.db`)); } catch { return false; }
 }
 
+// #2191: a project the Rust front deleted (a tombstone in its index outbox) never gets its index back.
+const deletedByFront = (projectId, userId) => { try { return lifecycleGuard.deletedSince(projectId, userId, 0); } catch { return false; } };
+
 function openIndex(projectId, userId) {
   // Queued indexing may begin after account deletion. Refuse the directory
   // creation before opening SQLite, including for detached index promises.
   if (userId && !userActive(userId)) return null;
+  if (deletedByFront(projectId, userId)) return null;
   const { Database, sqliteVec } = loadDeps();
   if (!Database || !sqliteVec) return null;
   try {
     const ragDir = indexDir(userId);
     fs.mkdirSync(ragDir, { recursive: true });
-    const db = new Database(path.join(ragDir, `${projectId}.db`));
+    const file = path.join(ragDir, `${projectId}.db`);
+    const db = new Database(file);
+    // Deleted between the check above and the open: the open created the file again, so remove it.
+    if (deletedByFront(projectId, userId)) {
+      try { db.close(); } catch { /* closing a fresh handle */ }
+      for (const f of [file, `${file}-wal`, `${file}-shm`]) { try { fs.rmSync(f, { force: true }); } catch { /* best effort */ } }
+      return null;
+    }
     db.pragma('journal_mode = WAL');
     sqliteVec.load(db);
     db.exec(`

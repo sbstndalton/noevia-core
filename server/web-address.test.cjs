@@ -67,8 +67,5 @@ test('the remaining Node route factory serves GET oracle and HEAD fallback only'
   assert.equal(await route({ method: 'POST' }, {}, { path: '/api/admin/web-address/remove', authn: admin }), false);
 });
 
-test('public registration pages remain available', () => {
-  const { publicPage } = require('./routes/public-pages.cjs');
-  assert.match(publicPage('/privacy'), /drive\.file/);
-  assert.match(publicPage('/about'), /noevia/);
-});
+// The public registration pages (/about, /privacy) are the Rust front's (#2190, noevia-rs
+// bins/noevia-server public_pages.rs, which keeps the drive.file wording); rust-settings-singles.test.cjs.

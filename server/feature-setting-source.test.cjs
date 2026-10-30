@@ -64,7 +64,7 @@ test('ignored writes cannot give an unstored cache value a missing-row fingerpri
   db.exec("CREATE TRIGGER refuse BEFORE INSERT ON settings BEGIN SELECT RAISE(IGNORE); END;");
   const owner = createDecisionSettings({ store, env: {} });
   const before = owner.runtimeContextSource();
-  assert.throws(() => owner.save({ url: 'http://192.168.1.20:8040', timeoutMs: 1500 }, 'synthetic'), { code: 'FEATURE_RUNTIME_SOURCE_UNAVAILABLE' });
+  assert.throws(() => store.set(DECISION, JSON.stringify({ url: 'http://192.168.1.20:8040', timeoutMs: 1500 })), { code: 'FEATURE_RUNTIME_SOURCE_UNAVAILABLE' });
   assert.equal(store.get(DECISION), undefined);
   assert.equal(owner.get().source, 'deployment');
   assert.equal(owner.runtimeContextSource(), before);
@@ -83,25 +83,29 @@ test('decision source is unknown after read failure, then refreshes using the ac
   assert.equal(owner.refreshRuntimeContextSource(), store.readFact(DECISION).source);
   assert.equal(owner.get().url, first.url);
   const previous = owner.runtimeContextSource();
+  // #2190: a write by the Rust front is in force on the owner's next use, with no refresh or restart.
   store.set(DECISION, JSON.stringify({ ...first, url: 'http://192.168.1.21:8040' }));
-  assert.equal(owner.get().url, first.url); // Context collection must detect this stale closure.
-  assert.equal(owner.runtimeContextSource(), previous);
-  assert.notEqual(previous, store.readFact(DECISION).source);
-  owner.refreshRuntimeContextSource();
   assert.equal(owner.get().url, 'http://192.168.1.21:8040');
+  assert.notEqual(owner.runtimeContextSource(), previous);
   assert.equal(owner.runtimeContextSource(), store.readFact(DECISION).source);
+  // A read failure is never answered from the last good value.
+  fail = true;
+  assert.equal(owner.get().url, '');
+  assert.equal(owner.runtimeContextSource(), null);
+  fail = false;
+  assert.equal(owner.get().url, 'http://192.168.1.21:8040');
 });
 
-test('known malformed decision data and committed save/reset with failed audit keep correct provenance', t => {
+test('known malformed decision data and Rust saves/resets keep correct provenance', t => {
   const { store } = fixture(t);
   store.set(DECISION, '{');
-  const owner = createDecisionSettings({ store, env: {}, audit: () => { throw Error('synthetic audit failure'); } });
+  const owner = createDecisionSettings({ store, env: {} });
   assert.equal(owner.get().url, '');
   assert.equal(owner.runtimeContextSource(), store.readFact(DECISION).source);
-  assert.throws(() => owner.save({ url: 'http://192.168.1.20:8040', timeoutMs: 1500 }, 'synthetic'), /audit/);
+  store.set(DECISION, JSON.stringify({ url: 'http://192.168.1.20:8040', timeoutMs: 1500 }));
   assert.equal(new URL(owner.get().url).hostname, '192.168.1.20');
   assert.equal(owner.runtimeContextSource(), store.readFact(DECISION).source);
-  assert.throws(() => owner.reset('synthetic'), /audit/);
+  store.delete(DECISION);
   assert.equal(owner.get().source, 'deployment');
   assert.equal(owner.runtimeContextSource(), store.readFact(DECISION).source);
   assert.equal(store.get(DECISION), undefined);
@@ -143,9 +147,10 @@ test('actual guarded connection accepts only the two exact source-store write sh
   guard.install(db);
   const store = createStore(db); // MUST prepare statements after installation.
   const decision = createDecisionSettings({ store, env: {} });
-  decision.save({ url: 'http://192.168.1.20:8040', timeoutMs: 1500 }, 'synthetic');
+  // #2190: decision:configuration is the Rust front's; Node's guarded connection refuses both shapes.
+  assert.throws(() => store.writeFact(DECISION, JSON.stringify({ url: 'http://192.168.1.20:8040', timeoutMs: 1500 })), { code: 'RUST_DECISION_SETTINGS_OWNED' });
+  assert.throws(() => store.deleteFact(DECISION), { code: 'RUST_DECISION_SETTINGS_OWNED' });
   assert.equal(decision.runtimeContextSource(), store.readFact(DECISION).source);
-  decision.reset('synthetic');
   assert.equal(store.get(DECISION), undefined);
   store.set(MACHINES, JSON.stringify(machineState(8040)));
   const machines = createInferenceMachines({ store, log: () => {} });
@@ -159,11 +164,12 @@ test('actual guarded connection accepts only the two exact source-store write sh
   assert.throws(() => guard.exempt(() => db.prepare('DELETE FROM settings WHERE key=?').run(DECISION)), { code: 'RUST_AUTH_OWNED' });
   assert.throws(() => db.prepare(`${WRITE_SQL}, 1 AS extra`).get(DECISION, 'forged'), { code: 'RUST_AUTH_OWNED' });
   assert.throws(() => guard.exempt(() => db.prepare('INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)').run('native:feature-runtime:incarnation', 'forged')), { code: 'RUST_FEATURE_RUNTIME_OWNED' });
-  const args = [DECISION, '{"url":"http://192.168.1.20:8040","timeoutMs":1500}'];
+  // The bound key is what the guard judges: the machines key Node still owns (#2190: not the decision key).
+  const args = [MACHINES, '{"url":"http://192.168.1.20:8040","timeoutMs":1500}'];
   const statement = db.prepare(WRITE_SQL).bind(args);
   args[0] = 'native:feature-runtime:incarnation';
-  statement.get(); // SQLite and the guard both retained the original decision key.
-  assert.equal(JSON.parse(store.get(DECISION)).timeoutMs, 1500);
+  statement.get(); // SQLite and the guard both retained the original machines key.
+  assert.equal(JSON.parse(store.get(MACHINES)).timeoutMs, 1500);
   const prohibited = db.prepare(WRITE_SQL).bind('native:feature-runtime:incarnation', 'forged').raw();
   assert.throws(() => guard.exempt(() => prohibited.get()), { code: 'RUST_AUTH_OWNED' });
 });

@@ -524,36 +524,6 @@ function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloa
     }
     return { ok: true, status: 200, body: { budgetGib, models: rows } };
   }
-  // Size-based preset suggestion. Never writes; the admin applies it through applyPreset.
-  async function suggestPreset(model) {
-    if(!presets)return unsupported('Native preset suggestions; configure LLAMACPP_PRESET_PATH');
-    const {modelsPath,cacheRamMaxMib}=autoconfig;const budgetGib=sizingBudgetGib();
-    if(!modelsPath)return {ok:false,status:501,body:{error:'Suggestions need the model directory mounted read-only; set LLAMACPP_MODELS_PATH.'}};
-    const budgetFault=budgetFaultReason();
-    if(budgetFault)return {ok:false,status:503,body:budgetFaultBody('Suggestions unavailable',budgetFault)};
-    if(!(budgetGib>0))return {ok:false,status:501,body:{error:'Suggestions need an inference memory budget; set LLAMACPP_AUTOCONFIG_MEMORY_GIB or LLAMACPP_MEMORY_LIMIT.'}};
-    const profile=presets.get(model);
-    const read=await readModel(model);
-    if(read.error)return {ok:false,status:read.status,body:{error:read.error}};
-    const result=require('./llamacpp-autoconfig.cjs').suggest({meta:read.meta,modelBytes:read.modelFile.size,mmprojBytes:read.mmproj?.size||0,budgetGib,current:{...profile.defaults,...profile.options},cacheRamMaxMib});
-    return {ok:true,status:200,body:{model,revision:profile.revision,arch:read.meta.arch,...result}};
-  }
-  // Memory-estimate inputs for the guided "Will it fit?" panel (#204). Reads the model file's
-  // metadata only; never loads, writes or measures. budgetGib is null when none is configured.
-  async function estimateMemory(model) {
-    if(!presets)return unsupported('Memory estimates; configure LLAMACPP_PRESET_PATH');
-    if(!autoconfig.modelsPath)return {ok:false,status:501,body:{error:'Estimates need the model directory mounted read-only; set LLAMACPP_MODELS_PATH.'}};
-    const budgetFault=budgetFaultReason();
-    if(budgetFault)return {ok:false,status:503,body:budgetFaultBody('Estimate unavailable',budgetFault)};
-    const profile=presets.get(model);
-    const read=await readModel(model);
-    if(read.error)return {ok:false,status:read.status,body:{error:read.error}};
-    let inputs;
-    try{inputs=require('./llamacpp-autoconfig.cjs').estimateInputs({meta:read.meta,modelBytes:read.modelFile.size,mmprojBytes:read.mmproj?.size||0,current:{...profile.defaults,...profile.options}});}
-    catch(err){if(err?.code!=='autoconfig_impl')throw err;return {ok:false,status:503,body:{error:'Estimate unavailable: '+err.message,code:'autoconfig_impl'}};}
-    const budgetGib=sizingBudgetGib();
-    return {ok:true,status:200,body:{model,budgetGib:budgetGib>0?budgetGib:null,...inputs}};
-  }
   // Starting settings for calibration: structural values from the model file; the context
   // itself is measured, so an unconfigured memory budget is not an obstacle here.
   async function conservativeFor(model) {
@@ -728,8 +698,6 @@ function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloa
     tuningActive: () => maintenance.held() || calibrator?.status().body.job?.status === 'running' || autotuner?.status().body.job?.status === 'running',
     getPreset: model => presets ? Promise.resolve({ok:true,status:200,body:presets.get(model)}) : unsupported('Native preset editing'),
     applyPreset,
-    suggestPreset,
-    estimateMemory,
     inferenceEstimates,
     // #697: the load guard and the budget, for the proxied benchmark start and the watchdog.
     loadRefusal: model => overBudget(model).then(r => r ? r.body : null),

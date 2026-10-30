@@ -1,6 +1,7 @@
 'use strict';
 const {configuration,createDecisionEndpoint}=require('./decision-endpoint.cjs');
-const {checkServiceEndpoint,serviceFetch,decisionServiceFetch}=require('./service-endpoint.cjs');
+const {serviceFetch,decisionServiceFetch}=require('./service-endpoint.cjs');
+const {createReread}=require('./shared-reread.cjs');
 const KEY='decision:configuration';
 const {PROFILES,profileFor}=require('./decision-models.cjs');
 /** #1666: the decision model ids an administrator can choose. */
@@ -42,26 +43,29 @@ function startupWarnings(env=process.env) {
   return out;
 }
 // #1755: fetchImpl defaults to the on-this-network fetch (service-endpoint.cjs), which resolves a name
-// at connect time and refuses it unless every answer is on this network; `lookup` is the resolver the
-// connection test's up-front check uses (tests stub it).
-const invalidUrl=()=>Object.assign(Error('Use a private HTTP address such as http://192.168.1.20:8040, with no path, login or query string.'),{status:400,messageId:'invalidUrl'});
+// at connect time and refuses it unless every answer is on this network.
+// #2190: the Rust front owns Settings -> Models -> Decision service (GET/PUT/DELETE and the connection
+// test, noevia-rs decision_settings_routes.rs) and is the single writer of the `decision:configuration`
+// row; this module only reads it. Every use re-reads the row's content fingerprint (shared-reread.cjs)
+// and parses it again only when it changed, so Rust's latest save applies to the next decision with no
+// restart. The per-URL backends below stay a cache keyed by what was read.
 // #1638: `machineUrl` is the address of the machine Settings → Inference machines puts the decision service on
 // (inference-machines.cjs urlFor('decision')), or null while it is on this machine. It wins over the URL saved here
 // and COWORK_DECISION_URL; the deadline and the model chosen here still apply. A machine is another host, so the
 // shared COWORK_DECISION_API_KEY is never sent there (backend()'s #1753 same-host rule).
 // #1844: `sensitivityMachineUrl` is the same for the sensitivity check's own entry on that page
 // (inference-machines.cjs urlFor('sensitivity')); see sensitivityBackend().
-function createDecisionSettings({store,env=process.env,fetchImpl=decisionServiceFetch,sensitivityFetchImpl=(fetchImpl===decisionServiceFetch?serviceFetch:fetchImpl),lookup=undefined,audit=()=>{},kinds=SERVICE_KINDS,machineUrl=()=>null,sensitivityMachineUrl=()=>null}) {
-  let saved, runtimeSource=null;
-  function loadRuntimeSource() {
-    runtimeSource=null;
-    try {
-      const observed=typeof store.readFact==='function' ? store.readFact(KEY) : {value:store.get(KEY),source:null};
-      runtimeSource=observed.source;
-      saved=JSON.parse(observed.value||'null');
-    } catch { saved={url:'',timeoutMs:1500}; }
-    return runtimeSource;
-  }
+function createDecisionSettings({store,env=process.env,fetchImpl=decisionServiceFetch,sensitivityFetchImpl=(fetchImpl===decisionServiceFetch?serviceFetch:fetchImpl),kinds=SERVICE_KINDS,machineUrl=()=>null,sensitivityMachineUrl=()=>null}) {
+  // A row that cannot be read or parsed is the same fallback as before #2190: an empty saved URL.
+  const unreadable=()=>({url:'',timeoutMs:1500});
+  let runtimeSource=null, observed=null;
+  const saved=createReread({
+    // One read gives the row and its fingerprint; a store without readFact (tests) is keyed by its raw value.
+    signal:()=>{ runtimeSource=null; observed=typeof store.readFact==='function' ? store.readFact(KEY) : {value:store.get(KEY),source:null}; runtimeSource=observed.source; return observed.source ?? `raw:${String(observed.value)}`; },
+    load:()=>{ try { return JSON.parse(observed.value||'null'); } catch { return unreadable(); } },
+    fallback:()=>{ runtimeSource=null; return unreadable(); },
+  });
+  function loadRuntimeSource() { saved.invalidate(); saved.current(); return runtimeSource; }
   loadRuntimeSource();
   // #1666: `model` is the decision model the administrator chose in Settings, present only when one was chosen (absent =
   // automatic: the deployment's COWORK_DECISION_MODEL when the URL is the deployment's own, Laya otherwise, exactly as
@@ -70,27 +74,11 @@ function createDecisionSettings({store,env=process.env,fetchImpl=decisionService
   const onMachine=()=>{ try { const u=machineUrl(); return typeof u==='string'&&u?u:null; } catch { return null; } };
   const sensitivityOnMachine=()=>{ try { const u=sensitivityMachineUrl(); return typeof u==='string'&&u?u:null; } catch { return null; } };
   const get=()=>{
-    const base=saved || {url:env.COWORK_DECISION_URL||'',timeoutMs:1500};
+    const current=saved.current();
+    const base=current || {url:env.COWORK_DECISION_URL||'',timeoutMs:1500};
     const machine=onMachine();
-    return {url:machine||base.url,timeoutMs:base.timeoutMs,...(typeof base.model==='string'&&base.model?{model:base.model}:{}),source:machine?'machine':saved?'admin':'deployment'};
+    return {url:machine||base.url,timeoutMs:base.timeoutMs,...(typeof base.model==='string'&&base.model?{model:base.model}:{}),source:machine?'machine':current?'admin':'deployment'};
   };
-  function validate(value) {
-    if(!value || typeof value.url!=='string' || !Number.isInteger(value.timeoutMs) || value.timeoutMs<100 || value.timeoutMs>2000)
-      throw Object.assign(Error('Enter a private decision-service URL and a deadline from 100 to 2000 ms.'),{status:400,messageId:'invalidInput'});
-    const parsed=configuration({COWORK_DECISION_URL:value.url.trim()});
-    if(parsed.reason) throw invalidUrl();
-    // #1666: '' / absent = automatic. Anything else must name a known profile: a typo is refused here rather than
-    // silently sent as Laya (unknown ids in COWORK_DECISION_MODEL keep falling back to Laya, as before).
-    // #1816: a PUT without `model` keeps the saved one (an older tab or a script sending {url,timeoutMs}); only '' / null clear it.
-    // #1817: a saved model that is no longer a profile is treated as automatic when the PUT omits `model`.
-    const keptRaw=typeof saved?.model==='string' ? saved.model.trim().toLowerCase() : '';
-    const kept=Object.prototype.hasOwnProperty.call(PROFILES,keptRaw) ? keptRaw : '';
-    const raw=value.model===undefined ? kept : value.model===null ? '' : value.model;
-    const model=typeof raw==='string' ? raw.trim().toLowerCase() : null;
-    if(model===null || (model && !Object.prototype.hasOwnProperty.call(PROFILES,model)))
-      throw Object.assign(Error('Choose a decision model from the list, or automatic.'),{status:400,messageId:'invalidModel'});
-    return {url:parsed.baseUrl,timeoutMs:value.timeoutMs,...(model?{model}:{})};
-  }
   // #1639: the model behind the URL (decision-models.cjs) is the operator's COWORK_DECISION_MODEL, and
   // it belongs to COWORK_DECISION_URL: an administrator who saved another URL in Settings gets the
   // Laya profile there (unknown model), exactly as before #1639.
@@ -168,6 +156,7 @@ function createDecisionSettings({store,env=process.env,fetchImpl=decisionService
   return {
     get, backend, sensitivityBackend,
     // A known malformed row may produce the existing fallback; a failed read has no provenance.
+    // The fingerprint of the row the last use parsed (feature-runtime.cjs compares it with the store's).
     runtimeContextSource:()=>runtimeSource,
     refreshRuntimeContextSource:loadRuntimeSource,
     /** Why an experiment that needs `kind` decisions cannot run, or null. Without a kind: only
@@ -177,38 +166,10 @@ function createDecisionSettings({store,env=process.env,fetchImpl=decisionService
       if(typeof kind==='string' && !kinds.includes(kind)) return `The configured decision service does not support ${kind} decisions, so this experiment cannot run.`;
       return null;
     },
-    save(value,actor) {const next=validate(value);const encoded=JSON.stringify(next);const observed=typeof store.writeFact==='function' ? store.writeFact(KEY,encoded) : (store.set(KEY,encoded),null);saved=next;runtimeSource=observed?.source??null;audit('decision.configure',actor,{url:next.url,timeoutMs:next.timeoutMs,model:next.model||'auto'});return get();},
-    /** #1765: forgets the URL and deadline saved in Settings, so COWORK_DECISION_URL (and its key and model)
-     *  applies again. Audited, also when nothing was saved, so the log shows every attempt. */
-    reset(actor) {
-      const had=!!saved;
-      let observed=null;
-      if(typeof store.deleteFact==='function') observed=store.deleteFact(KEY);
-      else if(typeof store.delete==='function') store.delete(KEY); else store.set(KEY,'null');
-      saved=null; runtimeSource=observed?.source??null;
-      audit('decision.reset',actor,{hadSaved:had});
-      return get();
-    },
     /** #1796: what Settings → Models shows for the decision service and the sensitivity check: the model id
      *  each one is sent as (decision-models.cjs), whether it is set up, and where the shared URL comes from.
      *  Never an address or a key, so members may see it. */
     describe() { return describeDecision(env,get(),sensitivityOnMachine()); },
-    async test(value) {
-      const next=validate(value);
-      // #1755: a name is accepted only if every address it resolves to is on this network; say so plainly
-      // here instead of as "not ready". The request below is checked again at connect time.
-      const where=await checkServiceEndpoint(next.url,{linkLocal:true,...(lookup?{lookup}:{})});
-      if(!where.ok && !where.transient) throw invalidUrl();
-      try {
-        const response=await fetchImpl(next.url+'/health',{signal:AbortSignal.timeout(3000),redirect:'error'});
-        if(!response.ok) throw Error();
-        const reader=response.body.getReader();let size=0;const chunks=[];
-        try {for(;;){const {done,value}=await reader.read();if(done)break;size+=value.byteLength;if(size>4096)throw Error();chunks.push(Buffer.from(value));}}
-        finally {await reader.cancel();}
-        if(JSON.parse(Buffer.concat(chunks).toString()).ready!==true)throw Error();
-        return {ok:true,message:'Decision service is ready. No inference was run.',messageId:'ready'};
-      } catch {throw Object.assign(Error('The decision service is not ready or could not be reached. Check the URL and service status.'),{status:502,messageId:'notReady'});}
-    },
   };
 }
 /** #1796: the decision rows of Settings → Models, from the shared configuration `current` ({url, source})

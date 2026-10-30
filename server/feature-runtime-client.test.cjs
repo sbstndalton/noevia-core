@@ -42,7 +42,9 @@ function fixture(t, behavior = () => {}) {
     setIntervalImpl: (fn, interval) => { assert.equal(interval, 5000); tick = fn; intervals++; return { unref() {} }; },
     clearIntervalImpl: () => { tick = null; },
   });
-  return { db, store, runtime, originalFacts, calls, replaceEpoch, setTime(n) { time = n; }, tick() { tick?.(); }, intervals() { return intervals; } };
+  // #2190: decision:configuration is the Rust front's to write; the native actor stands in for it.
+  const rustDecision = value => nativeActor.prepare('INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)').run('decision:configuration', value);
+  return { db, store, rustDecision, runtime, originalFacts, calls, replaceEpoch, setTime(n) { time = n; }, tick() { tick?.(); }, intervals() { return intervals; } };
 }
 test('register retry reuses immutable identity/body and EARLIEST send anchor', async t => {
   let attempts = 0;
@@ -76,7 +78,7 @@ test('same Node boot/construction facts survive native restart but session and i
 });
 test('changed source refuses ordinary reads until a fresh acknowledged owner renewal', async t => {
   const f = fixture(t); await f.runtime.ready();
-  f.store.set('decision:configuration', JSON.stringify({ url: 'http://192.168.1.20:8040', timeoutMs: 1500 }));
+  f.rustDecision(JSON.stringify({ url: 'http://192.168.1.20:8040', timeoutMs: 1500 }));
   assert.throws(() => f.runtime.read(() => true), { status: 503 });
   await f.runtime.renew();
   assert.equal(f.runtime.read(() => true), true);
@@ -209,7 +211,7 @@ test('a known register ACK with concurrently changed source stays unreadable and
   const f = fixture(t, p => {
     if (p.op === 'register' && !changed) {
       changed = true;
-      f.store.set('decision:configuration', JSON.stringify({ url: 'http://192.168.1.20:8040', timeoutMs: 1500 }));
+      f.rustDecision(JSON.stringify({ url: 'http://192.168.1.20:8040', timeoutMs: 1500 }));
     }
   });
   await assert.rejects(f.runtime.ready(), { status: 503 });
@@ -226,7 +228,7 @@ test('a known renew ACK overtaken by a source change recovers by next sequence w
   const f = fixture(t, p => {
     if (p.op === 'renew' && !changed) {
       changed = true;
-      f.store.set('decision:configuration', JSON.stringify({ url: 'http://192.168.1.21:8040', timeoutMs: 1500 }));
+      f.rustDecision(JSON.stringify({ url: 'http://192.168.1.21:8040', timeoutMs: 1500 }));
     }
   });
   await f.runtime.ready();

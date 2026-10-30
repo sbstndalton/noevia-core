@@ -22,11 +22,12 @@ test('every feature namespace refuses direct Node bypass before auth/body/facts'
  assert.equal(production.createFeatures,undefined);assert.equal(production.migrateLegacySetting,undefined);
 });
 
-test('decision settings remain mounted independently of retired feature setters',async()=>{
- let saved=0;const json=(res,status,body)=>Object.assign(res,{status,body});
- const route=createFeatureRoutes({json,readJson:async()=>({value:'synthetic'}),decisionSettings:{get:()=>({ok:'read'}),save:body=>{saved++;return body;}}});
- const out={};assert.equal(await route({method:'PUT'},out,{path:'/api/admin/decision-settings',authn:{user:{id:'synthetic',role:'admin'}}}),true);
- assert.deepEqual(out,{status:200,body:{value:'synthetic'}});assert.equal(saved,1);
+test('decision settings are the Rust front\'s: the feature routes no longer mount them (#2190)',async()=>{
+ const json=(res,status,body)=>Object.assign(res,{status,body});
+ const route=createFeatureRoutes({json});
+ for(const path of ['/api/admin/decision-settings','/api/admin/decision-settings/test']) for(const method of ['GET','PUT','DELETE','POST']) {
+  const out={};assert.equal(await route({method},out,{path,authn:{user:{id:'synthetic',role:'admin'}}}),false,`${method} ${path}`);assert.deepEqual(out,{});
+ }
 });
 
 test('all canonical feature keys and legacy fallback remain native even inside exemptions and old statements',()=>{
@@ -40,7 +41,12 @@ test('all canonical feature keys and legacy fallback remain native even inside e
    assert.throws(()=>exempt?guard.exempt(run):run(),e=>e.status===503&&e.code==='RUST_FEATURES_OWNED');
    assert.throws(()=>oldInsert.run(`feature:${name}`,'true'),/RUST_FEATURES_OWNED/);
   }
-  for(const key of ['decision:configuration','inference:machines','other:setting']) {
+  // #2190: the decision configuration is the Rust front's too, refused exempt or not.
+  for(const exempt of [false,true]) {
+   const run=()=>db.prepare('INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)').run('decision:configuration','synthetic');
+   assert.throws(()=>exempt?guard.exempt(run):run(),e=>e.status===503&&e.code==='RUST_DECISION_SETTINGS_OWNED');
+  }
+  for(const key of ['inference:machines','other:setting']) {
    db.prepare('INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)').run(key,'synthetic');
    assert.equal(db.prepare('SELECT value FROM settings WHERE key=?').get(key).value,'synthetic');
   }

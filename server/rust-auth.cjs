@@ -163,6 +163,8 @@ const FRONT_SETTING_KEYS = Object.freeze({
   routing_modes_allowed: ['Routing settings are owned by the Rust front.', 'RUST_ROUTING_MODE_OWNED'],
   reasoning_effort_default: ['Reasoning settings are written by the Rust front', 'RUST_REASONING_SETTINGS_OWNED'],
   auto_sampling_presets_enabled: ['Sampling settings are written by the Rust front', 'RUST_SAMPLING_SETTINGS_OWNED'],
+  // #2190: Settings -> Models -> Decision service; decision-settings.cjs only re-reads it.
+  'decision:configuration': ['Decision settings are owned by the Rust front.', 'RUST_DECISION_SETTINGS_OWNED'],
 });
 /** The guard. It takes no options: Rust always owns these tables (sbstndalton/noevia#1071). */
 function createRustAuthGuard() {

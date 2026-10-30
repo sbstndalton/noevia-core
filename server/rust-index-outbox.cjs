@@ -84,11 +84,12 @@ function createIndexOutbox({ userDir, userIds = () => [], runAs = (_userId, fn) 
     return stateFor(userId).reader.get().generation;
   }
 
-  /** Whether the front deleted `projectId` after generation `seen` (an index run queued then must stop). */
-  function deletedSince(projectId, userId, seen) {
+  /** Whether the front deleted `projectId`. Any tombstone counts, whenever the caller started: project
+   * ids are random and never revived, so a run that began before the delete must stop just the same
+   * (`seen` is kept for the callers' signature only). */
+  function deletedSince(projectId, userId, _seen) {
     if (!userId) return false;
-    const at = stateFor(userId).reader.get().tombstones.get(projectId);
-    return at !== undefined && at > (Number(seen) || 0);
+    return stateFor(userId).reader.get().tombstones.has(projectId);
   }
 
   async function runOne(userId, db, row) {
