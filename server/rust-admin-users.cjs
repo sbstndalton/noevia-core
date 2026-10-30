@@ -8,11 +8,13 @@
 //                                  credentials and its Diary tenant
 //
 // It was the one account route this process kept, under rust-auth.cjs `exempt()`, because its cleanup spanned
-// Node's own stores (the workspace store, the Drive session cache). Those are signalled by the account's folder
-// instead: a workspace this process holds for an account whose folder is gone is revoked (workspace.cjs
-// `revoked`), so a turn in flight stops and nothing here recreates the folder, and a workspace is never made
-// for a user the database no longer has (workspace.cjs `userExists`). Core's Drive session cache is keyed to the
-// broker's state file, which the front rewrites when it forgets the account (gdrive-broker.cjs).
+// Node's own stores (the workspace store, the Drive session cache). Those follow the auth database first and the
+// folder second: workspaceStore.isRemoved asks `userExists` (kept about a second, because rag asks once per
+// chunk; "gone" is latched), so rag stops indexing and makes no users/<id>/rag folder for a deleted account, a
+// workspace held for it is revoked at once, and none is made for a user the database no longer has (workspace.cjs
+// `userExists`); a workspace held when the folder alone disappears is revoked by the folder check (workspace.cjs
+// `revoked`). Core's Drive session cache is keyed to the broker's state file, which the front rewrites when it
+// forgets the account (gdrive-broker.cjs).
 //
 // A direct Node request is refused before authentication, whoever asks, so a stale route table cannot make two
 // processes answer: this process no longer has a way to delete an account (auth.cjs `deleteUser` is gone) and
