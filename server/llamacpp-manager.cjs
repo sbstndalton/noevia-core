@@ -559,7 +559,8 @@ function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloa
     let build=null;try{const props=await request('/props',{},8000);build=props?.body?.build_info||null;}catch{}
     const profile=presets?presets.get(model):{options:{},defaults:{}};
     const options={...(profile.defaults||{}),...(profile.options||{})};
-    const draft=options['spec-draft-model']?evidenceLib.fileFingerprint(localFile(options['spec-draft-model'])?.file):null;
+    const draftPath=presets?.draftFile?.(model);
+    const draft=draftPath?evidenceLib.fileFingerprint(localFile(draftPath)?.file):null;
     const identity={backend:'llamacpp',build,endpoint:evidenceLib.identityHash(base).slice(0,16),model,artifact,
       projector:files.mmproj?evidenceLib.fileFingerprint(localFile(files.mmproj)?.file):null,preset:evidenceLib.presetHash(options),
       context:{ctx:options['ctx-size']||null,parallel:options.parallel||null,cacheK:options['cache-type-k']||null,cacheV:options['cache-type-v']||null},
@@ -577,7 +578,8 @@ function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloa
     let live=null;
     try{live=await computeIdentity(model);}catch(e){console.warn(`[evidence] no identity for a record: ${e?.message||e}`);}
     if(!live)return null;
-    return evidenceInbox.put({kind:'record',model,record,identityHash:live.identityHash,at:Date.now()});
+    // A /props that failed here is no change of configuration: the front compares without the build.
+    return evidenceInbox.put({kind:'record',model,record,identityHash:live.identityHash,at:Date.now(),...(live.identity.build==null?{buildUnknown:true}:{})});
   }
   async function evidence(model){
     const live=evidenceStore?await computeIdentity(model):null;

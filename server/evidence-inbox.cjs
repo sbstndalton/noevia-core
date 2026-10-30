@@ -10,7 +10,7 @@
 //
 //   { "kind": "record", "model": "<name>", "record": { category, result, value, suite, source, limitations, ... } }
 //     A non-reported record also carries "identityHash" and "at", computed when it was recorded: the front files it
-//     only under that identity, and discards one with no hash (left by a rollback) or a hash no longer live.
+//     only under that identity (without the build when "buildUnknown" says /props failed), and discards one with no hash (left by a rollback) or a hash no longer live.
 //   { "kind": "import", "model": "<name>", "checkpoint": "<org/repo[:quant]>" | null }
 const fs = require('node:fs');
 const path = require('node:path');

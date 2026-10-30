@@ -340,6 +340,12 @@ test('#2210: a non-reported record carries the identity it was measured on and t
   const again=read(await manager.recordEvidence('fx',{category:'vision',result:'failed',value:null,suite:{name:'s',version:1},source:'recheck',limitations:[]}));
   assert.notEqual(again.identityHash,entry.identityHash);
   assert.equal(read(passed).identityHash,entry.identityHash);
+  // The draft file enters the identity through its own line, on both sides (#2215). Pinned: noevia-rs's replay
+  // case "a speculative draft model in the preset" expects this same hash for this same preset.
+  fs.writeFileSync(ini,'version = 1\n\n[fx]\nmodel = /models/fx/fx.gguf\nspec-type = draft-mtp\nspec-draft-model = /models/fx/draft.gguf\n');
+  const drafted=(await manager.evidence('fx')).body.identityHash;
+  fs.writeFileSync(path.join(models,'fx','draft.gguf'),Buffer.alloc(4096,9));
+  assert.notEqual((await manager.evidence('fx')).body.identityHash,drafted,'a replaced draft file is a new identity');
   const asked=props;
   const reported=read(await manager.recordEvidence('fx',{category:'throughput',result:'reported',value:{rate:5},suite:{name:'s',version:1},source:'chat',limitations:[]}));
   assert.equal(reported.identityHash,undefined);assert.equal(reported.at,undefined);

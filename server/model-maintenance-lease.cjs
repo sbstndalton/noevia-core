@@ -6,19 +6,22 @@
 // already proxies through, and a lease IS a hold of that gate. hold() checks and sets in one synchronous step, and
 // enter() (chat admission) reads the same flag, so there is no window between the check and the act.
 //
-//   POST   /internal/model-maintenance/lease             201 {lease, ttlMs}; 409 {error, chatActive} while busy
+//   POST   /internal/model-maintenance/lease             201 {lease, ttlMs, renewMs, hardMs}; 409 {error, chatActive} while busy
 //   POST   /internal/model-maintenance/lease/<id>/renew  200 {ttlMs}; 404 when it has ended
 //   DELETE /internal/model-maintenance/lease/<id>        204, also when it has already ended
 //
 // A lease not renewed within ttlMs ends by itself, so a front that dies frees chat and tune; hardMs caps it however
-// often it is renewed. Only the front may ask: the connection must come from loopback, carry the per-start secret
+// often it is renewed. ttlMs outlasts the longest single router call (120 s): the front starts a step only if its last
+// confirmation, and hardMs, still cover that step's whole limit, so a Node that stops hearing renewals cannot end the
+// lease under a call in flight. Only the front may ask: the connection must come from loopback, carry the per-start secret
 // the web supervisor hands both processes (NOEVIA_PROJECT_STORE_TOKEN), and not be a request the front is proxying
 // (a proxied request carries the client's address). Anything else is the same 404 as an unknown path, because with
 // file sharing on this listener is not bound to loopback alone. A front that cannot get a lease changes nothing.
 const crypto = require('node:crypto');
 
 const PREFIX = '/internal/model-maintenance/lease';
-const TTL_MS = 30000;
+const TTL_MS = 180000;
+const RENEW_MS = 10000;
 const HARD_MS = 60 * 60 * 1000;
 const LOOPBACK = /^(127\.|::1$|::ffff:127\.)/;
 
@@ -55,7 +58,7 @@ function createLeases({ hold, ttlMs = TTL_MS, hardMs = HARD_MS, log = (m) => con
       const id = crypto.randomBytes(16).toString('hex');
       leases.set(id, { release, timer: null, hardAt: now() + hardMs });
       arm(id);
-      return { lease: id, ttlMs };
+      return { lease: id, ttlMs, renewMs: Math.min(RENEW_MS, Math.max(1, Math.floor(ttlMs / 3))), hardMs };
     },
     renew(id) {
       const lease = leases.get(id);
@@ -94,7 +97,7 @@ function createLeaseRoutes({ secret, hold, json, ...options }) {
     if (!match) return notFound();
     if (req.method === 'POST' && match[2]) {
       if (!leases.renew(match[1])) return notFound();
-      json(res, 200, { ttlMs: options.ttlMs || TTL_MS });
+      json(res, 200, {});
       return true;
     }
     if (req.method === 'DELETE' && !match[2]) {
