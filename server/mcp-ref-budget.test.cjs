@@ -189,7 +189,7 @@ test('discovery drops the exponential tool, logs it, and keeps the other tools',
   };
   const wiring = createMcpWiring({
     servers: [{ id: 'hostile', url: 'http://127.0.0.1:9/mcp', auth: 'none' }], mcp: fake,
-    bindBoxes: () => [], directoryMcp: { asServers: () => [] }, mcpOAuth: {},
+    bindBoxes: () => [], directoryMcp: { signal: () => 0, asServers: () => [] }, mcpOAuth: {},
     directoryUrlAllowed: async () => true, credentialOriginAllowed: () => false,
     scope: { getStore: () => null }, storageFor: () => ({}), isWriteTool: () => false,
     internal: {}, internalKey: 'k', reduceToolResult: (t) => ({ text: t, reduced: false }),

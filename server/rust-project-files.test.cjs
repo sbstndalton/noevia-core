@@ -38,7 +38,7 @@ test('an owned request is refused with a 503 before its body is read; the rest f
 });
 
 test('the dead Node handler is gone; this process runs the unindex jobs', () => {
-  const routes = fs.readFileSync(path.join(__dirname, 'routes', 'projects.cjs'), 'utf8');
+  const routes = ''; assert.equal(fs.existsSync(path.join(__dirname, 'routes', 'projects.cjs')), false, 'no project route file is left (#2191 round 9)');
   assert.equal(routes.includes('projFileDel'), false);
   assert.ok(require('./rust-project-storage.cjs').CORE_KINDS.includes('unindex'));
   const index = fs.readFileSync(path.join(__dirname, 'index.cjs'), 'utf8');
@@ -86,6 +86,6 @@ test('through the router: the file delete is refused signed out and signed in', 
     const r = await request('/api/projects/p1/files', { method: 'DELETE', headers, body: { path: 'x/y.md' } });
     assert.deepEqual([r.status, r.json], [503, ROUTE_REFUSAL]);
   }
-  // Positive control: the config route is still Node's.
-  assert.equal((await request('/api/projects/p1/config', { method: 'POST', headers: as(admin), body: {} })).status, 404);
+  // Positive control: the browser route (chat-bound) is still Node's (a project's config is the front's since round 9).
+  assert.equal((await request('/api/projects/p1/browser', { method: 'POST', headers: as(admin), body: {} })).status, 404);
 });

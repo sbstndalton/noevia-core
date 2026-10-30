@@ -70,22 +70,6 @@ test('vision probe: an endless error body is cut at 64 KB; the verdict is unchan
   within(meter, 64 * 1024);
 });
 
-test('plugin directory: an endless SKILL.md is cut at 32 KiB and refused with the same 422', async () => {
-  const { fetchPublishedSkill } = require('./routes/plugin-directory.cjs');
-  const { stream, meter } = hugeBody(64 * MB, '---\nname: x\n---\n');
-  await assert.rejects(() => fetchPublishedSkill('synthetic-skill', { fetchImpl: async () => new Response(stream) }),
-    (e) => e.status === 422 && /32 KiB limit/.test(e.message));
-  within(meter, 32 * 1024);
-});
-
-test('plugin directory: an endless registry listing is cut at 4 MB and refused with a 502', async () => {
-  // The listing route is the Rust front's (#2190, its 4 MiB cap tested there); the registry lookup
-  // the MCP directory route still uses keeps the same cap here.
-  const { findRegistryServer } = require('./routes/plugin-directory.cjs');
-  const { stream, meter } = hugeBody(64 * MB, '{"servers":[');
-  await assert.rejects(() => findRegistryServer('synthetic/server', { fetchImpl: async () => new Response(stream) }), (e) => e.status === 502);
-  within(meter, 4 * MB);
-});
 
 test('kiwix: an endless article is cut at 2 MB and the tool still answers', async () => {
   const { createKiwixTools } = require('./kiwix.cjs');

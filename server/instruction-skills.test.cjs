@@ -6,20 +6,27 @@ let ran = 0;
 const skills = require('./instruction-skills.cjs');
 const file = (body = 'Draft a synthetic review.', meta = 'name: Review\ndescription: Review the notes\nversion: 1') => ({ name: 'review.md', content: `---\n${meta}\n---\n${body}` });
 const fixture = () => ({ files: [file(), { name: 'notes.txt', content: 'Ordinary notes.' }], toolboxes: ['core'] });
-const enable = p => skills.setSelection(p, {file:'review.md', enabled:true, hash:skills.hash(p.files[0].content)});
+// What the Rust front's PUT /instruction-skills stores for a selection (noevia-rs crates/server-projects
+// instruction_skills.rs `set_selection`, whose refusals - a stale hash, a bundled script, the context limit, an
+// unknown file - and whose manifest resolution are tested there, #2191 round 9). The selection is project data
+// this module reads back, so these tests write it directly.
+const select = (p, name, enabled, hash) => {
+  const kept = p.instructionSkills?.[name]?.reviewedHash;
+  p.instructionSkills = { ...p.instructionSkills, [name]: { enabled, reviewedHash: enabled ? hash : (kept || skills.hash(p.files.find(f => f.name === name).content)), reviewedAt: 1 } };
+};
+const enable = p => select(p, 'review.md', true, skills.hash(p.files[0].content));
 test('legacy and new skills need review; both enabled and disabled bodies stay out of sources', () => {
  const p=fixture(); skills.reconcile(p);
  assert.equal(skills.list(p)[0].status,'review'); assert.deepEqual(skills.enabled(p),[]);
  assert.deepEqual(skills.sources(p).map(f=>f.name),['notes.txt']); assert.match(skills.read(p,p.files[0]),/^ERROR/);
  enable(p); assert.equal(skills.enabled(p).length,1); assert.match(skills.read(p,p.files[0]),/Loaded instruction skill/);
- skills.setSelection(p,{file:'review.md',enabled:false}); assert.equal(skills.list(p)[0].status,'disabled');
+ select(p,'review.md',false); assert.equal(skills.list(p)[0].status,'disabled');
  assert.match(skills.read(p,p.files[0]),/^ERROR/); assert.equal(skills.sources(p).length,1);
 });
 test('updates invalidate review and pinned exchanges; removing frontmatter cannot evade exclusion', () => {
- const p=fixture(); skills.reconcile(p); enable(p); const old=skills.hash(p.files[0].content), snapshot=structuredClone(p);
+ const p=fixture(); skills.reconcile(p); enable(p); const snapshot=structuredClone(p);
  p.files[0].content+='\nChanged instructions.';
  assert.equal(skills.list(p)[0].status,'updated'); assert.equal(skills.enabled(p).length,0);
- assert.throws(()=>skills.setSelection(p,{file:'review.md',enabled:true,hash:old}),/changed/);
  assert.match(skills.read(snapshot,snapshot.files[0],p),/^ERROR/);
  p.files[0].content='Removed frontmatter';skills.reconcile(p);assert.equal(skills.list(p)[0].status,'invalid'); assert.equal(skills.sources(p).length,1);
  p.files=p.files.slice(1);skills.reconcile(p);assert.deepEqual(Object.keys(p.instructionSkills),[]);
@@ -31,15 +38,10 @@ test('selection persists per project; missing tools are explained and never enab
 });
 test('malformed, duplicate, oversized and executable metadata cannot enable or enter ordinary sources', () => {
  for(const meta of ['name: Review','name: A\nname: B\ndescription: Duplicate','name: A\ndescription: |\n  Multi','name: A\ndescription: B\nrun: sh','name: A\ndescription: '+'x'.repeat(1025),'name: A\ndescription: B\nmetadata: x']){
-  const p={files:[file('Body',meta)]};skills.reconcile(p);assert.equal(skills.list(p)[0].valid,false);assert.equal(skills.sources(p).length,0);assert.throws(()=>enable(p));
+  const p={files:[file('Body',meta)]};skills.reconcile(p);assert.equal(skills.list(p)[0].valid,false);assert.equal(skills.sources(p).length,0);enable(p);assert.equal(skills.enabled(p).length,0,'an invalid skill is never enabled');
  }
  assert.equal(skills.inspect(file('x'.repeat(32769))).valid,false);
  assert.equal(skills.inspect({name:'article.md',content:'---\ntitle: Article\n---\nOrdinary content'}),null);
-});
-test('catalogue overflow rejects enablement rather than silently omitting selected skills',()=>{
- const p={files:Array.from({length:20},(_,i)=>({...file('Body','name: '+'n'.repeat(160)+'\ndescription: '+'d'.repeat(500)),name:`skill-${i}.md`}))};skills.reconcile(p);let rejected=false;
- for(const f of p.files){try{skills.setSelection(p,{file:f.name,enabled:true,hash:skills.hash(f.content)});}catch(e){assert.match(e.message,/context limit/);rejected=true;break;}}
- assert.ok(rejected);assert.throws(()=>skills.setSelection(p,{file:'../other.md',enabled:true,hash:''}),/No such/);
 });
 test('excluded skill vectors never re-enter retrieval or fallback context',async()=>{
  const fs=require('node:fs'),vm=require('node:vm');
@@ -72,7 +74,7 @@ test('an ordinary note with a Name: line in the body (not the frontmatter) is no
 test('a genuine skill with name/description in frontmatter is still detected', () => {
  assert.equal(skills.inspect(file()).valid,true);
 });
-test('portable manifests have stable project-scoped IDs, metadata only, and exact reviewed resolution', () => {
+test('portable manifests have stable project-scoped IDs and metadata only (their content route is the Rust front\'s, #2191 round 9)', () => {
  const a={id:'owner-a',...fixture()}, b={id:'owner-b',...fixture()};
  skills.reconcile(a); skills.reconcile(b);
  const before=skills.manifests(a,['core'])[0];
@@ -80,18 +82,12 @@ test('portable manifests have stable project-scoped IDs, metadata only, and exac
  assert.equal(JSON.stringify(before).includes('Draft a synthetic review.'),false);
  assert.notEqual(before.id,skills.manifests(b,['core'])[0].id);
  assert.equal(before.version,skills.hash(a.files[0].content));
- assert.throws(()=>skills.resolve(a,before.id,before.version,['core']),e=>e.status===409);
  enable(a);
  const ready=skills.manifests(a,['core'])[0];assert.equal(ready.id,before.id);assert.equal(ready.resolvable,true);
- assert.equal(skills.resolve(a,ready.id,ready.version,['core']).content,a.files[0].content);
- assert.throws(()=>skills.resolve(b,ready.id,ready.version,['core']),e=>e.status===404);
- assert.throws(()=>skills.resolve(a,ready.id,'invalid',['core']),e=>e.status===400);
- assert.throws(()=>skills.resolve(a,ready.id,'0'.repeat(64),['core']),e=>e.status===409);
- skills.setSelection(a,{file:'review.md',enabled:false});
- assert.throws(()=>skills.resolve(a,ready.id,ready.version,['core']),e=>e.status===409);
+ select(a,'review.md',false);
+ assert.equal(skills.manifests(a,['core'])[0].status,'disabled');
  enable(a);a.files[0].content+=' updated';
  assert.equal(skills.manifests(a,['core'])[0].status,'updated');
- assert.throws(()=>skills.resolve(a,ready.id,ready.version,['core']),e=>e.status===409);
 });
 test('unsupported requirements block portable resolution without granting or selecting tools', () => {
  const p={id:'p',files:[file('Body','name: Review\ndescription: Notes\nrequires: unavailable-box')],toolboxes:['core']};
@@ -100,7 +96,6 @@ test('unsupported requirements block portable resolution without granting or sel
  assert.deepEqual(manifest.requirements.unsupportedToolboxes,['unavailable-box']);
  assert.deepEqual(manifest.requirements.unselectedToolboxes,[]);
  assert.equal(manifest.resolvable,false);
- assert.throws(()=>skills.resolve(p,manifest.id,manifest.version,['core']),e=>e.status===422);
  assert.deepEqual(p.toolboxes,['core']);
  const known=skills.manifests(p,['core','unavailable-box'])[0];
  assert.deepEqual(known.requirements.unselectedToolboxes,['unavailable-box']);

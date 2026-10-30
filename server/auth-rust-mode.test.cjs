@@ -111,10 +111,10 @@ test('the writers that stay Node\'s still work', async (t) => {
   assert.equal(f.deviceAuth.revokeAll,undefined);
   assert.throws(()=>f.guard.exempt(()=>f.auth.db.prepare('DELETE FROM device_grants').run()),owned);
   assert.equal(row(f.auth.db, 'SELECT count(*) AS n FROM device_tokens').n, 2, 'Node keeps both tokens; native owns feature-off cleanup');
-  // Deleting an account (and its cleanup) is Node's.
+  // Deleting an account is the front's (#2190, #2191 round 9): Node has no way to, not even inside exempt().
   const member = row(f.auth.db, "SELECT id FROM users WHERE username='member'").id;
-  assert.equal(f.auth.deleteUser(f.userId, member, 'member'), true);
-  assert.equal(row(f.auth.db, 'SELECT count(*) AS n FROM users').n, 1);
-  // And the guard is back on afterwards.
+  assert.equal(f.auth.deleteUser, undefined);
+  assert.throws(() => f.guard.exempt(() => f.auth.db.prepare('DELETE FROM users WHERE id=?').run(member)), owned);
+  assert.equal(row(f.auth.db, 'SELECT count(*) AS n FROM users').n, 2);
   assert.throws(() => f.auth.db.prepare('DELETE FROM users').run(), owned);
 });

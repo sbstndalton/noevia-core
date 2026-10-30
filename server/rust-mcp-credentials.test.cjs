@@ -55,14 +55,15 @@ test('index.cjs refuses the routes before authentication and builds the client o
   assert.match(index, /resealMcp: \(\) => require\('\.\/rust-mcp-credentials\.cjs'\)\.resealMcpCredentials\(PROJECT_STORE\)/);
   assert.doesNotMatch(index, /mcp-oauth\.cjs|createMcpOAuth/, 'the OAuth client, discovery and token store are gone from Node');
   assert.equal(fs.existsSync(path.join(__dirname, 'mcp-oauth.cjs')), false);
-  const code = fs.readFileSync(path.join(__dirname, 'routes', 'mcp-directory.cjs'), 'utf8').split('\n').filter((l) => !/^\s*\/\//.test(l)).join('\n');
-  assert.doesNotMatch(code, /\/api\/mcp-keys|\/api\/mcp-oauth\/(?!callback`)|mcpOAuth\.(?:finish|disconnect)|userKey/);
+  // The admin directory routes (their admin side used the broker) are the front's too since #2202 round 2.
+  assert.equal(fs.existsSync(path.join(__dirname, 'routes', 'mcp-directory.cjs')), false);
 });
 
-test('the three tables are refused for every Node write, exempt or not, with no allowance', () => {
+test('the four tables are refused for every Node write, exempt or not, with no allowance', () => {
   const Database = require('better-sqlite3');
   const raw = new Database(':memory:');
   owned.ensureSchema(raw);
+  require('./directory-mcp.cjs').migrate(raw);
   raw.exec("INSERT INTO mcp_oauth_tokens VALUES('u','s','old',1); INSERT INTO mcp_oauth_clients VALUES('s','old',1); INSERT INTO directory_mcp_user_keys VALUES('u','s','old',1)");
   const guard = createRustAuthGuard();
   const db = guard.install(raw);
@@ -70,16 +71,16 @@ test('the three tables are refused for every Node write, exempt or not, with no 
   for (const table of owned.TABLES) {
     assert.equal(FRONT_TABLES[table].code, 'RUST_MCP_CREDENTIALS_OWNED');
     assert.equal(FRONT_TABLES[table].allowed, null);
-    const col = table === 'directory_mcp_user_keys' ? 'headers_enc' : 'data_enc';
+    const col = table === 'directory_mcp_user_keys' || table === 'directory_mcp_servers' ? 'headers_enc' : 'data_enc';
     const width = table === 'mcp_oauth_clients' ? 3 : 4;
     const marks = Array(width).fill('?').join(',');
     const writes = [
-      `INSERT INTO ${table} VALUES(${marks})`,
+      table === 'directory_mcp_servers' ? 'INSERT INTO directory_mcp_servers(id, registry_name, title, url) VALUES(?,?,?,?)' : `INSERT INTO ${table} VALUES(${marks})`,
       `UPDATE ${table} SET ${col}=?`,
       `UPDATE ${table} SET ${col}=? WHERE ${col}=?`,
       `DELETE FROM ${table}`,
       `DELETE FROM ${table} WHERE ${col}=?`,
-      `REPLACE INTO "${table}" VALUES(${marks})`,
+      table === 'directory_mcp_servers' ? 'REPLACE INTO "directory_mcp_servers"(id, registry_name, title, url) VALUES(?,?,?,?)' : `REPLACE INTO "${table}" VALUES(${marks})`,
     ];
     for (const sql of writes) {
       const args = ['a', 'b', 'c', 'd'].slice(0, (sql.match(/\?/g) || []).length);
@@ -92,12 +93,11 @@ test('the three tables are refused for every Node write, exempt or not, with no 
   owned.ensureSchema(db);
   assert.equal(db.prepare('SELECT data_enc FROM mcp_oauth_tokens').get().data_enc, 'old');
   assert.equal(raw.prepare('SELECT count(*) n FROM directory_mcp_user_keys').get().n, 1, 'nothing was written');
-  // The shared key of a server stays Node's table.
-  db.exec('CREATE TABLE IF NOT EXISTS directory_mcp_servers(id TEXT PRIMARY KEY, headers_enc TEXT)');
-  db.prepare("INSERT INTO directory_mcp_servers VALUES('s','x')").run();
+  // The directory itself is the front's: Node's migrator makes the table (directory-mcp.cjs) and reads it, nothing more.
+  assert.equal(FRONT_TABLES.directory_mcp_servers.code, 'RUST_MCP_CREDENTIALS_OWNED');
 });
 
-test('no Node source writes the three tables', () => {
+test('no Node source writes the four tables', () => {
   const files = [];
   const walk = (dir) => {
     for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
@@ -109,7 +109,7 @@ test('no Node source writes the three tables', () => {
   const offenders = [];
   for (const f of files) {
     const src = fs.readFileSync(f, 'utf8');
-    for (const m of src.matchAll(/(?:INSERT|REPLACE|UPDATE|DELETE)[^`'"\n]*(?:mcp_oauth_tokens|mcp_oauth_clients|directory_mcp_user_keys)[^`'"]*/gi)) {
+    for (const m of src.matchAll(/(?:INSERT|REPLACE|UPDATE|DELETE)[^`'"\n]*(?:mcp_oauth_tokens|mcp_oauth_clients|directory_mcp_user_keys|directory_mcp_servers)[^`'"]*/gi)) {
       offenders.push(`${path.relative(__dirname, f)}: ${m[0].slice(0, 80)}`);
     }
   }
@@ -117,7 +117,7 @@ test('no Node source writes the three tables', () => {
   // The rotation's generic CAS statement is never built for them: the broker re-seals them.
   const names = require('./secrets-rotate.cjs').rotationTables({ db: { prepare: () => ({ get: () => undefined, all: () => [], run: () => ({ changes: 0 }) }) }, dataDir: os.tmpdir() }).map((t) => t.name);
   for (const t of owned.TABLES) assert.ok(!names.includes(t), t);
-  assert.ok(names.includes('directory_mcp_servers'), 'a server\'s shared key is still Node\'s to re-seal');
+  assert.ok(!names.includes('directory_mcp_servers'), 'a server\'s shared key is re-sealed by the front now (#2202 round 2)');
 });
 
 test('the stored formats the broker writes: the golden vectors both ways, tokens and keys bound to their owner', (t) => {
@@ -224,11 +224,10 @@ test('the broker is asked for one call\'s access token or key, a refusal is none
   assert.equal(await creds.oauth.start({ userId: A, serverId: 's', serverUrl: 'https://s.example/mcp' }), 'https://as.example/authorize?x=1');
   answers.push({ ok: false, status: 503 });
   await assert.rejects(creds.oauth.forget('s'), (e) => e.status === 503 && /unavailable/.test(e.message));
-  answers.push({ ok: true });
-  await creds.oauth.forgetUser(A);
+  assert.equal(creds.oauth.forgetUser, undefined, 'the front forgets a deleted account\'s sign-ins and keys itself (#2202, #2191 round 9)');
   answers.push({ ok: true });
   await creds.keys.set(A, 's', { K: 'v' });
-  assert.deepEqual(calls.slice(-2), [['mcpForgetUser', A], ['mcpKeySet', A, 's', { K: 'v' }]]);
+  assert.deepEqual(calls.slice(-1), [['mcpKeySet', A, 's', { K: 'v' }]]);
   answers.push({ ok: true, client: { manual: true, clientId: 'id', hasSecret: false, redirectUri: 'r', issuer: 'i' } });
   assert.equal((await creds.oauth.clientInfo('s')).clientId, 'id');
   answers.push({ ok: false, status: 400, error: 'Enter the client ID the service gave you (one word, no spaces).' });
@@ -270,9 +269,7 @@ test('the store client speaks the MCP broker protocol: the secret, the ops, refu
   answers.push([200, { ok: true }]);
   assert.deepEqual(await client.mcpForgetServer('s'), { ok: true });
   assert.deepEqual(seen.pop().body, { server: 's' });
-  answers.push([200, { ok: true }]);
-  await client.mcpForgetUser('u');
-  assert.deepEqual(seen.pop().body, { user: 'u' });
+  assert.equal(client.mcpForgetUser, undefined);
   answers.push([200, { ok: true }]);
   await client.mcpSetClient({ server: 's', serverUrl: 'https://s.example/mcp', clientId: 'id', clientSecret: 'sec' });
   assert.deepEqual(seen.pop().body, { server: 's', serverUrl: 'https://s.example/mcp', clientId: 'id', clientSecret: 'sec', challenge: '' });

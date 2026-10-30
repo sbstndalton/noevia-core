@@ -11,8 +11,6 @@ const offsite = require('./rust-offsite-backup.cjs');
 const { createDriveAccounts, ownsBackup, loopbackBase, MESSAGES } = require('./gdrive-broker.cjs');
 const { sealer, checkTokenFile } = require('./gdrive-seal.cjs');
 const { createSecretStore } = require('./secrets.cjs');
-const { createToolPolicy } = require('./tool-policy.cjs');
-const { createFingerprintedCache } = require('./toolboxes-permitted.cjs');
 const { createRustAuthGuard, FRONT_TABLES } = require('./rust-auth.cjs');
 
 const temps = [];
@@ -180,7 +178,7 @@ const publish = (dir, doc) => fs.writeFileSync(path.join(dir, gdrive.SIGNAL_FILE
 
 function harness({ answers = [], fetchAnswers = [] } = {}) {
   const dir = temp();
-  const calls = { session: [], reject: [], forget: [], fetch: [] };
+  const calls = { session: [], reject: [], fetch: [] };
   const broker = {
     async gdriveSession(user, admin, rejected) {
       calls.session.push({ user, admin, rejected });
@@ -189,8 +187,6 @@ function harness({ answers = [], fetchAnswers = [] } = {}) {
       return a || { ok: true, session: { accessToken: `tok-${calls.session.length}`, expiresAt: Date.now() + 3_000_000, generation: 'g'.repeat(64) } };
     },
     async gdriveReject(user, admin, generation) { calls.reject.push({ user, admin, generation }); return { ok: true, dropped: true }; },
-    async gdriveForget(user) { calls.forget.push(user); return { ok: true }; },
-    async gdriveView() { return { ok: false, status: 503 }; },
   };
   const fetchImpl = async (url, init) => {
     calls.fetch.push({ url, auth: init.headers.Authorization });
@@ -321,62 +317,9 @@ test('the broker\'s refusals reach the tool in people\'s words, and an unreachab
   assert.doesNotMatch(MESSAGES.unavailable, /not connected/i);
 });
 
-test('removing an account never throws, and the Google Drive half of the page degrades instead of failing', async () => {
-  const { accounts, calls, warnings } = harness();
-  await accounts.removeUser(B);
-  assert.deepEqual(calls.forget, [B]);
-  const refusing = createDriveAccounts({ broker: { gdriveForget: async () => ({ ok: false, status: 503 }), gdriveView: async () => { throw new Error('down'); } }, dataDir: temp(), warn: (m) => warnings.push(m) });
-  await refusing.removeUser(B);
-  assert.equal(warnings.length, 1);
-  assert.doesNotMatch(warnings[0], new RegExp(B));
-  const view = await refusing.view({ id: B, role: 'member' });
-  assert.deepEqual([view.id, view.state, view.backup, view.tools], ['gdrive', 'error', null, []]);
-  assert.equal(view.message, MESSAGES.unavailable);
-});
-
-// ── tool permissions: read here, re-read by fingerprint ──────────────────────────────────────
-
-test('the permitted-tools cache empties itself when the front writes a permission', () => {
-  const Database = require('better-sqlite3');
-  const db = new Database(':memory:');
-  db.exec("CREATE TABLE users(id TEXT PRIMARY KEY); INSERT INTO users VALUES('u1');");
-  const policy = createToolPolicy({ db });
-  const cache = createFingerprintedCache({ ttlMs: 60_000, fingerprint: () => policy.fingerprint() });
-  assert.equal(cache.get('warm-up'), undefined);
-  cache.set('u1', { tools: ['drive_search_files'] });
-  assert.deepEqual(cache.get('u1'), { tools: ['drive_search_files'] }, 'cached while nothing changed');
-  // The front\'s upsert, from another process (here another statement).
-  db.prepare('INSERT INTO tool_policies VALUES(?,?,?,?) ON CONFLICT(user_id, tool) DO UPDATE SET mode=excluded.mode, updated_at=excluded.updated_at').run('u1', 'drive_search_files', 'block', 5);
-  assert.equal(cache.get('u1'), undefined, 'the change emptied it before the lookup');
-  cache.set('u1', { tools: [] });
-  assert.deepEqual(cache.get('u1'), { tools: [] });
-  // A failing fingerprint empties the cache and is retried; it never serves what was cached before.
-  let fail = true;
-  const flaky = createFingerprintedCache({ ttlMs: 60_000, fingerprint: () => { if (fail) throw new Error('db busy'); return 'x'; } });
-  flaky.set('k', 1);
-  assert.equal(flaky.get('k'), undefined);
-  fail = false;
-  assert.equal(flaky.get('warm-up'), undefined);
-  flaky.set('k', 2);
-  assert.equal(flaky.get('k'), 2);
-  assert.equal(flaky.get('k'), 2);
-});
-
-test('#831/#845: a Drive sign-in completing or disconnecting empties the permitted-tools cache, whoever caused it', () => {
-  // The front finishes the sign-in on Google\'s page without telling this process; the broker\'s state file
-  // moving is what tells it (index.cjs composes this with the permission fingerprint).
-  const { dir, accounts } = harness();
-  publish(dir, { personal: {} });
-  const cache = createFingerprintedCache({ ttlMs: 60_000, fingerprint: () => accounts.fingerprint() });
-  assert.equal(cache.get('warm-up'), undefined);
-  cache.set(B, { boxes: [] });
-  assert.deepEqual(cache.get(B), { boxes: [] });
-  publish(dir, { personal: { [B]: 'connected' } }); // the sign-in completed
-  assert.equal(cache.get(B), undefined, 'the view that lacked the Drive box is gone');
-  cache.set(B, { boxes: ['gdrive'] });
-  assert.deepEqual(cache.get(B), { boxes: ['gdrive'] });
-  publish(dir, { personal: {} }); // disconnected
-  assert.equal(cache.get(B), undefined);
+test('forgetting an account is the front\'s: the Drive accounts keep no removeUser', () => {
+  const { accounts } = harness();
+  assert.equal(accounts.removeUser, undefined, 'the front forgets a deleted account\'s connection itself (#2190, #2191 round 9)');
 });
 
 // ── the internal store client ────────────────────────────────────────────────────────────────
@@ -407,9 +350,7 @@ test('the store client speaks the broker\'s operations and maps its answers', as
     assert.deepEqual(await client.gdriveReject(B, false, 'gen'), { ok: true, dropped: true });
     reply = { status: 200, body: { ok: true, state: 'disconnected' } };
     assert.deepEqual(await client.gdriveDisconnect(B, false), { ok: true });
-    assert.deepEqual(await client.gdriveForget(B), { ok: true });
-    reply = { status: 200, body: { id: 'gdrive', name: 'Google Drive' } };
-    assert.deepEqual(await client.gdriveView(B, false), { ok: true, view: { id: 'gdrive', name: 'Google Drive' } });
+    assert.equal(client.gdriveForget, undefined, 'the front forgets a deleted account\'s connection itself');
     reply = { status: 200, body: { current: 1, rotated: 2, empty: 0, failed: 0 } };
     assert.deepEqual(await client.gdriveReseal(), { ok: true, counts: { current: 1, rotated: 2, empty: 0, failed: 0 } });
     assert.deepEqual(seen.at(-1), { url: '/v1/gdrive/reseal', token: 'synthetic-store-token-0123456789abcdef', body: {} });
@@ -417,11 +358,9 @@ test('the store client speaks the broker\'s operations and maps its answers', as
       reply = bad;
       assert.equal((await client.gdriveReseal()).ok, false, JSON.stringify(bad));
     }
-    reply = { status: 200, body: { ok: true } };
-    assert.deepEqual(await client.toolPolicySet(B, ['nc_a', 'nc_b'], [false, true], 'ask'), { ok: true });
-    assert.deepEqual(seen.at(-1).body, { user: B, tools: ['nc_a', 'nc_b'], writes: [false, true], mode: 'ask' });
-    reply = { status: 400, body: { error: 'Choose a tool.', status: 400 } };
-    assert.deepEqual(await client.toolPolicySet(B, [], [], 'ask'), { ok: false, status: 400, error: 'Choose a tool.' });
+    // The connectors page (the Drive half, the Nextcloud permissions) is the front's own (#2202 round 2): no store call for it.
+    assert.equal(client.gdriveView, undefined);
+    assert.equal(client.toolPolicySet, undefined);
     // A store that is not there at all: the client throws the store's usual busy error, the callers turn it into "try again".
     server.close();
     await assert.rejects(() => client.gdriveSession(B, false), (e) => e.status === 503);

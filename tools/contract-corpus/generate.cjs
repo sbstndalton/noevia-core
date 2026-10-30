@@ -79,25 +79,26 @@ async function waitReady(base, child) {
 // GETs for client paths no scenario step reaches; {x} params are filled from the run. The Rust
 // front's permanent routes (sbstndalton/noevia#1071: sign-in and the account, usage, stats,
 // sampling, routing mode and default, ChatGPT status, the provider registry's list and writes since
-// #2190 round 6, the MCP keys and sign-ins since #2202, storage metadata/list/read, export, and since
+// #2190 round 6, the MCP keys and sign-ins since #2202 and the MCP directory, the permitted tools and the
+// connectors list since #2202 round 2, storage metadata/list/read, export, and since
 // #2185 the Diary source, today, storage-import and workspace export/import, since the #2190/#2191
 // close-out the health check, the auto-roles read and the workspace list, and since #2206 the rest of
 // the Diary routes but the local exchange: /api/diary, the storage status, the connector endpoint and
-// the connector credentials) are not
+// the connector credentials, and since #2191 round 9 a project's instruction skills and its manifests)
+// are not
 // Node's to record any more;
 // their exchanges stay in the noevia-rs corpus recorded at its contracts/http/core.ref.
 const PROBES = [
   '/api/account/retention',
-  '/api/admin/decision-settings', '/api/admin/features', '/api/admin/mcp-directory', '/api/admin/web-address',
+  '/api/admin/decision-settings', '/api/admin/features', '/api/admin/web-address',
   '/api/chat-framing/preferences', '/api/chat-vault-mirror/preferences', '/api/code/active',
-  '/api/connectors', '/api/connectors/nextcloud/policy',
   '/api/model-manager',
   '/api/models/autotune', '/api/models/autotune/settings', '/api/models/autotune/untuned', '/api/models/calibration', '/api/models/capabilities', '/api/models/evidence',
   '/api/models/hardware', '/api/models/inference-budget', '/api/models/installed', '/api/plugins/directory',
   '/api/profile/sharing',
   '/api/providers/{providerId}/models', '/api/reasoning-settings',
-  '/api/toolboxes', '/api/toolboxes/permitted',
-  '/api/projects/{projectId}/browser', '/api/projects/{projectId}/code', '/api/projects/{projectId}/instruction-skills', '/api/projects/{projectId}/instruction-skills/manifests', '/api/projects/{projectId}/research',
+  '/api/toolboxes',
+  '/api/projects/{projectId}/browser', '/api/projects/{projectId}/code', '/api/projects/{projectId}/research',
 ];
 
 // Validation-path probes for writes no scenario step makes: an empty or minimal body on the
@@ -106,7 +107,7 @@ const PROBES = [
 // backup and the Google Drive connector writes are the Rust front's since #2190 round 7 (their
 // exchanges stay in the noevia-rs corpus recorded at its core.ref; Node refuses them now).
 const WRITE_PROBES = [
-  ['POST', '/api/admin/decision-settings/test', {}], ['POST', '/api/admin/mcp-directory/custom/preview', {}],
+  ['POST', '/api/admin/decision-settings/test', {}],
   ['POST', '/api/chat-framing/suggest', {}],
   ['POST', '/api/integrations/storage/test', { kind: 'local' }], ['POST', '/api/models/estimate', {}],
   ['POST', '/api/models/presets/reload', {}], ['POST', '/api/models/autotune/cancel', {}], ['POST', '/api/models/calibration/cancel', {}],
@@ -195,7 +196,9 @@ async function main() {
     // list used to show it here; that read is the Rust front's, so a Node-owned read that names it does, and its
     // later paths record as <id:N> rather than as the run's literal id (the double recording must be byte-equal).
     await step(admin, 'GET', `/api/chats/search?projectId=${encodeURIComponent(projectId)}`, undefined, [200]);
-    await step(admin, 'POST', `/api/projects/${encodeURIComponent(projectId)}/config`, { instructions: 'Answer very briefly.' });
+    // A project's config is the Rust front's too (#2191 round 9): its exchange stays in the noevia-rs corpus.
+    const configRefused = await step(admin, 'POST', `/api/projects/${encodeURIComponent(projectId)}/config`, { instructions: 'Answer very briefly.' }, [503]);
+    if (configRefused.json?.code !== 'RUST_PROJECT_CONFIG_OWNED') throw new Error('Expected the Rust project config ownership refusal.');
 
     // A streamed chat turn against the mock model.
     const chat = await step(admin, 'POST', '/api/chat', { spaceId: projectId, projectId, chatId: null, message: 'Say hello.', history: [] });
@@ -228,7 +231,11 @@ async function main() {
     // Clean-up is part of the contract too. A chat's delete (#1071 slice 6) and the project delete
     // (#2191) are the Rust front's: Node refuses the delete below, and its exchange stays in the noevia-rs corpus.
     await step(admin, 'DELETE', `/api/projects/${encodeURIComponent(projectId)}`, undefined, [503]);
-    if (memberId) await step(admin, 'DELETE', `/api/admin/users/${encodeURIComponent(memberId)}`, { username: MEMBER.username });
+    // An account's deletion is the front's (#2190, #2191 round 9): Node refuses it, and its exchange stays in the noevia-rs corpus.
+    if (memberId) {
+      const deleteRefused = await step(admin, 'DELETE', `/api/admin/users/${encodeURIComponent(memberId)}`, { username: MEMBER.username }, [503]);
+      if (deleteRefused.json?.code !== 'RUST_ADMIN_USERS_OWNED') throw new Error('Expected the Rust account deletion ownership refusal.');
+    }
 
     // The project image routes, the project chat lists and the free-chat list (M4) are the Rust
     // front's since sbstndalton/noevia#1071: Node refuses them, and their exchanges stay in the

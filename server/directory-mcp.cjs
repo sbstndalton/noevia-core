@@ -1,5 +1,6 @@
 'use strict';
-// MCP servers an administrator added from the public registry (Plugins → MCP servers).
+// MCP servers an administrator added from the public registry or by address (Plugins -> MCP servers),
+// as this process's chat-time MCP client needs them.
 //
 // Kept apart from MCP_SERVERS, which the operator writes by hand: these come from strangers, so
 //  - only hosted streamable-HTTP servers at a public https address are accepted (nothing runs on
@@ -8,7 +9,16 @@
 //    sent in the header names its registry entry declares, to that server alone;
 //  - their tools are not on noevia's reviewed read-only list, so every call waits for approval;
 //  - each becomes its own toolbox that a project must choose before its tools are offered.
-const MAX_SERVERS = 20;
+//
+// The table (directory_mcp_servers) is the Rust front's since sbstndalton/noevia#2202 round 2
+// (rust-mcp-directory.cjs): it lists a candidate server's tools, adds, re-keys and removes servers and
+// is the only writer (rust-auth.cjs FRONT_TABLES refuses every write from here). This module reads it:
+// the list is re-read through shared-reread.cjs createReread on a change signal (the table's content),
+// so a server the front adds shows up on the next use without a restart, and a table that cannot be
+// read means NO directory servers (fails closed), never the last list. A shared key (headers_enc) is
+// opened only when a discovery or a call asks for it, and is never part of the list.
+const { createReread } = require('./shared-reread.cjs');
+
 // A hosted server's address: https with no template placeholders. QA runs may also use a synthetic
 // server on http://127.0.0.1 when NOEVIA_QA_ALLOW_LOOPBACK_MCP=1 (never set in deployments).
 function hostedUrlOk(url) {
@@ -17,85 +27,57 @@ function hostedUrlOk(url) {
   return process.env.NOEVIA_QA_ALLOW_LOOPBACK_MCP === '1' && /^http:\/\/127\.0\.0\.1:\d+\/[^{}\s]*$/.test(u);
 }
 
-
-// Header values: one line, bounded. The names are the registry's own declared headers only.
-function checkHeaderValues(declared, values) {
-  const out = {};
-  for (const h of declared) {
-    let v = values && typeof values[h.name] === 'string' ? values[h.name].trim() : '';
-    if (!v) { if (h.required) throw Object.assign(new Error(`Enter ${h.name}.`), { status: 400 }); continue; }
-    if (v.length > 4096 || /[\r\n\0]/.test(v)) throw Object.assign(new Error(`${h.name} must be a single line under 4 KB.`), { status: 400 });
-    if (h.template) v = h.template.replace(/\{[^}]+\}/, () => v);
-    out[h.name] = v;
-  }
-  return out;
-}
-
-function createDirectoryMcp({ db, audit = () => {}, secrets = null }) {
+/** Node is the schema migrator: the table exists, with every column, whichever process writes it. */
+function migrate(db) {
   db.exec(`CREATE TABLE IF NOT EXISTS directory_mcp_servers(id TEXT PRIMARY KEY, registry_name TEXT NOT NULL UNIQUE,
     title TEXT NOT NULL, url TEXT NOT NULL, added_by TEXT, added_at INTEGER NOT NULL);`);
   // Sign-in headers (2026-09-19): encrypted JSON {name: value}; never returned to a browser.
   if (!db.prepare("SELECT 1 FROM pragma_table_info('directory_mcp_servers') WHERE name='headers_enc'").get()) db.exec('ALTER TABLE directory_mcp_servers ADD COLUMN headers_enc TEXT');
-  // OAuth servers (2026-09-19): each account signs in for itself; the Rust front is the broker of
-  // the sign-ins and of every account's own key (rust-mcp-credentials.cjs, sbstndalton/noevia#2202).
+  // OAuth servers (2026-09-19): each account signs in for itself (the front is the broker).
   if (!db.prepare("SELECT 1 FROM pragma_table_info('directory_mcp_servers') WHERE name='oauth'").get()) db.exec('ALTER TABLE directory_mcp_servers ADD COLUMN oauth INTEGER NOT NULL DEFAULT 0');
   // Per-account keys (2026-09-19): `personal` servers take each account's own key; the declared
-  // header list (names, hints, templates — no values) is kept so the key form needs no registry.
+  // header list (names, hints, templates - no values) is kept so the key form needs no registry.
   if (!db.prepare("SELECT 1 FROM pragma_table_info('directory_mcp_servers') WHERE name='personal'").get()) db.exec("ALTER TABLE directory_mcp_servers ADD COLUMN personal INTEGER NOT NULL DEFAULT 0; ALTER TABLE directory_mcp_servers ADD COLUMN declared_json TEXT NOT NULL DEFAULT '[]'");
-  // directory_mcp_user_keys is the broker's table (rust-mcp-credentials.cjs ensureSchema makes it);
-  // this module never reads or writes it.
-  const rows = () => db.prepare('SELECT id, registry_name AS registryName, title, url, added_by AS addedBy, added_at AS addedAt, headers_enc AS headersEnc, oauth, personal, declared_json AS declaredJson FROM directory_mcp_servers ORDER BY added_at').all();
-  // A shared server's key has no owning user (decode/encode with no userId, v1). A
-  // personal server's per-account key is bound to its owner: secrets.decrypt only
-  // needs userId to check the AAD of a v2 (bound) ciphertext, so an existing v1 row
-  // still decrypts unchanged, and is re-encrypted as user-bound the next time that
-  // account saves its key.
-  const decode = (enc, userId) => { if (!enc || !secrets) return {}; try { return JSON.parse(secrets.decrypt(enc, userId)); } catch { return {}; } };
-  const encode = (headers, userId) => (Object.keys(headers).length ? (secrets ? secrets.encrypt(JSON.stringify(headers), userId) : (() => { throw Object.assign(new Error('Keys cannot be stored on this server.'), { status: 500 }); })()) : null);
-  // Public shape: which header names hold a key, never the key.
+}
+
+const COLUMNS = 'id, registry_name AS registryName, title, url, added_by AS addedBy, added_at AS addedAt, headers_enc AS headersEnc, oauth, personal, declared_json AS declaredJson';
+
+/**
+ * @param {object} o
+ * @param {object} o.db            the shared database (read here; the front writes)
+ * @param {object|null} [o.secrets] secretStore, to open a shared key
+ */
+function createDirectoryMcp({ db, secrets = null }) {
+  migrate(db);
+  const statement = db.prepare(`SELECT ${COLUMNS} FROM directory_mcp_servers ORDER BY added_at, rowid`);
+  /** The table's rows as one string: it changes exactly when a row, a flag or a sealed key does. */
+  const rawSignal = () => JSON.stringify(statement.all());
+
   const parse = (j) => { try { const v = JSON.parse(j); return Array.isArray(v) ? v : []; } catch { return []; } };
-  const list = () => rows().map(({ headersEnc, oauth, personal, declaredJson, ...r }) => ({ ...r, oauth: !!oauth, personal: !!personal, declaredHeaders: parse(declaredJson), keyHeaders: Object.keys(decode(headersEnc)) }));
+  // A shared server's key has no owning user (decode with no userId, v1). The front seals it unbound.
+  const decode = (enc) => { if (!enc || !secrets) return {}; try { return JSON.parse(secrets.decrypt(enc)); } catch { return {}; } };
+
+  const reread = createReread({
+    signal: rawSignal,
+    load: (token) => JSON.parse(token).map(({ headersEnc, oauth, personal, declaredJson, ...r }) => ({
+      ...r, oauth: !!oauth, personal: !!personal, declaredHeaders: parse(declaredJson), keyHeaders: Object.keys(decode(headersEnc)), headersEnc: headersEnc || null,
+    })),
+    fallback: () => [],
+  });
+
+  /** The servers as the admin page lists them (no key): `[]` while the table cannot be read. */
+  const list = () => reread.current().map(({ headersEnc, ...r }) => r);
+  /** A change signal for the list: differs when the table does, 'unreadable' while it cannot be read. */
+  const signal = () => { try { return rawSignal(); } catch { return 'unreadable'; } };
+  const headersFor = (id) => decode(reread.current().find((r) => r.id === id)?.headersEnc);
   const idFor = (name) => `dir-${String(name).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 34)}`;
-
-  function add({ registryName, title, url, declaredHeaders = [], headerValues = {}, oauth = false, personal = false }, actorId) {
-    if (list().length >= MAX_SERVERS) throw Object.assign(new Error(`At most ${MAX_SERVERS} directory servers can be added.`), { status: 409 });
-    if (!hostedUrlOk(url)) throw Object.assign(new Error('Only hosted servers at an https address can be added.'), { status: 400 });
-    if (list().some((s) => s.registryName === registryName)) throw Object.assign(new Error('That server is already added.'), { status: 409 });
-    const id = idFor(registryName);
-    if (list().some((s) => s.id === id)) throw Object.assign(new Error('A server with a similar name is already added.'), { status: 409 });
-    const headers = checkHeaderValues(declaredHeaders, headerValues);
-    const declared = JSON.stringify(declaredHeaders.map((h) => ({ name: h.name, required: !!h.required, secret: h.secret !== false, description: String(h.description || '').slice(0, 300), template: h.template || null })));
-    // A personal server keeps no shared key: the adding admin's key is stored as theirs.
-    db.prepare('INSERT INTO directory_mcp_servers(id, registry_name, title, url, added_by, added_at, headers_enc, oauth, personal, declared_json) VALUES(?,?,?,?,?,?,?,?,?,?)').run(id, registryName, String(title || registryName).slice(0, 80), url, actorId || null, Date.now(), personal ? null : encode(headers), oauth ? 1 : 0, personal ? 1 : 0, declared);
-    // A personal server keeps no shared key; the adding administrator's key is stored as theirs by the
-    // broker (the route asks it, with the values it has just checked), never from here.
-    audit('mcp.directory.add', actorId, { registryName, url, keyHeaders: Object.keys(headers) });
-    return list().find((s) => s.id === id);
-  }
-
-  function setKeys(id, declaredHeaders, headerValues, actorId) {
-    if (!list().some((s) => s.id === id)) throw Object.assign(new Error('No such server.'), { status: 404 });
-    const headers = checkHeaderValues(declaredHeaders, headerValues);
-    db.prepare('UPDATE directory_mcp_servers SET headers_enc=? WHERE id=?').run(encode(headers), id);
-    audit('mcp.directory.keys', actorId, { id, keyHeaders: Object.keys(headers) });
-  }
-  const headersFor = (id) => decode(rows().find((r) => r.id === id)?.headersEnc);
-
-  function remove(id, actorId) {
-    const row = list().find((s) => s.id === id);
-    if (!row) throw Object.assign(new Error('No such server.'), { status: 404 });
-    db.prepare('DELETE FROM directory_mcp_servers WHERE id=?').run(id);
-    // Every account's sign-in, app and key for it go with it: the route asks the broker (forget) first.
-    audit('mcp.directory.remove', actorId, { registryName: row.registryName });
-    return row;
-  }
 
   /** The servers in MCP_SERVERS shape, plus the box each one becomes once its tools are known. */
   const asServers = () => list().map((s) => ({ id: s.id, url: s.url, auth: s.oauth ? 'oauth' : s.personal ? 'personal' : s.keyHeaders.length ? 'directory' : 'none', directory: true, title: s.title, addedBy: s.addedBy }));
   const boxFor = (server, toolNames) => ({ id: server.id, server: server.id, label: server.title, directory: true,
     description: `Added from the MCP directory. Every call asks first.`, tools: [...toolNames] });
 
-  return { list, add, remove, setKeys, headersFor, asServers, boxFor, idFor };
+  return { list, signal, headersFor, asServers, boxFor, idFor };
 }
 
-module.exports = { createDirectoryMcp, hostedUrlOk, checkHeaderValues };
+module.exports = { createDirectoryMcp, hostedUrlOk, migrate };

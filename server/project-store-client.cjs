@@ -303,10 +303,6 @@ function createClient({ port, token, fetchImpl = globalThis.fetch, timeoutMs = T
       const { status, body } = await call('chatgpt/disconnect', { user }, CHATGPT_WAIT_MS);
       return status === 200 && body?.ok === true ? { ok: true } : chatgptRefusal(status, body);
     },
-    async chatgptForget(user) {
-      const { status, body } = await call('chatgpt/forget', { user }, CHATGPT_WAIT_MS);
-      return status === 200 && body?.ok === true ? { ok: true } : chatgptRefusal(status, body);
-    },
     /** sbstndalton/noevia#2202: the MCP credential broker (the Rust front, mcp_routes.rs). Each answers
      *  { ok: true, ... } or { ok: false, status, error, code? } (the broker's refusal, written for
      *  people). A session may refresh at the sign-in service, a start may discover and register at
@@ -344,10 +340,6 @@ function createClient({ port, token, fetchImpl = globalThis.fetch, timeoutMs = T
       const { status, body } = await call('mcp/forget', { server }, MCP_WAIT_MS);
       return status === 200 && body?.ok === true ? { ok: true } : mcpRefusal(status, body);
     },
-    async mcpForgetUser(user) {
-      const { status, body } = await call('mcp/forget', { user }, MCP_WAIT_MS);
-      return status === 200 && body?.ok === true ? { ok: true } : mcpRefusal(status, body);
-    },
     async mcpKeySet(user, server, headers) {
       const { status, body } = await call('mcp/key-set', { user, server, headers }, MCP_WAIT_MS);
       return status === 200 && body?.ok === true ? { ok: true } : mcpRefusal(status, body);
@@ -377,10 +369,6 @@ function createClient({ port, token, fetchImpl = globalThis.fetch, timeoutMs = T
       const { status, body } = await call('gdrive/disconnect', { user, admin: admin === true }, CHATGPT_WAIT_MS);
       return status === 200 && body?.ok === true ? { ok: true } : chatgptRefusal(status, body);
     },
-    async gdriveForget(user) {
-      const { status, body } = await call('gdrive/forget', { user }, CHATGPT_WAIT_MS);
-      return status === 200 && body?.ok === true ? { ok: true } : chatgptRefusal(status, body);
-    },
     /** secrets:rotate (round 7 review): the front re-seals every account's token file under the current
      *  secrets.key, under its own fence. { ok: true, counts: { current, rotated, empty, failed } } or a refusal
      *  (a 404 is an older front without the op). Counts only: no name, id or token. */
@@ -390,20 +378,6 @@ function createClient({ port, token, fetchImpl = globalThis.fetch, timeoutMs = T
       if (status === 200 && body && ['current', 'rotated', 'empty', 'failed'].every((k) => n(k) !== null)) {
         return { ok: true, counts: { current: body.current, rotated: body.rotated, empty: body.empty, failed: body.failed } };
       }
-      return chatgptRefusal(status, body);
-    },
-    /** The Google Drive half of GET /api/connectors, as the front would answer it. */
-    async gdriveView(user, admin) {
-      const { status, body } = await call('gdrive/view', { user, admin: admin === true }, CHATGPT_WAIT_MS);
-      return status === 200 && body && body.id === 'gdrive' ? { ok: true, view: body } : chatgptRefusal(status, body);
-    },
-    /** The one write of tool_policies, on Node's behalf (the Nextcloud permissions: Node knows the live
-     *  MCP tools and which of them write). `writes[i]` is whether `tools[i]` is a write. 400 carries the
-     *  words core always showed. */
-    async toolPolicySet(user, tools, writes, mode) {
-      const { status, body } = await call('gdrive/policy', { user, tools: [].concat(tools), writes: [].concat(writes).map((w) => w === true), mode }, CHATGPT_WAIT_MS);
-      if (status === 200 && body?.ok === true) return { ok: true };
-      if (status === 400 && body && typeof body.error === 'string') return { ok: false, status: 400, error: body.error };
       return chatgptRefusal(status, body);
     },
     /** sbstndalton/noevia#2153: the user's chat change journal after `after` (chat-change-journal.cjs):

@@ -1,7 +1,7 @@
 'use strict';
 // The account mount over a fake auth service: the administrator gate on
-// /api/admin/*, the secrets rotation and account deletion. Everything else that was here is the
-// Rust front's (#1071). The session and CSRF checks before the mount are the router's.
+// /api/admin/* and the secrets rotation. Everything else that was here is the Rust front's (#1071), and
+// since #2190/#2191 round 9 so is deleting an account (rust-admin-users.cjs). The session and CSRF checks before the mount are the router's.
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const { Readable } = require('node:stream');
@@ -9,18 +9,9 @@ const { createAuthRoutes } = require('./auth.cjs');
 
 function fixture() {
   const sent = [], calls = [];
-  const authService = {
-    deleteUser: (_by, id, username) => { if (username !== 'two') throw new Error('username must match'); return id === 'u2'; },
-  };
   const routes = createAuthRoutes({
     json: (res, status, body) => { sent.push({ status, body }); },
     readJson: async (req) => { let s = ''; for await (const c of req) s += c; return s ? JSON.parse(s) : {}; },
-    authService,
-    workspaceStore: { remove: (id) => calls.push(['workspace.remove', id]) },
-    driveAccounts: { removeUser: async (id) => calls.push(['drive.removeUser', id]) },
-    fetchJson: async (url, init) => { calls.push(['fetch', url, init.method, init.headers]); return { ok: true }; },
-    DIARY_BASE: 'http://diary:8010', DIARY_TOKEN: 'sidecar-token',
-    mcpOAuth: { forgetUser: async (id) => calls.push(['mcpOAuth.forgetUser', id]) },
     rotateSecrets: (actorId) => { calls.push(['rotate', actorId]); return { rotated: 0 }; },
   });
   const call = (mount, method, path, body, { role = 'member', legacy = false, session } = {}) => {
@@ -68,40 +59,8 @@ test('the admin routes Node still answers refuse members first', async () => {
   await f.call('account', 'POST', '/api/admin/secrets/rotate', undefined, { role: 'admin' });
   assert.deepEqual(f.sent.pop(), { status: 200, body: { rotated: 0 } });
   assert.deepEqual(f.calls.pop(), ['rotate', 'u1']);
-});
-
-test('deleting an account also removes its workspace, its Drive and its Diary tenant', async () => {
-  const f = fixture();
-  await f.call('account', 'DELETE', '/api/admin/users/u2', { username: 'one' }, { role: 'admin' });
-  assert.deepEqual(f.sent.pop(), { status: 400, body: { error: 'username must match' } });
-  assert.equal(f.calls.length, 0);
+  // Deleting an account is the Rust front's (rust-admin-users.cjs refuses it first): this mount has no handler.
   await f.call('account', 'DELETE', '/api/admin/users/u2', { username: 'two' }, { role: 'admin' });
-  assert.deepEqual(f.sent.pop(), { status: 200, body: { ok: true } });
-  assert.deepEqual(f.calls.map((c) => c[0]), ['workspace.remove', 'drive.removeUser', 'mcpOAuth.forgetUser', 'fetch']);
-  assert.deepEqual(f.calls[2].slice(1), ['u2']);
-  assert.deepEqual(f.calls[3].slice(1), ['http://diary:8010/api/internal/tenant', 'DELETE', { 'X-Cowork-User-ID': 'u2', Authorization: 'Bearer sidecar-token' }]);
-});
-
-test('#2202: an account\'s MCP sign-ins and keys are the broker\'s to forget; a broker that cannot does not undo the deletion', async () => {
-  const warned = [];
-  const realWarn = console.warn; console.warn = (...a) => warned.push(a.join(' '));
-  try {
-    const f = fixture();
-    // The broker is asked (awaited) before the Diary tenant goes; its failure is reported without detail.
-    const sent = [], calls = [];
-    const routes = createAuthRoutes({
-      json: (_res, status, body) => sent.push({ status, body }), readJson: async () => ({ username: 'two' }),
-      authService: { deleteUser: () => true }, workspaceStore: { remove: () => calls.push('workspace') }, driveAccounts: { removeUser: async () => calls.push('drive') },
-      fetchJson: async () => { calls.push('diary'); return {}; }, DIARY_BASE: 'http://diary', DIARY_TOKEN: 't',
-      mcpOAuth: { forgetUser: async () => { calls.push('mcp'); throw Object.assign(new Error('secret-detail-ABC'), { status: 503 }); } },
-    });
-    const req = Readable.from([]); Object.assign(req, { method: 'DELETE', headers: {} });
-    await routes.account(req, {}, { path: '/api/admin/users/u2', authn: { user: { id: 'u1', role: 'admin' } } });
-    assert.deepEqual(sent, [{ status: 200, body: { ok: true } }]);
-    assert.deepEqual(calls, ['workspace', 'drive', 'mcp', 'diary'], 'the rest of the deletion still runs');
-    assert.equal(warned.length, 1);
-    assert.match(warned[0], /MCP sign-ins and keys of a deleted account were not removed \(503\)/);
-    assert.doesNotMatch(warned[0], /secret-detail/);
-    void f;
-  } finally { console.warn = realWarn; }
+  assert.deepEqual(f.sent.pop(), { status: 404, body: { error: 'not found' } });
+  assert.deepEqual(f.calls, []);
 });

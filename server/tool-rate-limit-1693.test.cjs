@@ -26,7 +26,7 @@ function build({ auth = 'bearer', answer }) {
   const wiring = createMcpWiring({
     servers: [server], manifest: [{ id: 'web-search', server: 'synthetic-search' }], mcp,
     bindBoxes: ({ manifest, perServer }) => manifest.map((m) => ({ id: m.id, tools: [...(perServer.get(m.server) || new Map()).values()].map((e) => e.tool), server: m.server })),
-    directoryMcp: { asServers: () => [], headersFor: () => ({}) },
+    directoryMcp: { signal: () => 0, asServers: () => [], headersFor: () => ({}) },
     mcpKeys: { hasKey: () => true, headers: async (uid) => ({ 'X-Key': `key-${uid}` }) },
     mcpOAuth: { connected: () => false, tokenFor: async () => null },
     directoryUrlAllowed: async () => true, credentialOriginAllowed: () => true,

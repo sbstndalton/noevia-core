@@ -64,7 +64,7 @@ function ownsBackup({ admin, userId, backup, personalFile }) {
 
 /**
  * @param {object} deps
- * @param {{gdriveSession, gdriveReject, gdriveDisconnect, gdriveForget, gdriveView}} deps.broker  the project-store client
+ * @param {{gdriveSession, gdriveReject, gdriveDisconnect}} deps.broker  the project-store client
  * @param {string} deps.dataDir
  * @param {string} [deps.apiBase] @param {string} [deps.uploadBase]
  */
@@ -158,28 +158,7 @@ function createDriveAccounts({ broker, dataDir, apiBase = DEFAULT_API, uploadBas
     return { drive: driveFor(user), backup: owns(user, snapshot.current()) };
   }
 
-  /** The broker deletes an account's connection (revoked at Google first); a failure never undoes the deletion. */
-  async function removeUser(userId) {
-    sessions.delete(String(userId));
-    try {
-      const r = await broker.gdriveForget(String(userId));
-      if (!r || !r.ok) warn(`Google Drive connection of a deleted account was not removed (${r?.status || 'error'}).`);
-    } catch (e) { warn(`Google Drive connection of a deleted account was not removed (${e?.code || e?.status || 'error'}).`); }
-  }
-
-  /** The Google Drive half of GET /api/connectors, from the broker. */
-  async function view(user) {
-    let r;
-    try { r = await broker.gdriveView(String(user.id), admin(user)); } catch { r = null; }
-    if (r && r.ok) return r.view;
-    // The broker cannot answer: the page still lists Nextcloud, and says why this one is missing.
-    return { id: 'gdrive', name: 'Google Drive', configured: true, state: 'error', email: null, connectedAt: null, message: MESSAGES.unavailable, backup: null, tools: [] };
-  }
-
-  /** A change signal for everything that decides which Drive tools an account is offered: the broker's state file. */
-  const fingerprint = () => { try { return fileSignal(signalFile); } catch { return 'unreadable'; } };
-
-  return { forUser, removeUser, fingerprint, connected: (user) => !!user && !!user.id && stateOf(user) === 'connected', view, ownsBackup };
+  return { forUser, connected: (user) => !!user && !!user.id && stateOf(user) === 'connected', ownsBackup };
 }
 
 module.exports = { createDriveAccounts, ownsBackup, loopbackBase, MESSAGES };

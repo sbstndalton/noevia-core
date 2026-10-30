@@ -22,7 +22,7 @@ function harness() {
   const context = { requestScope: scope };
   const wiring = require('./mcp-wiring.cjs').createMcpWiring({
     servers: [], manifest: [], mcp: {}, bindBoxes: () => [],
-    directoryMcp: { asServers: () => [] }, mcpOAuth: {},
+    directoryMcp: { signal: () => 0, asServers: () => [] }, mcpOAuth: {},
     directoryUrlAllowed: async () => true, credentialOriginAllowed: () => false,
     scope, storageFor: () => ({ kind: 'local' }), isWriteTool: () => false,
     internal: { mintToken: (_key, claims) => { minted.push(claims); return 'tok'; } }, internalKey: 'test-key',

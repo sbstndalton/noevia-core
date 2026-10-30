@@ -54,7 +54,7 @@ function createCredentialOriginCheck(origins) {
  * @param {object[]} deps.manifest       curated boxes (mcp-toolbox-manifest.cjs)
  * @param {object} deps.mcp              the protocol client: connect, listTools, callTool, disconnect, convertTool, readOnlyHint, resultToText
  * @param {(opts) => object[]} deps.bindBoxes   mcp-boxes.cjs
- * @param {object} deps.directoryMcp     asServers, boxFor, headersFor
+ * @param {object} deps.directoryMcp     asServers, boxFor, headersFor, signal (the Rust front writes the table; this is a re-reader)
  * @param {object} deps.mcpOAuth         the OAuth broker (rust-mcp-credentials.cjs): connected, tokenFor, session, reject
  * @param {object} [deps.mcpKeys]        the keys broker: hasKey (sync, from its published readiness) and headers (async,
  *   one call's worth; never cached here). Without it no account has a key (fails closed).
@@ -94,6 +94,8 @@ function createMcpWiring({
   // discoveryTtlMs. The last step holds. Capped at discoveryTtlMs.
   discoveryRetryMs = [5000, 15000, 45000, 120000],
   toolRateLimit = require('./tool-rate-limit.cjs').createToolRateLimit(),
+  // How often the Rust front's directory table is looked at on the hot paths (0: every time).
+  directoryCheckMs = 250,
 }) {
   const rateLimit = require('./tool-rate-limit.cjs');
   const PER_USER_AUTH = new Set(['nextcloud', 'personal', 'oauth']);
@@ -123,30 +125,41 @@ function createMcpWiring({
   const MCP_SERVER_BY_ID = new Map(MCP_SERVERS.map((sv) => [sv.id, sv]));
   let MCP_ENABLED = MCP_SERVERS.length > 0;
 
-  const oauthServerIds = () => new Set(MCP_SERVERS.filter((sv) => sv.auth === 'oauth' || sv.auth === 'personal').map((sv) => sv.id));
+  const oauthServerIds = () => (refreshDirectory(), new Set(MCP_SERVERS.filter((sv) => sv.auth === 'oauth' || sv.auth === 'personal').map((sv) => sv.id)));
   /** Whether this account can use a per-account server: its own sign-in or its own key. */
   function accountReady(userId, serverId) {
+    refreshDirectory();
     const sv = MCP_SERVERS.find((x) => x.id === serverId);
     if (!sv) return false;
     return sv.auth === 'oauth' ? mcpOAuth.connected(userId, serverId) : sv.auth === 'personal' ? mcpKeys.hasKey(userId, serverId) : true;
   }
-  /** An unauthenticated initialize: tells us whether a server wants OAuth (401 + WWW-Authenticate). */
-  async function probeMcpAuth(url) {
-    if (!(await directoryUrlAllowed(url))) return { status: 0, challenge: '' };
-    try {
-      const r = await (publicFetch || fetch)(url, { method: 'POST', redirect: 'error', signal: AbortSignal.timeout(8000),
-        headers: { 'content-type': 'application/json', accept: 'application/json, text/event-stream' },
-        body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 'noevia', version: '1' } } }) });
-      return { status: r.status, challenge: r.headers.get('www-authenticate') || '' };
-    } catch { return { status: 0, challenge: '' }; }
-  }
+  // The directory is the Rust front's table (sbstndalton/noevia#2202 round 2), re-read here: the list
+  // this process works from is the one the table had when `directoryMcp.signal()` last said so. A table
+  // that cannot be read has no servers (directory-mcp.cjs fails closed), so nothing stays offered from a
+  // list that might be gone.
+  let syncedWith;
   function syncDirectoryServers() {
+    // The signal first: a write that lands while the list is read is caught by the next look.
+    const seen = directoryMcp.signal();
     for (let i = MCP_SERVERS.length - 1; i >= 0; i--) if (MCP_SERVERS[i].directory) MCP_SERVERS.splice(i, 1);
     for (const sv of directoryMcp.asServers()) MCP_SERVERS.push(sv);
     MCP_SERVER_BY_ID.clear();
     for (const sv of MCP_SERVERS) MCP_SERVER_BY_ID.set(sv.id, sv);
     MCP_ENABLED = MCP_SERVERS.length > 0;
+    syncedWith = seen;
   }
+  /** Brings the server list up to date with the table; true when it had changed. The table is looked at
+   *  at most once per `directoryCheckMs` (this is asked on every toolbox lookup of every turn). */
+  let lookedAt = 0;
+  function refreshDirectory(fresh = false) {
+    const t = Date.now();
+    if (!fresh && directoryCheckMs > 0 && t - lookedAt < directoryCheckMs && t >= lookedAt) return false;
+    lookedAt = t;
+    if (directoryMcp.signal() === syncedWith) return false;
+    syncDirectoryServers();
+    return true;
+  }
+  syncedWith = directoryMcp.signal();
 
   // Being unconfigured is a healthy state, but it is indistinguishable from a
   // broken one from the outside: a curated box that loses every tool is not
@@ -271,7 +284,7 @@ function createMcpWiring({
    *  identical for everyone, so this leaks nothing. Longer-lived than a call
    *  token because listTools paginates, and harmless because it cannot act. */
   function mcpDiscoveryAuth(server) {
-    if (server && server.auth === 'directory') return server.pendingHeaders || directoryMcp.headersFor(server.id);
+    if (server && server.auth === 'directory') return directoryMcp.headersFor(server.id);
     if (server && server.auth === 'internal') {
       return { Authorization: `Bearer ${internal.mintToken(internalKey, { discovery: true, ttlMs: 120000 })}` };
     }
@@ -290,7 +303,7 @@ function createMcpWiring({
       // The tool list is read with the key of the administrator who added the server. A disabled
       // administrator's key is not trusted for discovery, even if it is still stored.
       if (server.addedBy && isUserDisabled(server.addedBy)) throw new Error('waiting for an active administrator to add a key');
-      headers = server.pendingHeaders || await mcpKeys.headers(server.addedBy, server.id);
+      headers = await mcpKeys.headers(server.addedBy, server.id);
       if (!headers || !Object.keys(headers).length) throw new Error('waiting for the administrator who added it to enter their key');
     }
     if (server.auth === 'oauth') {
@@ -329,6 +342,8 @@ function createMcpWiring({
     .join('|');
   let discoveredWith;
   async function discoverMcpTools(force = false) {
+    // The Rust front adds, re-keys and removes directory servers: a changed table is rediscovered now.
+    if (refreshDirectory(true)) force = true;
     // A credential discovery depends on changed since the last discovery: the tool list it was waiting
     // for (or must no longer offer) is read again now, as a forced discovery after the sign-in was.
     const credentials = credentialKey();
@@ -469,6 +484,7 @@ function createMcpWiring({
   }
 
   async function executeMcpToolCall(name, args, signal, serverId) {
+    refreshDirectory();
     const route = routeMcpTool(name, serverId);
     if (route.error) return route.error;
     const known = route.known;
@@ -605,7 +621,7 @@ function createMcpWiring({
     servers: MCP_SERVERS,
     enabled: () => MCP_ENABLED,
     state: mcpState,
-    oauthServerIds, accountReady, probeMcpAuth, syncDirectoryServers,
+    oauthServerIds, accountReady, syncDirectoryServers, refreshDirectory,
     discoverOneServer, discoverMcpTools,
     mcpStaticAuth, mcpAuthHeaders, mcpInternalAuth, internalCallProjectId, mcpDiscoveryAuth,
     executeMcpToolCall, operatorServerFor, executeOperatorToolCall,

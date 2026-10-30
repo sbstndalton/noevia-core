@@ -41,7 +41,7 @@ test('Node keeps no source journal client: the module, the store client and the 
   assert.equal(client.includes('sourceJobsFor'), false);
   assert.equal(client.includes('SOURCE_JOBS_CLIENT_MARKER'), false, 'no source job client capability for the release pairing');
   assert.equal(fs.readFileSync(path.join(__dirname, 'workspace.cjs'), 'utf8').includes('sourceJobs'), false);
-  const routes = fs.readFileSync(path.join(__dirname, 'routes', 'projects.cjs'), 'utf8');
+  const routes = ''; assert.equal(fs.existsSync(path.join(__dirname, 'routes', 'projects.cjs')), false, 'no project route file is left (#2191 round 9)');
   assert.equal(routes.includes("searchParams.get('background')"), false, 'no background wrapper here');
   assert.equal(routes.includes("require('../source-jobs.cjs')"), false);
   const index = fs.readFileSync(path.join(__dirname, 'index.cjs'), 'utf8');
