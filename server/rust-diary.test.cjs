@@ -37,7 +37,7 @@ test('every owned route is refused with a 503 and its code, for every method, be
   }
 });
 
-test('what Node keeps is not refused: the memory-bound routes, the unnamed aliases, and any other path shape', () => {
+test('what this module does not own is not refused here: the later round\'s routes, the local exchange, the unnamed aliases, and any other path shape', () => {
   for (const url of [
     '/api/diary', '/api/diary-connector', '/api/diary/context', '/api/diary/exchanges', '/api/diary/local-exchange', '/api/diary/storage-status',
     '/api/profile/diary-connectors', `/api/profile/diary-connectors/${'a'.repeat(32)}`,
@@ -128,14 +128,15 @@ test('through the router: owned routes are refused signed out and signed in, kep
     }
   }
   // Positive controls: the routes Node keeps still run the ordinary chain (auth, then the add-on gate).
-  for (const url of ['/api/diary/storage-status', '/api/diary/history', '/api/diary/exchanges', '/api/diary/workspace-trash', '/api/diary/files']) {
+  // (The storage status, the exchanges and the context moved with #2206: rust-diary-routes.test.cjs.)
+  for (const url of ['/api/diary/history', '/api/diary/workspace-trash', '/api/diary/files']) {
     assert.equal((await request(url)).status, 401, `${url} signed out`);
     const off = await request(url, { headers: as(member) });
     assert.equal(off.status, 404, `${url} without the add-on`);
     assert.deepEqual(off.json, { error: 'Diary add-on is disabled' });
   }
-  // A kept method guard, as the combined storage route had it.
-  const wrong = await request('/api/diary/storage-status', { method: 'POST', headers: as(withDiary), body: '{}' });
+  // The local exchange keeps its method guard and its add-on gate here.
+  const wrong = await request('/api/diary/local-exchange', { method: 'GET', headers: as(withDiary) });
   assert.deepEqual([wrong.status, wrong.json], [405, { error: 'Method not allowed' }]);
   // A trailing slash is not the owned route: it falls through to the static 404, as it always did.
   const slash = await request('/api/diary/source/', { headers: as(withDiary) });

@@ -138,24 +138,24 @@ test('#786: a JSON body of null is a 400 on every route that reads its body', as
   const storage = await request('/api/integrations/storage', { method: 'PUT', headers: writeHeaders(), body: 'null' });
   assert.equal(storage.status, 503);
   assert.equal(JSON.parse(storage.text).code, 'RUST_STORAGE_CONNECTION_OWNED');
-  const routes = [
-    ['POST', '/api/profile/diary-connectors', writeHeaders()],
-  ];
-  for (const [method, url, headers] of routes) {
-    const res = await request(url, { method, headers, body: 'null' });
-    assert.equal(res.status, 400, `${method} ${url} answered ${res.status}: ${res.text}`);
-  }
   // A well-formed body is unaffected.
   const control = createProjectAs(testDataDir, adminId, { name: 'Synthetic null-body control' });
   assert.equal((await request(`/api/projects/${control.id}/config`, { method: 'POST', headers: writeHeaders(), body: JSON.stringify({ pinned: true }) })).status, 200);
 });
 
-test('#786: the Diary connector endpoint refuses a null body with 400', async () => {
+// #786 (a null body is a 400 on the connector endpoint and on the connector credentials) moved with the
+// routes to the Rust front (#2206): noevia-rs bins/noevia-server tests/diary.rs. Node refuses them
+// before authentication and before reading the body.
+test('#2206: Node refuses the Diary connector routes before authentication and before reading the body', async () => {
   setUserFeatures(testDataDir, adminId, { diaryEnabled: true });
-  const made = await request('/api/profile/diary-connectors', { method: 'POST', headers: writeHeaders(), body: JSON.stringify({ name: 'Synthetic connector' }) });
-  assert.equal(made.status, 201, made.text);
-  const res = await request('/api/diary-connector', { method: 'POST', headers: { authorization: `Bearer ${made.json.token}`, 'content-type': 'application/json' }, body: 'null' });
-  assert.equal(res.status, 400, res.text);
+  for (const [method, url, headers] of [
+    ['POST', '/api/profile/diary-connectors', writeHeaders()],
+    ['POST', '/api/diary-connector', { authorization: 'Bearer anything', 'content-type': 'application/json' }],
+  ]) {
+    const res = await request(url, { method, headers, body: 'null' });
+    assert.equal(res.status, 503, `${method} ${url}: ${res.text}`);
+    assert.equal(JSON.parse(res.text).code, 'RUST_DIARY_ROUTES_OWNED');
+  }
 });
 
 const createProject = async (name) => {

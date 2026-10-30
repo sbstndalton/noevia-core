@@ -150,7 +150,9 @@ function createStorageLatch({ now = Date.now, proofOf = null, file = ':memory:' 
   }
 
   /** What a status view shows about an account's held automatic calls, or null: the kind, and when the
-   *  next automatic attempt is due (epoch ms). Reading it never lets a probe through. */
+   *  next automatic attempt is due (epoch ms). Reading it never lets a probe through. The Diary storage
+   *  status is the Rust front's since #2206 (noevia-rs crates/server-projects `storage_latch::status`, the
+   *  same transition on the same rows); this is the reference reading its tests are held to. */
   function status(userId, connection) {
     return transaction(() => {
       const latch = inspect(userId, connection);
@@ -164,12 +166,6 @@ function createStorageLatch({ now = Date.now, proofOf = null, file = ':memory:' 
   /** The saved connection of an account, or null when there is none (or it cannot be read). */
   function connectionOf(readConnection, userId) {
     try { return readConnection(userId) || null; } catch { return null; }
-  }
-
-  /** The held state of an account's automatic calls from its saved connection, or null (a status view). */
-  function statusFor(userId, readConnection) {
-    const conn = connectionOf(readConnection, userId);
-    return conn ? status(userId, conn) : null;
   }
 
   /** Whether an account's automatic calls are held right now (the Diary backup worker's `suspended`). */
@@ -208,7 +204,7 @@ function createStorageLatch({ now = Date.now, proofOf = null, file = ':memory:' 
     });
   }
 
-  return { note, blocked, status, statusFor, clear, fingerprintOf, suspendedFor, noteDiaryReply };
+  return { note, blocked, status, clear, fingerprintOf, suspendedFor, noteDiaryReply };
 }
 
 /** The storage failure a Diary reply reports, in the shape `note` takes, or null. The Diary tags a

@@ -1,18 +1,14 @@
 'use strict';
-// The Diary's HTTP surface (diary.cjs holds the sidecar client). Three mounts, because the
-// router places them apart:
-//   connector   POST /api/diary-connector — a connected app's credential, checked here, not a
-//               session; mounted BEFORE the session and CSRF checks and refuses any browser origin
-//   connectors  /api/profile/diary-connectors[/:id] — list, create and revoke those credentials
-//   diary       /api/diary/* — recovery records, workspace trash, storage status, files and the
-//               local exchange, the history read, the operator import folders and the journaled entry
-//               edit; every one gated on the Diary add-on. The corpus source and day reads, the
-//               storage import and the workspace import and export are the Rust front's (rust-diary.cjs)
+// The Diary's HTTP surface that stays in this process (diary.cjs holds the sidecar client):
+//   diary   /api/diary/* — workspace trash, files and the local exchange, the history read, the
+//           operator import folders and the journaled entry edit; every one gated on the Diary add-on.
+// The rest is the Rust front's: the corpus source and day reads, the storage import and the workspace
+// import and export (#2185, rust-diary.cjs), and the storage status, the recovery records, the Diary
+// context, the connector endpoint and the connector credentials (#2206, rust-diary-routes.cjs).
+// What keeps the local exchange here is the model throttle chat shares and the inference gate.
 //
-// Each returns true when it handled the request. Blocks keep their original order and an
-// unmatched method falls through as it did inline.
-
-const { requireJsonObject } = require('../http.cjs');
+// Returns true when it handled the request. Blocks keep their original order and an unmatched
+// method falls through as it did inline.
 
 const PASS = Symbol('unhandled');
 
@@ -26,70 +22,16 @@ const PASS = Symbol('unhandled');
  * @param {object} deps.authService
  * @param {() => object} deps.currentWorkspace
  * @param {(userId:string) => boolean} deps.rateLimited      the shared LLM throttle, for the local exchange
- * @param {{ rateLimited: (key:string, limit:number, windowMs:number) => boolean }} deps.connectorRate
- * @param {object} deps.diaryConnectors   diary-connectors.cjs credentials (verify, list, create, revoke)
- * @param {object} deps.diary             diary.cjs: diaryHeaders, corpusSource, connectorFiles
- * @param {boolean} [deps.addressesTrusted]  TRUST_PROXY: only then is a client address a real, per-client key
+ * @param {object} deps.diary             diary.cjs: diaryHeaders, corpusSource, diaryFetchJson, withStorageCredential
+ * @param {object} [deps.storageLatch]    storage-latch.cjs: an explicit Retry that works clears the hold (#1589)
  */
-function createDiaryRoutes({ json, readBody, readJson, fetchJson, DIARY_BASE, authService, currentWorkspace, rateLimited, connectorRate, diaryConnectors, diary, clientAddress = (req) => req.socket?.remoteAddress, addressesTrusted = false, storageLatch = null }) {
-  const { diaryHeaders, corpusSource, connectorFiles } = diary;
+function createDiaryRoutes({ json, readBody, readJson, fetchJson, DIARY_BASE, authService, currentWorkspace, rateLimited, diary, storageLatch = null }) {
+  const { diaryHeaders, corpusSource } = diary;
   const log = diary.log || ((line) => console.info(line));
-  // The connector bodies are JSON objects; `null`, an array or a number is a 400 (#786).
-  const readObject = requireJsonObject(readJson);
   // Older fakes pass only diaryHeaders; fall back to a single send without the 428 retry.
   const diaryFetchJson = diary.diaryFetchJson || ((url, { method = 'GET', body, storageRetry = false } = {}, timeoutMs) => fetchJson(url, { method, headers: diaryHeaders(method, url, { body, storageRetry }), body }, timeoutMs));
 
-  async function connector(req, res, { path: p }) {
-    if(p==='/api/diary-connector') {
-      res.setHeader('Cache-Control','no-store');
-      if(req.method!=='POST')return json(res,405,{error:'POST required'});
-      if(req.headers.origin)return json(res,403,{error:'Use the authenticated connector client'});
-      // Behind the tunnel with TRUST_PROXY off every client shares one address, so the address alone
-      // is no bucket key (#796, like device-auth #555 F1): a verified credential is charged to
-      // itself, and unknown or malformed ones to a separate bucket (per address only when the
-      // address is real) that can never lock out a working connector.
-      const token=String(req.headers.authorization||'').replace(/^Bearer /,'');
-      const identity=diaryConnectors.verify(token);
-      if(!identity){
-        if(connectorRate.rateLimited(addressesTrusted?'diary-connector:invalid:'+String(clientAddress(req)||'unknown'):'diary-connector:invalid',300,60000))return json(res,429,{error:'Try later'});
-        return json(res,401,{error:'Diary connector credential required'});
-      }
-      if(connectorRate.rateLimited('diary-connector:credential:'+identity.id,120,60000))return json(res,429,{error:'Try later'});
-      const body=await readObject(req,4*1024*1024);
-      const result=await require('../diary-connectors.cjs').operate(identity,body,connectorFiles,()=>!!diaryConnectors.verify(token));
-      if(body.action==='write')authService.audit('diary-connector.write',identity.userId,identity.userId,{credentialId:identity.id,path:body.path,bytes:Buffer.byteLength(body.content)});
-      return json(res,200,result);
-    }
-    return PASS;
-  }
-
-  async function connectors(req, res, { path: p, authn }) {
-    if(p==='/api/profile/diary-connectors' && req.method==='GET')return json(res,200,{connectors:diaryConnectors.list(authn.user.id)});
-    if(p==='/api/profile/diary-connectors' && req.method==='POST')return json(res,201,diaryConnectors.create(authn.user.id,(await readObject(req)).name));
-    const revokeConnector=p.match(/^\/api\/profile\/diary-connectors\/([a-f0-9]{32})$/);
-    if(revokeConnector && req.method==='DELETE')return json(res,200,{revoked:diaryConnectors.revoke(authn.user.id,revokeConnector[1])});
-    return PASS;
-  }
-
   async function handle(req, res, { path: p, authn, url }) {
-    if(p==='/api/diary/exchanges' && req.method==='GET') {
-      if(!authService.diaryEnabled(authn.user.id))return json(res,404,{error:'Diary add-on is disabled'});
-      try{return json(res,200,{exchanges:require('../diary-jobs.cjs').list(currentWorkspace(),url.searchParams.get('day'))});}
-      catch(e){return json(res,e.status||500,{error:e.status?e.message:'Could not read recovery records'});}
-    }
-    // #1422: mark an uncertain or failed exchange as reviewed so it stops raising the banner. Only the
-    // exchange's own record changes; the diary is never touched. (Same path as the list, so the
-    // route inventory shared with the Rust front does not change.)
-    if(p==='/api/diary/exchanges' && req.method==='POST') {
-      if(!authService.diaryEnabled(authn.user.id))return json(res,404,{error:'Diary add-on is disabled'});
-      const body=await readObject(req,4096);
-      if(body.action!=='dismiss')return json(res,400,{error:'Unknown action'});
-      try{
-        const row=require('../diary-jobs.cjs').acknowledge(currentWorkspace(),body.day,body.id);
-        return json(res,200,{exchange:{id:row.id,day:row.day,state:row.state,acknowledgedAt:row.acknowledgedAt}});
-      }catch(e){return json(res,e.status||500,{error:e.status?e.message:'Could not update the recovery record'});}
-    }
-
     if (p === '/api/diary/workspace-trash') {
       if (!authService.diaryEnabled(authn.user.id)) return json(res, 404, { error: 'Diary add-on is disabled' });
       if (!['GET', 'POST'].includes(req.method)) return json(res, 405, { error: 'Method not allowed' });
@@ -98,22 +40,6 @@ function createDiaryRoutes({ json, readBody, readJson, fetchJson, DIARY_BASE, au
       const r = await diaryFetchJson(`${DIARY_BASE}/api/workspace-trash${query}`, { method: req.method, body }, 60000);
       res.setHeader('Cache-Control', 'no-store');
       return json(res, r.status, r.ok ? r.body : { error: r.body?.detail || 'Diary recovery request failed. Retry or refresh Trash.' });
-    }
-
-    // storage-import is the Rust front's (rust-diary.cjs). The status stays here: it reads the
-    // storage-login latch (#1589), which lives in this process.
-    if (p === '/api/diary/storage-status') {
-      if (!authService.diaryEnabled(authn.user.id)) return json(res, 404, { error: 'Diary add-on is disabled' });
-      if (req.method !== 'GET') return json(res, 405, { error: 'Method not allowed' });
-      const r = await diaryFetchJson(`${DIARY_BASE}/api/storage-status`, { method: req.method }, 60000);
-      // #1589: while a refused or throttled login holds this account's automatic storage calls (the backup
-      // among them), the status says so and when the next attempt is due, instead of looking healthy.
-      if (r.ok && r.body && typeof r.body === 'object' && !Array.isArray(r.body) && storageLatch) {
-        let held = null;
-        try { held = storageLatch.statusFor(authn.user.id, (id) => authService.getStorage(id, true)); } catch { held = null; }
-        if (held) return json(res, r.status, { ...r.body, automaticStorage: { held: true, kind: held.kind, nextAttemptAt: held.nextAttemptAt } });
-      }
-      return json(res, r.status, r.ok ? r.body : { error: r.body?.detail || 'Diary storage request failed' });
     }
 
     if (['/api/diary/files', '/api/diary/file', '/api/diary/local-exchange'].includes(p)) {
@@ -249,7 +175,7 @@ function createDiaryRoutes({ json, readBody, readJson, fetchJson, DIARY_BASE, au
   }
 
   const mount = (fn) => async (req, res, ctx) => (await fn(req, res, ctx)) !== PASS;
-  return { connector: mount(connector), connectors: mount(connectors), diary: mount(handle) };
+  return { diary: mount(handle) };
 }
 
 module.exports = { createDiaryRoutes };

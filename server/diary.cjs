@@ -4,12 +4,11 @@
 // the user id, the legacy-owner marker and the user's own storage descriptor
 // on the request, or a blocked descriptor when that storage fails the
 // member-origin policy, plus (DIARY_TENANT_KEY set) a signed tenant assertion. The corpus-source adapter is the Diary tab's read
-// side; callDiaryFile runs one file operation as a given user for the
-// connector bridge (diary-connectors.cjs) and the DAV listener.
+// side. (The connector bridge, which ran one file operation as a given
+// user for a verified credential, is the Rust front's since #2206.)
 //
 // Nothing here writes on its own: writes go through the sidecar's own
-// journaled endpoints, and the connector bridge only forwards what a
-// verified credential asked for.
+// journaled endpoints.
 
 /**
  * @param {object} deps
@@ -23,9 +22,8 @@
  * @param {object} deps.requestScope        AsyncLocalStorage carrying { workspace, authn }
  * @param {object} deps.authService
  * @param {(authn, url:string) => boolean} deps.endpointApproved
- * @param {{ get: (userId:string) => object }} deps.workspaceStore
  */
-function createDiary({ fs, path, fetchJson, DIARY_BASE, DIARY_TOKEN, DIARY_TENANT_KEY = '', DIARY_SOURCE, requestScope, authService, endpointApproved, workspaceStore }) {
+function createDiary({ fs, path, fetchJson, DIARY_BASE, DIARY_TOKEN, DIARY_TENANT_KEY = '', DIARY_SOURCE, requestScope, authService, endpointApproved }) {
   const { ASSERTION_HEADER, signTenantAssertion, storageSecretRef } = require('./diary-tenant-assertion.cjs');
 
   // Storage header policy (#292). Blocked and local descriptors never carry a
@@ -127,22 +125,6 @@ function createDiary({ fs, path, fetchJson, DIARY_BASE, DIARY_TOKEN, DIARY_TENAN
     },
   };
 
-  async function callDiaryFile(userId, endpoint, method, body) {
-    const workspace = workspaceStore.get(userId);
-    const user = authService.publicUser(authService.db.prepare('SELECT * FROM users WHERE id=? AND disabled_at IS NULL').get(userId));
-    if(!user || !authService.diaryEnabled(userId))throw Object.assign(Error('Diary unavailable'),{status:403});
-    return requestScope.run({workspace,authn:{user,legacy:false}},async()=>{
-      const r=await diaryFetchJson(`${DIARY_BASE}/api${endpoint}`,{method,body:body===undefined?undefined:JSON.stringify(body)},60000);
-      if(!r.ok)throw Object.assign(Error(r.body?.detail || 'Diary request interrupted; read the current version before retrying a write'),{status:r.status||502});
-      return r.body;
-    });
-  }
-  const connectorFiles={
-    list:async(id,path)=>(await callDiaryFile(id,'/files?path='+encodeURIComponent(path),'GET')).files,
-    read:(id,path)=>callDiaryFile(id,'/file','POST',{path}),
-    write:(id,body)=>callDiaryFile(id,'/file','PUT',body),
-  };
-
   /**
    * Bearer only, no tenant and no storage: for the sidecar's service-wide internal endpoints
    * (#1636 /api/internal/embedding), which act on every tenant's index and never on one tenant's data.
@@ -153,7 +135,7 @@ function createDiary({ fs, path, fetchJson, DIARY_BASE, DIARY_TOKEN, DIARY_TENAN
     return h;
   }
 
-  return { diaryHeaders, tenantHeaders, serviceHeaders, withStorageCredential, diaryFetchJson, corpusSource, callDiaryFile, connectorFiles };
+  return { diaryHeaders, tenantHeaders, serviceHeaders, withStorageCredential, diaryFetchJson, corpusSource };
 }
 
 module.exports = { createDiary };

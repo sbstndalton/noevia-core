@@ -22,9 +22,9 @@ test('failed or interrupted optional context rejects before capture; reference i
   const framed=server.reference({extrasEnabled:true,extraContext:'x'.repeat(20000)});assert.equal(framed.length,12000);assert.match(framed,/^<untrusted kind="Diary attachment excerpts">[\s\S]*<\/untrusted>$/);
 });
 test('internal contexts have no optional tools by default and free chats remain distinct', () => {
-  assert.deepEqual(server.newProject().toolboxes, []);
+  assert.equal('newProject' in server, false, 'the Rust front makes the project (#2206)');
   assert.notEqual(server.chatProjectId('c-one'),server.chatProjectId('c-two'));
   assert.equal(server.chatProjectId('../other'),null);
-  assert.equal(server.internalProject(server.newProject()),true);
+  assert.equal(server.internalProject({id:server.PROJECT_ID}),true);
   assert.equal(server.internalProject({id:'normal-project'}),false);
 });
