@@ -7,6 +7,8 @@ const os = require('node:os');
 const path = require('node:path');
 const { Readable, Writable } = require('node:stream');
 const test = require('node:test');
+// #2191 round 2: POST /api/projects is the Rust front's; fixtures are written as its create leaves them.
+const { createProjectAs } = require('../tests/server/front-projects.cjs');
 
 const { listFiles, readTextFile, createFolder, isBrowsable, safeRelativePath } = require('./storage-client.cjs');
 
@@ -417,6 +419,7 @@ let csrf = '';
 let accountId = '';
 let sharedDav = null;
 
+let frontUserId = '';
 test.before(async () => {
   sharedDav = await startFakeDav();
   // No model/inference endpoint: the owned DAV fixture refuses embedding POSTs with 405.
@@ -424,6 +427,7 @@ test.before(async () => {
   ({ handleRequest } = require('./index.cjs'));
   // Sign-in is the Rust front's (#1071): the account and its session are seeded directly.
   ({ cookie, csrf, id: accountId } = require('../tests/server/seed-account.cjs').seedAccount(testDataDir, { username: 'admin', displayName: 'Admin', publicOrigin: 'http://localhost' }));
+  frontUserId = accountId;
   // Connect the fake WebDAV as the user's storage. Saving it is the Rust front's (#2190 round 4):
   // Node refuses the PUT, and the row is written as the front writes it.
   const refused = await request('/api/integrations/storage', {
@@ -464,16 +468,20 @@ test('browse route requires authentication', async () => {
 
 
 async function createTestProject(name, extra = {}) {
-  const result = await request('/api/projects', { method: 'POST', headers: mutationHeaders(), body: JSON.stringify({ name, ...extra }) });
-  assert.equal(result.status, 200, result.text);
-  return JSON.parse(result.text);
+  // POST /api/projects is the Rust front's (#2191 round 2): written as its create leaves it, the folder
+  // reserved as it reserves one with storage connected (#589).
+  const made = createProjectAs(testDataDir, frontUserId, { name, ...extra, reserveIn: 'noevia projects' });
+  // Seen at the next request start once no save of this process is in flight (rust-projects.cjs refresh).
+  for (let i = 0; i < 200 && !(await workspaceProject(made.id)); i++) await new Promise((r) => setTimeout(r, 10));
+  return made;
 }
 
 // #1806: GET /api/workspace lists sources without their text; this reads one source's text.
+// #2191: that route is the Rust front's; the stored text is read as the front reads it.
 async function sourceText(projectId, name) {
-  const r = await request(`/api/projects/${encodeURIComponent(projectId)}/sources/text?name=${encodeURIComponent(name)}`, { headers: { cookie } });
-  assert.equal(r.status, 200, r.text);
-  return JSON.parse(r.text).content;
+  const r = require('../tests/server/stored-sources.cjs').sourceText(testDataDir, projectId, name);
+  assert.equal(r.status, 200, JSON.stringify(r.json));
+  return r.json.content;
 }
 
 async function workspaceProject(id) {

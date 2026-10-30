@@ -6,6 +6,8 @@ const os = require('node:os');
 const path = require('node:path');
 const { Readable, Writable } = require('node:stream');
 const test = require('node:test');
+// #2191 round 2: POST /api/projects is the Rust front's; fixtures are written as its create leaves them.
+const { createProjectAs } = require('../tests/server/front-projects.cjs');
 
 const testDataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'noevia-chat-lists-route-test-'));
 process.env.DIARY_AUTH_TOKEN = 'test-cowork-token';
@@ -110,7 +112,7 @@ test('Node refuses the list saves and the deletes the front owns; it follows the
 });
 
 test('a chat the front deleted from a project is gone from Node\'s view and from the project on disk', async () => {
-  const project = JSON.parse((await post('/api/projects', { name: 'Synthetic lists' })).text);
+  const project = createProjectAs(testDataDir, userId, { name: 'Synthetic lists' });
   const file = JSON.parse(fs.readFileSync(userFile('projects.json'), 'utf8'));
   file.projects.find((p) => p.id === project.id).chats = [meta('p-one'), meta('p-two')];
   frontWrite(userFile('projects.json'), file);
@@ -135,7 +137,7 @@ test('a late history save for a deleted chat does not write the transcript back'
 const frame = (extra = {}) => ({ projectId: null, kind: 'idea', tags: ['plans'], links: [], confirmed: true, source: 'user', ...extra });
 
 test('accepting a frame moves the chat into the project with its frame; the transcript stays readable (#738)', async () => {
-  const project = JSON.parse((await post('/api/projects', { name: 'Synthetic destination' })).text);
+  const project = createProjectAs(testDataDir, userId, { name: 'Synthetic destination' });
   await frontSaveFree([meta('c-moving', 'Moving chat')]);
   assert.equal(saveHistory('c-moving', { history: [{ role: 'user', content: 'synthetic first message' }] }).status, 200);
   const moved = await frontMove('/api/chats/c-moving/move', { projectId: project.id, frame: frame({ projectId: project.id }) });
@@ -168,7 +170,7 @@ test('the move refuses unknown, deleted and malformed targets without changing a
 });
 
 test('a moved chat is held by its new list exactly once, both ways (#755)', async () => {
-  const project = JSON.parse((await post('/api/projects', { name: 'Synthetic stale target' })).text);
+  const project = createProjectAs(testDataDir, userId, { name: 'Synthetic stale target' });
   await frontSaveFree([meta('c-stale-f1')]);
   assert.equal((await frontMove('/api/chats/c-stale-f1/move', { projectId: project.id })).status, 200);
   assert.ok(!(await freeChats()).includes('c-stale-f1'), 'the free list does not keep the moved chat');
@@ -180,7 +182,7 @@ test('a moved chat is held by its new list exactly once, both ways (#755)', asyn
 
 test('a move with an invalid frame is refused and keeps the stored frame (#759)', async () => {
   await frontSaveFree([{ ...meta('c-bad-frame'), frame: frame() }]);
-  const project = JSON.parse((await post('/api/projects', { name: 'Synthetic bad frame' })).text);
+  const project = createProjectAs(testDataDir, userId, { name: 'Synthetic bad frame' });
   const res = await frontMove('/api/chats/c-bad-frame/move', { projectId: project.id, frame: { kind: 'bogus' } });
   assert.equal(res.status, 400);
   assert.deepEqual((await freeMeta('c-bad-frame')).frame, frame(), 'still free, frame intact');
@@ -204,8 +206,8 @@ test('Node refuses native framing preference reads and writes without changing l
 });
 
 test('the move never puts a chat into an archived project; a once Code-only project takes it (#810, #1576)', async () => {
-  const code = JSON.parse((await post('/api/projects', { name: 'Synthetic code only', modes: ['code'] })).text);
-  const archived = JSON.parse((await post('/api/projects', { name: 'Synthetic archived' })).text);
+  const code = createProjectAs(testDataDir, userId, { name: 'Synthetic code only', modes: ['code'] });
+  const archived = createProjectAs(testDataDir, userId, { name: 'Synthetic archived' });
   assert.equal((await post(`/api/projects/${archived.id}/config`, { archived: true })).status, 200);
   await frontSaveFree([meta('c-810')]);
   const refused = await frontMove('/api/chats/c-810/move', { projectId: archived.id, frame: frame({ projectId: archived.id }) });

@@ -870,7 +870,9 @@ function createProjectStore({
       try { const saved = live.saveProjects(); if (saved && typeof saved.catch === 'function') saved.catch(() => { /* logged by the workspace; the next pass retries */ }); }
       catch (err) { console.warn('[documents] could not save index state:', err.message); }
     };
-    rag.indexProjectFile(project.id, file.name, file.content, workspace.userId).then(result => {
+    // #2191 round 2: the run's promise, so the index outbox (rust-index-outbox.cjs) acknowledges a job
+    // only once its run settled. Every other caller ignores it, as before.
+    return rag.indexProjectFile(project.id, file.name, file.content, workspace.userId).then(result => {
       if (workspace.revoked) return;
       mark(!result?.ok ? 'unavailable' : result.direct ? 'direct' : result.embedded < result.stored ? 'partial' : 'ready');
     }).catch((error) => {

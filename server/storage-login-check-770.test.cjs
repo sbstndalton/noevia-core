@@ -11,6 +11,8 @@ const ts = require('typescript');
 const storageClient = require('./storage-client.cjs');
 
 const SECRET = 'synthetic-app-password-7f3a';
+// undici's shape for a refused redirect: TypeError('fetch failed') with cause 'unexpected redirect'.
+const redirectError = () => Object.assign(new TypeError('fetch failed'), { cause: new Error('unexpected redirect') });
 
 // The save's login check (a 401 keeps the old row, a 403 or an unreachable server saves with a
 // warning, the redirect and timeout words, the secret never in a reply) moved with

@@ -6,6 +6,8 @@ const os = require('node:os');
 const path = require('node:path');
 const { Readable, Writable } = require('node:stream');
 const test = require('node:test');
+// #2191 round 2: POST /api/projects is the Rust front's; fixtures are written as its create leaves them.
+const { createProjectAs } = require('../tests/server/front-projects.cjs');
 
 const testDataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'noevia-project-modes-route-test-'));
 process.env.DIARY_AUTH_TOKEN = 'test-cowork-token';
@@ -56,9 +58,10 @@ async function request(url, { method = 'GET', headers = {}, body = '' } = {}) {
 
 let cookie = '';
 let csrf = '';
+let frontUserId = '';
 test.before(async () => {
   // Sign-in is the Rust front's (#1071): the account and its session are seeded directly.
-  ({ cookie, csrf } = require('../tests/server/seed-account.cjs').seedAccount(testDataDir, { username: 'admin', displayName: 'Admin', publicOrigin: 'http://localhost' }));
+  ({ cookie, csrf, id: frontUserId } = require('../tests/server/seed-account.cjs').seedAccount(testDataDir, { username: 'admin', displayName: 'Admin', publicOrigin: 'http://localhost' }));
 });
 
 const mutationHeaders = () => ({ origin: 'http://localhost', cookie, 'content-type': 'application/json', 'x-csrf-token': csrf });
@@ -69,14 +72,11 @@ test.before(() => { global.fetch = async () => { throw new Error('Unexpected net
 test.after(() => { global.fetch = realFetch; });
 
 test('projects are Chat projects; an old client sending modes is accepted, normalised, and garbage is refused (#1576)', async () => {
-  const plain = JSON.parse((await post('/api/projects', { name: 'Synthetic default' })).text);
+  const plain = createProjectAs(testDataDir, frontUserId, { name: 'Synthetic default' });
   assert.deepEqual(plain.modes, ['chat']);
-  const code = JSON.parse((await post('/api/projects', { name: 'Synthetic C++', modes: ['code'] })).text);
+  const code = createProjectAs(testDataDir, frontUserId, { name: 'Synthetic C++', modes: ['code'] });
   assert.deepEqual(code.modes, ['chat', 'code']);
-  const empty = await post('/api/projects', { name: 'Synthetic empty', modes: [] });
-  assert.equal(empty.status, 200);
-  assert.deepEqual(JSON.parse(empty.text).modes, ['chat']);
-  assert.equal((await post('/api/projects', { name: 'Bad', modes: ['voice'] })).status, 400);
+  // The create's own normalisation and its 400s are the Rust front's (noevia-rs lifecycle.rs tests).
   const patched = await post(`/api/projects/${plain.id}/config`, { modes: ['code', 'cowork'] });
   assert.equal(patched.status, 200);
   const workspace = JSON.parse((await request('/api/workspace', { headers: mutationHeaders() })).text);
@@ -85,7 +85,7 @@ test('projects are Chat projects; an old client sending modes is accepted, norma
 });
 
 test('a project once saved without Chat no longer refuses chat turns (#1576)', async () => {
-  const code = JSON.parse((await post('/api/projects', { name: 'Synthetic code only', modes: ['code'] })).text);
+  const code = createProjectAs(testDataDir, frontUserId, { name: 'Synthetic code only', modes: ['code'] });
   const reply = await post('/api/chat', { spaceId: 'project', projectId: code.id, message: 'hello', history: [] });
   assert.notEqual(reply.status, 409, reply.text);
   assert.doesNotMatch(reply.text, /not enabled for Chat/);
