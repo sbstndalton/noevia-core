@@ -601,7 +601,8 @@ const {
 } = projectStore;
 // #2191 round 2: the Rust front creates and deletes projects (rust-project-lifecycle.cjs). It reads the
 // toolbox catalogue published here (MCP discovery is this process's), and leaves the RAG index of
-// create-time files and the storage folder sweep in the user's index outbox, which this executor drains;
+// create-time files in the user's index outbox, which this executor drains (round 3: the storage folder
+// sweep and #687's create-time storage step are the front's own, rust-project-storage.cjs);
 // a delete's tombstone stops an index run of that project still in flight (rag.cjs lifecycle guard).
 const projectCatalogue = require('./project-catalogue.cjs').createCataloguePublisher({
   dataDir: DATA_DIR,
@@ -612,13 +613,15 @@ const projectCatalogue = require('./project-catalogue.cjs').createCataloguePubli
   }),
 });
 const indexOutbox = require('./rust-index-outbox.cjs').createIndexOutbox({
+  // #2191 round 3: only this process's job kinds; the front runs its own (the storage sweep).
+  kinds: require('./rust-project-storage.cjs').CORE_KINDS,
   userDir: (userId) => workspaceStore.userDir(userId),
   userIds: () => authService.db.prepare('SELECT id FROM users').all().map((r) => r.id).filter((id) => !workspaceStore.isRemoved(id)),
   runAs: (userId, fn) => {
     const user = authService.publicUser(authService.db.prepare('SELECT * FROM users WHERE id=?').get(userId));
     return requestScope.run({ workspace: workspaceStore.get(userId), authn: { user, legacy: false } }, fn);
   },
-  runJob: async (job, userId) => {
+  runJob: async (job) => {
     const workspace = currentWorkspace();
     if (job.kind === 'index') {
       // The project as the front saved it (re-read when projects.json changed), the file's text as it is now.
@@ -627,13 +630,6 @@ const indexOutbox = require('./rust-index-outbox.cjs').createIndexOutbox({
       const file = (project?.files || []).find((f) => f && f.name === job.file);
       if (!project || !file) return; // removed or replaced since: nothing left to index
       await indexSource(project, file);
-      return;
-    }
-    if (job.kind === 'sweep') {
-      let connection = null;
-      try { connection = authService.getStorage(userId, true); } catch { connection = null; }
-      await projectSweep.afterDelete({ projectId: job.project, tenantRoot: workspace.dir, localDirs: [], connection,
-        folder: String(job.payload?.folder || ''), root: PROJECT_ROOT_FOLDER, groups: require('./uploads.cjs').GROUPS });
       return;
     }
     throw new Error(`unknown outbox job kind ${job.kind}`);

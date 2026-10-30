@@ -103,7 +103,7 @@ test('a job that keeps failing is retried, then kept as failed for review', asyn
   assert.deepEqual(w.f1.rows().map((r) => [r.state, r.attempts]), [['failed', MAX_ATTEMPTS]]);
 });
 
-test('a delete tombstones the project: queued index work is dropped, an earlier run sees it, a later one does not, the sweep runs', async (t) => {
+test('a delete tombstones the project: queued index work is dropped, an earlier run sees it, a later one does not; the sweep is the front\'s', async (t) => {
   const ran = [];
   const w = world(t, async (job) => { ran.push([job.kind, job.project, job.payload]); });
   const outbox = w.make();
@@ -117,7 +117,34 @@ test('a delete tombstones the project: queued index work is dropped, an earlier 
   assert.equal(outbox.deletedSince('p2', 'u1', seen), false);
   assert.equal(outbox.deletedSince('p1', 'u2', 0), false, 'another account is unaffected');
   await outbox.tick();
-  assert.deepEqual(ran, [['sweep', 'p1', { folder: 'noevia projects/p1' }]]);
+  // #2191 round 3 (rust-project-storage.cjs): the sweep job is run by the front, never here.
+  assert.deepEqual(ran, []);
+  assert.deepEqual(w.f1.rows().map((r) => [r.kind, r.state, r.attempts]), [['sweep', 'pending', 0]]);
+});
+
+test('the front\'s job kinds are never claimed, recovered or counted here (round 3)', async (t) => {
+  const ran = [];
+  const w = world(t, async (job) => { ran.push([job.kind, job.project]); });
+  w.f1.index('p1', ['a.md']);
+  w.f1.tombstone('p2', 'noevia projects/p2');
+  // Both rows claimed by a process that died: only this side's kind is taken back here.
+  { const db = new DatabaseSync(w.f1.file); db.prepare("UPDATE jobs SET state = 'running', attempts = 1").run(); db.close(); }
+  const outbox = w.make();
+  await outbox.drain('u1');
+  assert.deepEqual(ran, [['index', 'p1']]);
+  assert.deepEqual(w.f1.rows().map((r) => [r.kind, r.state]), [['sweep', 'running']]);
+  // A pending sweep alone is no work here: a tick drains nothing for it.
+  { const db = new DatabaseSync(w.f1.file); db.prepare("UPDATE jobs SET state = 'pending'").run(); db.close(); }
+  assert.deepEqual(await w.make().tick(), {});
+  assert.deepEqual(ran, [['index', 'p1']]);
+});
+
+test('rust-project-storage.cjs splits the kinds and owns no route', () => {
+  const { OWNED_ROUTES, CORE_KINDS, FRONT_KINDS } = require('./rust-project-storage.cjs');
+  assert.equal(OWNED_ROUTES.size, 0);
+  assert.deepEqual([...CORE_KINDS], ['index']);
+  assert.deepEqual([...FRONT_KINDS], ['sweep']);
+  assert.ok(CORE_KINDS.every((k) => /^[a-z]+$/.test(k) && !FRONT_KINDS.includes(k)));
 });
 
 test('rag.cjs stops an index run its project was deleted under (lifecycle guard)', () => {
