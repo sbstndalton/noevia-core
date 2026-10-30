@@ -1131,6 +1131,23 @@ const modelRoutes = require('./routes/models.cjs').createModelRoutes({
     remoteRoles: () => chatMachines.remoteRoles(), machineModels: () => chatMachines.machineModels(), demand,
   });
   autoRolesSnapshot.watch(modelService);
+  // And what only this process's live MCP client knows, for the front's permitted-tools view, connectors page and admin
+  // directory listing (sbstndalton/noevia#2202 round 2; mcp-discovery-snapshot.cjs), on the same demand marker.
+  const mcpDiscoveryPublisher = require('./mcp-discovery-snapshot.cjs').createMcpDiscoveryPublisher({
+    dataDir: DATA_DIR, demand,
+    discoverMcpTools: () => discoverMcpTools(),
+    catalogue: () => require('./mcp-discovery-snapshot.cjs').buildCatalogue({
+      allToolboxes: () => allToolboxes(),
+      manifest: MCP_TOOLBOX_MANIFEST.filter((b) => toolboxOffered(b.id)),
+      mcpEnabled: () => mcpWiring.enabled(), servers: MCP_SERVERS, state: mcpState,
+      isWriteTool: (name) => isWriteTool(name),
+      harnessEnabled: () => features.enabled('codeHarness'),
+      hasRepositories: () => codeService.repositories().length > 0,
+      nextcloudOrigins: require('./mcp-wiring.cjs').parseNextcloudOrigins(process.env.MCP_NEXTCLOUD_ORIGINS),
+      defaultToolboxes: DEFAULT_TOOLBOXES, connectorBoxes: CONNECTOR_BOXES,
+    }),
+  });
+  afterNativeReady(() => mcpDiscoveryPublisher.start());
   afterNativeReady(() => { ragStatus.start(); autoRolesSnapshot.start(); demand.start(); });
 }
 // ── Routing ────────────────────────────────────────────────────────────────
@@ -1221,22 +1238,6 @@ const toolboxRoutes = require('./routes/toolboxes.cjs').createToolboxRoutes({
   discoverMcpTools: () => discoverMcpTools(), toolboxSummaries, connectedBoxes, json,
   prefill: { targetMs: TOOL_PREFILL_TARGET_MS, stats: () => prefill.stats() },
   mcp: () => ({ enabled: mcpWiring.enabled(), state: mcpState, servers: MCP_SERVERS, manifest: MCP_TOOLBOX_MANIFEST }),
-});
-// What only this process's live MCP client knows, for the Rust front's permitted-tools view, connectors page
-// and admin directory listing (sbstndalton/noevia#2202 round 2): published while the front asks.
-const mcpDiscoveryPublisher = require('./mcp-discovery-snapshot.cjs').createMcpDiscoveryPublisher({
-  dataDir: DATA_DIR,
-  discoverMcpTools: () => discoverMcpTools(),
-  catalogue: () => require('./mcp-discovery-snapshot.cjs').buildCatalogue({
-    allToolboxes: () => allToolboxes(),
-    manifest: MCP_TOOLBOX_MANIFEST.filter((b) => toolboxOffered(b.id)),
-    mcpEnabled: () => mcpWiring.enabled(), servers: MCP_SERVERS, state: mcpState,
-    isWriteTool: (name) => isWriteTool(name),
-    harnessEnabled: () => features.enabled('codeHarness'),
-    hasRepositories: () => codeService.repositories().length > 0,
-    nextcloudOrigins: require('./mcp-wiring.cjs').parseNextcloudOrigins(process.env.MCP_NEXTCLOUD_ORIGINS),
-    defaultToolboxes: DEFAULT_TOOLBOXES, connectorBoxes: CONNECTOR_BOXES,
-  }),
 });
 
 // The headers every page and API reply carries, the refusals answered before authentication too.
@@ -1582,8 +1583,6 @@ if (require.main === module) {
     // Never blocks startup: a side-car that is still booting must not stop
     // noevia from serving.
     discoverMcpTools().catch(() => undefined);
-    // ... and the front's views of it (permitted tools, connectors, the admin directory) are published while it asks.
-    mcpDiscoveryPublisher.start();
     // A calibration interrupted by a restart restores the preset it was testing.
     modelManager.calibration?.recover().catch(() => undefined);
     modelManager.autotune?.recover().catch(() => undefined);

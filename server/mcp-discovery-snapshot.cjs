@@ -84,9 +84,12 @@ function buildCatalogue({ allToolboxes, manifest, mcpEnabled, servers, state, is
  * @param {string} o.dataDir
  * @param {() => Promise<unknown>} o.discoverMcpTools  unforced; re-reads the directory itself
  * @param {() => object} o.catalogue                   buildCatalogue over the live objects
+ * @param {object} [o.demand]                           the process's shared demand source (published-snapshot.cjs createDemand)
  */
-function createMcpDiscoveryPublisher({ dataDir, discoverMcpTools, catalogue, onError = (err) => console.warn(`[mcp-discovery] not published: ${err && err.message}`), everyMs = EVERY_MS, waitMs = DISCOVERY_WAIT_MS, now = Date.now }) {
-  const demand = published.createDemand({ dir: dataDir, now });
+function createMcpDiscoveryPublisher({ dataDir, discoverMcpTools, catalogue, demand: shared = null, onError = (err) => console.warn(`[mcp-discovery] not published: ${err && err.message}`), everyMs = EVERY_MS, waitMs = DISCOVERY_WAIT_MS, now = Date.now }) {
+  // The process shares one demand source between its publishers (index.cjs) and starts it itself; a publisher made
+  // alone (tests) makes and starts its own.
+  const demand = shared || published.createDemand({ dir: dataDir, now });
   const publisher = published.createPublisher({
     file: path.join(dataDir, SNAPSHOT_FILE), kind: SNAPSHOT_KIND, everyMs, demand, onError, now,
     async build() {
@@ -101,8 +104,8 @@ function createMcpDiscoveryPublisher({ dataDir, discoverMcpTools, catalogue, onE
     },
   });
   return Object.freeze({
-    start() { demand.start(); publisher.start(); },
-    stop() { publisher.stop(); demand.stop(); },
+    start() { if (!shared) demand.start(); publisher.start(); },
+    stop() { publisher.stop(); if (!shared) demand.stop(); },
     publish: () => publisher.publish(),
     demand,
   });
