@@ -6,7 +6,9 @@
 // of users/<id>/providers.json and shared-providers.json, including the ChatGPT row its token
 // broker writes when a sign-in is saved; this process re-reads the private rows by the file's change
 // signal on every use (workspace.cjs, shared-reread.cjs), keeps no copy, and saves only its
-// seal-on-load migration of a plaintext key, through the project store (project-store-client.cjs).
+// seal-on-load migration of a plaintext key, through the project store (project-store-client.cjs). A secrets
+// rotation does not rewrite the files either: it asks the front to re-seal them first
+// (rust-providers-reseal.cjs, capability rust-providers-reseal).
 // Node answered exactly these methods on these paths, so only they are refused here, before
 // authentication: a stale route table cannot make two processes write the same file. Everything else
 // on the paths (a PUT on /api/providers/chatgpt, its 404 or 405) stays Node's.

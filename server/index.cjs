@@ -1173,7 +1173,8 @@ const authRoutes = require('./routes/auth.cjs').createAuthRoutes({
   json, readJson, authService, workspaceStore, driveAccounts, fetchJson, DIARY_BASE, DIARY_TOKEN, diaryTenantHeaders: diary.tenantHeaders,
   mcpOAuth, directoryMcp, chatgptOAuth,
   // POST /api/admin/secrets/rotate (CSRF-checked by the router like every signed-in POST).
-  rotateSecrets: (actorId) => require('./secrets-rotate.cjs').runRotation({ secrets: secretStore, db: authService.db, dataDir: DATA_DIR, audit: authService.audit, actorId }),
+  // The provider files are the front's: it re-seals them first (rust-providers-reseal.cjs), awaited.
+  rotateSecrets: (actorId) => require('./secrets-rotate.cjs').runRotation({ secrets: secretStore, db: authService.db, dataDir: DATA_DIR, audit: authService.audit, actorId, resealProviders: () => require('./rust-providers-reseal.cjs').resealProviderKeys(PROJECT_STORE) }),
 });
 // The user's own storage connection is the Rust front's in full (reading, browsing, the folder write,
 // the test, the Nextcloud sign-in and the save, #1071/sbstndalton/noevia#2190): routes/storage.cjs

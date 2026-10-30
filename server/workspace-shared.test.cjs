@@ -217,3 +217,87 @@ test('the seal merges again when the front wrote meanwhile, and a failing store 
     assert.doesNotMatch(warned[0], /synthetic-plain-key/);
   } finally { console.warn = warn; }
 });
+
+test('L5: the load and the seal agree on what is plaintext, so a key the seal leaves alone never sends a request to the store', async (t) => {
+  const f = fixture(t);
+  f.write(f.files.private(USER_B_ID), [
+    { id: 'bound', label: 'Bound', baseUrl: 'https://p.test/v1', apiKey: 'enc:v2:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA', shared: false },
+    { id: 'number', label: 'Number', baseUrl: 'https://n.test/v1', apiKey: 12345, shared: false },
+    { id: 'none', label: 'None', baseUrl: 'https://z.test/v1', apiKey: '', shared: false },
+  ]);
+  let reads = 0;
+  const counting = { ...f.projectStore, read: async (...a) => { reads += 1; return f.projectStore.read(...a); } };
+  const store = createWorkspaceStore(f.root, DEFAULT, f.secrets, { projectStore: counting });
+  const warn = console.warn; console.warn = () => {};
+  try {
+    for (let i = 0; i < 4; i++) {
+      const ws = store.get(USER_B_ID);
+      assert.equal(ws.needsKeySeal(), false, 'nothing here is a plaintext key the migration can seal');
+    }
+    await new Promise((resolve) => setImmediate(resolve));
+  } finally { console.warn = warn; }
+  assert.equal(reads, 0, 'the store was never asked');
+  // A real plaintext key beside them still is.
+  f.write(f.files.private(USER_B_ID), [{ id: 'plain', label: 'Plain', baseUrl: 'https://p.test/v1', apiKey: 'synthetic-plain-key', shared: false }]);
+  assert.equal(store.get(USER_B_ID).needsKeySeal(), true);
+  await store.get(USER_B_ID).sealLegacyProviders();
+  assert.equal(store.get(USER_B_ID).needsKeySeal(), false);
+});
+
+test('L5: a seal whose compare-and-swap never lands is quiet for half a minute, like one that failed', async (t) => {
+  const f = fixture(t);
+  f.write(f.files.private(USER_B_ID), [{ id: 'plain', label: 'Plain', baseUrl: 'https://p.test/v1', apiKey: 'synthetic-plain-key', shared: false }]);
+  let reads = 0;
+  const conflicting = {
+    ...f.projectStore,
+    read: async (...a) => { reads += 1; return f.projectStore.read(...a); },
+    // The front writes the file again before every one of Node's writes.
+    write: async (user, file, version, text) => ({ conflict: true, version: `newer-${reads}`, text }),
+  };
+  const store = createWorkspaceStore(f.root, DEFAULT, f.secrets, { projectStore: conflicting });
+  const warn = console.warn; const warned = [];
+  console.warn = (...a) => warned.push(a.join(' '));
+  try {
+    const ws = store.get(USER_B_ID);
+    await ws.sealLegacyProviders();
+    assert.equal(reads, 4, 'four attempts, then it gives up');
+    for (let i = 0; i < 5; i++) store.get(USER_B_ID);
+    await new Promise((resolve) => setImmediate(resolve));
+    await ws.sealLegacyProviders();
+    assert.equal(reads, 4, 'and does not try again on every request');
+    assert.equal(warned.length, 1);
+    assert.doesNotMatch(warned[0], /synthetic-plain-key/);
+  } finally { console.warn = warn; }
+});
+
+test('a damaged shared-providers.json does not throw for any account: the default row and the account\'s own rows, one warning', (t) => {
+  const f = fixture(t, { id: 'default', label: 'Default', baseUrl: 'http://localhost', apiKey: 'env-key' });
+  f.write(f.files.private(USER_B_ID), [{ id: 'mine', label: 'Mine', baseUrl: 'https://b.test/v1', apiKey: f.secrets.encrypt('b-key'), shared: false }]);
+  const warn = console.warn; const warned = [];
+  console.warn = (...a) => warned.push(a.join(' '));
+  try {
+    for (const damaged of ['null', '[]', '"text"', '{"providers":{"not":"a list"}}', '{"providers":[null]}', '{"providers":["x"]}', '{"providers":[[1]]}', '{"providers":[{"id":"ok"},null]}', '{oops', '']) {
+      fs.writeFileSync(f.files.shared, damaged);
+      for (const user of [ADMIN_ID, USER_B_ID]) {
+        const view = f.store.get(user).providers;
+        assert.deepEqual(view.filter((p) => p.shared).map((p) => p.id), ['default'], `${damaged}: only the environment's default is shared`);
+        assert.equal(view.find((p) => p.id === 'default').apiKey, 'env-key');
+      }
+      assert.equal(f.store.get(USER_B_ID).providers.find((p) => p.id === 'mine').apiKey, 'b-key', `${damaged}: private rows stay`);
+    }
+    assert.equal(warned.length, 1, 'said once while it stays damaged');
+    assert.match(warned[0], /shared-providers\.json is damaged/);
+    // Repaired: the rows come back, and a later damage is said again.
+    f.write(f.files.shared, [{ id: 'shared-x', label: 'X', baseUrl: 'https://x.test/v1', apiKey: '', shared: true }]);
+    assert.ok(f.store.get(USER_B_ID).providers.some((p) => p.id === 'shared-x'));
+    fs.writeFileSync(f.files.shared, 'null');
+    f.store.get(USER_B_ID);
+    assert.equal(warned.length, 2);
+  } finally { console.warn = warn; }
+  // A missing file and a file with no `providers` are not damage.
+  fs.rmSync(f.files.shared);
+  assert.deepEqual(f.store.get(USER_B_ID).providers.filter((p) => p.shared).map((p) => p.id), ['default']);
+  fs.writeFileSync(f.files.shared, '{}');
+  assert.deepEqual(f.store.get(USER_B_ID).providers.filter((p) => p.shared).map((p) => p.id), ['default']);
+  assert.equal(warned.length, 2, 'nothing more was said');
+});

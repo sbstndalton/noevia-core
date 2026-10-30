@@ -32,14 +32,84 @@ test('the registry\'s methods are refused before the body is read; everything el
   ]) assert.equal(refuse(method, url), null, `${method} ${url}`);
 });
 
-test('index.cjs refuses the routes before authentication; the Node writers and the listing are gone', () => {
-  const index = fs.readFileSync(path.join(__dirname, 'index.cjs'), 'utf8');
-  const at = index.indexOf("require('./rust-providers.cjs').refuseOwned(req, res, { parseRequestUrl, json })");
-  assert.ok(at > 0 && at < index.indexOf('const preAuth = requestAuth.authenticate(req);'));
-  const routes = fs.readFileSync(path.join(__dirname, 'routes', 'providers.cjs'), 'utf8');
-  assert.doesNotMatch(routes, /saveProviders|saveSharedProviders|removeProvider|PROVIDERS\.push|apiKeyMasked|listRow|maskKey|parseContextTokens/);
-  const workspace = fs.readFileSync(path.join(__dirname, 'workspace.cjs'), 'utf8');
-  assert.doesNotMatch(workspace, /saveProviders\(\) \{|saveShared\(id\)|removeProvider\(id\)|atomicJson\(providerFile|atomicJson\(sharedFile/);
-  const registry = fs.readFileSync(path.join(__dirname, 'providers.cjs'), 'utf8');
-  assert.doesNotMatch(registry, /saveProviders|saveSharedProviders|maskKey/);
+test('a request that reaches the routes mount is refused for every registry method, and the other methods keep their Node answers', async () => {
+  const { createProviderRoutes } = require('./routes/providers.cjs');
+  const sent = [];
+  const mount = (chatgptOn) => createProviderRoutes({ json: (_res, status, body) => { sent.push({ status, body }); }, chatgptOAuth: chatgptOn ? {} : null, chatgptEnabled: () => chatgptOn });
+  const ask = async (routes, method, p, authn = { user: { id: 'u', role: 'admin' } }) => { sent.length = 0; const handled = await routes({ method }, {}, { path: p, authn }); return { handled, sent: sent.slice() }; };
+  const off = mount(false), on = mount(true);
+  for (const [method, p] of [['GET', '/api/providers'], ['POST', '/api/providers'], ['PUT', '/api/providers/prov-1'], ['DELETE', '/api/providers/prov-1'], ['DELETE', '/api/providers/chatgpt'], ['PUT', '/api/providers/test'], ['DELETE', '/api/providers/test']]) {
+    for (const routes of [off, on]) assert.deepEqual(await ask(routes, method, p), { handled: true, sent: [{ status: 503, body: owned.ROUTE_REFUSAL }] }, `${method} ${p}`);
+  }
+  // What stays Node's on the sign-in paths: 404 while the feature is off, 401 signed out, else 405.
+  assert.deepEqual((await ask(off, 'PUT', '/api/providers/chatgpt')).sent, [{ status: 404, body: { error: 'Sign in with ChatGPT is turned off on this server.' } }]);
+  assert.deepEqual((await ask(on, 'PUT', '/api/providers/chatgpt', {})).sent, [{ status: 401, body: { error: 'Sign in to noevia first.' } }]);
+  assert.deepEqual((await ask(on, 'PUT', '/api/providers/chatgpt')).sent, [{ status: 405, body: { error: 'method not allowed' } }]);
+  // A path the mount does not own is passed on, not answered.
+  assert.deepEqual(await ask(on, 'GET', '/api/providers/prov-1'), { handled: false, sent: [] });
+});
+
+test('the provider registry module has no writer left (the workspace\'s is in workspace-shared.test.cjs)', () => {
+  const providers = require('./providers.cjs');
+  assert.deepEqual(Object.keys(providers.createProviderRegistry({ PROVIDERS: [], DEFAULT_PROVIDER_ID: 'default' })).sort(), ['getProvider', 'providerHeaders']);
+  for (const name of Object.keys(providers)) assert.doesNotMatch(name, /^(save|remove|mask|parseContext)/, name);
+});
+
+// ── through the real router ─────────────────────────────────────────────────────
+
+const os = require('node:os');
+const { Readable, Writable } = require('node:stream');
+const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'noevia-rust-providers-'));
+process.env.UI_DATA_DIR = dataDir;
+require('../tests/server/project-store-server.cjs').installProjectStore(dataDir);
+process.env.PUBLIC_ORIGIN = 'http://localhost';
+process.env.LEGACY_AUTH_COMPAT = 'false';
+const originalWarn = console.warn;
+console.warn = () => {};
+const { handleRequest } = require('./index.cjs');
+console.warn = originalWarn;
+const { seedAccount } = require('../tests/server/seed-account.cjs');
+
+test.after(() => fs.rmSync(dataDir, { recursive: true, force: true }));
+
+async function request(url, { method = 'GET', headers = {}, body } = {}) {
+  const payload = body === undefined ? '' : typeof body === 'string' ? body : JSON.stringify(body);
+  const req = Readable.from(payload ? [payload] : []);
+  Object.assign(req, { url, method, headers: { host: 'localhost', ...headers }, socket: { remoteAddress: '127.0.0.1' } });
+  const chunks = [];
+  const out = {};
+  const res = new Writable({ write(chunk, _e, cb) { chunks.push(Buffer.from(chunk)); cb(); } });
+  res.statusCode = 200;
+  res.headersSent = false;
+  res.setHeader = (k, v) => { out[k.toLowerCase()] = v; };
+  res.writeHead = (status, h = {}) => { res.statusCode = status; res.headersSent = true; for (const [k, v] of Object.entries(h)) out[k.toLowerCase()] = v; return res; };
+  const done = new Promise((resolve, reject) => { res.once('finish', resolve); res.once('error', reject); });
+  await handleRequest(req, res);
+  await done;
+  const text = Buffer.concat(chunks).toString('utf8');
+  let parsed = null; try { parsed = JSON.parse(text); } catch { /* not JSON */ }
+  return { status: res.statusCode, headers: out, text, json: parsed };
+}
+
+test('through the router: the registry\'s methods are refused before authentication, signed out and in, and write nothing', async () => {
+  const admin = seedAccount(dataDir, { username: 'prov-admin', displayName: 'Synthetic', role: 'admin', publicOrigin: 'http://localhost' });
+  const member = seedAccount(dataDir, { username: 'prov-member', displayName: 'Synthetic', role: 'member' });
+  const as = (a) => ({ cookie: a.cookie, origin: 'http://localhost', 'x-csrf-token': a.csrf });
+  const files = () => fs.readdirSync(dataDir, { recursive: true }).filter((f) => /providers\.json/.test(f));
+  const before = files();
+  for (const [method, url, body] of [
+    ['GET', '/api/providers'], ['POST', '/api/providers', { label: 'X', baseUrl: 'https://x.test/v1' }], ['PUT', '/api/providers/prov-1', { label: 'Y' }],
+    ['DELETE', '/api/providers/prov-1'], ['DELETE', '/api/providers/chatgpt'], ['PUT', '/api/providers/test', {}], ['DELETE', '/api/providers/%E0%A4'],
+  ]) {
+    for (const headers of [{}, as(member), as(admin)]) {
+      const r = await request(url, { method, headers, body });
+      assert.equal(r.status, 503, `${method} ${url}`);
+      assert.deepEqual(r.json, owned.ROUTE_REFUSAL, `${method} ${url}`);
+      assert.equal(r.headers['x-noevia-api'], '1');
+    }
+  }
+  assert.deepEqual(files(), before, 'no provider file was created or written');
+  // Positive controls: what is not the registry's still meets the session gate first.
+  assert.equal((await request('/api/providers/prov-1')).status, 401);
+  assert.equal((await request('/api/providers/prov-1', { method: 'PATCH', body: '{}' })).status, 401);
 });

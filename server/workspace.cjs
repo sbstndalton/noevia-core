@@ -22,6 +22,15 @@ function atomicJson(file, value) {
 // usable with an empty key and `keyUnreadable: true`, so it can be re-entered, instead of the
 // throw taking down every request that loads the workspace (#782). The front, which writes the
 // file, keeps the original ciphertext as it was, so restoring the right key still recovers it.
+// A stored key the seal-on-load migration still has to seal: a non-empty string that is not an
+// `enc:` envelope of any version. The load (needsKeySeal) and the migration (sealLegacyProviders)
+// share this one predicate: with two, a key the migration leaves alone (an `enc:v2:` value, which
+// is bound to an account and so cannot be a provider key's, or a value that is not a string) kept
+// needsKeySeal true and sent every request to the store for nothing.
+function isPlaintextKey(value) {
+  return typeof value === 'string' && value !== '' && !/^enc:v\d+:/.test(value);
+}
+
 function openProviderKey(row, secrets) {
   if (!secrets) return;
   const stored = row.apiKey;
@@ -68,8 +77,31 @@ function createWorkspaceStore(rootDir, defaultProvider, secrets, { projectStore 
   const usersDir = path.join(rootDir, 'users');
   const sharedFile = path.join(rootDir, 'shared-providers.json');
 
+  // A shared-providers.json that does not parse, or parses to something other than
+  // `{ providers: [objects] }` (a null, a providers that is not a list, a row that is not an
+  // object), is damaged. It must not throw for every
+  // account that loads a workspace: it fails closed to the environment's default row and the
+  // account's own rows (nothing shared is offered from a file nobody can trust), and says so once
+  // until the file reads well again. The front never overwrites a damaged file (it answers 500).
+  let sharedDamageLogged = false;
+  function sharedRows() {
+    let rows = [];
+    try {
+      const text = fs.readFileSync(sharedFile, 'utf8');
+      const doc = JSON.parse(text);
+      rows = doc === null || typeof doc !== 'object' || Array.isArray(doc) ? null : (doc.providers === undefined || doc.providers === null ? [] : doc.providers);
+    } catch (e) { rows = e && e.code === 'ENOENT' ? [] : null; }
+    const sound = Array.isArray(rows) && rows.every((row) => row !== null && typeof row === 'object' && !Array.isArray(row));
+    if (!sound) {
+      if (!sharedDamageLogged) { sharedDamageLogged = true; console.warn('[providers] shared-providers.json is damaged; shared providers are not offered until it is repaired'); }
+      return [];
+    }
+    sharedDamageLogged = false;
+    return rows;
+  }
+
   function loadShared() {
-    const rows = readJson(sharedFile, { providers: [] }).providers || [];
+    const rows = sharedRows();
     for (const row of rows) openProviderKey(row, secrets);
     // A stale default row may exist in the file from before this fix. Prefer
     // the current env-derived defaultProvider values for that id (dropped on
@@ -151,7 +183,7 @@ function createWorkspaceStore(rootDir, defaultProvider, secrets, { projectStore 
         const stored = readJson(providerFile, { providers: [] }).providers || [];
         let plaintext = false;
         for (const provider of stored) {
-          if (provider.apiKey && !String(provider.apiKey).startsWith('enc:v1:')) plaintext = true;
+          if (isPlaintextKey(provider.apiKey)) plaintext = true;
           openProviderKey(provider, secrets);
         }
         for (const provider of stored) {
@@ -180,12 +212,16 @@ function createWorkspaceStore(rootDir, defaultProvider, secrets, { projectStore 
           if (!doc || !Array.isArray(doc.providers)) return;
           let changed = false;
           for (const row of doc.providers) {
-            if (row && typeof row.apiKey === 'string' && row.apiKey && !/^enc:v\d+:/.test(row.apiKey)) { row.apiKey = secrets ? secrets.encrypt(row.apiKey) : row.apiKey; changed = true; }
+            if (row && isPlaintextKey(row.apiKey)) { row.apiKey = secrets ? secrets.encrypt(row.apiKey) : row.apiKey; changed = true; }
           }
           if (!changed) return;
           const saved = await projectStore.write(userId, 'providers.json', version, JSON.stringify(doc, null, 2));
           if (saved.ok) return;
         }
+        // Every attempt met a newer version: quiet for half a minute, as after a failed one,
+        // instead of a store round trip (and a log line) on every request.
+        sealFailedAt = Date.now();
+        console.warn('[providers] could not seal legacy provider keys: the file kept changing; trying again shortly');
       })().catch((e) => { sealFailedAt = Date.now(); console.warn('[providers] could not seal legacy provider keys through the project store:', e.message); })
         .finally(() => { sealing = null; });
       return sealing;

@@ -18,6 +18,8 @@ test.after(async () => { await google.close(); for (const d of temps) fs.rmSync(
 const noPrev = { env: {} };
 const member = { id: 'u-member', role: 'member' }, other = { id: 'u-other', role: 'member' };
 const until = async (fn) => { for (let i = 0; i < 100; i++) { if (await fn()) return; await new Promise((r) => setTimeout(r, 50)); } throw new Error('timed out'); };
+// The provider files are the Rust front's (rust-providers-reseal.cjs): no front, no provider rows here.
+const noProviders = async () => ({ tables: {}, failures: [] });
 // No database tables here: rotationTables skips tables that do not exist.
 const noDb = { prepare: () => ({ get: () => undefined, all: () => [] }) };
 
@@ -63,7 +65,7 @@ test('after a key change a member\'s Drive reads through the previous key, and d
 
 test('the rotation re-seals every member file so the previous key can be removed', async () => {
   const { dir, fresh } = await connectedBeforeRotation();
-  const report = runRotation({ secrets: fresh, db: noDb, dataDir: dir });
+  const report = await runRotation({ secrets: fresh, db: noDb, dataDir: dir, resealProviders: noProviders });
   assert.deepEqual(report.tables.google_drive_users, { current: 0, rotated: 2, upgraded: 0, empty: 0, failed: 0 });
   assert.equal(report.totals.failed, 0);
   for (const secret of google.state.refresh) assert.ok(!JSON.stringify(report).includes(secret), 'the report never carries a token');
@@ -81,7 +83,7 @@ test('the rotation re-seals every member file so the previous key can be removed
   assert.equal(google.state.revoked.length, before + 1);
 
   // Idempotent: a second run finds everything current.
-  const again = runRotation({ secrets: only, db: noDb, dataDir: dir });
+  const again = await runRotation({ secrets: only, db: noDb, dataDir: dir, resealProviders: noProviders });
   assert.deepEqual(again.tables.google_drive_users, { current: 1, rotated: 0, upgraded: 0, empty: 0, failed: 0 });
 });
 
@@ -90,7 +92,7 @@ test('a file sealed under neither key is counted as failed, never rewritten, and
   const lost = path.join(dir, 'google-drive-users', `${other.id}.sealed`);
   const text = fs.readFileSync(path.join(dir, 'google-drive-users', `${member.id}.sealed`), 'utf8');
   fs.writeFileSync(lost, 'AAAA' + text.slice(4)); // tampered: opens under neither key
-  const report = runRotation({ secrets: fresh, db: noDb, dataDir: dir });
+  const report = await runRotation({ secrets: fresh, db: noDb, dataDir: dir, resealProviders: noProviders });
   assert.deepEqual(report.tables.google_drive_users, { current: 0, rotated: 1, upgraded: 0, empty: 0, failed: 1 });
   assert.equal(report.failures[0].ref, `${other.id}.sealed`);
   assert.match(report.failures[0].error, /no longer available/);
