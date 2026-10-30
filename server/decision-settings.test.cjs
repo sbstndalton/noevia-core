@@ -4,95 +4,47 @@ if (!require('node:fs').existsSync(process.env.DAV_PARSE_WASM || require('./dav-
   require('node:test').test('needs dav-parse.wasm (not built)', { skip: 'dav-parse.wasm not built' }, () => {});
   return;
 }
+// #2190: the Rust front writes the decision configuration (its validation, audit and connection test
+// are tested in noevia-rs tests/decision_settings.rs). Here: Node re-reads what Rust wrote on every use.
 const test=require('node:test'),assert=require('node:assert/strict');
 const {createDecisionSettings}=require('./decision-settings.cjs');
 const {createFeatures}=require('../tests/server/oracles/features-legacy.cjs');
-const {createFeatureRoutes}=require('./routes/features.cjs');
 const {createSystemOneRouter}=require('./system-one-router.cjs');
+const {rustSavesDecision,rustResetsDecision}=require('../tests/server/rust-decision-row.cjs');
 function fixture(fetchImpl=async()=>Response.json({ready:true})) {
-  const map=new Map(),store={get:k=>map.get(k),set:(k,v)=>map.set(k,v)};
+  const map=new Map(),store={get:k=>map.get(k),set:(k,v)=>map.set(k,v),delete:k=>map.delete(k)};
   const settings=createDecisionSettings({store,env:{},fetchImpl});
   const features=createFeatures({store,env:{},availability:{stepSupervision:settings.unavailable,systemOneRouting:settings.unavailable}});
   return {store,settings,features};
 }
-test('saving shared settings unlocks both experiments immediately and persists restart',()=>{
+test('a save by the Rust front unlocks both experiments at once, with no restart',()=>{
   const {store,settings,features}=fixture();
   assert.throws(()=>features.set('systemOneRouting',true,'admin'),/Set up/);
-  settings.save({url:'http://laya:8040',timeoutMs:900},'admin');
+  rustSavesDecision(store,{url:'http://laya:8040',timeoutMs:900});
   for(const feature of ['stepSupervision','systemOneRouting']) {features.set(feature,true,'admin');assert.equal(features.enabled(feature),true);}
-  assert.equal(createDecisionSettings({store,env:{}}).get().timeoutMs,900);
+  assert.deepEqual(settings.get(),{url:'http://laya:8040',timeoutMs:900,source:'admin'});
+  rustResetsDecision(store);
+  assert.deepEqual(settings.get(),{url:'',timeoutMs:1500,source:'deployment'},'a reset is seen on the next use too');
 });
-test('invalid settings leave active configuration intact',()=>{
-  const {settings}=fixture();settings.save({url:'http://laya:8040',timeoutMs:1500},'admin');
-  for(const value of [{url:'http://93.184.216.34',timeoutMs:500},{url:'http://laya:8040',timeoutMs:9999},{url:'http://laya:8040/?key=secret',timeoutMs:500}])assert.throws(()=>settings.save(value,'admin'));
-  assert.equal(settings.get().url,'http://laya:8040');
-});
-test('connection test uses health only, rejects redirects/not-ready and never saves drafts',async()=>{
-  let calls=0;const {settings}=fixture(async(url,init)=>{calls++;assert.equal(url,'http://laya:8040/health');assert.equal(init.redirect,'error');assert.ok(init.signal);return Response.json({ready:true});});
-  assert.equal((await settings.test({url:'http://laya:8040',timeoutMs:500})).ok,true);assert.equal(settings.get().url,'');assert.equal(calls,1);
-  for(const reply of [Response.json({ready:false}),new Response('',{status:302}),Response.json('x'.repeat(5000))]) {
-    await assert.rejects(fixture(async()=>reply).settings.test({url:'http://laya:8040',timeoutMs:500}));
-  }
-});
-test('deadline accepts up to 2000 ms and rejects 2001 (#682)',()=>{
+test('the write API is gone: Node never writes the row',()=>{
   const {settings}=fixture();
-  assert.equal(settings.save({url:'http://laya:8040',timeoutMs:2000},'admin').timeoutMs,2000);
-  assert.throws(()=>settings.save({url:'http://laya:8040',timeoutMs:2001},'admin'),e=>e.messageId==='invalidInput'&&/2000 ms/.test(e.message));
+  for(const name of ['save','reset','test']) assert.equal(name in settings,false,name);
 });
-test('test results and refusals carry a stable message id, in the body and in the route reply (#624)',async()=>{
-  const {settings,features}=fixture();
-  assert.equal((await settings.test({url:'http://laya:8040',timeoutMs:500})).messageId,'ready');
-  await assert.rejects(fixture(async()=>Response.json({ready:false})).settings.test({url:'http://laya:8040',timeoutMs:500}),e=>e.status===502&&e.messageId==='notReady');
-  assert.throws(()=>settings.save({url:'http://laya:8040',timeoutMs:9999},'admin'),e=>e.messageId==='invalidInput');
-  assert.throws(()=>settings.save({url:'http://93.184.216.34',timeoutMs:500},'admin'),e=>e.messageId==='invalidUrl');
-  const route=createFeatureRoutes({features,decisionSettings:settings,json:(res,status,body)=>Object.assign(res,{status,body}),readJson:async req=>req.body});
-  const admin={user:{id:'admin',role:'admin'}};
-  let res={};await route({method:'POST',body:{url:'http://laya:8040',timeoutMs:500}},res,{path:'/api/admin/decision-settings/test',authn:admin});
-  assert.equal(res.body.messageId,'ready');assert.match(res.body.message,/ready/);
-  res={};await route({method:'PUT',body:{url:'http://93.184.216.34',timeoutMs:500}},res,{path:'/api/admin/decision-settings',authn:admin});
-  assert.equal(res.status,400);assert.equal(res.body.errorId,'invalidUrl');assert.match(res.body.error,/private HTTP address/,'the English stays for older clients');
-  // #1499: the example address the refusal suggests is one this service accepts.
-  const example=res.body.error.match(/https?:\/\/[^\s,]+/)[0];
-  assert.equal(fixture().settings.save({url:example,timeoutMs:500},'admin').url,example);
-  res={};await route({method:'PUT',get body(){throw Error('unreadable');}},res,{path:'/api/admin/decision-settings',authn:admin});
-  assert.equal('errorId' in res.body,false,'an error without an id sends none');
-  const info=features.describe();
-  assert.equal(info.find(f=>f.name==='stepSupervision').unavailableId,'decisionSetup');
-});
-test('Laya routing supports Fast/Smart choice and live endpoint replacement',async()=>{
-  const urls=[];const {settings}=fixture(async(url,init)=>{urls.push(url);const body=JSON.parse(init.body);assert.deepEqual(body.options.map(o=>o.id),['fast','smart']);return Response.json({selected:'smart',scores:{fast:0.2,smart:0.8}});});
-  settings.save({url:'http://laya:8040',timeoutMs:1000},'admin');
+test('Laya routing follows each Rust save on the next decision (live endpoint replacement)',async()=>{
+  const urls=[];const {store,settings}=fixture(async(url,init)=>{urls.push(url);const body=JSON.parse(init.body);assert.deepEqual(body.options.map(o=>o.id),['fast','smart']);return Response.json({selected:'smart',scores:{fast:0.2,smart:0.8}});});
+  rustSavesDecision(store,{url:'http://laya:8040',timeoutMs:1000});
   const router=createSystemOneRouter({enabled:()=>true,roles:()=>({fast:'a',smart:'b'}),fallback:()=>assert.fail('Unexpected fallback'),getBackend:settings.backend,getDeadlineMs:()=>settings.get().timeoutMs});
   assert.equal(await router.classify('synthetic task'),'smart');
-  settings.save({url:'http://127.0.0.1:8041',timeoutMs:1000},'admin');
+  rustSavesDecision(store,{url:'http://127.0.0.1:8041',timeoutMs:1000});
   assert.equal(await router.classify('second tenant synthetic task'),'smart');
   assert.deepEqual(urls,['http://laya:8040/v1/decisions','http://127.0.0.1:8041/v1/decisions']);
 });
-test('only admins can read, save or test decision settings',async()=>{
-  const {settings,features}=fixture();const route=createFeatureRoutes({features,decisionSettings:settings,json:(res,status,body)=>Object.assign(res,{status,body}),readJson:async req=>req.body});
-  for(const method of ['GET','PUT','POST']){
-    const res={};await route({method,body:{url:'http://laya:8040',timeoutMs:500}},res,{path:'/api/admin/decision-settings'+(method==='POST'?'/test':''),authn:{user:{id:'member',role:'member'}}});assert.equal(res.status,403);
-  }
-  const res={};await route({method:'PUT',body:{url:'http://laya:8040',timeoutMs:500}},res,{path:'/api/admin/decision-settings',authn:{user:{id:'admin',role:'admin'}}});assert.equal(res.status,200);
-});
-test('#1816 a PUT without model keeps the saved decision model; only "" or null clear it',()=>{
+test('a chosen model is read back as stored; rows Node cannot parse keep the old fallbacks',()=>{
   const {store,settings}=fixture();
-  settings.save({url:'http://laya:8040',timeoutMs:900,model:'kev-0.8b'},'admin');
+  rustSavesDecision(store,{url:'http://laya:8040',timeoutMs:900,model:'kev-0.8b'});
   assert.equal(settings.get().model,'kev-0.8b');
-  settings.save({url:'http://laya:8040',timeoutMs:1000},'admin');
-  assert.equal(settings.get().model,'kev-0.8b','absent model keeps the choice');
-  assert.equal(createDecisionSettings({store,env:{}}).get().model,'kev-0.8b','and it is persisted');
-  settings.save({url:'http://laya:8040',timeoutMs:1000,model:null},'admin');
-  assert.equal('model' in settings.get(),false,'null clears; GET shape has no model key');
-  settings.save({url:'http://laya:8040',timeoutMs:1000,model:'kev-0.8b'},'admin');
-  settings.save({url:'http://laya:8040',timeoutMs:1000,model:''},'admin');
-  assert.equal('model' in settings.get(),false,'empty string clears');
-});
-test('#1817 a saved model that is no longer a profile is automatic on a PUT that omits model',()=>{
-  const {store,settings}=fixture();
-  store.set('decision:configuration',JSON.stringify({url:'http://laya:8040',timeoutMs:900,model:'removed-profile'}));
-  const again=createDecisionSettings({store,env:{}});
-  const out=again.save({url:'http://laya:8040',timeoutMs:1000},'admin');
-  assert.equal('model' in again.get(),false);
-  assert.throws(()=>again.save({url:'http://laya:8040',timeoutMs:1000,model:'removed-profile'},'admin'),{status:400});
+  store.set('decision:configuration','{');
+  assert.deepEqual(settings.get(),{url:'',timeoutMs:1500,source:'admin'});
+  store.set('decision:configuration','null');
+  assert.equal(settings.get().source,'deployment');
 });

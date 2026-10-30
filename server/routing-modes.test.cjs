@@ -884,7 +884,7 @@ async function decisionServiceCheck(t, reply, { log = () => {}, seen = [] } = {}
   t.after(() => { server.closeAllConnections(); return new Promise((resolve) => server.close(resolve)); });
   const kv = new Map();
   const settings = require('./decision-settings.cjs').createDecisionSettings({ store: { get: (k) => kv.get(k), set: (k, v) => kv.set(k, v) }, env: {} });
-  settings.save({ url: `http://127.0.0.1:${server.address().port}`, timeoutMs: 1500 }, 'admin');
+  require('../tests/server/rust-decision-row.cjs').rustSavesDecision({ set: (k, v) => kv.set(k, v) }, { url: `http://127.0.0.1:${server.address().port}`, timeoutMs: 1500 });
   const decisions = createDecisions({ backends: { configured: settings.backend() }, chains: { 'routing.sensitivity': ['configured'] } });
   return rm.createSensitivity({ decide: decisions.decide, log, qualified: SYN_QUALIFIED });
 }

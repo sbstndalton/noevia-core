@@ -84,22 +84,8 @@ test('manager: a faulty evaluator refuses a preset save, leaving the ini untouch
   assert.ok(!calls.includes('POST /models/load'), calls.join('\n'));
 });
 
-test('manager: a faulty evaluator makes the Will-it-fit panel a 503', { skip: skipWasm }, async (t) => {
-  const probe = faultyEvaluator(t);
-  const { m } = manager(t);
-  const panel = await m.estimateMemory('small');
-  assert.ok(probe.ran > 0);
-  assert.equal(panel.status, 503); assert.equal(panel.body.code, 'autoconfig_impl');
-});
-
-test('manager: a faulty evaluator yields autoconfig_impl and no settings from suggestPreset', { skip: skipWasm }, async (t) => {
-  const probe = faultyEvaluator(t);
-  const { m } = manager(t);
-  const s = await m.suggestPreset('small');
-  assert.ok(probe.ran > 0);
-  assert.equal(s.status, 200); assert.equal(s.body.code, 'autoconfig_impl'); assert.equal(s.body.values, undefined);
-});
-
+// The Will-it-fit panel and the preset suggestion are the Rust front's since #2189 (noevia-rs
+// model_sizing.rs, which links the sizing port instead of loading this module).
 test('manager: a faulty evaluator leaves the Models page with a null estimate rather than a wrong one', { skip: skipWasm }, async (t) => {
   const probe = faultyEvaluator(t);
   const { m } = manager(t);
@@ -112,8 +98,8 @@ test('manager: a faulty evaluator leaves the Models page with a null estimate ra
 // confirmation is reached. Each refusal must be traceable to the missing module: the 422 bodies name `(missing)`, and the Models
 // page (which swallows the error into a null estimate) is checked through a spy on the module's GGUF entry point, which must have
 // thrown reason `missing` during that very call. `ran` is incremented only after a case's refusal assertions pass, and test.after
-// asserts the three module-absent refusals.
-test('manager: with no dav-parse.wasm at all the GGUF read refuses (422): no suggestion, no panel, no estimate, and the preset is untouched', async (t) => {
+// asserts the module-absent refusal.
+test('manager: with no dav-parse.wasm at all the GGUF read refuses: no Models page estimate, and the preset is untouched', async (t) => {
   const saved = process.env.DAV_PARSE_WASM, savedSummary = davParseWasm.ggufSummary, probe = { ran: 0 }, thrown = [];
   process.env.DAV_PARSE_WASM = path.join(os.tmpdir(), 'no-such-dav-parse.wasm');
   davParseWasm.reset();
@@ -124,26 +110,15 @@ test('manager: with no dav-parse.wasm at all the GGUF read refuses (422): no sug
     davParseWasm.ggufSummary = savedSummary;
     if (saved === undefined) delete process.env.DAV_PARSE_WASM; else process.env.DAV_PARSE_WASM = saved;
     davParseWasm.reset();
-    assert.equal(probe.ran, 3, 'the suggestion, the panel and the Models page must each have been refused by the missing module');
+    assert.equal(probe.ran, 1, 'the Models page must have been refused by the missing module');
   });
   assert.throws(() => davParseWasm.llamacppAutoconfig(4, {}), (e) => e instanceof davParseWasm.DavParseError && e.reason === 'missing', 'the module really is absent');
   const { m, ini, calls } = manager(t);
   const before = fs.readFileSync(ini, 'utf8');
   const missingSince = (mark) => { assert.ok(thrown.length > mark, 'the GGUF entry point must have been reached'); assert.ok(thrown.slice(mark).every((r) => r === 'missing'), thrown.join(',')); };
-  const METADATA_MISSING = /^Could not read model metadata: GGUF header could not be checked \(missing\)/;
-
-  let mark = thrown.length;
-  const suggested = await m.suggestPreset('small');
-  assert.equal(suggested.status, 422); assert.match(suggested.body.error, METADATA_MISSING); assert.equal(suggested.body.values, undefined);
-  missingSince(mark); probe.ran++;
-
-  mark = thrown.length;
-  const panel = await m.estimateMemory('small');
-  assert.equal(panel.status, 422); assert.match(panel.body.error, METADATA_MISSING); assert.equal(panel.body.code, undefined);
-  missingSince(mark); probe.ran++;
 
   // Unreadable metadata means no estimate (the runtime watchdog covers what cannot be estimated), never a made-up one.
-  mark = thrown.length;
+  const mark = thrown.length;
   const est = await m.inferenceEstimates();
   assert.equal(est.body.models[0].estimate, null); assert.equal(est.body.models[0].fits, null);
   missingSince(mark); probe.ran++;
