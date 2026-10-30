@@ -129,7 +129,12 @@ async function scenario(front, mode, workerBase, fixtures, root, calls) {
     const upload = async name => admin.call('POST', route + '/upload', { name, organized: true, dataBase64: fs.readFileSync(path.join(fixtures, name)).toString('base64') });
     const scan = await upload('scan.pdf');
     let pages;
-    if (scan.document?.state === 'ready') pages = await admin.call('GET', route + '/documents/pages?name=scan.pdf');
+    // The page reader is the Rust front's too (#2191 round 4; Node alone refuses it with 503): the Node
+    // reference reads the stored result the way the front does (tests/server/stored-sources.cjs).
+    if (scan.document?.state === 'ready') {
+      if (front) pages = await admin.call('GET', route + '/documents/pages?name=scan.pdf');
+      else { const read = stored.documentPages(dataDir, id, 'name=scan.pdf'); assert.equal(read.status, 200, read.text); pages = read.json; }
+    }
     // Negative controls must fail this precise oracle, not a boot/setup failure.
     if (mode !== 'good') {
       assert.throws(() => requireScan(scan, pages || {}), /native OCR must/);
@@ -161,7 +166,9 @@ async function scenario(front, mode, workerBase, fixtures, root, calls) {
     assert.ok(files.some(file => file.name === large.path) && (await text(large.path)).includes('SYNTHETIC NATIVE TEXT FOR REDUCTION'));
     signIn(member, { username: 'synthetic-member', displayName: 'Synthetic Member', role: 'member' });
     const before = calls.length;
-    const deniedPages = await member.call('GET', route + '/documents/pages?name=scan.pdf', undefined, 404);
+    // The tenant refusal of the page reader is the front's as well (Node alone refuses it with 503 before
+    // auth), so it is checked through the front and kept out of the reference comparison.
+    await member.call('GET', route + '/documents/pages?name=scan.pdf', undefined, front ? 404 : 503);
     // The tenant refusal of the original is the front's (Node alone refuses it with 503 before auth),
     // so it is checked through the front and kept out of the reference comparison.
     if (front) await member.call('GET', route + '/documents/original?name=scan.pdf', undefined, 404);
@@ -203,7 +210,7 @@ async function scenario(front, mode, workerBase, fixtures, root, calls) {
       for (const [identity, replacement] of identities) item = item.replaceAll(identity, replacement);
       return key === 'notice' ? item.replace(/; index: [a-z]+\.$/, '; index: <progress>.') : item;
     });
-    return stable({ scan, pages, docx, large: comparedLarge, files: files.map(file => file === reduced ? comparedReduced : file).map(({ name, content, document, attachment }) => ({ name, content, document, attachment })), deniedPages, deniedUpload });
+    return stable({ scan, pages, docx, large: comparedLarge, files: files.map(file => file === reduced ? comparedReduced : file).map(({ name, content, document, attachment }) => ({ name, content, document, attachment })), deniedUpload });
   } finally {
     await stop(rust); await stop(node); mocks.close(); await store.close(); relay.closeAllConnections(); await new Promise(resolve => relay.close(resolve));
     fs.rmSync(dataDir, { recursive: true, force: true });

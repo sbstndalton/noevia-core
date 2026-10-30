@@ -20,6 +20,8 @@
 // hold longer than HOLD_WARN_MS logs one line, without any document content.
 const { AsyncLocalStorage } = require('node:async_hooks');
 const crypto = require('node:crypto');
+// #2191 round 7: the host-wide half, shared with the Rust front (large-document-file-lock.cjs).
+const fileLock = require('./large-document-file-lock.cjs');
 
 const LARGE_BYTES = 25 * 1024 * 1024;
 const ACQUIRE_WAIT_MS = 2 * 60 * 1000;
@@ -59,6 +61,17 @@ async function acquire(ref) {
   const timedOut = new Promise((resolve) => { timer = setTimeout(() => resolve(false), acquireWaitMs()); });
   const got = await Promise.race([previous.then(() => true), timedOut]);
   clearTimeout(timer);
+  let releaseFile = null;
+  if (got) {
+    // This process's turn: now the host's, within what is left of the same wait.
+    try { releaseFile = await fileLock.take(waitStart + acquireWaitMs()); } catch (err) { outstanding -= 1; release(); throw err; }
+    if (!releaseFile) {
+      outstanding -= 1; release();
+      counters.busy += 1; counters.waited += 1; counters.waitMsTotal += Date.now() - waitStart;
+      console.warn(`[large-document-lock] gave up waiting for another process: doc=${refHash(ref)} waitedMs=${Date.now() - waitStart} outcome=busy`);
+      throw busy();
+    }
+  }
   if (!got) {
     // Not taking it: pass the turn on as soon as the holder ahead lets go, so the queue behind still moves.
     previous.then(() => { outstanding -= 1; release(); });
@@ -77,7 +90,7 @@ async function acquire(ref) {
   }, holdWarnMs());
   warn.unref?.();
   let released = false;
-  return () => { if (released) return; released = true; outstanding -= 1; clearTimeout(warn); release(); };
+  return () => { if (released) return; released = true; outstanding -= 1; clearTimeout(warn); releaseFile(); release(); };
 }
 
 /** Run `fn` holding the lock. */

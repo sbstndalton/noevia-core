@@ -85,28 +85,6 @@ test('the store is permanent: used with a port and the secret alone; the retired
   assert.equal(/NOEVIA_RUST_PROJECT_STORE_CONFIRMED|NOEVIA_RUST_FREE_CHATS_CONFIRMED|NOEVIA_RUST_PROJECTS_CONFIRMED/.test(src), false, 'nor a retired confirmation');
 });
 
-test('source start retries a lost reply with the same request key and never creates a second job', async () => {
-  for (const lost of ['transport', 'empty-200']) {
-    const calls = [], committed = new Map();
-    const fetchImpl = async (url, init) => {
-      assert.match(url, /\/v1\/source-jobs\/start$/);
-      const body = JSON.parse(init.body);
-      calls.push(body);
-      if (!committed.has(body.request)) committed.set(body.request, { id: '11111111-1111-4111-8111-111111111111', run: '22222222-2222-4222-8222-222222222222' });
-      if (calls.length === 1 && lost === 'transport') throw Error('reply lost after commit');
-      return new Response(calls.length === 1 && lost === 'empty-200' ? '' : JSON.stringify(committed.get(body.request)), { status: 200 });
-    };
-    const client = psc.createClient({ port: 1, token: TOKEN, fetchImpl }).sourceJobsFor(USER);
-    const owner = { start: 'a'.repeat(32), born: '100', owner: '33333333-3333-4333-8333-333333333333' };
-    const request = '44444444-4444-4444-8444-444444444444';
-    const job = await client.start(owner, 'project', request);
-    assert.equal(job.id, committed.get(request).id);
-    assert.equal(committed.size, 1, lost);
-    assert.equal(calls.length, 2, lost);
-    assert.deepEqual(calls[0], calls[1], lost);
-  }
-});
-
 test('research report retries a malformed 200 acknowledgement with the exact result', async () => {
   const calls = [];
   const client = psc.createClient({ port: 1, token: TOKEN, fetchImpl: async (url, init) => {

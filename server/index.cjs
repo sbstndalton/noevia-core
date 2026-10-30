@@ -167,28 +167,9 @@ const exportRoutes = require('./routes/export.cjs').createExportRoutes({ json })
 const retentionLists = () => ({ freeChats: Array.from(FREE_CHATS), projects: PROJECTS.filter((proj) => !diaryExtras.internalProject(proj)) });
 const removeRetainedChat = ({ projectId, id }) => (projectId ? deleteChat(projectId, id) : deleteFreeChat(id));
 const accountRoutes = require('./routes/account.cjs').createAccountRoutes({ json, readJson, dir: () => currentWorkspace().dir, chatLists: retentionLists, removeChat: removeRetainedChat });
-const importRoutes = require('./routes/import.cjs').createImportRoutes({
-  json, readBody: (req, limit) => readBody(req, limit), newId: () => `c-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-  audit: (action, actor, detail) => authService.audit(action, actor, actor, detail),
-  context: () => {
-    const lists = require('./chat-lists.cjs');
-    const visible = () => PROJECTS.filter((proj) => !diaryExtras.internalProject(proj));
-    return {
-      projects: () => visible().map((proj) => ({ id: proj.id, name: proj.name })),
-      existingChatIds: () => new Set([...Array.from(FREE_CHATS), ...PROJECTS.flatMap((proj) => proj.chats || [])].map((c) => c.id)),
-      tombstones: () => lists.readTombstones(currentWorkspace().dir),
-      directory: currentWorkspace().dir,
-      // sbstndalton/noevia#1071 slice 4: transcripts are published through the Rust store only.
-      transcripts: currentWorkspace().transcripts,
-      persistedChatIds: () => require('./conversation-import.cjs').persistedChatIds(currentWorkspace().dir),
-      addFreeChats: (chats) => { FREE_CHATS.splice(0, FREE_CHATS.length, ...lists.mergeChats(Array.from(FREE_CHATS), chats, lists.readTombstones(currentWorkspace().dir))); saveFreeChats(FREE_CHATS); },
-      addProjectChats: (projectId, chats) => saveChats(projectId, chats),
-      // The saves above go through the Rust project store; the import reads the disk after them.
-      whenSaved: () => projectStore.whenSaved(() => {}),
-      createProject: (body) => createProject(body),
-    };
-  },
-});
+// Settings → Data → Import conversations: the POST is the Rust front's (#2191 round 4,
+// rust-conversation-import.cjs); this mount keeps the other methods' 405.
+const importRoutes = require('./routes/import.cjs').createImportRoutes({ json });
 const offsiteBackup = require('./offsite-service.cjs').createOffsiteService({ features, dataDir: DATA_DIR, log: (event) => console.log('[backup]', JSON.stringify(event)) });
 const offsiteRoutes = require('./routes/offsite-backup.cjs').createOffsiteRoutes({ service: offsiteBackup, json });
 // Google Drive as a chat connector: each account's own connection, per-tool allow/ask/block.
@@ -1302,6 +1283,14 @@ async function handleRequestInner(req, res) {
   // And a project's create and delete (#2191 round 2): POST /api/projects, DELETE /api/projects/{id}.
   if (require('./rust-project-lifecycle.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   if (require('./rust-project-files.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
+  // And a stored document's page reader (#2191 round 4).
+  if (require('./rust-project-document-pages.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
+  // And the conversation import (#2191 round 4).
+  if (require('./rust-conversation-import.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
+  // And a project document's upload, on the front's Docling pipeline (#2191 round 5).
+  if (require('./rust-project-documents.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
+  // And the background source jobs, whose store the front owns (#2191 round 6).
+  if (require('./rust-source-jobs.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   // And the two read-only sizing reads (#2189): GET /api/models/estimate and /api/models/preset/suggest.
   if (require('./rust-model-sizing.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   // #2190: the public pages and the device approval page, and the plugin directory.

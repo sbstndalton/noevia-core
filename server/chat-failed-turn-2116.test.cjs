@@ -8,8 +8,6 @@ const test = require('node:test'), assert = require('node:assert/strict');
 const fs = require('node:fs'), path = require('node:path'), os = require('node:os');
 const { EventEmitter } = require('node:events');
 const { createChatHandler } = require('./chat.cjs');
-const { planImport } = require('./chat-import.cjs');
-const { FORMAT } = require('./chat-export.cjs');
 const { isFailedTurn } = require('./chat-sources.cjs');
 
 const PARTIAL = 'PARTIAL-TEXT-OF-A-FAILED-REPLY';
@@ -71,11 +69,10 @@ test('the model request carries neither the text of a failed reply nor its failu
 });
 
 test('a failed turn that went through a conversations export and import stays out of the model request', async (t) => {
-  // What the export writes for a chat with a failed reply (it keeps every field but reasoning) is what import reads.
-  const exported = { format: FORMAT, chats: [{ id: 'c-round', title: 'Round trip', updatedAt: 1, history: [
-    { role: 'user', content: 'Summarise the synthetic notes.' }, { role: 'assistant', content: PARTIAL, failure: FAILURE }] }] };
-  const plan = planImport(JSON.parse(JSON.stringify(exported)), { existingChatIds: new Set(), tombstones: new Set(), projects: [], newId: () => 'c-new' });
-  const imported = plan.histories['c-round'];
+  // The import is the Rust front's since #2191 round 4 (noevia-rs crates/server-projects import.rs, whose
+  // tests check it keeps an assistant turn's failure sentence, trimmed): this is the transcript it publishes
+  // for an exported chat with a failed reply, which the chat handler then reads.
+  const imported = [{ role: 'user', content: 'Summarise the synthetic notes.' }, { role: 'assistant', content: PARTIAL, failure: FAILURE }];
   assert.equal(isFailedTurn(imported[1]), true, 'the failed turn is still a failed turn after import');
   const messages = await modelRequestFor(t, imported, 'Try again, shorter.');
   assert.ok(!asSeen(messages).includes(PARTIAL));

@@ -4,7 +4,9 @@
 // through them. These read the same files the front reads, as it reads them: projects.json's
 // source entry, then its content-addressed text (project-sources/<safe id>/<textRef>.txt) or its
 // stored upload (project-uploads/<sha256(id)>/<attachment.id>) or PDF original
-// (project-documents/<sha256(id)>/<document.byteHash>.pdf). Test-only; synthetic data.
+// (project-documents/<sha256(id)>/<document.byteHash>.pdf). Round 4 moved GET .../documents/pages too
+// (server/rust-project-document-pages.cjs): documentPages answers as the front does, through
+// document-sources.cjs readPages over the stored result. Test-only; synthetic data.
 const crypto = require('node:crypto');
 const fs = require('node:fs');
 const path = require('node:path');
@@ -59,4 +61,20 @@ function documentOriginal(dataDir, projectId, name) {
   catch { return { status: 422, bytes: null }; }
 }
 
-module.exports = { sourceText, uploadOriginal, documentOriginal };
+/** What GET .../documents/pages?<query> answers for the user owning `projectId`: { status, json, text }
+ *  (`text` is the page text of a 200, '' otherwise); the route's own order and words (routes/projects.cjs
+ *  docRead before #2191 round 4). */
+function documentPages(dataDir, projectId, query = '') {
+  const url = new URL('http://localhost/?' + String(query).replace(/^[?&]/, ''));
+  const hit = locate(dataDir, projectId);
+  const file = hit && (hit.project.files || []).find((f) => f && f.name === url.searchParams.get('name'));
+  const answer = (status, json) => ({ status, json, text: status === 200 ? json.text + '\n' + json.notice : JSON.stringify(json) });
+  if (!file?.document) return answer(404, { error: 'no such document' });
+  try {
+    const start = Number(url.searchParams.get('startPage') || 1);
+    return answer(200, require('../../server/document-sources.cjs').readPages({ dir: hit.dir }, projectId, file, start,
+      Number(url.searchParams.get('endPage') || start), Number(url.searchParams.get('offset') || 0)));
+  } catch (err) { return answer(err.status || 422, { error: err.status ? err.message : 'Saved document data is unavailable; upload or refresh again.' }); }
+}
+
+module.exports = { sourceText, uploadOriginal, documentOriginal, documentPages };
