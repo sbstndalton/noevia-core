@@ -25,6 +25,18 @@ const SNAPSHOT_KIND = 'mcp-discovery';
 /** The publishing interval; the front calls the file stale after two of them. */
 const EVERY_MS = 3000;
 const DISCOVERY_WAIT_MS = 1500;
+/** The front reads at most 4 MiB (noevia-rs snapshot.rs MAX_BYTES); a larger file makes every consumer answer "being prepared". */
+const MAX_BYTES = 3 * 1024 * 1024;
+/** Tools carried per box. A model is offered a few dozen; the box's own tool count (`toolCount`) still says how many exist. */
+const MAX_BOX_TOOLS = 500;
+const MAX_ERROR_CHARS = 1000;
+
+/**
+ * A string cut to `max` UTF-16 units that is still well formed. A cut through a surrogate pair leaves a lone
+ * surrogate, which JSON.stringify writes as `\ud83d` and the front's JSON reader (serde_json) refuses: the whole
+ * file would be unreadable for every tenant. toWellFormed turns the stray half into U+FFFD.
+ */
+const cut = (value, max) => String(value ?? '').slice(0, max).toWellFormed();
 
 // A tool the front can carry has a text name (discovery guarantees it for MCP tools; a built-in always has one).
 const named = (tool) => !!(tool && tool.function && typeof tool.function.name === 'string' && tool.function.name);
@@ -45,6 +57,17 @@ const named = (tool) => !!(tool && tool.function && typeof tool.function.name ==
  * @param {Iterable<string>} o.connectorBoxes
  */
 function buildCatalogue({ allToolboxes, manifest, mcpEnabled, servers, state, isWriteTool, harnessEnabled, hasRepositories, nextcloudOrigins, defaultToolboxes, connectorBoxes }) {
+  // The whole document must stay under the front's read limit whatever a third-party server lists: tools per box
+  // are cut, and cut harder while the serialised catalogue is still over the budget.
+  let cap = MAX_BOX_TOOLS;
+  for (;;) {
+    const doc = buildWith({ allToolboxes, manifest, mcpEnabled, servers, state, isWriteTool, harnessEnabled, hasRepositories, nextcloudOrigins, defaultToolboxes, connectorBoxes }, cap);
+    if (cap === 0 || Buffer.byteLength(JSON.stringify(doc)) <= MAX_BYTES) return doc;
+    cap = Math.floor(cap / 2);
+  }
+}
+
+function buildWith({ allToolboxes, manifest, mcpEnabled, servers, state, isWriteTool, harnessEnabled, hasRepositories, nextcloudOrigins, defaultToolboxes, connectorBoxes }, boxToolCap) {
   const enabled = mcpEnabled();
   return {
     mcpEnabled: !!enabled,
@@ -55,23 +78,23 @@ function buildCatalogue({ allToolboxes, manifest, mcpEnabled, servers, state, is
     defaults: [...defaultToolboxes],
     connectorBoxes: [...connectorBoxes],
     boxes: allToolboxes().map((b) => ({
-      id: String(b.id), label: b.label, description: b.description, source: b.source, inApp: isInAppBox(b),
+      id: String(b.id), label: b.label === undefined ? undefined : cut(b.label, 200), description: b.description === undefined ? undefined : cut(b.description, 1000), source: b.source, inApp: isInAppBox(b),
       server: typeof b.server === 'string' && b.server ? b.server : null,
-      tools: (b.tools || []).filter(named).map((t) => ({
-        name: t.function.name, description: String(t.function.description || '').slice(0, 240), write: !!isWriteTool(t.function.name),
+      tools: (b.tools || []).filter(named).slice(0, boxToolCap).map((t) => ({
+        name: cut(t.function.name, 128), description: cut(t.function.description, 240), write: !!isWriteTool(t.function.name),
       })),
     })),
-    manifest: enabled ? manifest.map((e) => ({ id: e.id, label: e.label || e.id, description: e.description || '', inApp: isManifestBoxInApp(e) })) : [],
+    manifest: enabled ? manifest.map((e) => ({ id: e.id, label: cut(e.label || e.id, 200), description: cut(e.description || '', 1000), inApp: isManifestBoxInApp(e) })) : [],
     // Each server's last discovery, as the admin directory shows it: the tools actually bound to its own
     // box (not the global name registry, where collisions can hide a server's own tools).
     servers: servers.map((sv) => {
       const st = state.servers.get(sv.id);
       const box = sv.directory ? (state.boxes || []).find((b) => b.directory && b.server === sv.id && b.id === sv.id) : null;
       const tools = (box?.tools || []).slice(0, 40).map((t) => ({
-        name: String(t.function?.name || '').slice(0, 120), description: String(t.function?.description || '').slice(0, 240),
+        name: cut(t.function?.name, 120), description: cut(t.function?.description, 240),
       }));
       return {
-        id: sv.id, auth: sv.auth, directory: !!sv.directory, error: st?.error || null, toolCount: st?.toolCount ?? null,
+        id: sv.id, auth: sv.auth, directory: !!sv.directory, error: st?.error ? cut(st.error, MAX_ERROR_CHARS) : null, toolCount: st?.toolCount ?? null,
         tools, toolsTruncated: (box?.tools?.length || 0) > tools.length,
       };
     }),
@@ -111,4 +134,4 @@ function createMcpDiscoveryPublisher({ dataDir, discoverMcpTools, catalogue, dem
   });
 }
 
-module.exports = { SNAPSHOT_FILE, SNAPSHOT_KIND, EVERY_MS, buildCatalogue, createMcpDiscoveryPublisher };
+module.exports = { SNAPSHOT_FILE, SNAPSHOT_KIND, EVERY_MS, MAX_BYTES, MAX_BOX_TOOLS, buildCatalogue, createMcpDiscoveryPublisher };
