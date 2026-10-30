@@ -30,7 +30,7 @@ const PASS = Symbol('unhandled');
  * @param {{ forgetUser: (userId:string) => void }} [deps.mcpOAuth]      OAuth sign-ins, keyed per (user, server)
  * @param {{ forgetUser: (userId:string) => void }} [deps.directoryMcp]  directory server keys, keyed per (user, server)
  * @param {{ forgetUser: (userId:string) => Promise<void> }} [deps.chatgptOAuth]  Sign in with ChatGPT tokens (the Rust broker's), keyed per user
- * @param {(actorId:string) => object} [deps.rotateSecrets]  re-encrypts stored credentials under the current key
+ * @param {(actorId:string) => object|Promise<object>} [deps.rotateSecrets]  re-encrypts stored credentials under the current key
  */
 function createAuthRoutes({ json, readJson: readAnyJson, authService, workspaceStore, driveAccounts, fetchJson, DIARY_BASE, DIARY_TOKEN, diaryTenantHeaders = null, mcpOAuth, directoryMcp, chatgptOAuth = null, rotateSecrets }) {
   // Every body these routes read is a JSON object; `null`, an array or a number is a 400 (#786).
@@ -40,7 +40,7 @@ function createAuthRoutes({ json, readJson: readAnyJson, authService, workspaceS
       if (authn.user.role !== 'admin') return json(res, 403, { error: 'administrator required' });
       if (p === '/api/admin/secrets/rotate' && req.method === 'POST') {
         if (!rotateSecrets) return json(res, 501, { error: 'secrets rotation is not available' });
-        try { return json(res, 200, rotateSecrets(authn.user.id)); } catch (e) { return json(res, 500, { error: String(e.message || e) }); }
+        try { return json(res, 200, await rotateSecrets(authn.user.id)); } catch (e) { return json(res, 500, { error: String(e.message || e) }); }
       }
       const userRoute = p.match(/^\/api\/admin\/users\/([^/]+)$/);
       if (userRoute && req.method === 'DELETE') {

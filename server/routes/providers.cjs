@@ -1,274 +1,60 @@
 'use strict';
-// The provider registry's HTTP surface (providers.cjs holds the registry):
+// The provider registry's HTTP surface is the Rust front's (noevia-rs bins/noevia-server
+// provider_routes.rs, sbstndalton/noevia#2190 round 6; rust-providers.cjs refuses its routes before
+// authentication):
 //   GET    /api/providers        list, with keys masked
 //   POST   /api/providers        connect one (shared rows are admin-only)
-//   POST   /api/providers/test   the Rust front's (sbstndalton/noevia#2190 round 4, rust-provider-test.cjs)
-//   PUT    /api/providers/:id    edit one in place (#535); projects on it keep their provider/model
+//   PUT    /api/providers/:id    edit one in place (#535)
 //   DELETE /api/providers/:id    remove one; projects on it fall back to the default
-//   GET    /api/providers/:id/models[?refresh=1]  the Rust front's (sbstndalton/noevia#2190 round 5,
-//                                rust-provider-models.cjs)
-//
-// Sign in with ChatGPT (#447), only while features.chatgptOAuth is on (404 off). The Rust front is
-// its token broker (sbstndalton/noevia#2190 round 5, rust-chatgpt-oauth.cjs): it answers the status
-// GET, the device sign-in (POST device, device/poll, device/cancel) and GET /models, and keeps the
-// tokens. This mount answers only:
-//   DELETE /api/providers/chatgpt              disconnect: tokens deleted (by the broker), the provider row removed
-// The provider row follows the broker's token row: it is added here when the account lists or uses
-// its providers and a token row exists (the broker cannot write providers.json, which this process
-// writes), so a sign-in finished on the front shows up in the next listing.
-// A connection is always the signed-in account's own private provider, never shared.
+//   DELETE /api/providers/chatgpt   disconnect Sign in with ChatGPT (tokens, row and fallbacks)
+//   POST   /api/providers/test   the probe (round 4, rust-provider-test.cjs)
+//   GET    /api/providers/:id/models[?refresh=1]  (round 5, rust-provider-models.cjs)
+//   GET    /api/providers/chatgpt, POST .../chatgpt/device[/poll|/cancel], GET .../chatgpt/models
+//                                 Sign in with ChatGPT's status, device sign-in and catalogue
+//                                 (M6 and round 5, the front's token broker)
+// The front is the only writer of users/<id>/providers.json and shared-providers.json; this
+// process re-reads the private rows by the file's change signal (workspace.cjs) and never writes
+// them. This mount remains for what is still Node's on these paths, and as the last refusal of a
+// request that got past the early one (a stale route table), so two processes never answer:
+//   the other methods on /api/providers/chatgpt and /chatgpt/*: 404 while Sign in with ChatGPT is
+//   turned off (features.chatgptOAuth), 401 signed out, else 405.
 //
 // Returns true when it handled the request. Auth and CSRF run before routes are mounted.
-// The SSRF guard (endpointApproved) is the same policy the storage routes apply.
 
 const PASS = Symbol('unhandled');
 
 /**
  * @param {object} deps
  * @param {(res, status, body) => any} deps.json
- * @param {(req) => Promise<string>} deps.readBody
- * @param {(req) => Promise<any>} deps.readJson
- * @param {(authn, url:string) => boolean} deps.endpointApproved
- * @param {object[]} deps.PROVIDERS
- * @param {object[]} deps.PROJECTS
- * @param {string} deps.DEFAULT_PROVIDER_ID
- * @param {{ enabled:boolean }} deps.modelManager
- * @param {() => object} deps.currentWorkspace
- * @param {(projects:object[]) => void} deps.saveProjects
- * @param {object} deps.registry   providers.cjs
  * @param {object|null} [deps.chatgptOAuth]   chatgpt-oauth.cjs; null leaves Sign in with ChatGPT out entirely
  * @param {() => boolean} [deps.chatgptEnabled]   features.enabled('chatgptOAuth')
  */
-function createProviderRoutes({ json, readBody, readJson, endpointApproved, PROVIDERS, PROJECTS, DEFAULT_PROVIDER_ID, modelManager, currentWorkspace, saveProjects, registry, chatgptOAuth = null, chatgptEnabled = () => false }) {
-  const { saveProviders, saveSharedProviders, maskKey } = registry;
-  const { parseContextTokens, validContextTokens, parseCapabilities, effectiveCapabilities } = require('../providers.cjs');
-  const chatgpt = require('../chatgpt-oauth.cjs');
-  const egress = require('../provider-egress.cjs');
+function createProviderRoutes({ json, chatgptOAuth = null, chatgptEnabled = () => false }) {
   const { RUST_CHATGPT_STATUS_REFUSAL } = require('../features.cjs');
   const brokerRoutes = require('../rust-chatgpt-oauth.cjs');
-  // #1209: provider addresses are short; a long one only costs every listing and chat.
-  const MAX_BASE_URL = 2048;
+  const registry = require('../rust-providers.cjs');
   const chatgptOn = () => !!chatgptOAuth && chatgptEnabled();
 
-  // The provider row that points this account's chats at its ChatGPT connection (no credential in it).
-  function ensureChatGptRow() {
-    if (Array.from(PROVIDERS).some((pr) => pr.id === chatgpt.PROVIDER_ID && !pr.shared)) return;
-    PROVIDERS.push(chatgpt.providerRow());
-    saveProviders();
-  }
-  // sbstndalton/noevia#2190 round 5: the broker saved a sign-in this process did not see finish.
-  function reconcileChatGptRow(userId) {
-    if (!chatgptOn() || !userId) return;
-    if (chatgptOAuth.status(userId).state !== 'disconnected') ensureChatGptRow();
-  }
-  function removeChatGptRow() {
-    const row = Array.from(PROVIDERS).find((pr) => pr.id === chatgpt.PROVIDER_ID);
-    if (row && !row.shared) currentWorkspace().removeProvider(chatgpt.PROVIDER_ID);
-    let changed = false;
-    for (const pr of PROJECTS) if (pr.provider === chatgpt.PROVIDER_ID) {
-      delete pr.provider;
-      delete pr.model;
-      changed = true;
-    }
-    if (changed) saveProjects(PROJECTS);
-  }
-
-  async function handleChatGpt(req, res, p, authn, url) {
-    // The main router's auth/browser gate has already run. The status GET is the Rust front's
-    // (sbstndalton/noevia#1071): one that reaches this mount is a bypass, refused before any read.
-    if (p === '/api/providers/chatgpt' && req.method === 'GET') {
-      return json(res, 503, RUST_CHATGPT_STATUS_REFUSAL);
-    }
-    // The device sign-in and the model list are the broker's (refused before authentication by
-    // rust-chatgpt-oauth.cjs); one that reaches this mount is a bypass, refused before any read.
+  async function handleChatGpt(req, res, p, authn) {
+    // The status GET is the Rust front's (sbstndalton/noevia#1071); the device sign-in and the model
+    // list are the broker's; the disconnect is the registry's (round 6). One that reaches this mount
+    // is a bypass, refused before any read.
+    if (p === '/api/providers/chatgpt' && req.method === 'GET') return json(res, 503, RUST_CHATGPT_STATUS_REFUSAL);
     if (brokerRoutes.owned(req.method, p)) return json(res, 503, brokerRoutes.ROUTE_REFUSAL);
+    if (registry.owned(req.method, p)) return json(res, 503, registry.ROUTE_REFUSAL);
     if (!chatgptOn()) return json(res, 404, { error: 'Sign in with ChatGPT is turned off on this server.' });
-    const userId = authn?.user?.id;
-    if (!userId) return json(res, 401, { error: 'Sign in to noevia first.' });
-    try {
-      if (p === '/api/providers/chatgpt' && req.method === 'DELETE') {
-        // The tokens first: if the broker cannot delete them, the row stays and the answer says so.
-        await chatgptOAuth.disconnect(userId);
-        removeChatGptRow();
-        return json(res, 200, { ok: true, state: 'disconnected' });
-      }
-    } catch (e) {
-      // Messages from chatgpt-oauth.cjs are written for people and carry no credential.
-      return json(res, e.status && e.status < 600 ? e.status : 502, { error: e.status ? e.message : 'ChatGPT sign-in failed.' });
-    }
+    if (!authn?.user?.id) return json(res, 401, { error: 'Sign in to noevia first.' });
     return json(res, 405, { error: 'method not allowed' });
   }
 
-
-  // One provider as the client sees it: never the plaintext key.
-  function listRow(pr, authn) {
-    const contextTokens = validContextTokens(pr.contextTokens);
-    const capabilities = effectiveCapabilities(pr);
-    return {
-      id: pr.id,
-      label: pr.label,
-      baseUrl: pr.baseUrl,
-      apiKeyMasked: maskKey(pr.apiKey),
-      isDefault: pr.id === DEFAULT_PROVIDER_ID,
-      managed: pr.id === DEFAULT_PROVIDER_ID && modelManager.enabled,
-      shared: !!pr.shared,
-      defaultModel: pr.defaultModel || undefined,
-      ...(contextTokens ? { contextTokens } : {}),
-      ...(Object.keys(capabilities).length ? { capabilities } : {}),
-      // The stored key could not be decrypted on this server (#782): it needs entering again.
-      ...(pr.keyUnreadable ? { keyUnreadable: true } : {}),
-      ...(egress.isTrialTermsHost(pr) ? { external: true } : {}),
-      ...(chatgpt.isChatGptProvider(pr) ? { kind: chatgpt.KIND, external: true, connection: chatgptOAuth.status(authn?.user?.id).state } : {}),
-    };
-  }
-
-  // scheme://host:port of a URL, or null. A stored key may follow a path change, never an origin change.
-  function originOf(url) {
-    try { return new URL(url).origin; } catch { return null; }
-  }
-  const hasRealKey = (key) => !!key && key !== 'local';
-
-  // The rows PUT may not touch: the default (and its legacy alias), and rows a sign-in owns or
-  // the server flagged external (their address and credential are not the person's to set).
-  function editRefusal(id, row, authn) {
-    if (id === DEFAULT_PROVIDER_ID || id === 'lemonade') return [400, 'the default provider cannot be edited'];
-    if (!row) return [404, 'no such provider'];
-    if (chatgpt.isChatGptProvider(row) || row.external === true) return [400, 'this provider is managed by its sign-in and cannot be edited'];
-    if (row.shared && authn?.user?.role !== 'admin') return [403, 'administrator required'];
-    return null;
-  }
-
-  async function handle(req, res, { path: p, authn, url }) {
+  async function handle(req, res, { path: p, authn }) {
     // A stored provider's model list is the Rust front's (rust-provider-models.cjs, refused before
     // authentication); one that reaches this mount is a bypass, refused before any read.
     if (require('../rust-provider-models.cjs').owned(p)) return json(res, 503, require('../rust-provider-models.cjs').ROUTE_REFUSAL);
-    if (p === '/api/providers/chatgpt' || p.startsWith('/api/providers/chatgpt/')) return handleChatGpt(req, res, p, authn, url);
-    // ── Provider registry (step 9): list / connect / remove. GET never returns
-    // a saved apiKey in plaintext — masked, e.g. sk-…last4.
-    if (p === '/api/providers' && req.method === 'GET') {
-      reconcileChatGptRow(authn?.user?.id);
-      // A ChatGPT row is listed only while the flag is on, with its connection state instead of a key.
-      const listed = Array.from(PROVIDERS).filter((pr) => !chatgpt.isChatGptProvider(pr) || (chatgptOn() && !pr.shared));
-      return json(res, 200, { providers: listed.map((pr) => listRow(pr, authn)) });
-    }
-    if (p === '/api/providers' && req.method === 'POST') {
-      const raw = await readBody(req);
-      let body;
-      try {
-        body = JSON.parse(raw);
-      } catch {
-        return json(res, 400, { error: 'invalid JSON' });
-      }
-      if (!require('../http.cjs').isJsonObject(body)) return json(res, 400, { error: 'request body must be a JSON object' });
-      const label = String(body.label || '').trim().slice(0, 80);
-      let baseUrl = String(body.baseUrl || '').trim().replace(/\/+$/, '');
-      const apiKey = String(body.apiKey || '').trim();
-      const defaultModel = String(body.defaultModel || '').trim().slice(0, 200);
-      const shared = body.shared === true;
-      if (shared && authn.user.role !== 'admin') return json(res, 403, { error: 'administrator required for shared providers' });
-      if (!label) return json(res, 400, { error: 'label required' });
-      const context = parseContextTokens(body.contextTokens);
-      if (context.error) return json(res, 400, { error: context.error });
-      if (!/^https?:\/\//.test(baseUrl)) return json(res, 400, { error: 'baseUrl must be an http(s) URL' });
-      if (baseUrl.length > MAX_BASE_URL) return json(res, 400, { error: 'baseUrl is too long' });
-      // SSRF guard: a member must not register an endpoint the server can
-      // only reach from its own internal network (RFC1918, metadata, etc.).
-      // Admins are exempt — local-inference setups legitimately do this.
-      if (!endpointApproved(authn, baseUrl)) {
-        return json(res, 400, { error: 'Provider origin is not approved for member connections; contact an administrator.' });
-      }
-      let capabilities;
-      if (body.capabilities !== undefined && body.capabilities !== null) {
-        const parsed = parseCapabilities(body.capabilities);
-        if (parsed.error) return json(res, 400, { error: parsed.error });
-        capabilities = parsed.value;
-      }
-      const id = `prov-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-      PROVIDERS.push({ id, label, baseUrl, apiKey, defaultModel, shared, ...(context.value ? { contextTokens: context.value } : {}), ...(capabilities ? { capabilities } : {}) });
-      if (shared) saveSharedProviders(id); else saveProviders();
-      return json(res, 200, { id, label, baseUrl, defaultModel, apiKeyMasked: maskKey(apiKey), ...(context.value ? { contextTokens: context.value } : {}) });
-    }
-    // sbstndalton/noevia#2190 round 4: the probe is the Rust front's (rust-provider-test.cjs; normally
-    // refused before authentication). One that reaches this mount is a bypass.
+    if (p === '/api/providers/chatgpt' || p.startsWith('/api/providers/chatgpt/')) return handleChatGpt(req, res, p, authn);
+    // The registry (list, connect, edit, remove) is the Rust front's, as is the probe: a bypass.
+    if (registry.owned(req.method, p)) return json(res, 503, registry.ROUTE_REFUSAL);
     if (p === '/api/providers/test' && req.method === 'POST') return json(res, 503, require('../rust-provider-test.cjs').ROUTE_REFUSAL);
-    const provDel = p.match(/^\/api\/providers\/([^/]+)$/);
-    if (provDel && req.method === 'PUT') {
-      const id = decodeURIComponent(provDel[1]);
-      const row = Array.from(PROVIDERS).find((pr) => pr.id === id);
-      const refused = editRefusal(id, row, authn);
-      if (refused) return json(res, refused[0], { error: refused[1] });
-      let body;
-      try {
-        body = JSON.parse(await readBody(req));
-      } catch {
-        return json(res, 400, { error: 'invalid JSON' });
-      }
-      if (!body || typeof body !== 'object' || Array.isArray(body)) return json(res, 400, { error: 'invalid JSON' });
-      for (const field of ['label', 'baseUrl', 'apiKey', 'defaultModel']) {
-        if (body[field] !== undefined && body[field] !== null && typeof body[field] !== 'string') return json(res, 400, { error: `${field} must be a string` });
-      }
-      const label = body.label === undefined ? row.label : String(body.label || '').trim().slice(0, 80);
-      const baseUrl = body.baseUrl === undefined ? row.baseUrl : String(body.baseUrl || '').trim().replace(/\/+$/, '');
-      const newKey = String(body.apiKey || '').trim();
-      const defaultModel = body.defaultModel === undefined ? (row.defaultModel || '') : String(body.defaultModel || '').trim().slice(0, 200);
-      if (!label) return json(res, 400, { error: 'label required' });
-      if (!/^https?:\/\//.test(baseUrl)) return json(res, 400, { error: 'baseUrl must be an http(s) URL' });
-      if (baseUrl.length > MAX_BASE_URL) return json(res, 400, { error: 'baseUrl is too long' });
-      // Same SSRF guard as POST whenever the address changes.
-      if (baseUrl !== row.baseUrl && !endpointApproved(authn, baseUrl)) {
-        return json(res, 400, { error: 'Provider origin is not approved for member connections; contact an administrator.' });
-      }
-      // A stored key never follows the provider to another origin: that would send it somewhere
-      // the person never typed it for (and read it back out through a host they control).
-      if (!newKey && hasRealKey(row.apiKey) && (originOf(baseUrl) === null || originOf(baseUrl) !== originOf(row.baseUrl))) {
-        return json(res, 400, { error: 'Enter the API key again when moving a provider to a different address.' });
-      }
-      // Omitted keeps the stored value; null or '' clears it.
-      const context = body.contextTokens === undefined ? { value: validContextTokens(row.contextTokens) } : parseContextTokens(body.contextTokens);
-      if (context.error) return json(res, 400, { error: context.error });
-      // Omitted keeps the stored capabilities; null returns to the preset default; an object replaces them.
-      let capabilities = row.capabilities;
-      if (body.capabilities === null) capabilities = undefined;
-      else if (body.capabilities !== undefined) {
-        const parsed = parseCapabilities(body.capabilities);
-        if (parsed.error) return json(res, 400, { error: parsed.error });
-        capabilities = parsed.value;
-      }
-      // Validated in full before anything changes, so a refusal leaves the row as it was.
-      // A key that could not be decrypted (#782) is kept for its own origin only: moving the row
-      // elsewhere without a new key forgets it, so the old ciphertext never follows the address.
-      if (!newKey && row.keyUnreadable && originOf(baseUrl) !== originOf(row.baseUrl)) delete row.keyUnreadable;
-      row.label = label;
-      row.baseUrl = baseUrl;
-      if (newKey) { row.apiKey = newKey; delete row.keyUnreadable; }
-      row.defaultModel = defaultModel;
-      if (context.value) row.contextTokens = context.value; else delete row.contextTokens;
-      if (capabilities) row.capabilities = capabilities; else delete row.capabilities;
-      if (row.shared) saveSharedProviders(row.id); else saveProviders();
-      return json(res, 200, listRow(row, authn));
-    }
-    if (provDel && req.method === 'DELETE') {
-      const id = decodeURIComponent(provDel[1]);
-      if (id === DEFAULT_PROVIDER_ID || id === 'lemonade') return json(res, 400, { error: 'the default provider cannot be removed' });
-      const selectedProvider = Array.from(PROVIDERS).find(p => p.id === id);
-      if (selectedProvider?.shared && authn.user.role !== 'admin') return json(res, 403, { error: 'administrator required' });
-      // Removing the ChatGPT row is disconnecting: its tokens go too, flag on or off, and first (the
-      // broker's), so a failed delete leaves the row rather than tokens without a row.
-      if (chatgpt.isChatGptProvider(selectedProvider) && !selectedProvider.shared && chatgptOAuth && authn?.user?.id) {
-        try { await chatgptOAuth.disconnect(authn.user.id); }
-        catch (e) { return json(res, e.status && e.status < 600 ? e.status : 503, { error: e.status ? e.message : 'ChatGPT sign-in failed.' }); }
-      }
-      if (!currentWorkspace().removeProvider(id)) return json(res, 404, { error: 'no such provider' });
-      // Projects pointing at the removed provider fall back to the configured default.
-      for (const pr of PROJECTS) {
-        if (pr.provider === id) {
-          delete pr.provider;
-          delete pr.model;
-        }
-      }
-      saveProjects(PROJECTS);
-      return json(res, 200, { ok: true });
-    }
     return PASS;
   }
 

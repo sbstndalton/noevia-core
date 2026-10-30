@@ -4,6 +4,7 @@ const fs = require('fs');
 const path = require('path');
 const sourceText = require('./source-text.cjs');
 const legacyClaim = require('./legacy-claim.cjs');
+const { createReread, fileSignal } = require('./shared-reread.cjs');
 
 function readJson(file, fallback) {
   try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch { return fallback; }
@@ -19,10 +20,16 @@ function atomicJson(file, value) {
 // A stored provider key that no available secrets key opens (secrets.key restored without its
 // rows, or secrets.key.previous removed after a rotation that left failures). The row stays
 // usable with an empty key and `keyUnreadable: true`, so it can be re-entered, instead of the
-// throw taking down every request that loads the workspace (#782). Its original ciphertext is
-// kept off the enumerable row and written back unchanged on the next save, so restoring the
-// right key still recovers it; typing a new key replaces it.
-const UNREADABLE_CIPHERTEXT = Symbol('unreadableCiphertext');
+// throw taking down every request that loads the workspace (#782). The front, which writes the
+// file, keeps the original ciphertext as it was, so restoring the right key still recovers it.
+// A stored key the seal-on-load migration still has to seal: a non-empty string that is not an
+// `enc:` envelope of any version. The load (needsKeySeal) and the migration (sealLegacyProviders)
+// share this one predicate: with two, a key the migration leaves alone (an `enc:v2:` value, which
+// is bound to an account and so cannot be a provider key's, or a value that is not a string) kept
+// needsKeySeal true and sent every request to the store for nothing.
+function isPlaintextKey(value) {
+  return typeof value === 'string' && value !== '' && !/^enc:v\d+:/.test(value);
+}
 
 function openProviderKey(row, secrets) {
   if (!secrets) return;
@@ -31,19 +38,16 @@ function openProviderKey(row, secrets) {
   catch {
     row.apiKey = '';
     row.keyUnreadable = true;
-    Object.defineProperty(row, UNREADABLE_CIPHERTEXT, { value: stored, enumerable: false, configurable: true, writable: true });
   }
 }
 
-/** The on-disk form of a provider row: the key encrypted, or an unreadable key kept as it was.
- *  The ciphertext is written back only while the row is still flagged keyUnreadable; a caller
- *  that clears the flag (a new key, or a move to another origin) gets the key encrypted. */
-function sealProviderRow(row, secrets) {
-  const { keyUnreadable, ...rest } = row;
-  if (keyUnreadable && !row.apiKey && row[UNREADABLE_CIPHERTEXT]) return { ...rest, apiKey: row[UNREADABLE_CIPHERTEXT] };
-  return { ...rest, apiKey: secrets ? secrets.encrypt(row.apiKey) : row.apiKey };
-}
-
+// providers.json and shared-providers.json are the Rust front's (sbstndalton/noevia#2190 round 6,
+// rust-providers.cjs): its provider routes, and the ChatGPT row its token broker writes, are their
+// only writers. Node keeps no copy of the private rows: `privateProviders` re-reads the file by its
+// change signal (shared-reread.cjs) on every use, failing closed to no private providers, and the
+// shared rows are read again on every access (loadShared). Its one write is the seal-on-load
+// migration of a plaintext key (sealLegacyProviders), saved through the project store like
+// projects.json is.
 // projects.json and free-chats.json are the Rust front's (M4, rust-projects.cjs; permanent since
 // sbstndalton/noevia#1071): each workspace reads them again when they changed and saves by a merge
 // through the front's project store, never by writing either file itself.
@@ -73,12 +77,35 @@ function createWorkspaceStore(rootDir, defaultProvider, secrets, { projectStore 
   const usersDir = path.join(rootDir, 'users');
   const sharedFile = path.join(rootDir, 'shared-providers.json');
 
+  // A shared-providers.json that does not parse, or parses to something other than
+  // `{ providers: [objects] }` (a null, a providers that is not a list, a row that is not an
+  // object), is damaged. It must not throw for every
+  // account that loads a workspace: it fails closed to the environment's default row and the
+  // account's own rows (nothing shared is offered from a file nobody can trust), and says so once
+  // until the file reads well again. The front never overwrites a damaged file (it answers 500).
+  let sharedDamageLogged = false;
+  function sharedRows() {
+    let rows = [];
+    try {
+      const text = fs.readFileSync(sharedFile, 'utf8');
+      const doc = JSON.parse(text);
+      rows = doc === null || typeof doc !== 'object' || Array.isArray(doc) ? null : (doc.providers === undefined || doc.providers === null ? [] : doc.providers);
+    } catch (e) { rows = e && e.code === 'ENOENT' ? [] : null; }
+    const sound = Array.isArray(rows) && rows.every((row) => row !== null && typeof row === 'object' && !Array.isArray(row));
+    if (!sound) {
+      if (!sharedDamageLogged) { sharedDamageLogged = true; console.warn('[providers] shared-providers.json is damaged; shared providers are not offered until it is repaired'); }
+      return [];
+    }
+    sharedDamageLogged = false;
+    return rows;
+  }
+
   function loadShared() {
-    const rows = readJson(sharedFile, { providers: [] }).providers || [];
+    const rows = sharedRows();
     for (const row of rows) openProviderKey(row, secrets);
     // A stale default row may exist in the file from before this fix. Prefer
     // the current env-derived defaultProvider values for that id (dropped on
-    // the next saveShared()/removeProvider() write since both now exclude it).
+    // the front's next write of that file, which excludes it).
     const filtered = rows.filter(p => p.id !== defaultProvider.id);
     filtered.unshift({ ...defaultProvider, shared: true });
     return filtered;
@@ -109,6 +136,7 @@ function createWorkspaceStore(rootDir, defaultProvider, secrets, { projectStore 
     const cached = cache.get(userId);
     if (cached) {
       cached.providers = mergeProviders(cached.privateProviders);
+      if (cached.needsKeySeal()) cached.sealLegacyProviders();
       const projectsChanged = cached.projectsFile.refresh(cached.projects);
       const freeChatsChanged = cached.freeChatsFile.refresh(cached);
       if (projectsChanged || freeChatsChanged) onProjectsChanged(userId);
@@ -145,16 +173,59 @@ function createWorkspaceStore(rootDir, defaultProvider, secrets, { projectStore 
     const projects = Array.isArray(loaded) ? loaded : [];
     const freeChatsFile = require('./rust-projects.cjs').createFreeChatsFile(path.join(dir, 'free-chats.json'), { atomicJson, remote });
     const providerFile = path.join(dir, 'providers.json');
-    const savedProviders = readJson(providerFile, { providers: [] }).providers || [];
-    let needsEncryption = false;
-    for (const provider of savedProviders) {
-      if (provider.apiKey && !String(provider.apiKey).startsWith('enc:v1:')) needsEncryption = true;
-      openProviderKey(provider, secrets);
+    // The private rows as the file holds them now (keys opened, the legacy `lemonade` id read as the
+    // default, the first row of each id). `legacyKeys` notes a plaintext key left in the file, which
+    // the migration below seals through the store.
+    let legacyKeys = false;
+    const privateRows = createReread({
+      signal: () => fileSignal(providerFile),
+      load: () => {
+        const stored = readJson(providerFile, { providers: [] }).providers || [];
+        let plaintext = false;
+        for (const provider of stored) {
+          if (isPlaintextKey(provider.apiKey)) plaintext = true;
+          openProviderKey(provider, secrets);
+        }
+        for (const provider of stored) {
+          if (provider.id === 'lemonade') { provider.id = defaultProvider.id; provider.label = defaultProvider.label; }
+        }
+        legacyKeys = plaintext;
+        const unique = stored.filter((provider, index, all) => all.findIndex(p => p.id === provider.id) === index);
+        return unique.filter(p => p.id !== defaultProvider.id);
+      },
+      // A file that cannot be read means no private providers (chat falls back to the default),
+      // never the last rows Node happened to read.
+      fallback: () => { legacyKeys = false; return []; },
+    });
+    let sealing = null, sealFailedAt = 0;
+    /** Seals the plaintext keys of this account's providers.json under the current key, through the
+     *  Rust project store (compare-and-swap on the file's version, merged again on a conflict). */
+    function sealLegacyProviders() {
+      // After a failure, not again for half a minute (every request would retry and log).
+      if (sealing || Date.now() - sealFailedAt < 30000) return sealing || Promise.resolve();
+      sealing = (async () => {
+        for (let attempt = 0; attempt < 4; attempt++) {
+          const { version, text } = await projectStore.read(userId, 'providers.json');
+          if (text === null) return;
+          let doc;
+          try { doc = JSON.parse(text); } catch { return; }
+          if (!doc || !Array.isArray(doc.providers)) return;
+          let changed = false;
+          for (const row of doc.providers) {
+            if (row && isPlaintextKey(row.apiKey)) { row.apiKey = secrets ? secrets.encrypt(row.apiKey) : row.apiKey; changed = true; }
+          }
+          if (!changed) return;
+          const saved = await projectStore.write(userId, 'providers.json', version, JSON.stringify(doc, null, 2));
+          if (saved.ok) return;
+        }
+        // Every attempt met a newer version: quiet for half a minute, as after a failed one,
+        // instead of a store round trip (and a log line) on every request.
+        sealFailedAt = Date.now();
+        console.warn('[providers] could not seal legacy provider keys: the file kept changing; trying again shortly');
+      })().catch((e) => { sealFailedAt = Date.now(); console.warn('[providers] could not seal legacy provider keys through the project store:', e.message); })
+        .finally(() => { sealing = null; });
+      return sealing;
     }
-    for (const provider of savedProviders) {
-      if (provider.id === 'lemonade') { provider.id = defaultProvider.id; provider.label = defaultProvider.label; }
-    }
-    const uniqueProviders = savedProviders.filter((provider, index, all) => all.findIndex(p => p.id === provider.id) === index);
     // #1236: a null entry in project.files (a damaged projects.json) is dropped on load, so no reader
     // (uploads.prune, instruction-skills reconcile, the edit planner) meets a null and throws a TypeError.
     for (const project of projects) if (project && Array.isArray(project.files)) project.files = project.files.filter((f) => f && typeof f === 'object');
@@ -211,10 +282,12 @@ function createWorkspaceStore(rootDir, defaultProvider, secrets, { projectStore 
       assertActive() {
         if (this.revoked) throw Object.assign(new Error('account no longer exists'), { status: 410 });
       },
-      // `privateProviders` is the cached per-user truth; `providers` is the
-      // merged view rebuilt from disk on every get() so it always reflects
-      // the current shared set.
-      privateProviders: uniqueProviders.filter(p => p.id !== defaultProvider.id),
+      // `privateProviders` is the file's rows as of now (re-read when it changed); `providers` is the
+      // merged view rebuilt on every get() so it always reflects the current shared set.
+      get privateProviders() { return privateRows.current(); },
+      /** A plaintext key was left in the file the last time it was read (see sealLegacyProviders). */
+      needsKeySeal() { return legacyKeys; },
+      sealLegacyProviders,
       providers: [],
       // #1420: free-chats.json holding null (or any non-list) is an empty list, never a null the routes trip on.
       freeChats: (() => { const list = freeChatsFile.load(); return Array.isArray(list) ? list : []; })(),
@@ -259,66 +332,6 @@ function createWorkspaceStore(rootDir, defaultProvider, secrets, { projectStore 
         }
         } finally { restoreModes(); }
       },
-      saveProviders() {
-        this.assertActive();
-        const encode = p => sealProviderRow(p, secrets);
-        // Adopt rows a consumer pushed directly onto the merged `providers`
-        // view (the historical push-then-save contract). Existing rows are
-        // shared by reference between the view and privateProviders, so
-        // edits to them are already visible here.
-        const sharedIds = new Set(loadShared().map(p => p.id));
-        for (const p of this.providers) {
-          if (!p.shared && !sharedIds.has(p.id) && p.id !== defaultProvider.id &&
-              !this.privateProviders.some(q => q.id === p.id)) {
-            this.privateProviders.push(p);
-          }
-        }
-        // Writes ONLY this user's private provider file. Never touches
-        // shared-providers.json — shared rows are managed exclusively via
-        // saveShared(), so a stale private save can't erase another
-        // admin's shared provider.
-        atomicJson(providerFile, { providers: this.privateProviders.map(encode) });
-        this.providers = mergeProviders(this.privateProviders);
-      },
-      // Admin path for shared-provider changes. The change is applied BY ID onto a fresh read
-      // of shared-providers.json, never by writing this view's whole shared set: the view was
-      // merged when the request started, and another admin may have saved a shared provider
-      // while this request awaited its body (#785).
-      //   saveShared(id)  upserts this view's row `id`, or removes `id` when the view no longer
-      //                   holds it as a shared row
-      //   saveShared()    upserts every shared row of this view; never removes a row
-      saveShared(id) {
-        this.assertActive();
-        const encode = p => sealProviderRow(p, secrets);
-        const viewShared = this.providers.filter(p => p.shared && p.id !== defaultProvider.id);
-        const changes = id === undefined ? viewShared : viewShared.filter(p => p.id === id);
-        let rows = loadShared().filter(p => p.id !== defaultProvider.id);
-        if (id !== undefined && !changes.length) rows = rows.filter(p => p.id !== id);
-        for (const row of changes) {
-          const at = rows.findIndex(p => p.id === row.id);
-          if (at === -1) rows.push(row); else rows[at] = row;
-        }
-        atomicJson(sharedFile, { providers: rows.map(encode) });
-        this.providers = mergeProviders(this.privateProviders);
-      },
-      removeProvider(id) {
-        this.assertActive();
-        const selected = this.providers.find(p => p.id === id);
-        if (!selected || id === defaultProvider.id) return false;
-        if (selected.shared) {
-          const encode = p => sealProviderRow(p, secrets);
-          // Mirror saveShared(): never persist the built-in default row back
-          // to shared-providers.json, or its env-sourced key gets baked into
-          // the file and the env value is ignored from then on.
-          atomicJson(sharedFile, { providers: loadShared().filter(p => p.id !== id && p.id !== defaultProvider.id).map(encode) });
-        } else {
-          this.privateProviders = this.privateProviders.filter(p => p.id !== id);
-          this.providers = this.providers.filter(p => p.id !== id);
-          this.saveProviders();
-        }
-        this.providers = mergeProviders(this.privateProviders);
-        return true;
-      },
       saveFreeChats() {
         this.assertActive();
         const saved = freeChatsFile.save(this);
@@ -352,7 +365,7 @@ function createWorkspaceStore(rootDir, defaultProvider, secrets, { projectStore 
     };
     workspace.providers = mergeProviders(workspace.privateProviders);
     cache.set(userId, workspace);
-    if (needsEncryption) workspace.saveProviders();
+    if (workspace.needsKeySeal()) sealLegacyProviders();
     if (modesMigrated || textMigrated) workspace.saveProjects();
     return workspace;
   }
