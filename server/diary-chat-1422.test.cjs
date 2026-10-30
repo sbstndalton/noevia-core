@@ -10,6 +10,7 @@ const { EventEmitter } = require('node:events');
 const { createChatHandler } = require('./chat.cjs');
 const { createToolExchange } = require('./tool-exchange.cjs');
 const jobs = require('./diary-jobs.cjs');
+const { rows } = require('../tests/server/diary-records.cjs');
 
 const DAY = '2026-10-12';
 const sse = (events) => new Response(new ReadableStream({ start(c) { for (const e of events) c.enqueue(new TextEncoder().encode(`data: ${JSON.stringify(e)}\n\n`)); c.close(); } }), { headers: { 'Content-Type': 'text/event-stream' } });
@@ -58,7 +59,7 @@ function setup(t, { diary, health = { ok: true, model: 'configured-model' }, ser
     try {
       await handleChat({}, res, { spaceId: 'diary', exchangeId: 'exchange-1422-synthetic-a', entryDay: DAY, entryTime: `${DAY}T10:00:00+00:00`, sessionId: 's1', message: 'Synthetic diary line', history: [], ...body }, { user });
     } finally { if (!res.writableEnded) res.end(); }
-    return { events, refused, row: jobs.list({ dir }, DAY).find((r) => r.id === (body.exchangeId || 'exchange-1422-synthetic-a')) };
+    return { events, refused, row: rows({ dir }, DAY).find((r) => r.id === (body.exchangeId || 'exchange-1422-synthetic-a')) };
   };
   return { run, fetched, touched };
 }

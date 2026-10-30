@@ -2,7 +2,25 @@
 const fs=require('node:fs'),path=require('node:path');
 const {atomicJson}=require('./workspace.cjs');
 const {eventReason,relayableToken}=require('./diary-stream.cjs');
-const active=new Set();
+const {START_ID}=require('./chat-partial.cjs');
+// Which exchanges run in this process, per workspace directory ('<day>/<id>.json'). The Rust front lists
+// and dismisses the recovery records (#2206), so what was this process's memory is published beside
+// them: `diary-conversations/active.json` = { start, files }, with the container start that wrote it
+// (NOEVIA_START_ID), so a set left by a Node that is gone names nothing. The order is the contract: a
+// record is added to the set (and the set written) BEFORE its first write, and removed AFTER its last,
+// so a record that reads `running` and is missing from a set read afterwards is one nothing runs for.
+// The file the front reads (noevia-rs crates/server-diary `exchanges::ACTIVE_FILE`).
+const SIGNAL='active.json';
+const running=new Map();
+function publish(dir){
+ atomicJson(path.join(dir,'diary-conversations',SIGNAL),{start:START_ID,files:[...(running.get(dir)||[])].sort()});
+}
+function release(dir,rel){
+ const set=running.get(dir);if(!set)return;
+ set.delete(rel);if(!set.size)running.delete(dir);
+ // Best effort: a stale name only keeps a finished record from being dismissed until the next publish.
+ try{publish(dir);}catch{/* the next start or finish writes the whole set again */}
+}
 const validDay=day=>typeof day==='string'&&/^\d{4}-\d{2}-\d{2}$/.test(day)&&Number.isFinite(Date.parse(day+'T12:00:00Z'))&&new Date(day+'T12:00:00Z').toISOString().slice(0,10)===day;
 function location(workspace,day,id){
  if(!validDay(day)||!/^[a-zA-Z0-9-]{16,80}$/.test(id||''))throw Object.assign(Error('Valid diary day and exchange ID required.'),{status:400});
@@ -21,8 +39,11 @@ function start(workspace,{entryDay,exchangeId,message,kind,preparationId},{saveI
   if(prior.kind!=='preparation'||prior.state!=='complete'||prior.message!==message)throw Object.assign(Error('Optional preparation is not complete for this message.'),{status:409});
  }
  const row={kind:kind==='preparation'?'preparation':'capture',preparationId:preparationId||null,tools:[],id:exchangeId,day:entryDay,message,startedAt:Date.now(),state:'running',content:'',reasoning:'',activity:[],decision:null};
- // Persist before dispatch. An orphaned running record is never replayed.
- atomicJson(file,row);active.add(file);
+ // Publish the set, then persist the record, before dispatch. An orphaned running record is never replayed.
+ const dir=workspace.dir,rel=`${entryDay}/${exchangeId}.json`;
+ if(!running.has(dir))running.set(dir,new Set());
+ running.get(dir).add(rel);
+ try{publish(dir);atomicJson(file,row);}catch(error){release(dir,rel);throw error;}
  let lastSave=now(),timer=null,dirty=false;
  // dirty/lastSave change only once the write succeeded, so a failed write is retried by the next
  // event or by finish().
@@ -66,29 +87,7 @@ function start(workspace,{entryDay,exchangeId,message,kind,preparationId},{saveI
    // dirty first: if this write fails, finish() still retries it (#894).
    if(IMMEDIATE.has(event.type)){dirty=true;save();}else saveSoon();
   },
-  finish(){try{const interrupted=row.state==='running';if(interrupted)row.state='uncertain';if(interrupted||dirty)save();}finally{if(timer){clearTimer(timer);timer=null;}active.delete(file);}},
+  finish(){try{const interrupted=row.state==='running';if(interrupted)row.state='uncertain';if(interrupted||dirty)save();}finally{if(timer){clearTimer(timer);timer=null;}release(dir,rel);}},
  };
 }
-function list(workspace,day){
- if(!validDay(day))throw Object.assign(Error('Valid diary day required.'),{status:400});
- const dir=path.join(workspace.dir,'diary-conversations',day);if(!fs.existsSync(dir))return [];
- const names=fs.readdirSync(dir).filter(n=>/^[a-zA-Z0-9-]{16,80}\.json$/.test(n));
- // Bound returned data, without deleting older transcripts.
- return names.map(name=>{
-  const file=path.join(dir,name);try{const row=JSON.parse(fs.readFileSync(file,'utf8'));if(row.state==='running'&&!active.has(file))row.state='uncertain';return row;}catch{return null;}
- }).filter(Boolean).sort((a,b)=>a.startedAt-b.startedAt).slice(-100);
-}
-// #1422: an uncertain (or failed) exchange stays in the day's record, but the person can mark it as
-// reviewed so it stops raising the "uncertain save" banner. This records that someone looked; it
-// never claims the entry was or was not saved, and it never edits the diary.
-function acknowledge(workspace,day,id,{now=Date.now}={}){
- const file=location(workspace,day,id);
- if(!fs.existsSync(file))throw Object.assign(Error('No such exchange.'),{status:404});
- if(active.has(file))throw Object.assign(Error('This exchange is still running.'),{status:409});
- let row;try{row=JSON.parse(fs.readFileSync(file,'utf8'));}catch{throw Object.assign(Error('This exchange record cannot be read.'),{status:500});}
- if(row.state==='running')row.state='uncertain'; // an orphaned record, as list() reports it
- if(row.state!=='uncertain'&&row.state!=='failed')throw Object.assign(Error('This exchange has nothing to resolve.'),{status:409});
- if(!row.acknowledgedAt){row.acknowledgedAt=now();row.updatedAt=now();atomicJson(file,row);}
- return row;
-}
-module.exports={start,list,acknowledge,validDay};
+module.exports={start,validDay,SIGNAL};

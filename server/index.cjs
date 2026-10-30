@@ -451,7 +451,7 @@ function inferenceHeaders(extra) {
 // The member-origin policy for providers, storage connections and the Diary corpus (ssrf.cjs).
 const endpointApproved = createEndpointApproved();
 // The Diary sidecar client: tenant headers, the corpus reads and the connector file bridge (diary.cjs).
-const diary = require('./diary.cjs').createDiary({ fs, path, fetchJson, DIARY_BASE, DIARY_TOKEN, DIARY_TENANT_KEY, DIARY_SOURCE, requestScope, authService, endpointApproved, workspaceStore });
+const diary = require('./diary.cjs').createDiary({ fs, path, fetchJson, DIARY_BASE, DIARY_TOKEN, DIARY_TENANT_KEY, DIARY_SOURCE, requestScope, authService, endpointApproved });
 const { diaryHeaders, diaryFetchJson } = diary;
 // The Diary files client (/api/file, /api/directory, /api/workspace-ops), always as one user and
 // with that user's tenant headers. Shared by the DAV listener and the chat mirror (#741).
@@ -1152,13 +1152,13 @@ const modelRoutes = require('./routes/models.cjs').createModelRoutes({
 }
 // ── Routing ────────────────────────────────────────────────────────────────
 
-const diaryConnectors = require('./diary-connectors.cjs').createCredentials(authService);
-const connectorRate = require('./auth.cjs').createRateLimiter();
-// The Diary routes: the connector endpoint, the connector credentials and /api/diary/* (routes/diary.cjs).
+// The connector credentials and the connector endpoint are the Rust front's (#2206, rust-diary-routes.cjs);
+// the table is still created here, at boot, in the shape a rollback reads.
+require('./diary-connectors.cjs').ensureTable(authService.db);
+// The Diary routes that stay: the local exchange (the model throttle and the inference gate), the
+// files, the trash, the history, the operator import folders and the entry edit (routes/diary.cjs).
 const diaryRoutes = require('./routes/diary.cjs').createDiaryRoutes({
-  json, readBody, readJson, fetchJson, DIARY_BASE, authService, currentWorkspace, rateLimited: (userId) => llmRateLimited(userId), connectorRate, diaryConnectors, diary,
-  clientAddress: (req) => require('./auth.cjs').clientAddress(req, process.env.TRUST_PROXY === 'true'),
-  addressesTrusted: process.env.TRUST_PROXY === 'true',
+  json, readBody, readJson, fetchJson, DIARY_BASE, authService, currentWorkspace, rateLimited: (userId) => llmRateLimited(userId), diary,
   storageLatch,
 });
 // The router's list of the paths a signed-out browser may call. Their sign-in methods are the Rust
@@ -1266,6 +1266,9 @@ async function handleRequestInner(req, res) {
   if (require('./routes/features.cjs').refuseOwnedFeatures(req, res, { parseRequestUrl, json })) return;
   // The Diary routes that are only a proxy and a policy are the Rust front's (#2185).
   if (require('./rust-diary.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
+  // And the rest of the Diary routes the web client names but the local exchange (#2206): the storage
+  // status, the exchanges, the context, the connector endpoint and the connector credentials.
+  if (require('./rust-diary-routes.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   // So are the two configuration-only model reads (#2187): GET /api/models/capabilities and /hardware.
   if (require('./rust-models.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   // And a project source's stored text and originals (#2191): GET sources/text, documents/original, uploads/original.
@@ -1349,7 +1352,6 @@ async function handleRequestScoped(req, res) {
     // So are the M4 project routes (#1071): Node refuses them whoever asks.
     if (require('./rust-projects.cjs').refuseOwnedRoute(req, res, p, json)) return;
     if (require('./rust-web-address.cjs').refuseOwned(req, res, p, json)) return;
-    if (await diaryRoutes.connector(req, res, { path: p })) return;
     if ((p === '/api/instance' || p === '/.well-known/webauthn') && await webAddressRoutes(req, res, { path: p, authn: null })) return;
     if (await deviceRoutes.open(req, res, { path: p })) return;
     if (await readyRoutes(req, res, { path: p })) return;
@@ -1376,7 +1378,6 @@ async function handleRequestScoped(req, res) {
     if (authn && p.startsWith('/api/projects/') && await researchRoutes(req, res, { path: p, authn })) return;
     if (authn && (p === '/api/code/active' || p.startsWith('/api/projects/')) && await codeRoutes(req, res, { path: p, authn })) return;
     if (authn && p.startsWith('/api/projects/') && await browserRoutes(req, res, { path: p, authn })) return;
-    if (await diaryRoutes.connectors(req, res, { path: p, authn })) return;
     if (await projectRoutes(req, res, { path: p, authn, url })) return;
     if (await authRoutes.account(req, res, { path: p, authn })) return;
     if (await storageRoutes(req, res, { path: p, authn })) return;
@@ -1426,7 +1427,7 @@ async function handleRequest(req,res) {
   // responses. Set it before the maintenance gate, which may return early.
   if (pathname.startsWith('/api/')) res.setHeader('X-Noevia-API', '1');
   // The Diary routes the Rust front owns (rust-diary.cjs) are refused below and never take the gate.
-  const inference=req.method!=='GET' && (pathname==='/api/chat' || (pathname.startsWith('/api/diary/') && !require('./rust-diary.cjs').owned(pathname)));
+  const inference=req.method!=='GET' && (pathname==='/api/chat' || (pathname.startsWith('/api/diary/') && !require('./rust-diary.cjs').owned(pathname) && !require('./rust-diary-routes.cjs').owned(req.method,pathname)));
   let leave;
   // #1896: a chat turn waits a moment (<= 3 s) for a briefly held gate, then answers a retryable 503 and logs its reason.
   const chatAdmission=require('./chat-admission.cjs');

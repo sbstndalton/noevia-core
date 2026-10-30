@@ -1,36 +1,29 @@
 'use strict';
-// The three Diary mounts over fakes: the connector endpoint's own checks (method, no browser
-// origin, rate, credential), the credential list/create/revoke, and the /api/diary/* block with
-// its add-on gate, method guards and the words it keeps. The sidecar client is diary.test.cjs.
+// The /api/diary/* mount that stays in this process, over fakes: its add-on gate, method guards and
+// the words it keeps. The sidecar client is diary.test.cjs. The connector endpoint, the connector
+// credentials, the recovery records and the storage status are the Rust front's (#2206): noevia-rs
+// crates/server-diary/tests and bins/noevia-server/tests/diary.rs; Node refuses them in rust-diary-routes.test.cjs.
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const { Readable } = require('node:stream');
 const { createDiaryRoutes } = require('./diary.cjs');
 
-function fixture({ dir = '/nowhere', diaryOn = true, limited = false, connectorLimited = false, admin = false, reply, clientAddress, addressesTrusted, rateLimitedKeys, log, storageLatch } = {}) {
-  const sent = [], fetched = [], audits = [], headers = [];
-  const rateKeys = [];
-  const credentials = [{ id: 'a'.repeat(32), name: 'Claude Diary' }];
+function fixture({ dir = '/nowhere', diaryOn = true, limited = false, admin = false, reply, log, storageLatch } = {}) {
+  const sent = [], fetched = [], headers = [];
   const routes = createDiaryRoutes({
     json: (res, status, body, extra) => { sent.push({ status, body, ...(extra ? { headers: extra } : {}) }); },
     readBody: async (req) => { let s = ''; for await (const c of req) s += c; return s; },
     readJson: require('../http.cjs').readJson,
     fetchJson: async (url, init) => { fetched.push({ url, init }); return reply ? reply(url, init) : { ok: true, status: 200, body: { ok: true } }; },
     DIARY_BASE: 'http://diary:8010',
-    authService: { diaryEnabled: () => diaryOn, audit: (...args) => audits.push(args), getStorage: () => ({ kind: 'nextcloud', baseUrl: 'https://cloud.example/dav', username: 'ada', secret: 'synthetic-pw' }) },
+    authService: { diaryEnabled: () => diaryOn, getStorage: () => ({ kind: 'nextcloud', baseUrl: 'https://cloud.example/dav', username: 'ada', secret: 'synthetic-pw' }) },
     currentWorkspace: () => ({ userId: 'u1', dir }),
     rateLimited: () => limited,
-    connectorRate: { rateLimited: (key, limit) => { rateKeys.push(key); return rateLimitedKeys ? rateLimitedKeys.has(key) : connectorLimited; } },
-    clientAddress, addressesTrusted, storageLatch,
-    diaryConnectors: {
-      verify: (token) => (token === 'good' ? { id: credentials[0].id, userId: 'u1' } : null),
-      list: () => credentials, create: (userId, name) => ({ id: 'b'.repeat(32), name, userId }), revoke: (userId, id) => id === credentials[0].id,
-    },
+    storageLatch,
     diary: {
       diaryHeaders: (method, url, opts) => ({ 'X-Cowork-User-ID': 'u1', ...(opts?.storageRetry ? { 'X-Cowork-Storage-Retry': '1' } : {}) }),
       log: log || (() => {}),
       corpusSource: { name: 'sidecar', readMonth: async (m) => ({ todayLog: m || 'today', standing: '' }) },
-      connectorFiles: { list: async () => [], read: async () => ({}), write: async () => ({}) },
     },
   });
   const call = (mount, method, path, body, { search = '', role = admin ? 'admin' : 'member', reqHeaders = {} } = {}) => {
@@ -39,91 +32,26 @@ function fixture({ dir = '/nowhere', diaryOn = true, limited = false, connectorL
     const res = { setHeader: (k, v) => headers.push([k, v]) };
     return routes[mount](req, res, { path, authn: { user: { id: 'u1', role } }, url: new URL(`http://localhost${path}${search}`) });
   };
-  return { call, sent, fetched, audits, headers, credentials, rateKeys };
+  return { call, sent, fetched, headers };
 }
-
-test('the connector endpoint is POST-only, refuses browsers, rate-limits and checks the credential', async () => {
-  const f = fixture();
-  assert.equal(await f.call('connector', 'POST', '/api/diary-connectors'), false);
-  await f.call('connector', 'GET', '/api/diary-connector');
-  assert.deepEqual(f.sent.pop(), { status: 405, body: { error: 'POST required' } });
-  await f.call('connector', 'POST', '/api/diary-connector', {}, { reqHeaders: { origin: 'https://app.example' } });
-  assert.deepEqual(f.sent.pop(), { status: 403, body: { error: 'Use the authenticated connector client' } });
-  await f.call('connector', 'POST', '/api/diary-connector', {}, { reqHeaders: { authorization: 'Bearer nope' } });
-  assert.deepEqual(f.sent.pop(), { status: 401, body: { error: 'Diary connector credential required' } });
-  assert.ok(f.headers.some(([k, v]) => k === 'Cache-Control' && v === 'no-store'));
-  const limited = fixture({ connectorLimited: true });
-  await limited.call('connector', 'POST', '/api/diary-connector', {}, { reqHeaders: { authorization: 'Bearer good' } });
-  assert.deepEqual(limited.sent.pop(), { status: 429, body: { error: 'Try later' } });
-});
-
-test('#796: the connector rate limit is per credential; unknown tokens use their own bucket and cannot lock out a connector', async () => {
-  // Shared tunnel address: a flooded invalid bucket must not touch the good credential's.
-  const f = fixture({ clientAddress: () => 'tunnel', rateLimitedKeys: new Set(['diary-connector:invalid']) });
-  await f.call('connector', 'POST', '/api/diary-connector', {}, { reqHeaders: { authorization: 'Bearer nope' } });
-  assert.deepEqual(f.sent.pop(), { status: 429, body: { error: 'Try later' } });
-  await f.call('connector', 'POST', '/api/diary-connector', { action: 'list', path: 'Notes' }, { reqHeaders: { authorization: 'Bearer good' } });
-  assert.equal(f.sent.pop().status, 200, 'a working connector is unaffected by the flood of bad tokens');
-  assert.deepEqual(f.rateKeys, ['diary-connector:invalid', 'diary-connector:credential:' + 'a'.repeat(32)]);
-  assert.ok(!f.rateKeys.some((k) => k.includes('tunnel')), 'the shared address is never a bucket key');
-  // A connector over its own budget is limited, and only that one.
-  const g = fixture({ rateLimitedKeys: new Set(['diary-connector:credential:' + 'a'.repeat(32)]) });
-  await g.call('connector', 'POST', '/api/diary-connector', {}, { reqHeaders: { authorization: 'Bearer good' } });
-  assert.deepEqual(g.sent.pop(), { status: 429, body: { error: 'Try later' } });
-  // The address joins the invalid bucket only when TRUST_PROXY makes it a real client address.
-  const t = fixture({ clientAddress: () => 'proxy-resolved-ip', addressesTrusted: true });
-  await t.call('connector', 'POST', '/api/diary-connector', {}, { reqHeaders: {} });
-  assert.deepEqual(t.rateKeys, ['diary-connector:invalid:proxy-resolved-ip']);
-  assert.equal(t.sent.pop().status, 401);
-});
-
-test('a verified connector write is forwarded and audited with its path and size', async () => {
-  const f = fixture();
-  assert.equal(await f.call('connector', 'POST', '/api/diary-connector', { action: 'list', path: 'Notes' }, { reqHeaders: { authorization: 'Bearer good' } }), true);
-  assert.equal(f.sent.pop().status, 200);
-  assert.equal(f.audits.length, 0, 'a read is not audited');
-  await f.call('connector', 'POST', '/api/diary-connector', { action: 'write', path: 'Notes/a.md', content: 'hello', version: null }, { reqHeaders: { authorization: 'Bearer good' } });
-  const reply = f.sent.pop();
-  assert.equal(reply.status, 200, JSON.stringify(reply));
-  assert.equal(f.audits.length, 1);
-  assert.equal(f.audits[0][0], 'diary-connector.write');
-  assert.deepEqual(f.audits[0][3], { credentialId: 'a'.repeat(32), path: 'Notes/a.md', bytes: 5 });
-});
-
-test('credentials are listed, created with a name and revoked by id', async () => {
-  const f = fixture();
-  assert.equal(await f.call('connectors', 'GET', '/api/profile/diary-connectors/'), false);
-  await f.call('connectors', 'GET', '/api/profile/diary-connectors');
-  assert.deepEqual(f.sent.pop(), { status: 200, body: { connectors: f.credentials } });
-  await f.call('connectors', 'POST', '/api/profile/diary-connectors', { name: 'Phone' });
-  assert.deepEqual(f.sent.pop(), { status: 201, body: { id: 'b'.repeat(32), name: 'Phone', userId: 'u1' } });
-  await f.call('connectors', 'DELETE', `/api/profile/diary-connectors/${'a'.repeat(32)}`);
-  assert.deepEqual(f.sent.pop(), { status: 200, body: { revoked: true } });
-  await f.call('connectors', 'DELETE', `/api/profile/diary-connectors/${'c'.repeat(32)}`);
-  assert.deepEqual(f.sent.pop(), { status: 200, body: { revoked: false } });
-  assert.equal(await f.call('connectors', 'DELETE', '/api/profile/diary-connectors/short'), false, 'a malformed id is not a connector route');
-});
 
 test('every /api/diary route this mount keeps is gated on the add-on and guards its method', async () => {
   const off = fixture({ diaryOn: false });
-  for (const [method, path] of [['GET', '/api/diary/exchanges'], ['GET', '/api/diary/workspace-trash'], ['GET', '/api/diary/storage-status'], ['GET', '/api/diary/files'], ['GET', '/api/diary/history'], ['POST', '/api/diary/entries/edit']]) {
+  for (const [method, path] of [['GET', '/api/diary/workspace-trash'], ['GET', '/api/diary/files'], ['GET', '/api/diary/history'], ['POST', '/api/diary/entries/edit']]) {
     assert.equal(await off.call('diary', method, path, method === 'POST' ? {} : undefined), true, path);
     assert.deepEqual(off.sent.pop(), { status: 404, body: { error: 'Diary add-on is disabled' } }, path);
   }
   const f = fixture();
   await f.call('diary', 'DELETE', '/api/diary/workspace-trash');
   assert.deepEqual(f.sent.pop(), { status: 405, body: { error: 'Method not allowed' } });
-  // The status route kept the combined route's guard (GET only).
-  await f.call('diary', 'POST', '/api/diary/storage-status', {});
-  assert.deepEqual(f.sent.pop(), { status: 405, body: { error: 'Method not allowed' } });
   await f.call('diary', 'DELETE', '/api/diary/file');
   assert.deepEqual(f.sent.pop(), { status: 405, body: { error: 'Method not allowed' } });
   assert.equal(await f.call('diary', 'GET', '/api/diary/entries/edit'), false, 'an unhandled method falls through');
   assert.equal(await f.call('diary', 'GET', '/api/chat'), false);
-  // #2185: the five routes the Rust front owns are not this mount's any more, in any method, add-on on or off.
+  // #2185 and #2206: the routes the Rust front owns are not this mount's any more, in any method, add-on on or off.
   // (Their add-on gate, method guards and answers are noevia-rs crates/server-diary/tests/sidecar.rs;
   // Node refuses them before authentication: rust-diary.test.cjs.)
-  for (const path of ['/api/diary/source', '/api/diary/today', '/api/diary/storage-import', '/api/diary/workspace-export', '/api/diary/workspace-import']) {
+  for (const path of ['/api/diary/source', '/api/diary/today', '/api/diary/storage-import', '/api/diary/workspace-export', '/api/diary/workspace-import', '/api/diary/exchanges', '/api/diary/storage-status']) {
     for (const method of ['GET', 'POST', 'PUT', 'DELETE']) {
       assert.equal(await off.call('diary', method, path, method === 'POST' ? {} : undefined), false, `${method} ${path}`);
       assert.equal(await f.call('diary', method, path, method === 'POST' ? {} : undefined), false, `${method} ${path}`);
@@ -175,14 +103,11 @@ test('operator import folders are admin-only and the entry edit validates before
 });
 
 
-test('malformed local exchange and authenticated connector JSON fail before side effects', async () => {
+test('a malformed local exchange fails before side effects', async () => {
   const f = fixture();
   await assert.rejects(f.call('diary', 'POST', '/api/diary/local-exchange', '{broken'),
     { status: 400, message: 'invalid JSON' });
-  await assert.rejects(f.call('connector', 'POST', '/api/diary-connector', '{broken',
-    { reqHeaders: { authorization: 'Bearer good' } }), { status: 400, message: 'invalid JSON' });
   assert.deepEqual(f.fetched, []);
-  assert.deepEqual(f.audits, []);
 });
 
 test('entry edits forward base_hash and relay a 409 conflict body unchanged', async () => {
@@ -256,51 +181,6 @@ test('#1168: X-Cowork-Storage-Retry: 1 from the browser reaches the sidecar only
   // Not on the chat exchange: a retry press is a file-list action.
   await f.call('diary', 'POST', '/api/diary/local-exchange', { message: 'hi' }, { reqHeaders: { 'x-cowork-storage-retry': '1' } });
   assert.equal('X-Cowork-Storage-Retry' in f.fetched.pop().init.headers, false);
-});
-
-test('#1422 POST /api/diary/exchanges dismisses an uncertain or failed exchange and nothing else', async (t) => {
-  const fs = require('node:fs'), os = require('node:os'), path = require('node:path');
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'diary-routes-1422-'));
-  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
-  const jobs = require('../diary-jobs.cjs');
-  const job = jobs.start({ dir }, { entryDay: '2026-10-12', exchangeId: 'exchange-1422-synthetic-a', message: 'Synthetic' });
-  job.event({ type: 'error', text: 'dropped' }); job.finish();
-  const f = fixture({ dir });
-  await f.call('diary', 'POST', '/api/diary/exchanges', { action: 'dismiss', day: '2026-10-12', id: 'exchange-1422-synthetic-a' });
-  const ok = f.sent.pop();
-  assert.equal(ok.status, 200);
-  assert.equal(ok.body.exchange.state, 'uncertain');
-  assert.equal(typeof ok.body.exchange.acknowledgedAt, 'number');
-  await f.call('diary', 'GET', '/api/diary/exchanges', undefined, { search: '?day=2026-10-12' });
-  assert.equal(f.sent.pop().body.exchanges[0].acknowledgedAt, ok.body.exchange.acknowledgedAt);
-  await f.call('diary', 'POST', '/api/diary/exchanges', { action: 'delete', day: '2026-10-12', id: 'exchange-1422-synthetic-a' });
-  assert.equal(f.sent.pop().status, 400);
-  await f.call('diary', 'POST', '/api/diary/exchanges', { action: 'dismiss', day: '2026-10-12', id: 'no-such-exchange-123456' });
-  assert.equal(f.sent.pop().status, 404);
-  await f.call('diary', 'POST', '/api/diary/exchanges', { action: 'dismiss', day: 'nope', id: 'exchange-1422-synthetic-a' });
-  assert.equal(f.sent.pop().status, 400);
-  const off = fixture({ dir, diaryOn: false });
-  await off.call('diary', 'POST', '/api/diary/exchanges', { action: 'dismiss', day: '2026-10-12', id: 'exchange-1422-synthetic-a' });
-  assert.deepEqual(off.sent.pop(), { status: 404, body: { error: 'Diary add-on is disabled' } });
-});
-
-test('#1589: the storage status says when a refused login is holding automatic storage calls', async () => {
-  const { createStorageLatch } = require('../storage-latch.cjs');
-  let now = 1_000_000;
-  const storageLatch = createStorageLatch({ now: () => now });
-  const conn = { kind: 'nextcloud', baseUrl: 'https://cloud.example/dav', username: 'ada', secret: 'synthetic-pw' };
-  const f = fixture({ storageLatch, reply: () => ({ ok: true, status: 200, body: { backup: 'idle' } }) });
-  await f.call('diary', 'GET', '/api/diary/storage-status');
-  assert.deepEqual(f.sent.pop(), { status: 200, body: { backup: 'idle' } }, 'nothing is added while nothing is held');
-  storageLatch.note('u1', conn, { kind: 'login' });
-  await f.call('diary', 'GET', '/api/diary/storage-status');
-  const shown = f.sent.pop();
-  assert.equal(shown.body.backup, 'idle');
-  assert.deepEqual(shown.body.automaticStorage, { held: true, kind: 'login', nextAttemptAt: now + 15 * 60 * 1000 });
-  // Reading the status never lets a probe through.
-  now += 16 * 60 * 1000;
-  await f.call('diary', 'GET', '/api/diary/storage-status');
-  assert.equal(f.sent.pop().body.automaticStorage.held, true);
 });
 
 // The sidecar's storage-status tells whether an account is kept in the app ('managed') or on the storage server ('legacy').

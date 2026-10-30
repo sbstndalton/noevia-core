@@ -71,16 +71,9 @@ function createProjectRoutes({
     // are the Rust front's, in the foreground and as source jobs (rust-source-jobs.cjs); index.cjs refuses
     // them before authentication. There is no worker call any more.
 
-    if (p === '/api/diary/context' && ['GET', 'POST'].includes(req.method)) {
-      if (!authService.diaryEnabled(authn.user.id)) return json(res, 404, { error: 'Diary add-on is disabled' });
-      let project = getProject(diaryExtras.PROJECT_ID);
-      if (!project && req.method === 'POST') {
-        // Publish synchronously before awaiting storage to prevent duplicate contexts.
-        project = diaryExtras.newProject();
-        PROJECTS.push(project); saveProjects(PROJECTS);
-      }
-      return json(res, 200, { project });
-    }
+    // GET and POST /api/diary/context are the Rust front's (#2206, rust-diary-routes.cjs; noevia-rs
+    // crates/server-projects `diary_context`): it creates the Diary attachments project in the person's
+    // projects.json, which chat reads through getProject like any other project.
 
     // POST /api/projects and DELETE /api/projects/{projectId} are the Rust front's (#2191 round 2,
     // rust-project-lifecycle.cjs, refused before authentication); so is the conversation import

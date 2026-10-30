@@ -194,16 +194,11 @@ test('chat metas: the list and one chat\'s delete are not this mount\'s any more
 });
 
 
-test('Diary context remains Node-owned and respects the add-on permission', async () => {
-  const off = fixture({ diary: false });
-  await off.call('POST', '/api/diary/context');
-  assert.deepEqual(off.sent.pop(), { status: 404, body: { error: 'Diary add-on is disabled' } });
-  const on = fixture();
-  await on.call('GET', '/api/diary/context');
-  assert.deepEqual(on.sent.pop(), { status: 200, body: { project: null } });
-  await on.call('POST', '/api/diary/context');
-  assert.equal(on.sent.pop().body.project.id, 'diary-extras');
-  assert.equal(on.store.saves, 1);
+test('#2206: the Diary context has no Node handler (the Rust front creates the project)', async () => {
+  const f = fixture();
+  for (const m of ['GET', 'POST']) assert.equal(await f.call(m, '/api/diary/context'), false, m);
+  assert.equal(f.sent.length, 0);
+  assert.equal(f.store.saves, 0, 'nothing saved');
 });
 
 // Context behavior (#352/#788/#1522/#1902) is exercised through the real Rust
