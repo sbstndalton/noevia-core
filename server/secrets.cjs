@@ -78,7 +78,7 @@ function createSecretStore(dataDir, { env = process.env } = {}) {
         try {
           // A table whose values are not enc: strings (a sealed file) brings its own reseal(row).
           const out = table.reseal ? table.reseal(row) : reseal(row.value, row.userId);
-          if (out.value !== undefined) table.write(row.ref, out.value);
+          if (out.value !== undefined) table.write(row.ref, out.value, row.value);
           counts[out.status] += 1;
         } catch (e) {
           counts.failed += 1;

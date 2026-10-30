@@ -250,13 +250,14 @@ test('member cannot register a private-range provider', async () => {
   assert.match(JSON.parse(response.text).error, /approved/i);
 });
 
-test('member cannot probe a private target through the provider test route', async () => {
+test('the provider test route is the Rust front\'s: Node refuses it for a member (#2190 round 4)', async () => {
+  // The member-origin rule on the probe is asserted in noevia-rs tests/storage_integrations.rs.
   const response = await request('/api/providers/test', {
     method: 'POST', headers: memberHeaders(),
     body: JSON.stringify({ baseUrl: 'http://10.9.8.7:8080/v1' }),
   });
-  assert.equal(response.status, 400);
-  assert.match(JSON.parse(response.text).error, /approved/i);
+  assert.equal(response.status, 503);
+  assert.equal(JSON.parse(response.text).code, 'RUST_PROVIDER_TEST_OWNED');
 });
 
 test('member cannot register an unapproved public-IP provider', async () => {
@@ -277,9 +278,8 @@ test('admin is exempt from the denylist (local inference targets private address
   assert.ok(JSON.parse(response.text).id);
 });
 
-test('admin can still test a private target (same exemption)', async (t) => {
-  // Probe a disposable fixture, not an arbitrary host-local port. A 502 from
-  // the fixture proves that the request passed the member-origin guard.
+test('the provider test route is the Rust front\'s for an administrator too (#2190 round 4)', async (t) => {
+  // The administrator's exemption on the probe is asserted in noevia-rs tests/storage_integrations.rs.
   let probed = false;
   const server = http.createServer((_req, res) => { probed = true; res.writeHead(503); res.end('{}'); });
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
@@ -288,8 +288,9 @@ test('admin can still test a private target (same exemption)', async (t) => {
     method: 'POST', headers: adminHeaders,
     body: JSON.stringify({ baseUrl: `http://127.0.0.1:${server.address().port}/v1` }),
   });
-  assert.equal(response.status, 502);
-  assert.equal(probed, true);
+  assert.equal(response.status, 503);
+  assert.equal(JSON.parse(response.text).code, 'RUST_PROVIDER_TEST_OWNED');
+  assert.equal(probed, false);
 });
 
 // ── storage endpoints: same policy, more fetch points ────────────────────────
@@ -304,37 +305,35 @@ async function putStorage(headers, body) {
   });
 }
 
-test('admin is exempt from the storage denylist (LAN NAS / in-network Nextcloud)', async () => {
-  // Saving never fetches, so a private baseUrl must simply be accepted.
-  const response = await putStorage(adminHeaders, {
-    kind: 'webdav', baseUrl: 'http://192.168.1.50:5005/dav', username: 'admin', secret: 'pw', corpusRoot: 'Cowork',
-  });
-  assert.equal(response.status, 200);
-  assert.equal(JSON.parse(response.text).kind, 'webdav');
-});
-
-test('member cannot save a private-range storage connection', async () => {
-  const response = await putStorage(memberHeaders(), {
-    kind: 'webdav', baseUrl: 'http://10.0.0.5:5005/dav', username: 'u', secret: 'p', corpusRoot: 'Cowork',
-  });
-  assert.equal(response.status, 400);
-  assert.match(JSON.parse(response.text).error, /approved/i);
-  // Nothing was saved for the member (read from the table: the GET is the Rust front's, #1071).
+test('saving the storage connection is the Rust front\'s: Node refuses it for admin and member (#2190 round 4)', async () => {
+  // The member-origin rule and the administrator's exemption on the save are asserted in noevia-rs
+  // tests/storage_integrations.rs (put_connection_validates_checks_and_saves).
+  for (const [headers, baseUrl] of [[adminHeaders, 'http://192.168.1.50:5005/dav'], [memberHeaders(), 'http://10.0.0.5:5005/dav']]) {
+    const response = await putStorage(headers, { kind: 'webdav', baseUrl, username: 'u', secret: 'p', corpusRoot: 'Cowork' });
+    assert.equal(response.status, 503);
+    assert.equal(JSON.parse(response.text).code, 'RUST_STORAGE_CONNECTION_OWNED');
+  }
+  // Nothing was saved (read from the table: the GET is the Rust front's, #1071).
   const db = new Database(path.join(testDataDir, 'cowork.db'));
   try {
-    const member = db.prepare("SELECT id FROM users WHERE username='member'").get();
-    const row = db.prepare('SELECT kind FROM storage_connections WHERE user_id=?').get(member.id);
-    assert.ok(!row || row.kind === 'local', JSON.stringify(row));
+    for (const name of ['admin', 'member']) {
+      const user = db.prepare('SELECT id FROM users WHERE username=?').get(name);
+      const row = db.prepare('SELECT kind FROM storage_connections WHERE user_id=?').get(user.id);
+      assert.ok(!row || row.kind === 'local', JSON.stringify(row));
+    }
   } finally { db.close(); }
 });
 
-test('member cannot run the storage connection test against a private target', async () => {
-  const response = await request('/api/integrations/storage/test', {
-    method: 'POST', headers: { ...memberHeaders(), 'content-type': 'application/json' },
-    body: JSON.stringify({ kind: 'webdav', baseUrl: 'http://169.254.169.254/remote.php/dav', username: 'u', secret: 'p', corpusRoot: '' }),
-  });
-  assert.equal(response.status, 400);
-  assert.match(JSON.parse(response.text).error, /approved/i);
+test('the storage connection test and the Nextcloud sign-in are the Rust front\'s: Node refuses them (#2190)', async () => {
+  // The member-origin rule on these targets is asserted in noevia-rs tests/storage_integrations.rs.
+  for (const [url, body] of [
+    ['/api/integrations/storage/test', { kind: 'webdav', baseUrl: 'http://169.254.169.254/remote.php/dav', username: 'u', secret: 'p', corpusRoot: '' }],
+    ['/api/integrations/storage/nextcloud/start', { baseUrl: 'https://10.1.2.3:8080' }],
+  ]) {
+    const response = await request(url, { method: 'POST', headers: { ...memberHeaders(), 'content-type': 'application/json' }, body: JSON.stringify(body) });
+    assert.equal(response.status, 503, url);
+    assert.equal(JSON.parse(response.text).code, 'RUST_STORAGE_INTEGRATIONS_OWNED', url);
+  }
 });
 
 test('member cannot browse or read through a saved private connection (Node refuses both, #1071)', async () => {
@@ -344,10 +343,11 @@ test('member cannot browse or read through a saved private connection (Node refu
   const db = new Database(path.join(testDataDir, 'cowork.db'));
   const admin = db.prepare("SELECT id FROM users WHERE username='admin'").get();
   const member = db.prepare("SELECT id FROM users WHERE username='member'").get();
-  const adminRow = db.prepare('SELECT * FROM storage_connections WHERE user_id=?').get(admin.id);
-  assert.ok(adminRow, 'admin storage row exists for the ciphertext copy');
+  // The admin's sealed secret, copied onto the member's row (this connection is the front's, which
+  // writes the table; Node's own connection refuses it, #2190 round 4).
+  const adminSecret = secrets.encrypt('pw', admin.id);
   db.prepare('INSERT INTO storage_connections(user_id,kind,base_url,bucket,username,secret,corpus_root,updated_at) VALUES(?,?,?,?,?,?,?,?)')
-    .run(member.id, 'webdav', 'http://169.254.169.254/dav', '', 'u', adminRow.secret, 'Cowork', Date.now());
+    .run(member.id, 'webdav', 'http://169.254.169.254/dav', '', 'u', adminSecret, 'Cowork', Date.now());
 
   // Browsing and reading are the Rust front's since #1071 (it re-checks the saved connection's
   // origin itself): Node refuses both before reading the row.
@@ -363,16 +363,6 @@ test('member cannot browse or read through a saved private connection (Node refu
   db.prepare('DELETE FROM storage_connections WHERE user_id=?').run(member.id);
   db.close();
 });
-
-test('member cannot start a Nextcloud login flow against a private host', async () => {
-  const response = await request('/api/integrations/storage/nextcloud/start', {
-    method: 'POST', headers: { ...memberHeaders(), 'content-type': 'application/json' },
-    body: JSON.stringify({ baseUrl: 'https://10.1.2.3:8080' }),
-  });
-  assert.equal(response.status, 400);
-  assert.match(JSON.parse(response.text).error, /approved/i);
-});
-
 
 test('member can connect an operator-approved origin, but not a lookalike origin', async () => {
   process.env.MEMBER_OUTBOUND_ORIGINS = 'https://approved.example.com';

@@ -5,8 +5,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const crypto = require('node:crypto');
-const { createChatVaultMirror, renderNote, safeName, folderFor, insideMirror, mirrorTrigger, readPreferences, writePreferences, readIndex, writeIndex } = require('./chat-vault-mirror.cjs');
-const { createChatVaultMirrorRoutes } = require('./routes/chat-vault-mirror.cjs');
+const { createChatVaultMirror, renderNote, safeName, folderFor, insideMirror, mirrorTrigger, readPreferences, readIndex, writeIndex } = require('./chat-vault-mirror.cjs');
 
 const version = (text) => crypto.createHash('sha256').update(text ?? '').digest('hex');
 function stubVault() {
@@ -411,33 +410,15 @@ test('preferences: off by default, strict boolean, per workspace directory; inde
   const dir = require('node:fs').mkdtempSync(require('node:path').join(require('node:os').tmpdir(), 'mirror-'));
   try {
     assert.deepEqual(readPreferences(dir), { enabled: false });
-    assert.throws(() => writePreferences(dir, { enabled: 'yes' }), /true or false/);
-    assert.deepEqual(writePreferences(dir, { enabled: true, extra: 1 }), { enabled: true });
-    assert.deepEqual(readPreferences(dir), { enabled: true });
+    // #2190: the Rust front writes the file (vault_mirror.rs); Node only reads it, strictly.
+    const fs = require('node:fs'); const file = require('node:path').join(dir, 'chat-vault-mirror.json');
+    for (const [text, on] of [['{"enabled":"yes"}', false], ['{"enabled":1}', false], ['not json', false], ['{"enabled":true}', true]]) {
+      fs.writeFileSync(file, text); assert.deepEqual(readPreferences(dir), { enabled: on }, text);
+    }
     assert.deepEqual(readIndex(dir), {});
     writeIndex(dir, { notes: { a: { path: 'Chats/Inbox/A.md' } } });
     assert.equal(readIndex(dir).notes.a.path, 'Chats/Inbox/A.md');
   } finally { require('node:fs').rmSync(dir, { recursive: true, force: true }); }
-});
-
-test('route: signed-in only, own setting, turning on starts a sync at once', async () => {
-  let prefs = { enabled: false }; const scheduled = [];
-  const routes = createChatVaultMirrorRoutes({
-    json: (res, status, body) => { res.status = status; res.body = body; },
-    readJson: async (req) => req.body,
-    preferences: { get: () => prefs, save: (v) => { if (typeof v?.enabled !== 'boolean') throw Object.assign(Error('enabled must be true or false'), { status: 400 }); prefs = { enabled: v.enabled }; return prefs; } },
-    available: (userId) => userId === 'u1', schedule: (...args) => scheduled.push(args),
-  });
-  const call = async (method, body, authn = { user: { id: 'u1' } }, path = '/api/chat-vault-mirror/preferences') => { const res = {}; const handled = await routes({ method, body }, res, { path, authn }); return { handled, ...res }; };
-  assert.equal((await call('GET', null, null)).status, 401);
-  assert.equal((await call('GET', null, undefined, '/api/other')).handled, false);
-  assert.deepEqual((await call('GET')).body, { enabled: false, available: true });
-  assert.equal((await call('PUT', { enabled: 1 })).status, 400);
-  assert.deepEqual((await call('PUT', { enabled: true })).body, { enabled: true, available: true });
-  assert.deepEqual(scheduled, [['u1', null, { immediate: true }]]);
-  assert.equal((await call('POST', {})).status, 405);
-  await call('PUT', { enabled: true }, { user: { id: 'u2' } });
-  assert.equal(scheduled.length, 1, 'no sync where the mirror is not available');
 });
 
 test('#2167 repeated remove-triggered mirror passes preserve survivors and trash once', async () => {

@@ -1,4 +1,5 @@
 'use strict';
+const { RESEAL_SQL } = require('./rust-storage-connection.cjs');
 
 const crypto = require('crypto');
 const fs = require('fs');
@@ -434,24 +435,20 @@ function createAuth({ dataDir, publicOrigin, rpId, legacyToken = '', legacyCompa
         console.warn(`storage secret for user ${userId} could not be decrypted; treating it as unset`);
         plain = ''; needsReauth = !!row.secret;
       }
-      // Upgrade a legacy unbound (v1) ciphertext or a plaintext secret to the account-bound format.
+      // Upgrade a legacy unbound (v1) ciphertext or a plaintext secret to the account-bound format:
+      // the same plaintext, and only while the row still holds the value read here (the Rust front
+      // is the row's writer, sbstndalton/noevia#2190; rust-storage-connection.cjs RESEAL_SQL).
       if (secrets && plain && !String(row.secret).startsWith('enc:v2:')) {
-        db.prepare('UPDATE storage_connections SET secret=? WHERE user_id=?').run(secrets.encrypt(plain, userId), userId);
+        try { db.prepare(RESEAL_SQL).run(secrets.encrypt(plain, userId), userId, row.secret); } catch (err) {
+          console.warn(`storage secret for user ${userId} could not be upgraded (${err && err.code ? err.code : 'error'})`);
+        }
       }
       return { kind: row.kind, baseUrl: row.base_url, bucket: row.bucket || '', region: normalizeS3Region(row.region), username: row.username, corpusRoot: row.corpus_root,
         secret: includeSecret ? plain : undefined, secretConfigured: !!plain, secretNeedsReauth: needsReauth };
     },
-    saveStorage(userId, value) {
-      const kind = ['local', 'nextcloud', 'webdav', 's3'].includes(value.kind) ? value.kind : 'local';
-      const encrypted = secrets ? secrets.encrypt(value.secret || '', userId) : (value.secret || '');
-      db.prepare(`INSERT INTO storage_connections(user_id,kind,base_url,bucket,region,username,secret,corpus_root,updated_at)
-        VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(user_id) DO UPDATE SET kind=excluded.kind,base_url=excluded.base_url,
-        bucket=excluded.bucket,region=excluded.region,username=excluded.username,secret=excluded.secret,corpus_root=excluded.corpus_root,updated_at=excluded.updated_at`)
-        .run(userId, kind, String(value.baseUrl || '').replace(/\/+$/, ''), String(value.bucket || '').replace(/\/+$/, ''),
-          normalizeS3Region(value.region), String(value.username || ''), encrypted, String(value.corpusRoot || ''), Date.now());
-      audit('storage.update', userId, userId, { kind });
-      return this.getStorage(userId);
-    },
+    // saveStorage is gone (sbstndalton/noevia#2190 round 4): the Rust front saves the row
+    // (PUT /api/integrations/storage, a completed Nextcloud sign-in, the legacy WebDAV setup through
+    // the internal store), and the guard refuses any other Node write of it.
   };
 }
 

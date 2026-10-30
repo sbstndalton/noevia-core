@@ -32,8 +32,8 @@ function fingerprintOf(connection) {
   ])).digest('hex');
 }
 
-function createStorageLatch({ now = Date.now } = {}) {
-  // userId -> { fingerprint, kind, until, strikes, probing }. A throttle over a refused login also has
+function createStorageLatch({ now = Date.now, proofOf = null } = {}) {
+  // userId -> { fingerprint, kind, until, strikes, probing, since }. `since` is when the hold was last set. A throttle over a refused login also has
   // `login: { strikes, until }`, what the login latch is restored to when the throttle has passed (#1607).
   const latches = new Map();
 
@@ -41,9 +41,17 @@ function createStorageLatch({ now = Date.now } = {}) {
    *  credentials, gives way to that login latch with the strikes it had. A login that is already due
    *  is still the probe in flight, so a refusal that follows counts as the probe's. */
   function settle(userId) {
+    // sbstndalton/noevia#2190: an explicit call the Rust front ran with the saved login (a folder write,
+    // Test connection) and that worked proves the login, as `clear` does here; its proof ends a hold
+    // that was set before it, never a later one. A proof that cannot be read changes nothing.
+    if (proofOf && latches.has(userId)) {
+      let at = null;
+      try { at = proofOf(userId); } catch { at = null; }
+      if (Number.isFinite(at) && at >= latches.get(userId).since) latches.delete(userId);
+    }
     const latch = latches.get(userId);
     if (latch && latch.kind === 'throttled' && now() >= latch.until) {
-      if (latch.login) latches.set(userId, { fingerprint: latch.fingerprint, kind: 'login', until: latch.login.until, strikes: latch.login.strikes, probing: latch.login.until <= now() });
+      if (latch.login) latches.set(userId, { fingerprint: latch.fingerprint, kind: 'login', until: latch.login.until, strikes: latch.login.strikes, probing: latch.login.until <= now(), since: latch.since });
       else latches.delete(userId);
     }
     return latches.get(userId) || null;
@@ -61,7 +69,7 @@ function createStorageLatch({ now = Date.now } = {}) {
       // A probe that was refused again doubles the wait; an explicit press that was refused only renews it.
       const strikes = sameLogin ? (before.probing ? before.strikes + 1 : before.strikes) : sameThrottle ? before.login.strikes : 1;
       const wait = Math.min(LOGIN_PROBE_MAX_MS, LOGIN_PROBE_BASE_MS * 2 ** Math.min(strikes - 1, 16));
-      latches.set(userId, { fingerprint, kind: 'login', until: now() + wait, strikes, probing: false });
+      latches.set(userId, { fingerprint, kind: 'login', until: now() + wait, strikes, probing: false, since: now() });
     } else if (failure.kind === 'throttled') {
       const wait = Number.isFinite(failure.retryAfter) && failure.retryAfter > 0 ? failure.retryAfter * 1000 : DEFAULT_THROTTLE_WAIT_MS;
       // The login strikes survive a throttle on the same credentials. A probe was past its base wait, so
@@ -71,7 +79,7 @@ function createStorageLatch({ now = Date.now } = {}) {
         if (before.kind === 'login') login = { strikes: before.strikes, until: before.probing ? 0 : before.until };
         else if (before.kind === 'throttled' && before.login) login = before.login;
       }
-      latches.set(userId, { fingerprint, kind: 'throttled', until: now() + wait, strikes: 0, probing: false, ...(login ? { login } : {}) });
+      latches.set(userId, { fingerprint, kind: 'throttled', until: now() + wait, strikes: 0, probing: false, since: now(), ...(login ? { login } : {}) });
     }
   }
 

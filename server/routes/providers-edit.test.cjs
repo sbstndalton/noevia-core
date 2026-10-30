@@ -180,20 +180,9 @@ test('invalid bodies are refused and leave the row untouched; fields cannot flip
   assert.equal(row.id, 'mine');
 });
 
-test('the probe may use a stored key only for a row the caller can edit, on the same origin', async () => {
-  const f = fixture();
-  await f.call('POST', '/api/providers/test', { baseUrl: 'https://approved.example/openai/v1', providerId: 'mine' });
-  assert.equal(f.probes.at(-1).init.headers.Authorization, 'Bearer sk-original-1111');
-  await f.call('POST', '/api/providers/test', { baseUrl: 'https://other-approved.example/v1', providerId: 'mine' });
-  assert.equal(f.probes.at(-1).init.headers.Authorization, undefined, 'another origin never receives the stored key');
-  await f.call('POST', '/api/providers/test', { baseUrl: 'https://approved.example/v1', providerId: 'mine', apiKey: 'sk-typed' });
-  assert.equal(f.probes.at(-1).init.headers.Authorization, 'Bearer sk-typed');
-  f.providers[1].baseUrl = 'https://approved.example';
-  await f.call('POST', '/api/providers/test', { baseUrl: 'https://approved.example', providerId: 'shared-1' });
-  assert.equal(f.probes.at(-1).init.headers.Authorization, undefined, 'a member cannot borrow a shared key');
-  await f.call('POST', '/api/providers/test', { baseUrl: 'https://approved.example', providerId: 'shared-1' }, 'admin');
-  assert.equal(f.probes.at(-1).init.headers.Authorization, 'Bearer sk-teamteam1234');
-});
+// The probe's stored-key rule (an editable row, a real key, the same origin) moved with POST
+// /api/providers/test to the Rust front (sbstndalton/noevia#2190 round 4): noevia-rs
+// tests/storage_integrations.rs provider_test_probes_with_node_rules.
 
 // ── The real workspace store: the edit lands on disk, key encrypted, and survives a reload. ──
 function realStack(t) {

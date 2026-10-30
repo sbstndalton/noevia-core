@@ -313,7 +313,7 @@ function createHandler(dataDir, token, writes = [], failures = [], { changes = f
     req.on('end', async () => {
       try {
         const sourceOp = req.url.startsWith('/v1/source-jobs/') ? req.url.slice('/v1/source-jobs/'.length) : null;
-        if (req.method !== 'POST' || !(['/v1/read', '/v1/write','/v1/features/context'].includes(req.url) || HISTORY_OPS.has(req.url) || sourceOps.has(sourceOp))) return send(res, 404, { error: 'not found' });
+        if (req.method !== 'POST' || !(['/v1/read', '/v1/write','/v1/features/context','/v1/storage/legacy-webdav'].includes(req.url) || HISTORY_OPS.has(req.url) || sourceOps.has(sourceOp))) return send(res, 404, { error: 'not found' });
         if (req.url === '/v1/changes/read' && !changes) return send(res, 404, { error: 'not found' });
         if (req.headers['x-noevia-store-token'] !== token) return send(res, 401, { error: 'unauthorised' });
         const planned = failures.find((f) => f.url === req.url && f.times > 0);
@@ -321,6 +321,16 @@ function createHandler(dataDir, token, writes = [], failures = [], { changes = f
         let body;
         try { body = JSON.parse(Buffer.concat(chunks).toString('utf8')); } catch { return send(res, 400, { error: 'invalid JSON' }); }
         if(req.url==='/v1/features/context')return send(res,200,contextReply(body));
+        // sbstndalton/noevia#2190 round 4: the legacy WebDAV setup, saved as the front saves it (only
+        // while the account has no row or a local one; noevia-rs project_store.rs legacy_webdav).
+        if (req.url === '/v1/storage/legacy-webdav') {
+          if (!body || typeof body !== 'object' || typeof body.user !== 'string' || !body.user) return send(res, 400, { error: 'invalid user' });
+          const front = require('./storage-row-front.cjs');
+          const kind = front.asFront(dataDir, (db) => db.prepare('SELECT kind FROM storage_connections WHERE user_id=?').get(body.user)?.kind);
+          if (kind && kind !== 'local') return send(res, 200, { saved: false });
+          front.saveStorageAsFront(dataDir, require('../../server/secrets.cjs').createSecretStore(dataDir), body.user, { kind: 'webdav', baseUrl: body.baseUrl, username: body.username, secret: body.secret, corpusRoot: body.corpusRoot });
+          return send(res, 200, { saved: true });
+        }
         if (!body || typeof body.user !== 'string') return send(res, 400, { error: 'user required' });
         if (!sourceOps.has(sourceOp) && !HISTORY_OPS.has(req.url) && !FILES.has(body.file)) return send(res, 400, { error: 'file must be projects.json or free-chats.json' });
         if (!USER.test(body.user)) return send(res, 400, { error: 'invalid user' });

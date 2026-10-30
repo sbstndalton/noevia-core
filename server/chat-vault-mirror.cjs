@@ -337,14 +337,8 @@ function readPreferences(dir) {
   const data = readJsonFile(require('node:path').join(dir, PREFERENCES_FILE), null);
   return { enabled: data?.enabled === true };
 }
-function writePreferences(dir, value) {
-  if (!value || typeof value !== 'object' || Array.isArray(value) || typeof value.enabled !== 'boolean') throw Object.assign(Error('enabled must be true or false'), { status: 400 });
-  const record = { enabled: value.enabled };
-  writeJsonFile(dir, PREFERENCES_FILE, record);
-  return record;
-}
 const readIndex = (dir) => readJsonFile(require('node:path').join(dir, INDEX_FILE), {});
 const writeIndex = (dir, state) => writeJsonFile(dir, INDEX_FILE, state);
 
 module.exports = { createChatVaultMirror, renderNote, frontmatter, safeName, folderFor, insideMirror, mirrorTrigger,
-  readPreferences, writePreferences, readIndex, writeIndex, BRAIN_SCHEMA, ROOT, INBOX };
+  readPreferences, readIndex, writeIndex, BRAIN_SCHEMA, ROOT, INBOX };

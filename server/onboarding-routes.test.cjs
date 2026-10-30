@@ -86,12 +86,13 @@ test('a member who has not finished onboarding gets no administrator or global m
   assert.equal((await request('/api/providers', { method: 'POST', headers: headers(member), body: JSON.stringify({ label: 'Forbidden shared', baseUrl: 'https://example.test', shared: true }) })).status, 403);
 });
 test('a member\'s storage choice stays within the authenticated account', async () => {
+  // Saving is the Rust front's (#2190 round 4), which saves for the session's account only (the body's
+  // userId is ignored: noevia-rs tests/storage_integrations.rs). Node refuses it and writes nothing.
   const saved = await request('/api/integrations/storage', { method: 'PUT', headers: headers(member), body: JSON.stringify({ kind: 'local', corpusRoot: 'synthetic-member-only', userId: admin.id }) });
-  assert.equal(saved.status, 200);
-  // GET /api/integrations/storage is the Rust front's (#1071): the saved rows are read directly.
+  assert.equal(saved.status, 503);
+  assert.equal(JSON.parse(saved.text).code, 'RUST_STORAGE_CONNECTION_OWNED');
   const db = new (require('better-sqlite3'))(path.join(testDataDir, 'cowork.db'), { readonly: true });
   try {
-    assert.equal(db.prepare('SELECT corpus_root FROM storage_connections WHERE user_id=?').get(member.id)?.corpus_root, 'synthetic-member-only');
-    assert.notEqual(db.prepare('SELECT corpus_root FROM storage_connections WHERE user_id=?').get(admin.id)?.corpus_root, 'synthetic-member-only');
+    for (const id of [member.id, admin.id]) assert.notEqual(db.prepare('SELECT corpus_root FROM storage_connections WHERE user_id=?').get(id)?.corpus_root, 'synthetic-member-only');
   } finally { db.close(); }
 });
