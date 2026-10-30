@@ -1175,8 +1175,9 @@ const authRoutes = require('./routes/auth.cjs').createAuthRoutes({
   json, readJson, authService, workspaceStore, driveAccounts, fetchJson, DIARY_BASE, DIARY_TOKEN, diaryTenantHeaders: diary.tenantHeaders,
   mcpOAuth, chatgptOAuth,
   // POST /api/admin/secrets/rotate (CSRF-checked by the router like every signed-in POST).
-  // The provider files are the front's: it re-seals them first (rust-providers-reseal.cjs), awaited.
-  rotateSecrets: (actorId) => require('./secrets-rotate.cjs').runRotation({ secrets: secretStore, db: authService.db, dataDir: DATA_DIR, audit: authService.audit, actorId, resealProviders: () => require('./rust-providers-reseal.cjs').resealProviderKeys(PROJECT_STORE), resealMcp: () => require('./rust-mcp-credentials.cjs').resealMcpCredentials(PROJECT_STORE) }),
+  // The provider files and the MCP credentials are the front's: it re-seals them first (rust-providers-reseal.cjs,
+  // rust-mcp-credentials.cjs; then the Drive token files when it offers that), each awaited, before the rest here.
+  rotateSecrets: (actorId) => require('./secrets-rotate.cjs').runRotation({ secrets: secretStore, db: authService.db, dataDir: DATA_DIR, audit: authService.audit, actorId, resealProviders: () => require('./rust-providers-reseal.cjs').resealProviderKeys(PROJECT_STORE), resealMcp: () => require('./rust-mcp-credentials.cjs').resealMcpCredentials(PROJECT_STORE), gdriveReseal: typeof PROJECT_STORE.gdriveReseal === 'function' ? () => PROJECT_STORE.gdriveReseal() : null }),
 });
 // The user's own storage connection is the Rust front's in full (reading, browsing, the folder write,
 // the test, the Nextcloud sign-in and the save, #1071/sbstndalton/noevia#2190): routes/storage.cjs

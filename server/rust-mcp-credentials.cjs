@@ -73,6 +73,25 @@ function unavailable() {
   return Object.assign(new Error('MCP sign-ins and keys are unavailable right now. Try again in a moment.'), { status: 503 });
 }
 
+/** The broker could not be asked, or could not say right now (down, busy, its refresh at the service failed
+ *  just now). NOT "sign in first": the sign-in or key may be perfectly good, and a caller that tells the
+ *  person to sign in again sends them to redo something that was fine. `transient` marks it for callers. */
+function brokerUnavailable(r) {
+  return Object.assign(new Error(typeof r?.error === 'string' && r.error ? r.error : 'Your sign-in or key could not be checked right now. Try again in a moment.'), { status: 503, code: 'MCP_BROKER_UNAVAILABLE', transient: true });
+}
+
+/** What the broker says when the account has to (re)do something: no sign-in or key, or one that no longer works. */
+const needsSignIn = (r) => !!r && r.ok === false && r.status === 401 && (r.code === 'disconnected' || r.code === 'reconnect');
+
+/** A broker call, with the caller's signal: its failure is `brokerUnavailable`, and a Stop (the signal) stays a Stop. */
+async function ask(call, signal) {
+  try { return await call(); }
+  catch (e) {
+    if (signal && signal.aborted) throw Object.assign(new Error('The request was stopped.'), { name: 'AbortError', code: 'ABORT_ERR', cause: e });
+    throw brokerUnavailable();
+  }
+}
+
 /** A broker refusal as the error a Node route or tool call would have thrown. */
 function refusalError(r) {
   if (!r || r.ok !== false || !Number.isInteger(r.status) || typeof r.error !== 'string') return unavailable();
@@ -106,18 +125,20 @@ function createMcpCredentials({ broker, dataDir, fs = require('node:fs') }) {
       return v === 'connected' ? 'connected' : v === 'reauth' ? 'needs-reauth' : 'disconnected';
     },
     connected: (userId, serverId) => oauth.status(userId, serverId) === 'connected',
-    /** One access token for this account and server, from the broker: `{ accessToken, generation }`,
-     *  or null when the account has no usable sign-in (or the broker cannot say). `rejected` is the
-     *  token the MCP server just answered 401 to. Never cached here. */
-    async session(userId, serverId, rejected = null) {
+    /** One access token for this account and server, from the broker: `{ accessToken, generation, expiresAt }`,
+     *  or null when the account has to sign in (none, or one that no longer works). `rejected` is the token
+     *  the MCP server just answered 401 to. Never cached here. THROWS (`transient`, MCP_BROKER_UNAVAILABLE)
+     *  when the broker cannot be asked or cannot say right now - "try again", not "sign in first" - and an
+     *  AbortError when `signal` (the chat's Stop) fired, so Stop cancels the call promptly. */
+    async session(userId, serverId, rejected = null, { signal = null } = {}) {
       if (!userId) return null;
-      // A broker that cannot be reached is "no token" for a tool call (the model is told to sign in
-      // or try again), never an exception out of the chat loop.
-      const r = await broker.mcpSession(userId, serverId, rejected).catch(() => ({ ok: false }));
-      return r.ok ? r.session : null;
+      const r = await ask(() => broker.mcpSession(userId, serverId, rejected, { signal }), signal);
+      if (r.ok) return r.session;
+      if (needsSignIn(r)) return null;
+      throw brokerUnavailable(r);
     },
-    async tokenFor(userId, serverId) {
-      return (await oauth.session(userId, serverId))?.accessToken ?? null;
+    async tokenFor(userId, serverId, opts = {}) {
+      return (await oauth.session(userId, serverId, null, opts))?.accessToken ?? null;
     },
     /** The second 401 on a fresh token: that sign-in (by its generation) needs a new one. */
     async reject(userId, serverId, generation) {
@@ -153,11 +174,14 @@ function createMcpCredentials({ broker, dataDir, fs = require('node:fs') }) {
 
   const keys = {
     hasKey: (userId, serverId) => !!userId && ready('keys', userId, serverId),
-    /** The account's own key headers for ONE call: an object, or null when it has none. */
-    async headers(userId, serverId) {
+    /** The account's own key headers for ONE call: an object, or null when it has none (or one no key opens).
+     *  Throws like `oauth.session` when the broker cannot say. */
+    async headers(userId, serverId, { signal = null } = {}) {
       if (!userId) return null;
-      const r = await broker.mcpKey(userId, serverId).catch(() => ({ ok: false }));
-      return r.ok ? r.headers : null;
+      const r = await ask(() => broker.mcpKey(userId, serverId, { signal }), signal);
+      if (r.ok) return r.headers;
+      if (needsSignIn(r)) return null;
+      throw brokerUnavailable(r);
     },
     /** The adding administrator's own key for a server they just added as personal. */
     async set(userId, serverId, headers) {

@@ -62,16 +62,20 @@ function failure(status, body) {
 }
 
 function createClient({ port, token, fetchImpl = globalThis.fetch, timeoutMs = TIMEOUT_MS }) {
-  async function call(op, payload, wait = timeoutMs) {
+  /** `abort` (optional): the caller's own signal, e.g. a chat's Stop. The deadline still applies; an
+   *  abort throws an AbortError (not "busy"), so a caller can tell a Stop from an outage. The front
+   *  finishes work it has begun (a refresh is stored whatever the caller does). */
+  async function call(op, payload, wait = timeoutMs, abort = null) {
     let res;
     try {
       res = await fetchImpl(`http://127.0.0.1:${port}/v1/${op}`, {
         method: 'POST',
         headers: { 'content-type': 'application/json', 'x-noevia-store-token': token },
         body: JSON.stringify(payload),
-        signal: AbortSignal.timeout(wait),
+        signal: abort ? AbortSignal.any([AbortSignal.timeout(wait), abort]) : AbortSignal.timeout(wait),
       });
     } catch (err) {
+      if (abort && abort.aborted) throw Object.assign(new Error('The request was stopped.'), { name: 'AbortError', code: 'ABORT_ERR', cause: err });
       // Unreachable or too slow: as a store that could not be locked in time.
       throw Object.assign(busy(), { cause: err });
     }
@@ -308,15 +312,15 @@ function createClient({ port, token, fetchImpl = globalThis.fetch, timeoutMs = T
      *  people). A session may refresh at the sign-in service, a start may discover and register at
      *  it, and a key is only ever handed out for the one call asking.
      *  `mcpSession` hands out an access token, never a refresh token. */
-    async mcpSession(user, server, rejected = null) {
-      const { status, body } = await call('mcp/session', { user, server, ...(rejected ? { rejected: String(rejected) } : {}) }, MCP_WAIT_MS);
+    async mcpSession(user, server, rejected = null, { signal = null } = {}) {
+      const { status, body } = await call('mcp/session', { user, server, ...(rejected ? { rejected: String(rejected) } : {}) }, MCP_WAIT_MS, signal);
       if (status === 200 && body && typeof body.accessToken === 'string' && typeof body.generation === 'string') {
         return { ok: true, session: { accessToken: body.accessToken, expiresAt: Number.isFinite(body.expiresAt) ? body.expiresAt : null, generation: body.generation } };
       }
       return mcpRefusal(status, body);
     },
-    async mcpKey(user, server) {
-      const { status, body } = await call('mcp/key', { user, server }, MCP_WAIT_MS);
+    async mcpKey(user, server, { signal = null } = {}) {
+      const { status, body } = await call('mcp/key', { user, server }, MCP_WAIT_MS, signal);
       if (status === 200 && body && body.headers && typeof body.headers === 'object' && !Array.isArray(body.headers)) return { ok: true, headers: body.headers };
       return mcpRefusal(status, body);
     },

@@ -319,6 +319,72 @@ test('a second refusal marks that sign-in by its generation, and the account is 
   assert.deepEqual(rejected, [['signed', 'o', 'g1']]);
 });
 
+test('M1: a broker that cannot say on the retry leaves the sign-in alone, and the 401 stands', async () => {
+  const servers = [{ id: 'o', url: 'http://o/mcp', auth: 'oauth', title: 'OAuth', addedBy: 'signed' }];
+  const marked = [];
+  const run = async (retry) => {
+    const { mcp } = unauthorizedFirst([rawTool('o_read')], ['Bearer old']);
+    const mcpOAuth = {
+      connected: () => true,
+      session: async (_u, _s, was) => { if (was) return retry(); return { accessToken: 'old', generation: 'g1' }; },
+      tokenFor: async () => 'discovery', reject: async (...args) => { marked.push(args); return true; },
+    };
+    const { wiring, scope } = build({ servers, mcp, mcpOAuth });
+    await wiring.discoverMcpTools();
+    return asUser(scope, 'signed', () => wiring.executeMcpToolCall('o_read', {}));
+  };
+  // The broker's refresh failed just now (a flaky service): it says "try again", which Node surfaces as a throw.
+  const transient = await run(() => { throw Object.assign(new Error('The sign-in to this server could not be refreshed right now. Try again in a moment.'), { transient: true, code: 'MCP_BROKER_UNAVAILABLE' }); });
+  assert.match(transient, /^ERROR calling o_read: tool call failed \(HTTP 401\)/);
+  // The broker has no usable sign-in left (it marked the refused one itself): null, and nothing more to mark.
+  const none = await run(() => null);
+  assert.match(none, /HTTP 401/);
+  assert.deepEqual(marked, [], 'a passing fault must not cost the account its sign-in');
+});
+
+test('L6: a broker that is down is "try again", never "sign in first", for a sign-in and for a key', async () => {
+  const down = () => { throw Object.assign(new Error('x'), { transient: true, code: 'MCP_BROKER_UNAVAILABLE' }); };
+  const servers = [{ id: 'o', url: 'http://o/mcp', auth: 'oauth', title: 'OAuth', addedBy: 'signed' }, { id: 'p', url: 'http://p/mcp', auth: 'personal', title: 'Personal', addedBy: 'keyed' }];
+  const catalogues = { 'http://o/mcp': [rawTool('o_read')], 'http://p/mcp': [rawTool('p_read')] };
+  let broken = false;
+  const mcpOAuth = { connected: () => true, tokenFor: async () => 'discovery', session: async () => (broken ? down() : { accessToken: 't', generation: 'g' }) };
+  const mcpKeys = { hasKey: () => true, headers: async () => (broken ? down() : { 'X-Key': 'k' }) };
+  const { wiring, scope, mcp } = build({ servers, catalogues, mcpOAuth, mcpKeys });
+  await wiring.discoverMcpTools();
+  broken = true;
+  const o = await asUser(scope, 'signed', () => wiring.executeMcpToolCall('o_read', {}));
+  assert.match(o, /could not check your sign-in for OAuth right now.*try again in a moment/i);
+  assert.doesNotMatch(o, /Plugins → Connected|sign in first/i, 'not told to sign in again');
+  const p = await asUser(scope, 'keyed', () => wiring.executeMcpToolCall('p_read', {}));
+  assert.match(p, /could not check your key for Personal right now/);
+  assert.doesNotMatch(p, /Add key/);
+  assert.equal(mcp.calls.length, 0, 'nothing was sent to the server');
+  // A fault that is not the broker being unavailable is not dressed up as that, and is not thrown out of the chat loop.
+  mcpOAuth.session = async () => { throw new TypeError('a real bug'); };
+  assert.equal(await asUser(scope, 'signed', () => wiring.executeMcpToolCall('o_read', {})), 'ERROR calling o_read: a real bug');
+});
+
+test('L6: the chat\'s signal reaches the broker, and a Stop answers as a stop, not as a sign-in problem', async () => {
+  const servers = [{ id: 'o', url: 'http://o/mcp', auth: 'oauth', title: 'OAuth', addedBy: 'signed' }, { id: 'p', url: 'http://p/mcp', auth: 'personal', title: 'Personal', addedBy: 'keyed' }];
+  const seen = [];
+  const mcpOAuth = { connected: () => true, tokenFor: async () => 'discovery', session: async (_u, _s, _r, opts) => { seen.push(['session', opts?.signal]); return { accessToken: 't', generation: 'g' }; } };
+  const mcpKeys = { hasKey: () => true, headers: async (_u, _s, opts) => { seen.push(['key', opts?.signal]); return { 'X-Key': 'k' }; } };
+  const catalogues = { 'http://o/mcp': [rawTool('o_read')], 'http://p/mcp': [rawTool('p_read')] };
+  const { wiring, scope } = build({ servers, catalogues, mcpOAuth, mcpKeys });
+  await wiring.discoverMcpTools();
+  seen.length = 0;
+  const stop = new AbortController();
+  await asUser(scope, 'signed', () => wiring.executeMcpToolCall('o_read', {}, stop.signal));
+  await asUser(scope, 'keyed', () => wiring.executeMcpToolCall('p_read', {}, stop.signal));
+  assert.deepEqual(seen, [['session', stop.signal], ['key', stop.signal]]);
+  // A Stop while the broker is being asked is reported as that.
+  const stopping = build({ servers, catalogues, mcpOAuth: { connected: () => true, tokenFor: async () => 'discovery', session: async () => { throw Object.assign(new Error('The request was stopped.'), { name: 'AbortError', code: 'ABORT_ERR' }); } }, mcpKeys });
+  await stopping.wiring.discoverMcpTools();
+  const out = await asUser(stopping.scope, 'signed', () => stopping.wiring.executeMcpToolCall('o_read', {}, stop.signal));
+  assert.equal(out, 'ERROR calling o_read: the request was stopped.');
+  assert.equal(stopping.mcp.calls.length, 0);
+});
+
 test('a personal key is asked of the broker for each call and never kept', async () => {
   let asked = 0;
   const mcpKeys = { hasKey: () => true, headers: async (uid) => { if (uid === 'x') return null; asked += 1; return { 'X-Key': `k${asked}` }; } };

@@ -198,17 +198,18 @@ test('the broker is asked for one call\'s access token or key, a refusal is none
   assert.equal(await creds.oauth.tokenFor(A, 's'), 'AT2', 'asked again: never cached here');
   answers.push({ ok: true, session: { accessToken: 'AT3', expiresAt: null, generation: 'g3' } });
   assert.equal((await creds.oauth.session(A, 's', 'AT2')).accessToken, 'AT3');
-  assert.deepEqual(calls, [['mcpSession', A, 's', null], ['mcpSession', A, 's', null], ['mcpSession', A, 's', 'AT2']]);
+  assert.deepEqual(calls, [['mcpSession', A, 's', null, { signal: null }], ['mcpSession', A, 's', null, { signal: null }], ['mcpSession', A, 's', 'AT2', { signal: null }]]);
   answers.push({ ok: false, status: 401, error: 'Sign in again', code: 'reconnect' });
   assert.equal(await creds.oauth.tokenFor(A, 's'), null);
-  answers.push({ ok: false, status: 503 });
-  assert.equal(await creds.oauth.session(A, 's'), null, 'a broker that cannot say is not a token');
+  answers.push({ ok: false, status: 401, error: 'No sign-in', code: 'disconnected' });
+  assert.equal(await creds.oauth.session(A, 's'), null, 'no sign-in is null: the account has to sign in');
   assert.equal(await creds.oauth.session('', 's'), null);
   assert.equal(calls.length, 5, 'no account, no call');
   answers.push({ ok: true, marked: true });
   assert.equal(await creds.oauth.reject(A, 's', 'g3'), true);
   answers.push({ ok: false, status: 503 });
   assert.equal(await creds.oauth.reject(A, 's', 'g3'), false);
+  assert.equal(calls.at(-1)[0], 'mcpReject', 'a mark is never held up by a Stop: it takes no signal');
   // Keys: one call's headers, or none.
   answers.push({ ok: true, headers: { 'X-Api-Key': 'k' } });
   assert.deepEqual(await creds.keys.headers(A, 'k'), { 'X-Api-Key': 'k' });
@@ -287,11 +288,71 @@ test('the store client speaks the MCP broker protocol: the secret, the ops, refu
   await assert.rejects(down.mcpSession('u', 's'), (e) => e.status === 503);
 });
 
-test('a broker that cannot be reached is "no token" and "no key" for a tool call, never a thrown error', async () => {
-  const busy = async () => { throw Object.assign(new Error('The project store is busy.'), { status: 503 }); };
-  const creds = owned.createMcpCredentials({ broker: { mcpSession: busy, mcpKey: busy, mcpReject: busy }, dataDir: os.tmpdir() });
-  assert.equal(await creds.oauth.session(A, 's'), null);
-  assert.equal(await creds.oauth.tokenFor(A, 's'), null);
-  assert.equal(await creds.oauth.reject(A, 's', 'g'), false);
-  assert.equal(await creds.keys.headers(A, 's'), null);
+test('L6: a broker that cannot say is "try again", not "sign in first"; "sign in first" is only what the broker says it is', async () => {
+  const unusable = (extra = {}) => async () => ({ ok: false, status: 503, ...extra });
+  const down = async () => { throw Object.assign(new Error('The project store is busy.'), { status: 503 }); };
+  for (const [label, broker] of [
+    ['unreachable', { mcpSession: down, mcpKey: down }],
+    ['an answer it cannot use', { mcpSession: unusable(), mcpKey: unusable() }],
+    ['the broker\'s own transient refusal', { mcpSession: unusable({ error: 'The sign-in to this server could not be refreshed right now. Try again in a moment.', code: 'transient' }), mcpKey: unusable({ error: 'x', code: 'transient' }) }],
+    ['a 401 without a code (not the broker\'s)', { mcpSession: async () => ({ ok: false, status: 401 }), mcpKey: async () => ({ ok: false, status: 401 }) }],
+  ]) {
+    const creds = owned.createMcpCredentials({ broker, dataDir: os.tmpdir() });
+    const trouble = (e) => e.transient === true && e.code === 'MCP_BROKER_UNAVAILABLE' && e.status === 503 && !/sign in first/i.test(e.message);
+    await assert.rejects(creds.oauth.session(A, 's'), trouble, label);
+    await assert.rejects(creds.oauth.tokenFor(A, 's'), trouble, label);
+    await assert.rejects(creds.keys.headers(A, 's'), trouble, label);
+  }
+  // The broker's words reach the caller when it gave some.
+  const said = owned.createMcpCredentials({ broker: { mcpSession: unusable({ error: 'Try again in a moment.', code: 'transient' }) }, dataDir: os.tmpdir() });
+  await assert.rejects(said.oauth.session(A, 's'), /^Error: Try again in a moment\.$/);
+  // "Sign in" / "add your key" is exactly the broker's disconnected and reconnect.
+  for (const code of ['disconnected', 'reconnect']) {
+    const creds = owned.createMcpCredentials({ broker: { mcpSession: async () => ({ ok: false, status: 401, error: 'x', code }), mcpKey: async () => ({ ok: false, status: 401, error: 'x', code }) }, dataDir: os.tmpdir() });
+    assert.equal(await creds.oauth.session(A, 's'), null, code);
+    assert.equal(await creds.keys.headers(A, 's'), null, code);
+  }
+  // A mark is soft: it never throws.
+  const soft = owned.createMcpCredentials({ broker: { mcpReject: down }, dataDir: os.tmpdir() });
+  assert.equal(await soft.oauth.reject(A, 's', 'g'), false);
+});
+
+test('L6: the chat\'s signal reaches the broker call, and a Stop is an AbortError, not an outage', async () => {
+  const seen = [];
+  const stopped = new AbortController();
+  const broker = {
+    mcpSession: async (_u, _s, _r, opts) => { seen.push(opts.signal); return new Promise((_resolve, reject) => opts.signal.addEventListener('abort', () => reject(Object.assign(new Error('x'), { name: 'AbortError' })))); },
+    mcpKey: async (_u, _s, opts) => { seen.push(opts.signal); throw new Error('boom'); },
+  };
+  const creds = owned.createMcpCredentials({ broker, dataDir: os.tmpdir() });
+  const pending = creds.oauth.session(A, 's', 'old', { signal: stopped.signal });
+  stopped.abort();
+  await assert.rejects(pending, (e) => e.name === 'AbortError' && e.code === 'ABORT_ERR' && e.transient !== true);
+  assert.equal(seen[0], stopped.signal);
+  // A failure while the signal has fired is the Stop; the same failure with a live signal is the outage.
+  await assert.rejects(creds.keys.headers(A, 's', { signal: stopped.signal }), (e) => e.name === 'AbortError');
+  await assert.rejects(creds.keys.headers(A, 's', { signal: new AbortController().signal }), (e) => e.transient === true);
+});
+
+test('L6: the store client lets the caller\'s signal cancel a broker call promptly, and says so', async () => {
+  const { createClient } = require('./project-store-client.cjs');
+  const token = 'synthetic-store-token-0123456789abcdef';
+  let signalSeen;
+  const hang = async (_url, init) => { signalSeen = init.signal; return new Promise((_resolve, reject) => init.signal.addEventListener('abort', () => reject(init.signal.reason))); };
+  const client = createClient({ port: 4321, token, fetchImpl: hang });
+  const stop = new AbortController();
+  const started = Date.now();
+  const pending = client.mcpSession('u', 's', null, { signal: stop.signal });
+  setTimeout(() => stop.abort(), 20);
+  await assert.rejects(pending, (e) => e.name === 'AbortError' && e.code === 'ABORT_ERR');
+  assert.ok(Date.now() - started < 5000, 'cancelled at the Stop, not at the 45 s deadline');
+  assert.equal(signalSeen.aborted, true);
+  // Without a caller signal the deadline still applies (a signal exists and is not aborted).
+  let plain;
+  await createClient({ port: 4321, token, fetchImpl: async (_u, init) => { plain = init.signal; return new Response('{}', { status: 200 }); } }).mcpKey('u', 's');
+  assert.ok(plain instanceof AbortSignal && plain.aborted === false);
+  // A refusal from the broker with its status (the wire `status`) is data; the same without it is "try again".
+  const answer = (status, body) => createClient({ port: 4321, token, fetchImpl: async () => new Response(JSON.stringify(body), { status }) });
+  assert.deepEqual(await answer(400, { error: 'invalid user or server', status: 400 }).mcpKey('u', 's'), { ok: false, status: 400, error: 'invalid user or server', code: undefined });
+  assert.deepEqual(await answer(400, { error: 'invalid user or server' }).mcpKey('u', 's'), { ok: false, status: 503 });
 });

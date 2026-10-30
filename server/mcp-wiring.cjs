@@ -98,10 +98,19 @@ function createMcpWiring({
   const rateLimit = require('./tool-rate-limit.cjs');
   const PER_USER_AUTH = new Set(['nextcloud', 'personal', 'oauth']);
   /** An access token for one call: the broker's session ({ accessToken, generation }), or null. */
-  const oauthSessionFor = async (userId, serverId, rejected = null) => {
-    if (typeof mcpOAuth.session === 'function') return mcpOAuth.session(userId, serverId, rejected);
-    const token = await mcpOAuth.tokenFor(userId, serverId);
+  const oauthSessionFor = async (userId, serverId, rejected = null, signal = undefined) => {
+    if (typeof mcpOAuth.session === 'function') return mcpOAuth.session(userId, serverId, rejected, { signal });
+    const token = await mcpOAuth.tokenFor(userId, serverId, { signal });
     return token ? { accessToken: token, generation: '' } : null;
+  };
+  /** What a tool call says when its credential could not be fetched for a reason that is NOT "the account has to
+   *  sign in": the broker is down or busy (`transient`) - nothing is wrong with the sign-in or key, so the
+   *  person is not sent to redo it - or the chat was stopped. */
+  const credentialTrouble = (name, server, err) => {
+    if (err && err.name === 'AbortError') return `ERROR calling ${name}: the request was stopped.`;
+    if (err && err.transient === true) return `ERROR: ${name} could not check your ${server.auth === 'oauth' ? 'sign-in' : 'key'} for ${server.title || 'this server'} right now. This is temporary: try again in a moment. Do not sign in again.`;
+    // Anything else is returned like any other failed call (a thrown error would strand the chip with no result).
+    return `ERROR calling ${name}: ${String((err && err.message) || err).slice(0, 300)}`;
   };
   const MCP_SERVERS = servers;
   if (publicFetch && typeof mcp.withFetch !== 'function') throw new TypeError('publicFetch needs an MCP client with withFetch');
@@ -483,12 +492,13 @@ function createMcpWiring({
     const callerId = scope.getStore()?.authn?.user?.id;
     if (server.auth === 'personal') {
       // Each account's own key, never another's: asked of the broker for this call only.
-      auth = await mcpKeys.headers(callerId, server.id);
+      // `signal` is the chat's: Stop cancels the broker call too.
+      try { auth = await mcpKeys.headers(callerId, server.id, { signal }); } catch (e) { return credentialTrouble(name, server, e); }
       if (!auth || !Object.keys(auth).length) return `ERROR: ${name} needs your own key for ${server.title || 'this server'}: Plugins → Connected → Add key.`;
     } else if (server.auth === 'oauth') {
       // Each account's own sign-in, never another's: an access token for this call only. The refresh
-      // token stays with the broker.
-      oauthSession = await oauthSessionFor(callerId, server.id);
+      // token stays with the broker. A broker that cannot say right now is "try again", not "sign in".
+      try { oauthSession = await oauthSessionFor(callerId, server.id, null, signal); } catch (e) { return credentialTrouble(name, server, e); }
       if (!oauthSession) return `ERROR: ${name} needs you to sign in to ${server.title || 'this server'} first: Plugins → Connected → Sign in.`;
       auth = { Authorization: `Bearer ${oauthSession.accessToken}` };
     } else if (server.auth === 'directory') {
@@ -534,8 +544,20 @@ function createMcpWiring({
         // refreshes only if that token is still the stored one) and try once more. A second refusal
         // marks THAT sign-in as needing a new one, so the account is told to sign in again.
         if (!(oauthSession && err && err.httpStatus === 401)) throw err;
-        const next = await oauthSessionFor(callerId, server.id, oauthSession.accessToken);
-        if (!next || next.accessToken === oauthSession.accessToken) {
+        let next;
+        try { next = await oauthSessionFor(callerId, server.id, oauthSession.accessToken, signal); }
+        catch (down) {
+          // The broker could not say (down, or its refresh at the service failed just now). The 401
+          // stands as the answer, and NOTHING is marked: the sign-in may be perfectly good, and
+          // marking it would cost the account a sign-in over a passing fault.
+          if (signal && signal.aborted) throw down;
+          throw err;
+        }
+        // No usable sign-in left: the broker has already marked the refused one (it does that itself when
+        // it cannot refresh past it), so there is nothing to mark here either.
+        if (!next) throw err;
+        if (next.accessToken === oauthSession.accessToken) {
+          // The broker's best is the very token that was refused: that sign-in is no good.
           if (typeof mcpOAuth.reject === 'function') await mcpOAuth.reject(callerId, server.id, oauthSession.generation).catch(() => false);
           throw err;
         }

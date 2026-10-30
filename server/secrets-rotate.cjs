@@ -83,15 +83,43 @@ function mergeProviderPass(report, pass) {
 }
 
 /**
- * Run a rotation and record it in the audit log. Never throws for a bad row. It does throw, before
- * anything is changed, when the front cannot re-seal the provider files (`resealProviders`, awaited
- * first: rust-providers-reseal.cjs `resealProviderKeys` on the internal store).
+ * The Rust front re-seals the Google Drive token files (it is their only writer, settings 7 /
+ * sbstndalton/noevia#2200) before the rest is rotated. `gdriveReseal` is the broker call
+ * (`project-store-client` gdriveReseal): `{ ok, counts }` or `{ ok: false, ... }`. SOFT: a front that cannot do
+ * it (down, an older build) is `{ error }`, never a throw - the files are left as they were, still readable by
+ * the front under the retired key, and the operator keeps the previous key and runs the rotation again.
  */
-async function runRotation({ secrets, db, dataDir, audit = () => {}, actorId = null, resealProviders, resealMcp }) {
+async function resealGoogleDrive(gdriveReseal) {
+  if (!gdriveReseal) return { error: 'the Rust front was not asked to re-seal the Google Drive token files (run the rotation from the admin page of the running server)' };
+  try {
+    const r = await gdriveReseal();
+    if (r && r.ok) return { counts: r.counts };
+    return { error: `the Rust front could not re-seal the Google Drive token files (${(r && r.status) || 'unreachable'})` };
+  } catch { return { error: 'the Rust front could not re-seal the Google Drive token files (unreachable)' }; }
+}
+
+/**
+ * Run a rotation and record it in the audit log. Never throws for a bad row. The order is fixed, and every
+ * callback is checked before the first await (a missing one must not leave the first passes done):
+ *   1. `await resealProviders()`: the front re-seals the provider files (rust-providers-reseal.cjs).
+ *   2. `await resealMcp()`: the front re-seals the MCP sign-ins, apps and keys (rust-mcp-credentials.cjs).
+ *   3. `await gdriveReseal()`, when given: the front re-seals the Google Drive token files. SOFT (above).
+ *   4. `secrets.rotate`: the rest, in this process.
+ *   5. the passes are merged into the report.
+ * Steps 1 and 2 throw when the front cannot do them, and then THIS process has changed nothing. The front's own
+ * passes may have run in part (the providers' before a failing MCP pass, or some rows of one): each re-seal is
+ * idempotent and per row, so a rotation can simply be run again.
+ */
+async function runRotation({ secrets, db, dataDir, audit = () => {}, actorId = null, resealProviders, resealMcp, gdriveReseal = null }) {
   if (typeof resealProviders !== 'function') throw new Error('the provider keys are re-sealed by the Rust front: runRotation needs resealProviders');
   if (typeof resealMcp !== 'function') throw new Error('the MCP credentials are re-sealed by the Rust front: runRotation needs resealMcp');
+  if (gdriveReseal !== null && gdriveReseal !== undefined && typeof gdriveReseal !== 'function') throw new Error('gdriveReseal, when given, must be a function');
   const providers = await resealProviders();
   const mcpCredentials = await resealMcp();
+  // Awaited too: the front's re-seal is a step of the rotation, not a race with it. (Settings 7 reads this
+  // result to reconcile the report's google_drive_users counts; on this base Node's own table still re-seals
+  // those files, so the result is not needed yet.)
+  await resealGoogleDrive(gdriveReseal);
   const report = secrets.rotate({ tables: rotationTables({ db, dataDir, secrets }) });
   mergeProviderPass(report, providers);
   mergeProviderPass(report, mcpCredentials);
@@ -108,8 +136,12 @@ if (require.main === module) {
     console.error('secrets rotation was not started and nothing was changed: the provider keys are re-sealed by the Rust front, which this shell cannot reach (the internal store\'s port and secret belong to the web process). Rotate through the running app instead: sign in as an administrator and POST /api/admin/secrets/rotate.');
     process.exit(2);
   }
-  const resealProviders = () => require('./rust-providers-reseal.cjs').resealProviderKeys(store.clientFromEnv(process.env));
-  const resealMcp = () => require('./rust-mcp-credentials.cjs').resealMcpCredentials(store.clientFromEnv(process.env));
+  // Every re-seal the front's store client offers, as the admin route passes them (index.cjs): a client from before
+  // the Drive broker has no gdriveReseal, which runRotation allows (the providers' and the MCP pass are required).
+  const front = store.clientFromEnv(process.env);
+  const resealProviders = () => require('./rust-providers-reseal.cjs').resealProviderKeys(front);
+  const resealMcp = () => require('./rust-mcp-credentials.cjs').resealMcpCredentials(front);
+  const gdriveReseal = typeof front.gdriveReseal === 'function' ? () => front.gdriveReseal() : null;
   const dataDir = process.env.UI_DATA_DIR || path.join(__dirname, 'ui-data');
   const { createSecretStore } = require('./secrets.cjs');
   const Database = require('better-sqlite3');
@@ -119,12 +151,12 @@ if (require.main === module) {
   const audit = (action, actor, target, detail) => {
     if (hasTable(db, 'audit_events')) db.prepare('INSERT INTO audit_events(actor_user_id,target_user_id,action,detail,created_at) VALUES(?,?,?,?,?)').run(actor, target, action, JSON.stringify({ ...detail, via: 'cli' }), Date.now());
   };
-  runRotation({ secrets, db, dataDir, audit, resealProviders, resealMcp }).then((report) => {
+  runRotation({ secrets, db, dataDir, audit, resealProviders, resealMcp, gdriveReseal }).then((report) => {
     console.log(JSON.stringify(report, null, 2));
     if (!report.previousKey) console.error('note: no previous key is configured; only legacy/plaintext values could be upgraded.');
     process.exitCode = report.totals.failed ? 2 : 0;
   }, (e) => {
-    console.error(`secrets rotation stopped before any other credential was changed (the front's provider pass may have run in part; a rotation can be run again): ${String(e && e.message || e).slice(0, 300)}`);
+    console.error(`secrets rotation stopped before this process changed any credential (the front's passes may have run in part; a rotation can be run again): ${String(e && e.message || e).slice(0, 300)}`);
     process.exitCode = 2;
   });
 }

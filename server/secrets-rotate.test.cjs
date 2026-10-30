@@ -231,6 +231,120 @@ test('M1: the shell form refuses without the front\'s internal store, before it 
   assert.equal(r.stdout, '');
 });
 
+// The order of a rotation (providers, MCP, then the Drive token files when the front offers that, then this
+// process's own pass, then the merge) and the checks before it. Settings 7 (Drive) and the MCP broker both
+// edit runRotation; these hold whichever lands second to the same sequence.
+function rotationFixture(t) {
+  const root = tmp(t);
+  const old = createSecretStore(root, noPrev);
+  const auth = createAuth({ dataDir: root, publicOrigin: 'https://noevia.example.test', secrets: old });
+  seedUsers(root, [[U1, U1]]);
+  saveStorageAsFront(root, null, U1, { kind: 'webdav', baseUrl: 'https://dav.example.test', username: 'a', secret: 'plain-old' });
+  const secrets = createSecretStore(root, noPrev);
+  const row = () => auth.db.prepare('SELECT secret v FROM storage_connections WHERE user_id=?').get(U1).v;
+  return { root, auth, secrets, row };
+}
+const counts = (o = {}) => ({ current: 0, rotated: 0, upgraded: 0, empty: 0, failed: 0, ...o });
+
+test('R: providers, then MCP, then Drive (soft), then this process, then the merge - each awaited', async (t) => {
+  const { root, auth, secrets, row } = rotationFixture(t);
+  const calls = [];
+  const untouched = async (name) => { calls.push(name); await new Promise((resolve) => setImmediate(resolve)); assert.equal(row(), 'plain-old', `${name}: this process has not started its own pass`); };
+  const report = await runRotation({
+    secrets, db: auth.db, dataDir: root, audit: () => calls.push('audit'),
+    resealProviders: async () => { await untouched('providers'); return { tables: { shared_providers: counts({ rotated: 2 }) }, failures: [] }; },
+    resealMcp: async () => { await untouched('mcp'); return { tables: { mcp_oauth_tokens: counts({ rotated: 3, failed: 1 }) }, failures: [{ table: 'mcp_oauth_tokens', ref: [U1, 's'], error: 'credential could not be opened' }] }; },
+    // SOFT: a front that is down is not a failure of the rotation.
+    gdriveReseal: async () => { await untouched('drive'); throw new Error('front down'); },
+  });
+  assert.deepEqual(calls, ['providers', 'mcp', 'drive', 'audit']);
+  assert.match(row(), /^enc:v2:/, 'the rotation went on after the Drive pass failed');
+  assert.deepEqual([report.tables.shared_providers.rotated, report.tables.mcp_oauth_tokens.rotated], [2, 3], 'both passes are in the report');
+  assert.equal(report.totals.rotated >= 5, true);
+  assert.deepEqual(report.failures.map((f) => f.table), ['mcp_oauth_tokens']);
+  // A Drive pass that answers "no" is soft too; one that answers "yes" is simply awaited.
+  for (const answer of [{ ok: false, status: 503 }, { ok: true, counts: { current: 1, rotated: 0, empty: 0, failed: 0 } }, null, undefined]) {
+    const seen = [];
+    const done = await runRotation({ secrets, db: auth.db, dataDir: root, resealProviders: async () => ({ tables: {}, failures: [] }), resealMcp: async () => ({ tables: {}, failures: [] }), gdriveReseal: answer === undefined ? undefined : async () => { seen.push('drive'); return answer; } });
+    assert.equal(done.totals.failed, 0, JSON.stringify(answer));
+    assert.equal(seen.length, answer === undefined ? 0 : 1, 'a callback given is called once');
+  }
+});
+
+test('R: every callback is checked before anything is awaited, so a bad one leaves no pass half-run', async (t) => {
+  const { root, auth, secrets, row } = rotationFixture(t);
+  const calls = [];
+  const providers = async () => { calls.push('providers'); return { tables: {}, failures: [] }; };
+  const mcp = async () => { calls.push('mcp'); return { tables: {}, failures: [] }; };
+  const run = (extra) => runRotation({ secrets, db: auth.db, dataDir: root, ...extra });
+  await assert.rejects(run({ resealProviders: providers }), /needs resealMcp/);
+  await assert.rejects(run({ resealMcp: mcp }), /needs resealProviders/);
+  for (const bad of ['yes', 5, {}, true]) await assert.rejects(run({ resealProviders: providers, resealMcp: mcp, gdriveReseal: bad }), /gdriveReseal/, String(bad));
+  assert.deepEqual(calls, [], 'no front pass ran before a refusal');
+  assert.equal(row(), 'plain-old', 'and nothing was changed');
+  // null and undefined are "the front offers no Drive pass".
+  await run({ resealProviders: providers, resealMcp: mcp, gdriveReseal: null });
+  await run({ resealProviders: providers, resealMcp: mcp });
+  assert.deepEqual(calls, ['providers', 'mcp', 'providers', 'mcp']);
+});
+
+test('R: a failing MCP pass stops the rotation after the providers\' pass ran, and this process changed nothing', async (t) => {
+  const { root, auth, secrets, row } = rotationFixture(t);
+  const calls = [];
+  const audits = [];
+  await assert.rejects(runRotation({
+    secrets, db: auth.db, dataDir: root, audit: (...a) => audits.push(a),
+    resealProviders: async () => { calls.push('providers'); return { tables: {}, failures: [] }; },
+    resealMcp: async () => { calls.push('mcp'); throw new Error('project store answered 503: credential store unavailable'); },
+    gdriveReseal: async () => { calls.push('drive'); return { ok: true, counts: counts() }; },
+  }), /credential store unavailable/);
+  assert.deepEqual(calls, ['providers', 'mcp'], 'the front\'s earlier pass did run; the Drive pass and this process\'s did not');
+  assert.equal(row(), 'plain-old');
+  assert.deepEqual(audits, []);
+  // The words say what is true: the front\'s passes may have run in part; nothing of this process\'s was changed.
+  const src = fs.readFileSync(path.join(__dirname, 'secrets-rotate.cjs'), 'utf8');
+  assert.doesNotMatch(src, /before anything is changed/);
+  assert.match(src, /passes may have run in part/);
+});
+
+test('R: the shell form calls every re-seal the store client offers, in that order, then rotates', async (t) => {
+  const root = tmp(t);
+  const old = createSecretStore(root, noPrev);
+  const auth = createAuth({ dataDir: root, publicOrigin: 'https://noevia.example.test', secrets: old });
+  seedUsers(root, [[U1, U1]]);
+  const token = 'synthetic-store-token-0123456789abcdef';
+  const hits = [];
+  const http = require('node:http');
+  const server = http.createServer((req, res) => {
+    req.resume();
+    req.on('end', () => {
+      hits.push(req.url);
+      res.setHeader('content-type', 'application/json');
+      const send = (body) => res.end(JSON.stringify(body));
+      if (req.headers['x-noevia-store-token'] !== token) { res.statusCode = 401; return send({}); }
+      if (req.url === '/v1/providers/reseal') return send({ ok: true, tables: { shared_providers: counts({ current: 1 }) }, failures: [] });
+      if (req.url === '/v1/mcp/reseal') return send({ ok: true, tables: { mcp_oauth_tokens: counts({ current: 2 }), mcp_oauth_clients: counts(), directory_mcp_user_keys: counts() }, failures: [] });
+      if (req.url === '/v1/gdrive/reseal') return send({ current: 1, rotated: 0, empty: 0, failed: 0 });
+      res.statusCode = 404; return send({});
+    });
+  });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  t.after(() => server.close());
+  const offered = typeof require('./project-store-client.cjs').createClient({ port: 1, token }).gdriveReseal === 'function';
+  const child = require('node:child_process').spawn(process.execPath, [path.join(__dirname, 'secrets-rotate.cjs')], {
+    env: { ...process.env, UI_DATA_DIR: root, NOEVIA_PROJECT_STORE_PORT: String(server.address().port), NOEVIA_PROJECT_STORE_TOKEN: token },
+  });
+  let stdout = ''; let stderr = '';
+  child.stdout.on('data', (d) => { stdout += d; }); child.stderr.on('data', (d) => { stderr += d; });
+  const code = await new Promise((resolve) => { const timer = setTimeout(() => { child.kill(); resolve('timeout'); }, 60000); child.on('close', (c) => { clearTimeout(timer); resolve(c); }); });
+  assert.equal(code, 0, stderr);
+  assert.deepEqual(hits, ['/v1/providers/reseal', '/v1/mcp/reseal', ...(offered ? ['/v1/gdrive/reseal'] : [])]);
+  const report = JSON.parse(stdout);
+  assert.equal(report.tables.shared_providers.current, 1);
+  assert.equal(report.tables.mcp_oauth_tokens.current, 2);
+  void auth;
+});
+
 test('an undecryptable storage secret reports needs re-auth, not connected (the MCP sign-ins\' own states are the front\'s)', (t) => {
   const root = tmp(t);
   const secrets = createSecretStore(root, noPrev);

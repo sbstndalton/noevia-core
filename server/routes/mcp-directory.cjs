@@ -73,7 +73,7 @@ function createMcpDirectoryRoutes({ json, readJson, auth, servers: MCP_SERVERS, 
           description: String(t.function?.description || '').slice(0, 240),
         }));
         return { ...s, toolCount: st?.toolCount ?? null, tools, toolsTruncated: (box?.tools?.length || 0) > tools.length,
-          error: st?.error || null, ...(s.oauth ? { oauthClient: await mcpOAuth.clientInfo(s.id), redirectUri } : {}) };
+          error: st?.error || null, ...(s.oauth ? { oauthClient: await mcpOAuth.clientInfo(s.id).catch(() => null), redirectUri } : {}) };
       }));
       if (p === '/api/admin/mcp-directory' && req.method === 'GET') return reply(res, 200, { servers: await describe() });
       if (p === '/api/admin/mcp-directory' && req.method === 'POST') {
@@ -200,6 +200,10 @@ function createMcpDirectoryRoutes({ json, readJson, auth, servers: MCP_SERVERS, 
         if (!rediscovered) {
           // A concurrent delete may already have removed it; either way the answer is the same 409.
           try { directoryMcp.remove(added.id, authn.user.id); } catch { /* Already gone. */ }
+          // The adding administrator's key (keepAdminKey stored it with the broker) goes with the server it
+          // was for. An id is derived from the server's name, so adding the same server again would otherwise
+          // inherit a key that was never kept on purpose.
+          await mcpOAuth.forget(added.id).catch(() => {});
           syncDirectoryServers();
           try { await discoverMcpTools(true); } catch { /* The saved entry is already gone. */ }
           return reply(res, 409, { error: 'The server’s tools changed while connecting. It was not kept; preview again.' });

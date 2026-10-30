@@ -243,6 +243,51 @@ test('a concurrent delete during rediscovery still returns the drift 409', async
   assert.ok(calls.includes('remove'));
 });
 
+test('M3: a custom add rolled back because its tools changed also forgets the adding administrator\'s key', async () => {
+  const calls = [];
+  const { routes, directoryMcp } = customDeps({
+    discoverMcpTools: async () => { throw new Error('rediscovery failed'); },
+    mcpOAuth: { clientInfo: async () => null, forget: async (id) => { calls.push(['forget', id]); } },
+    mcpKeys: { set: async (user, id, headers) => { calls.push(['keySet', user, id, Object.keys(headers)]); } },
+  });
+  const personal = { id: 'dir-custom', title: 'Custom', registryName: 'url:https://external.example/mcp', personal: true };
+  directoryMcp.list = () => [personal];
+  directoryMcp.add = () => { calls.push(['add']); return personal; };
+  directoryMcp.remove = (id) => { calls.push(['remove', id]); };
+  const body = { ...customBody, headerName: 'X-Api-Key', headerValue: 'synthetic-key', keyMode: 'personal' };
+  const preview = fakeRes();
+  await routes(req('POST', body), preview, { path: '/api/admin/mcp-directory/custom/preview', authn: admin });
+  assert.equal(preview.out.code, 200, JSON.stringify(preview.out.body));
+  const res = fakeRes();
+  await routes(req('POST', { ...body, previewToken: preview.out.body.previewToken }), res, { path: '/api/admin/mcp-directory/custom', authn: admin });
+  assert.equal(res.out.code, 409);
+  assert.match(res.out.body.error, /not kept/);
+  assert.deepEqual(calls, [['add'], ['keySet', 'adm', 'dir-custom', ['X-Api-Key']], ['remove', 'dir-custom'], ['forget', 'dir-custom']], 'the key the broker stored goes with the server');
+  // A broker that cannot forget does not turn the 409 into something else (the start sweep removes it).
+  const failing = customDeps({
+    discoverMcpTools: async () => { throw new Error('rediscovery failed'); },
+    mcpOAuth: { clientInfo: async () => null, forget: async () => { throw new Error('unavailable'); } },
+    mcpKeys: { set: async () => {} },
+  });
+  failing.directoryMcp.list = () => [personal];
+  failing.directoryMcp.add = () => personal;
+  const p2 = fakeRes();
+  await failing.routes(req('POST', body), p2, { path: '/api/admin/mcp-directory/custom/preview', authn: admin });
+  const r2 = fakeRes();
+  await failing.routes(req('POST', { ...body, previewToken: p2.out.body.previewToken }), r2, { path: '/api/admin/mcp-directory/custom', authn: admin });
+  assert.equal(r2.out.code, 409);
+});
+
+test('L6: the admin list survives a broker that cannot describe one server\'s app', async () => {
+  const { routes } = build({ mcpOAuth: { clientInfo: async () => { throw Object.assign(new Error('unavailable'), { status: 503 }); }, forget: async () => {} } });
+  const res = fakeRes();
+  await routes(req('GET'), res, { path: '/api/admin/mcp-directory', authn: admin });
+  assert.equal(res.out.code, 200);
+  assert.equal(res.out.body.servers[0].id, 'dir-a');
+  assert.equal(res.out.body.servers[0].oauthClient, null);
+  assert.equal(res.out.body.servers[0].redirectUri, 'https://noevia.example/api/mcp-oauth/callback');
+});
+
 test('#796: a body that is not a JSON object is a 400 on every admin directory write, not a TypeError', async () => {
   const { routes, calls } = build();
   for (const [method, path] of [['POST', '/api/admin/mcp-directory'], ['PUT', '/api/admin/mcp-directory/dir-a/keys'], ['POST', '/api/admin/mcp-directory/custom']]) {
