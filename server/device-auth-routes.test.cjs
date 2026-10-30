@@ -155,9 +155,12 @@ test('scope limits: a device token never reaches administration or account secur
   const backup = await asDevice(tokens.access, '/api/admin/offsite-backup', { method: 'GET' });
   assert.equal(backup.status, 503);
   assert.equal(backup.json.code, 'RUST_OFFSITE_BACKUP_OWNED');
+  // The Diary connector credentials are the Rust front's too (#2206; its gate refuses device tokens there).
+  const connectors = await asDevice(tokens.access, '/api/profile/diary-connectors', { method: 'POST', body: {} });
+  assert.equal(connectors.status, 503);
+  assert.equal(connectors.json.code, 'RUST_DIARY_ROUTES_OWNED');
   const refused = [
     ['DELETE', `/api/admin/users/${memberId}`, { username: 'memberqa' }],
-    ['POST', '/api/profile/diary-connectors', {}],
   ];
   for (const [method, url, body] of refused) {
     const r = await asDevice(tokens.access, url, { method, body });

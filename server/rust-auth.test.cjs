@@ -77,7 +77,7 @@ test('#1071: Node refuses exactly the sign-in and account routes the Rust front 
   for (const [p, methods] of RUST_ROUTES) {
     for (const m of METHODS) assert.equal(ownedRoute(m, p), methods === null || methods.includes(m), `${m} ${p}`);
   }
-  // What stays Node's: account deletion, Settings -> Web address, the Diary connectors,
+  // What stays Node's: account deletion, Settings -> Web address, (the Diary connectors are rust-diary-routes.cjs's),
   // retention's PUT, the feature switches, the device approval page (rust-public-pages.cjs's since #2190),
   // and look-alike paths.
   for (const [m, p] of [
@@ -122,7 +122,11 @@ test('while on, owned writes throw 503 when they run; reads and other tables do 
   db.prepare('INSERT INTO audit_events(action,created_at) VALUES(?,?)').run('x', 1);
   // sbstndalton/noevia#2190 round 4: the storage row is the front's too (its own code).
   assert.throws(() => db.prepare('INSERT INTO storage_connections(user_id) VALUES(?)').run('u'), (e) => e.status === 503 && e.code === 'RUST_STORAGE_CONNECTION_OWNED');
-  db.prepare('DELETE FROM diary_connectors WHERE user_id=?').run('u');
+  // sbstndalton/noevia#2206: the Diary connectors are the front's table, refused with their own code.
+  assert.throws(() => db.prepare('DELETE FROM diary_connectors WHERE user_id=?').run('u'), (e) => e.status === 503 && e.code === 'RUST_DIARY_ROUTES_OWNED');
+  assert.throws(() => db.prepare('INSERT INTO diary_connectors VALUES(?,?,?,?,?)').run('i', 'u', 'n', 'h', 1), (e) => e.code === 'RUST_DIARY_ROUTES_OWNED');
+  assert.throws(() => guard.exempt(() => db.prepare('DELETE FROM diary_connectors WHERE id=?').run('i')), (e) => e.code === 'RUST_DIARY_ROUTES_OWNED', 'refused inside exempt() too');
+  assert.throws(() => db.exec('DELETE FROM diary_connectors'), (e) => e.code === 'RUST_DIARY_ROUTES_OWNED');
   db.exec('CREATE TABLE IF NOT EXISTS x(y)');
   assert.throws(() => db.exec('CREATE TABLE a(b); DELETE FROM sessions'), (e) => e.code === 'RUST_AUTH_OWNED');
   assert.ok(!db.ran.some(([, sql]) => /sessions/.test(sql) && !/SELECT/.test(sql)), 'no owned write reached the database');
@@ -337,7 +341,7 @@ test('settings: an old "off" option guards anyway, and the front\'s keys stay re
 });
 test('sbstndalton/noevia#2190 round 4: storage_connections is refused exempt or not, but for the exact reseal', () => {
   const { RESEAL_SQL, ROUTE_REFUSAL } = require('./rust-storage-connection.cjs');
-  assert.deepEqual(Object.keys(FRONT_TABLES), ['storage_connections', 'chatgpt_oauth_tokens', 'tool_policies']);
+  assert.deepEqual(Object.keys(FRONT_TABLES), ['storage_connections', 'chatgpt_oauth_tokens', 'tool_policies', 'diary_connectors']);
   assert.equal(FRONT_TABLES.storage_connections.code, ROUTE_REFUSAL.code);
   const guard = on();
   const db = guard.install(fakeDb());

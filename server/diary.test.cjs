@@ -28,7 +28,6 @@ function fixture({ storage = { kind: 'local' }, approved = true, source = 'sidec
       db: { prepare: () => ({ get: (id) => (users[id] && !users[id].disabled_at ? users[id] : undefined) }) },
     },
     endpointApproved: () => approved,
-    workspaceStore: { get: (id) => ({ userId: id, dir: path.join(dir, id) }) },
   });
   const asUser = (id, fn) => requestScope.run({ workspace: { userId: id, dir: path.join(dir, id) }, authn: { user: users[id] } }, fn);
   return { diary, fetched, asUser, dir, users, diaryOn };
@@ -72,21 +71,6 @@ test('the sidecar corpus source reads a month or today; the month list is the Ru
 test('an unsupported DIARY_SOURCE fails at startup and names the value', () => {
   assert.throws(() => fixture({ source: 'local' }), /Unsupported DIARY_SOURCE 'local': only 'sidecar' is supported/);
   assert.throws(() => fixture({ source: '' }), /Unsupported DIARY_SOURCE ''/);
-});
-
-test('callDiaryFile runs as the named user and refuses accounts without the Diary', async () => {
-  const f = fixture({ reply: (url, init) => ({ ok: true, status: 200, body: { files: [url, init.headers['X-Cowork-User-ID']] } }) });
-  assert.deepEqual(await f.diary.connectorFiles.list('u1', 'Notes/a b'), ['http://diary:8010/api/files?path=Notes%2Fa%20b', 'u1']);
-  assert.equal(f.fetched[0].init.method, 'GET');
-  await f.diary.connectorFiles.write('u1', { path: 'x.md', content: 'c' });
-  assert.equal(f.fetched[1].init.method, 'PUT');
-  assert.equal(f.fetched[1].init.body, '{"path":"x.md","content":"c"}');
-  await assert.rejects(f.diary.callDiaryFile('u2', '/file', 'POST', {}), (e) => e.status === 403 && e.message === 'Diary unavailable');
-  await assert.rejects(f.diary.callDiaryFile('ghost', '/file', 'POST', {}), (e) => e.status === 403);
-  const failing = fixture({ reply: () => ({ ok: false, status: 409, body: { detail: 'stale version' } }) });
-  await assert.rejects(failing.diary.connectorFiles.read('u1', 'x.md'), (e) => e.status === 409 && e.message === 'stale version');
-  const silent = fixture({ reply: () => ({ ok: false, status: 0, body: null }) });
-  await assert.rejects(silent.diary.connectorFiles.read('u1', 'x.md'), (e) => e.status === 502 && /read the current version before retrying a write/.test(e.message));
 });
 
 test('#1168: diaryFetchJson sends X-Cowork-Storage-Retry only when asked, and the 428 resend keeps it', async () => {

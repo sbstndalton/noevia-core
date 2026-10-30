@@ -5,14 +5,11 @@
 // refused before authentication and before the inference gate, whoever asks, so the sidecar is only
 // ever reached by the front's signed requests and a stale route table cannot make two processes answer.
 //
-// What stays here, and why (each reads this process's memory or its own table):
-//   /api/diary/context          the project list (PROJECTS), created on first use
-//   /api/diary/exchanges        the set of running exchange jobs (diary-jobs.cjs `active`)
-//   /api/diary/local-exchange   the model throttle shared with chat (llmRateLimited) and the inference gate
-//   /api/diary/storage-status   the storage-login latch (storage-latch.cjs), written by the backup worker
-//   /api/diary-connector, /api/profile/diary-connectors   the diary_connectors table, its throttles and audit
-// and the paths the web client does not name (/api/diary/history, files, file, workspace-trash,
-// external-sources, entries/edit), which the front's route table does not list.
+// The rest of the Diary routes the web client names, but the local exchange, moved with #2206 and are
+// refused by rust-diary-routes.cjs. What stays here is POST /api/diary/local-exchange (the model
+// throttle chat shares and the inference gate), and the paths the web client does not name
+// (/api/diary/history, files, file, workspace-trash, external-sources, entries/edit), which the front's
+// route table does not list.
 //
 // The list is exactly noevia-rs contracts/http/routes.toml's owner = "rust" entries under /api/diary/
 // (every method: each route answers its own 405 after the add-on gate, as Node did).

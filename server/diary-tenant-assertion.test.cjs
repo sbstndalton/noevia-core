@@ -57,7 +57,6 @@ function fixture({ key = KEY, storage, approved = true, reply } = {}) {
     fetchJson: async (url, init) => { fetched.push({ url, init }); return reply ? reply(url, init, fetched.length) : { ok: true, status: 200, body: {} }; },
     authService: { getStorage: () => storage, diaryEnabled: () => true, publicUser: (r) => r, db: { prepare: () => ({ get: (id) => ({ id }) }) } },
     endpointApproved: () => approved,
-    workspaceStore: { get: (id) => ({ userId: id, dir: path.join(dir, id) }) },
   });
   const asUser = (fn) => requestScope.run({ workspace: { userId: A, dir: path.join(dir, A) }, authn: { user: { id: A } } }, fn);
   const decode = (h) => JSON.parse(Buffer.from(h['X-Cowork-Storage'], 'base64url').toString());
@@ -140,10 +139,7 @@ test('every Diary call made inside a workspace scope names the tenant and is sig
     await f.diary.corpusSource.readMonth('2026-09');
     await f.diary.diaryFetchJson('http://diary:8010/api/storage-status', {}, 1000);
   });
-  await f.diary.connectorFiles.list(A, 'x');
-  await f.diary.connectorFiles.read(A, 'x');
-  await f.diary.connectorFiles.write(A, { path: 'x', content: 'y' });
-  assert.equal(f.fetched.length, 6);
+  assert.equal(f.fetched.length, 3);
   for (const { init } of f.fetched) {
     assert.equal(init.headers['X-Cowork-User-ID'], A);
     assert.match(init.headers[ASSERTION_HEADER], /^v2\./);

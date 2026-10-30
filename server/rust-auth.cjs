@@ -189,6 +189,14 @@ const FRONT_TABLES = Object.freeze({
     code: require('./rust-google-drive.cjs').ROUTE_REFUSAL.code,
     allowed: null,
   }),
+  // sbstndalton/noevia#2206: the Diary connector credentials (rust-diary-routes.cjs). Created at boot by
+  // diary-connectors.cjs (DDL is not a write the guard sees); the front makes, lists, revokes and verifies
+  // them, so no Node statement is allowed. An account's rows go with it by cascade.
+  [require('./rust-diary-routes.cjs').TABLE]: Object.freeze({
+    message: require('./rust-diary-routes.cjs').ROUTE_REFUSAL.error,
+    code: require('./rust-diary-routes.cjs').ROUTE_REFUSAL.code,
+    allowed: null,
+  }),
 });
 /** The guard. It takes no options: Rust always owns these tables (sbstndalton/noevia#1071). */
 function createRustAuthGuard() {
