@@ -29,6 +29,25 @@ const MESSAGES = {
   unavailable: 'Google Drive is unavailable right now. Try again in a moment.',
 };
 const ID = /^[\w-]+$/;
+const DEFAULT_API = 'https://www.googleapis.com/drive/v3';
+const DEFAULT_UPLOAD = 'https://www.googleapis.com/upload/drive/v3';
+
+/**
+ * The Drive API base this process hands its chat tools. The Rust front accepts a different endpoint only on a
+ * loopback address (a QA server); core took any URL, which would send every access token this process holds to
+ * wherever an environment variable pointed. The same rule here: a loopback http(s) URL without credentials, else the
+ * default (a warning says so).
+ */
+function loopbackBase(raw, fallback, warn = console.warn) {
+  if (!raw || raw === fallback) return fallback;
+  let u;
+  try { u = new URL(raw); } catch { u = null; }
+  const host = u ? u.hostname.replace(/^\[|\]$/g, '').toLowerCase() : '';
+  const loopback = host === 'localhost' || /^127(\.\d{1,3}){3}$/.test(host) || host === '::1';
+  if (u && (u.protocol === 'http:' || u.protocol === 'https:') && !u.username && !u.password && loopback) return String(raw).replace(/\/+$/, '');
+  warn('GOOGLE_DRIVE_API_BASE_URL / GOOGLE_DRIVE_UPLOAD_BASE_URL are ignored unless they name a loopback address; the Google defaults are used');
+  return fallback;
+}
 
 /** drive-accounts.cjs `ownsBackup`: whether the backup slot is this account's Drive. */
 function ownsBackup({ admin, userId, backup, personalFile }) {
@@ -49,8 +68,10 @@ function ownsBackup({ admin, userId, backup, personalFile }) {
  * @param {string} deps.dataDir
  * @param {string} [deps.apiBase] @param {string} [deps.uploadBase]
  */
-function createDriveAccounts({ broker, dataDir, apiBase = 'https://www.googleapis.com/drive/v3', uploadBase = 'https://www.googleapis.com/upload/drive/v3',
+function createDriveAccounts({ broker, dataDir, apiBase = DEFAULT_API, uploadBase = DEFAULT_UPLOAD,
   fetchImpl = (...args) => globalThis.fetch(...args), now = () => Date.now(), signalFile = path.join(dataDir, SIGNAL_FILE), warn = console.warn }) {
+  apiBase = loopbackBase(apiBase, DEFAULT_API, warn);
+  uploadBase = loopbackBase(uploadBase, DEFAULT_UPLOAD, warn);
   const snapshot = createReread({
     signal: () => fileSignal(signalFile),
     load: () => {
@@ -77,7 +98,7 @@ function createDriveAccounts({ broker, dataDir, apiBase = 'https://www.googleapi
     return typeof doc.personal[user.id] === 'string' ? doc.personal[user.id] : 'disconnected';
   }
 
-  const sessions = new Map(); // userId -> { session, until, mark }
+  const sessions = new Map(); // userId -> { session, until, mark, admin } (a session is the account's AS an administrator or not)
   const brokerError = (r) => {
     const code = typeof r?.code === 'string' ? r.code : undefined;
     const text = code && MESSAGES[code] ? MESSAGES[code] : (typeof r?.error === 'string' && Number.isInteger(r?.status) ? r.error.slice(0, 300) : MESSAGES.unavailable);
@@ -89,7 +110,7 @@ function createDriveAccounts({ broker, dataDir, apiBase = 'https://www.googleapi
     const mark = markOf();
     if (!rejected && mark !== null) {
       const hit = sessions.get(key);
-      if (hit && hit.mark === mark && hit.until > now()) return hit.session;
+      if (hit && hit.mark === mark && hit.until > now() && hit.admin === admin(user)) return hit.session;
     }
     sessions.delete(key);
     let r;
@@ -98,7 +119,7 @@ function createDriveAccounts({ broker, dataDir, apiBase = 'https://www.googleapi
     const s = r.session;
     const until = Math.min(now() + SESSION_CACHE_MS, Number.isFinite(s.expiresAt) && s.expiresAt > 0 ? s.expiresAt : Infinity);
     if (mark !== null && until > now()) {
-      sessions.set(key, { session: s, until, mark });
+      sessions.set(key, { session: s, until, mark, admin: admin(user) });
       while (sessions.size > SESSION_CACHE_MAX) sessions.delete(sessions.keys().next().value);
     }
     return s;
@@ -161,4 +182,4 @@ function createDriveAccounts({ broker, dataDir, apiBase = 'https://www.googleapi
   return { forUser, removeUser, fingerprint, connected: (user) => !!user && !!user.id && stateOf(user) === 'connected', view, ownsBackup };
 }
 
-module.exports = { createDriveAccounts, ownsBackup, MESSAGES };
+module.exports = { createDriveAccounts, ownsBackup, loopbackBase, MESSAGES };

@@ -8,8 +8,8 @@ const test = require('node:test'), assert = require('node:assert/strict');
 const fs = require('node:fs'), os = require('node:os'), path = require('node:path');
 const gdrive = require('./rust-google-drive.cjs');
 const offsite = require('./rust-offsite-backup.cjs');
-const { createDriveAccounts, ownsBackup, MESSAGES } = require('./gdrive-broker.cjs');
-const { sealer, resealTokenFile } = require('./gdrive-seal.cjs');
+const { createDriveAccounts, ownsBackup, loopbackBase, MESSAGES } = require('./gdrive-broker.cjs');
+const { sealer, checkTokenFile } = require('./gdrive-seal.cjs');
 const { createSecretStore } = require('./secrets.cjs');
 const { createToolPolicy } = require('./tool-policy.cjs');
 const { createFingerprintedCache } = require('./toolboxes-permitted.cjs');
@@ -149,12 +149,13 @@ test('golden vector: the Rust front opens what Node sealed and Node opens what t
     assert.equal(sealer(key).seal(USER_RECORD), USER_SEALED);
     assert.equal(sealer(Buffer.alloc(32, 9)).seal(BACKUP_RECORD), BACKUP_SEALED);
   } finally { crypto.randomBytes = real; }
-  // A file the front wrote under the previous key is re-sealed by the rotation and still opens.
+  // The rotation's check is read-only: a file the front sealed opens under its key ('current'); under another it
+  // does not, and Node does not rewrite it (the front re-seals; noevia-rs tests/gdrive.rs proves that half).
   const file = path.join(dir, 'u.sealed');
   fs.writeFileSync(file, USER_SEALED);
-  const next = Buffer.alloc(32, 5);
-  assert.equal(resealTokenFile(file, next, key), 'rotated');
-  assert.deepEqual(sealer(next).open(fs.readFileSync(file, 'utf8')), USER_RECORD);
+  assert.equal(checkTokenFile(file, key), 'current');
+  assert.throws(() => checkTokenFile(file, Buffer.alloc(32, 5)), /not sealed under the current key/);
+  assert.equal(fs.readFileSync(file, 'utf8'), USER_SEALED);
 });
 
 test('whose Drive an account reaches: the cases file the front tests too', () => {
@@ -244,6 +245,44 @@ test('an access token is cached while the state file stands still, and for no lo
   await drive.call('https://drive.test/files');
   await drive.call('https://drive.test/files');
   assert.equal(calls.session.length, 4);
+});
+
+test('a cached access token belongs to the role it was asked for: an account that stops being an administrator asks again', async () => {
+  const { dir, calls, accounts } = harness();
+  publish(dir, { personal: { [A]: 'connected' } });
+  const asAdmin = accounts.forUser({ id: A, role: 'admin' }).drive;
+  await asAdmin.call('https://drive.test/files');
+  await asAdmin.call('https://drive.test/files');
+  assert.equal(calls.session.length, 1);
+  assert.equal(calls.session[0].admin, true);
+  // The same account, the same state file, now a member: the token minted for the administrator (it may be the
+  // backup slot's) is not reused.
+  const asMember = accounts.forUser({ id: A, role: 'member' }).drive;
+  await asMember.call('https://drive.test/files');
+  assert.equal(calls.session.length, 2, 'a role change is a new session');
+  assert.equal(calls.session[1].admin, false);
+  await asMember.call('https://drive.test/files');
+  assert.equal(calls.session.length, 2, 'and that one is cached in turn');
+  await asAdmin.call('https://drive.test/files');
+  assert.equal(calls.session.length, 3);
+});
+
+test('the Drive API base is a loopback address or the Google default, as the front\'s own', () => {
+  const warned = [];
+  const base = (u) => loopbackBase(u, 'DEFAULT', (m) => warned.push(m));
+  assert.equal(base('http://127.0.0.1:9/drive/v3/'), 'http://127.0.0.1:9/drive/v3');
+  assert.equal(base('http://localhost:8080'), 'http://localhost:8080');
+  assert.equal(base('http://[::1]:5/x'), 'http://[::1]:5/x');
+  assert.deepEqual(warned, []);
+  for (const bad of ['https://evil.example/drive/v3', 'http://user:pw@127.0.0.1:9', 'ftp://127.0.0.1', 'not a url', 'http://127.0.0.1.evil.example/']) assert.equal(base(bad), 'DEFAULT', bad);
+  assert.equal(warned.length, 5);
+  assert.equal(base(''), 'DEFAULT');
+  assert.equal(warned.length, 5, 'unset is not a warning');
+  const { accounts } = harness();
+  assert.equal(accounts.forUser({ id: B, role: 'member' }).drive.api, 'https://www.googleapis.com/drive/v3');
+  const pointed = createDriveAccounts({ broker: {}, dataDir: temp(), apiBase: 'https://evil.example/drive', uploadBase: 'http://127.0.0.1:3/up', warn: () => {} });
+  const d = pointed.forUser({ id: B, role: 'member' }).drive;
+  assert.deepEqual([d.api, d.upload], ['https://www.googleapis.com/drive/v3', 'http://127.0.0.1:3/up']);
 });
 
 test('a 401 drops the cached token and asks again naming it; a second 401 rejects the sign-in', async () => {
@@ -370,6 +409,13 @@ test('the store client speaks the broker\'s operations and maps its answers', as
     assert.deepEqual(await client.gdriveForget(B), { ok: true });
     reply = { status: 200, body: { id: 'gdrive', name: 'Google Drive' } };
     assert.deepEqual(await client.gdriveView(B, false), { ok: true, view: { id: 'gdrive', name: 'Google Drive' } });
+    reply = { status: 200, body: { current: 1, rotated: 2, empty: 0, failed: 0 } };
+    assert.deepEqual(await client.gdriveReseal(), { ok: true, counts: { current: 1, rotated: 2, empty: 0, failed: 0 } });
+    assert.deepEqual(seen.at(-1), { url: '/v1/gdrive/reseal', token: 'synthetic-store-token-0123456789abcdef', body: {} });
+    for (const bad of [{ status: 200, body: { rotated: 1 } }, { status: 200, body: { current: -1, rotated: 0, empty: 0, failed: 0 } }, { status: 404, body: { error: 'not found' } }]) {
+      reply = bad;
+      assert.equal((await client.gdriveReseal()).ok, false, JSON.stringify(bad));
+    }
     reply = { status: 200, body: { ok: true } };
     assert.deepEqual(await client.toolPolicySet(B, ['nc_a', 'nc_b'], [false, true], 'ask'), { ok: true });
     assert.deepEqual(seen.at(-1).body, { user: B, tools: ['nc_a', 'nc_b'], writes: [false, true], mode: 'ask' });

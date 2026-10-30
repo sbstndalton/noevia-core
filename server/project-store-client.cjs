@@ -307,6 +307,17 @@ function createClient({ port, token, fetchImpl = globalThis.fetch, timeoutMs = T
       const { status, body } = await call('gdrive/forget', { user }, CHATGPT_WAIT_MS);
       return status === 200 && body?.ok === true ? { ok: true } : chatgptRefusal(status, body);
     },
+    /** secrets:rotate (round 7 review): the front re-seals every account's token file under the current
+     *  secrets.key, under its own fence. { ok: true, counts: { current, rotated, empty, failed } } or a refusal
+     *  (a 404 is an older front without the op). Counts only: no name, id or token. */
+    async gdriveReseal() {
+      const { status, body } = await call('gdrive/reseal', {}, CHATGPT_WAIT_MS);
+      const n = (k) => (Number.isInteger(body?.[k]) && body[k] >= 0 ? body[k] : null);
+      if (status === 200 && body && ['current', 'rotated', 'empty', 'failed'].every((k) => n(k) !== null)) {
+        return { ok: true, counts: { current: body.current, rotated: body.rotated, empty: body.empty, failed: body.failed } };
+      }
+      return chatgptRefusal(status, body);
+    },
     /** The Google Drive half of GET /api/connectors, as the front would answer it. */
     async gdriveView(user, admin) {
       const { status, body } = await call('gdrive/view', { user, admin: admin === true }, CHATGPT_WAIT_MS);

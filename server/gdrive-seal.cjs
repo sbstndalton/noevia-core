@@ -3,8 +3,8 @@
 // reads (noevia-rs crates/google-token-seal, sbstndalton/noevia#2190 round 7): AES-256-GCM under
 // HKDF-SHA256(backupKey, empty salt, "noevia google token v1"), base64 of iv|tag|body. The Rust front is
 // the only owner of the files; this module is what is left of gdrive.cjs for the two things that still
-// run in Node: `secrets:rotate` re-sealing an account's file under the new key (#866), and the golden
-// vector that proves Rust and Node agree on the bytes.
+// run in Node: the read-only check `secrets:rotate` makes after the front re-sealed an account's file under the
+// new key (#866), and the golden vector that proves Rust and Node agree on the bytes.
 const nodeFs = require('node:fs');
 const crypto = require('node:crypto');
 
@@ -26,21 +26,17 @@ function sealer(backupKey) {
 }
 
 /**
- * Re-seals a token file written under `previousKey` with `currentKey` (#866). Returns 'current' when it
- * already opens with the current key, 'rotated' when it was re-sealed, 'empty' for an empty file, and
- * throws when neither key opens it. Token values never appear in the thrown message.
+ * A READ-ONLY check that a token file opens with the current key. Since the review of round 7 Node writes none
+ * of these files: `secrets:rotate` asks the Rust front to re-seal them (POST /v1/gdrive/reseal, under the
+ * front's own fence, so a disconnect or a sign-in during the rotation is never undone by a stale rewrite) and
+ * then checks the result here. Returns 'current' when it opens, 'empty' for an empty file, and throws when it
+ * does not (still sealed under the retired key, or under no key). Token values never appear in the message.
  */
-function resealTokenFile(file, currentKey, previousKey) {
+function checkTokenFile(file, currentKey) {
   const text = nodeFs.readFileSync(file, 'utf8');
   if (!text.trim()) return 'empty';
-  try { sealer(currentKey).open(text); return 'current'; } catch { /* maybe the previous key */ }
-  if (!previousKey) throw new Error('sealed under a key that is no longer available');
-  let obj;
-  try { obj = sealer(previousKey).open(text); } catch { throw new Error('sealed under a key that is no longer available'); }
-  const tmp = `${file}.${process.pid}.${crypto.randomBytes(6).toString('hex')}.tmp`;
-  nodeFs.writeFileSync(tmp, sealer(currentKey).seal(obj), { mode: 0o600 });
-  nodeFs.renameSync(tmp, file);
-  return 'rotated';
+  try { sealer(currentKey).open(text); } catch { throw new Error('not sealed under the current key; the Rust front has not re-sealed it'); }
+  return 'current';
 }
 
-module.exports = { sealer, resealTokenFile };
+module.exports = { sealer, checkTokenFile };

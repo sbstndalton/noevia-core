@@ -58,7 +58,7 @@ test('decrypt falls back to the previous key from the file or SECRETS_KEY_PREVIO
   assert.throws(() => createSecretStore(root, { env: { SECRETS_KEY_PREVIOUS: 'c2hvcnQ=' } }), /previous/);
 });
 
-test('rotate re-encrypts every stored kind, upgrades plaintext, counts failures, and is idempotent', (t) => {
+test('rotate re-encrypts every stored kind, upgrades plaintext, counts failures, and is idempotent', async (t) => {
   const root = tmp(t);
   const old = createSecretStore(root, noPrev);
   const auth = createAuth({ dataDir: root, publicOrigin: 'https://noevia.example.test', secrets: old });
@@ -85,7 +85,7 @@ test('rotate re-encrypts every stored kind, upgrades plaintext, counts failures,
   retire(root);
   const secrets = createSecretStore(root, noPrev);
   const audits = [];
-  const report = runRotation({ secrets, db, dataDir: root, actorId: U1, audit: (...a) => audits.push(a) });
+  const report = await runRotation({ secrets, db, dataDir: root, actorId: U1, audit: (...a) => audits.push(a) });
   assert.deepEqual(report.totals, { current: 0, rotated: 7, upgraded: 2, empty: 0, failed: 1 });
   assert.equal(report.failures[0].table, 'mcp_oauth_tokens');
   assert.deepEqual(report.failures[0].ref, [U2, 'srv']);
@@ -111,7 +111,7 @@ test('rotate re-encrypts every stored kind, upgrades plaintext, counts failures,
   const mine = JSON.parse(fs.readFileSync(path.join(root, 'users', U1, 'providers.json'), 'utf8')).providers;
   assert.equal(only.decrypt(mine[0].apiKey), 'private-key');
 
-  const again = runRotation({ secrets: only, db, dataDir: root });
+  const again = await runRotation({ secrets: only, db, dataDir: root });
   assert.deepEqual(again.totals, { current: 9, rotated: 0, upgraded: 0, empty: 0, failed: 1 });
 });
 
