@@ -336,3 +336,29 @@ test('a personal key is asked of the broker for each call and never kept', async
   await none.wiring.discoverMcpTools();
   assert.match(none.wiring.state.servers.get('p').error, /waiting for the administrator who added it to enter their key/);
 });
+
+test('#2202: a sign-in or key the Rust front stored since the last discovery is noticed, without a forced discovery', async () => {
+  let signedIn = false;
+  const mcpOAuth = { connected: () => signedIn, tokenFor: async () => (signedIn ? 'admin-token' : null) };
+  const servers = [{ id: 'o', url: 'http://o/mcp', auth: 'oauth', title: 'OAuth', addedBy: 'admin' }, { id: 'b', url: 'http://b/mcp', auth: 'bearer', tokenEnv: 'T' }];
+  const { wiring, mcp } = build({ servers, mcpOAuth, env: { T: 't' }, manifest: [{ id: 'b-box', server: 'b' }], catalogues: { 'http://o/mcp': [rawTool('o_read')], 'http://b/mcp': [rawTool('b_read')] } });
+  let state = await wiring.discoverMcpTools();
+  assert.match(state.servers.get('o').error, /waiting for the administrator who added it to sign in/);
+  assert.equal(state.tools.has('o_read'), false);
+  // Cached while nothing moved.
+  const before = mcp.sessions.length;
+  await wiring.discoverMcpTools();
+  assert.equal(mcp.sessions.length, before, 'no credential changed, so no new discovery');
+  // The administrator signs in (the callback was the front's): the very next request reads the list.
+  signedIn = true;
+  state = await wiring.discoverMcpTools();
+  assert.equal(state.tools.has('o_read'), true);
+  assert.equal(state.servers.get('o').error, null);
+  const after = mcp.sessions.length;
+  await wiring.discoverMcpTools();
+  assert.equal(mcp.sessions.length, after, 'and it is cached again');
+  // A sign-out is noticed the same way: the box is no longer offered.
+  signedIn = false;
+  state = await wiring.discoverMcpTools();
+  assert.equal(state.tools.has('o_read'), false);
+});

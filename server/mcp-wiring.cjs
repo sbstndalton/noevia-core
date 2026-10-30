@@ -311,7 +311,19 @@ function createMcpWiring({
     return byName;
   }
 
+  // Whether the administrator who added each per-account server is ready for it (their sign-in or key,
+  // which discovery reads the tool list with). The Rust front completes the sign-in callback and stores
+  // keys, so this process is not the one to call a forced discovery when they change: it notices here.
+  const credentialKey = () => MCP_SERVERS
+    .filter((sv) => sv.auth === 'oauth' || sv.auth === 'personal')
+    .map((sv) => `${sv.id}:${sv.auth === 'oauth' ? !!mcpOAuth.connected(sv.addedBy, sv.id) : !!mcpKeys.hasKey(sv.addedBy, sv.id)}`)
+    .join('|');
+  let discoveredWith;
   async function discoverMcpTools(force = false) {
+    // A credential discovery depends on changed since the last discovery: the tool list it was waiting
+    // for (or must no longer offer) is read again now, as a forced discovery after the sign-in was.
+    const credentials = credentialKey();
+    if (!force && discoveredWith !== undefined && credentials !== discoveredWith) force = true;
     // No servers left (the last directory server was just removed): nothing may stay offered.
     if (!MCP_ENABLED) { mcpState.tools = new Map(); mcpState.offers = new Map(); mcpState.boxes = []; mcpState.servers = new Map(); mcpState.error = null; return mcpState; }
     const fresh = Date.now() - mcpState.discoveredAt < discoveryTtlMs;
@@ -328,6 +340,7 @@ function createMcpWiring({
     if (mcpState.inflight && force) { await mcpState.inflight.catch(() => undefined); return discoverMcpTools(true); }
     if (mcpState.inflight) return mcpState.inflight;
     mcpState.inflight = (async () => {
+      discoveredWith = credentials;
       try {
         const perServer = new Map();
         const found = new Map();

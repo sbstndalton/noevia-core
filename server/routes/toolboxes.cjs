@@ -22,6 +22,7 @@ const { createTtlCache } = require('../toolboxes-permitted.cjs');
  * @param {(input:{ authn:object, projectId:string|null, mode:'chat'|'cowork' }) => ({ project:object|null, boxes:object[] } | null)} [deps.permitted]
  *        null when the project is not this account's (the caller's getProject is tenant-scoped)
  * @param {{ get:(k:string)=>any, set:(k:string, v:any)=>void }} [deps.cache]
+ * @param {(authn:object, projectId:string|null) => unknown} [deps.cacheKeyExtra]  JSON-serialisable state the cached view depends on that this process does not clear the cache for
  */
 function createToolboxRoutes({ discoverMcpTools, toolboxSummaries, connectedBoxes = () => [], prefill, mcp, json, permitted = null, cache = createTtlCache({ ttlMs: 30000 }), cacheKeyExtra = () => null }) {
   return async function toolboxRoutes(req, res, { path, authn, url }) {
@@ -32,9 +33,11 @@ function createToolboxRoutes({ discoverMcpTools, toolboxSummaries, connectedBoxe
       const projectId = params.get('projectId') || null;
       const mode = params.get('mode') || 'chat';
       if (mode !== 'chat' && mode !== 'cowork') return json(res, 400, { error: 'mode must be "chat" or "cowork"' }), true;
-      // cacheKeyExtra: per-user state another process may change (the Diary preference, which the
-      // Rust front writes without clearing this cache, #1071), so a change shows at once.
-      const key = JSON.stringify([authn.user.id, authn.user.role, projectId, mode, cacheKeyExtra(authn)]);
+      // cacheKeyExtra: the state this view shows that another process may change without clearing this
+      // cache - the Diary preference, a project's toolbox selection and the account's connections (the
+      // Rust front writes all of these, #1071/#2190/#2191), the MCP credentials' readiness (#2202) - so a
+      // change shows at once instead of after the TTL. It is given the project asked about.
+      const key = JSON.stringify([authn.user.id, authn.user.role, projectId, mode, cacheKeyExtra(authn, projectId)]);
       let view = cache.get(key);
       if (!view) {
         await discoverMcpTools();

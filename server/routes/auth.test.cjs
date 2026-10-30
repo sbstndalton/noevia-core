@@ -81,3 +81,27 @@ test('deleting an account also removes its workspace, its Drive and its Diary te
   assert.deepEqual(f.calls[2].slice(1), ['u2']);
   assert.deepEqual(f.calls[3].slice(1), ['http://diary:8010/api/internal/tenant', 'DELETE', { 'X-Cowork-User-ID': 'u2', Authorization: 'Bearer sidecar-token' }]);
 });
+
+test('#2202: an account\'s MCP sign-ins and keys are the broker\'s to forget; a broker that cannot does not undo the deletion', async () => {
+  const warned = [];
+  const realWarn = console.warn; console.warn = (...a) => warned.push(a.join(' '));
+  try {
+    const f = fixture();
+    // The broker is asked (awaited) before the Diary tenant goes; its failure is reported without detail.
+    const sent = [], calls = [];
+    const routes = createAuthRoutes({
+      json: (_res, status, body) => sent.push({ status, body }), readJson: async () => ({ username: 'two' }),
+      authService: { deleteUser: () => true }, workspaceStore: { remove: () => calls.push('workspace') }, driveAccounts: { removeUser: async () => calls.push('drive') },
+      fetchJson: async () => { calls.push('diary'); return {}; }, DIARY_BASE: 'http://diary', DIARY_TOKEN: 't',
+      mcpOAuth: { forgetUser: async () => { calls.push('mcp'); throw Object.assign(new Error('secret-detail-ABC'), { status: 503 }); } },
+    });
+    const req = Readable.from([]); Object.assign(req, { method: 'DELETE', headers: {} });
+    await routes.account(req, {}, { path: '/api/admin/users/u2', authn: { user: { id: 'u1', role: 'admin' } } });
+    assert.deepEqual(sent, [{ status: 200, body: { ok: true } }]);
+    assert.deepEqual(calls, ['workspace', 'drive', 'mcp', 'diary'], 'the rest of the deletion still runs');
+    assert.equal(warned.length, 1);
+    assert.match(warned[0], /MCP sign-ins and keys of a deleted account were not removed \(503\)/);
+    assert.doesNotMatch(warned[0], /secret-detail/);
+    void f;
+  } finally { console.warn = realWarn; }
+});

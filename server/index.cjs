@@ -1230,9 +1230,15 @@ const readyRoutes = require('./routes/health.cjs').createReadyRoutes({
 // GET /api/toolboxes: the picker view (routes/toolboxes.cjs). MCP state is read at call time.
 const toolboxRoutes = require('./routes/toolboxes.cjs').createToolboxRoutes({
   discoverMcpTools: () => discoverMcpTools(), toolboxSummaries, connectedBoxes, json, cache: permittedToolsCache,
-  // The Diary preference and the MCP credentials are the Rust front's to change: a new Diary setting
-  // or a changed sign-in/key (the broker's readiness file) shows at once.
-  cacheKeyExtra: (authn) => [authService.diaryEnabled(authn.user.id), mcpCredentials.signal()],
+  // What the cached view shows and another process can change (#2202): the Diary preference, the project's
+  // toolbox selection (the Rust front's project routes write projects.json without clearing this cache),
+  // the account's connected connectors (Drive, and Nextcloud through the storage connection the front
+  // saves), the MCP credentials' readiness (the broker's published file) and what discovery last found.
+  cacheKeyExtra: (authn, projectId) => {
+    const project = projectId ? getProject(projectId) : null;
+    return [authService.diaryEnabled(authn.user.id), connectedBoxes(authn.user), mcpCredentials.signal(), mcpState.discoveredAt,
+      project ? [project.toolsMode ?? null, project.docsToolboxDefaulted === true, Array.isArray(project.toolboxes) ? project.toolboxes : null] : null];
+  },
   prefill: { targetMs: TOOL_PREFILL_TARGET_MS, stats: () => prefill.stats() },
   mcp: () => ({ enabled: mcpWiring.enabled(), state: mcpState, servers: MCP_SERVERS, manifest: MCP_TOOLBOX_MANIFEST }),
   // The per-turn catalogue (#237). getProject is scoped to the signed-in account's workspace.
