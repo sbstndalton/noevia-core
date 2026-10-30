@@ -13,6 +13,7 @@ const { bindProjectStore } = require('./boot.cjs');
 const { requireScan, requireReducedPdf, REDUCED_CAP } = require('./contracts.cjs');
 const { seedAccount } = require('../../tests/server/seed-account.cjs');
 const { startProjectStore } = require('../../tests/server/project-store-server.cjs');
+const { createProjectAs } = require('../../tests/server/front-projects.cjs');
 const required = name => { assert.ok(process.env[name], `${name} is required; this gate cannot skip`); return path.resolve(process.env[name]); };
 const children = new Set();
 function child(command, args, env) {
@@ -116,9 +117,12 @@ async function scenario(front, mode, workerBase, fixtures, root, calls) {
     const admin = new Client(base); const member = new Client(base);
     // Sign-in is the Rust front's (sbstndalton/noevia#1071): both accounts and their sessions are
     // seeded the way it writes them, and the clients carry those cookies.
-    const signIn = (client, opts) => { const seeded = seedAccount(dataDir, opts); client.cookies.set('cowork_session', seeded.session); client.cookies.set('cowork_csrf', seeded.csrf); };
-    signIn(admin, { username: 'synthetic-admin', displayName: 'Synthetic Admin', publicOrigin: base });
-    const created = await admin.call('POST', '/api/projects', { name: 'Synthetic OCR contract', goal: 'Synthetic documents only' });
+    const signIn = (client, opts) => { const seeded = seedAccount(dataDir, opts); client.cookies.set('cowork_session', seeded.session); client.cookies.set('cowork_csrf', seeded.csrf); return seeded; };
+    const adminAccount = signIn(admin, { username: 'synthetic-admin', displayName: 'Synthetic Admin', publicOrigin: base });
+    // A project's create is the Rust front's (sbstndalton/noevia#2191): through the front when one runs,
+    // else seeded the way its create writes projects.json (Node alone refuses the create with 503).
+    const projectBody = { name: 'Synthetic OCR contract', goal: 'Synthetic documents only' };
+    const created = front ? await admin.call('POST', '/api/projects', projectBody) : createProjectAs(dataDir, adminAccount.id, projectBody);
     const id = created.id || created.project?.id; assert.ok(id);
     const route = `/api/projects/${encodeURIComponent(id)}`;
     const upload = async name => admin.call('POST', route + '/upload', { name, organized: true, dataBase64: fs.readFileSync(path.join(fixtures, name)).toString('base64') });
