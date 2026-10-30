@@ -122,12 +122,12 @@ test('the account routes Node still answers keep working', async () => {
       assert.equal((await request(url, { method: 'POST', body: { origin: 'bad' }, headers })).status, 503, 'direct Node POST is refused before auth');
     }
   }
-  assert.equal((await request('/api/workspace', { headers: { cookie: admin.cookie } })).status, 200, 'the seeded session signs in (read-only gate)');
-  assert.equal((await request('/api/workspace')).status, 401);
+  assert.equal((await request('/api/chats/search', { headers: { cookie: admin.cookie } })).status, 200, 'the seeded session signs in (read-only gate)');
+  assert.equal((await request('/api/chats/search')).status, 401);
   // Deleting an account stays Node's (its clean-up spans Node's own stores).
   const removed = await request(`/api/admin/users/${member.id}`, { method: 'DELETE', body: { username: 'routes-member' }, headers: admin.headers('http://localhost') });
   assert.equal(removed.status, 200, JSON.stringify(removed.json));
-  assert.equal((await request('/api/workspace', { headers: { cookie: member.cookie } })).status, 401, 'the deleted account is signed out');
+  assert.equal((await request('/api/chats/search', { headers: { cookie: member.cookie } })).status, 401, 'the deleted account is signed out');
   // A member is still refused /api/admin/* before its routes are looked at.
   const other = seedAccount(dataDir, { username: 'routes-member-two', role: 'member' });
   assert.equal((await request('/api/admin/web-address', { headers: { cookie: other.cookie } })).status, 503, 'direct Node GET is refused before auth');

@@ -47,7 +47,12 @@ test.before(async () => {
   ({ cookie, csrf, id: frontUserId } = require('../tests/server/seed-account.cjs').seedAccount(testDataDir, { username: 'admin', displayName: 'Admin', publicOrigin: 'http://localhost' }));
 });
 const mutation = () => ({ origin: 'http://localhost', cookie, 'content-type': 'application/json', 'x-csrf-token': csrf });
-const workspace = async () => JSON.parse((await request('/api/workspace', { headers: { cookie } })).text);
+// The projects as the store holds them: sources are metadata and a pointer, never the text. (The list the client
+// reads, GET /api/workspace, is the Rust front's since the #2191 close-out; a Node request refreshes this process's view.)
+const workspace = async () => {
+  await request('/api/chats/search', { headers: { cookie } });
+  return JSON.parse(fs.readFileSync(path.join(testDataDir, 'users', frontUserId, 'projects.json'), 'utf8'));
+};
 const textUrl = (id, name) => `/api/projects/${encodeURIComponent(id)}/sources/text?name=${encodeURIComponent(name)}`;
 // #2191: the per-source text route is the Rust front's; the stored text is read as it reads it.
 const stored = require('../tests/server/stored-sources.cjs');
@@ -55,15 +60,15 @@ const stored = require('../tests/server/stored-sources.cjs');
 const NOTES = '# Synthetic notes\n\nThe synthetic code word is CEDAR-1806.';
 const PLAN = 'Synthetic plan: ship the widget.';
 
-test('#1806: /api/workspace sends source metadata only; the text is fetched per source', async () => {
+test('#1806: the stored projects hold source metadata only; the text is fetched per source', async () => {
   const createdProject = createProjectAs(testDataDir, frontUserId, { name: 'Synthetic 1806', files: [{ name: 'notes.md', content: NOTES }, { name: 'docs/plan.txt', content: PLAN }] });
   const created = { status: 200, text: JSON.stringify(createdProject) };
   assert.equal(created.status, 200, created.text);
   const id = JSON.parse(created.text).id;
   assert.ok(!created.text.includes('CEDAR-1806'), 'the create answer carries no source text');
 
-  const raw = (await request('/api/workspace', { headers: { cookie } })).text;
-  assert.ok(!raw.includes('CEDAR-1806') && !raw.includes('ship the widget'), 'no source text in the workspace payload');
+  const raw = fs.readFileSync(path.join(testDataDir, 'users', frontUserId, 'projects.json'), 'utf8');
+  assert.ok(!raw.includes('CEDAR-1806') && !raw.includes('ship the widget'), 'no source text in the stored projects');
   const project = JSON.parse(raw).projects.find((p) => p.id === id);
   assert.deepEqual(project.files.map((f) => [f.name, 'content' in f, f.chars, f.textRef]), [
     ['notes.md', false, NOTES.length, crypto.createHash('sha256').update(NOTES).digest('hex')],

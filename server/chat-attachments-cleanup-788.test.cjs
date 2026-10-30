@@ -166,8 +166,7 @@ test('an archived chat keeps its attachments project; only deleting it removes t
   try {
     f.alice.freeChats.push({ id: 'old', archived: true });
     const { paths } = seedProject(f.alice, CONTEXT('old'));
-    assert.equal(f.store.removeOrphanChatContexts(), 0, 'archived is not deleted');
-    assert.ok(allExist(paths));
+    assert.ok(allExist(paths), 'archived is not deleted');
     assert.equal(await f.store.deleteFreeChat('old'), true);
     await tick();
     assert.ok(noneExist(paths));
@@ -207,33 +206,8 @@ test("removing an attachments project never purges chats filed under it (#788)",
   } finally { f.cleanup(); }
 });
 
-test('orphaned attachments projects are removed only when their chat is provably deleted (#788)', async () => {
-  const f = fixture();
-  try {
-    // Left behind by deletes before #788: the chat is tombstoned, its project still there.
-    const orphans = ['gone-1', 'gone-2', 'gone-3'].map((id) => { lists.addTombstone(f.alice.dir, id); return seedProject(f.alice, CONTEXT(id)); });
-    // Opened in a tab, no message yet: in no list, not tombstoned. Must stay.
-    const fresh = seedProject(f.alice, CONTEXT('fresh'));
-    // Listed and (impossibly) tombstoned: the list wins, it stays.
-    f.alice.freeChats.push({ id: 'listed' });
-    lists.addTombstone(f.alice.dir, 'listed');
-    const listed = seedProject(f.alice, CONTEXT('listed'));
-    const regular = seedProject(f.alice, 'proj-regular');
-    // Bob's orphan with the same id is his workspace's business, not alice's sweep.
-    lists.addTombstone(f.bob.dir, 'gone-1');
-    const bobs = seedProject(f.bob, CONTEXT('gone-1'));
-
-    assert.equal(f.store.removeOrphanChatContexts({ limit: 2 }), 2, 'bounded per call');
-    assert.equal(f.store.removeOrphanChatContexts(), 1);
-    assert.equal(f.store.removeOrphanChatContexts(), 0, 'idempotent');
-    await tick();
-    for (const o of orphans) assert.ok(noneExist(o.paths));
-    assert.ok(allExist(fresh.paths) && allExist(listed.paths) && allExist(regular.paths));
-    assert.deepEqual(f.alice.projects.map((p) => p.id), [CONTEXT('fresh'), CONTEXT('listed'), 'proj-regular']);
-    assert.ok(allExist(bobs.paths));
-    assert.deepEqual(f.bob.projects.map((p) => p.id), [CONTEXT('gone-1')]);
-  } finally { f.cleanup(); }
-});
+// The orphan cleanup (the attachments projects of chats deleted before #788, ten per list) is the Rust workspace list's
+// since the #2191 close-out: noevia-rs tests/workspace.rs.
 
 test('Delete old chats (retention) removes expired chats\' attachments projects through the normal delete (#788)', async () => {
   const f = fixture();
@@ -254,20 +228,6 @@ test('Delete old chats (retention) removes expired chats\' attachments projects 
     await tick();
     assert.ok(noneExist(stale.paths) && noneExist(staleInProject.paths));
     assert.ok(allExist(pinned.paths) && allExist(recent.paths) && allExist(host.paths));
-  } finally { f.cleanup(); }
-});
-
-test('the orphan sweep removes at most 10 contexts per call by default and drains a backlog over several calls (#826)', async () => {
-  const f = fixture();
-  try {
-    const ids = Array.from({ length: 13 }, (_, i) => `backlog-${i}`);
-    for (const id of ids) { lists.addTombstone(f.alice.dir, id); seedProject(f.alice, CONTEXT(id)); }
-    assert.equal(f.store.removeOrphanChatContexts(), 10);
-    assert.equal(f.alice.projects.length, 3);
-    assert.equal(f.store.removeOrphanChatContexts(), 3);
-    assert.equal(f.store.removeOrphanChatContexts(), 0);
-    await tick();
-    assert.equal(f.alice.projects.length, 0);
   } finally { f.cleanup(); }
 });
 

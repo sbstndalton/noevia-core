@@ -79,17 +79,22 @@ const meta = (id, title = id, updatedAt = 1000) => ({ id, title, updatedAt, prev
 // The chat-list and free-chat-list saves are the Rust front's (sbstndalton/noevia#1071; their merge
 // is noevia-rs crates/server-projects): here the front's write is the file as the front writes it,
 // replaced whole, and Node takes it in at the next request start. What Node still does with the
-// lists (a delete, a move, a transcript) runs through its own routes; its view is /api/workspace.
+// lists (a delete, a move, a transcript) runs through its own routes; its view is read from the stored files
+// (the list the client reads, GET /api/workspace, is the Rust front's since the #2191 close-out).
 const userFile = (name) => path.join(testDataDir, 'users', userId, name);
 function frontWrite(file, value) { fs.writeFileSync(`${file}.front`, JSON.stringify(value, null, 2)); fs.renameSync(`${file}.front`, file); }
 async function frontSaveFree(metas) {
-  await request('/api/workspace', { headers: mutationHeaders() }); // the workspace (and its directory) exists
+  await request('/api/chats/search', { headers: mutationHeaders() }); // the workspace (and its directory) exists
   let list = [];
   try { list = JSON.parse(fs.readFileSync(userFile('free-chats.json'), 'utf8')) || []; } catch { /* none yet */ }
   for (const m of metas) { const i = list.findIndex((c) => c.id === m.id); if (i >= 0) list[i] = { ...list[i], ...m }; else list.unshift(m); }
   frontWrite(userFile('free-chats.json'), list);
 }
-const workspace = async () => JSON.parse((await request('/api/workspace', { headers: mutationHeaders() })).text);
+const readStored = (name, fallback) => { try { return JSON.parse(fs.readFileSync(userFile(name), 'utf8')) ?? fallback; } catch { return fallback; } };
+const workspace = async () => {
+  await request('/api/chats/search', { headers: mutationHeaders() }); // a request start takes in what the front wrote
+  return { projects: readStored('projects.json', { projects: [] }).projects || [], freeChats: readStored('free-chats.json', []) };
+};
 const freeChats = async () => (await workspace()).freeChats.map((c) => c.id).sort();
 const freeMeta = async (id) => (await workspace()).freeChats.find((c) => c.id === id);
 const projectChats = async (projectId) => (await workspace()).projects.find((p) => p.id === projectId).chats;

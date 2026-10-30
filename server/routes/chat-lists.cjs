@@ -1,7 +1,7 @@
 'use strict';
 // The chat lists and transcripts (the store is projects.cjs):
-//   GET  /api/workspace                    the projects and free chats, chats[] sanitized, after the
-//                                          delete-old-chats sweep has had its hourly chance to run
+//   (GET /api/workspace is the Rust front's, #2191 close-out: rust-workspace.cjs. It runs the delete-old-chats
+//   sweep and the removal of orphaned chat-attachment projects that this route used to run.)
 //   GET  /api/chats/:id/export             one chat as a Markdown file (#1471)
 //   GET  /api/chats/search?q=              the chat ids whose message text holds q (#1450)
 //   (GET/POST /api/freechats and DELETE /api/freechats/:id are the Rust front's, #1071)
@@ -24,25 +24,14 @@ const SEARCH_MIN_QUERY = 2, SEARCH_MAX_QUERY = 200, SEARCH_MAX_CHATS = 500, SEAR
  * @param {object[]} deps.FREE_CHATS
  * @param {object} deps.diaryExtras
  * @param {number} deps.STORED_HISTORY_BYTES
- * @param {() => { freeChats:object[], projects:object[] }} deps.chatLists   what the retention sweep may delete from
- * @param {(chat:{ projectId?:string, id:string }) => boolean} deps.removeChat
  * @param {object} deps.store   projects.cjs: sanitizeChats, readHistory
  * @param {(userId:string, chatId:string) => boolean} [deps.revokeChatGrant]  approvals.cjs: drops a chat's "Allow for this chat" grant
  */
-function createChatListRoutes({ json, readBody, currentWorkspace, PROJECTS, FREE_CHATS, diaryExtras, STORED_HISTORY_BYTES, chatLists, removeChat, store }) {
+function createChatListRoutes({ json, readBody, currentWorkspace, PROJECTS, FREE_CHATS, diaryExtras, STORED_HISTORY_BYTES, store }) {
   const { sanitizeChats } = store;
   // #812: a malformed percent-escape in the URL is the caller's mistake (400), not a server error.
   const decodeChatId = require('../http.cjs').decodePathPart;
   const badChatId = (res) => json(res, 400, { error: 'invalid chat id' });
-
-  // Delete-old-chats sweep (chat-retention.cjs): runs as the user's workspace loads, at most hourly.
-  function sweepRetention() {
-    const retention = require('../chat-retention.cjs');
-    const dir = currentWorkspace().dir, settings = retention.read(dir);
-    if (!retention.sweepDue(settings)) return;
-    for (const chat of retention.expired({ ...chatLists(), days: settings.days })) removeChat(chat);
-    retention.markSwept(dir);
-  }
 
   async function handle(req, res, { path: p, authn, url }) {
     // #1450: the chats whose message text holds the query. Titles are matched in the client; this covers the
@@ -74,20 +63,6 @@ function createChatListRoutes({ json, readBody, currentWorkspace, PROJECTS, FREE
       }
       return json(res, 200, { chats: matches, truncated });
     }
-    if (p === '/api/workspace') {
-      try { sweepRetention(); } catch (e) { console.warn('[retention] sweep failed:', e?.message || e); }
-      // Attachments projects of chats deleted before #788 (only provably deleted ones; bounded).
-      try { store.removeOrphanChatContexts?.(); } catch (e) { console.warn('[projects] orphan chat attachments cleanup failed:', e?.message || e); }
-      // PROJECTS is served raw everywhere else; here it crosses to the client,
-      // so chats[] must be sanitized exactly as loadChats does.
-      return json(res, 200, {
-        // #1806: sources as metadata only; a source's text is GET /api/projects/{id}/sources/text.
-        projects: PROJECTS.filter(proj => !diaryExtras.internalProject(proj)).map((proj) => ({ ...proj, chats: sanitizeChats(proj.chats),
-          ...(Array.isArray(proj.files) ? { files: proj.files.map(require('../source-text.cjs').meta) } : {}) })),
-        freeChats: sanitizeChats(FREE_CHATS),
-      });
-    }
-
     // GET /api/chats/:id/context-window (a chat's last context meter) is the Rust front's
     // (sbstndalton/noevia#1071): index.cjs refuses it before this mount (rust-projects.cjs refuseOwnedRoute).
 

@@ -476,7 +476,7 @@ async function createTestProject(name, extra = {}) {
   return made;
 }
 
-// #1806: GET /api/workspace lists sources without their text; this reads one source's text.
+// #1806: the workspace list shows sources without their text; this reads one source's text.
 // #2191: that route is the Rust front's; the stored text is read as the front reads it.
 async function sourceText(projectId, name) {
   const r = require('../tests/server/stored-sources.cjs').sourceText(testDataDir, projectId, name);
@@ -484,9 +484,12 @@ async function sourceText(projectId, name) {
   return r.json.content;
 }
 
+// A project as the store holds it. (GET /api/workspace, which this used, is the Rust front's since the #2191
+// close-out; any Node request refreshes this process's view at its start, as the canary read does.)
 async function workspaceProject(id) {
-  const result = await request('/api/workspace', { headers: { cookie } });
-  return JSON.parse(result.text).projects.find((p) => p.id === id);
+  await request('/api/chats/search', { headers: { cookie } });
+  const stored = JSON.parse(fs.readFileSync(path.join(testDataDir, 'users', frontUserId, 'projects.json'), 'utf8'));
+  return stored.projects.find((p) => p.id === id);
 }
 
 

@@ -208,13 +208,16 @@ async function scenario(front, mode, workerBase, fixtures, root, calls, { doclin
     assert.ok(large.bytes <= 25 * 1024 * 1024);
     assert.equal(large.attachment.reduction.originalBytes, fs.statSync(path.join(fixtures, 'large.pdf')).size);
     assert.ok(['pdf', 'text'].includes(large.attachment.reduction.kind));
-    const workspace = await admin.call('GET', '/api/workspace');
-    const project = workspace.projects.find(item => item.id === id);
-    assert.ok(project, 'synthetic project must be present in its tenant workspace');
-    const files = project.files; assert.ok(Array.isArray(files));
-    // #1806: the workspace lists sources without their text; each text is read per source.
-    assert.ok(files.every(file => !('content' in file)), 'the workspace carries no source text');
-    assert.ok(files.some(file => file.name === large.path) && (await text(large.path)).includes('SYNTHETIC NATIVE TEXT FOR REDUCTION'));
+    // The workspace list is the Rust front's (#2191 close-out): Node refuses it, so the reference run has no list to read.
+    if (front) {
+      const workspace = await admin.call('GET', '/api/workspace');
+      const project = workspace.projects.find(item => item.id === id);
+      assert.ok(project, 'synthetic project must be present in its tenant workspace');
+      const files = project.files; assert.ok(Array.isArray(files));
+      // #1806: the workspace lists sources without their text; each text is read per source.
+      assert.ok(files.every(file => !('content' in file)), 'the workspace carries no source text');
+      assert.ok(files.some(file => file.name === large.path) && (await text(large.path)).includes('SYNTHETIC NATIVE TEXT FOR REDUCTION'));
+    }
     signIn(member, { username: 'synthetic-member', displayName: 'Synthetic Member', role: 'member' });
     const before = calls.length;
     // The tenant refusal of the page reader is the front's as well (Node alone refuses it with 503 before

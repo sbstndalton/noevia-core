@@ -59,7 +59,6 @@ function clientMessage(e, fallback) {
  * @param {(provider:object, extra?:object) => object} deps.providerHeaders
  * @param {string} deps.DEFAULT_PROVIDER_ID
  * @param {() => Function} deps.createVisionProbe
- * @param {(roles:object|null, catalogue:object[]|null) => any} deps.missingRoles
  * @param {() => object} deps.currentWorkspace
  * @param {object} deps.service   models.cjs
  */
@@ -68,7 +67,8 @@ function clientMessage(e, fallback) {
 // bypass of the front, refused before any engine or workspace read.
 const STATS_REFUSAL = Object.freeze({ error: 'Engine statistics are owned by the Rust front.' });
 const ROUTING_DEFAULT_REFUSAL = Object.freeze({ error: 'Routing default is owned by the Rust front.' });
-function createModelRoutes({ servedEmbeddingModels = (target) => require('../rag.cjs').servedModelsCached(target), json, readBody, readJson, fetchJson, env, modelManager, getProvider, providerHeaders, DEFAULT_PROVIDER_ID, createVisionProbe, missingRoles, currentWorkspace, service, inferenceBudget = null, idleUnload = null, sweepGuardOptions = {}, decisionSettings = null, rerankSettings = null, localRoles = (roles) => roles, machineModels = () => [] }) {
+const AUTO_ROLES_REFUSAL = Object.freeze({ error: 'The auto-roles read is owned by the Rust front.', code: 'RUST_AUTO_ROLES_OWNED' });
+function createModelRoutes({ servedEmbeddingModels = (target) => require('../rag.cjs').servedModelsCached(target), json, readBody, readJson, fetchJson, env, modelManager, getProvider, providerHeaders, DEFAULT_PROVIDER_ID, createVisionProbe, currentWorkspace, service, inferenceBudget = null, idleUnload = null, sweepGuardOptions = {}, decisionSettings = null, rerankSettings = null }) {
   const { modelScanCache, refreshModelScan, autoRoles, setAutoRoles, ensureRolesLoaded, servedCatalogue, modelsInstalled, deriveUserModelName, lastLoadedModel, clearLastLoadedModel, clearRoleReferences } = service;
   // #1461: the installed list is shared for a moment (service.modelsInstalled). A decision that must confirm
   // the engine's state right now (a delete that checks the model exists, a load that checks it is not missing)
@@ -211,22 +211,9 @@ function createModelRoutes({ servedEmbeddingModels = (target) => require('../rag
     }
 
     if (p === '/api/auto-roles') {
-      if (req.method === 'GET') {
-        const roles = autoRoles();
-        // #1840: a role on an Inference machine is not expected in this machine's catalogue.
-        // #1849: the models chat roles' machines serve, for the Manual list (labelled with the machine). Left out when
-        // nothing is on a machine, so that answer is exactly what it was.
-        // #1855: a name this machine's served catalogue lists is answered here (the router's own test), so it is left out
-        // of the list; the web shows exactly this.
-        const catalogue = await servedCatalogue();
-        let onMachines = [];
-        try { onMachines = machineModels() || []; } catch { onMachines = []; }
-        if (onMachines.length) {
-          const served = new Set((Array.isArray(catalogue) ? catalogue : []).map((m) => m?.name));
-          onMachines = onMachines.filter((r) => !served.has(r?.model));
-        }
-        return json(res, 200, { configured: !!roles, roles: roles || null, missing: missingRoles(localRoles(roles), catalogue), ...(onMachines.length ? { machineModels: onMachines } : {}) });
-      }
+      // The GET is the Rust front's (sbstndalton/noevia#2190 close-out, rust-auto-roles.cjs): index.cjs refuses it
+      // before authentication; this is the same refusal for a mount that is reached some other way.
+      if (req.method === 'GET') return json(res, 503, AUTO_ROLES_REFUSAL);
       if (req.method === 'PUT') {
         const raw = await readBody(req);
         let body;
@@ -846,4 +833,4 @@ function createModelRoutes({ servedEmbeddingModels = (target) => require('../rag
   return modelRoutes;
 }
 
-module.exports = { createModelRoutes, STATS_REFUSAL, ROUTING_DEFAULT_REFUSAL };
+module.exports = { createModelRoutes, STATS_REFUSAL, ROUTING_DEFAULT_REFUSAL, AUTO_ROLES_REFUSAL };
