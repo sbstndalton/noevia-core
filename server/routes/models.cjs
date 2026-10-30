@@ -475,7 +475,9 @@ function createModelRoutes({ servedEmbeddingModels = (target) => require('../rag
       const provider=getProvider(DEFAULT_PROVIDER_ID);
       const vision=await createVisionProbe()(provider.baseUrl,providerHeaders(provider),model);
       if(!vision.supported&&!/projector|mmproj/i.test(vision.reason||''))return json(res,503,{error:vision.reason||'The engine could not run the image probe.'});
-      await modelManager.recordEvidence(model,{category:'vision',result:vision.supported?'passed':'failed',value:null,suite:{name:'vision-probe',version:1},source:'recheck',limitations:vision.supported?['1×1 image accepted; not an accuracy test']:[String(vision.reason||'').slice(0,200)]});
+      // The front files the record (#2210): wait, bounded, so the answer shows it.
+      const queued=await modelManager.recordEvidence(model,{category:'vision',result:vision.supported?'passed':'failed',value:null,suite:{name:'vision-probe',version:1},source:'recheck',limitations:vision.supported?['1×1 image accepted; not an accuracy test']:[String(vision.reason||'').slice(0,200)]});
+      if(queued)await modelManager.evidenceApplied?.(queued);
       return json(res,200,(await modelManager.evidence(model)).body);
     }
 

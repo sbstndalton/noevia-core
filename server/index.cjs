@@ -105,6 +105,8 @@ if (!require('./project-store-client.cjs').enabledFrom(process.env)) {
   console.error('FATAL: the Rust project store is required (NOEVIA_PROJECT_STORE_PORT and NOEVIA_PROJECT_STORE_TOKEN, set by the web supervisor): Node writes projects.json and free-chats.json only through it (sbstndalton/noevia#1071).');
   process.exit(2);
 }
+// sbstndalton/noevia#2210: kept in this closure only: the front proves itself with it when it asks for a maintenance lease.
+const FRONT_SECRET = String(process.env.NOEVIA_PROJECT_STORE_TOKEN || '');
 const PROJECT_STORE = require('./project-store-client.cjs').clientFromEnv(process.env); // #1916: the secret leaves process.env here
 const authService = createAuth({
   rustAuth,
@@ -1239,6 +1241,11 @@ const toolboxRoutes = require('./routes/toolboxes.cjs').createToolboxRoutes({
   mcp: () => ({ enabled: mcpWiring.enabled(), state: mcpState, servers: MCP_SERVERS, manifest: MCP_TOOLBOX_MANIFEST }),
 });
 
+// With no inference gate, the Rust front's reload holds this process's own maintenance gate (#2210).
+const maintenanceLeases = require('./model-maintenance-lease.cjs').createLeaseRoutes({
+  secret: FRONT_SECRET, json, hold: typeof modelManager.holdMaintenance === 'function' ? () => modelManager.holdMaintenance() : null,
+});
+
 // The headers every page and API reply carries, the refusals answered before authentication too.
 function publicHeaders(res) {
   res.setHeader('X-Content-Type-Options', 'nosniff');
@@ -1254,6 +1261,8 @@ function publicHeaders(res) {
 async function handleRequestInner(req, res) {
   // The ownership refusals below answer before handleRequestScoped; they carry the same headers.
   publicHeaders(res);
+  // The Rust front's maintenance lease on this process's gate (#2210): before everything, and only the front's.
+  if (await maintenanceLeases.handle(req, res)) return;
   // #2191 round 2: a toolbox discovered since the last request reaches the front's next project create
   // (project-catalogue.cjs; written only when it changed).
   projectCatalogue.publish();

@@ -57,7 +57,7 @@ test('applied() waits for the front to take the entry, and gives up', async (t) 
 test('the manager queues evidence for the front and reads the log the front wrote', async (t) => {
   const root = tmp(t), evidenceDir = path.join(root, 'evidence-0123456789abcdef');
   const manager = createLlamaCppManager({ baseUrl: 'http://127.0.0.1:9/v1', fetchJson: async () => ({ ok: false }), evidenceDir, downloadStatePath: path.join(root, 'dl.json') });
-  const handle = await manager.recordEvidence('synthetic-model', { category: 'vision', result: 'passed', value: null, suite: { name: 'vision-probe', version: 1 }, source: 'probe', limitations: [] });
+  const handle = await manager.recordEvidence('synthetic-model', { category: 'vision', result: 'reported', value: null, suite: { name: 'vision-probe', version: 1 }, source: 'probe', limitations: [] });
   assert.ok(handle, 'queued');
   const inbox = path.join(root, 'evidence-inbox-0123456789abcdef');
   assert.deepEqual(fs.readdirSync(inbox), [handle]);

@@ -568,9 +568,16 @@ function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloa
   }
   // Queued for the front (the store's one writer); resolves to a handle for evidenceApplied, or null when it
   // was not queued. Producers are best effort and ignore the result.
+  // A result is true of the configuration it was measured on, so a non-reported record carries that configuration's
+  // identity and the time; the front files it only if the live identity still equals it. A frequent reported rate
+  // is filed under the identity live when it is drained, and asks nothing of the router here.
   async function recordEvidence(model,record){
     if(!evidenceInbox)return null;
-    return evidenceInbox.put({kind:'record',model,record});
+    if(record?.result==='reported')return evidenceInbox.put({kind:'record',model,record});
+    let live=null;
+    try{live=await computeIdentity(model);}catch(e){console.warn(`[evidence] no identity for a record: ${e?.message||e}`);}
+    if(!live)return null;
+    return evidenceInbox.put({kind:'record',model,record,identityHash:live.identityHash,at:Date.now()});
   }
   async function evidence(model){
     const live=evidenceStore?await computeIdentity(model):null;

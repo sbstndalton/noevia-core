@@ -30,6 +30,9 @@
 // not take is held (inference-maintenance.cjs), so the folder sync, the optional chat work and the code
 // machine wait for a hold the front took.
 //
+// With no inference gate (no admin token, or nothing at the engine address knows the hold), the front's reload takes a
+// lease on this process's maintenance gate (model-maintenance-lease.cjs), so it is exclusive with this process's work.
+//
 // The list is exactly noevia-rs contracts/http/routes.toml's #2210 owner = "rust" rows.
 const OWNED = Object.freeze([
   Object.freeze({ method: 'POST', path: '/api/models/presets/reload' }),

@@ -1009,3 +1009,39 @@ test('a model or role write drops the shared reads before it and again once its 
   f.response().emit('close');
   assert.equal(f.invalidations.length, 4, 'a read changes nothing');
 });
+
+test('#2210: the recheck waits for the front to apply its record, so the answer shows the new state', async () => {
+  const fs = require('node:fs'), os = require('node:os'), path = require('node:path');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'noevia-recheck-'));
+  try {
+    const { createInbox } = require('../evidence-inbox.cjs');
+    const inbox = createInbox({ dir });
+    let state = 'old';
+    const f = fixture({ manager: {
+      recordEvidence: async (model, record) => inbox.put({ kind: 'record', model, record }),
+      evidenceApplied: (handle) => inbox.applied(handle, { timeoutMs: 3000, stepMs: 10 }),
+      evidence: async () => ({ ok: true, status: 200, body: { state } }),
+    } });
+    // The fake front: takes the entry about 100 ms later.
+    const front = setTimeout(() => {
+      const [name] = fs.readdirSync(dir).filter((n) => n.endsWith('.json'));
+      state = 'verified';
+      fs.rmSync(path.join(dir, name));
+    }, 100);
+    await f.call('POST', '/api/models/evidence/recheck', { model: 'm', category: 'vision' }, 'admin');
+    clearTimeout(front);
+    assert.deepEqual(f.sent.pop(), { status: 200, body: { state: 'verified' } });
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('#2210: a front that does not apply the record bounds the recheck, and the answer is the state as it stands', async () => {
+  const applied = [];
+  const f = fixture({ manager: {
+    recordEvidence: async () => 'handle',
+    evidenceApplied: async (handle) => { applied.push(handle); return false; },
+    evidence: async () => ({ ok: true, status: 200, body: { state: 'old' } }),
+  } });
+  await f.call('POST', '/api/models/evidence/recheck', { model: 'm', category: 'vision' }, 'admin');
+  assert.deepEqual(applied, ['handle']);
+  assert.deepEqual(f.sent.pop(), { status: 200, body: { state: 'old' } });
+});

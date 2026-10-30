@@ -16,6 +16,7 @@
 // Anything unknown, unreadable or ambiguous fails closed (no reload with models loaded).
 
 const fs = require('node:fs');
+const crypto = require('node:crypto');
 
 // Statuses the router counts as running (server-models.h is_running(): loaded, loading, sleeping);
 // a reload unloads any of them whose preset changed.
@@ -70,27 +71,32 @@ function writeLocked(stateFile, text, { staleMs = LOCK_STALE_MS, waitMs = LOCK_W
     }
   }
   const temporary = `${stateFile}.${process.pid}.tmp`;
+  // Removed below only while it is still this writer's: a stale takeover may have made it another writer's.
+  const owner = `${process.pid}:${crypto.randomBytes(8).toString('hex')}`;
   try {
-    fs.writeSync(fd, String(process.pid));
+    fs.writeSync(fd, owner);
     fs.writeFileSync(temporary, text, { mode: 0o600 });
     fs.renameSync(temporary, stateFile);
   } finally {
     try { fs.closeSync(fd); } catch { /* closed */ }
-    try { fs.unlinkSync(lock); } catch { /* gone */ }
+    try { if (fs.readFileSync(lock, 'utf8') === owner) fs.unlinkSync(lock); } catch { /* gone */ }
     try { fs.rmSync(temporary, { force: true }); } catch { /* gone */ }
   }
 }
 
 function createReloadGuard({ stateFile = null, check = (req) => require('./dav-parse-wasm.cjs').presetReload(req), log = () => {}, lock = {} } = {}) {
   let memory = null; // { text, view }, used only without a state file
-  const current = () => (stateFile ? readBaseline(stateFile) : memory);
+  // A write that failed (the lock timed out) may have left an old baseline on disk: unknown until a write succeeds.
+  let unsaved = false;
+  const current = () => (stateFile ? (unsaved ? null : readBaseline(stateFile)) : memory);
   const persist = (next) => {
     if (!stateFile) { memory = next; return; }
     try {
       // Forgetting writes a tombstone instead of deleting, so a failed delete can never leave an
       // old baseline behind for the next start (#1040).
       writeLocked(stateFile, JSON.stringify(next || {}), lock);
-    } catch (e) { log(`[models] could not save the preset reload baseline: ${e?.message || e}`); }
+      unsaved = false;
+    } catch (e) { unsaved = true; log(`[models] could not save the preset reload baseline; it is treated as unknown: ${e?.message || e}`); }
   };
   return {
     /** After a reload noevia made: the text it read just before and the router's rows just after.

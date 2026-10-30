@@ -5,9 +5,12 @@
 // (a finished download) is one file in `evidence-inbox-<hash>/`, written whole under a `.tmp` name and renamed to
 // `.json`, so the front never reads half an entry. The front applies entries oldest first and deletes each; the
 // names sort by time. The inbox is bounded (a front that is not running does not let it grow without end) and an
-// entry is small. Producers are best effort, as they were: a full inbox drops the record.
+// entry is small. Producers are best effort, as they were: a full inbox drops the record. A failed apply is tried
+// again a bounded number of times, then discarded with a log line (the front's side).
 //
 //   { "kind": "record", "model": "<name>", "record": { category, result, value, suite, source, limitations, ... } }
+//     A non-reported record also carries "identityHash" and "at", computed when it was recorded: the front files it
+//     only under that identity, and discards one with no hash (left by a rollback) or a hash no longer live.
 //   { "kind": "import", "model": "<name>", "checkpoint": "<org/repo[:quant]>" | null }
 const fs = require('node:fs');
 const path = require('node:path');

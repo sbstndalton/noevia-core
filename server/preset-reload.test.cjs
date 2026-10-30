@@ -284,3 +284,31 @@ test('#2210 a write waits for the other writer\'s lock, takes over a dead one, a
   assert.equal(fs.existsSync(lock), false);
   assert.equal(logs.length, 1);
 });
+
+test('#2210: a write that cannot take the lock is reported and the baseline is unknown until a write succeeds', (t) => {
+  const stateFile = path.join(tmp(t), 'state.json');
+  const logs = [];
+  const guard = createReloadGuard({ stateFile, check: fakeCheck, log: (m) => logs.push(m), lock: { waitMs: 30 } });
+  guard.record('text', rows([]), 'text');
+  assert.equal(guard.known(), true);
+  // Another writer holds the lock: this forget cannot write, so the old baseline is still on disk.
+  fs.writeFileSync(`${stateFile}.lock`, 'other');
+  guard.forget();
+  assert.ok(JSON.parse(fs.readFileSync(stateFile, 'utf8')).text, 'the old baseline is still on disk');
+  assert.equal(guard.known(), false, 'and is not trusted');
+  assert.equal(guard.verdict('text', rows([]), []).safe, false);
+  assert.match(logs.join('\n'), /could not save/);
+  fs.rmSync(`${stateFile}.lock`);
+  guard.record('text', rows([]), 'text');
+  assert.equal(guard.known(), true, 'a later write that succeeds restores it');
+});
+
+test('#2210: a writer does not remove a lock another writer has taken over', (t) => {
+  const stateFile = path.join(tmp(t), 'state.json');
+  const lock = `${stateFile}.lock`;
+  const realRename = fs.renameSync;
+  // While this writer is inside its write, its lock goes stale and another writer takes it over.
+  t.mock.method(fs, 'renameSync', (...args) => { fs.writeFileSync(lock, 'another-writer'); return realRename(...args); });
+  createReloadGuard({ stateFile, check: fakeCheck }).forget();
+  assert.equal(fs.readFileSync(lock, 'utf8'), 'another-writer');
+});

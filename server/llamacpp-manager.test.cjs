@@ -316,3 +316,34 @@ test('noevia#2115: a shutdown gives back the gate leases still held, with the op
  const bare=createModelManager({gate:fakeGate(),kind:'llamacpp',baseUrl:'http://synthetic',fetchJson:routerFake({},[])});
  assert.equal(await bare.releaseLeases(),0);
 });
+test('#2210: a non-reported record carries the identity it was measured on and the time; a reported one does not',async()=>{
+ const fs=require('node:fs'),os=require('node:os'),path=require('node:path');
+ const root=fs.mkdtempSync(path.join(os.tmpdir(),'noevia-evidence-carry-'));
+ try{
+  const models=path.join(root,'models'),ev=path.join(root,'evidence-0123');fs.mkdirSync(path.join(models,'fx'),{recursive:true});
+  fs.writeFileSync(path.join(models,'fx','fx.gguf'),Buffer.alloc(2048,7));
+  fs.writeFileSync(path.join(models,'fx','draft.gguf'),Buffer.alloc(1024,3));
+  const ini=path.join(root,'models.ini');
+  fs.writeFileSync(ini,'version = 1\n\n[fx]\nmodel = /models/fx/fx.gguf\nspec-type = draft-mtp\nspec-draft-model = /models/fx/draft.gguf\n');
+  let props=0;
+  const manager=createModelManager({gate:fakeGate(),kind:'llamacpp',baseUrl:'http://synthetic-router/v1/',presetPath:ini,evidenceDir:ev,autoconfig:{modelsPath:models},fetchStream:async()=>({ok:false}),
+   fetchJson:async(url)=>{const p=new URL(url).pathname;if(p==='/props')props++;return {ok:true,status:200,body:p==='/models'?{data:[{id:'fx',status:{value:'unloaded',args:[]}}]}:p==='/props'?{build_info:'b-synthetic'}:{}};}});
+  const inboxDir=require('./evidence-inbox.cjs').inboxDirFor(ev);
+  const read=name=>JSON.parse(fs.readFileSync(path.join(inboxDir,name),'utf8'));
+  const before=Date.now();
+  const passed=await manager.recordEvidence('fx',{category:'vision',result:'passed',value:null,suite:{name:'s',version:1},source:'recheck',limitations:[]});
+  const entry=read(passed);
+  assert.equal(entry.identityHash,(await manager.evidence('fx')).body.identityHash);
+  assert.ok(entry.at>=before&&entry.at<=Date.now());
+  // Taken when recorded: a preset change afterwards does not change what the queued entry carries.
+  fs.writeFileSync(ini,'version = 1\n\n[fx]\nmodel = /models/fx/fx.gguf\nspec-type = draft-mtp\nctx-size = 4096\n');
+  const again=read(await manager.recordEvidence('fx',{category:'vision',result:'failed',value:null,suite:{name:'s',version:1},source:'recheck',limitations:[]}));
+  assert.notEqual(again.identityHash,entry.identityHash);
+  assert.equal(read(passed).identityHash,entry.identityHash);
+  const asked=props;
+  const reported=read(await manager.recordEvidence('fx',{category:'throughput',result:'reported',value:{rate:5},suite:{name:'s',version:1},source:'chat',limitations:[]}));
+  assert.equal(reported.identityHash,undefined);assert.equal(reported.at,undefined);
+  assert.equal(props,asked,'a rate asks the router nothing');
+  assert.equal(await manager.recordEvidence('gone',{category:'vision',result:'passed',value:null,suite:{name:'s',version:1},source:'recheck',limitations:[]}),null,'no identity: not queued');
+ }finally{fs.rmSync(root,{recursive:true,force:true});}
+});
