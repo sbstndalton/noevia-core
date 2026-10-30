@@ -1,190 +1,76 @@
 'use strict';
-// Sign in with ChatGPT (#447): the device-code login, encrypted per-user storage, refresh, and the
-// /chat/completions <-> Responses adapter. Every upstream is a fake at *.fixture.invalid; no real
-// OpenAI account, token or network is involved.
+// Sign in with ChatGPT (#447): the /chat/completions <-> Responses adapter and the token client.
+// sbstndalton/noevia#2190 round 5: the device sign-in, the token store, the refresh and the model
+// catalogue are the Rust front's (noevia-rs chatgpt_oauth_routes.rs, tests/chatgpt_oauth.rs); here
+// a synthetic broker (tests/server/chatgpt-broker-fake.cjs) hands out access tokens and catalogue
+// entries. Every upstream is a fake at *.fixture.invalid; no real OpenAI account, token or network.
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const Database = require('better-sqlite3');
-const { createSecretStore } = require('./secrets.cjs');
 const chatgpt = require('./chatgpt-oauth.cjs');
 const { rotationTables } = require('./secrets-rotate.cjs');
+const { createFakeBroker } = require('../tests/server/chatgpt-broker-fake.cjs');
 
-const ISSUER = 'https://auth.fixture.invalid';
 const CODEX = 'https://codex.fixture.invalid/backend-api/codex';
-const b64 = (o) => Buffer.from(JSON.stringify(o)).toString('base64url');
-const jwt = (claims) => `${b64({ alg: 'none' })}.${b64(claims)}.sig`;
-const idToken = (account, email = 'synthetic.person@example.test', plan = 'plus') => jwt({ email, 'https://api.openai.com/auth': { chatgpt_account_id: account, chatgpt_plan_type: plan } });
 const sse = (events) => new Response(events.map((e) => `event: ${e.type}\ndata: ${JSON.stringify(e)}\n\n`).join(''), { status: 200, headers: { 'content-type': 'text/event-stream' } });
 const json = (o, status = 200) => new Response(JSON.stringify(o), { status, headers: { 'content-type': 'application/json' } });
 
+// The broker's catalogue projection (noevia-rs chatgpt_oauth_routes.rs fetch_catalogue, ported
+// from this module): raw Codex /models rows to the entries the adapter checks.
+const word = (v) => (typeof v === 'string' && /^[a-z_]{1,20}$/.test(v) ? v : null);
+function project(raw) {
+  return (Array.isArray(raw?.models) ? raw.models : [])
+    .filter((m) => m && typeof m === 'object' && typeof m.slug === 'string' && m.slug && m.supported_in_api !== false && (m.visibility === undefined || m.visibility === 'list'))
+    .map((m) => ({ slug: m.slug.slice(0, 120), effort: word(m.default_reasoning_level), summary: word(m.default_reasoning_summary), summaryParam: m.supports_reasoning_summary_parameter !== false,
+      levels: Array.isArray(m.supported_reasoning_levels) ? m.supported_reasoning_levels.map((l) => word(l && typeof l === 'object' ? l.effort : null)).filter(Boolean).slice(0, 12) : null })).slice(0, 50);
+}
+const DEFAULT_RAW = { models: [{ slug: 'gpt-synthetic', visibility: 'list' }, { slug: 'hidden', visibility: 'hide' }, { slug: 'no-api', supported_in_api: false },
+  { slug: 'gpt-thinker', default_reasoning_level: 'medium', default_reasoning_summary: 'detailed' }, { slug: 'gpt-plain', supports_reasoning_summary_parameter: false }, { slug: 'gpt-quiet', default_reasoning_summary: 'none' }] };
+
 function fakeOpenAI() {
-  const seen = { calls: [], responses: [], refreshes: 0 };
-  const state = { approved: false, refresh: 'ok', upstream: [], tokenSeq: 1, logins: 0, exchangeGate: null, onExchange: null, modelsDown: false };
+  const seen = { calls: [], responses: [] };
+  const state = { upstream: [], modelsDown: false, catalogue: null, fedRampToken: false };
   const fetchImpl = async (url, init = {}) => {
     url = String(url);
     seen.calls.push({ url, init });
-    if (url === `${ISSUER}/api/accounts/deviceauth/usercode`) {
-      assert.equal(JSON.parse(init.body).client_id, chatgpt.DEFAULTS.clientId);
-      return json({ device_auth_id: 'DAID-synthetic', user_code: 'ABCD-1234', interval: '5' });
-    }
-    if (url === `${ISSUER}/api/accounts/deviceauth/token`) {
-      const b = JSON.parse(init.body);
-      assert.deepEqual(b, { device_auth_id: 'DAID-synthetic', user_code: 'ABCD-1234' });
-      return state.approved ? json({ authorization_code: 'AUTHCODE', code_challenge: 'CH', code_verifier: 'VERIFIER' }) : json({ error: 'pending' }, 403);
-    }
-    if (url === `${ISSUER}/oauth/token`) {
-      const form = String(init.headers['content-type']).includes('form');
-      const b = form ? Object.fromEntries(new URLSearchParams(init.body)) : JSON.parse(init.body);
-      if (b.grant_type === 'authorization_code') {
-        assert.deepEqual(b, { grant_type: 'authorization_code', code: 'AUTHCODE', redirect_uri: `${ISSUER}/deviceauth/callback`, client_id: chatgpt.DEFAULTS.clientId, code_verifier: 'VERIFIER' });
-        state.logins += 1;
-        state.onExchange?.();
-        if (state.exchangeGate) await state.exchangeGate;
-        const n = state.logins;
-        const id = state.fedRampToken ? jwt({ 'https://api.openai.com/auth': { chatgpt_account_id: 'acct-F', chatgpt_account_is_fedramp: true } }) : idToken('acct-A', undefined, 'planClaim' in state ? state.planClaim : 'plus');
-        return json({ access_token: n === 1 ? 'AT-1' : `AT-L${n}`, refresh_token: n === 1 ? 'RT-1' : `RT-L${n}`, id_token: id, expires_in: 3600 });
-      }
-      if (b.grant_type === 'refresh_token') {
-        seen.refreshes += 1;
-        if (state.refreshGate) await state.refreshGate;
-        if (state.refresh === 'invalid') return json({ error: 'invalid_grant' }, 400);
-        if (state.refresh === 'down') return json({ error: 'server' }, 503);
-        state.tokenSeq += 1;
-        return json({ access_token: `AT-${state.tokenSeq}`, refresh_token: `RT-${state.tokenSeq}`, expires_in: 3600 });
-      }
-    }
     if (url === `${CODEX}/responses`) {
       seen.responses.push({ headers: init.headers, body: JSON.parse(init.body) });
       const next = state.upstream.shift();
       return next ? next(init) : sse([{ type: 'response.output_text.delta', delta: 'Hello' }, { type: 'response.completed', response: { usage: { input_tokens: 7, output_tokens: 2, total_tokens: 9 } } }]);
     }
-    if (url.startsWith(`${CODEX}/models?`) && state.modelsDown) return json({ detail: 'down' }, 503);
-    if (url.startsWith(`${CODEX}/models?`) && state.catalogue) return json(state.catalogue);
-    if (url.startsWith(`${CODEX}/models?`)) return json({ models: [{ slug: 'gpt-synthetic', visibility: 'list' }, { slug: 'hidden', visibility: 'hide' }, { slug: 'no-api', supported_in_api: false },
-      { slug: 'gpt-thinker', default_reasoning_level: 'medium', default_reasoning_summary: 'detailed' }, { slug: 'gpt-plain', supports_reasoning_summary_parameter: false }, { slug: 'gpt-quiet', default_reasoning_summary: 'none' }] });
     return json({ error: 'unexpected ' + url }, 599);
   };
   return { fetchImpl, seen, state };
 }
 
-function make(t, fake = fakeOpenAI(), clock = { t: 1_800_000_000_000 }, config = {}) {
+function make(t, fake = fakeOpenAI(), clock = { t: 1_800_000_000_000 }) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'noevia-chatgpt-'));
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
   const db = new Database(':memory:');
-  const secrets = createSecretStore(dir, { env: {} });
-  const audits = [];
-  const oauth = chatgpt.createChatGptOAuth({ db, secrets, fetchImpl: fake.fetchImpl, now: () => clock.t, audit: (a, u, d) => audits.push({ a, u, d }),
-    config: { issuer: ISSUER, codexBaseUrl: CODEX, ...config } });
-  return { oauth, db, secrets, fake, clock, audits, dir };
+  const b = createFakeBroker({ db, now: () => clock.t });
+  // The catalogue the broker projects from the fake account's raw /models answer.
+  b.broker.chatgptCatalogue = async (user) => {
+    b.calls.push({ op: 'catalogue', user });
+    return fake.state.modelsDown ? { ok: false, status: 502, error: 'ChatGPT returned 503: down' } : { ok: true, models: project(fake.state.catalogue || DEFAULT_RAW) };
+  };
+  const oauth = chatgpt.createChatGptOAuth({ db, broker: b.broker, signal: b.signal, fetchImpl: fake.fetchImpl, now: () => clock.t, config: { codexBaseUrl: CODEX } });
+  return { oauth, db, fake, clock, dir, b };
 }
 async function connect(f, userId = 'user-a') {
-  const login = await f.oauth.startDeviceLogin(userId);
-  f.fake.state.approved = true;
-  f.clock.t += login.interval * 1000;
-  const done = await f.oauth.pollDeviceLogin(userId, login.loginId);
-  f.fake.state.approved = false;
-  return { login, done };
+  f.b.connect(userId, { accessToken: 'AT-1', accountId: 'acct-A', fedRamp: f.fake.state.fedRampToken === true, expiresAt: f.clock.t + 3_600_000 });
 }
 
-test('device-code login: code shown, pending until approved, then tokens stored encrypted and bound to the user', async (t) => {
-  const f = make(t);
-  const login = await f.oauth.startDeviceLogin('user-a');
-  assert.equal(login.userCode, 'ABCD-1234');
-  assert.equal(login.verificationUrl, `${ISSUER}/codex/device`);
-  assert.equal(login.interval, 5);
-  assert.equal('deviceAuthId' in login, false, 'the device handle stays on the server');
-  assert.deepEqual(await f.oauth.pollDeviceLogin('user-a', login.loginId), { state: 'pending', interval: 5 }, 'too early: no upstream poll');
-  assert.equal(f.fake.seen.calls.filter((c) => c.url.endsWith('/deviceauth/token')).length, 0);
-  f.clock.t += 5000;
-  assert.equal((await f.oauth.pollDeviceLogin('user-a', login.loginId)).state, 'pending');
-  f.fake.state.approved = true;
-  f.clock.t += 5000;
-  const done = await f.oauth.pollDeviceLogin('user-a', login.loginId);
-  assert.deepEqual(done, { state: 'connected', account: { email: 's…@example.test', plan: 'plus' } });
-  assert.equal((await f.oauth.pollDeviceLogin('user-a', login.loginId)).state, 'expired', 'a login is used once');
-
-  const row = f.db.prepare('SELECT * FROM chatgpt_oauth_tokens').get();
-  assert.equal(row.user_id, 'user-a');
-  assert.match(row.data_enc, /^enc:v2:/, 'user-bound v2 ciphertext');
-  for (const secret of ['AT-1', 'RT-1', 'acct-A', 'synthetic.person']) assert.equal(row.data_enc.includes(secret), false, secret);
-  assert.throws(() => f.secrets.decrypt(row.data_enc, 'user-b'), 'another account cannot open it');
-  assert.equal(JSON.parse(f.secrets.decrypt(row.data_enc, 'user-a')).accessToken, 'AT-1');
-  assert.deepEqual(f.oauth.status('user-a'), { state: 'connected', account: { email: 's…@example.test', plan: 'plus' } });
-  assert.equal(JSON.stringify(f.oauth.status('user-a')).includes('AT-1'), false);
-  assert.equal(JSON.stringify(f.audits).match(/AT-|RT-|DAID|AUTHCODE|VERIFIER/), null, 'the audit log carries no credential');
-});
-
-test('a login belongs to the account that started it: another account can neither poll, finish nor cancel it', async (t) => {
-  const f = make(t);
-  const login = await f.oauth.startDeviceLogin('user-a');
-  f.fake.state.approved = true;
-  f.clock.t += 5000;
-  await assert.rejects(f.oauth.pollDeviceLogin('user-b', login.loginId), (e) => e.status === 403);
-  assert.throws(() => f.oauth.cancelDeviceLogin('user-b', login.loginId), (e) => e.status === 403);
-  assert.equal(f.oauth.status('user-b').state, 'disconnected');
-  assert.equal((await f.oauth.pollDeviceLogin('user-a', login.loginId)).state, 'connected', 'the owner still finishes it');
-  assert.equal(f.oauth.status('user-b').state, 'disconnected');
-});
-
-test('an expired login and an unknown one answer expired; start caps pending logins per account', async (t) => {
-  const f = make(t);
-  const login = await f.oauth.startDeviceLogin('user-a');
-  f.clock.t += 16 * 60 * 1000;
-  assert.equal((await f.oauth.pollDeviceLogin('user-a', login.loginId)).state, 'expired');
-  assert.equal((await f.oauth.pollDeviceLogin('user-a', 'nope')).state, 'expired');
-  const ids = [];
-  for (let i = 0; i < 5; i++) ids.push((await f.oauth.startDeviceLogin('user-a')).loginId);
-  assert.equal(f.oauth.cancelDeviceLogin('user-a', ids[0]), false, 'the oldest was evicted');
-  assert.equal(f.oauth.cancelDeviceLogin('user-a', ids[4]), true);
-});
-
-test('status sends only a short plan identifier; credential-looking keys inside a stored plan object never reach it (#1373)', (t) => {
-  const f = make(t);
-  const put = (userId, data) => f.db.prepare(`INSERT INTO chatgpt_oauth_tokens(user_id, data_enc, state, updated_at) VALUES(?,?,'connected',0)
-    ON CONFLICT(user_id) DO UPDATE SET data_enc=excluded.data_enc`).run(userId, f.secrets.encrypt(JSON.stringify(data), userId));
-  const base = { accessToken: 'AT-synthetic', refreshToken: 'RT-synthetic', accountId: 'acct-A', email: 'synthetic.person@example.test' };
-  for (const plan of ['plus', 'pro', 'team', 'enterprise', 'free_workspace', 'edu.v2', 'a'.repeat(40)]) {
-    put('user-a', { ...base, plan });
-    assert.deepEqual(f.oauth.status('user-a'), { state: 'connected', account: { email: 's…@example.test', plan } }, plan);
-  }
-  const leaky = { type: 'plus', name: 'Plus', tier: 'paid', access_token: 'AT-LEAK', refresh_token: 'RT-LEAK', id_token: 'ID-LEAK', apiKey: 'sk-LEAK', secret: 'S-LEAK' };
-  for (const plan of [leaky, [leaky], ['plus'], 1, true, '', 'a'.repeat(41), 'plus plan', 'plus\n', 'tëam', 'sk-LEAK"}', null, undefined]) {
-    put('user-a', { ...base, plan });
-    const out = f.oauth.status('user-a');
-    assert.deepEqual(out, { state: 'connected', account: { email: 's…@example.test', plan: null } }, JSON.stringify(plan));
-    assert.equal(/LEAK/.test(JSON.stringify(out)), false);
-  }
-  assert.equal(chatgpt.publicPlan('plus'), 'plus');
-  assert.equal(chatgpt.publicPlan({ type: 'plus' }), null);
-});
-
-test('the connect audit row carries only a short plan identifier, never an object or credential-like plan (#1838)', async (t) => {
-  for (const [claim, expected] of [['plus', 'plus'], [{ type: 'plus', access_token: 'AT-LEAK' }, undefined], ['sk-LEAK plan with spaces', undefined], ['sk-LEAK"}', undefined], [['plus'], undefined]]) {
-    const f = make(t);
-    f.fake.state.planClaim = claim;
-    const { done } = await connect(f);
-    assert.equal(done.state, 'connected');
-    const row = f.audits.find((a) => a.a === 'chatgpt.oauth.connect');
-    assert.ok(row, 'connect was audited');
-    assert.deepEqual(row.d, { plan: expected }, JSON.stringify(claim));
-    assert.equal(/LEAK|spaces/.test(JSON.stringify(f.audits)), false, JSON.stringify(claim));
-  }
-});
-
-test('tenant isolation: user B has no session, cannot use A’s token, and a copied ciphertext does not open for B', async (t) => {
+test('tenant isolation: user B has no session and cannot use A’s token (a copied ciphertext: noevia-rs tests/chatgpt_oauth.rs)', async (t) => {
   const f = make(t);
   await connect(f, 'user-a');
   await assert.rejects(f.oauth.session('user-b'), (e) => e.code === 'disconnected');
   const r = await f.oauth.fetchFor('user-b')('https://x/v1/chat/completions', { method: 'POST', body: JSON.stringify({ model: 'gpt-synthetic', messages: [], stream: false }) });
   assert.equal(r.status, 401);
   assert.equal(f.fake.seen.responses.length, 0, 'nothing was sent upstream for B');
-  const row = f.db.prepare("SELECT data_enc FROM chatgpt_oauth_tokens WHERE user_id='user-a'").get();
-  f.db.prepare("INSERT INTO chatgpt_oauth_tokens(user_id, data_enc, state, updated_at) VALUES('user-b', ?, 'connected', 0)").run(row.data_enc);
-  assert.equal(f.oauth.status('user-b').state, 'reconnect', 'the stolen row is unreadable for B');
-  await assert.rejects(f.oauth.session('user-b'), (e) => e.code === 'reconnect');
+  assert.ok(f.b.calls.filter((c) => c.op === 'session').every((c) => c.user === 'user-b'), 'B asked for B only');
   assert.equal((await f.oauth.session('user-a')).accessToken, 'AT-1');
 });
 
@@ -280,23 +166,7 @@ test('non-streaming requests (compaction, fallback) get one chat.completion; ups
   assert.equal(wrongPath.status, 404);
 });
 
-test('refresh: near expiry the token is refreshed once (single flight) and the rotated refresh token is kept', async (t) => {
-  const f = make(t);
-  await connect(f);
-  f.clock.t += 3600 * 1000 - 60 * 1000; // inside the five-minute margin
-  const [a, b] = await Promise.all([f.oauth.session('user-a'), f.oauth.session('user-a')]);
-  assert.equal(f.fake.seen.refreshes, 1, 'OpenAI rotates refresh tokens; two refreshes would burn each other');
-  assert.equal(a.accessToken, 'AT-2');
-  assert.equal(b.accessToken, 'AT-2');
-  const refreshCall = f.fake.seen.calls.filter((c) => c.url === `${ISSUER}/oauth/token`).at(-1);
-  assert.deepEqual(JSON.parse(refreshCall.init.body), { grant_type: 'refresh_token', refresh_token: 'RT-1', client_id: chatgpt.DEFAULTS.clientId });
-  const stored = JSON.parse(f.secrets.decrypt(f.db.prepare('SELECT data_enc FROM chatgpt_oauth_tokens').get().data_enc, 'user-a'));
-  assert.equal(stored.refreshToken, 'RT-2');
-  assert.equal(stored.accountId, 'acct-A', 'the account id survives a refresh without an id token');
-  assert.equal(stored.email, 'synthetic.person@example.test');
-});
-
-test('refresh on 401: the request is retried once with the new bearer', async (t) => {
+test('refresh on 401: the broker is asked again with the rejected token and the request retried once with the new bearer', async (t) => {
   const f = make(t);
   await connect(f);
   f.fake.state.upstream.push(() => json({ detail: 'token expired' }, 401));
@@ -304,15 +174,11 @@ test('refresh on 401: the request is retried once with the new bearer', async (t
   assert.equal(r.status, 200);
   assert.deepEqual(f.fake.seen.responses.map((x) => x.headers.authorization), ['Bearer AT-1', 'Bearer AT-2']);
   assert.equal(f.oauth.status('user-a').state, 'connected');
+  assert.deepEqual(f.b.calls.filter((c) => c.op === 'session').map((c) => c.rejected), [null, 'AT-1']);
 });
 
 // #934: a second 401 after the refresh marks only the sign-in that failed, never a newer one.
 const chatBody = () => ({ method: 'POST', body: JSON.stringify({ model: 'gpt-synthetic', messages: [], stream: false }) });
-const storedTokens = (f) => JSON.parse(f.secrets.decrypt(f.db.prepare('SELECT data_enc FROM chatgpt_oauth_tokens WHERE user_id=?').get('user-a').data_enc, 'user-a'));
-function writeSignIn(f, tokens) {
-  f.db.prepare("UPDATE chatgpt_oauth_tokens SET data_enc=?, state='connected', updated_at=? WHERE user_id='user-a'")
-    .run(f.secrets.encrypt(JSON.stringify(tokens), 'user-a'), f.clock.t);
-}
 
 test('a 401 twice marks the signed-in row "reconnect" when nothing else changed', async (t) => {
   const f = make(t);
@@ -322,6 +188,7 @@ test('a 401 twice marks the signed-in row "reconnect" when nothing else changed'
   const r = await f.oauth.fetchFor('user-a')('https://c/v1/chat/completions', chatBody());
   assert.equal(r.status, 401);
   assert.equal(f.oauth.status('user-a').state, 'reconnect');
+  assert.deepEqual(f.b.calls.filter((c) => c.op === 'reject').map((c) => c.generation), ['gen-2'], 'the generation that failed, never a token');
 });
 
 test('a 401 twice leaves a newer sign-in written between the calls "connected"', async (t) => {
@@ -330,26 +197,25 @@ test('a 401 twice leaves a newer sign-in written between the calls "connected"',
   f.fake.state.upstream.push(() => json({}, 401));
   f.fake.state.upstream.push(() => {
     // The user finishes a fresh device sign-in while the retry is in flight.
-    writeSignIn(f, { ...storedTokens(f), accessToken: 'AT-NEW', refreshToken: 'RT-NEW' });
+    f.b.connect('user-a', { accessToken: 'AT-NEW', accountId: 'acct-A' });
     return json({}, 401);
   });
   const r = await f.oauth.fetchFor('user-a')('https://c/v1/chat/completions', chatBody());
   assert.equal(r.status, 401, 'this request still fails');
   assert.equal(f.oauth.status('user-a').state, 'connected', 'the fresh sign-in is not marked');
-  assert.equal(storedTokens(f).accessToken, 'AT-NEW');
   assert.equal((await f.oauth.session('user-a')).accessToken, 'AT-NEW');
 });
 
 test('a refused refresh marks the account "reconnect"; a transient one does not; disconnect deletes the tokens', async (t) => {
   const f = make(t);
   await connect(f);
-  f.fake.state.refresh = 'down';
+  f.b.state.refresh = 'down';
   f.fake.state.upstream.push(() => json({}, 401));
   const transient = await f.oauth.fetchFor('user-a')('https://c/v1/chat/completions', { method: 'POST', body: JSON.stringify({ model: 'gpt-synthetic', messages: [] }) });
   assert.equal(transient.status, 503);
   assert.equal(f.oauth.status('user-a').state, 'connected', 'a network blip is not a revoked sign-in');
 
-  f.fake.state.refresh = 'invalid';
+  f.b.state.refresh = 'invalid';
   f.fake.state.upstream.push(() => json({}, 401));
   const refused = await f.oauth.fetchFor('user-a')('https://c/v1/chat/completions', { method: 'POST', body: JSON.stringify({ model: 'gpt-synthetic', messages: [] }) });
   assert.equal(refused.status, 401);
@@ -361,50 +227,25 @@ test('a refused refresh marks the account "reconnect"; a transient one does not;
   assert.equal(after.status, 401);
   assert.equal(f.fake.seen.responses.length, before, 'a reconnect-needed account sends nothing upstream');
 
-  f.oauth.disconnect('user-a');
+  await f.oauth.disconnect('user-a');
   assert.equal(f.db.prepare('SELECT COUNT(*) AS n FROM chatgpt_oauth_tokens').get().n, 0);
   assert.equal(f.oauth.status('user-a').state, 'disconnected');
   await connect(f);
   assert.equal(f.oauth.status('user-a').state, 'connected', 'signing in again recovers');
 });
 
-test('a disconnect during an in-flight refresh wins: the refreshed tokens are not written back', async (t) => {
+test('forgetUser removes a deleted account through the broker; rotation covers the table', async (t) => {
   const f = make(t);
   await connect(f);
-  let release;
-  f.fake.state.refreshGate = new Promise((r) => { release = r; });
-  f.clock.t += 3600 * 1000;
-  const pending = f.oauth.session('user-a');
-  await new Promise((r) => setImmediate(r));
-  f.oauth.disconnect('user-a');
-  release();
-  await assert.rejects(pending, (e) => e.code === 'disconnected');
-  assert.equal(f.db.prepare('SELECT COUNT(*) AS n FROM chatgpt_oauth_tokens').get().n, 0);
-  assert.equal(f.oauth.status('user-a').state, 'disconnected');
-});
-
-test('the model list is the account’s public models; forgetUser removes a deleted account; rotation covers the table', async (t) => {
-  const f = make(t);
-  await connect(f);
-  assert.deepEqual(await f.oauth.listModels('user-a'), ['gpt-synthetic', 'gpt-thinker', 'gpt-plain', 'gpt-quiet']);
-  const modelCall = f.fake.seen.calls.find((c) => c.url.startsWith(`${CODEX}/models?`));
-  assert.match(modelCall.url, /client_version=0\.155\.0/);
-  assert.equal(modelCall.init.headers.authorization, 'Bearer AT-1');
-  await assert.rejects(f.oauth.listModels('user-b'), (e) => e.status === 401);
   const tables = rotationTables({ db: f.db, dataDir: f.dir });
   const table = tables.find((x) => x.name === 'chatgpt_oauth_tokens');
   assert.ok(table, 'secrets rotation re-encrypts ChatGPT tokens');
   assert.deepEqual(table.rows().map((r) => r.userId), ['user-a'], 'bound rows rotate with their owner');
-  f.oauth.forgetUser('user-a');
+  await f.oauth.forgetUser('user-a');
   assert.equal(f.oauth.status('user-a').state, 'disconnected');
 });
 
-test('pure helpers: masked e-mail, account id from claims, provider row is private and external', () => {
-  assert.equal(chatgpt.maskEmail('someone@example.test'), 's…@example.test');
-  assert.equal(chatgpt.maskEmail('no-at-sign'), null);
-  assert.equal(chatgpt.accountIdFrom(idToken('acct-Z')), 'acct-Z');
-  assert.equal(chatgpt.accountIdFrom(jwt({ organizations: [{ id: 'org-1' }] })), 'org-1');
-  assert.equal(chatgpt.accountIdFrom('not.a.jwt'), undefined);
+test('the provider row is private and external', () => {
   const row = chatgpt.providerRow();
   assert.deepEqual({ shared: row.shared, external: row.external, kind: row.kind, apiKey: row.apiKey }, { shared: false, external: true, kind: 'chatgpt-oauth', apiKey: '' });
 });
@@ -510,63 +351,6 @@ test('fork allowlist: a model the account does not have is refused before anythi
   assert.equal((await post(g, { model: 'gpt-anything' })).status, 200);
 });
 
-test('fork 3b04587 / review: a transient refresh failure inside the early window keeps the still-valid token', async (t) => {
-  const f = make(t);
-  await connect(f);
-  f.fake.state.refresh = 'down';
-  f.clock.t += 3600 * 1000 - 60 * 1000; // four minutes early, token still valid
-  assert.equal((await f.oauth.session('user-a')).accessToken, 'AT-1');
-  f.clock.t += 120 * 1000; // now expired
-  await assert.rejects(f.oauth.session('user-a'), (e) => e.code === 'transient');
-  assert.equal(f.oauth.status('user-a').state, 'connected');
-});
-
-test('#453: a stale refresh cannot overwrite a newer sign-in (compare-and-set)', async (t) => {
-  const f = make(t);
-  await connect(f);
-  let release;
-  f.fake.state.refreshGate = new Promise((r) => { release = r; });
-  f.clock.t += 3600 * 1000;
-  const stale = f.oauth.session('user-a');
-  await new Promise((r) => setImmediate(r));
-  await connect(f); // the person signs in again while the old refresh is in flight
-  release();
-  const got = await stale;
-  const stored = JSON.parse(f.secrets.decrypt(f.db.prepare('SELECT data_enc FROM chatgpt_oauth_tokens').get().data_enc, 'user-a'));
-  assert.equal(stored.accessToken, 'AT-L2', 'the re-sign-in survives');
-  assert.equal(got.accessToken, 'AT-L2', 'the caller gets the current sign-in, not the stale refresh');
-});
-
-test('#454: Cancel or Disconnect during the token exchange wins; nothing is stored', async (t) => {
-  for (const how of ['cancel', 'disconnect']) {
-    const f = make(t);
-    const login = await f.oauth.startDeviceLogin('user-a');
-    f.fake.state.approved = true;
-    let release, entered;
-    const inExchange = new Promise((r) => { entered = r; });
-    f.fake.state.exchangeGate = new Promise((r) => { release = r; });
-    f.fake.state.onExchange = entered;
-    f.clock.t += 5000;
-    const polled = f.oauth.pollDeviceLogin('user-a', login.loginId);
-    await inExchange;
-    if (how === 'cancel') assert.equal(f.oauth.cancelDeviceLogin('user-a', login.loginId), true);
-    else f.oauth.disconnect('user-a');
-    release();
-    assert.deepEqual(await polled, { state: 'cancelled' }, how);
-    assert.equal(f.oauth.status('user-a').state, 'disconnected', how);
-    assert.equal(f.db.prepare('SELECT COUNT(*) AS n FROM chatgpt_oauth_tokens').get().n, 0, how);
-  }
-});
-
-test('review: starting a sign-in is rate-limited per account (5 per 10 minutes)', async (t) => {
-  const f = make(t);
-  for (let i = 0; i < 5; i++) await f.oauth.startDeviceLogin('user-a');
-  await assert.rejects(f.oauth.startDeviceLogin('user-a'), (e) => e.status === 429);
-  await f.oauth.startDeviceLogin('user-b');
-  f.clock.t += 10 * 60 * 1000 + 1;
-  await f.oauth.startDeviceLogin('user-a');
-});
-
 test('forks YangKeao@d72dec5 / twaldin@b471a45: reasoning summaries are requested, following the model’s catalogue defaults', async (t) => {
   const f = make(t);
   await connect(f);
@@ -599,14 +383,10 @@ test('fork QuartzWarrior@7100902, checked against openai/codex: per-conversation
   assert.notEqual(f.fake.seen.responses.at(-1).headers['session-id'], a.headers['session-id']);
   assert.match(a.headers['user-agent'], /^noevia\/\S+ \(chatgpt-oauth; \+https:\/\/github\.com\/sbstndalton\/noevia\)$/);
   assert.equal('originator' in a.headers, false, 'noevia does not claim to be the Codex CLI');
-  const tokenCall = f.fake.seen.calls.find((c) => c.url.endsWith('/oauth/token'));
-  assert.equal(tokenCall.init.headers['user-agent'], a.headers['user-agent']);
   // FedRAMP: the Codex client itself sends X-OpenAI-Fedramp for such accounts (bearer_auth_provider.rs L43-44).
   const g = make(t);
   g.fake.state.fedRampToken = true;
-  const login = await g.oauth.startDeviceLogin('user-f');
-  g.fake.state.approved = true; g.clock.t += 5000;
-  await g.oauth.pollDeviceLogin('user-f', login.loginId);
+  await connect(g, 'user-f');
   await g.oauth.fetchFor('user-f')('https://c/v1/chat/completions', { method: 'POST', body: JSON.stringify({ model: 'gpt-synthetic', messages: [] }) });
   assert.equal(g.fake.seen.responses.at(-1).headers['x-openai-fedramp'], 'true');
   assert.equal('x-openai-fedramp' in a.headers, false);
@@ -625,16 +405,10 @@ test('catalogue compatibility #1310: published GPT-6 metadata uses the exact new
     { slug: 'synthetic-api-disabled', visibility: 'list', supported_in_api: false },
   ] };
   assert.equal(publicCatalogue1310.source.revision, 'cc7ba33601286a751477832b01de7b6f8de0dd9c');
-  assert.equal(chatgpt.DEFAULTS.codexClientVersion, '0.155.0');
-  const ids = await f.oauth.listModels('user-a');
+  const ids = (await f.b.broker.chatgptCatalogue('user-a')).models.map((m) => m.slug);
   assert.deepEqual(ids, ['gpt-6-astra', 'gpt-6.1-sol', 'gpt-6-sol', 'gpt-6-luna']);
-  const call = f.fake.seen.calls.find((c) => c.url.startsWith(`${CODEX}/models?`));
-  assert.equal(call.url, `${CODEX}/models?client_version=0.155.0`);
-  assert.equal(call.init.method, 'GET');
-  assert.equal(call.init.redirect, 'error');
   assert.ok(ids.every((id) => typeof id === 'string'));
-  assert.doesNotMatch(JSON.stringify({ ids, status: f.oauth.status('user-a'), audits: f.audits }), /AT-1|RT-1|AUTHCODE|VERIFIER/);
-  await assert.rejects(f.oauth.listModels('user-b'), (e) => e.status === 401);
+  assert.doesNotMatch(JSON.stringify({ ids, status: f.oauth.status('user-a') }), /AT-1/);
 
   // Exercise the existing catalogue-default adapter with fake Response objects only.
   for (const row of publicCatalogue1310.models) {
@@ -653,16 +427,6 @@ test('catalogue compatibility #1310: published GPT-6 metadata uses the exact new
   assert.equal(publicCatalogue1310.models.find((row) => row.slug === 'gpt-6-luna').supported_reasoning_levels.some((level) => level.effort === 'ultra'), false);
 });
 
-test('catalogue compatibility #1310: the existing configured version override remains authoritative', async (t) => {
-  const f = make(t, fakeOpenAI(), { t: 1_800_000_000_000 }, { codexClientVersion: '0.199.2-fixture' });
-  await connect(f);
-  f.fake.state.catalogue = { models: publicCatalogue1310.models };
-  assert.deepEqual(await f.oauth.listModels('user-a'), publicCatalogue1310.models.map((row) => row.slug));
-  assert.equal(f.fake.seen.calls.find((c) => c.url.startsWith(`${CODEX}/models?`)).url, `${CODEX}/models?client_version=0.199.2-fixture`);
-});
-
-// #1311: an explicit reasoning effort the adapter does not map by default is sent when the model's
-// published list offers it, and refused with the offered levels otherwise. It is never silently dropped.
 test('#1311: explicit xhigh/max/ultra reach upstream only when the model publishes them; others are refused, not dropped', async (t) => {
   const f = make(t);
   await connect(f);
@@ -727,4 +491,56 @@ test('#1592: a basic level the model does not publish is refused; a model withou
   r = await post(f, { model: 'gpt-nolevels', reasoning_effort: 'high' });
   assert.equal(r.status, 200, 'with no published list a basic level goes through as before');
   assert.equal(lastSent(f).reasoning.effort, 'high');
+});
+
+
+// ── sbstndalton/noevia#2190 round 5: the token client ──
+
+test('the access token is cached briefly: re-asked when the broker signals a change, never inside the refresh margin', async (t) => {
+  const f = make(t);
+  await connect(f);
+  const sessions = () => f.b.calls.filter((c) => c.op === 'session').length;
+  assert.equal((await f.oauth.session('user-a')).accessToken, 'AT-1');
+  await f.oauth.session('user-a');
+  assert.equal(sessions(), 1, 'cached');
+  f.clock.t += 61_000;
+  await f.oauth.session('user-a');
+  assert.equal(sessions(), 2, 'at most a minute');
+  f.b.state.signal += 1; // the broker changed a token row (refresh, reconnect, disconnect)
+  await f.oauth.session('user-a');
+  assert.equal(sessions(), 3, 'the change signal drops the cache');
+  // A token inside the broker's five-minute refresh margin is never cached: the broker refreshes it.
+  f.b.connect('user-a', { accessToken: 'AT-short', expiresAt: f.clock.t + 4 * 60_000 });
+  await f.oauth.session('user-a');
+  await f.oauth.session('user-a');
+  assert.equal(sessions(), 5);
+  // A signal that cannot be read is no cache at all.
+  const g = make(t);
+  await connect(g);
+  const blind = chatgpt.createChatGptOAuth({ db: g.db, broker: g.b.broker, signal: () => { throw new Error('EACCES'); }, fetchImpl: g.fake.fetchImpl, now: () => g.clock.t });
+  await blind.session('user-a'); await blind.session('user-a');
+  assert.equal(g.b.calls.filter((c) => c.op === 'session').length, 2);
+});
+
+test('the broker unreachable is "try again" (503 transient), never a disconnect', async (t) => {
+  const f = make(t);
+  await connect(f);
+  f.b.state.down = true;
+  await assert.rejects(f.oauth.session('user-a'), (e) => e.status === 503 && e.code === 'transient');
+  const r = await f.oauth.fetchFor('user-a')('https://c/v1/chat/completions', { method: 'POST', body: JSON.stringify({ model: 'gpt-synthetic', messages: [] }) });
+  assert.equal(r.status, 503);
+  assert.equal(r.headers.get('x-noevia-provider-message'), '1');
+  assert.equal(f.fake.seen.responses.length, 0);
+  assert.equal(f.oauth.status('user-a').state, 'connected');
+  await assert.rejects(f.oauth.disconnect('user-a'), (e) => e.status === 503);
+});
+
+test('this process holds no refresh token, writes no token row and keeps no device sign-in', (t) => {
+  const source = fs.readFileSync(require.resolve('./chatgpt-oauth.cjs'), 'utf8');
+  assert.doesNotMatch(source, /refresh_token|refreshToken|deviceauth|secrets\.(en|de)crypt|INSERT INTO chatgpt_oauth_tokens|UPDATE chatgpt_oauth_tokens|DELETE FROM chatgpt_oauth_tokens/);
+  const f = make(t);
+  assert.deepEqual(Object.keys(f.oauth).sort(), ['disconnect', 'fetchFor', 'forgetUser', 'session', 'status']);
+  assert.equal(f.oauth.status('nobody').state, 'disconnected');
+  f.db.prepare("INSERT INTO chatgpt_oauth_tokens(user_id,data_enc,state,updated_at) VALUES('user-r','enc:v2:x','reconnect',1)").run();
+  assert.equal(f.oauth.status('user-r').state, 'reconnect');
 });

@@ -76,7 +76,8 @@ test('index.cjs refuses before authentication and no longer mounts the Node rout
   const src = fs.readFileSync(path.join(__dirname, 'index.cjs'), 'utf8');
   const refusal = src.indexOf("require('./rust-vault-mirror-preferences.cjs').refuseOwned(");
   assert.ok(refusal > 0);
-  assert.ok(refusal < src.indexOf("require('./rust-storage-integrations.cjs').refuseOwned(") + 400);
+  assert.ok(refusal > src.indexOf("require('./rust-storage-integrations.cjs').refuseOwned("));
+  assert.ok(refusal < src.indexOf('const preAuth = requestAuth.authenticate(req);'));
   assert.ok(!src.includes('routes/chat-vault-mirror.cjs'));
   assert.ok(src.includes("require('./rust-vault-mirror-preferences.cjs').startNudges("));
   assert.ok(!fs.existsSync(path.join(__dirname, 'routes', 'chat-vault-mirror.cjs')));

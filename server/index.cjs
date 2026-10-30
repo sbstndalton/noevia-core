@@ -841,11 +841,14 @@ const mcpOAuth = require('./mcp-oauth.cjs').createMcpOAuth({
   urlAllowed: async (url) => require('./directory-mcp.cjs').hostedUrlOk(url) && directoryUrlAllowed(url),
   redirectUri: () => `${String(authService.origin || process.env.PUBLIC_ORIGIN || '').replace(/\/$/, '')}/api/mcp-oauth/callback`,
 });
-// Sign in with ChatGPT (#447): per-account tokens, encrypted and bound to their owner, used only
-// while features.chatgptOAuth is on. The table exists either way so a disconnect always works.
+// Sign in with ChatGPT (#447), used only while features.chatgptOAuth is on. The Rust front is its
+// token broker (sbstndalton/noevia#2190 round 5, rust-chatgpt-oauth.cjs): the sign-in, the tokens,
+// their refresh and the model catalogue are its own; chat asks it for an access token through the
+// internal store (PROJECT_STORE) and re-asks when the broker's change signal moves. The table is
+// created here either way (Node is the schema migrator) so a disconnect always works.
 const chatgptOAuth = require('./chatgpt-oauth.cjs').createChatGptOAuth({
-  db: authService.db, secrets: secretStore, audit: (action, actor, detail) => authService.audit(action, actor, actor, detail),
-  config: { codexClientVersion: process.env.NOEVIA_CHATGPT_CODEX_VERSION },
+  db: authService.db, broker: PROJECT_STORE,
+  signal: () => require('./shared-reread.cjs').fileSignal(path.join(DATA_DIR, require('./rust-chatgpt-oauth.cjs').SIGNAL_FILE)),
 });
 const mcpCredentialOriginAllowed = createCredentialOriginCheck(process.env.MCP_NEXTCLOUD_ORIGINS);
 // The live server list, discovery, per-server credentials and the MCP executor: mcp-wiring.cjs.
@@ -1129,7 +1132,7 @@ const projectRoutes = require('./routes/projects.cjs').createProjectRoutes({
 // The provider registry's routes: list, connect, test and remove (routes/providers.cjs), plus
 // Sign in with ChatGPT (chatgptOAuth, built beside mcpOAuth above) while features.chatgptOAuth is on.
 const providerRoutes = require('./routes/providers.cjs').createProviderRoutes({
-  json, readBody, readJson, fetchJson, endpointApproved, PROVIDERS, PROJECTS, DEFAULT_PROVIDER_ID, modelManager, currentWorkspace, saveProjects, registry: providerRegistry,
+  json, readBody, readJson, endpointApproved, PROVIDERS, PROJECTS, DEFAULT_PROVIDER_ID, modelManager, currentWorkspace, saveProjects, registry: providerRegistry,
   chatgptOAuth, chatgptEnabled: () => features.enabled('chatgptOAuth'),
 });
 // Statistics, the auto-router roles, the model manager proxy and /api/models/* (routes/models.cjs).
@@ -1297,6 +1300,8 @@ async function handleRequestInner(req, res) {
   if (require('./rust-storage-integrations.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   if (require('./rust-storage-connection.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   if (require('./rust-provider-test.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
+  if (require('./rust-chatgpt-oauth.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
+  if (require('./rust-provider-models.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   if (require('./rust-vault-mirror-preferences.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   await readyFeatures();
   const preAuth = requestAuth.authenticate(req);

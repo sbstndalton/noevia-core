@@ -29,7 +29,7 @@ const PASS = Symbol('unhandled');
  * @param {(userId:string, method:string, url:string) => object} [deps.diaryTenantHeaders]  diary.cjs tenantHeaders (signed)
  * @param {{ forgetUser: (userId:string) => void }} [deps.mcpOAuth]      OAuth sign-ins, keyed per (user, server)
  * @param {{ forgetUser: (userId:string) => void }} [deps.directoryMcp]  directory server keys, keyed per (user, server)
- * @param {{ forgetUser: (userId:string) => void }} [deps.chatgptOAuth]  Sign in with ChatGPT tokens, keyed per user
+ * @param {{ forgetUser: (userId:string) => Promise<void> }} [deps.chatgptOAuth]  Sign in with ChatGPT tokens (the Rust broker's), keyed per user
  * @param {(actorId:string) => object} [deps.rotateSecrets]  re-encrypts stored credentials under the current key
  */
 function createAuthRoutes({ json, readJson: readAnyJson, authService, workspaceStore, driveAccounts, fetchJson, DIARY_BASE, DIARY_TOKEN, diaryTenantHeaders = null, mcpOAuth, directoryMcp, chatgptOAuth = null, rotateSecrets }) {
@@ -51,7 +51,9 @@ function createAuthRoutes({ json, readJson: readAnyJson, authService, workspaceS
             await driveAccounts.removeUser(id);
             mcpOAuth?.forgetUser(id);
             directoryMcp?.forgetUser(id);
-            chatgptOAuth?.forgetUser(id);
+            // The broker deletes the account's ChatGPT tokens (sbstndalton/noevia#2190 round 5); a
+            // failure is reported without detail and does not undo the deletion.
+            await Promise.resolve(chatgptOAuth?.forgetUser(id)).catch((e) => console.warn(`ChatGPT tokens of a deleted account were not removed (${e?.code || e?.status || 'error'}).`));
             const target = `${DIARY_BASE}/api/internal/tenant`;
             // Signed with DIARY_TENANT_KEY when set: the sidecar refuses an unasserted delete.
             let headers = diaryTenantHeaders ? diaryTenantHeaders(id, 'DELETE', target) : null;

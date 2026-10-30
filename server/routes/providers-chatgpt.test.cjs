@@ -1,41 +1,26 @@
 'use strict';
 // Sign in with ChatGPT through the provider routes (#447): hidden and refused while the feature is
-// off; with it on, a device-code sign-in adds a PRIVATE provider row to that account only, the
-// listing shows a state (never a token), and disconnecting deletes tokens, row and project links.
-// The real chatgpt-oauth.cjs runs against a fake OpenAI at *.fixture.invalid.
+// off; with it on, a finished sign-in adds a PRIVATE provider row to that account only, the listing
+// shows a state (never a token), and disconnecting deletes tokens, row and project links.
+// sbstndalton/noevia#2190 round 5: the device sign-in, the tokens and the model list are the Rust
+// broker's (noevia-rs chatgpt_oauth_routes.rs, tests/chatgpt_oauth.rs); this mount refuses those
+// routes, and a synthetic broker (tests/server/chatgpt-broker-fake.cjs) plays the front here.
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const fs = require('node:fs');
-const os = require('node:os');
-const path = require('node:path');
 const { Readable } = require('node:stream');
 const Database = require('better-sqlite3');
 const { createProviderRoutes } = require('./providers.cjs');
 const STATUS_REFUSAL = { status: 503, body: { error: 'ChatGPT status is owned by the Rust front.', code: 'RUST_CHATGPT_STATUS_OWNED' } };
-const { createSecretStore } = require('../secrets.cjs');
+const BROKER_REFUSAL = { status: 503, body: { error: 'Sign in with ChatGPT is owned by the Rust front.', code: 'RUST_CHATGPT_OAUTH_OWNED' } };
 const chatgpt = require('../chatgpt-oauth.cjs');
-
-const ISSUER = 'https://auth.fixture.invalid';
-const b64 = (o) => Buffer.from(JSON.stringify(o)).toString('base64url');
-const idToken = `${b64({ alg: 'none' })}.${b64({ email: 'member@example.test', 'https://api.openai.com/auth': { chatgpt_account_id: 'acct-synthetic', chatgpt_plan_type: 'plus' } })}.sig`;
-const reply = (o, status = 200) => new Response(JSON.stringify(o), { status, headers: { 'content-type': 'application/json' } });
+const { createFakeBroker } = require('../../tests/server/chatgpt-broker-fake.cjs');
 
 function fixture(t, { flag = true } = {}) {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'noevia-chatgpt-routes-'));
-  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
   const clock = { t: 1_800_000_000_000 };
   const flags = { on: flag };
-  const gates = { exchange: null, entered: null };
-  const fetchImpl = async (url, init) => {
-    url = String(url);
-    if (url.endsWith('/deviceauth/usercode')) return reply({ device_auth_id: 'DAID', user_code: 'WXYZ-9876', interval: '1' });
-    if (url.endsWith('/deviceauth/token')) return reply({ authorization_code: 'CODE', code_challenge: 'C', code_verifier: 'V' });
-    if (url.endsWith('/oauth/token') && gates.exchange) { gates.entered?.(); await gates.exchange; }
-    if (url.endsWith('/oauth/token')) return reply({ access_token: 'AT-secret', refresh_token: 'RT-secret', id_token: idToken, expires_in: 3600 });
-    if (url.includes('/models?')) return reply({ models: [{ slug: 'gpt-synthetic' }] });
-    throw new Error('unexpected ' + url + (init ? '' : ''));
-  };
-  const oauth = chatgpt.createChatGptOAuth({ db: new Database(':memory:'), secrets: createSecretStore(dir, { env: {} }), fetchImpl, now: () => clock.t, config: { issuer: ISSUER } });
+  const db = new Database(':memory:');
+  const fake = createFakeBroker({ db, now: () => clock.t });
+  const oauth = chatgpt.createChatGptOAuth({ db, broker: fake.broker, signal: fake.signal, now: () => clock.t, fetchImpl: async () => { throw new Error('no upstream in route tests'); } });
   // One route instance per account, as the request scope gives each account its own workspace view.
   const accounts = {};
   const routesFor = (userId) => {
@@ -63,67 +48,65 @@ function fixture(t, { flag = true } = {}) {
     };
     return (accounts[userId] = { call, providers, projects, saved });
   };
-  return { routesFor, flags, clock, oauth, gates };
+  return { routesFor, flags, clock, oauth, fake };
 }
-async function signIn(f, userId) {
-  const a = f.routesFor(userId);
-  const start = await a.call('POST', '/api/providers/chatgpt/device');
-  assert.equal(start.status, 200);
-  f.clock.t += 1000;
-  const done = await a.call('POST', '/api/providers/chatgpt/device/poll', { loginId: start.body.loginId });
-  assert.equal(done.body.state, 'connected');
-  return { start, done };
+/** The front finished a device sign-in for `userId` (its broker saved the tokens). */
+function signIn(f, userId) {
+  f.fake.connect(userId, { accessToken: 'AT-secret', accountId: 'acct-synthetic' });
 }
 
-test('flag off: every ChatGPT route answers 404, and an existing row is hidden from the listing', async (t) => {
+test('flag off: the routes Node keeps answer 404, the broker\'s are refused, and an existing row is hidden from the listing', async (t) => {
   const f = fixture(t, { flag: false });
   const a = f.routesFor('user-a');
   // The status GET is the Rust front's (#1071): refused whatever the flag says.
   assert.deepEqual(await a.call('GET', '/api/providers/chatgpt'), STATUS_REFUSAL);
+  // The device sign-in and the model list are the broker's: refused whatever the flag says (#2190).
   for (const [method, p] of [['POST', '/api/providers/chatgpt/device'], ['POST', '/api/providers/chatgpt/device/poll'],
-    ['GET', '/api/providers/chatgpt/models'], ['DELETE', '/api/providers/chatgpt']]) {
-    assert.deepEqual(await a.call(method, p, method === 'POST' ? {} : undefined), { status: 404, body: { error: 'Sign in with ChatGPT is turned off on this server.' } }, `${method} ${p}`);
+    ['POST', '/api/providers/chatgpt/device/cancel'], ['GET', '/api/providers/chatgpt/models']]) {
+    assert.deepEqual(await a.call(method, p, method === 'POST' ? {} : undefined), BROKER_REFUSAL, `${method} ${p}`);
   }
+  assert.deepEqual(await a.call('DELETE', '/api/providers/chatgpt'), { status: 404, body: { error: 'Sign in with ChatGPT is turned off on this server.' } });
+  assert.deepEqual(await a.call('GET', '/api/providers/chatgpt/device'), { status: 404, body: { error: 'Sign in with ChatGPT is turned off on this server.' } }, 'other methods stay Node\'s');
+  // A token row while the flag is off adds no row (the reconcile runs only with the flag on).
+  signIn(f, 'user-a');
+  assert.deepEqual((await a.call('GET', '/api/providers')).body.providers.map((p) => p.id), ['default']);
+  assert.equal(a.saved.private, 0);
   a.providers.push(chatgpt.providerRow());
   const list = await a.call('GET', '/api/providers');
   assert.deepEqual(list.body.providers.map((p) => p.id), ['default']);
 });
 
-test('flag on: sign-in adds a private, external row for that account only; nothing token-like reaches the client', async (t) => {
+test('flag on: a finished sign-in adds a private, external row for that account only; nothing token-like reaches the client', async (t) => {
   const f = fixture(t);
-  const { start, done } = await signIn(f, 'user-a');
-  assert.deepEqual(Object.keys(start.body).sort(), ['expiresAt', 'interval', 'loginId', 'userCode', 'verificationUrl']);
-  assert.deepEqual(done.body, { state: 'connected', account: { email: 'm…@example.test', plan: 'plus' } });
   const a = f.routesFor('user-a');
-  assert.deepEqual(a.providers.at(-1), chatgpt.providerRow());
-  assert.equal(a.saved.private, 1, 'saved to the private provider file');
+  signIn(f, 'user-a');
   // The status itself is the Rust front's GET (#1071); Node only refuses it.
   assert.deepEqual(await a.call('GET', '/api/providers/chatgpt'), STATUS_REFUSAL);
-  assert.deepEqual(f.oauth.status('user-a'), { state: 'connected', account: { email: 'm…@example.test', plan: 'plus' } });
+  assert.deepEqual(f.oauth.status('user-a'), { state: 'connected' });
   const list = await a.call('GET', '/api/providers');
+  assert.deepEqual(a.providers.at(-1), chatgpt.providerRow(), 'the listing adds the row the broker\'s sign-in implies');
+  assert.equal(a.saved.private, 1, 'saved to the private provider file');
   const row = list.body.providers.find((p) => p.id === 'chatgpt-oauth');
   assert.deepEqual(row, { id: 'chatgpt-oauth', label: 'ChatGPT', baseUrl: chatgpt.DEFAULTS.codexBaseUrl, apiKeyMasked: null, isDefault: false, managed: false, shared: false, defaultModel: undefined, kind: 'chatgpt-oauth', external: true, connection: 'connected' });
-  for (const reply of [start, done, list]) assert.equal(/AT-secret|RT-secret|DAID|acct-synthetic/.test(JSON.stringify(reply.body)), false);
-  assert.deepEqual((await a.call('GET', '/api/providers/chatgpt/models')).body, { models: ['gpt-synthetic'], cached: false, fetchedAt: f.clock.t });
+  assert.equal(/AT-secret|acct-synthetic|enc:v2/.test(JSON.stringify(list.body)), false);
+  await a.call('GET', '/api/providers');
+  assert.equal(a.saved.private, 1, 'listed again: still one row, no second save');
+  // The row's model list is the Rust front's (rust-provider-models.cjs): refused here.
+  assert.deepEqual(await a.call('GET', '/api/providers/chatgpt-oauth/models'), { status: 503, body: { error: 'The provider model list is owned by the Rust front.', code: 'RUST_PROVIDER_MODELS_OWNED' } });
 
-  // user B: separate workspace, no row, not connected, cannot finish A's login.
+  // user B: separate workspace, no row, not connected.
   const b = f.routesFor('user-b');
   assert.equal(f.oauth.status('user-b').state, 'disconnected');
   assert.deepEqual((await b.call('GET', '/api/providers')).body.providers.map((p) => p.id), ['default']);
-  const again = await a.call('POST', '/api/providers/chatgpt/device');
-  const stolen = await b.call('POST', '/api/providers/chatgpt/device/poll', { loginId: again.body.loginId });
-  assert.equal(stolen.status, 403);
-  assert.equal(f.oauth.status('user-b').state, 'disconnected');
-  const models = await b.call('GET', '/api/providers/chatgpt/models');
-  assert.equal(models.status, 401);
-  assert.match(models.body.error, /not connected/);
 });
 
 test('connecting twice keeps one row; disconnect deletes the tokens, the row and project links', async (t) => {
   const f = fixture(t);
-  await signIn(f, 'user-a');
-  await signIn(f, 'user-a');
   const a = f.routesFor('user-a');
+  signIn(f, 'user-a');
+  await a.call('GET', '/api/providers');
+  signIn(f, 'user-a');
+  await a.call('GET', '/api/providers');
   assert.equal(a.providers.filter((p) => p.id === 'chatgpt-oauth').length, 1);
   a.projects[0].provider = 'chatgpt-oauth';
   a.projects[0].model = 'gpt-synthetic';
@@ -133,8 +116,10 @@ test('connecting twice keeps one row; disconnect deletes the tokens, the row and
   assert.equal('provider' in a.projects[0], false, 'the project falls back to the default provider');
   assert.equal('model' in a.projects[0], false, 'the ChatGPT model cannot be sent to the default provider');
   assert.equal(f.oauth.status('user-a').state, 'disconnected');
+  assert.deepEqual(f.fake.calls.filter((c) => c.op === 'disconnect').map((c) => c.user), ['user-a'], 'the broker deleted the tokens');
   // Removing the row through the generic route is also a disconnect.
-  await signIn(f, 'user-a');
+  signIn(f, 'user-a');
+  await a.call('GET', '/api/providers');
   a.projects[0].provider = 'chatgpt-oauth';
   a.projects[0].model = 'gpt-synthetic';
   assert.equal((await a.call('DELETE', '/api/providers/chatgpt-oauth')).status, 200);
@@ -158,43 +143,32 @@ test('POST /api/providers cannot mint a ChatGPT or external row', async (t) => {
   assert.equal(chatgpt.isChatGptProvider(row), false);
 });
 
-test('#454: Disconnect while the sign-in is being exchanged wins, and the route does not add the row', async (t) => {
+test('#2190: the broker unreachable keeps the row: a disconnect that could not delete the tokens says so', async (t) => {
   const f = fixture(t);
   const a = f.routesFor('user-a');
-  const start = await a.call('POST', '/api/providers/chatgpt/device');
-  let release;
-  f.gates.exchange = new Promise((r) => { release = r; });
-  const entered = new Promise((r) => { f.gates.entered = r; });
-  f.clock.t += 1000;
-  const polling = a.call('POST', '/api/providers/chatgpt/device/poll', { loginId: start.body.loginId });
-  await entered;
-  assert.equal((await a.call('DELETE', '/api/providers/chatgpt')).status, 200);
-  release();
-  assert.deepEqual((await polling).body, { state: 'cancelled' });
-  assert.equal(a.providers.some((p) => p.id === 'chatgpt-oauth'), false);
+  signIn(f, 'user-a');
+  await a.call('GET', '/api/providers');
+  a.projects[0].provider = 'chatgpt-oauth';
+  f.fake.state.down = true;
+  for (const p of ['/api/providers/chatgpt', '/api/providers/chatgpt-oauth']) {
+    const out = await a.call('DELETE', p);
+    assert.equal(out.status, 503, p);
+    assert.match(out.body.error, /busy/);
+    assert.equal(a.providers.some((x) => x.id === 'chatgpt-oauth'), true, 'no row without its tokens gone');
+    assert.equal(a.projects[0].provider, 'chatgpt-oauth');
+  }
+  f.fake.state.down = false;
+  assert.equal((await a.call('DELETE', '/api/providers/chatgpt-oauth')).status, 200);
   assert.equal(f.oauth.status('user-a').state, 'disconnected');
-});
-
-test('review: too many sign-in starts answer 429 through the route', async (t) => {
-  const f = fixture(t);
-  const a = f.routesFor('user-a');
-  for (let i = 0; i < 5; i++) assert.equal((await a.call('POST', '/api/providers/chatgpt/device')).status, 200);
-  const sixth = await a.call('POST', '/api/providers/chatgpt/device');
-  assert.equal(sixth.status, 429);
-  assert.match(sixth.body.error, /Too many ChatGPT sign-in attempts/);
 });
 
 // `env` is ignored by the routes since #1071; callers pass leftover switch values to prove it.
 function nativeStatusFixture({ env: _env, enabled = () => true } = {}) {
-  const calls = { status: 0, disconnect: 0, device: 0, poll: 0, cancel: 0, models: 0 };
+  const calls = { status: 0, disconnect: 0, models: 0 };
   const sent = [];
   const oauth = {
     status: () => { calls.status++; return { state: 'disconnected' }; },
-    disconnect: () => { calls.disconnect++; },
-    startDeviceLogin: async () => { calls.device++; return { state: 'sentinel-device' }; },
-    pollDeviceLogin: async () => { calls.poll++; return { state: 'pending' }; },
-    cancelDeviceLogin: () => { calls.cancel++; return true; },
-    listModels: async () => { calls.models++; return ['sentinel-model']; },
+    disconnect: async () => { calls.disconnect++; },
   };
   const routes = createProviderRoutes({
     json: (_res, status, body) => { sent.push({ status, body }); },
@@ -230,12 +204,14 @@ test('#1071: the status GET is the Rust front\'s, so Node always refuses it befo
   for (const [method, target, status] of [
     ['get', '/api/providers/chatgpt', 405], ['HEAD', '/api/providers/chatgpt', 405], ['OPTIONS', '/api/providers/chatgpt', 405],
     ['POST', '/api/providers/chatgpt', 405], ['GET', '/api/providers/chatgpt/', 405], ['GET', '/api/providers/chatgpt/sibling', 405],
-    ['GET', '/api/providers/chatgpt/models', 200], ['POST', '/api/providers/chatgpt/device', 200],
-    ['POST', '/api/providers/chatgpt/device/poll', 200], ['POST', '/api/providers/chatgpt/device/cancel', 200],
+    // sbstndalton/noevia#2190 round 5: the broker's, refused here.
+    ['GET', '/api/providers/chatgpt/models', 503], ['POST', '/api/providers/chatgpt/device', 503],
+    ['POST', '/api/providers/chatgpt/device/poll', 503], ['POST', '/api/providers/chatgpt/device/cancel', 503],
+    ['GET', '/api/providers/chatgpt/device', 405], ['DELETE', '/api/providers/chatgpt/models', 405],
     ['DELETE', '/api/providers/chatgpt', 200],
   ]) assert.equal((await owned.call(method, target)).status, status, `${method} ${target}`);
   assert.equal(await owned.call('GET', '/api/providers/chatgpt-sibling'), null);
-  assert.deepEqual(owned.calls, { status: 0, disconnect: 1, device: 1, poll: 1, cancel: 1, models: 1 });
+  assert.deepEqual(owned.calls, { status: 0, disconnect: 1, models: 0 });
 });
 
 test('native ChatGPT status: Node writes use current feature truth and device gate stays prior', async () => {
@@ -245,17 +221,18 @@ test('native ChatGPT status: Node writes use current feature truth and device ga
   const features = createFeatures({ env: {}, store, registry: { chatgptOAuth: REGISTRY.chatgptOAuth } });
   const f = nativeStatusFixture({ env: {}, enabled: () => features.enabled('chatgptOAuth') });
   rows.set('feature:chatgptOAuth', 'false');
-  assert.equal((await f.call('POST', '/api/providers/chatgpt/device')).status, 404);
-  assert.equal(f.calls.device, 0);
+  assert.equal((await f.call('DELETE', '/api/providers/chatgpt')).status, 404);
+  assert.equal(f.calls.disconnect, 0);
   rows.set('feature:chatgptOAuth', 'true');
-  assert.equal((await f.call('POST', '/api/providers/chatgpt/device')).status, 200);
+  assert.equal((await f.call('DELETE', '/api/providers/chatgpt')).status, 200);
   store.set = (key, value) => { rows.set(key, value); throw new Error('synthetic committed write then throw'); };
   assert.throws(() => features.set('chatgptOAuth', false, 'synthetic'), /committed write/);
-  assert.equal((await f.call('POST', '/api/providers/chatgpt/device')).status, 404);
-  assert.equal(f.calls.device, 1, 'a failed cache update cannot start a second Node sign-in');
+  assert.equal((await f.call('DELETE', '/api/providers/chatgpt')).status, 404);
+  assert.equal(f.calls.disconnect, 1, 'a failed cache update cannot run a second Node disconnect');
   store.get = () => { throw new Error('synthetic read failure'); };
-  await assert.rejects(() => f.call('POST', '/api/providers/chatgpt/device'), e => e.status === 503);
-  assert.equal(f.calls.device, 1);
+  await assert.rejects(() => f.call('DELETE', '/api/providers/chatgpt'), e => e.status === 503);
+  assert.equal(f.calls.disconnect, 1);
+  assert.equal((await f.call('POST', '/api/providers/chatgpt/device')).status, 503, 'the broker\'s routes are refused before feature reads');
   assert.equal((await f.call('GET', '/api/providers/chatgpt')).status, 503, 'the native handoff precedes feature read failures');
 
   // Actual request-auth collaborator methods, without starting index.cjs or reimplementing its gate.
