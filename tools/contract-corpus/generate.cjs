@@ -85,9 +85,9 @@ async function waitReady(base, child) {
 // their exchanges stay in the noevia-rs corpus recorded at its contracts/http/core.ref.
 const PROBES = [
   '/api/account/retention',
-  '/api/admin/decision-settings', '/api/admin/features', '/api/admin/mcp-directory', '/api/admin/offsite-backup', '/api/admin/web-address',
+  '/api/admin/decision-settings', '/api/admin/features', '/api/admin/mcp-directory', '/api/admin/web-address',
   '/api/auto-roles', '/api/chat-framing/preferences', '/api/chat-vault-mirror/preferences', '/api/code/active',
-  '/api/connectors', '/api/connectors/gdrive/policy', '/api/connectors/nextcloud/policy', '/api/diary', '/api/diary-connector', '/api/diary/storage-status',
+  '/api/connectors', '/api/connectors/nextcloud/policy', '/api/diary', '/api/diary-connector', '/api/diary/storage-status',
   '/api/mcp-keys/servers', '/api/mcp-oauth/servers', '/api/model-manager',
   '/api/models/autotune', '/api/models/autotune/settings', '/api/models/autotune/untuned', '/api/models/calibration', '/api/models/capabilities', '/api/models/evidence',
   '/api/models/hardware', '/api/models/inference-budget', '/api/models/installed', '/api/plugins/directory',
@@ -99,12 +99,12 @@ const PROBES = [
 
 // Validation-path probes for writes no scenario step makes: an empty or minimal body on the
 // throwaway data dir. Anything they would reach outside loopback is refused by net-guard.cjs.
-// Left out on purpose: offsite-backup run/copy/google connect, gdrive connect/backup-copy and
-// uploads (multipart), which start flows a probe cannot finish.
+// Left out on purpose: uploads (multipart), which start flows a probe cannot finish. The off-site
+// backup and the Google Drive connector writes are the Rust front's since #2190 round 7 (their
+// exchanges stay in the noevia-rs corpus recorded at its core.ref; Node refuses them now).
 const WRITE_PROBES = [
   ['POST', '/api/admin/decision-settings/test', {}], ['POST', '/api/admin/mcp-directory/custom/preview', {}],
-  ['POST', '/api/admin/offsite-backup/verify', {}],
-  ['POST', '/api/chat-framing/suggest', {}], ['POST', '/api/connectors/gdrive/disconnect', {}],
+  ['POST', '/api/chat-framing/suggest', {}],
   ['POST', '/api/integrations/storage/test', { kind: 'local' }], ['POST', '/api/models/estimate', {}],
   ['POST', '/api/models/presets/reload', {}], ['POST', '/api/models/autotune/cancel', {}], ['POST', '/api/models/calibration/cancel', {}],
   ['POST', '/api/providers/test', {}],

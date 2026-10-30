@@ -85,23 +85,23 @@ test('every status id the server sends has a catalogue key in every locale', () 
 });
 
 test('every Drive copy message id the server names has a catalogue key with the params it sends', () => {
-  const gdrive = read('server/gdrive.cjs');
-  const seen = new Map();
-  for (const m of gdrive.matchAll(/fail\([^\n]*?, (?:\d{3}|r\.status === 404 \? 404 : 502), (?:r\.status === 404 \? undefined : )?'(\w+)'(?:, (\{[^}]*\}))?\)/g)) seen.set(m[1], m[2] || '');
+  // The Rust front sends these (noevia-rs offsite_mirror.rs and gdrive.rs; its test reads the same file);
+  // Core's gdrive-broker.cjs sends driveAnswered.
+  const shared = JSON.parse(read('server/gdrive-messages.v1.json'));
+  const seen = new Map(shared.messages.map((m) => [m.id, m]));
   assert.deepEqual([...seen.keys()].sort(), ['differentStore', 'driveAnswered', 'fileDiffers', 'staleShare', 'storeEmpty', 'tooManyStale', 'waitingFirstBackup']);
-  for (const [id, params] of seen) for (const l of ['en-GB', ...Object.keys(FILES)]) {
+  for (const [id, m] of seen) for (const l of ['en-GB', ...Object.keys(FILES)]) {
     const text = core.translate(l, `gdrive.msg.${id}`);
     assert.notEqual(text, `gdrive.msg.${id}`, `${l} gdrive.msg.${id}`);
-    for (const name of (params.match(/\b(\w+):/g) || []).map((s) => s.slice(0, -1))) assert.ok(text.includes(`{${name}}`) || id === 'staleShare' && ['stale', 'total'].includes(name) || id === 'tooManyStale' && name === 'max', `${l} ${id} uses {${name}}`);
+    for (const name of m.params) assert.ok(text.includes(`{${name}}`), `${l} ${id} uses {${name}}`);
   }
   for (const id of ['didNotFinish', 'stale']) for (const l of ['en-GB', ...Object.keys(FILES)]) assert.ok(has(l, `gdrive.msg.${id}`), `${l} gdrive.msg.${id}`);
   const de = tFor('de-DE');
   assert.equal(de('gdrive.msg.staleShare', { stale: 9, total: 20 }), 'Kopiert, aber 9 der 20 Dateien auf Drive fehlen im lokalen Speicher; zur Sicherheit wurde nichts entfernt.');
   assert.match(tFor('fr-FR')('gdrive.msg.driveAnswered', { status: 502 }), /502/);
   // The English catalogue is the English the server sends.
-  assert.ok(gdrive.includes(core.translate('en-GB', 'gdrive.msg.storeEmpty')));
-  assert.ok(gdrive.includes(core.translate('en-GB', 'gdrive.msg.waitingFirstBackup')));
-  assert.ok(gdrive.includes(core.translate('en-GB', 'gdrive.msg.differentStore')));
+  for (const m of shared.messages) assert.equal(core.translate('en-GB', `gdrive.msg.${m.id}`), m.english, m.id);
+  assert.ok(read('server/gdrive-broker.cjs').includes("messageId: 'driveAnswered'"), 'the Node side names driveAnswered');
 });
 
 test('decision-service reasons, test messages and refusals have a key in every locale, and the English is the server’s', () => {

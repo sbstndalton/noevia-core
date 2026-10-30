@@ -170,18 +170,14 @@ const accountRoutes = require('./routes/account.cjs').createAccountRoutes({ json
 // Settings → Data → Import conversations: the POST is the Rust front's (#2191 round 4,
 // rust-conversation-import.cjs); this mount keeps the other methods' 405.
 const importRoutes = require('./routes/import.cjs').createImportRoutes({ json });
-const offsiteBackup = require('./offsite-service.cjs').createOffsiteService({ features, dataDir: DATA_DIR, log: (event) => console.log('[backup]', JSON.stringify(event)) });
-const offsiteRoutes = require('./routes/offsite-backup.cjs').createOffsiteRoutes({ service: offsiteBackup, json });
-// Google Drive as a chat connector: each account's own connection, per-tool allow/ask/block.
-const toolPolicy = require('./tool-policy.cjs').createToolPolicy({ db: authService.db, audit: (action, actor, detail) => authService.audit(action, actor, actor, detail) });
-const driveAccounts = require('./drive-accounts.cjs').createDriveAccounts({
-  backupDrive: offsiteBackup.drive, backupUsable: () => offsiteBackup.driveUsable(), dataDir: DATA_DIR,
-  userKey: () => secretStore.derive('google-drive-user'), userKeyPrevious: () => secretStore.derivePrevious('google-drive-user'),
-  makeDrive: ({ tokenFile, backupKey, previousBackupKey }) => require('./gdrive.cjs').createGoogleDrive({
-    clientId: String(process.env.GOOGLE_OAUTH_CLIENT_ID || '').trim(), clientSecret: String(process.env.GOOGLE_OAUTH_CLIENT_SECRET || '').trim(),
-    tokenFile, backupKey, previousBackupKey, oauthBase: process.env.GOOGLE_OAUTH_BASE_URL || undefined, apiBase: process.env.GOOGLE_DRIVE_API_BASE_URL || undefined,
-    uploadBase: process.env.GOOGLE_DRIVE_UPLOAD_BASE_URL || undefined, log: (event) => console.log('[gdrive]', JSON.stringify(event)),
-  }),
+// Google Drive as a chat connector (sbstndalton/noevia#2190 round 7): the Rust front is the token authority
+// (rust-google-drive.cjs) and the off-site backup (rust-offsite-backup.cjs); this process asks it for access
+// tokens (gdrive-broker.cjs) and holds no Google credential. Per-account, per-tool allow/ask/block is a table
+// only the front writes; mode() reads it here on every call.
+const toolPolicy = require('./tool-policy.cjs').createToolPolicy({ db: authService.db });
+const driveAccounts = require('./gdrive-broker.cjs').createDriveAccounts({
+  broker: PROJECT_STORE, dataDir: DATA_DIR,
+  apiBase: process.env.GOOGLE_DRIVE_API_BASE_URL || undefined, uploadBase: process.env.GOOGLE_DRIVE_UPLOAD_BASE_URL || undefined,
 });
 const webAddressRoutes = require('./routes/web-address.cjs').createWebAddressRoutes({ auth: authService, json });
 const davConfig = require('./dav-settings.cjs').configuration(process.env, authService.origin);
@@ -513,14 +509,20 @@ const {
 });
 // The per-turn permitted-tools view is cached for 30 s; every write that changes what it shows
 // (a tool permission, a project's toolbox selection) clears it so the picker is never stale (#796).
-const permittedToolsCache = require('./toolboxes-permitted.cjs').createTtlCache({ ttlMs: 30000 });
+// sbstndalton/noevia#2190 round 7: the Rust front writes tool_policies (rust-google-drive.cjs), so no Node
+// code path sees a write to clear this cache. It also empties itself when the table's content
+// fingerprint changes (toolboxes-permitted.cjs createFingerprintedCache, shared-reread.cjs): a tool permission,
+// or a Drive sign-in completing or disconnecting (the broker's state file moves), whichever process caused it
+// (#796, #831, #845).
+const permittedToolsCache = require('./toolboxes-permitted.cjs').createFingerprintedCache({ ttlMs: 30000, fingerprint: () => `${toolPolicy.fingerprint()}|${driveAccounts.fingerprint()}` });
 const { nextcloudStorageConnected } = require('./tools-mode.cjs');
 // #1550: whether Automatic may add a box for this account (a Nextcloud box needs its own usable connection).
 const automaticToolsReady = require('./tools-mode.cjs').createAutomaticToolsReady({
   getStorage: (userId) => authService.getStorage(userId, true), originAllowed: (url) => mcpCredentialOriginAllowed(url) });
 const connectorRoutes = require('./routes/connectors.cjs').createConnectorRoutes({
   onPolicyChange: () => permittedToolsCache.clear(),
-  accounts: driveAccounts, driveTools, policy: toolPolicy, offsite: offsiteBackup, isWrite: (name) => isWriteTool(name), json, readBody: (req) => readJson(req),
+  accounts: driveAccounts, policy: toolPolicy, toolPolicy: { set: (userId, tools, writes, mode) => PROJECT_STORE.toolPolicySet(userId, tools, writes, mode) },
+  isWrite: (name) => isWriteTool(name), json, readBody: (req) => readJson(req),
   // Nextcloud's tools ride on the account's storage connection, so this only reports what that
   // connection allows and owns the per-tool permissions.
   nextcloud: {
@@ -1173,8 +1175,9 @@ const authRoutes = require('./routes/auth.cjs').createAuthRoutes({
   json, readJson, authService, workspaceStore, driveAccounts, fetchJson, DIARY_BASE, DIARY_TOKEN, diaryTenantHeaders: diary.tenantHeaders,
   mcpOAuth, directoryMcp, chatgptOAuth,
   // POST /api/admin/secrets/rotate (CSRF-checked by the router like every signed-in POST).
-  // The provider files are the front's: it re-seals them first (rust-providers-reseal.cjs), awaited.
-  rotateSecrets: (actorId) => require('./secrets-rotate.cjs').runRotation({ secrets: secretStore, db: authService.db, dataDir: DATA_DIR, audit: authService.audit, actorId, resealProviders: () => require('./rust-providers-reseal.cjs').resealProviderKeys(PROJECT_STORE) }),
+  // The provider files and the Google Drive token files are the front's: it re-seals both first, awaited
+  // (providers: a throw stops the rotation; Drive: soft), before the rest is rotated here.
+  rotateSecrets: (actorId) => require('./secrets-rotate.cjs').runRotation({ secrets: secretStore, db: authService.db, dataDir: DATA_DIR, audit: authService.audit, actorId, resealProviders: () => require('./rust-providers-reseal.cjs').resealProviderKeys(PROJECT_STORE), gdriveReseal: () => PROJECT_STORE.gdriveReseal() }),
 });
 // The user's own storage connection is the Rust front's in full (reading, browsing, the folder write,
 // the test, the Nextcloud sign-in and the save, #1071/sbstndalton/noevia#2190): routes/storage.cjs
@@ -1307,6 +1310,8 @@ async function handleRequestInner(req, res) {
   if (require('./rust-provider-models.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   if (require('./rust-providers.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   if (require('./rust-vault-mirror-preferences.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
+  if (require('./rust-google-drive.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
+  if (require('./rust-offsite-backup.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   await readyFeatures();
   const preAuth = requestAuth.authenticate(req);
   // accountRole: a device token acts as a member, but its account's workspace is the same one.
@@ -1373,7 +1378,6 @@ async function handleRequestScoped(req, res) {
     if (authn && await exportRoutes(req, res, { path: p, authn })) return;
     if (authn && await importRoutes(req, res, { path: p, authn })) return;
     if (authn && await accountRoutes(req, res, { path: p, authn })) return;
-    if (authn && await offsiteRoutes(req, res, { path: p, authn })) return;
     if (authn && await connectorRoutes(req, res, { path: p, authn })) return;
     if (await mcpDirectoryRoutes(req, res, { path: p, authn })) return;
     if (authn && await webAddressRoutes(req, res, { path: p, authn })) return;
@@ -1549,7 +1553,6 @@ if (require.main === module) {
     internalServer.headersTimeout = 15000;
   }
 
-  offsiteBackup.schedule();
   const readStorage = (userId) => authService.getStorage(userId, true);
   require('./diary-backup-worker.cjs').startDiaryBackupWorker({
     users: () => authService.listUsers(),
