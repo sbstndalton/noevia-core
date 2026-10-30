@@ -176,6 +176,13 @@ const FRONT_TABLES = Object.freeze({
     code: require('./rust-storage-connection.cjs').ROUTE_REFUSAL.code,
     allowed: require('./rust-storage-connection.cjs').RESEAL_SQL,
   }),
+  // sbstndalton/noevia#2202: the MCP credential broker owns these three tables outright; the
+  // secrets rotation re-seals them through it, so no Node statement is allowed (allowed: null).
+  ...Object.fromEntries(require('./rust-mcp-credentials.cjs').TABLES.map((table) => [table, Object.freeze({
+    message: require('./rust-mcp-credentials.cjs').ROUTE_REFUSAL.error,
+    code: require('./rust-mcp-credentials.cjs').ROUTE_REFUSAL.code,
+    allowed: null,
+  })])),
   // sbstndalton/noevia#2190 round 5: the ChatGPT token broker (rust-chatgpt-oauth.cjs).
   chatgpt_oauth_tokens: Object.freeze({
     message: require('./rust-chatgpt-oauth.cjs').ROUTE_REFUSAL.error,

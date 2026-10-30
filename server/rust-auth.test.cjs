@@ -199,7 +199,7 @@ test('secrets-rotate.cjs\'s separate database handle writes no owned table', () 
   const src = require('node:fs').readFileSync(require('node:path').join(__dirname, 'secrets-rotate.cjs'), 'utf8');
   // Every table the rotation names, and every statement it runs, are checked against the owned list.
   const named = [...src.matchAll(/sqlTable\(db, '([a-z_]+)'/g)].map((m) => m[1]);
-  assert.ok(named.length >= 6);
+  assert.ok(named.length >= 3, 'storage, the shared MCP server keys and ChatGPT (the MCP credential tables are the front\'s)');
   for (const t of named) assert.ok(!OWNED_TABLES.has(t), t);
   for (const m of src.matchAll(/prepare\(([`'"])((?:(?!\1)[\s\S])*)\1/g)) {
     for (const target of writeTargets(m[2])) assert.ok(!OWNED_TABLES.has(target.table) || target.table === 'audit_events', m[2]);
@@ -337,7 +337,7 @@ test('settings: an old "off" option guards anyway, and the front\'s keys stay re
 });
 test('sbstndalton/noevia#2190 round 4: storage_connections is refused exempt or not, but for the exact reseal', () => {
   const { RESEAL_SQL, ROUTE_REFUSAL } = require('./rust-storage-connection.cjs');
-  assert.deepEqual(Object.keys(FRONT_TABLES), ['storage_connections', 'chatgpt_oauth_tokens']);
+  assert.deepEqual(Object.keys(FRONT_TABLES), ['storage_connections', 'mcp_oauth_tokens', 'mcp_oauth_clients', 'directory_mcp_user_keys', 'chatgpt_oauth_tokens']);
   assert.equal(FRONT_TABLES.storage_connections.code, ROUTE_REFUSAL.code);
   const guard = on();
   const db = guard.install(fakeDb());

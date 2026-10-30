@@ -54,8 +54,10 @@ function createCredentialOriginCheck(origins) {
  * @param {object[]} deps.manifest       curated boxes (mcp-toolbox-manifest.cjs)
  * @param {object} deps.mcp              the protocol client: connect, listTools, callTool, disconnect, convertTool, readOnlyHint, resultToText
  * @param {(opts) => object[]} deps.bindBoxes   mcp-boxes.cjs
- * @param {object} deps.directoryMcp     asServers, boxFor, headersFor, userHeadersFor, hasUserKey
- * @param {object} deps.mcpOAuth         connected, tokenFor
+ * @param {object} deps.directoryMcp     asServers, boxFor, headersFor
+ * @param {object} deps.mcpOAuth         the OAuth broker (rust-mcp-credentials.cjs): connected, tokenFor, session, reject
+ * @param {object} [deps.mcpKeys]        the keys broker: hasKey (sync, from its published readiness) and headers (async,
+ *   one call's worth; never cached here). Without it no account has a key (fails closed).
  * @param {(url) => Promise<boolean>} deps.directoryUrlAllowed
  * @param {(baseUrl) => boolean} deps.credentialOriginAllowed
  * @param {{ getStore() }} deps.scope    the request scope: { workspace:{userId}, authn:{user}, internalCallProject }
@@ -82,7 +84,7 @@ function createCredentialOriginCheck(origins) {
  * @param {{ log, warn }} [deps.logger]
  */
 function createMcpWiring({
-  servers, manifest = [], mcp, bindBoxes, directoryMcp, mcpOAuth, directoryUrlAllowed, credentialOriginAllowed,
+  servers, manifest = [], mcp, bindBoxes, directoryMcp, mcpOAuth, mcpKeys = { hasKey: () => false, headers: async () => null }, directoryUrlAllowed, credentialOriginAllowed,
   scope, storageFor, isWriteTool, internal, internalKey, reduceToolResult, resultCap = 8000,
   env = process.env, fetch = globalThis.fetch, publicFetch = null, discoveryTtlMs = 10 * 60 * 1000,
   discoveryFailTtlMs = Number(process.env.MCP_DISCOVERY_FAIL_TTL_MS || 30 * 1000), logger = console,
@@ -95,6 +97,12 @@ function createMcpWiring({
 }) {
   const rateLimit = require('./tool-rate-limit.cjs');
   const PER_USER_AUTH = new Set(['nextcloud', 'personal', 'oauth']);
+  /** An access token for one call: the broker's session ({ accessToken, generation }), or null. */
+  const oauthSessionFor = async (userId, serverId, rejected = null) => {
+    if (typeof mcpOAuth.session === 'function') return mcpOAuth.session(userId, serverId, rejected);
+    const token = await mcpOAuth.tokenFor(userId, serverId);
+    return token ? { accessToken: token, generation: '' } : null;
+  };
   const MCP_SERVERS = servers;
   if (publicFetch && typeof mcp.withFetch !== 'function') throw new TypeError('publicFetch needs an MCP client with withFetch');
   const publicMcp = publicFetch ? mcp.withFetch(publicFetch) : null;
@@ -111,7 +119,7 @@ function createMcpWiring({
   function accountReady(userId, serverId) {
     const sv = MCP_SERVERS.find((x) => x.id === serverId);
     if (!sv) return false;
-    return sv.auth === 'oauth' ? mcpOAuth.connected(userId, serverId) : sv.auth === 'personal' ? directoryMcp.hasUserKey(userId, serverId) : true;
+    return sv.auth === 'oauth' ? mcpOAuth.connected(userId, serverId) : sv.auth === 'personal' ? mcpKeys.hasKey(userId, serverId) : true;
   }
   /** An unauthenticated initialize: tells us whether a server wants OAuth (401 + WWW-Authenticate). */
   async function probeMcpAuth(url) {
@@ -273,8 +281,8 @@ function createMcpWiring({
       // The tool list is read with the key of the administrator who added the server. A disabled
       // administrator's key is not trusted for discovery, even if it is still stored.
       if (server.addedBy && isUserDisabled(server.addedBy)) throw new Error('waiting for an active administrator to add a key');
-      headers = server.pendingHeaders || directoryMcp.userHeadersFor(server.addedBy, server.id);
-      if (!Object.keys(headers).length) throw new Error('waiting for the administrator who added it to enter their key');
+      headers = server.pendingHeaders || await mcpKeys.headers(server.addedBy, server.id);
+      if (!headers || !Object.keys(headers).length) throw new Error('waiting for the administrator who added it to enter their key');
     }
     if (server.auth === 'oauth') {
       // The tool list is read with the sign-in of the administrator who added the server. A
@@ -457,15 +465,19 @@ function createMcpWiring({
     // somebody else's service, so only a server the operator marked
     // auth=nextcloud gets it — and then only if the origin allowlist agrees.
     let auth = null;
+    // The signed-in account's sign-in session, kept to retry once if the server refuses its token.
+    let oauthSession = null;
+    const callerId = scope.getStore()?.authn?.user?.id;
     if (server.auth === 'personal') {
-      // Each account's own key, never another's.
-      auth = directoryMcp.userHeadersFor(scope.getStore()?.authn?.user?.id, server.id);
-      if (!Object.keys(auth).length) return `ERROR: ${name} needs your own key for ${server.title || 'this server'}: Plugins → Connected → Add key.`;
+      // Each account's own key, never another's: asked of the broker for this call only.
+      auth = await mcpKeys.headers(callerId, server.id);
+      if (!auth || !Object.keys(auth).length) return `ERROR: ${name} needs your own key for ${server.title || 'this server'}: Plugins → Connected → Add key.`;
     } else if (server.auth === 'oauth') {
-      // Each account's own sign-in, never another's.
-      const token = await mcpOAuth.tokenFor(scope.getStore()?.authn?.user?.id, server.id);
-      if (!token) return `ERROR: ${name} needs you to sign in to ${server.title || 'this server'} first: Plugins → Connected → Sign in.`;
-      auth = { Authorization: `Bearer ${token}` };
+      // Each account's own sign-in, never another's: an access token for this call only. The refresh
+      // token stays with the broker.
+      oauthSession = await oauthSessionFor(callerId, server.id);
+      if (!oauthSession) return `ERROR: ${name} needs you to sign in to ${server.title || 'this server'} first: Plugins → Connected → Sign in.`;
+      auth = { Authorization: `Bearer ${oauthSession.accessToken}` };
     } else if (server.auth === 'directory') {
       auth = directoryMcp.headersFor(server.id);
     } else if (server.auth === 'bearer') {
@@ -491,14 +503,35 @@ function createMcpWiring({
     if (coolingMs > 0) return rateLimit.coolingDownText(name, coolingMs);
     try {
       const transport = transportFor(server);
-      const { session } = await transport.connect(server.url, auth, undefined, signal);
+      const callOnce = async (headers) => {
+        const { session } = await transport.connect(server.url, headers, undefined, signal);
+        try {
+          return await transport.callTool(server.url, session, name, args, headers, undefined, signal);
+        } finally {
+          // Close it whatever happened. Nothing used to, so every tool call left a
+          // session behind on the server for the life of the process.
+          await transport.disconnect(server.url, session, headers, undefined, signal);
+        }
+      };
       let result;
       try {
-        result = await transport.callTool(server.url, session, name, args, auth, undefined, signal);
-      } finally {
-        // Close it whatever happened. Nothing used to, so every tool call left a
-        // session behind on the server for the life of the process.
-        await transport.disconnect(server.url, session, auth, undefined, signal);
+        result = await callOnce(auth);
+      } catch (err) {
+        // A server that refuses the token it was just given: ask the broker for one past it (it
+        // refreshes only if that token is still the stored one) and try once more. A second refusal
+        // marks THAT sign-in as needing a new one, so the account is told to sign in again.
+        if (!(oauthSession && err && err.httpStatus === 401)) throw err;
+        const next = await oauthSessionFor(callerId, server.id, oauthSession.accessToken);
+        if (!next || next.accessToken === oauthSession.accessToken) {
+          if (typeof mcpOAuth.reject === 'function') await mcpOAuth.reject(callerId, server.id, oauthSession.generation).catch(() => false);
+          throw err;
+        }
+        oauthSession = next;
+        try { result = await callOnce({ Authorization: `Bearer ${next.accessToken}` }); }
+        catch (again) {
+          if (again && again.httpStatus === 401 && typeof mcpOAuth.reject === 'function') await mcpOAuth.reject(callerId, server.id, next.generation).catch(() => false);
+          throw again;
+        }
       }
       const text = mcp.resultToText(result);
       if (result && result.isError && rateLimit.isRateLimitedText(text)) {

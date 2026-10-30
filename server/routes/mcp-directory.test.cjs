@@ -22,13 +22,11 @@ function build(overrides = {}) {
     servers, mcpState: { servers: new Map([['dir-a', { toolCount: 3, error: null }]]), tools: new Map(), boxes: [{ id: 'dir-a', server: 'dir-a', directory: true, tools: [{ function: { name: 'find_note', description: 'Find a note', parameters: { secret: 'never expose' } } }] }] },
     directoryMcp: {
       list: () => [{ id: 'dir-a', title: 'A', url: 'https://a.example/mcp', oauth: true, personal: true, declaredHeaders: [{ name: 'X-Key', required: true, secret: true }] }],
-      hasUserKey: (uid, id) => uid === 'u1' && id === 'dir-a',
-      setUserKey: (...a) => calls.push(['setUserKey', ...a]),
-      clearUserKey: (...a) => calls.push(['clearUserKey', ...a]),
       remove: (...a) => calls.push(['remove', ...a]),
       idFor: (x) => `dir-${x}`,
     },
-    mcpOAuth: { connected: (uid) => uid === 'u1', clientInfo: () => null, disconnect: (...a) => calls.push(['disconnect', ...a]), forget: (...a) => calls.push(['forget', ...a]) },
+    mcpOAuth: { clientInfo: async () => null, forget: async (...a) => calls.push(['forget', ...a]) },
+    mcpKeys: { set: async (...a) => calls.push(['keySet', ...a]) },
     discoverOneServer: async () => new Map([['t', {}]]),
     discoverMcpTools: async () => calls.push(['discover']),
     probeMcpAuth: async () => ({ status: 0 }),
@@ -44,13 +42,6 @@ const admin = { user: { id: 'adm', role: 'admin' } };
 test('paths it does not own are left alone', async () => {
   const { routes } = build();
   assert.equal(await routes(req('GET'), fakeRes(), { path: '/api/projects', authn: member }), false);
-});
-
-test('a member sees the servers that want their own key, and whether they gave one', async () => {
-  const { routes } = build();
-  const res = fakeRes();
-  assert.equal(await routes(req('GET'), res, { path: '/api/mcp-keys/servers', authn: member }), true);
-  assert.deepEqual(res.out.body, { servers: [{ id: 'dir-a', title: 'A', headers: [{ name: 'X-Key', required: true, secret: true }], hasKey: true }] });
 });
 
 test('admin tool details are bounded to the server-bound toolbox', async () => {
@@ -163,31 +154,6 @@ test('custom preview reports sign-in requirement without adding a server', async
   assert.deepEqual(calls, []);
 });
 
-test('a personal key is checked against the server before it is stored, and is this account\'s only', async () => {
-  const { routes, calls } = build();
-  const res = fakeRes();
-  await routes(req('PUT', { headers: { 'X-Key': 'abc' } }), res, { path: '/api/mcp-keys/dir-a', authn: member });
-  assert.equal(res.out.code, 200);
-  assert.deepEqual(calls, [['setUserKey', 'u1', 'dir-a', { 'X-Key': 'abc' }]]);
-
-  const rejected = build({ discoverOneServer: async () => { throw new Error('401'); } });
-  const r2 = fakeRes();
-  await rejected.routes(req('PUT', { headers: { 'X-Key': 'bad' } }), r2, { path: '/api/mcp-keys/dir-a', authn: member });
-  assert.equal(r2.out.code, 422);
-  assert.deepEqual(rejected.calls, [], 'a refused key is never stored');
-
-  const r3 = fakeRes();
-  await routes(req('PUT', { headers: {} }), r3, { path: '/api/mcp-keys/nope', authn: member });
-  assert.equal(r3.out.code, 404);
-});
-
-test('sign-in servers list this account\'s own connection state', async () => {
-  const { routes } = build();
-  const res = fakeRes();
-  await routes(req('GET'), res, { path: '/api/mcp-oauth/servers', authn: { user: { id: 'u2', role: 'member' } } });
-  assert.deepEqual(res.out.body, { servers: [{ id: 'dir-a', title: 'A', connected: false, needsReauth: false }] });
-});
-
 test('the admin directory refuses members and answers admins', async () => {
   const { routes, calls } = build();
   const res = fakeRes();
@@ -289,34 +255,65 @@ test('#796: a body that is not a JSON object is a 400 on every admin directory w
   assert.deepEqual(calls, [], 'nothing was added or changed');
 });
 
-test('#831: an OAuth sign-in finishing and a sign-out clear the permitted-tools view; a failed sign-in does not', async () => {
-  let cleared = 0;
-  const callback = (finish) => {
-    const { routes } = build({ onToolsChange: () => { cleared += 1; }, mcpOAuth: { finish, disconnect() {}, connected: () => true, clientInfo: () => null } });
-    const res = { writeHead() {}, end() {} };
-    return routes({ method: 'GET', url: '/api/mcp-oauth/callback?state=s&code=c' }, res, { path: '/api/mcp-oauth/callback', authn: member });
-  };
-  await callback(async () => ({ purpose: 'connect' }));
-  assert.equal(cleared, 1, 'the sign-in callback clears it');
-  await callback(async () => { throw new Error('bad state'); });
-  assert.equal(cleared, 1, 'a failed sign-in changed nothing');
-  const { routes } = build({ onToolsChange: () => { cleared += 1; } });
-  const res = fakeRes();
-  await routes(req('DELETE'), res, { path: '/api/mcp-oauth/dir-a', authn: member });
-  assert.equal(res.out.code, 200);
-  assert.equal(cleared, 2, 'signing out clears it');
+// sbstndalton/noevia#2202: each account's own key and sign-in (and the sign-in callback) are the Rust
+// front's; this module answers none of them, whatever the method, and index.cjs refuses them before
+// authentication (rust-mcp-credentials.cjs).
+test('the account routes the Rust front owns are not answered here', async () => {
+  const { routes, calls } = build();
+  for (const [method, path] of [['GET', '/api/mcp-keys/servers'], ['PUT', '/api/mcp-keys/dir-a'], ['DELETE', '/api/mcp-keys/dir-a'], ['GET', '/api/mcp-oauth/servers'],
+    ['POST', '/api/mcp-oauth/dir-a/connect'], ['DELETE', '/api/mcp-oauth/dir-a'], ['GET', '/api/mcp-oauth/callback']]) {
+    const res = fakeRes();
+    assert.equal(await routes(req(method, {}), res, { path, authn: member }), false, `${method} ${path}`);
+    assert.equal(res.out.code, null);
+  }
+  assert.deepEqual(calls, []);
 });
 
-test('#845: an OAuth sign-in whose rediscovery throws still clears the permitted-tools view (the token is already stored)', async () => {
-  let cleared = 0;
-  let body = '';
-  const { routes } = build({
-    onToolsChange: () => { cleared += 1; },
-    discoverMcpTools: async () => { throw new Error('discovery down'); },
-    mcpOAuth: { finish: async () => ({ purpose: 'connect' }), disconnect() {}, connected: () => true, clientInfo: () => null },
+test('describing a sign-in server asks the broker for its app, without its secret', async () => {
+  const { routes } = build({ mcpOAuth: { clientInfo: async (id) => ({ manual: true, clientId: `id-of-${id}`, hasSecret: true, redirectUri: 'https://noevia.example/api/mcp-oauth/callback', issuer: 'https://as.example' }), forget: async () => {} } });
+  const res = fakeRes();
+  await routes(req('GET'), res, { path: '/api/admin/mcp-directory', authn: admin });
+  assert.deepEqual(res.out.body.servers[0].oauthClient, { manual: true, clientId: 'id-of-dir-a', hasSecret: true, redirectUri: 'https://noevia.example/api/mcp-oauth/callback', issuer: 'https://as.example' });
+});
+
+test('removing a server asks the broker to forget it first, and a broker that cannot keeps the server', async () => {
+  const { routes, calls } = build({ mcpOAuth: { clientInfo: async () => null, forget: async () => { throw Object.assign(new Error('MCP sign-ins and keys are unavailable right now. Try again in a moment.'), { status: 503 }); } } });
+  const res = fakeRes();
+  await routes(req('DELETE'), res, { path: '/api/admin/mcp-directory/dir-a', authn: admin });
+  assert.equal(res.out.code, 503);
+  assert.match(res.out.body.error, /unavailable right now/);
+  assert.deepEqual(calls, [], 'nothing was removed, synced or rediscovered');
+});
+
+test('a personal server\'s adding administrator keeps the key they typed, through the broker', async () => {
+  const calls = [];
+  const row = { id: 'dir-custom', title: 'Custom', registryName: 'url:https://external.example/mcp', personal: true };
+  const mcpState = { servers: new Map(), boxes: [] };
+  const functionTool = { name: 'search', description: 'Find', parameters: {} };
+  const make = (keySet) => build({
+    directoryMcp: { list: () => [row], idFor: () => row.id, add: (entry) => { calls.push(['add', entry.personal]); return row; }, remove: () => calls.push('remove') },
+    mcpState, mcpKeys: { set: keySet },
+    mcpOAuth: { clientInfo: async () => null, forget: async (id) => { calls.push(['forget', id]); } },
+    discoverOneServer: async () => new Map([['search', { tool: { function: functionTool } }]]),
+    syncDirectoryServers: () => calls.push('sync'),
+    discoverMcpTools: async () => { calls.push('rediscover'); mcpState.boxes = [{ id: row.id, server: row.id, directory: true, tools: [{ function: functionTool }] }]; },
   });
-  const res = { writeHead() {}, end(b) { body = String(b); } };
-  await routes({ method: 'GET', url: '/api/mcp-oauth/callback?state=s&code=c' }, res, { path: '/api/mcp-oauth/callback', authn: member });
-  assert.equal(cleared, 1);
-  assert.match(body, /discovery down/);
+  const body = { title: 'Custom', url: 'https://external.example/mcp', headerName: 'X-Key', headerValue: 'admin-key', keyMode: 'personal' };
+  const post = async (routes, extra = {}) => {
+    const preview = fakeRes();
+    await routes(req('POST', body), preview, { path: '/api/admin/mcp-directory/custom/preview', authn: admin });
+    const res = fakeRes();
+    await routes(req('POST', { ...body, previewToken: preview.out.body.previewToken, ...extra }), res, { path: '/api/admin/mcp-directory/custom', authn: admin });
+    return res;
+  };
+  const ok = make(async (...a) => { calls.push(['keySet', ...a]); });
+  const res = await post(ok.routes);
+  assert.equal(res.out.code, 201);
+  assert.deepEqual(calls.slice(0, 3), [['add', true], ['keySet', 'adm', 'dir-custom', { 'X-Key': 'admin-key' }], 'sync'], 'stored before the tool list is read with it');
+  // A broker that cannot store it: no server is left that nobody can list tools of.
+  calls.length = 0;
+  const failing = make(async () => { throw Object.assign(new Error('unavailable'), { status: 503 }); });
+  const bad = await post(failing.routes);
+  assert.equal(bad.out.code, 503);
+  assert.deepEqual(calls, [['add', true], 'remove', ['forget', 'dir-custom'], 'sync']);
 });

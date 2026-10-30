@@ -31,6 +31,10 @@ const CHATGPT_WAIT_MS = 45000;
 // sbstndalton/noevia#2190 round 6: the provider keys' re-seal walks every account's providers.json
 // under its lock, so it may wait for a busy one.
 const RESEAL_WAIT_MS = 120000;
+// sbstndalton/noevia#2202: an MCP session may refresh at the sign-in service (10 s); a start may
+// discover and register (up to five 8 s requests).
+const MCP_WAIT_MS = 45000;
+const MCP_START_WAIT_MS = 120000;
 const REPLY_CAP = 2 * 32 * 1024 * 1024 + 64 * 1024;
 // providers.json (sbstndalton/noevia#2190 round 6) is the account's private provider rows: the Rust
 // front's routes are its writer; Node saves only its seal-on-load migration here.
@@ -299,6 +303,57 @@ function createClient({ port, token, fetchImpl = globalThis.fetch, timeoutMs = T
       const { status, body } = await call('chatgpt/forget', { user }, CHATGPT_WAIT_MS);
       return status === 200 && body?.ok === true ? { ok: true } : chatgptRefusal(status, body);
     },
+    /** sbstndalton/noevia#2202: the MCP credential broker (the Rust front, mcp_routes.rs). Each answers
+     *  { ok: true, ... } or { ok: false, status, error, code? } (the broker's refusal, written for
+     *  people). A session may refresh at the sign-in service, a start may discover and register at
+     *  it, and a key is only ever handed out for the one call asking.
+     *  `mcpSession` hands out an access token, never a refresh token. */
+    async mcpSession(user, server, rejected = null) {
+      const { status, body } = await call('mcp/session', { user, server, ...(rejected ? { rejected: String(rejected) } : {}) }, MCP_WAIT_MS);
+      if (status === 200 && body && typeof body.accessToken === 'string' && typeof body.generation === 'string') {
+        return { ok: true, session: { accessToken: body.accessToken, expiresAt: Number.isFinite(body.expiresAt) ? body.expiresAt : null, generation: body.generation } };
+      }
+      return mcpRefusal(status, body);
+    },
+    async mcpKey(user, server) {
+      const { status, body } = await call('mcp/key', { user, server }, MCP_WAIT_MS);
+      if (status === 200 && body && body.headers && typeof body.headers === 'object' && !Array.isArray(body.headers)) return { ok: true, headers: body.headers };
+      return mcpRefusal(status, body);
+    },
+    async mcpReject(user, server, generation) {
+      const { status, body } = await call('mcp/reject', { user, server, generation: String(generation || '') }, MCP_WAIT_MS);
+      return status === 200 && body ? { ok: true, marked: body.marked === true } : mcpRefusal(status, body);
+    },
+    async mcpStart({ user, server, serverUrl, challenge = '', purpose = 'connect' }) {
+      const { status, body } = await call('mcp/start', { user, server, serverUrl, challenge: String(challenge || ''), purpose }, MCP_START_WAIT_MS);
+      return status === 200 && body && typeof body.signIn === 'string' ? { ok: true, signIn: body.signIn } : mcpRefusal(status, body);
+    },
+    async mcpSetClient({ server, serverUrl, clientId, clientSecret = '', challenge = '' }) {
+      const { status, body } = await call('mcp/client', { server, serverUrl, clientId: String(clientId ?? ''), clientSecret: String(clientSecret ?? ''), challenge: String(challenge || '') }, MCP_START_WAIT_MS);
+      return status === 200 && body?.ok === true ? { ok: true } : mcpRefusal(status, body);
+    },
+    async mcpClientInfo(server) {
+      const { status, body } = await call('mcp/client-info', { server }, MCP_WAIT_MS);
+      return status === 200 && body && 'client' in body ? { ok: true, client: body.client } : mcpRefusal(status, body);
+    },
+    async mcpForgetServer(server) {
+      const { status, body } = await call('mcp/forget', { server }, MCP_WAIT_MS);
+      return status === 200 && body?.ok === true ? { ok: true } : mcpRefusal(status, body);
+    },
+    async mcpForgetUser(user) {
+      const { status, body } = await call('mcp/forget', { user }, MCP_WAIT_MS);
+      return status === 200 && body?.ok === true ? { ok: true } : mcpRefusal(status, body);
+    },
+    async mcpKeySet(user, server, headers) {
+      const { status, body } = await call('mcp/key-set', { user, server, headers }, MCP_WAIT_MS);
+      return status === 200 && body?.ok === true ? { ok: true } : mcpRefusal(status, body);
+    },
+    /** The three credential tables' re-seal for a secrets rotation (rust-mcp-credentials.cjs). */
+    async mcpReseal() {
+      const { status, body } = await call('mcp/reseal', {}, RESEAL_WAIT_MS);
+      if (status === 200 && body && body.ok === true) return body;
+      throw failure(status, body);
+    },
     /** sbstndalton/noevia#2153: the user's chat change journal after `after` (chat-change-journal.cjs):
      *  { entries, oldestSeq, latestSeq, more, start }, or { unsupported: true } from a store
      *  without the op (404: an older Rust front). */
@@ -317,6 +372,13 @@ function chatgptRefusal(status, body) {
   // secret, a 404 from an older front, a 5xx) is "try again", never its raw text.
   if (!body || !Number.isInteger(body.status) || typeof body.error !== 'string') return { ok: false, status: 503 };
   return { ok: false, status: body.status, error: body.error, code: typeof body.code === 'string' ? body.code : undefined };
+}
+
+/** The MCP broker's refusal ({ error, code?, status, needsClient?, issuer? }), or an unusable answer. */
+function mcpRefusal(status, body) {
+  const refusal = chatgptRefusal(status, body);
+  if (refusal.ok === false && refusal.error !== undefined && body.needsClient === true) return { ...refusal, needsClient: true, issuer: typeof body.issuer === 'string' ? body.issuer : undefined };
+  return refusal;
 }
 
 function moveFailure(status, body) {

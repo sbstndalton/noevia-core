@@ -833,14 +833,16 @@ const directoryUrlAllowed = createDirectoryUrlAllowed({ isPublicUrl, allowLoopba
 // again at connect time, so a name that re-resolves after directoryUrlAllowed (DNS rebinding,
 // #795) cannot reach a private one. The operator's MCP_SERVERS keep the ordinary fetch.
 const mcpPublicFetch = require('./public-fetch.cjs').createPublicFetch({ allowLoopbackLiteral: process.env.NOEVIA_QA_ALLOW_LOOPBACK_MCP === '1' });
-// OAuth sign-in for directory servers: one sign-in per account per server (mcp-oauth.cjs).
-// Its URLs come from strangers' metadata, so they must be https (or the QA loopback) and public.
-const mcpOAuth = require('./mcp-oauth.cjs').createMcpOAuth({
-  db: authService.db, secrets: secretStore, audit: (action, actor, detail) => authService.audit(action, actor, actor, detail),
-  fetchImpl: mcpPublicFetch,
-  urlAllowed: async (url) => require('./directory-mcp.cjs').hostedUrlOk(url) && directoryUrlAllowed(url),
-  redirectUri: () => `${String(authService.origin || process.env.PUBLIC_ORIGIN || '').replace(/\/$/, '')}/api/mcp-oauth/callback`,
-});
+// Each account's OAuth sign-ins to directory servers and its own server keys are the Rust front's
+// (sbstndalton/noevia#2202, rust-mcp-credentials.cjs): discovery, registration, PKCE, the callback,
+// the refresh and the revoke all happen there, and this process asks it for one call's access token
+// or key headers over the internal store (PROJECT_STORE), holding neither past the request. Who is
+// ready is re-read from the file it publishes. The tables are created here either way (Node is the
+// schema migrator).
+require('./rust-mcp-credentials.cjs').ensureSchema(authService.db);
+const mcpCredentials = require('./rust-mcp-credentials.cjs').createMcpCredentials({ broker: PROJECT_STORE, dataDir: DATA_DIR });
+const mcpOAuth = mcpCredentials.oauth;
+const mcpKeys = mcpCredentials.keys;
 // Sign in with ChatGPT (#447), used only while features.chatgptOAuth is on. The Rust front is its
 // token broker (sbstndalton/noevia#2190 round 5, rust-chatgpt-oauth.cjs): the sign-in, the tokens,
 // their refresh and the model catalogue are its own; chat asks it for an access token through the
@@ -854,7 +856,7 @@ const mcpCredentialOriginAllowed = createCredentialOriginCheck(process.env.MCP_N
 // The live server list, discovery, per-server credentials and the MCP executor: mcp-wiring.cjs.
 // It appends the directory servers to MCP_SERVERS itself and keeps that array current.
 const mcpWiring = createMcpWiring({
-  servers: MCP_SERVERS, manifest: MCP_TOOLBOX_MANIFEST, mcp, bindBoxes, directoryMcp, mcpOAuth, directoryUrlAllowed,
+  servers: MCP_SERVERS, manifest: MCP_TOOLBOX_MANIFEST, mcp, bindBoxes, directoryMcp, mcpOAuth, mcpKeys, directoryUrlAllowed,
   publicFetch: mcpPublicFetch,
   credentialOriginAllowed: mcpCredentialOriginAllowed, scope: requestScope,
   storageFor: (userId) => authService.getStorage(userId, true),
@@ -1171,10 +1173,10 @@ const requestAuth = require('./device-auth.cjs').createRequestAuth({ enabled: na
 const deviceRoutes = require('./routes/device-auth.cjs').createDeviceAuthRoutes({ json, enabled: nativeClientAuth });
 const authRoutes = require('./routes/auth.cjs').createAuthRoutes({
   json, readJson, authService, workspaceStore, driveAccounts, fetchJson, DIARY_BASE, DIARY_TOKEN, diaryTenantHeaders: diary.tenantHeaders,
-  mcpOAuth, directoryMcp, chatgptOAuth,
+  mcpOAuth, chatgptOAuth,
   // POST /api/admin/secrets/rotate (CSRF-checked by the router like every signed-in POST).
   // The provider files are the front's: it re-seals them first (rust-providers-reseal.cjs), awaited.
-  rotateSecrets: (actorId) => require('./secrets-rotate.cjs').runRotation({ secrets: secretStore, db: authService.db, dataDir: DATA_DIR, audit: authService.audit, actorId, resealProviders: () => require('./rust-providers-reseal.cjs').resealProviderKeys(PROJECT_STORE) }),
+  rotateSecrets: (actorId) => require('./secrets-rotate.cjs').runRotation({ secrets: secretStore, db: authService.db, dataDir: DATA_DIR, audit: authService.audit, actorId, resealProviders: () => require('./rust-providers-reseal.cjs').resealProviderKeys(PROJECT_STORE), resealMcp: () => require('./rust-mcp-credentials.cjs').resealMcpCredentials(PROJECT_STORE) }),
 });
 // The user's own storage connection is the Rust front's in full (reading, browsing, the folder write,
 // the test, the Nextcloud sign-in and the save, #1071/sbstndalton/noevia#2190): routes/storage.cjs
@@ -1228,7 +1230,9 @@ const readyRoutes = require('./routes/health.cjs').createReadyRoutes({
 // GET /api/toolboxes: the picker view (routes/toolboxes.cjs). MCP state is read at call time.
 const toolboxRoutes = require('./routes/toolboxes.cjs').createToolboxRoutes({
   discoverMcpTools: () => discoverMcpTools(), toolboxSummaries, connectedBoxes, json, cache: permittedToolsCache,
-  cacheKeyExtra: (authn) => authService.diaryEnabled(authn.user.id),
+  // The Diary preference and the MCP credentials are the Rust front's to change: a new Diary setting
+  // or a changed sign-in/key (the broker's readiness file) shows at once.
+  cacheKeyExtra: (authn) => [authService.diaryEnabled(authn.user.id), mcpCredentials.signal()],
   prefill: { targetMs: TOOL_PREFILL_TARGET_MS, stats: () => prefill.stats() },
   mcp: () => ({ enabled: mcpWiring.enabled(), state: mcpState, servers: MCP_SERVERS, manifest: MCP_TOOLBOX_MANIFEST }),
   // The per-turn catalogue (#237). getProject is scoped to the signed-in account's workspace.
@@ -1246,7 +1250,7 @@ const toolboxRoutes = require('./routes/toolboxes.cjs').createToolboxRoutes({
   },
 });
 const mcpDirectoryRoutes = require('./routes/mcp-directory.cjs').createMcpDirectoryRoutes({
-  json, readJson, auth: authService, servers: MCP_SERVERS, mcpState, directoryMcp, mcpOAuth,
+  json, readJson, auth: authService, servers: MCP_SERVERS, mcpState, directoryMcp, mcpOAuth, mcpKeys,
   discoverOneServer, discoverMcpTools, probeMcpAuth, syncDirectoryServers, directoryUrlAllowed,
   onToolsChange: () => permittedToolsCache.clear(),
 });
@@ -1306,6 +1310,7 @@ async function handleRequestInner(req, res) {
   if (require('./rust-chatgpt-oauth.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   if (require('./rust-provider-models.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   if (require('./rust-providers.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
+  if (require('./rust-mcp-credentials.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   if (require('./rust-vault-mirror-preferences.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   await readyFeatures();
   const preAuth = requestAuth.authenticate(req);

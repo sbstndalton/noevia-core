@@ -15,7 +15,7 @@
 // Built on node:http/https rather than an undici dispatcher: undici is not a
 // dependency of this server, and Node does not export the copy inside its
 // built-in fetch. It returns a WHATWG Response, so callers written against
-// fetch (mcp.cjs, mcp-oauth.cjs) use it unchanged. Deliberate differences from
+// fetch (mcp.cjs) use it unchanged. Deliberate differences from
 // fetch: redirects are never followed (all callers already pass
 // redirect:'error'), and no compression is requested.
 //

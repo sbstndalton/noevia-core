@@ -12,6 +12,12 @@
 // changed under a half-rotated registry. This process never writes either file, and so cannot
 // shift or overwrite a row the front deletes or edits meanwhile (a row-index write could).
 //
+// The MCP credential tables (mcp_oauth_tokens, mcp_oauth_clients, directory_mcp_user_keys) are not
+// listed either: the front is their only writer (sbstndalton/noevia#2202), so it re-seals them in
+// one pass under each sign-in's refresh lock (rust-mcp-credentials.cjs, POST /v1/mcp/reseal),
+// awaited before the rest. `directory_mcp_servers.headers_enc` (an administrator's shared key)
+// is still Node's and stays below.
+//
 // The shell form needs the front's internal store (NOEVIA_PROJECT_STORE_PORT and
 // NOEVIA_PROJECT_STORE_TOKEN, which the web supervisor hands the web process alone and Node removes
 // from its environment at start), so it refuses to run without them, before it changes anything,
@@ -60,17 +66,14 @@ function googleDriveUserFiles(dir, secrets) {
 function rotationTables({ db, dataDir, secrets = null }) {
   const tables = [
     sqlTable(db, 'storage_connections', { table: 'storage_connections', keys: ['user_id'], column: 'secret', bound: true }),
-    sqlTable(db, 'mcp_oauth_tokens', { table: 'mcp_oauth_tokens', keys: ['user_id', 'server_id'], column: 'data_enc', bound: true }),
-    sqlTable(db, 'mcp_oauth_clients', { table: 'mcp_oauth_clients', keys: ['server_id'], column: 'data_enc', bound: false }),
     sqlTable(db, 'directory_mcp_servers', { table: 'directory_mcp_servers', keys: ['id'], column: 'headers_enc', bound: false }),
-    sqlTable(db, 'directory_mcp_user_keys', { table: 'directory_mcp_user_keys', keys: ['user_id', 'server_id'], column: 'headers_enc', bound: true }),
     sqlTable(db, 'chatgpt_oauth_tokens', { table: 'chatgpt_oauth_tokens', keys: ['user_id'], column: 'data_enc', bound: true }),
   ];
   if (secrets) tables.push(googleDriveUserFiles(path.join(dataDir, 'google-drive-users'), secrets));
   return tables;
 }
 
-/** Adds the front's provider pass (`{ tables, failures }`, rust-providers-reseal.cjs) to `report`. */
+/** Adds a front pass (`{ tables, failures }`: the providers' or the MCP credentials') to `report`. */
 function mergeProviderPass(report, pass) {
   for (const [name, counts] of Object.entries(pass.tables)) {
     report.tables[name] = counts;
@@ -84,11 +87,14 @@ function mergeProviderPass(report, pass) {
  * anything is changed, when the front cannot re-seal the provider files (`resealProviders`, awaited
  * first: rust-providers-reseal.cjs `resealProviderKeys` on the internal store).
  */
-async function runRotation({ secrets, db, dataDir, audit = () => {}, actorId = null, resealProviders }) {
+async function runRotation({ secrets, db, dataDir, audit = () => {}, actorId = null, resealProviders, resealMcp }) {
   if (typeof resealProviders !== 'function') throw new Error('the provider keys are re-sealed by the Rust front: runRotation needs resealProviders');
+  if (typeof resealMcp !== 'function') throw new Error('the MCP credentials are re-sealed by the Rust front: runRotation needs resealMcp');
   const providers = await resealProviders();
+  const mcpCredentials = await resealMcp();
   const report = secrets.rotate({ tables: rotationTables({ db, dataDir, secrets }) });
   mergeProviderPass(report, providers);
+  mergeProviderPass(report, mcpCredentials);
   report.previousKey = secrets.hasPreviousKey();
   audit('secrets.rotate', actorId, actorId, { totals: report.totals, failed: report.failures.map((f) => ({ table: f.table, ref: f.ref })).slice(0, 50) });
   return report;
@@ -103,6 +109,7 @@ if (require.main === module) {
     process.exit(2);
   }
   const resealProviders = () => require('./rust-providers-reseal.cjs').resealProviderKeys(store.clientFromEnv(process.env));
+  const resealMcp = () => require('./rust-mcp-credentials.cjs').resealMcpCredentials(store.clientFromEnv(process.env));
   const dataDir = process.env.UI_DATA_DIR || path.join(__dirname, 'ui-data');
   const { createSecretStore } = require('./secrets.cjs');
   const Database = require('better-sqlite3');
@@ -112,7 +119,7 @@ if (require.main === module) {
   const audit = (action, actor, target, detail) => {
     if (hasTable(db, 'audit_events')) db.prepare('INSERT INTO audit_events(actor_user_id,target_user_id,action,detail,created_at) VALUES(?,?,?,?,?)').run(actor, target, action, JSON.stringify({ ...detail, via: 'cli' }), Date.now());
   };
-  runRotation({ secrets, db, dataDir, audit, resealProviders }).then((report) => {
+  runRotation({ secrets, db, dataDir, audit, resealProviders, resealMcp }).then((report) => {
     console.log(JSON.stringify(report, null, 2));
     if (!report.previousKey) console.error('note: no previous key is configured; only legacy/plaintext values could be upgraded.');
     process.exitCode = report.totals.failed ? 2 : 0;

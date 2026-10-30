@@ -23,15 +23,17 @@ function fakeMcp(catalogues) {
   };
 }
 
-function build({ servers, catalogues, directoryServers = [], env = {}, storage = { kind: 'local' }, origins = '', manifest = [], isUserDisabled, discoveryFailTtlMs, discoveryTtlMs, discoveryRetryMs } = {}) {
-  const mcp = fakeMcp(catalogues);
+function build({ servers, catalogues, directoryServers = [], env = {}, storage = { kind: 'local' }, origins = '', manifest = [], isUserDisabled, discoveryFailTtlMs, discoveryTtlMs, discoveryRetryMs, mcpOAuth, mcpKeys, mcp: mcpOverride } = {}) {
+  const mcp = mcpOverride || fakeMcp(catalogues);
   const scope = new AsyncLocalStorage();
   const minted = [];
   const wiring = createMcpWiring({
     servers, manifest, mcp,
     bindBoxes: ({ manifest, perServer }) => manifest.map((m) => ({ id: m.id, tools: [...(perServer.get(m.server) || new Map()).values()].map((e) => e.tool), server: m.server })),
-    directoryMcp: { asServers: () => directoryServers, boxFor: (sv, names) => ({ id: sv.id, server: sv.id, tools: [...names] }), headersFor: () => ({ 'X-Key': 'dir' }), userHeadersFor: (uid) => (uid === 'keyed' ? { 'X-Key': 'mine' } : {}), hasUserKey: (uid) => uid === 'keyed' },
-    mcpOAuth: { connected: (uid) => uid === 'signed', tokenFor: async (uid) => (uid === 'signed' ? 'oauth-token' : null) },
+    directoryMcp: { asServers: () => directoryServers, boxFor: (sv, names) => ({ id: sv.id, server: sv.id, tools: [...names] }), headersFor: () => ({ 'X-Key': 'dir' }) },
+    // The brokers (rust-mcp-credentials.cjs): one call's key headers / access token, asked per call.
+    mcpKeys: mcpKeys || { hasKey: (uid) => uid === 'keyed', headers: async (uid) => (uid === 'keyed' ? { 'X-Key': 'mine' } : null) },
+    mcpOAuth: mcpOAuth || { connected: (uid) => uid === 'signed', tokenFor: async (uid) => (uid === 'signed' ? 'oauth-token' : null) },
     directoryUrlAllowed: async (url) => !url.includes('private'),
     credentialOriginAllowed: createCredentialOriginCheck(origins),
     scope, storageFor: () => storage, isWriteTool: (name) => name.endsWith('_write'),
@@ -256,4 +258,81 @@ test('an MCP HTTP failure reaches the model as a neutral status line; the body g
   assert.equal(out, 'ERROR calling b_read: tool call failed (HTTP 502)');
   mcp.callTool = async () => { throw new Error('MCP error -32602: bad arguments'); };
   assert.equal(await wiring.executeMcpToolCall('b_read', {}), 'ERROR calling b_read: MCP error -32602: bad arguments', 'non-HTTP errors are unchanged');
+});
+
+// A server that answers 401 to an access token it was just given (revoked upstream, or rotated by a
+// refresh another request made): the broker is asked for one past it, once; a second refusal marks
+// that sign-in, so the account is told to sign in again. Nothing is retried for any other failure.
+function unauthorizedFirst(catalogue, refusals) {
+  const mcp = fakeMcp({ 'http://o/mcp': catalogue });
+  const seen = [];
+  const connect = mcp.connect;
+  mcp.connect = async (url, headers, ...rest) => {
+    if (headers && headers.Authorization && refusals.includes(headers.Authorization)) {
+      throw Object.assign(new Error('MCP 401: unauthorized'), { httpStatus: 401 });
+    }
+    seen.push(headers && headers.Authorization);
+    return connect(url, headers, ...rest);
+  };
+  return { mcp, seen };
+}
+
+test('an OAuth server that refuses the token gets one retry with a token the broker issued past it', async () => {
+  const { mcp, seen } = unauthorizedFirst([rawTool('o_read')], ['Bearer old']);
+  const asked = [];
+  const mcpOAuth = {
+    connected: () => true,
+    session: async (uid, sid, rejected) => { asked.push([uid, sid, rejected ?? null]); return { accessToken: rejected ? 'new' : 'old', generation: rejected ? 'g2' : 'g1' }; },
+    tokenFor: async () => 'old', reject: async () => { throw new Error('a recovered call marks nothing'); },
+  };
+  const servers = [{ id: 'o', url: 'http://o/mcp', auth: 'oauth', title: 'OAuth', addedBy: 'signed' }];
+  const { wiring, scope } = build({ servers, mcp, mcpOAuth });
+  const run = () => asUser(scope, 'signed', () => wiring.executeMcpToolCall('o_read', { q: 1 }));
+  // Discovery uses the administrator's token (the first, accepted); the call is the refused one.
+  mcpOAuth.tokenFor = async () => 'fresh-for-discovery';
+  await wiring.discoverMcpTools();
+  assert.equal(await run(), 'o_read:{"q":1}');
+  assert.deepEqual(asked, [['signed', 'o', null], ['signed', 'o', 'old']]);
+  assert.equal(seen.at(-1), 'Bearer new');
+  assert.ok(mcp.sessions.every((s) => !s.open));
+});
+
+test('a second refusal marks that sign-in by its generation, and the account is told, not retried again', async () => {
+  const { mcp } = unauthorizedFirst([rawTool('o_read')], ['Bearer old', 'Bearer new']);
+  const rejected = [];
+  const mcpOAuth = {
+    connected: () => true,
+    session: async (_u, _s, was) => ({ accessToken: was ? 'new' : 'old', generation: was ? 'g2' : 'g1' }),
+    tokenFor: async () => 'discovery', reject: async (...args) => { rejected.push(args); return true; },
+  };
+  const servers = [{ id: 'o', url: 'http://o/mcp', auth: 'oauth', title: 'OAuth', addedBy: 'signed' }];
+  const { wiring, scope } = build({ servers, mcp, mcpOAuth });
+  await wiring.discoverMcpTools();
+  const out = await asUser(scope, 'signed', () => wiring.executeMcpToolCall('o_read', {}));
+  assert.match(out, /^ERROR calling o_read: tool call failed \(HTTP 401\)/);
+  assert.deepEqual(rejected, [['signed', 'o', 'g2']]);
+  // The broker handing back the very token that was refused marks it too, without a second try.
+  rejected.length = 0;
+  mcpOAuth.session = async () => ({ accessToken: 'old', generation: 'g1' });
+  const same = await asUser(scope, 'signed', () => wiring.executeMcpToolCall('o_read', {}));
+  assert.match(same, /HTTP 401/);
+  assert.deepEqual(rejected, [['signed', 'o', 'g1']]);
+});
+
+test('a personal key is asked of the broker for each call and never kept', async () => {
+  let asked = 0;
+  const mcpKeys = { hasKey: () => true, headers: async (uid) => { if (uid === 'x') return null; asked += 1; return { 'X-Key': `k${asked}` }; } };
+  const servers = [{ id: 'p', url: 'http://p/mcp', auth: 'personal', title: 'Personal', addedBy: 'keyed' }];
+  const { wiring, mcp, scope } = build({ servers, mcpKeys, catalogues: { 'http://p/mcp': [rawTool('p_read')] } });
+  await wiring.discoverMcpTools();
+  assert.equal(asked, 1, 'discovery asks for the administrator\'s key');
+  assert.deepEqual(mcp.sessions[0].headers, { 'X-Key': 'k1' });
+  await asUser(scope, 'keyed', () => wiring.executeMcpToolCall('p_read', {}));
+  await asUser(scope, 'keyed', () => wiring.executeMcpToolCall('p_read', {}));
+  assert.deepEqual(mcp.calls.map((c) => c.headers), [{ 'X-Key': 'k2' }, { 'X-Key': 'k3' }], 'a fresh answer for every call');
+  // An account with no key (or a broker that cannot say) gets the actionable error, nothing sent.
+  assert.match(await asUser(scope, 'x', () => wiring.executeMcpToolCall('p_read', {})), /^ERROR: p_read needs your own key/);
+  const none = build({ servers, mcpKeys: { hasKey: () => false, headers: async () => null }, catalogues: { 'http://p/mcp': [rawTool('p_read')] } });
+  await none.wiring.discoverMcpTools();
+  assert.match(none.wiring.state.servers.get('p').error, /waiting for the administrator who added it to enter their key/);
 });
