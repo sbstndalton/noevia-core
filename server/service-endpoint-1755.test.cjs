@@ -9,6 +9,7 @@ const path = require('node:path');
 const { configuration } = require('./decision-endpoint.cjs');
 const { configuration: systemOneConfiguration } = require('./system-one-router.cjs');
 const { createDecisionSettings } = require('./decision-settings.cjs');
+const { rustSavesDecision } = require('../tests/server/rust-decision-row.cjs');
 
 // Required per test, so on a tree without the helper each test fails on its own.
 const helper = () => require('./service-endpoint.cjs');
@@ -61,9 +62,7 @@ test('a name that resolves to a public address is refused (stub DNS), before and
   const r = await helper().checkServiceEndpoint('http://cloud.example:8040', { lookup });
   assert.equal(r.ok, false);
   assert.match(r.reason, /93\.184\.216\.34 is a public address/);
-  // The connection test says so plainly.
-  const settings = createDecisionSettings({ store: memory(), env: {}, lookup, fetchImpl: async () => assert.fail('no request to a public host') });
-  await assert.rejects(settings.test({ url: 'http://cloud.example:8040', timeoutMs: 500 }), (e) => e.status === 400 && e.messageId === 'invalidUrl');
+  // The connection test (the Rust front's since #2190, noevia-rs tests/decision_settings.rs) refuses it too.
   // And the socket's lookup refuses it.
   await assert.rejects(lookupVia(resolveFrom(DNS), 'cloud.example'), (e) => e.code === 'EPUBLICADDR');
 });
@@ -96,15 +95,18 @@ test('rock5b.local resolving to 10.x is accepted, and Settings tests a LAN name 
   // The socket's lookup hands back exactly the checked answers.
   assert.deepEqual(await lookupVia(resolveFrom(DNS), 'rock5b.local'), [{ address: '10.20.30.40', family: 4 }]);
   assert.deepEqual(await lookupVia(resolveFrom(DNS), 'pi5.tail1234.ts.net'), [{ address: '100.101.102.103', family: 4 }]);
-  // Settings saves a .local URL, and its connection test goes through the on-this-network fetch.
+  // A .local URL saved in Settings (by the Rust front since #2190) is reached through the on-this-network fetch.
   const port = await fixtureServer(t, (req, res) => { assert.equal(req.url, '/health'); res.setHeader('content-type', 'application/json'); res.end('{"ready":true}'); });
   const urls = [];
   const real = helper().createServiceFetch({ resolve: resolveFrom(DNS) });
   // The fixture board is 127.0.0.1 (the only address a test may connect to): the name is checked, then the literal is fetched.
   const fetchImpl = async (url, init) => { urls.push(url); const u = new URL(url); await lookupVia(resolveFrom(DNS), u.hostname); return real(`http://127.0.0.1:${port}${u.pathname}`, init); };
-  const settings = createDecisionSettings({ store: memory(), env: {}, lookup, fetchImpl });
-  assert.equal(settings.save({ url: 'http://rock5b.local:8040', timeoutMs: 500 }, 'admin').url, 'http://rock5b.local:8040');
-  assert.equal((await settings.test({ url: 'http://rock5b.local:8040', timeoutMs: 500 })).messageId, 'ready');
+  const store = memory();
+  const settings = createDecisionSettings({ store, env: {}, fetchImpl });
+  rustSavesDecision(store, { url: 'http://rock5b.local:8040', timeoutMs: 500 });
+  assert.equal(settings.get().url, 'http://rock5b.local:8040');
+  const response = await fetchImpl(`${settings.get().url}/health`, { redirect: 'error' });
+  assert.deepEqual(await response.json(), { ready: true });
   assert.deepEqual(urls, ['http://rock5b.local:8040/health']);
 });
 
@@ -119,8 +121,6 @@ test('a redirect is still refused, whatever it points at', async (t) => {
   const port = await fixtureServer(t, (_q, res) => { res.statusCode = 302; res.setHeader('location', 'http://93.184.216.34/'); res.end(); });
   const fetchImpl = helper().createServiceFetch({ resolve: resolveFrom(DNS) });
   await assert.rejects(fetchImpl(`http://127.0.0.1:${port}/health`, { redirect: 'error' }), /redirect \(302\)/);
-  const settings = createDecisionSettings({ store: memory(), env: {}, lookup, fetchImpl });
-  await assert.rejects(settings.test({ url: `http://127.0.0.1:${port}`, timeoutMs: 500 }), (e) => e.status === 502 && e.messageId === 'notReady');
   // The decision endpoint's default fetch is the same one, and it refuses the redirect too.
   const { createDecisionEndpoint } = require('./decision-endpoint.cjs');
   const endpoint = createDecisionEndpoint({ env: { COWORK_DECISION_URL: `http://127.0.0.1:${port}` } });
@@ -174,13 +174,15 @@ function settingsWithSpy() {
 test('#1753: a decision URL saved in Settings on another host gets no shared key; the deployment host keeps it', () => {
   const { create, seen } = settingsWithSpy();
   const env = { COWORK_DECISION_URL: 'http://kev:11435', COWORK_DECISION_MODEL: 'kev-0.8b', COWORK_DECISION_API_KEY: 'synthetic-shared-key' };
-  const other = create({ store: memory(), env });
-  other.save({ url: 'http://10.9.8.7:8040', timeoutMs: 500 }, 'admin');
+  const otherStore = memory();
+  const other = create({ store: otherStore, env });
+  rustSavesDecision(otherStore, { url: 'http://10.9.8.7:8040', timeoutMs: 500 });
   assert.ok(other.backend());
   assert.equal(seen.at(-1).COWORK_DECISION_URL, 'http://10.9.8.7:8040');
   assert.equal('COWORK_DECISION_API_KEY' in seen.at(-1), false, 'another host must not receive the shared key');
-  const same = create({ store: memory(), env });
-  same.save({ url: 'http://kev:11435', timeoutMs: 500 }, 'admin');
+  const sameStore = memory();
+  const same = create({ store: sameStore, env });
+  rustSavesDecision(sameStore, { url: 'http://kev:11435', timeoutMs: 500 });
   assert.ok(same.backend());
   assert.equal(seen.at(-1).COWORK_DECISION_API_KEY, 'synthetic-shared-key');
   const deployment = create({ store: memory(), env });

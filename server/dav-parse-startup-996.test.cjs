@@ -300,7 +300,7 @@ test('index.cjs starts with the pinned module and every retired switch left at j
   const child = require('node:child_process').spawn(process.execPath, [path.join(__dirname, 'index.cjs')], {
     env: { ...process.env, UI_DATA_DIR: dataDir, UI_PORT: '0', PORT: '0', HOST: '127.0.0.1', PUBLIC_ORIGIN: 'http://localhost', DIARY_AUTH_TOKEN: 'test-cowork-token', DAV_PARSE_WASM: wasmFile,
       // The project store is required (sbstndalton/noevia#1071); nothing is saved in this test.
-      NOEVIA_PROJECT_STORE_PORT: '9', NOEVIA_PROJECT_STORE_TOKEN: 'synthetic-store-token-'.padEnd(64, 'x'), NOEVIA_RUST_PROJECTS: '0',
+      NOEVIA_PROJECT_STORE_PORT: '9', NOEVIA_PROJECT_STORE_TOKEN: 'synthetic-store-token-'.padEnd(64, 'x'), NOEVIA_RUST_PROJECTS: '0', NOEVIA_START_ID: '0123456789abcdef0123456789abcdef',
       LLAMACPP_PRESETS_IMPL: 'js', STREAM_GUARD_IMPL: 'js', ROLE_CONTEXT_IMPL: 'js', DAV_PARSE_IMPL: 'js', S3_PARSE_IMPL: 'js', CHAT_TEMPLATE_CAPS_IMPL: 'off', AUTOTUNE_PLAN_IMPL: 'js', PRESET_RELOAD_IMPL: 'off', LAYA_LOAD_ADVISOR: 'off',
       MCP_FRAME_IMPL: 'js', UPLOAD_SNIFF_IMPL: 'js', S3_SIGN_IMPL: 'js', PROMPT_FRAMING_IMPL: 'js', SSRF_IMPL: 'js',
       POLICY_LEAVES_IMPL: 'js', CODE_REVIEW_VERDICT_IMPL: 'js', TOOL_EXCHANGE_IMPL: 'js', DECISION_IMPL: 'js', COMPLETENESS_REPORT_IMPL: 'js', TASK_LIFECYCLE_IMPL: 'js', MCP_SERVERS_IMPL: 'js', CODE_NET_GUARD_IMPL: 'js', LLAMACPP_AUTOCONFIG_IMPL: 'js', GGUF_META_IMPL: 'js', PROJECT_FILE_NAMES_IMPL: 'js', PROVIDER_EGRESS_IMPL: 'js', BROWSER_POLICY_IMPL: 'js', CODE_ACTIONS_IMPL: 'js', TOOL_GATE_IMPL: 'js', TOOLBOXES_PERMITTED_IMPL: 'js', STORAGE_PATH_IMPL: 'js', SECRET_ENVELOPE_IMPL: 'js' },
@@ -312,7 +312,7 @@ test('index.cjs starts with the pinned module and every retired switch left at j
   const deadline = Date.now() + 30000;
   while (!/dav-parse\.wasm verified/.test(out) && child.exitCode === null && Date.now() < deadline) await new Promise((r) => setTimeout(r, 100));
   assert.match(out, /\[dav-parse\] dav-parse\.wasm verified/, `stdout ${out.slice(-500)} stderr ${err.slice(-500)}`);
-  assert.equal(child.exitCode, null, 'still running');
+  assert.equal(child.exitCode, null, `still running\nstdout ${out.slice(-1500)}\nstderr ${err.slice(-1500)}`);
   // This run sets the deprecated LAYA_LOAD_ADVISOR: it counts as DECISION_LOAD_ADVISOR, the warning names the variable that was set, and a note says it is deprecated (#2093).
   for (const flag of Object.keys(davParseWasm.RETIRED_FLAGS)) assert.match(err, new RegExp(`${flag === 'DECISION_LOAD_ADVISOR' ? 'LAYA_LOAD_ADVISOR' : flag} is retired; Rust is always used`));
   assert.match(err, /LAYA_LOAD_ADVISOR is a deprecated alias of DECISION_LOAD_ADVISOR; set DECISION_LOAD_ADVISOR instead/);

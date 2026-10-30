@@ -140,7 +140,7 @@ const chatMachines = require('./chat-machines.cjs').createChatMachines({ machine
 // #1880: an administrator-started measurement of a chat role's model on its machine (nothing on this machine changes).
 const machineTune = require('./machine-tune.cjs').createMachineTune({ machines: inferenceMachines, chatMachines, store: require('./features.cjs').settingsStore(authService.db),
   audit: (action,actor,detail)=>authService.audit(action,actor,actor,detail) });
-const decisionSettings = require('./decision-settings.cjs').createDecisionSettings({ store: featureSourceStore, audit: (action,actor,detail)=>authService.audit(action,actor,actor,detail), machineUrl: () => inferenceMachines.urlFor('decision'), sensitivityMachineUrl: () => inferenceMachines.urlFor('sensitivity') });
+const decisionSettings = require('./decision-settings.cjs').createDecisionSettings({ store: featureSourceStore, machineUrl: () => inferenceMachines.urlFor('decision'), sensitivityMachineUrl: () => inferenceMachines.urlFor('sensitivity') });
 // #1841: OCR and Docling read their address from the same registry (document-workers.cjs), the environment being the fallback.
 require('./document-workers.cjs').useMachines((kind) => inferenceMachines.urlFor(kind));
 // #1665: the reranker's on/off and model, saved in Settings over the deployment's RERANK_* environment.
@@ -160,8 +160,7 @@ featureRuntime = require('./feature-runtime.cjs').createFeatureRuntime({
 let featureStartup=null;
 const readyFeatures=()=>featureStartup ||= featureRuntime.ready();
 
-const featureRoutes = require('./routes/features.cjs').createFeatureRoutes({ json, readJson, decisionSettings });
-const pluginDirectoryRoutes = require('./routes/plugin-directory.cjs').createPluginDirectoryRoutes({ json });
+const featureRoutes = require('./routes/features.cjs').createFeatureRoutes({ json });
 // Settings → Data: the signed-in user's conversations as a ZIP (routes/export.cjs).
 // GET /api/export/conversations is the Rust front's (#1071): this mount only refuses a bypass.
 const exportRoutes = require('./routes/export.cjs').createExportRoutes({ json });
@@ -203,7 +202,6 @@ const driveAccounts = require('./drive-accounts.cjs').createDriveAccounts({
     uploadBase: process.env.GOOGLE_DRIVE_UPLOAD_BASE_URL || undefined, log: (event) => console.log('[gdrive]', JSON.stringify(event)),
   }),
 });
-const { publicPage } = require('./routes/public-pages.cjs');
 const webAddressRoutes = require('./routes/web-address.cjs').createWebAddressRoutes({ auth: authService, json });
 const davConfig = require('./dav-settings.cjs').configuration(process.env, authService.origin);
 const davSettings = require('./dav-settings.cjs').createDavSettings({ auth: authService });
@@ -1243,6 +1241,10 @@ async function handleRequestInner(req, res) {
   if (require('./rust-models.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   // And the two read-only sizing reads (#2189): GET /api/models/estimate and /api/models/preset/suggest.
   if (require('./rust-model-sizing.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
+  // #2190: the public pages and the device approval page, and the plugin directory.
+  if (require('./rust-public-pages.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
+  if (require('./rust-plugin-directory.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
+  if (require('./rust-decision-settings.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   await readyFeatures();
   const preAuth = requestAuth.authenticate(req);
   // accountRole: a device token acts as a member, but its account's workspace is the same one.
@@ -1277,10 +1279,6 @@ async function handleRequestScoped(req, res) {
   publicHeaders(res);
 
   try {
-    if ((req.method === 'GET' || req.method === 'HEAD') && publicPage(p)) {
-      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'public, max-age=300' });
-      return res.end(req.method === 'HEAD' ? undefined : publicPage(p));
-    }
     // Sign-in and the account are the Rust front's (#1071): a request that reaches Node bypassed it.
     if (require('./rust-auth.cjs').refuseOwned(req, res, p, json)) return;
     // So are the M4 project routes (#1071): Node refuses them whoever asks.
@@ -1312,7 +1310,6 @@ async function handleRequestScoped(req, res) {
     if (authn && await accountRoutes(req, res, { path: p, authn })) return;
     if (authn && await offsiteRoutes(req, res, { path: p, authn })) return;
     if (authn && await connectorRoutes(req, res, { path: p, authn })) return;
-    if (authn && await pluginDirectoryRoutes(req, res, { path: p, authn })) return;
     if (await mcpDirectoryRoutes(req, res, { path: p, authn })) return;
     if (authn && await webAddressRoutes(req, res, { path: p, authn })) return;
     if (authn && p.startsWith('/api/projects/') && await researchRoutes(req, res, { path: p, authn })) return;

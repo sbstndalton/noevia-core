@@ -78,7 +78,8 @@ test('#1071: Node refuses exactly the sign-in and account routes the Rust front 
     for (const m of METHODS) assert.equal(ownedRoute(m, p), methods === null || methods.includes(m), `${m} ${p}`);
   }
   // What stays Node's: account deletion, Settings -> Web address, the Diary connectors,
-  // retention's PUT, the feature switches, the device approval page, and look-alike paths.
+  // retention's PUT, the feature switches, the device approval page (rust-public-pages.cjs's since #2190),
+  // and look-alike paths.
   for (const [m, p] of [
     ['DELETE', '/api/admin/users/u1'], ['GET', '/api/admin/web-address'], ['POST', '/api/admin/web-address'], ['POST', '/api/admin/secrets/rotate'],
     ['GET', '/api/admin/features'], ['POST', '/api/profile/sharing'], ['GET', '/api/profile/diary-connectors'],

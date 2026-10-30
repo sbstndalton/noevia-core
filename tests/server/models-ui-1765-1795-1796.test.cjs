@@ -9,7 +9,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const { Readable } = require('node:stream');
 const { createDecisionSettings, describeDecision } = require('../../server/decision-settings.cjs');
-const { createFeatureRoutes } = require('../../server/routes/features.cjs');
+const { rustSavesDecision, rustResetsDecision } = require('./rust-decision-row.cjs');
 const { createModelRoutes } = require('../../server/routes/models.cjs');
 const { modelAssignments } = require('../../server/model-assignments.cjs');
 const { createModelService } = require('../../server/models.cjs');
@@ -18,57 +18,26 @@ const embeddingService = require('../../server/embedding-service.cjs');
 const KEV_ENV = { COWORK_DECISION_URL: 'http://kev:11435', COWORK_DECISION_MODEL: 'kev-0.8b', COWORK_SENSITIVITY_DECISION_URL: 'http://laya:8040' };
 
 function decisionFixture(env = KEV_ENV) {
-  const map = new Map(), audits = [];
+  const map = new Map();
   const store = { get: (k) => map.get(k), set: (k, v) => map.set(k, v), delete: (k) => map.delete(k) };
-  const settings = createDecisionSettings({ store, env, fetchImpl: async () => Response.json({ ready: true }), audit: (action, actor, detail) => audits.push([action, actor, detail]) });
-  // The feature registry is the Rust front's; these routes are the decision-settings leaf that stays Node's.
-  const route = createFeatureRoutes({ decisionSettings: settings, json: (res, status, body) => Object.assign(res, { status, body }), readJson: async (req) => req.body });
-  const call = async (method, body, role = 'admin', path = '/api/admin/decision-settings') => { const res = {}; await route({ method, body }, res, { path, authn: { user: { id: role, role } } }); return res; };
-  return { map, audits, settings, call, store };
+  // #2190: the routes (save, reset, PUT {reset:true}, audit, the 405s and 403s) are the Rust front's,
+  // tested in noevia-rs tests/decision_settings.rs; Node re-reads the row it writes.
+  const settings = createDecisionSettings({ store, env, fetchImpl: async () => Response.json({ ready: true }) });
+  return { map, settings, store };
 }
 
 // ── #1765 ───────────────────────────────────────────────────────────────────────────────────────
 
-test('#1765 DELETE forgets the saved URL: the deployment URL, its model and source apply again, audited', async () => {
+test('#1765 a reset by the Rust front: the deployment URL, its model and source apply again on the next use', () => {
   const f = decisionFixture();
-  assert.equal((await f.call('PUT', { url: 'http://192.168.1.20:8040', timeoutMs: 900 })).body.source, 'admin');
+  rustSavesDecision(f.store, { url: 'http://192.168.1.20:8040', timeoutMs: 900 });
+  assert.equal(f.settings.get().source, 'admin');
   assert.equal(f.settings.backend().model, 'laya', 'a URL saved in Settings gets the Laya profile');
-  const res = await f.call('DELETE');
-  assert.equal(res.status, 200);
-  assert.deepEqual(res.body, { url: 'http://kev:11435', timeoutMs: 1500, source: 'deployment' });
-  assert.equal(f.map.has('decision:configuration'), false, 'the stored key is removed, not overwritten');
+  rustResetsDecision(f.store);
+  assert.deepEqual(f.settings.get(), { url: 'http://kev:11435', timeoutMs: 1500, source: 'deployment' });
   assert.equal(f.settings.backend().model, 'kev-0.8b', 'decisions go to the deployment model again');
-  assert.deepEqual(f.audits.at(-1), ['decision.reset', 'admin', { hadSaved: true }]);
   // A restart reads no saved value either.
   assert.equal(createDecisionSettings({ store: f.store, env: KEV_ENV }).get().source, 'deployment');
-});
-
-test('#1765 PUT {reset:true} is the same reset; a reset with nothing saved still answers and is audited', async () => {
-  const f = decisionFixture();
-  const idle = await f.call('PUT', { reset: true });
-  assert.equal(idle.status, 200);
-  assert.equal(idle.body.source, 'deployment');
-  assert.deepEqual(f.audits.at(-1), ['decision.reset', 'admin', { hadSaved: false }]);
-  await f.call('PUT', { url: 'http://192.168.1.20:8040', timeoutMs: 700 });
-  const res = await f.call('PUT', { reset: true });
-  assert.deepEqual([res.status, res.body.url, res.body.source], [200, 'http://kev:11435', 'deployment']);
-  // reset must be exactly true: anything else is an ordinary (invalid) save.
-  const bad = await f.call('PUT', { reset: 'yes' });
-  assert.equal(bad.status, 400);
-  assert.equal(f.settings.get().source, 'deployment');
-});
-
-test('#1765 members cannot reset; the test path refuses DELETE; a store without delete still resets', async () => {
-  const f = decisionFixture();
-  await f.call('PUT', { url: 'http://192.168.1.20:8040', timeoutMs: 700 });
-  assert.equal((await f.call('DELETE', undefined, 'member')).status, 403);
-  assert.equal((await f.call('PUT', { reset: true }, 'member')).status, 403);
-  assert.equal(f.settings.get().source, 'admin', 'nothing changed');
-  assert.equal((await f.call('DELETE', undefined, 'admin', '/api/admin/decision-settings/test')).status, 405);
-  const map = new Map([['decision:configuration', JSON.stringify({ url: 'http://192.168.1.20:8040', timeoutMs: 700 })]]);
-  const legacy = createDecisionSettings({ store: { get: (k) => map.get(k), set: (k, v) => map.set(k, v) }, env: KEV_ENV });
-  assert.equal(legacy.reset('admin').source, 'deployment');
-  assert.equal(createDecisionSettings({ store: { get: (k) => map.get(k), set() {} }, env: KEV_ENV }).get().source, 'deployment');
 });
 
 test('#1765 the settings store deletes the row', () => {
@@ -111,7 +80,7 @@ test('#1796 describeDecision: shared sensitivity, a URL saved in Settings, nothi
 
 test('#1796 GET /api/models/assignments takes the decision rows from the decision settings', async () => {
   const f = decisionFixture();
-  f.settings.save({ url: 'http://192.168.1.20:8040', timeoutMs: 900 }, 'admin');
+  rustSavesDecision(f.store, { url: 'http://192.168.1.20:8040', timeoutMs: 900 });
   const sent = [];
   const handle = createModelRoutes({
     servedEmbeddingModels: async () => [], json: (res, status, body) => sent.push({ status, body }),
@@ -126,7 +95,7 @@ test('#1796 GET /api/models/assignments takes the decision rows from the decisio
   await handle(req, { setHeader() {} }, { path: '/api/models/assignments', authn: { user: { id: 'u1', role: 'admin' } }, url: new URL('http://localhost/api/models/assignments') });
   const by = Object.fromEntries(sent.pop().body.services.map((s) => [s.id, s]));
   assert.deepEqual([by.decision.model, by.decision.source], ['laya', 'admin']);
-  f.settings.reset('admin');
+  rustResetsDecision(f.store);
   await handle(Object.assign(Readable.from([]), { method: 'GET' }), { setHeader() {} }, { path: '/api/models/assignments', authn: { user: { id: 'u1', role: 'admin' } }, url: new URL('http://localhost/api/models/assignments') });
   const after = Object.fromEntries(sent.pop().body.services.map((s) => [s.id, s]));
   assert.deepEqual([after.decision.model, after.decision.source], ['kev-0.8b', 'deployment']);

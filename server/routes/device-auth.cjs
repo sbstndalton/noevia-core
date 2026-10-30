@@ -4,10 +4,10 @@
 // /api/auth/devices/{id}) and a device token's GET /api/auth/session and POST /api/auth/logout are
 // the Rust front's (sbstndalton/noevia#1071; rust-auth.cjs OWNED_ROUTES refuses them before this
 // module runs). One mount remains, before the session gate:
-//   open     while the nativeClientAuth feature is off, the /device approval page answers 404, as
-//            if it did not exist; and a request to /api/ that carries BOTH a device bearer token
-//            and a session cookie is refused with 400, so neither credential can ride along with
-//            the other on the routes Node still answers.
+//   open     while the nativeClientAuth feature is on, a request to /api/ that carries BOTH a
+//            device bearer token and a session cookie is refused with 400, so neither credential
+//            can ride along with the other on the routes Node still answers. (The /device page is
+//            the Rust front's, sbstndalton/noevia#2190.)
 //
 // It returns true when it handled the request.
 
@@ -23,8 +23,9 @@ const DEVICE_API = /^\/api\/auth\/(device\/(code|token|lookup|approve)|devices(\
  */
 function createDeviceAuthRoutes({ json, enabled }) {
   async function open(req, res, { path: p }) {
-    const isDevicePage = p === '/device' || p === '/device/';
-    if (!enabled()) return isDevicePage ? json(res, 404, { error: 'not found' }) : PASS;
+    // The /device approval page (its 404 while the feature is off) is the Rust front's
+    // (sbstndalton/noevia#2190; rust-public-pages.cjs refuses it before this module runs).
+    if (!enabled()) return PASS;
     if (p.startsWith('/api/') && bearerToken(req) && hasSessionCookie(req)) {
       return json(res, 400, { error: 'Send either a session cookie or a bearer token, not both.', code: 'ambiguous_credentials' });
     }
