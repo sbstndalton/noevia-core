@@ -52,99 +52,10 @@ let currentStorage = null;
 // The routes reach uploads.ingest through the module, so the harness's storage is handed in here.
 uploads.ingest = (...args) => { args[4] = { ...args[4], storageImpl: currentStorage }; return realIngest(...args); };
 test.after(() => { uploads.ingest = realIngest; });
-function harness(remote = false) {
-  const project = { id: 'fixture-project', files: [], projectFolder: 'fixture', sourceFolders: remote ? ['fixture'] : [] };
-  const stored = new Map();
-  const workspace = { assetDir: id => path.join(testDir, 'assets', id), dir: path.join(testDir, String(++workspaceNumber)), userId: 'fixture-user', projects: [project], saveProjects: () => {} };
-  let extracts = 0;
-  const storageClient = {
-    TEXT_EXTENSIONS: new Set(['.txt']), isBrowsable: () => remote,
-    createFolder: async () => {},
-    writeFile: async (_conn, name, bytes) => stored.set(name, bytes),
-    listFiles: async () => [...stored.keys()].map(p => ({ name: p.split('/').pop(), path: p, ext: '.pdf' })),
-    // As storage-client.cjs readBinaryFile: over the caller's cap (default 25 MiB) is a 413 (#1864).
-    readBinaryFile: async (_conn, name, opts) => {
-      const bytes = stored.get(name), cap = (opts && opts.cap) || 25 * 1024 * 1024;
-      if (bytes && bytes.length > cap) throw Object.assign(new Error(`file exceeds the ${cap} byte limit`), { status: 413 });
-      return bytes;
-    },
-    deleteFile: async (_conn, name) => stored.delete(name),
-  };
-  currentStorage = storageClient;
-  const shared = {
-    fs, path, documentSources, storageClient,
-    rag: { indexProjectFile: async () => {}, deleteProjectFile: () => {} },
-    authService: { getStorage: () => ({}) }, currentWorkspace: () => workspace, PROJECTS: [project],
-  };
-  const store = {
-    ...require('./projects.cjs').createProjectStore({ ...shared, reasoningEffort: {}, projectAppearance: () => ({}), FREE_CHATS: [], sanitizeToolboxes: () => null, defaultToolboxes: () => [], PROJECT_ROOT_FOLDER: 'fixture-root', createProjectFolder: async () => null, projectSweep: { afterDelete: async () => {} } }),
-    getProject: id => id === project.id ? project : null, saveProjects: () => {},
-  };
-  let last;
-  const routes = require('./routes/projects.cjs').createProjectRoutes({
-    ...shared, store, requestScope: { getStore: () => ({}) }, dispatch: async () => {},
-    readJson: async req => req.body, readBody: async req => JSON.stringify(req.body),
-    json: (_res, status, body) => { last = { status, body }; },
-    documents: { ...documents, extractDocumentText: async (...args) => { extracts++; return documents.extractDocumentText(...args); } },
-    reasoningEffort: {}, projectAppearance: () => ({}), diaryExtras: {}, DEFAULT_TOOLBOXES: [], sanitizeToolboxes: () => null, getProvider: () => null, ensureRolesLoaded: () => {},
-  });
-  const run = async (p, req) => { last = undefined; await routes(req, {}, { path: p, authn: { user: { id: 'fixture-user' } }, url: new URL('http://localhost' + p) }); return last; };
-  return { project, stored, workspace, extracts: () => extracts,
-    // `replace` is the explicit overwrite of an existing source (#1454); without it a taken name is refused.
-    upload: (name, bytes, id = project.id, organized = false, replace = false) => run('/api/projects/' + id + '/upload', { method: 'POST', body: { name, organized, ...(replace ? { replace: true } : {}), dataBase64: bytes.toString('base64') } }),
-    remove: name => run('/api/projects/' + project.id + '/files', { method: 'DELETE', body: { path: name } }),
-    sync: () => run('/api/projects/' + project.id + '/sources/sync', { method: 'POST' }),
-  };
-}
 
-test('local PDF upload extracts text; failed replacement preserves prior text', async () => {
-  const h = harness();
-  assert.equal((await h.upload('statement.pdf', fixture('text.pdf'))).status, 200);
-  const before = h.project.files[0].content;
-  assert.equal((await h.upload('statement.pdf', fixture('scanned.pdf'), undefined, false, true)).body.document.stale, true);
-  assert.equal(h.project.files[0].content, before);
-  assert.deepEqual(documentSources.readOriginal(h.workspace, h.project.id, h.project.files[0]), fixture('scanned.pdf'));
-  assert.match(documentSources.readPages(h.workspace, h.project.id, h.project.files[0]).text, /TEXT-P1/);
-});
 
-test('remote upload preserves original bytes; sync distinguishes existing and new failed sources', async () => {
-  const h = harness(true);
-  await h.upload('old.pdf', fixture('text.pdf'));
-  assert.deepEqual(h.stored.get('fixture/old.pdf'), fixture('text.pdf'));
-  await h.sync();
-  const before = h.project.files[0].content;
-  await h.upload('old.pdf', fixture('scanned.pdf'), undefined, false, true);
-  await h.upload('new.pdf', fixture('scanned.pdf'));
-  const out = await h.sync();
-  assert.equal(out.body.skipped.length, 2);
-  assert.equal(h.project.files.length, 2);
-  assert.equal(h.project.files.find(f => f.name === 'fixture/new.pdf').document.stale, false);
-  assert.equal(h.project.files[0].content, before);
-  assert.equal(h.project.files[0].name, 'fixture/old.pdf');
-});
 
-test('upload/sync preserve truncation metadata and unchanged bytes reuse extraction', async () => {
-  const local = harness();
-  const uploaded = await local.upload('long.pdf', fixture('long.pdf'));
-  assert.equal(uploaded.body.document.truncated, true);
-  assert.equal(local.project.files[0].content.length, documents.EXTRACT_CAP);
-  const remote = harness(true);
-  await remote.upload('long.pdf', fixture('long.pdf'));
-  const synced = await remote.sync();
-  assert.equal(synced.body.files[0].document.truncated, true);
-  await remote.sync();
-  const old = documents.extractDocumentText;
-  documents.extractDocumentText = async () => { throw new Error('unchanged content must not be parsed'); };
-  try { await remote.sync(); assert.equal(remote.project.files[0].document.state, 'partial'); }
-  finally { documents.extractDocumentText = old; }
-});
 
-test('upload rejects oversized bytes and a project outside the current workspace', async () => {
-  const h = harness();
-  assert.equal((await h.upload('large.pdf', Buffer.alloc(25 * 1024 * 1024 + 1))).status, 413);
-  assert.equal((await h.upload('text.pdf', fixture('text.pdf'), 'another-users-project')).status, 404);
-  assert.equal(h.extracts(), 0);
-});
 
 test('S3 binary reads preserve bytes and enforce the cap', async () => {
   const originalFetch = global.fetch;
@@ -190,82 +101,14 @@ test('blank PDF pages are kept as blank rather than OCR failures', async () => {
   assert.equal(out.pageTexts[0].status, 'blank');
 });
 
-test('a detached folder is not restored when its in-flight refresh finishes', async () => {
-  const h = harness(true);
-  await h.upload('a.pdf', fixture('text.pdf'));
-  const extract = documentSources.ingest;
-  let release; const wait = new Promise(resolve => { release = resolve; });
-  let entered; const started = new Promise(resolve => { entered = resolve; });
-  documentSources.ingest = async (...args) => { entered(); await wait; return extract(...args); };
-  try {
-    const refresh = h.sync(); await started;
-    h.project.sourceFolders = [];
-    release(); await refresh;
-    assert.equal(h.project.files.filter(f => f.source).length, 0);
-  } finally { documentSources.ingest = extract; }
-});
-
-test('concurrent source operations serialize so a stale refresh cannot overwrite a later upload', async () => {
-  const h = harness(true);
-  await h.upload('a.pdf', fixture('text.pdf'));
-  const ingest = documentSources.ingest;
-  let release; const wait = new Promise(resolve => { release = resolve; });
-  let entered; const started = new Promise(resolve => { entered = resolve; });
-  let first = true;
-  documentSources.ingest = async (...args) => { if (first) { first = false; entered(); await wait; } return ingest(...args); };
-  try {
-    const refresh = h.sync(); await started;
-    const upload = h.upload('a.pdf', fixture('scanned.pdf'), undefined, false, true);
-    release(); await Promise.all([refresh, upload]);
-    const f = h.project.files[0];
-    assert.equal(f.document.state, 'failed'); assert.equal(f.document.stale, true);
-    assert.deepEqual(documentSources.readOriginal(h.workspace, h.project.id, f), fixture('scanned.pdf'));
-  } finally { documentSources.ingest = ingest; }
-});
-
-// #2191 round 3: DELETE /api/projects/{id}/files is the Rust front's (rust-project-files.cjs refuses
-// it before auth; noevia-rs crates/server-projects files.rs prunes the source, original and images).
-test('file deletion is no longer answered by the Node projects routes', async () => {
-  const h = harness(true);
-  await h.upload('a.pdf', fixture('text.pdf'));
-  assert.equal(await h.remove('fixture/a.pdf'), undefined);
-  assert.equal(h.project.files.length, 1); assert.equal(h.stored.size, 1);
-});
 
 
-test('organized remote refresh preserves opaque files and images, and exact managed paths can be deleted', async () => {
-  const h = harness(true);
-  for (const name of ['fixture.docx', 'fixture.png', 'fixture.txt']) {
-    const out = await h.upload(name, Buffer.from('synthetic bytes'), h.project.id, true);
-    assert.equal(out.status, 200, JSON.stringify(out));
-  }
-  assert.equal(h.project.files.length, 3);
-  const refreshed = await h.sync();
-  assert.equal(refreshed.status, 200);
-  assert.equal(h.project.files.length, 3);
-  assert.equal(h.project.files.find(f => f.name.endsWith('.docx')).attachment.state, 'stored');
-  assert.equal(h.project.assets.length, 1);
-});
 
 
-test('refresh migrates legacy local images into managed storage without losing their bytes', async () => {
-  const h = harness(true);
-  const dir = h.workspace.assetDir(h.project.id); fs.mkdirSync(dir, { recursive: true });
-  const bytes = Buffer.from('synthetic legacy image'); fs.writeFileSync(path.join(dir, 'img-legacy'), bytes);
-  h.project.assets = [{ id: 'img-legacy', name: 'fixture.png', mime: 'image/png', bytes: bytes.length }];
-  const out = await h.sync(); assert.equal(out.status, 200);
-  assert.deepEqual(h.stored.get('fixture/Images/fixture-img-legacy.png'), bytes);
-  assert.equal(h.project.assets.length, 1); assert.equal(h.project.assets[0].storagePath, 'fixture/Images/fixture-img-legacy.png');
-  assert.equal(h.project.files.length, 1);
-});
 
 
-test('refresh retains unified batches larger than the retired 40-source folder cap', async () => {
-  const h = harness(true);
-  for (let i=0; i<41; i++) assert.equal((await h.upload(`fixture-${i}.bin`, Buffer.from('synthetic'), h.project.id, true)).status, 200);
-  const out = await h.sync(); assert.equal(out.status, 200);
-  assert.equal(h.project.files.length, 41); assert.equal(out.body.skipped.length, 0);
-});
+
+
 
 test('retrieval fallback stays within the files-context budget, smallest first, naming omitted files', async () => {
   const ragSource = fs.readFileSync(path.join(__dirname, 'rag.cjs'), 'utf8');
@@ -293,31 +136,6 @@ test('retrieval fallback stays within the files-context budget, smallest first, 
   assert.equal(included + omitted, files.length);
 });
 
-test('#577: with Docling live, text-like types stay on the plain-text path and SKILL.md yields a readable Skill awaiting review', async () => {
-  const prev = process.env.DOCLING_BASE_URL; process.env.DOCLING_BASE_URL = 'http://synthetic-docling';
-  try {
-    for (const name of ['a.md', 'A.MARKDOWN', 'a.txt', 'a.csv', 'a.json', 'a.yaml', 'a.yml', 'a.ts', 'a.py', 'a.sh', 'SKILL.md']) {
-      assert.equal(documents.isDocument(name), false, name);
-    }
-    assert.equal(documents.isDocument('a.docx'), true);
-    assert.equal(documents.isDocument('a.pdf'), true);
-    const h = harness(true);
-    const skill = '---\nname: synthetic-skill\ndescription: Synthetic skill for tests\n---\n\nDo the synthetic thing.\n';
-    const out = await h.upload('SKILL.md', Buffer.from(skill), h.project.id, true);
-    assert.equal(out.status, 200, JSON.stringify(out));
-    const file = h.project.files.find(f => f.name.endsWith('SKILL.md'));
-    assert.equal(file.attachment.state, 'ready');
-    assert.equal(file.content, skill);
-    const listed = require('./instruction-skills.cjs').list(h.project);
-    assert.equal(listed.length, 1);
-    assert.equal(listed[0].status, 'review');
-    for (const name of ['notes.md', 'data.csv', 'conf.json', 'conf.yaml']) {
-      const r = await h.upload(name, Buffer.from('synthetic text'), h.project.id, true);
-      assert.equal(r.status, 200, name);
-      assert.equal(r.body.attachment.state, 'ready', name);
-    }
-  } finally { if (prev === undefined) delete process.env.DOCLING_BASE_URL; else process.env.DOCLING_BASE_URL = prev; }
-});
 
 // #1864: a large PDF that arrives through storage (an attached folder, or the project's own synced
 // folder) is read and indexed, not skipped for its size. Synthetic: a text page plus padding.
@@ -335,32 +153,4 @@ function largeSyntheticPdf(marker, padding) {
   return Buffer.concat(parts);
 }
 
-test('#1864: a PDF over 25 MiB in an attached or synced folder is read and indexed, not skipped for its size', async () => {
-  const h = harness(true);
-  const attached = largeSyntheticPdf('SYN-LARGE-ATTACHED', 26 * 1024 * 1024);
-  const managed = largeSyntheticPdf('SYN-LARGE-MANAGED', 26 * 1024 * 1024);
-  h.stored.set('fixture/Finance/large.pdf', attached);
-  h.stored.set('fixture/Documents/large-synced.pdf', managed);
-  const out = await h.sync();
-  assert.equal(out.status, 200);
-  assert.deepEqual(out.body.skipped.filter(s => /byte limit/.test(s.reason)), [], 'no file skipped for its byte size');
-  const a = h.project.files.find(f => f.name === 'fixture/Finance/large.pdf');
-  const m = h.project.files.find(f => f.name === 'fixture/Documents/large-synced.pdf');
-  assert.equal(a.document.state, 'ready'); assert.match(a.content, /SYN-LARGE-ATTACHED/);
-  assert.equal(m.document.state, 'ready'); assert.match(m.content, /SYN-LARGE-MANAGED/);
-  // Uploads keep their HTTP body cap (a separate concern): same bytes, refused with 413.
-  assert.equal((await h.upload('large-upload.pdf', attached)).status, 413);
-});
 
-test('#1864: a PDF over PROJECT_DOCUMENT_READ_BYTES is listed as failed with the reason, never silently dropped', async () => {
-  const h = harness(true);
-  h.stored.set('fixture/huge.pdf', largeSyntheticPdf('SYN-HUGE', 2 * 1024 * 1024));
-  const saved = process.env.PROJECT_DOCUMENT_READ_BYTES;
-  process.env.PROJECT_DOCUMENT_READ_BYTES = String(1024 * 1024);
-  try {
-    const out = await h.sync();
-    const file = h.project.files.find(f => f.name === 'fixture/huge.pdf');
-    assert.equal(file.document.state, 'failed');
-    assert.match(out.body.skipped.find(s => s.file === 'fixture/huge.pdf').reason, /1048576 byte limit/);
-  } finally { if (saved === undefined) delete process.env.PROJECT_DOCUMENT_READ_BYTES; else process.env.PROJECT_DOCUMENT_READ_BYTES = saved; }
-});

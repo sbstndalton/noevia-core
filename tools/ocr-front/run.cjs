@@ -243,10 +243,12 @@ async function main() {
       await scenario(front, mode, workerBase, fixtures, root, []);
       console.log(`PASS: ${mode} native OCR rejected by the same scan oracle`);
     }
-    const reference = await scenario(null, 'good', workerBase, fixtures, root, []);
-    const actual = await scenario(front, 'good', workerBase, fixtures, root, []);
-    assert.deepEqual(actual, reference, 'Rust front document contracts must have zero diffs');
-    console.log('PASS: native OCR/DOCX/reduction through Rust front; zero document contract diffs; tenant isolation');
+    // sbstndalton/noevia#2191 round 8: Node no longer runs uploads (the Rust front does; Node refuses the
+    // POST with 503), so there is no Node reference to compare with. The contracts asserted inside the
+    // scenario (the scan oracle, the DOCX state, the reduction's relationships, the stored text, the tenant
+    // refusals) are the gate, on the front alone.
+    await scenario(front, 'good', workerBase, fixtures, root, []);
+    console.log('PASS: native OCR/DOCX/reduction through Rust front; contracts asserted; tenant isolation');
   } finally { await stop(native); fs.rmSync(root, { recursive: true, force: true }); }
 }
 main().catch(async error => { console.error(error); await Promise.all([...children].map(stop)); process.exitCode = 1; });

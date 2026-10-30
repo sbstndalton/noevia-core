@@ -114,22 +114,4 @@ const ifLarge = (size, fn, ref) => (isLarge(size) ? withLargeDocument(fn, ref) :
 
 const held = () => !!holder.getStore();
 
-/**
- * Read a document from storage and use its bytes, under the lock when it is large (#1872). The listed
- * size can be wrong (a file listed small but sent large), so when the listing does not already demand the
- * lock the read is given a `beforeBody(contentLength)` hook that takes it from the response headers,
- * before any of the body is read, when the length is over 25 MiB or missing. `read(beforeBody)` returns the
- * bytes; `use(bytes)` runs while the lock is still held.
- */
-async function readThenUse(listedSize, read, use, ref) {
-  if (isLarge(listedSize) || held()) return ifLarge(listedSize, async () => use(await read(undefined)), ref);
-  let release = null;
-  try {
-    const bytes = await read(async (contentLength) => {
-      if (isLarge(contentLength)) release = await acquire(ref);
-    });
-    return await (release ? holding(() => use(bytes)) : use(bytes));
-  } finally { if (release) release(); }
-}
-
-module.exports = { counters, refHash, withLargeDocument, ifLarge, isLarge, held, acquire, holding, detached, readThenUse, LARGE_BYTES, ACQUIRE_WAIT_MS, HOLD_WARN_MS };
+module.exports = { counters, refHash, withLargeDocument, ifLarge, isLarge, held, acquire, holding, detached, LARGE_BYTES, ACQUIRE_WAIT_MS, HOLD_WARN_MS };

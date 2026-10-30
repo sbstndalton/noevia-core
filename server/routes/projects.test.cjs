@@ -9,7 +9,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const { AsyncLocalStorage } = require('node:async_hooks');
-const { createProjectRoutes, sameSource, DOCUMENT_UPLOAD_CAP } = require('./projects.cjs');
+const { createProjectRoutes } = require('./projects.cjs');
 const { createProviderRegistry } = require('../providers.cjs');
 
 function fixture({ projects = [], diary = true, catalogue = null, onToolboxesChange } = {}) {
@@ -192,45 +192,7 @@ test('chat metas: the list and one chat\'s delete are not this mount\'s any more
   assert.equal(f.sent.length, 0);
   assert.equal(f.store.savedChats, undefined, 'nothing saved');
 });
-test('uploads refuse what they always refused', async () => {
-  const f = fixture({ projects: [{ id: 'p1', files: [] }] });
-  await f.call('POST', '/api/projects/p1/upload', { name: '' });
-  assert.deepEqual(f.sent.pop(), { status: 400, body: { error: 'a filename is required' } });
-  await f.call('POST', '/api/projects/p1/upload', { name: 'photo.png' });
-  assert.deepEqual(f.sent.pop(), { status: 400, body: { error: 'photo.png is not a supported source (text file or PDF).' } });
-  await f.call('POST', '/api/projects/p1/upload', { name: 'notes.txt', dataBase64: '' });
-  assert.deepEqual(f.sent.pop(), { status: 400, body: { error: 'file was empty' } });
-  // A document upload is the Rust front's (#2191 round 5, rust-project-documents.cjs): not this mount's.
-  assert.equal(await f.call('POST', '/api/projects/p1/documents', { name: 'notes.txt' }), false);
-  assert.equal(await f.call('POST', '/api/projects/p1/documents', { name: 'x.pdf' }, '?background=1'), false);
-  // A project's images are the Rust front's (#1071): not this mount's.
-  assert.equal(await f.call('POST', '/api/projects/p1/assets', { name: 'a', mime: 'image/bmp' }), false);
-  for (const m of ['GET', 'DELETE']) assert.equal(await f.call(m, '/api/projects/p1/assets/img-1'), false, m);
-  // A source file's delete is the Rust front's (#2191 round 3, rust-project-files.cjs): not this mount's.
-  assert.equal(await f.call('DELETE', '/api/projects/p1/files', { path: 'Elsewhere/x.txt' }), false);
-  assert.equal(DOCUMENT_UPLOAD_CAP, 25 * 1024 * 1024);
-});
 
-test('the front\'s worker call re-enters the router with the caller\'s headers and streams its progress (#2191 round 6)', async () => {
-  const f = fixture({ projects: [{ id: 'p1', files: [] }] });
-  // The background start and the poll are the Rust front's (rust-source-jobs.cjs refuses them before
-  // this mount): the poll has no handler here, and nothing re-enters the router without the header.
-  assert.equal(await f.call('GET', '/api/projects/p1/source-jobs/11111111-1111-4111-8111-111111111111'), false);
-  assert.deepEqual(f.dispatched, []);
-  const work = { 'x-noevia-source-work': '1' };
-  assert.equal(await f.call('POST', '/api/projects/p1/upload', { name: 'x.txt' }, '', 'member', work), true);
-  assert.equal(f.dispatched.length, 1);
-  assert.equal(f.dispatched[0].url, '/api/projects/p1/upload');
-  assert.equal(f.dispatched[0].headers.cookie, 'session=x');
-  assert.equal(f.dispatched[0].headers['x-noevia-source-work'], undefined, 'the inner call is the plain synchronous route');
-  assert.equal(typeof f.dispatched[0].progress, 'function');
-  assert.deepEqual(f.streamed, [
-    { status: 200, headers: { 'Content-Type': 'application/x-ndjson', 'Cache-Control': 'no-store' } },
-    { accepted: true }, { done: { status: 200, body: { ok: true } } }, 'end']);
-  await f.call('POST', '/api/projects/ghost/upload', { name: 'x.txt' }, '', 'member', work);
-  assert.deepEqual(f.sent.pop(), { status: 404, body: { error: 'project not found' } });
-  assert.equal(f.streamed.length, 4, 'a refusal is plain JSON, not a stream');
-});
 
 test('Diary context remains Node-owned and respects the add-on permission', async () => {
   const off = fixture({ diary: false });
@@ -348,60 +310,7 @@ test('a model on a non-default (cloud) provider is never checked against the loc
   assert.equal(f.projects[0].model, 'laya_multilingual_f16');
 });
 
-test('malformed source JSON on the front\'s worker call is 400 before any work is dispatched', async () => {
-  const f = fixture({ projects: [{ id: 'p1' }] });
-  for (const suffix of ['upload', 'sources/sync']) {
-    await assert.rejects(f.call('POST', `/api/projects/p1/${suffix}`, '{broken', '', 'member', { 'x-noevia-source-work': '1' }),
-      { status: 400, message: 'invalid JSON' });
-  }
-  assert.deepEqual(f.streamed, []);
-  // The document upload is the Rust front's (#2191 round 5): no background job for it here.
-  assert.equal(await f.call('POST', '/api/projects/p1/documents', '{broken', '?background=1'), false);
-  assert.deepEqual(f.dispatched, []);
-});
 
-test('a project id from another tenant 404s on the upload path: getProject reads only the current workspace (#116)', async () => {
-  const { createProjectStore } = require('../projects.cjs');
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'noevia-tenant-'));
-  const mk = (userId) => ({ dir: path.join(root, userId), userId, projects: [], freeChats: [], saveProjects() {}, saveFreeChats() {}, historyPath: (id) => path.join(root, userId, `h-${id}.json`), assetDir: (id) => path.join(root, userId, 'assets', id), ragDir: () => path.join(root, userId, 'rag') });
-  const tenants = { alice: mk('alice'), bob: mk('bob') };
-  tenants.bob.projects.push({ id: 'proj-bob', name: 'Bob only', files: [], chats: [] });
-  tenants.alice.projects.push({ id: 'proj-alice', name: 'Alice', files: [], chats: [] });
-  const scope = new AsyncLocalStorage();
-  const currentWorkspace = () => tenants[scope.getStore().user];
-  // The same request-scoped array view index.cjs builds (arrayProxy).
-  const view = (field) => new Proxy([], {
-    get(_t, prop) { const v = currentWorkspace()[field][prop]; return typeof v === 'function' ? v.bind(currentWorkspace()[field]) : v; },
-    set(_t, prop, v) { currentWorkspace()[field][prop] = v; return true; },
-    ownKeys() { return Reflect.ownKeys(currentWorkspace()[field]); },
-    getOwnPropertyDescriptor() { return { enumerable: true, configurable: true }; },
-  });
-  const PROJECTS = view('projects');
-  const store = createProjectStore({ fs, path, reasoningEffort: {}, projectAppearance: () => ({}), rag: {}, storageClient: { isBrowsable: () => false }, documentSources: {}, authService: {},
-    currentWorkspace, PROJECTS, FREE_CHATS: view('freeChats'), sanitizeToolboxes: () => null, defaultToolboxes: () => [], PROJECT_ROOT_FOLDER: 'x', createProjectFolder: async () => null, projectSweep: {} });
-  const sent = [];
-  let touchedLock = false;
-  const routes = createProjectRoutes({
-    json: (_res, status, body) => { sent.push({ status, body }); }, readBody: async () => '{}', readJson: async () => ({}), requestScope: scope, dispatch: async () => {},
-    currentWorkspace, authService: { getStorage: () => ({ kind: 'local' }) }, storageClient: { isBrowsable: () => false, TEXT_EXTENSIONS: new Set(['.txt']) }, documents: { isDocument: () => false },
-    documentSources: {}, rag: {}, fs, path, reasoningEffort: {}, projectAppearance: () => ({}), diaryExtras: { chatProjectId: () => null }, PROJECTS, DEFAULT_TOOLBOXES: [], sanitizeToolboxes: () => null,
-    getProvider: () => null, ensureRolesLoaded() {}, store: { ...store, withSourceLock: (...a) => { touchedLock = true; return store.withSourceLock(...a); } },
-  });
-  const upload = (user, id) => scope.run({ user }, () => {
-    const p = `/api/projects/${id}/upload`;
-    const req = Readable.from([Buffer.from(JSON.stringify({ name: 'n.txt', dataBase64: Buffer.from('synthetic').toString('base64'), organized: true }))]);
-    Object.assign(req, { method: 'POST', url: p, headers: {}, socket: {} });
-    return routes(req, { writeHead() {}, end() {} }, { path: p, authn: { user: { id: user } }, url: new URL(`http://localhost${p}`) });
-  });
-  try {
-    await upload('alice', 'proj-bob');
-    assert.deepEqual(sent.pop(), { status: 404, body: { error: 'no such project' } });
-    assert.equal(touchedLock, false, 'no source lock or write was attempted for a foreign project');
-    assert.deepEqual(tenants.bob.projects[0].files, [], 'the other tenant\'s project is untouched');
-    scope.run({ user: 'bob' }, () => assert.equal(store.getProject('proj-bob').name, 'Bob only'));
-    scope.run({ user: 'alice' }, () => assert.equal(store.getProject('proj-bob'), null));
-  } finally { fs.rmSync(root, { recursive: true, force: true }); }
-});
 
 test('#796: saving a project\'s toolbox selection clears the cached permitted-tools view', async () => {
   let cleared = 0;
@@ -473,12 +382,26 @@ test('#1458: renaming a project moves nothing: its storage folder and every sour
   assert.deepEqual(project.files.map((x) => x.name), ['noevia projects/proj-1/Text/a.md']);
 });
 
-test('sameSource ignores undefined top-level keys, which a store round-trip drops (#1953)', () => {
-  const file = { name: 'notes.txt', size: 12, source: undefined, content: () => 'lazy' };
-  const roundTrip = JSON.parse(JSON.stringify(file));
-  assert.ok(!('source' in roundTrip));
-  assert.equal(sameSource(file, roundTrip), true);
-  assert.equal(sameSource(roundTrip, file), true);
-  assert.equal(sameSource(file, { ...roundTrip, size: 13 }), false);
-  assert.equal(sameSource(file, { ...roundTrip, source: null }), false);
+
+// #2191 round 8: every way a source reaches a project is the Rust front's (rust-project-source-work.cjs,
+// rust-project-documents.cjs, rust-project-files.cjs and the project reads refuse them before this mount),
+// so this router has no handler for any of them, with or without the old worker header or a background query.
+test('the upload, the sync, the folder plan, the documents, the images and the file delete have no handler here', async () => {
+  const f = fixture({ projects: [{ id: 'p1', files: [] }] });
+  const work = { 'x-noevia-source-work': '1' };
+  for (const [method, url, query, headers] of [
+    ['POST', '/api/projects/p1/upload', '', undefined],
+    ['POST', '/api/projects/p1/upload', '?background=1', undefined],
+    ['POST', '/api/projects/p1/upload', '', work],
+    ['POST', '/api/projects/p1/sources/sync', '', work],
+    ['POST', '/api/projects/p1/folder-import/plan', '', undefined],
+    ['POST', '/api/projects/p1/documents', '', undefined],
+    ['POST', '/api/projects/p1/assets', '', undefined],
+    ['GET', '/api/projects/p1/assets/img-1', '', undefined],
+    ['DELETE', '/api/projects/p1/files', '', undefined],
+    ['GET', '/api/projects/p1/source-jobs/11111111-1111-4111-8111-111111111111', '', undefined],
+  ]) {
+    assert.equal(await f.call(method, url, { name: 'x.txt' }, query, 'member', headers), false, `${method} ${url}${query}`);
+  }
+  assert.deepEqual(f.dispatched || [], [], 'nothing re-enters the router');
 });
