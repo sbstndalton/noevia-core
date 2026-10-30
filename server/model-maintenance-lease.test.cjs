@@ -94,14 +94,15 @@ test('a lease whose front died expires by itself; a renewed one lasts; an ended 
   assert.equal((await ask('POST', `${PREFIX}/${lease}/renew`)).status, 404, 'the front learns it has ended');
 });
 
-test('renewal cannot keep a lease past its hard limit', async (t) => {
+test('a lease ends at its hard limit, whatever its renewal time, and renewal cannot keep it past that', async (t) => {
   const manager = realManager();
-  const { ask } = await serve(t, { hold: () => manager.holdMaintenance(), ttlMs: 100, hardMs: 150 });
+  const { ask } = await serve(t, { hold: () => manager.holdMaintenance(), ttlMs: 5000, hardMs: 200 });
   const { body: { lease } } = await ask('POST');
   await delay(70);
   assert.equal((await ask('POST', `${PREFIX}/${lease}/renew`)).status, 200);
-  await delay(120);
-  assert.equal(manager.maintenanceHeld(), false);
+  await delay(250);
+  assert.equal(manager.maintenanceHeld(), false, 'over at its limit, though renewed for much longer');
+  assert.equal((await ask('POST', `${PREFIX}/${lease}/renew`)).status, 404);
 });
 
 test('no window between check and act: in one tick, either the chat or the lease wins, never both', async () => {
