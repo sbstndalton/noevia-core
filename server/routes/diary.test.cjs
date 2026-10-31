@@ -8,7 +8,7 @@ const assert = require('node:assert/strict');
 const { Readable } = require('node:stream');
 const { createDiaryRoutes } = require('./diary.cjs');
 
-function fixture({ dir = '/nowhere', diaryOn = true, limited = false, admin = false, reply, log, storageLatch } = {}) {
+function fixture({ dir = '/nowhere', diaryOn = true, limited = false, admin = false, reply, log, storageLatch, readMonth } = {}) {
   const sent = [], fetched = [], headers = [];
   const routes = createDiaryRoutes({
     json: (res, status, body, extra) => { sent.push({ status, body, ...(extra ? { headers: extra } : {}) }); },
@@ -23,7 +23,7 @@ function fixture({ dir = '/nowhere', diaryOn = true, limited = false, admin = fa
     diary: {
       diaryHeaders: (method, url, opts) => ({ 'X-Cowork-User-ID': 'u1', ...(opts?.storageRetry ? { 'X-Cowork-Storage-Retry': '1' } : {}) }),
       log: log || (() => {}),
-      corpusSource: { name: 'sidecar', readMonth: async (m) => ({ todayLog: m || 'today', standing: '' }) },
+      corpusSource: { name: 'sidecar', readMonth: readMonth || (async (m) => ({ todayLog: m || 'today', standing: '' })) },
     },
   });
   const call = (mount, method, path, body, { search = '', role = admin ? 'admin' : 'member', reqHeaders = {} } = {}) => {
@@ -221,15 +221,40 @@ test('#1607: when the sidecar cannot say which kind of account it is, the hold s
   assert.notEqual(storageLatch.status('u1', conn), null);
 });
 
-// sbstndalton/noevia#2232: a Diary that cannot be reached (the call throws) is a 503 the page can
-// word, with a stable code and no address or error text; it used to reach http.cjs as a bare 500.
-test('#2232: an unreachable Diary answers 503 diaryUnavailable on the file listing, file save, local exchange and trash', async () => {
-  const f = fixture({ reply: () => { throw Object.assign(new TypeError('fetch failed'), { cause: { code: 'ECONNREFUSED', address: '10.1.2.3' } }); } });
+// sbstndalton/noevia#2232: a Diary that cannot be reached (the network call fails) is a 503 the page can
+// word, with a stable code and no address or error text; it used to reach http.cjs as a bare 500. Only a
+// network or abort failure is "unavailable": a redirect (fetchJson uses redirect:'error') or a failure while
+// building the tenant headers is a bug and stays a 500, and is logged by class.
+const refused = () => Object.assign(new TypeError('fetch failed'), { cause: Object.assign(new Error('connect ECONNREFUSED 10.1.2.3:8010'), { code: 'ECONNREFUSED', address: '10.1.2.3' }) });
+const ROUTES = [['GET', '/api/diary/files', undefined], ['PUT', '/api/diary/file', '{}'], ['POST', '/api/diary/local-exchange', { message: 'hi' }], ['GET', '/api/diary/workspace-trash', undefined],
+  ['GET', '/api/diary/history', undefined], ['GET', '/api/diary/external-sources', undefined],
+  ['POST', '/api/diary/external-sources/import', { sourcePath: '/a', relPath: 'b' }],
+  ['POST', '/api/diary/entries/edit', { xid: 'x', me: 'm' }]];
+
+test('#2232: an unreachable Diary answers 503 diaryUnavailable on every Node-owned Diary route', async () => {
   const unavailable = { status: 503, body: { error: 'Diary is unavailable right now. Try again shortly.', code: 'diaryUnavailable' } };
-  for (const [method, path, body] of [['GET', '/api/diary/files', undefined], ['PUT', '/api/diary/file', '{}'], ['POST', '/api/diary/local-exchange', { message: 'hi' }], ['GET', '/api/diary/workspace-trash', undefined]]) {
-    assert.equal(await f.call('diary', method, path, body), true, path);
-    const answered = f.sent.pop();
-    assert.deepEqual(answered, unavailable, path);
-    assert.doesNotMatch(JSON.stringify(answered), /10\.1\.2\.3|ECONN|fetch failed/);
+  for (const reply of [() => { throw refused(); }, () => { throw Object.assign(new Error('The operation was aborted'), { name: 'TimeoutError' }); }]) {
+    const lines = [];
+    const f = fixture({ admin: true, reply, readMonth: async () => reply(), log: (l) => lines.push(l) });
+    for (const [method, path, body] of ROUTES) {
+      assert.equal(await f.call('diary', method, path, body), true, path);
+      const answered = f.sent.pop();
+      assert.deepEqual(answered, unavailable, path);
+      assert.doesNotMatch(JSON.stringify(answered), /10\.1\.2\.3|ECONN|fetch failed/);
+    }
+    assert.ok(lines.length > 0 && lines.every((l) => /unavailable/.test(l) && !/10\.1\.2\.3/.test(l)), 'logged by class');
   }
+});
+
+test('#2232: a redirect or a failure building the tenant headers is not "unavailable"', async () => {
+  const redirect = () => { throw Object.assign(new TypeError('fetch failed'), { cause: new Error('unexpected redirect') }); };
+  const lines = [];
+  const f = fixture({ reply: redirect, log: (l) => lines.push(l) });
+  await assert.rejects(f.call('diary', 'GET', '/api/diary/files'), /fetch failed/);
+  assert.equal(f.sent.length, 0);
+  assert.match(lines[0], /TypeError.*\(internal\)/);
+  const g = fixture({ reply: () => { throw new Error('storage row unreadable /srv/secret'); }, log: (l) => lines.push(l) });
+  await assert.rejects(g.call('diary', 'GET', '/api/diary/files'), /storage row/);
+  assert.equal(g.sent.length, 0);
+  assert.ok(lines.every((l) => !l.includes('/srv/secret')));
 });
