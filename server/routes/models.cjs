@@ -524,30 +524,16 @@ function createModelRoutes({ servedEmbeddingModels = (target) => require('../rag
       return json(res,405,{error:'Method not allowed'});
     }
 
-    // #697: the inference memory budget (admin setting) and each model's estimate against it.
-    // GET is read-only (no load, no write); PUT stores the budget.
+    // #697: the inference memory budget (admin setting). The GET is the Rust front's (#2262, rust-model-state-reads.cjs); the
+    // PUT stays here with the figure this process enforces and the audit.
     if (p === '/api/models/inference-budget') {
       if(authn.user.role!=='admin')return json(res,403,{error:'Administrator required for shared model profiles'});
       if(!inferenceBudget)return json(res,404,{error:'The inference memory budget is unavailable'});
       res.setHeader('Cache-Control','no-store');
-      if(req.method==='PUT'){
-        let body;try{body=await readJson(req);}catch{return json(res,400,{error:'invalid JSON'});}
-        try{return json(res,200,inferenceBudget.save(body,authn.user.id));}
-        catch(e){return json(res,e.status||500,{error:e.status?e.message:'Could not save the budget',...(e.messageId?{errorId:e.messageId,minGib:e.minGib,maxGib:e.maxGib}:{})});}
-      }
-      if(req.method!=='GET')return json(res,405,{error:'Method not allowed'});
-      let models=null,estimateError=null;
-      if(modelManager.inferenceEstimates){
-        try{const r=await modelManager.inferenceEstimates();if(r.ok)models=r.body.models;else estimateError='engine';}
-        catch(e){estimateError='engine';clientMessage(e,'');}
-      }
-      // #1708: a model whose file was deleted is not in the budget table, as in the Models tab (#1695):
-      // the same installed list decides. An unreadable list leaves the rows as they are.
-      if(Array.isArray(models)){
-        let installed=null;try{installed=await modelsInstalled();}catch{installed=null;}
-        if(Array.isArray(installed)){const gone=new Set(installed.filter(m=>m?.missingFile===true).map(m=>m.name));models=models.filter(m=>!gone.has(m?.model));}
-      }
-      return json(res,200,{...inferenceBudget.get(),models,...(estimateError?{estimateError}:{})});
+      if(req.method!=='PUT')return json(res,405,{error:'Method not allowed'});
+      let body;try{body=await readJson(req);}catch{return json(res,400,{error:'invalid JSON'});}
+      try{return json(res,200,inferenceBudget.save(body,authn.user.id));}
+      catch(e){return json(res,e.status||500,{error:e.status?e.message:'Could not save the budget',...(e.messageId?{errorId:e.messageId,minGib:e.minGib,maxGib:e.maxGib}:{})});}
     }
 
     // noevia#1863: how long an idle chat model stays loaded (admin setting; the model manager
@@ -629,13 +615,8 @@ function createModelRoutes({ servedEmbeddingModels = (target) => require('../rag
       return json(res, r.status, r.ok ? { removed: r.removed, kept: r.kept, reloaded: r.reloaded } : { error: r.error, ...(r.code ? { code: r.code } : {}) });
     }
 
-    if (p === '/api/models/installed') {
-      try {
-        return json(res, 200, await modelsInstalled());
-      } catch (err) {
-        return json(res, 502, { error: clientMessage(err, 'Could not list installed models.') });
-      }
-    }
+    // The GET is the Rust front's (#2262). Another method used to get the list too; it is refused like any other unknown method.
+    if (p === '/api/models/installed') return json(res, 405, { error: 'Method not allowed' });
 
     if (p === '/api/models/mtp-artifact' && req.method === 'GET') {
       const repo = url.searchParams.get('repo') || '';

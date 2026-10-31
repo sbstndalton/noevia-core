@@ -40,8 +40,8 @@ test('what Node keeps is not refused: other methods, the other model routes, oth
     assert.equal(refuseOwned({ url, method, headers: {} }, {}, { parseRequestUrl, json }), false, `${method} ${url}`);
   }
   for (const url of [
-    '/api/models/preset', '/api/models/preset?model=m', '/api/models/presets/reload', '/api/models/evidence', '/api/models/inference-budget',
-    '/api/models/installed', '/api/models/capabilities', '/api/models/estimate/', '/api/models/preset/suggest/', '/api/models/estimatex',
+    '/api/models/preset', '/api/models/preset?model=m', '/api/models/presets/reload', '/api/models/evidence',
+    '/api/models/capabilities', '/api/models/estimate/', '/api/models/preset/suggest/', '/api/models/estimatex',
     '/API/MODELS/ESTIMATE', '/api/models/%65stimate', '/api/models/preset/suggest/x',
   ]) {
     assert.equal(refuseOwned({ url, method: 'GET', headers: {} }, {}, { parseRequestUrl, json }), false, url);
@@ -115,5 +115,5 @@ test('through the router: the owned GETs are refused signed out and signed in; t
     assert.deepEqual([adminPost.status, adminPost.json], [405, { error: 'Method not allowed' }], p);
   }
   // A kept model read still answers here.
-  assert.equal((await request('/api/models/installed')).status, 401);
+  assert.equal((await request('/api/models/machines')).status, 401);
 });

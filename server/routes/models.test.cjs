@@ -363,8 +363,8 @@ test('engine-specific routes say what is unavailable and guard the method', asyn
   assert.deepEqual(f.sent.pop(), { status: 403, body: { error: 'Administrator required for shared model profiles' } });
   await f.call('GET', '/api/models/mtp-artifact', undefined, 'member', '?repo=bad');
   assert.deepEqual(f.sent.pop(), { status: 400, body: { error: 'Invalid repository' } });
-  await f.call('GET', '/api/models/installed');
-  assert.deepEqual(f.sent.pop(), { status: 200, body: [{ name: 'm', loaded: true }] });
+  await f.call('POST', '/api/models/installed', undefined, 'admin');
+  assert.equal(f.sent.pop().status, 405, 'only the front lists, and it lists on GET');
   const native = fixture({ manager: { autotune: { status: (model) => ({ status: 200, body: { model, state: 'idle' } }), cancel: () => ({ status: 200, body: { cancelled: true } }) } } });
   await native.call('GET', '/api/models/autotune', undefined, 'admin', '?model=m');
   assert.deepEqual(native.sent.pop(), { status: 200, body: { model: 'm', state: 'idle' } });
@@ -724,15 +724,11 @@ test('#545: load refuses a preset whose model file is missing with 409, but unlo
 
 // #697: the inference memory budget setting, the estimates beside it, and the two proxied paths
 // that would otherwise reach the engine or size past the budget.
-test('the inference budget is read with each model\'s estimate and saved by an administrator', async () => {
+test('the inference budget is saved by an administrator; its GET is the Rust front\'s', async () => {
   const saved = [];
   const inferenceBudget = { get: () => ({ budgetGib: 12, source: 'deployment', minGib: 2, maxGib: 25 }),
     save: (body, actor) => { if (body.budgetGib > 25) throw Object.assign(Error('Enter a budget from 2 to 25 GiB, in steps of 0.1.'), { status: 400, messageId: 'invalidBudget', minGib: 2, maxGib: 25 }); saved.push([body, actor]); return { budgetGib: body.budgetGib, source: 'admin', minGib: 2, maxGib: 25 }; } };
-  const f = fixture({ inferenceBudget, manager: { inferenceEstimates: async () => ({ ok: true, status: 200, body: { budgetGib: 12, models: [{ model: 'chat-syn', fits: true, estimate: { totalGib: 9.1 } }] } }) } });
-  await f.call('GET', '/api/models/inference-budget');
-  assert.equal(f.sent.pop().status, 403, 'members do not read shared model settings');
-  await f.call('GET', '/api/models/inference-budget', undefined, 'admin');
-  assert.deepEqual(f.sent.pop(), { status: 200, body: { budgetGib: 12, source: 'deployment', minGib: 2, maxGib: 25, models: [{ model: 'chat-syn', fits: true, estimate: { totalGib: 9.1 } }] } });
+  const f = fixture({ inferenceBudget });
   await f.call('PUT', '/api/models/inference-budget', { budgetGib: 20 });
   assert.equal(f.sent.pop().status, 403);
   await f.call('PUT', '/api/models/inference-budget', { budgetGib: 20 }, 'admin');
@@ -742,9 +738,6 @@ test('the inference budget is read with each model\'s estimate and saved by an a
   assert.deepEqual(f.sent.pop(), { status: 400, body: { error: 'Enter a budget from 2 to 25 GiB, in steps of 0.1.', errorId: 'invalidBudget', minGib: 2, maxGib: 25 } });
   await f.call('DELETE', '/api/models/inference-budget', undefined, 'admin');
   assert.equal(f.sent.pop().status, 405);
-  const engineDown = fixture({ inferenceBudget, manager: { inferenceEstimates: async () => ({ ok: false, status: 502 }) } });
-  await engineDown.call('GET', '/api/models/inference-budget', undefined, 'admin');
-  assert.deepEqual(engineDown.sent.pop().body, { budgetGib: 12, source: 'deployment', minGib: 2, maxGib: 25, models: null, estimateError: 'engine' });
 });
 
 // noevia#1863: the idle unload time is an administrator setting.
@@ -773,19 +766,6 @@ test('#1863 the idle unload time is read and saved by administrators only', asyn
   const none = fixture();
   await none.call('GET', '/api/models/idle-unload', undefined, 'admin');
   assert.equal(none.sent.pop().status, 404);
-});
-
-// #1708: a model whose file was deleted is left out of the budget table, like the Models tab (#1695).
-test('#1708 the inference budget leaves out models whose file is missing', async () => {
-  const inferenceBudget = { get: () => ({ budgetGib: 12, source: 'deployment', minGib: 2, maxGib: 25 }) };
-  const rows = [{ model: 'chat-syn', loaded: true, fits: true, estimate: { totalGib: 6.2 } }, { model: 'gone-chat', loaded: false, fits: null, estimate: null }, { model: 'gone-rerank', loaded: false, fits: null, estimate: null }, { model: 'unlisted', loaded: false, fits: null, estimate: null }];
-  const installed = [{ name: 'chat-syn', loaded: true, missingFile: false }, { name: 'gone-chat', missingFile: true }, { name: 'gone-rerank', missingFile: true }];
-  const f = fixture({ inferenceBudget, modelsInstalled: async () => installed, manager: { inferenceEstimates: async () => ({ ok: true, status: 200, body: { budgetGib: 12, models: rows } }) } });
-  await f.call('GET', '/api/models/inference-budget', undefined, 'admin');
-  assert.deepEqual(f.sent.pop().body.models.map((m) => m.model), ['chat-syn', 'unlisted']);
-  const listDown = fixture({ inferenceBudget, modelsInstalled: async () => { throw new Error('down'); }, manager: { inferenceEstimates: async () => ({ ok: true, status: 200, body: { budgetGib: 12, models: rows } }) } });
-  await listDown.call('GET', '/api/models/inference-budget', undefined, 'admin');
-  assert.equal(listDown.sent.pop().body.models.length, 4, 'an unreadable installed list leaves every row');
 });
 
 test('a benchmark of an over-budget model is refused before the model manager loads it', async () => {

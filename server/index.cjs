@@ -767,6 +767,11 @@ const taskFactsBridge = require('./rust-task-facts.cjs').createTaskFactsBridge({
   workspace: () => currentWorkspace(), asUser: (userId, fn) => diaryAsUser(userId, fn),
 });
 
+// #2262: GET inference-budget and GET installed are the Rust front's; this is what they cannot read for themselves.
+const modelFactsBridge = require('./rust-model-facts.cjs').createModelFactsBridge({
+  secret: FRONT_SECRET, json, readJson, inferenceBudget, service: modelService,
+});
+
 // ── Deep research (#2218): the Rust front's (rust-research.cjs); what its jobs still need from this process ──
 const inferenceAdmission = require('./inference-admission-lease.cjs').createAdmissionRoutes({
   secret: FRONT_SECRET, modelManager, admitEngineModel, chatMachines, json, readJson,
@@ -1274,6 +1279,7 @@ async function handleRequestInner(req, res) {
   if (require('./rust-diary-routes.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   // So are the two configuration-only model reads (#2187): GET /api/models/capabilities and /hardware.
   if (require('./rust-models.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
+  if (require('./rust-model-state-reads.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   // And a project source's stored text and originals (#2191): GET sources/text, documents/original, uploads/original.
   if (require('./rust-project-reads.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   // And a project's create and delete (#2191 round 2): POST /api/projects, DELETE /api/projects/{id}.
@@ -1296,6 +1302,7 @@ async function handleRequestInner(req, res) {
   // And the Code and Browser task reads, and the front's loopback call for what only this process knows (#2257).
   if (require('./rust-task-reads.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   if (await taskFactsBridge(req, res)) return;
+  if (await modelFactsBridge(req, res)) return;
   // And a project's configuration, its instruction skills and a published skill's install (#2191 round 9).
   if (require('./rust-project-config.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   // And an account's deletion, complete (#2190, #2191 round 9): DELETE /api/admin/users/{id}.

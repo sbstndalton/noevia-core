@@ -41,7 +41,7 @@ test('what Node keeps is not refused: other methods, the other model routes, oth
   }
   for (const url of [
     '/api/model-manager', '/api/model-manager/models', '/api/models/autotune', '/api/models/autotune/untuned', '/api/models/calibration',
-    '/api/models/estimate', '/api/models/evidence', '/api/models/inference-budget', '/api/models/installed', '/api/models/machines',
+    '/api/models/estimate', '/api/models/evidence', '/api/models/machines',
     '/api/models/preset', '/api/models/downloads',
     '/api/models/capabilities/', '/api/models/hardwarex', '/api/models/hardware/x', '/API/MODELS/HARDWARE', '/api/models/%68ardware',
   ]) {
@@ -112,5 +112,5 @@ test('through the router: the owned GETs are refused signed out and signed in; t
   const adminPut = await request('/api/models/hardware', { method: 'PUT', headers: as(admin), body: '{}' });
   assert.deepEqual([adminPut.status, adminPut.json], [405, { error: 'Method not allowed' }]);
   // A kept model read still answers here.
-  assert.equal((await request('/api/models/installed')).status, 401);
+  assert.equal((await request('/api/models/machines')).status, 401);
 });

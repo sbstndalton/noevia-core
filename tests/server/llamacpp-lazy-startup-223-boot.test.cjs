@@ -196,10 +196,11 @@ for (const mode of Object.keys(EXPECT)) {
     ran++;
     assert.equal(refusedHealth.status, 503);
     assert.equal(refusedHealth.json.code, 'RUST_HEALTH_OWNED');
+    // The budget's GET is the Rust front's (#2262) and answers from the inference budget, which this fault never touches.
     const budget = await s.call('GET', '/api/models/inference-budget');
     ran++;
-    assert.equal(budget.status, 200, budget.text.slice(0, 300));
-    assert.ok(budget.json.budgetGib > 0 || budget.json.budget?.budgetGib > 0 || JSON.stringify(budget.json).includes('budgetGib'), budget.text.slice(0, 300));
+    assert.equal(budget.status, 503, budget.text.slice(0, 300));
+    assert.equal(budget.json.code, 'RUST_MODEL_STATE_READS_OWNED');
 
     // The Will-it-fit panel and the size-based suggestion are the Rust front's (#2189,
     // bins/noevia-server/tests/model_sizing.rs); Node refuses them under every fault.
