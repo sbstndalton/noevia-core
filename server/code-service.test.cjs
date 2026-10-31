@@ -325,6 +325,9 @@ test('without the egress proxy, network and installs are never granted, and the 
   // #2226: configured but down reports no network, and back up reports it again.
   let up = false; const gated = service({ egress: { available: () => up, grant: () => ({ token: 't' }), revoke: () => {} } });
   assert.equal(gated.svc.network(), false); up = true; assert.equal(gated.svc.network(), true);
+  // #2242: and says which of the two it is, so the panel need not send a person to an administrator for a restart.
+  up = false; assert.equal(gated.svc.networkState(), 'unavailable'); up = true; assert.equal(gated.svc.networkState(), 'ready');
+  assert.equal(svc.networkState(), 'unconfigured'); assert.equal(withProxy.svc.networkState(), 'ready');
   const online = await withProxy.svc.start(withProxy.ws, project, { repository: 'noevia', prompt: 'x',
     capabilities: ['read_repository', 'network'], domains: ['registry.npmjs.org'] });
   assert.deepEqual(online.capabilities, ['read_repository', 'network']);
