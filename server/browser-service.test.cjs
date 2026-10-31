@@ -356,3 +356,9 @@ test('cancel starts original-lease cleanup while action and context close remain
     process.removeListener('unhandledRejection', onUnhandled);
   }
 });
+
+test('#2226: network() follows the egress session, not only its configuration', () => {
+  let up = false; const svc = createBrowserService({ launch: async () => ({}), egress: { available: () => up, grant: async () => ({}), revoke: async () => ({}) } });
+  assert.equal(svc.network(), false); up = true; assert.equal(svc.network(), true);
+  assert.equal(createBrowserService({ launch: async () => ({}) }).network(), false);
+});
