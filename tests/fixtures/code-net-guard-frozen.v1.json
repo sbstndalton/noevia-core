@@ -1,6 +1,6 @@
 {
 "version":1,
-"provenance":{"coreCommit":"b2582357c93cad605524a276090114082de1b2e1","oracle":"tests/reference/code-net-guard-js.cjs","oracleSha256":"6235e2ceaffd571f78f1cfaadc7b5d70e01e5edad60819b36e645b2dcda202a6","fixtureSha256":"430f13c7cef59e4b473f94af6296bf65a317f10ab7fc5d2285f2e07981225e39","wasmSha256":"aebb50e1a63848fe309cec9470f9d441ec738ef095e7a52b3053d53f79a892d0","noeviaRsRef":"88f50c5c65a166c08bd27c736ce1aef69ba38f32","generator":"tools/gen-code-net-guard-frozen.cjs"},
+"provenance":{"coreCommit":"b2582357c93cad605524a276090114082de1b2e1","oracle":"tests/reference/code-net-guard-js.cjs","oracleSha256":"6235e2ceaffd571f78f1cfaadc7b5d70e01e5edad60819b36e645b2dcda202a6","fixtureSha256":"430f13c7cef59e4b473f94af6296bf65a317f10ab7fc5d2285f2e07981225e39","wasmSha256":"1ac7c7e3aa32c9f951666f2347110167af272b25fe88d1aea088754b55f06b94","noeviaRsRef":"176bbebf0a1b8b54f5017df0a20f71fd8b102794","generator":"tools/gen-code-net-guard-frozen.cjs"},
 "counts":{"spec":{"rows":1439,"bothStart":393,"jsMalformedRefused":695,"rustStricter":351,"weaker":0},"answers":{"rows":1317,"same":972,"noAddress":155,"rustFault":190,"rustExtra":0,"weaker":0},"guard":{"rows":400,"requests":4000,"same":3989,"refusedBoth":1648,"rustStricter":11,"weaker":0}},
 "specRows":[
 {"spec":"","js":{"literals":[],"hosts":[]},"port":{"literals":[],"hosts":[]},"old":{"started":true}},
