@@ -225,15 +225,6 @@ test('no budget, or a model whose file cannot be read, is not blocked (the watch
   assert.equal((await missing.manager.load('ghost')).ok, true);
 });
 
-test('the Models page gets each model\'s estimate against the budget, read-only', async t => {
-  const { manager, calls } = fixture(t, {});
-  const r = await manager.inferenceEstimates();
-  assert.equal(r.body.budgetGib, 2);
-  const by = Object.fromEntries(r.body.models.map(m => [m.model, m]));
-  assert.equal(by.big.fits, false); assert.equal(by.small.fits, true); assert.ok(by.big.estimate.totalGib > 2);
-  assert.ok(calls.every(c => c === 'GET /models'), 'listing only');
-});
-
 test('autoconfig sizes against the inference budget, lowered only by an explicit autoconfig figure', async t => {
   const { manager } = fixture(t, { budget: 12 });
   assert.equal(manager.sizingBudgetGib(), 12);

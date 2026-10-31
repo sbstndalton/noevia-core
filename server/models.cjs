@@ -18,7 +18,7 @@ const MODEL_READ_TTL_MS = 2000;
  * @param {object} deps.modelManager         model-manager.cjs adapter
  * @param {() => object} deps.currentWorkspace
  */
-const { isSidecarModel, isSystemModel, modelPathFromArgs } = require('./model-system.cjs');
+const { isSidecarModel, sidecarModelNames, isSystemModel, modelPathFromArgs } = require('./model-system.cjs');
 
 // #1840: `roleOnMachine(role)` is true for a chat role served by an Inference machine; it is never warmed here.
 function createModelService({ fetchJson, env, modelManager, currentWorkspace, listWorkspaces, roleOnMachine = () => false }) {
@@ -204,7 +204,50 @@ function createModelService({ fetchJson, env, modelManager, currentWorkspace, li
   const degradedLists = new WeakSet();
   const installedRead = createSharedRead(() => modelsInstalledFresh(), MODEL_READ_TTL_MS, (list) => !degradedLists.has(list));
   function modelsInstalled() { return installedRead.get(); }
-  function invalidateModelReads() { installedRead.clear(); }
+  // One folder scan at a time for the front's reads, however many ask (its answer is modelScanCache's).
+  const scanRead = createSharedRead(() => folderScanFiles(), 0);
+  function invalidateModelReads() { installedRead.clear(); scanRead.clear(); }
+
+  // Which of the router's `ids` a sidecar reports as loaded.
+  async function sidecarLoadedAmong(ids) {
+    // #580: the embedding (and reranking) sidecar is its own fixed llama-server, so the router's
+    // status for its model ("unloaded") says nothing about it. The model manager probes each
+    // backend; a sidecar model counts as loaded when some backend reports it as loaded.
+    const sidecarLoaded = new Set();
+    if (env.MODEL_LOADER_URL && ids.some((id) => isSidecarModel(id, env))) {
+      const res = await fetchJson(`${env.MODEL_LOADER_URL.replace(/\/+$/, '')}/api/v1/backends`, { method: 'GET', headers: { 'Content-Type': 'application/json', ...(env.MODEL_LOADER_TOKEN ? { 'X-Model-Loader-Token': env.MODEL_LOADER_TOKEN } : {}) } }, 4000).catch(() => null);
+      for (const b of res?.ok && Array.isArray(res.body?.backends) ? res.body.backends : []) {
+        if (b?.status !== 'running' || typeof b.loaded_model !== 'string') continue;
+        for (const id of b.loaded_model.split(',').map((x) => x.trim()).filter(Boolean)) sidecarLoaded.add(id);
+      }
+    }
+    // #1795: since #1668 the model manager runs the embedding service itself and reports, under each
+    // model's own name (the alias it serves it as), which ones its router has loaded. That report is the
+    // service's own word; the backend probe above may not list the managed container at all, which left
+    // the in-use embedding model's card "Unloaded" under a "Running" row. A stale report adds nothing.
+    try {
+      const embedService = require('./embedding-service.cjs').current();
+      const st = embedService?.managed() ? embedService.status() : null;
+      if (st && !st.stale && st.enabled !== false && Array.isArray(st.running?.loaded)) {
+        for (const id of st.running.loaded) if (typeof id === 'string' && id) sidecarLoaded.add(id);
+      }
+    } catch { /* no embedding service in this process */ }
+    return sidecarLoaded;
+  }
+
+  // sbstndalton/noevia#2262: what the Rust front's installed list needs of this process (rust-model-facts.cjs): the sidecar
+  // names and reports (embedding service state) and the shared folder scan. A list read used to name the first loaded model
+  // as a side effect, which the code roles fall back to; the front's read keeps that by naming it here.
+  async function installedFacts({ ids, scan, firstLoaded }) {
+    if (!LAST_LOADED_MODEL && firstLoaded) LAST_LOADED_MODEL = firstLoaded;
+    const sidecarLoaded = await sidecarLoadedAmong(ids);
+    const files = scan ? await scanRead.get().catch(() => null) : null;
+    return {
+      sidecarNames: [...sidecarModelNames(env)],
+      sidecarLoaded: [...sidecarLoaded],
+      scan: files ? files.map((f) => ({ modelId: f?.modelId, sections: f?.sections, bytes: f?.bytes, shape: f?.shape })) : null,
+    };
+  }
 
   async function modelsInstalledFresh() {
     modelManager.requireEnabled();
@@ -225,28 +268,7 @@ function createModelService({ fetchJson, env, modelManager, currentWorkspace, li
     // download-cache models legitimately have none. Laya's preset points at a GGUF that only exists
     // inside its own sidecar; it is marked servedElsewhere (#1084) rather than missing.
     const rows = list.value.body?.data || [];
-    // #580: the embedding (and reranking) sidecar is its own fixed llama-server, so the router's
-    // status for its model ("unloaded") says nothing about it. The model manager probes each
-    // backend; a sidecar model counts as loaded when some backend reports it as loaded.
-    const sidecarLoaded = new Set();
-    if (env.MODEL_LOADER_URL && rows.some((m) => isSidecarModel(m.id || m.model_name, env))) {
-      const res = await fetchJson(`${env.MODEL_LOADER_URL.replace(/\/+$/, '')}/api/v1/backends`, { method: 'GET', headers: { 'Content-Type': 'application/json', ...(env.MODEL_LOADER_TOKEN ? { 'X-Model-Loader-Token': env.MODEL_LOADER_TOKEN } : {}) } }, 4000).catch(() => null);
-      for (const b of res?.ok && Array.isArray(res.body?.backends) ? res.body.backends : []) {
-        if (b?.status !== 'running' || typeof b.loaded_model !== 'string') continue;
-        for (const id of b.loaded_model.split(',').map((x) => x.trim()).filter(Boolean)) sidecarLoaded.add(id);
-      }
-    }
-    // #1795: since #1668 the model manager runs the embedding service itself and reports, under each
-    // model's own name (the alias it serves it as), which ones its router has loaded. That report is the
-    // service's own word; the backend probe above may not list the managed container at all, which left
-    // the in-use embedding model's card "Unloaded" under a "Running" row. A stale report adds nothing.
-    try {
-      const embedService = require('./embedding-service.cjs').current();
-      const st = embedService?.managed() ? embedService.status() : null;
-      if (st && !st.stale && st.enabled !== false && Array.isArray(st.running?.loaded)) {
-        for (const id of st.running.loaded) if (typeof id === 'string' && id) sidecarLoaded.add(id);
-      }
-    } catch { /* no embedding service in this process */ }
+    const sidecarLoaded = await sidecarLoadedAmong(rows.map((m) => m.id || m.model_name));
     const sidecarUp = (m) => isSidecarModel(m.id || m.model_name, env) && sidecarLoaded.has(m.id || m.model_name);
     const scan = rows.some((m) => m.source === 'preset') ? await folderScanFiles().catch(() => null) : null;
     const degradedScan = rows.some((m) => m.source === 'preset') && !scan;
@@ -333,7 +355,7 @@ function createModelService({ fetchJson, env, modelManager, currentWorkspace, li
   return {
     managerFetch, modelScanCache, refreshModelScan, lastLoadedModel, clearLastLoadedModel,
     autoRoles, setAutoRoles, clearRoleReferences, ensureModelLoaded, ensureRolesLoaded,
-    servedCatalogue, modelsInstalled, modelsInstalledFresh, invalidateModelReads, deriveUserModelName,
+    servedCatalogue, modelsInstalled, modelsInstalledFresh, invalidateModelReads, installedFacts, deriveUserModelName,
   };
 }
 

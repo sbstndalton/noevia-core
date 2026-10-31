@@ -57,8 +57,7 @@ test('#1695 deleting a missing-file model reloads the router, so the installed l
   assert.equal(out.body.presetRemoved, true);
   assert.equal(out.body.presetsReloaded, true);
   assert.deepEqual(f.reloads, [{ unload: false }], 'reload never unloads a running model');
-  const listed = await f.call('GET', '/api/models/installed');
-  assert.deepEqual(listed.body.map((m) => m.name), ['kept']);
+  assert.deepEqual(f.rows(), ['kept']);
 });
 
 test('#1695 prune-missing removes only presets whose file is gone by both checks, then reloads; a rerun is a no-op', async () => {

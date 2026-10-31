@@ -508,22 +508,6 @@ function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloa
       : `Not saved: with these settings ${model} needs about ${est.totalGib} GiB (weights ${est.modelGib}, context ${est.kvGib} at ${est.ctx.toLocaleString('en-US')} tokens, prompt cache ${est.cacheRamGib}, runtime ${est.extraGib}), above the ${budgetGib} GiB inference memory budget. Lower the context or prompt cache, or raise the budget.`;
     return { error, code: 'inference_budget', budgetGib, estimate: est };
   }
-  // The Models page's per-model estimate against the budget. Read-only; loads nothing.
-  async function inferenceEstimates() {
-    const listing = await rawModels();
-    if (!listing.ok) return listing;
-    if (!Array.isArray(listing.body?.data)) throw Error('Invalid llama.cpp model listing');
-    const budgetGib = Number(inferenceBudget?.budgetGib?.()) || null;
-    const { isSystemModel, modelPathFromArgs } = require('./model-system.cjs');
-    const rows = [];
-    for (const m of listing.body.data) {
-      const est = await footprint(m.id).catch(() => null);
-      rows.push({ model: m.id, loaded: m.status?.value === 'loaded', sleeping: m.status?.value === 'sleeping', labels: nativeLabels(m),
-        system: isSystemModel(m.id, modelPathFromArgs(m.status?.args)), estimate: est,
-        fits: est && budgetGib ? !est.cacheRamUnbounded && Number.isFinite(est.totalGib) && est.totalGib <= budgetGib : null });
-    }
-    return { ok: true, status: 200, body: { budgetGib, models: rows } };
-  }
   // Starting settings for calibration: structural values from the model file; the context
   // itself is measured, so an unconfigured memory budget is not an obstacle here.
   async function conservativeFor(model) {
@@ -697,7 +681,6 @@ function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloa
     tuningActive: () => maintenance.held() || calibrator?.status().body.job?.status === 'running' || autotuner?.status().body.job?.status === 'running',
     getPreset: model => presets ? Promise.resolve({ok:true,status:200,body:presets.get(model)}) : unsupported('Native preset editing'),
     applyPreset,
-    inferenceEstimates,
     // #697: the load guard and the budget, for the proxied benchmark start and the watchdog.
     loadRefusal: model => overBudget(model).then(r => r ? r.body : null),
     // LLAMACPP_PRESETS_IMPL=wasm: an entry the Rust port folds differently is refused (400), never dropped.
