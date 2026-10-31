@@ -127,6 +127,18 @@ function createBrowserService({ launch, egress = null, log = () => {}, now = Dat
     // configured but not answering ('unavailable', often a restart) or usable ('ready'). `network()` stays the boolean.
     networkState: () => (!egress ? 'unconfigured' : (typeof egress.available !== 'function' || egress.available()) ? 'ready' : 'unavailable'),
 
+    // What the Rust front's reads (rust-task-facts.cjs, #2257) cannot read from disk; as code-service.cjs's.
+    facts(workspace) {
+      const { jobs } = storeFor(workspace);
+      const approvals = {};
+      for (const waiting of pending.values()) {
+        if (Object.hasOwn(approvals, waiting.taskId)) continue;
+        let own = false;
+        try { own = jobs.get(waiting.taskId)?.kind === 'browser'; } catch { own = false; }
+        if (own) approvals[waiting.taskId] = { id: waiting.id, ...waiting.request };
+      }
+      return { capabilities: this.grantable, network: this.network(), networkState: this.networkState(), approvals };
+    },
     list(workspace, project) {
       const { jobs } = storeFor(workspace);
       return jobs.list({ projectId: project.id, kind: 'browser' }).map((j) => view(j, pendingFor(j.id)));

@@ -10,14 +10,12 @@ function harness({ enabled = true } = {}) {
     harnesses: () => [{ id: 'opencode', label: 'OpenCode', version: null }],
     promptPreparation: () => [{ id: 'direct', label: 'Direct', available: true, reason: 'As you wrote it.' }],
     sandboxed: () => true,
-    list: (ws, p) => p.id === 'p1' ? [{ id: 'task-1', status: 'waiting_approval', task: 'Fix tests', stage: 'Checking tests', updatedAt: 10, approval: { action: 'execute_command' } }] : [{ id: 'task-2', status: 'completed' }],
-    listActive: () => ({ tasks: [{ id: 'task-1', projectId: 'p1', status: 'waiting_approval', task: 'Fix tests', stage: 'Checking tests', updatedAt: 10, approval: { action: 'execute_command' } }], total: 1 }), get: (ws, p, id) => ({ id }),
     start: async (ws, p, body) => { calls.push(['start', p.id, body]); return { taskId: 't', branch: 'noevia/task-t' }; },
     decide: (ws, p, id, decision, approvalId) => { calls.push(['decide', id, decision, approvalId]); return { ok: true }; },
     cancel: (ws, p, id) => { calls.push(['cancel', id]); return { id, status: 'cancelled' }; },
   };
   const route = createCodeRoutes({ service, features: { enabled: () => enabled },
-    getProject: (id) => (id === 'p1' ? { id } : null), projects: () => [{ id: 'p1', name: 'Alpha' }, { id: 'p2', name: 'Beta' }], workspace: () => ({ dir: '/tmp/x' }),
+    getProject: (id) => (id === 'p1' ? { id } : null), workspace: () => ({ dir: '/tmp/x' }),
     json: (res, status, body) => Object.assign(res, { status, body }), readJson: async (req) => JSON.parse(req.raw || '{}') });
   const call = async (method, path, role = 'admin', raw) => {
     const res = {};
@@ -29,33 +27,16 @@ function harness({ enabled = true } = {}) {
 const TASK = '12345678-1234-4234-8234-123456789012';
 
 test('the feature off hides every route, and members are refused before anything runs', async () => {
-  assert.equal((await harness({ enabled: false }).call('GET', '/api/projects/p1/code')).status, 404);
-  assert.equal((await harness({ enabled: false }).call('GET', '/api/code/active')).status, 404);
+  assert.equal((await harness({ enabled: false }).call('POST', '/api/projects/p1/code')).status, 404);
   const { call, calls } = harness();
   assert.equal((await call('POST', '/api/projects/p1/code', 'member', '{"prompt":"x"}')).status, 403);
-  assert.equal((await call('GET', '/api/projects/p1/code', null)).status, 403, 'signed out too');
-  assert.equal((await call('GET', '/api/code/active', 'member')).status, 403);
+  assert.equal((await call('POST', '/api/projects/p1/code', null)).status, 403, 'signed out too');
   assert.equal(calls.length, 0, 'nothing reached the service');
 });
 
-test('active summary includes only live tasks from this scoped project list', async () => {
-  const { call } = harness();
-  const response = await call('GET', '/api/code/active');
-  assert.equal(response.status, 200);
-  assert.deepEqual(response.body, { tasks: [{ id: 'task-1', projectId: 'p1', projectName: 'Alpha', title: 'Fix tests', status: 'waiting_approval', stage: 'Checking tests', updatedAt: 10, approvalAction: 'execute_command' }], total: 1 });
-  assert.equal((await call('POST', '/api/code/active')).status, 405);
-});
-
-test('an admin lists, starts, reads, approves and cancels', async () => {
+test('an admin starts, approves and cancels', async () => {
   const { call, calls } = harness();
-  const listed = await call('GET', '/api/projects/p1/code');
-  assert.deepEqual(listed.body.repositories, [{ id: 'noevia' }]);
-  assert.deepEqual(listed.body.capabilities, ['read_repository', 'edit_file']);
-  assert.deepEqual(listed.body.harnesses, [{ id: 'opencode', label: 'OpenCode', version: null }]);
-  assert.deepEqual(listed.body.promptPreparation.map((p) => p.id), ['direct']);
-  assert.equal(listed.body.sandboxed, true, 'the page says whether the harness is contained');
   assert.equal((await call('POST', '/api/projects/p1/code', 'admin', '{"repository":"noevia","prompt":"fix"}')).status, 202);
-  assert.equal((await call('GET', `/api/projects/p1/code/${TASK}`)).body.id, TASK);
   assert.deepEqual((await call('POST', `/api/projects/p1/code/${TASK}/approve`, 'admin', '{"decision":"approve","approvalId":"a-1"}')).body, { ok: true });
   assert.equal((await call('POST', `/api/projects/p1/code/${TASK}/cancel`)).body.status, 'cancelled');
   assert.deepEqual(calls.map((c) => c[0]), ['start', 'decide', 'cancel']);
@@ -64,10 +45,11 @@ test('an admin lists, starts, reads, approves and cancels', async () => {
 
 test('bad requests are refused without reaching the service', async () => {
   const { call, calls } = harness();
-  assert.equal((await call('GET', '/api/projects/nope/code')).status, 404);
+  assert.equal((await call('POST', '/api/projects/nope/code')).status, 404);
   assert.equal((await call('POST', '/api/projects/p1/code', 'admin', '{bad')).status, 400);
   assert.equal((await call('DELETE', '/api/projects/p1/code')).status, 405);
   assert.equal((await call('GET', `/api/projects/p1/code/${TASK}/approve`)).status, 405);
+  assert.equal((await call('GET', `/api/projects/p1/code/${TASK}`)).status, 405, 'the read is the front\'s');
   assert.equal((await call('GET', '/api/projects/p1/code/../../x')).handled, false, 'not our route at all');
   assert.equal((await call('GET', '/api/projects/p1/code/not-a-uuid')).handled, false);
   assert.equal(calls.length, 0);
@@ -80,16 +62,3 @@ test('an approval decision is passed through verbatim, so the service decides wh
   assert.deepEqual(calls.map((c) => c[2]), ['approve_all', '']);
 });
 
-test('#2242: the list says why there is no network: unconfigured, unavailable or ready', async () => {
-  for (const [network, networkState, expected] of [[true, 'ready', 'ready'], [false, 'unavailable', 'unavailable'], [false, 'unconfigured', 'unconfigured'], [false, undefined, 'unconfigured'], [true, undefined, 'ready']]) {
-    const service = { repositories: () => [], grantable: [], defaultCapabilities: [], harnesses: () => [], promptPreparation: () => [], sandboxed: () => true, list: () => [],
-      network: () => network, ...(networkState ? { networkState: () => networkState } : {}) };
-    const sent = [];
-    const route = createCodeRoutes({ service, features: { enabled: () => true }, getProject: (id) => ({ id }), projects: () => [], workspace: () => ({ dir: '/tmp/x' }),
-      json: (res, status, body) => sent.push({ status, body }), readJson: async () => ({}) });
-    await route({ method: 'GET' }, {}, { path: '/api/projects/p1/code', authn: { user: { role: 'admin' } } });
-    assert.equal(sent[0].status, 200);
-    assert.equal(sent[0].body.network, network);
-    assert.equal(sent[0].body.networkState, expected);
-  }
-});

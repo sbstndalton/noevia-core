@@ -26,20 +26,16 @@ function harness({ enabled = true } = {}) {
 const TASK = '12345678-1234-4234-8234-123456789012';
 
 test('the feature off hides every route, and members are refused before anything runs', async () => {
-  assert.equal((await harness({ enabled: false }).call('GET', '/api/projects/p1/browser')).status, 404);
+  assert.equal((await harness({ enabled: false }).call('POST', '/api/projects/p1/browser')).status, 404);
   const { call, calls } = harness();
   assert.equal((await call('POST', '/api/projects/p1/browser', 'member', '{"domains":["x.test"]}')).status, 403);
-  assert.equal((await call('GET', '/api/projects/p1/browser', null)).status, 403, 'signed out too');
+  assert.equal((await call('POST', '/api/projects/p1/browser', null)).status, 403, 'signed out too');
   assert.equal(calls.length, 0, 'nothing reached the service');
 });
 
-test('an admin lists, starts, reads, acts, approves, finishes and cancels', async () => {
+test('an admin starts, acts, approves, finishes and cancels', async () => {
   const { call, calls } = harness();
-  const listed = await call('GET', '/api/projects/p1/browser');
-  assert.deepEqual(listed.body.capabilities, ['open_browser']);
-  assert.equal(listed.body.network, true);
   assert.equal((await call('POST', '/api/projects/p1/browser', 'admin', '{"domains":["x.test"]}')).status, 202);
-  assert.equal((await call('GET', `/api/projects/p1/browser/${TASK}`)).body.id, TASK);
   assert.deepEqual((await call('POST', `/api/projects/p1/browser/${TASK}/act`, 'admin', '{"type":"extract"}')).body, { status: 'done', origin: 'https://shop.example.test' });
   assert.deepEqual((await call('POST', `/api/projects/p1/browser/${TASK}/approve`, 'admin', '{"decision":"approve","approvalId":"a-1"}')).body, { ok: true });
   assert.deepEqual((await call('POST', `/api/projects/p1/browser/${TASK}/finish`, 'admin', '{"result":{"pages":2}}')).body, { ok: true });
@@ -52,10 +48,11 @@ test('an admin lists, starts, reads, acts, approves, finishes and cancels', asyn
 
 test('bad requests are refused without reaching the service', async () => {
   const { call, calls } = harness();
-  assert.equal((await call('GET', '/api/projects/nope/browser')).status, 404);
+  assert.equal((await call('POST', '/api/projects/nope/browser')).status, 404);
   assert.equal((await call('POST', '/api/projects/p1/browser', 'admin', '{bad')).status, 400);
   assert.equal((await call('DELETE', '/api/projects/p1/browser')).status, 405);
   assert.equal((await call('GET', `/api/projects/p1/browser/${TASK}/approve`)).status, 405);
+  assert.equal((await call('GET', `/api/projects/p1/browser/${TASK}`)).status, 405, 'the read is the front\'s');
   assert.equal((await call('GET', '/api/projects/p1/browser/../../x')).handled, false, 'not our route at all');
   assert.equal((await call('GET', '/api/projects/p1/browser/not-a-uuid')).handled, false);
   assert.equal(calls.length, 0);
@@ -81,15 +78,3 @@ test('a service error carries its status and public message through, and never l
   assert.equal(res2.body.error, 'This task is not running.');
 });
 
-test('#2242: the list says why there is no network: unconfigured, unavailable or ready', async () => {
-  for (const [network, networkState, expected] of [[true, 'ready', 'ready'], [false, 'unavailable', 'unavailable'], [false, 'unconfigured', 'unconfigured'], [false, undefined, 'unconfigured'], [true, undefined, 'ready']]) {
-    const service = { grantable: ['open_browser'], network: () => network, ...(networkState ? { networkState: () => networkState } : {}), list: () => [], get: () => null };
-    const sent = [];
-    const route = createBrowserRoutes({ service, features: { enabled: () => true }, getProject: (id) => ({ id }), workspace: () => ({ dir: '/tmp/x' }),
-      json: (res, status, body) => sent.push({ status, body }), readJson: async () => ({}) });
-    await route({ method: 'GET' }, {}, { path: '/api/projects/p1/browser', authn: { user: { role: 'admin' } } });
-    assert.equal(sent[0].status, 200);
-    assert.equal(sent[0].body.network, network);
-    assert.equal(sent[0].body.networkState, expected);
-  }
-});

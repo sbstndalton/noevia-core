@@ -735,7 +735,7 @@ const codeService = require('./code-service.cjs').createCodeService({
   },
 });
 const codeRoutes = require('./routes/code.cjs').createCodeRoutes({
-  features, getProject, projects: () => PROJECTS.filter((project) => !diaryExtras.internalProject(project)), workspace: () => currentWorkspace(), json, readJson, service: codeService,
+  features, getProject, workspace: () => currentWorkspace(), json, readJson, service: codeService,
 });
 
 // ── Browser mode (issue #274, spec-agent-execution §6 wired to §4): service in
@@ -760,6 +760,12 @@ const browserRoutes = require('./routes/browser.cjs').createBrowserRoutes({
 
 // GET /api/usage[/aggregate] is the Rust front's (#1071): this mount only refuses a bypass.
 const usageRoutes = require('./routes/usage.cjs').createUsageRoutes({ json });
+
+// #2257: the Code and Browser task reads are the Rust front's; this is what they cannot read from disk.
+const taskFactsBridge = require('./rust-task-facts.cjs').createTaskFactsBridge({
+  secret: FRONT_SECRET, json, readJson, features, services: { code: codeService, browser: browserService },
+  workspace: () => currentWorkspace(), asUser: (userId, fn) => diaryAsUser(userId, fn),
+});
 
 // ── Deep research (#2218): the Rust front's (rust-research.cjs); what its jobs still need from this process ──
 const inferenceAdmission = require('./inference-admission-lease.cjs').createAdmissionRoutes({
@@ -1287,6 +1293,9 @@ async function handleRequestInner(req, res) {
   if (require('./rust-research.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   if (await inferenceAdmission.handle(req, res)) return;
   if (await researchBridge(req, res)) return;
+  // And the Code and Browser task reads, and the front's loopback call for what only this process knows (#2257).
+  if (require('./rust-task-reads.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
+  if (await taskFactsBridge(req, res)) return;
   // And a project's configuration, its instruction skills and a published skill's install (#2191 round 9).
   if (require('./rust-project-config.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   // And an account's deletion, complete (#2190, #2191 round 9): DELETE /api/admin/users/{id}.
@@ -1382,7 +1391,7 @@ async function handleRequestScoped(req, res) {
     if (authn && await importRoutes(req, res, { path: p, authn })) return;
     if (authn && await accountRoutes(req, res, { path: p, authn })) return;
     if (authn && await webAddressRoutes(req, res, { path: p, authn })) return;
-    if (authn && (p === '/api/code/active' || p.startsWith('/api/projects/')) && await codeRoutes(req, res, { path: p, authn })) return;
+    if (authn && p.startsWith('/api/projects/') && await codeRoutes(req, res, { path: p, authn })) return;
     if (authn && p.startsWith('/api/projects/') && await browserRoutes(req, res, { path: p, authn })) return;
     if (await authRoutes.account(req, res, { path: p, authn })) return;
     if (await storageRoutes(req, res, { path: p, authn })) return;
