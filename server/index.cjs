@@ -1460,7 +1460,8 @@ if (require.main === module) {
   (async () => {
   // Authenticated native readiness precedes listeners and scheduled runtime work.
   await readyFeatures();
-  if (codeEgress) await codeEgress.ready();
+  // Egress is not part of that: without it only network grants are refused. It connects, and reconnects, by itself.
+  if (codeEgress) codeEgress.start();
   for (const start of readyRuntime) start();
   fs.mkdirSync(DATA_DIR, { recursive: true });
   authTokens.warnings.forEach((w) => console.warn(w));

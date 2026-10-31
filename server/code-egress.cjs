@@ -50,11 +50,12 @@ function startEgressFromEnv(env = process.env, { log = () => {}, secrets = null,
   const ttlMs = positive('CODE_EGRESS_TOKEN_TTL_MS', DEFAULT_TOKEN_TTL_MS);
   const lifetimeMs = positive('CODE_EGRESS_GRANT_LIFETIME_MS', DEFAULT_GRANT_LIFETIME_MS);
   // Lazy import avoids a cycle with the unchanged pure grant byte helpers above.
-  const { publishWebKey, createControlClient } = require('./code-egress-control.cjs');
+  const { publishWebKey, createKeyKeeper, createControlClient } = require('./code-egress-control.cjs');
+  const file = String(env.CODE_EGRESS_CONTROL_KEY_FILE || '');
   let fileKey;
-  try { fileKey = publishWebKey({ masterKey: secrets.derive(GRANT_KEY_LABEL, 32), file: String(env.CODE_EGRESS_CONTROL_KEY_FILE || ''), uid, gid }); }
+  try { fileKey = publishWebKey({ masterKey: secrets.derive(GRANT_KEY_LABEL, 32), file, uid, gid }); }
   catch { throw unavailable(); }
-  const client = createControlClient({ fileKey, endpoint: `${host}:${rawPort}`, ttlMs, lifetimeMs, log, ...(transport ? { transport } : {}) });
+  const client = createControlClient({ fileKey, endpoint: `${host}:${rawPort}`, ttlMs, lifetimeMs, log, keeper: createKeyKeeper({ deriveMaster: () => secrets.derive(GRANT_KEY_LABEL, 32), fileKey, file, uid, gid }), ...(transport ? { transport } : {}) });
   try { log({ event: 'egress.rust_control_client', endpoint: client.endpoint }); } catch { /* diagnostics cannot change readiness */ }
   return client;
 }

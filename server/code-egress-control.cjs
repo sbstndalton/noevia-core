@@ -7,7 +7,7 @@ const { performance } = require('node:perf_hooks');
 const { mintGrant, grantHosts, DEFAULT_TOKEN_TTL_MS } = require('./code-egress.cjs');
 const CAPABILITY = 'noevia-code-egress-control/1';
 const ROUTES = Object.freeze(Object.fromEntries(['ready', 'renew', 'activity', 'revoke', 'forget'].map((name) => [name, `/v1/control/${name}`])));
-const MAX_REQUEST = 32768, MAX_RESPONSE = 65536, SESSION_MS = 15000, RENEW_MS = 5000, MAX_HANDLES = 256;
+const MAX_REQUEST = 32768, MAX_RESPONSE = 65536, SESSION_MS = 15000, RENEW_MS = 5000, MAX_HANDLES = 256, RPC_MS = 10000, RETRY_MIN_MS = 1000, RETRY_MAX_MS = 15000;
 const HEX32 = /^[0-9a-f]{32}$/, HEX64 = /^[0-9a-f]{64}$/, TASK = /^[A-Za-z0-9._:-]{1,128}$/;
 class ControlError extends Error {
   constructor(reason = 'unavailable') { super('native egress is unavailable'); this.name = 'EgressControlError'; this.code = 'EGRESS_UNAVAILABLE'; this.status = 503; this.reason = reason; }
@@ -85,22 +85,76 @@ function reportValue(body, record) {
 function scope(body, record) {
   if (body.bootId !== record.boot || body.sessionId !== record.session || body.taskId !== record.claims.task || body.leaseNonce !== record.claims.nonce) throw error('scope');
 }
-// Publication is confined to a preexisting trusted local key volume. No mkdir,
-// permission repair, old-key restoration, or path/value leakage on failure.
+// Publication is confined to a preexisting trusted local key volume. No mkdir, permission
+// repair or path/value leakage on failure. Only createKeyKeeper restores or replaces a key.
 function publishWebKey({ masterKey, file, uid, gid }) {
-  const fs = require('node:fs'), path = require('node:path'); key32(masterKey);
+  key32(masterKey);
+  return writeKeyFile({ file, uid, gid, make: () => deriveFileKey(masterKey, crypto.randomBytes(32)), replace: true });
+}
+// Recovery only: restores this process's own key to a trusted directory that lost it. It never
+// replaces a present file, which may be a newer web's key or a fault the operator must see.
+function republishMissingKey({ fileKey, file, uid, gid }) {
+  const fs = require('node:fs'); key32(fileKey);
+  try { fs.lstatSync(file); return false; } catch (e) { if (e.code !== 'ENOENT') throw error('publication'); }
+  writeKeyFile({ file, uid, gid, make: () => fileKey, replace: false });
+  return true;
+}
+// Only createKeyKeeper's checks decide whether this process may touch the file: `own` is the one state it may replace.
+function keyFileState(file, fileKey) {
+  const fs = require('node:fs'); let fd;
+  try {
+    fd = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+    return fs.readFileSync(fd, 'utf8') === `${fileKey.toString('hex')}\n` ? 'own' : 'foreign';
+  } catch (e) { return e.code === 'ENOENT' ? 'missing' : 'unknown'; }
+  finally { if (fd !== undefined) fs.closeSync(fd); }
+}
+/** The key file seen by one web process. Once it has seen another web's key it never writes again. */
+function createKeyKeeper({ deriveMaster, fileKey, file, uid, gid }) {
+  let current = fileKey, superseded = false;
+  const state = () => { const seen = keyFileState(file, current); if (seen === 'foreign') superseded = true; return seen; };
+  return {
+    /** 'restored', 'superseded' or 'present'. */
+    restore() {
+      if (superseded) return 'superseded';
+      const seen = state();
+      if (seen === 'foreign') return 'superseded';
+      return seen === 'missing' && republishMissingKey({ fileKey: current, file, uid, gid }) ? 'restored' : 'present';
+    },
+    /** A new key, written over this process's own key only; null if the file is anything else. */
+    rekey() {
+      if (superseded || state() !== 'own') return null;
+      try { current = writeKeyFile({ file, uid, gid, replace: true, make: () => { if (keyFileState(file, current) !== 'own') throw error('publication'); return deriveFileKey(deriveMaster(), crypto.randomBytes(32)); } }); return current; }
+      catch { return null; }
+    },
+  };
+}
+// A crash between link and unlink in writeKeyFile leaves the key with a second name. Only the
+// writer's own temporary pattern with this exact inode is removed, so any other extra link still refuses.
+function clearInterruptedLink(fs, path, dir, file, uid, gid) {
+  let key; try { key = fs.lstatSync(file); } catch { return; }
+  if (!key.isFile() || key.nlink !== 2 || key.uid !== uid || key.gid !== gid) return;
+  for (const name of fs.readdirSync(dir)) {
+    if (!/^\.egress-key-[0-9a-f]{32}\.tmp$/.test(name)) continue;
+    const other = fs.lstatSync(path.join(dir, name));
+    if (other.isFile() && other.dev === key.dev && other.ino === key.ino) { fs.unlinkSync(path.join(dir, name)); return; }
+  }
+}
+function writeKeyFile({ file, uid, gid, make, replace }) {
+  const fs = require('node:fs'), path = require('node:path');
   if (typeof file !== 'string' || !path.isAbsolute(file) || path.resolve(file) !== file || file.includes('\0') || !Number.isInteger(uid) || uid < 0 || uid >= 0xffffffff || !Number.isInteger(gid) || gid <= 0 || gid >= 0xffffffff || process.getuid?.() !== uid || !Number.isInteger(fs.constants.O_NOFOLLOW)) throw error('publication');
   const dir=path.dirname(file); let fd, temporary, created=false;
   try {
     const parent=fs.lstatSync(dir);
     if (!parent.isDirectory() || parent.isSymbolicLink() || fs.realpathSync(dir)!==dir || parent.uid!==uid || parent.gid!==gid || (parent.mode&0o022)!==0 || (parent.mode&0o050)!==0o050) throw error('publication');
+    clearInterruptedLink(fs,path,dir,file,uid,gid);
     try { const old=fs.lstatSync(file); if(!old.isFile()||old.isSymbolicLink()||old.nlink!==1||old.uid!==uid||old.gid!==gid||(old.mode&0o7777)!==0o440) throw error('publication'); } catch(e) {if(e.code!=='ENOENT') throw e;}
-    const fileKey=deriveFileKey(masterKey,crypto.randomBytes(32));
+    const fileKey=make();
     temporary=path.join(dir,`.egress-key-${crypto.randomBytes(16).toString('hex')}.tmp`);
     fd=fs.openSync(temporary,fs.constants.O_WRONLY|fs.constants.O_CREAT|fs.constants.O_EXCL|fs.constants.O_NOFOLLOW,0o440);created=true;
     fs.fchownSync(fd,uid,gid);fs.fchmodSync(fd,0o440);fs.writeFileSync(fd,`${fileKey.toString('hex')}\n`);fs.fsyncSync(fd);fs.closeSync(fd);fd=undefined;
     const current=fs.lstatSync(dir);if(current.dev!==parent.dev||current.ino!==parent.ino) throw error('publication');
-    fs.renameSync(temporary,file);created=false;
+    if(replace){fs.renameSync(temporary,file);created=false;}
+    else{fs.linkSync(temporary,file);fs.unlinkSync(temporary);created=false;}
     return fileKey;
   } catch {
     if(fd!==undefined)try{fs.closeSync(fd);}catch{}
@@ -108,13 +162,30 @@ function publishWebKey({ masterKey, file, uid, gid }) {
     throw error('publication');
   }
 }
-function createControlClient({ fileKey, endpoint, now = Date.now, monotonic = () => performance.now(), transport = defaultTransport, log = () => {}, ttlMs = DEFAULT_TOKEN_TTL_MS, lifetimeMs = 7200000, autoRenew = true } = {}) {
+function createControlClient({ fileKey, endpoint, now = Date.now, monotonic = () => performance.now(), transport = defaultTransport, log = () => {}, ttlMs = DEFAULT_TOKEN_TTL_MS, lifetimeMs = 7200000, autoRenew = true, keeper = null, retryMinMs = RETRY_MIN_MS, retryMaxMs = RETRY_MAX_MS } = {}) {
   fileKey = Buffer.from(key32(fileKey)); endpointAddress(endpoint);
-  const fingerprint = sha(fileKey), records = new WeakMap(), active = new Set(), latest = new Map();
+  let fingerprint = sha(fileKey), conflictSince = null, supersededNoted = false; const records = new WeakMap(), active = new Set(), latest = new Map();
   const life = Math.min(safeInt(lifetimeMs), 86400000), idle = Math.min(safeInt(ttlMs), life);
-  let epoch = null, readyFlight = null, renewFlight = null, timer = null, failed = false, closed = false, lastMono = -Infinity;
-  const mono = () => { const value = monotonic(); if (!Number.isFinite(value) || value < lastMono) { failed = true; clearTimeout(timer); throw error('clock'); } lastMono = value; return value; };
-  const fail = (reason) => { failed = true; clearTimeout(timer); timer = null; try { log({ event: 'egress.control_unavailable', reason }); } catch { /* diagnostics cannot restore authority */ } };
+  // `epoch` is the only network authority. A failure drops it and only an authenticated Ready for a
+  // different session restores it: the proxy refuses that Ready until the old session is dead (expired,
+  // retired or lost with its process), so an uncertain revoke cannot survive recovery. The clock fault alone is final.
+  let epoch = null, lastEpoch = null, readyFlight = null, renewFlight = null, timer = null, retryTimer = null, failed = false, closed = false, clockFault = false, lastMono = -Infinity, nextAttempt = -Infinity, retryDelay = retryMinMs, downSince = null;
+  const note = (entry) => { try { log(entry); } catch { /* diagnostics cannot change authority */ } };
+  const stopTimers = () => { clearTimeout(timer); timer = null; clearTimeout(retryTimer); retryTimer = null; };
+  const mono = () => { const value = monotonic(); if (!Number.isFinite(value) || value < lastMono) { failed = true; clockFault = true; epoch = null; stopTimers(); throw error('clock'); } lastMono = value; return value; };
+  function armRetry() {
+    clearTimeout(retryTimer); retryTimer = null;
+    if (!autoRenew || closed || clockFault || !failed) return;
+    retryTimer = setTimeout(() => { retryTimer = null; ready().catch(() => { if (!retryTimer) armRetry(); }); }, Math.max(retryMinMs, nextAttempt - lastMono));
+    retryTimer.unref?.();
+  }
+  const fail = (reason, holdUntil = -Infinity) => {
+    if (!failed) { downSince = Number.isFinite(lastMono) ? lastMono : 0; note({ event: 'egress.control_unavailable', reason }); }
+    failed = true; if (epoch) { lastEpoch = epoch; epoch = null; }
+    clearTimeout(timer); timer = null;
+    nextAttempt = Math.max((Number.isFinite(lastMono) ? lastMono : 0) + retryDelay, holdUntil); retryDelay = Math.min(retryDelay * 2, retryMaxMs);
+    armRetry();
+  };
   const stamp = (task) => { const wall = safeInt(now()), t = Math.max(wall, (latest.get(task) || 0) + 1); if (!Number.isSafeInteger(t) || t - wall > 60000) throw error('clock'); latest.delete(task); latest.set(task, t); if (latest.size > 10000) latest.delete(latest.keys().next().value); return t; };
   async function rpc(name, body, boot, budgetMs = 10000) {
     if (!Number.isFinite(budgetMs) || budgetMs <= 0) throw error('timeout');
@@ -125,6 +196,7 @@ function createControlClient({ fileKey, endpoint, now = Date.now, monotonic = ()
     const headers = { 'content-type': 'application/json', 'content-length': bytes.length, 'cache-control': undefined, connection: 'close', 'x-noevia-request-id': requestId, 'x-noevia-deadline-ms': String(meta.deadlineMs), 'x-noevia-key-fingerprint': fingerprint, 'x-noevia-control-mac': tag };
     delete headers['cache-control']; if (boot !== null) headers['x-noevia-boot-id'] = boot;
     for (let attempt = 0; attempt < 16; attempt++) {
+      if (closed && name === 'ready') throw error('closed');
       const left = until - mono(); if (left <= 0) throw error('timeout');
       const abort = new AbortController(); let t;
       try {
@@ -155,26 +227,83 @@ function createControlClient({ fileKey, endpoint, now = Date.now, monotonic = ()
     return { boot: v.bootId, session: v.sessionId, sequence: v.sequence, until: reply.first + v.leaseMs };
   }
   function schedule() { clearTimeout(timer); if (autoRenew && !closed && !failed) { timer = setTimeout(() => { renew().catch(() => {}); }, RENEW_MS); timer.unref?.(); } }
+  async function readyRequest(mode, prior) {
+    const challenge = crypto.randomBytes(16).toString('hex');
+    const reply = await rpc('ready', { version: 1, mode, challenge, expectedKeyFingerprint: fingerprint, priorSession: prior ? prior.session : null }, prior ? prior.boot : null);
+    return { reply, challenge };
+  }
+  // Both modes refused with a signed answer, so the proxy holds this key and a session nobody here can name:
+  // a Ready that committed after this client gave up on it. Nothing else clears that until a new key does.
+  // The wait outlasts any session this client could still renew, so a live one is never cut short. The proxy
+  // reads the key file on every request, and a new key retires its session and accepts Initial (engine.rs sync_key).
+  async function conflicted() {
+    const at = mono();
+    if (conflictSince === null) { conflictSince = at; note({ event: 'egress.control_conflict' }); }
+    if (at - conflictSince < SESSION_MS + RPC_MS) throw error('conflict');
+    const next = keeper ? keeper.rekey() : null;
+    if (!next) { note({ event: 'egress.control_rekey_refused' }); throw error('conflict'); }
+    fileKey = Buffer.from(next); fingerprint = sha(fileKey); lastEpoch = null; conflictSince = null;
+    note({ event: 'egress.control_rekeyed' });
+  }
+  async function establish() {
+    if (failed && keeper) {
+      const kept = keeper.restore();
+      if (kept === 'restored') note({ event: 'egress.key_republished' });
+      if (kept === 'superseded' && !supersededNoted) { supersededNoted = true; note({ event: 'egress.key_superseded' }); }
+    }
+    let prior = lastEpoch, sent = null;
+    // Replace answers a live proxy whose session this client held. A restarted or re-keyed proxy has
+    // no such session and answers 409, signed; it accepts only Initial, which an initialized proxy refuses.
+    if (prior) { sent = await readyRequest('replace', prior); if (sent.reply.status === 409) sent = null; }
+    if (closed) throw error('closed');
+    if (!sent) {
+      sent = await readyRequest('initial', null);
+      if (sent.reply.status === 409) { await conflicted(); prior = null; sent = await readyRequest('initial', null); }
+    }
+    conflictSince = null;
+    const next = proof(sent.reply, 'ready', sent.challenge, 0);
+    if (closed || clockFault || (prior && next.session === prior.session)) throw error('epoch');
+    const recovered = failed, downMs = recovered && downSince !== null ? Math.max(0, Math.round(lastMono - downSince)) : 0;
+    epoch = next; lastEpoch = null; failed = false; downSince = null; retryDelay = retryMinMs; nextAttempt = -Infinity;
+    clearTimeout(retryTimer); retryTimer = null;
+    // Tokens of a replaced session verify nowhere now. Their owners can still ask for a report.
+    for (const r of active) if (r.session !== next.session) active.delete(r);
+    note({ event: 'egress.control_ready', recovered, ...(recovered ? { downMs } : {}) });
+    schedule();
+    return { capability: CAPABILITY, available: true };
+  }
   function ready() {
-    if (closed || failed) return Promise.reject(error('unavailable'));
-    if (epoch) { if (mono() >= epoch.until) { fail('expired'); return Promise.reject(error('expired')); } return Promise.resolve({ capability: CAPABILITY, available: true }); }
-    if (readyFlight) return readyFlight;
-    readyFlight = Promise.resolve().then(async () => {
-      const challenge = crypto.randomBytes(16).toString('hex');
-      const reply = await rpc('ready', { version: 1, mode: 'initial', challenge, expectedKeyFingerprint: fingerprint, priorSession: null }, null);
-      const next = proof(reply, 'ready', challenge, 0); if (closed || failed) throw error('closed'); epoch = next; schedule(); return { capability: CAPABILITY, available: true };
-    }).catch((e) => { fail('ready'); throw e instanceof ControlError ? e : error('ready'); });
+    try {
+      if (closed || clockFault) return Promise.reject(error('unavailable'));
+      if (epoch) { if (mono() < epoch.until) return Promise.resolve({ capability: CAPABILITY, available: true }); fail('expired'); }
+      if (readyFlight) return readyFlight;
+      // Inside the backoff a caller is refused at once, not parked behind a proxy that just failed.
+      if (failed && mono() < nextAttempt) return Promise.reject(error('unavailable'));
+    } catch (e) { return Promise.reject(e instanceof ControlError ? e : error('ready')); }
+    readyFlight = Promise.resolve().then(establish)
+      .catch((e) => {
+        const conflict = e instanceof ControlError && e.reason === 'conflict';
+        if (!conflict) conflictSince = null; // only an unbroken run of signed refusals counts
+        if (!closed && !clockFault) fail(conflict ? 'conflict' : 'ready');
+        throw e instanceof ControlError ? e : error('ready');
+      })
+      .finally(() => { readyFlight = null; });
     return readyFlight;
   }
   function renew() {
     if (renewFlight) return renewFlight;
     renewFlight = Promise.resolve().then(async () => {
       await ready(); const prior = epoch; if (!prior || !Number.isSafeInteger(prior.sequence + 1)) throw error('epoch');
-      const reply = await rpc('renew', { version: 1, sessionId: prior.session, sequence: prior.sequence + 1 }, prior.boot, Math.min(1000, prior.until - mono()));
-      const next = proof(reply, 'renewed', null, prior.sequence + 1); if (closed || failed) throw error('closed'); epoch = next; schedule(); return { available: true };
-    }).catch((e) => { fail('renew'); throw e instanceof ControlError ? e : error('renew'); }).finally(() => { renewFlight = null; });
+      try {
+        const reply = await rpc('renew', { version: 1, sessionId: prior.session, sequence: prior.sequence + 1 }, prior.boot, Math.min(1000, prior.until - mono()));
+        const next = proof(reply, 'renewed', null, prior.sequence + 1); if (closed || epoch !== prior) throw error('closed'); epoch = next; schedule(); return { available: true };
+      } catch (e) { if (epoch === prior) fail('renew'); throw e instanceof ControlError ? e : error('renew'); }
+    }).finally(() => { renewFlight = null; });
     return renewFlight;
   }
+  /** Boot without waiting: an outage is logged, retried and refused per grant, never fatal to the web. */
+  function start() { ready().catch(() => {}); }
+  function available() { try { return !closed && !failed && !!epoch && mono() < epoch.until; } catch { return false; } }
   async function grant({ taskId, domains = [] } = {}) {
     if (typeof taskId !== 'string' || !TASK.test(taskId)) throw error('task'); if(!Array.isArray(domains)||domains.some((v)=>typeof v!=='string')) throw error('hosts'); let hosts; try { hosts=grantHosts(domains); } catch { throw error('hosts'); } if (!hosts.length) throw error('hosts');
     await ready(); if (renewFlight) await renewFlight;
@@ -225,7 +354,13 @@ function createControlClient({ fileKey, endpoint, now = Date.now, monotonic = ()
         if (!report.final) throw error('uncertain');
         retainReport(r, report); active.delete(r);
         return Object.freeze({ confirmed: true, report });
-      } catch { fail('cleanup'); return unavailableReport(); }
+      } catch {
+        // Only the session this lease belongs to can be left uncertain. Hold new authority until that
+        // lease has run out. A lease of an already replaced session must not take the new one down.
+        if (epoch && epoch.session === r.session) fail('cleanup', epoch.until);
+        if (!epoch || epoch.session !== r.session) active.delete(r);
+        return unavailableReport();
+      }
     });
     return r.cleanup;
   }
@@ -238,7 +373,7 @@ function createControlClient({ fileKey, endpoint, now = Date.now, monotonic = ()
       catch { return Object.freeze({ confirmed: false }); }
     }); return r.forget;
   }
-  async function close() { closed = true; clearTimeout(timer); const until=mono()+10000; const pending = [...active]; let cursor = 0; const results = []; await Promise.all(Array.from({ length: Math.min(4, pending.length) }, async () => { while (cursor < pending.length) { const r = pending[cursor++]; results.push(await revoke(r.handle, Math.max(0,until-mono()))); } })); return results; }
-  return Object.freeze({ impl: 'rust-controlled', capability: CAPABILITY, endpoint, ready, renew, grant, activity, revoke, forget, close, sweep: () => 0 });
+  async function close() { closed = true; stopTimers(); if (readyFlight) await readyFlight.catch(() => {}); const until=mono()+10000; const pending = [...active]; let cursor = 0; const results = []; await Promise.all(Array.from({ length: Math.min(4, pending.length) }, async () => { while (cursor < pending.length) { const r = pending[cursor++]; results.push(await revoke(r.handle, Math.max(0,until-mono()))); } })); return results; }
+  return Object.freeze({ impl: 'rust-controlled', capability: CAPABILITY, endpoint, start, available, ready, renew, grant, activity, revoke, forget, close, sweep: () => 0 });
 }
-module.exports = { CAPABILITY, ROUTES, ControlError, publishWebKey, deriveFileKey, deriveControlKey, deriveGrantKey, requestMac, responseMac, createControlClient, defaultTransport };
+module.exports = { CAPABILITY, ROUTES, ControlError, publishWebKey, republishMissingKey, createKeyKeeper, deriveFileKey, deriveControlKey, deriveGrantKey, requestMac, responseMac, createControlClient, defaultTransport };
