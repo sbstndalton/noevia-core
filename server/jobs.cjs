@@ -22,6 +22,7 @@ const TYPES = new Set(['job.created', 'job.started', 'step.started', 'step.compl
   // never write one. See task-lifecycle.cjs for how they fold.
   'task.stage', 'task.revision']);
 const REVIEW_TYPES = new Set(['review.requested', 'review.completed', 'review.failed']);
+const JOB_ID = /^[0-9a-f-]{36}$/;
 const TERMINAL = new Set(['completed', 'failed', 'cancelled', 'interrupted']);
 const AUTHORITY_TYPES = taskLifecycle.AUTHORITY_TYPES;
 const MAX_STAGE_EVENTS = 64, MAX_REVISIONS = 32, MAX_STAGE_REASON = 300, MAX_EXPECTED_ARTIFACTS = 32;
@@ -230,7 +231,7 @@ function createJobs({ dir, now = Date.now, retainMs = 7 * 86400000, maxJobs = 20
   const root = path.join(dir, 'jobs');
   const controllers = new Map();
   const file = (id) => {
-    if (!/^[0-9a-f-]{36}$/.test(String(id))) throw Object.assign(Error('Invalid job id'), { status: 400 });
+    if (!JOB_ID.test(String(id))) throw Object.assign(Error('Invalid job id'), { status: 400 });
     return path.join(root, id + '.jsonl');
   };
   // #1126: the parsed journal of each job this process has read or written, kept while the file's
@@ -383,7 +384,8 @@ function createJobs({ dir, now = Date.now, retainMs = 7 * 86400000, maxJobs = 20
     return snapshot(entry.acc);
   }
   function get(id) { const e = events(id); return e.length ? derive(e) : null; }
-  function ids() { try { return fs.readdirSync(root).filter((n) => n.endsWith('.jsonl')).map((n) => n.slice(0, -6)); } catch { return []; } }
+  // #2273: only names that are job ids; a stray notes.jsonl is left alone (file() would throw on it).
+  function ids() { try { return fs.readdirSync(root).filter((n) => n.endsWith('.jsonl') && JOB_ID.test(n.slice(0, -6))).map((n) => n.slice(0, -6)); } catch { return []; } }
   const warnedUnreadable = new Set();
   // A single corrupt or torn-mid-line journal must never take down reads of every other
   // job sharing the directory (recover/prune/list all enumerate every file up front).

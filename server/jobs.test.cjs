@@ -325,3 +325,29 @@ test('only a cancelled job accepts a late artifact; a failed one, even holding a
     assert.deepEqual(jobs.get(cancelled).artifacts, [{ name: 'partial.md' }]);
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
+
+// #2273: a stray *.jsonl whose name is not a job id (notes.jsonl) used to make file(id) throw
+// 'Invalid job id' from ids(), so recover/list/prune failed for the whole user. The name is skipped; the
+// file is neither read, deleted nor rewritten, and a damaged middle line stays that journal's own problem.
+test('a stray .jsonl that is not a job id is skipped by recover, list and prune and left untouched', async (t) => {
+  const dir = tmp(); t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const store = createJobs({ dir, kinds: ['code'] });
+  const jdir = path.join(dir, 'jobs');
+  const running = store.create({ kind: 'code' }); store.append(running, 'job.started');
+  const damaged = store.create({ kind: 'code' }); store.append(damaged, 'job.started'); store.append(damaged, 'progress', { stage: 'x' });
+  const lines = fs.readFileSync(path.join(jdir, damaged + '.jsonl'), 'utf8').split('\n').filter(Boolean);
+  lines[1] = '{"job":"x","seq":2,"type":"progr';
+  fs.writeFileSync(path.join(jdir, damaged + '.jsonl'), lines.join('\n') + '\n');
+  fs.writeFileSync(path.join(jdir, 'notes.jsonl'), 'stray file, not a job\n');
+  fs.writeFileSync(path.join(jdir, 'stray.txt'), 'stray text\n');
+  fs.writeFileSync(path.join(jdir, 'Not-A-Job.jsonl'), 'x\n');
+  const fresh = createJobs({ dir, kinds: ['code'] });
+  assert.equal(fresh.recover(), 1);
+  assert.equal(fresh.get(running).status, 'interrupted');
+  const listed = fresh.list();
+  assert.deepEqual(listed.map((j) => j.id).sort(), [running, damaged].sort());
+  assert.deepEqual(listed.find((j) => j.id === damaged), { id: damaged, status: 'unreadable' });
+  fresh.prune();
+  assert.equal(fs.readFileSync(path.join(jdir, 'notes.jsonl'), 'utf8'), 'stray file, not a job\n');
+  assert.ok(fs.existsSync(path.join(jdir, 'Not-A-Job.jsonl')));
+});
