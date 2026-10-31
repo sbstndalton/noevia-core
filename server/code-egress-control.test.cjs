@@ -1,7 +1,7 @@
 'use strict';
 const test = require('node:test'), assert = require('node:assert/strict');
 const fs = require('node:fs'), path = require('node:path'), os = require('node:os'), crypto = require('node:crypto');
-const { CAPABILITY, ROUTES, deriveFileKey, deriveControlKey, deriveGrantKey, requestMac, responseMac, createControlClient, publishWebKey, republishMissingKey } = require('./code-egress-control.cjs');
+const { CAPABILITY, ROUTES, deriveFileKey, deriveControlKey, deriveGrantKey, requestMac, responseMac, createControlClient, publishWebKey, republishMissingKey, createKeyKeeper } = require('./code-egress-control.cjs');
 const { mintGrant } = require('./code-egress.cjs');
 const vectors = require('../contracts/egress-control.v1.vectors.json');
 const file = Buffer.alloc(32, 7), boot = 'ab'.repeat(16), session = 'cd'.repeat(16), snapshot = 'ef'.repeat(16);
@@ -148,24 +148,25 @@ test('fresh file publication is confined to an owned profile and never repairs u
 });
 // A proxy with the real Ready rules: boot and session identity change on restart, a live session refuses Ready.
 function restartable() {
-  const fp = crypto.createHash('sha256').update(file).digest('hex'), calls = [];
-  let up = true, seq = 0, bootId = 'a1'.repeat(16), sessionId = null, sessionLive = false;
+  const calls = [], fpOf = (k) => crypto.createHash('sha256').update(k).digest('hex');
+  let key = file, fp = fpOf(file), up = true, seq = 0, bootId = 'a1'.repeat(16), sessionId = null, sessionLive = false;
   const fresh = () => crypto.randomBytes(16).toString('hex');
+  const signed = (req, value, status = 200) => response(req, value, status, key);
   const transport = async (req) => {
     if (!up) throw Object.assign(Error('synthetic refused'), { code: 'ECONNREFUSED' });
     const b = JSON.parse(req.body); calls.push({ route: req.route, mode: b.mode });
     if (req.route === ROUTES.ready) {
       const fit = b.mode === 'initial' ? sessionId === null : (req.headers['x-noevia-boot-id'] === bootId && b.priorSession === sessionId && sessionId !== null);
-      if (sessionLive || !fit) return response(req, { state: 'conflict' }, 409);
+      if (sessionLive || !fit) return signed(req, { state: 'conflict' }, 409);
       sessionId = fresh(); sessionLive = true;
-      return response(req, { state: 'ready', capability: CAPABILITY, bootId, sessionId, keyFingerprint: fp, sequence: 0, leaseMs: 15000, challenge: b.challenge });
+      return signed(req, { state: 'ready', capability: CAPABILITY, bootId, sessionId, keyFingerprint: fp, sequence: 0, leaseMs: 15000, challenge: b.challenge });
     }
-    if (req.route === ROUTES.renew) { if (!sessionLive || b.sessionId !== sessionId) return response(req, { state: 'conflict' }, 409); return response(req, { state: 'renewed', capability: CAPABILITY, bootId, sessionId, keyFingerprint: fp, sequence: b.sequence, leaseMs: 15000 }); }
-    if (b.sessionId !== sessionId) return response(req, { state: 'conflict' }, 409);
+    if (req.route === ROUTES.renew) { if (!sessionLive || b.sessionId !== sessionId) return signed(req, { state: 'conflict' }, 409); return signed(req, { state: 'renewed', capability: CAPABILITY, bootId, sessionId, keyFingerprint: fp, sequence: b.sequence, leaseMs: 15000 }); }
+    if (b.sessionId !== sessionId) return signed(req, { state: 'conflict' }, 409);
     seq++;
-    return response(req, { state: req.route === ROUTES.revoke ? 'revoke-confirmed' : 'activity', bootId, sessionId, taskId: b.taskId, leaseNonce: b.leaseNonce, barrierInstalled: req.route === ROUTES.revoke, drained: req.route === ROUTES.revoke, snapshot: { id: seq.toString(16).padStart(32, '0'), state: 'complete', final: req.route === ROUTES.revoke, summary: { hosts: [], allowed: 0, refused: 0 }, partial: false, overflow: false } });
+    return signed(req, { state: req.route === ROUTES.revoke ? 'revoke-confirmed' : 'activity', bootId, sessionId, taskId: b.taskId, leaseNonce: b.leaseNonce, barrierInstalled: req.route === ROUTES.revoke, drained: req.route === ROUTES.revoke, snapshot: { id: seq.toString(16).padStart(32, '0'), state: 'complete', final: req.route === ROUTES.revoke, summary: { hosts: [], allowed: 0, refused: 0 }, partial: false, overflow: false } });
   };
-  return { calls, transport, stop() { up = false; }, restart() { up = true; bootId = fresh(); sessionId = null; sessionLive = false; }, expire() { sessionLive = false; } };
+  return { calls, transport, stop() { up = false; }, rekey(next) { key = next; fp = fpOf(next); sessionId = null; sessionLive = false; }, restart() { up = true; bootId = fresh(); sessionId = null; sessionLive = false; }, expire() { sessionLive = false; } };
 }
 const quick = { retryMinMs: 1, retryMaxMs: 2, autoRenew: false };
 const settle = (ms = 5) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -216,10 +217,67 @@ test('#2226: an outage at start refuses grants at once, retries alone and logs o
 test('#2226: close stops recovery for good and a clock fault stays final', async () => {
   const p = restartable(); p.stop();
   const c = createControlClient({ fileKey: file, endpoint: 'localhost:3001', transport: p.transport, retryMinMs: 1, retryMaxMs: 1 });
-  c.start(); await settle(20); await c.close(); p.restart(); const n = p.calls.length; await settle(20);
+  c.start(); await c.close(); p.restart(); const n = p.calls.length; await settle(20);
   assert.equal(p.calls.length, n); await assert.rejects(c.ready());
   let clock = 100; const q = restartable(), d = createControlClient({ fileKey: file, endpoint: 'localhost:3001', transport: q.transport, monotonic: () => clock, ...quick });
   await d.ready(); clock = 50; await assert.rejects(d.renew()); clock = 100000; await assert.rejects(d.ready()); assert.equal(d.available(), false); await d.close();
+});
+// A Ready that commits on the proxy while its reply misses the deadline, then a clock that runs on.
+function wedge(extra = {}) {
+  const p = restartable(), events = []; let shift = 0, losing = true, next = null;
+  const c = createControlClient({ fileKey: file, endpoint: 'localhost:3001', autoRenew: false, retryMinMs: 1, retryMaxMs: 2, monotonic: () => performance.now() + shift, log: (e) => events.push(e.event),
+    transport: async (req) => { const reply = await p.transport(req); if (losing && req.route === ROUTES.ready) { losing = false; shift += 11000; } return reply; },
+    keeper: { restore: () => 'present', rekey: () => { if (extra.refuse) return null; next = Buffer.alloc(32, 9); p.rekey(next); return next; } } });
+  return { p, c, events, later(ms) { shift += ms; }, rekeyed: () => next };
+}
+const { performance } = require('node:perf_hooks');
+test('#2226: a committed Ready whose reply was lost heals by a new key once the signed refusals outlast any session', async () => {
+  const { p, c, events, later, rekeyed } = wedge();
+  await assert.rejects(c.ready()); assert.equal(c.available(), false);
+  await settle(); await assert.rejects(c.ready(), { reason: 'conflict' }); assert.ok(events.includes('egress.control_conflict'));
+  assert.equal(rekeyed(), null, 'a live unknown session is waited out, not cut short');
+  p.expire(); later(10000); await settle(); await assert.rejects(c.ready(), { reason: 'conflict' }); assert.equal(rekeyed(), null);
+  later(16000); await settle(); await c.ready(); assert.equal(c.available(), true); assert.ok(rekeyed());
+  assert.ok(events.includes('egress.control_rekeyed')); assert.ok((await c.grant({ taskId: 'healed.1', domains: ['example.com'] })).token); await c.close();
+});
+test('#2226: a refused re-key stays closed and says so', async () => {
+  const { p, c, events, later } = wedge({ refuse: true });
+  await assert.rejects(c.ready()); await settle(); await assert.rejects(c.ready()); p.expire(); later(26000); await settle();
+  await assert.rejects(c.ready(), { reason: 'conflict' }); assert.ok(events.includes('egress.control_rekey_refused')); assert.equal(c.available(), false); await c.close();
+});
+test('#2226: only an unbroken run of signed refusals counts, never a network failure or an unsigned answer', async () => {
+  let shift = 0, mode = 'down', rekeys = 0; const p = restartable();
+  const c = createControlClient({ fileKey: file, endpoint: 'localhost:3001', autoRenew: false, retryMinMs: 1, retryMaxMs: 2, monotonic: () => performance.now() + shift, keeper: { restore: () => 'present', rekey: () => { rekeys++; return null; } },
+    transport: async (req) => { if (mode === 'down') throw Error('synthetic refused'); if (mode === 'unsigned') return response(req, { state: 'conflict' }, 409, Buffer.alloc(32, 66)); return p.transport(req); } });
+  c.start(); await settle(20);
+  for (const m of ['down', 'unsigned']) { mode = m; for (let i = 0; i < 3; i++) { shift += 30000; await settle(); await c.ready().catch(() => {}); } }
+  assert.equal(rekeys, 0); await c.close();
+});
+test('#2226: the key keeper replaces only its own key, and one that saw another web key never writes again', () => {
+  const dir = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), 'noevia-core-keeper-'));
+  try {
+    const uid = process.getuid(), gid = process.getgid() || (uid === 0 ? 1 : 0); fs.chownSync(dir, uid, gid); fs.chmodSync(dir, 0o750);
+    const keyFile = path.join(dir, 'k'), master = Buffer.alloc(32, 5), own = publishWebKey({ masterKey: master, file: keyFile, uid, gid });
+    const keeper = createKeyKeeper({ deriveMaster: () => master, fileKey: own, file: keyFile, uid, gid });
+    assert.equal(keeper.restore(), 'present'); const next = keeper.rekey(); assert.ok(next && !next.equals(own)); assert.equal(fs.readFileSync(keyFile, 'utf8'), `${next.toString('hex')}\n`);
+    const newer = publishWebKey({ masterKey: master, file: keyFile, uid, gid }), text = fs.readFileSync(keyFile, 'utf8'); assert.ok(!newer.equals(next));
+    assert.equal(keeper.rekey(), null); assert.equal(fs.readFileSync(keyFile, 'utf8'), text);
+    fs.unlinkSync(keyFile); assert.equal(keeper.restore(), 'superseded'); assert.equal(fs.existsSync(keyFile), false);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+test('#2226: a crash between link and unlink is cleared; any other extra link still refuses', () => {
+  const dir = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), 'noevia-core-link-'));
+  try {
+    const uid = process.getuid(), gid = process.getgid() || (uid === 0 ? 1 : 0); fs.chownSync(dir, uid, gid); fs.chmodSync(dir, 0o750);
+    const keyFile = path.join(dir, 'k'), master = Buffer.alloc(32, 6); publishWebKey({ masterKey: master, file: keyFile, uid, gid });
+    fs.linkSync(keyFile, path.join(dir, `.egress-key-${'a'.repeat(32)}.tmp`)); publishWebKey({ masterKey: master, file: keyFile, uid, gid });
+    assert.deepEqual(fs.readdirSync(dir), ['k']);
+    fs.linkSync(keyFile, path.join(dir, 'other')); assert.throws(() => publishWebKey({ masterKey: master, file: keyFile, uid, gid }));
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+test('#2226: a retry timer survives a clock fault thrown inside ready()', async () => {
+  let clock = 100; const q = restartable(), d = createControlClient({ fileKey: file, endpoint: 'localhost:3001', transport: q.transport, monotonic: () => clock, ...quick });
+  await d.ready(); clock = 50; await assert.rejects(d.ready(), { reason: 'clock' }); clock = 1e6; await d.close();
 });
 test('#2226: only a missing key file is restored, with the same key, safely', () => {
   const dir = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), 'noevia-core-republish-'));
@@ -233,7 +291,7 @@ test('#2226: only a missing key file is restored, with the same key, safely', ()
     fs.unlinkSync(keyFile); fs.chmodSync(dir, 0o777); assert.throws(() => republishMissingKey({ fileKey: own, file: keyFile, uid, gid })); assert.equal(fs.existsSync(keyFile), false);
   } finally { fs.chmodSync(dir, 0o700); fs.rmSync(dir, { recursive: true, force: true }); }
 });
-test('#2226: a real proxy restart and a boot outage recover by themselves, without ever accepting an old token', async () => {
+test('#2226: a real proxy restart and a boot outage recover by themselves, without ever accepting an old token', { timeout: 240000 }, async () => {
   const { spawn } = require('node:child_process'), { once } = require('node:events'), net = require('node:net');
   const binary = process.env.NOEVIA_EGRESS_CONTROL_BINARY; assert.ok(binary, 'explicit paired Rust binary is required');
   const hermetic = globalThis[Symbol.for('noevia.hermetic.nativeFixture.v1')];
@@ -268,12 +326,19 @@ test('#2226: a real proxy restart and a boot outage recover by themselves, witho
     assert.equal(await connect(first.token), 407); assert.equal(await connect(second.token), 403);
     await assert.rejects(client.activity(first)); assert.equal((await client.revoke(first, 2000)).confirmed, false); assert.equal(client.available(), true, 'old cleanup leaves the new session alone');
     // A lost key file comes back on its own, after the proxy has dropped the session it no longer has a key for.
-    fs.unlinkSync(keyFile); await until(() => !client.available() && fs.existsSync(keyFile) === true, 30000).catch(() => {}); await until(() => client.available(), 40000); assert.equal(fs.existsSync(keyFile), true);
+    fs.unlinkSync(keyFile); await assert.rejects(client.renew()); await until(() => client.available(), 40000); assert.equal(fs.existsSync(keyFile), true);
+    assert.ok(events.some((e) => e.event === 'egress.key_republished'));
+    // A Ready the real proxy committed, its reply lost past the budget: no restart of anything.
+    await kill(); await assert.rejects(client.renew()); await client.close(); events.length = 0;
+    const { defaultTransport } = require('./code-egress-control.cjs'); let lose = true;
+    client = require('./code-egress.cjs').startEgressFromEnv({ CODE_EGRESS_PORT: String(free), CODE_EGRESS_RUST_HOST: '127.0.0.1', CODE_EGRESS_CONTROL_KEY_FILE: keyFile, CODE_EGRESS_KEY_UID: String(uid), CODE_EGRESS_KEY_GID: String(gid) }, { secrets: { derive: () => Buffer.alloc(32, 41) }, log: (e) => events.push(e), transport: async (req) => { const reply = await defaultTransport(req); if (lose && req.route === ROUTES.ready) throw Error('synthetic reply lost after commit'); return reply; } });
+    await launch(); client.start(); await until(() => events.some((e) => e.event === 'egress.control_unavailable'));
+    lose = false; await until(() => client.available(), 90000);
+    assert.ok(events.some((e) => e.event === 'egress.control_conflict')); assert.ok(events.some((e) => e.event === 'egress.control_rekeyed'));
     const third = await client.grant({ taskId: 'third.job', domains: ['example.com'] });
     const ended = await client.revoke(third); assert.equal(ended.confirmed, true); assert.equal(ended.report.final, true);
     assert.equal((await client.forget(third, ended.report.snapshotId)).confirmed, true);
-    assert.deepEqual(events.filter((e) => e.event === 'egress.control_ready').slice(0, 2).map((e) => e.recovered), [true, true]);
-    assert.ok(events.some((e) => e.event === 'egress.key_republished'));
+    assert.equal(events.filter((e) => e.event === 'egress.control_ready').at(-1).recovered, true);
     assert.ok(!JSON.stringify(events).includes(second.token));
   } finally {
     try { if (client) await client.close(); } finally { if (child) await kill(); fs.rmSync(dir, { recursive: true, force: true }); }
