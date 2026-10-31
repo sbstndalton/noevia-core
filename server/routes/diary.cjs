@@ -31,13 +31,19 @@ function createDiaryRoutes({ json, readBody, readJson, fetchJson, DIARY_BASE, au
   // Older fakes pass only diaryHeaders; fall back to a single send without the 428 retry.
   const diaryFetchJson = diary.diaryFetchJson || ((url, { method = 'GET', body, storageRetry = false } = {}, timeoutMs) => fetchJson(url, { method, headers: diaryHeaders(method, url, { body, storageRetry }), body }, timeoutMs));
 
+  // #2232: a Diary that cannot be reached is a status the page can word, not a bare 500. The call
+  // throws (connection refused, a stalled reply); nothing of the error is passed on.
+  const unavailable = (res) => json(res, 503, { error: 'Diary is unavailable right now. Try again shortly.', code: 'diaryUnavailable' });
+  const reach = async (res, call) => { try { return await call(); } catch { unavailable(res); return null; } };
+
   async function handle(req, res, { path: p, authn, url }) {
     if (p === '/api/diary/workspace-trash') {
       if (!authService.diaryEnabled(authn.user.id)) return json(res, 404, { error: 'Diary add-on is disabled' });
       if (!['GET', 'POST'].includes(req.method)) return json(res, 405, { error: 'Method not allowed' });
       const body = req.method === 'POST' ? await readBody(req, 4096) : undefined;
       const query = req.method === 'GET' ? '?after=' + encodeURIComponent(url.searchParams.get('after') || '') : '';
-      const r = await diaryFetchJson(`${DIARY_BASE}/api/workspace-trash${query}`, { method: req.method, body }, 60000);
+      const r = await reach(res, () => diaryFetchJson(`${DIARY_BASE}/api/workspace-trash${query}`, { method: req.method, body }, 60000));
+      if (!r) return;
       res.setHeader('Cache-Control', 'no-store');
       return json(res, r.status, r.ok ? r.body : { error: r.body?.detail || 'Diary recovery request failed. Retry or refresh Trash.' });
     }
@@ -63,7 +69,8 @@ function createDiaryRoutes({ json, readBody, readJson, fetchJson, DIARY_BASE, au
       // #1198: live QA could not tell whether a Retry press reached this point. Method, route and the
       // account's id only: no path, no storage address, no credential.
       if (storageRetry) log(`[diary] forwarding X-Cowork-Storage-Retry: 1 (${req.method} ${p}, user ${authn.user.id})`);
-      const r = await diaryFetchJson(`${DIARY_BASE}/api${suffix}`, { method: req.method, body, storageRetry }, local ? 600000 : 60000);
+      const r = await reach(res, () => diaryFetchJson(`${DIARY_BASE}/api${suffix}`, { method: req.method, body, storageRetry }, local ? 600000 : 60000));
+      if (!r) return;
       if (r.ok) {
         // #1589: an explicit Retry that works proves the saved login is good, so automatic calls resume.
         // #1607: but only when the listing really went to the storage server. A Diary account kept in the app

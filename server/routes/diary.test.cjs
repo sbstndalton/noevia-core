@@ -220,3 +220,16 @@ test('#1607: when the sidecar cannot say which kind of account it is, the hold s
   assert.equal(f.sent.pop().status, 200);
   assert.notEqual(storageLatch.status('u1', conn), null);
 });
+
+// sbstndalton/noevia#2232: a Diary that cannot be reached (the call throws) is a 503 the page can
+// word, with a stable code and no address or error text; it used to reach http.cjs as a bare 500.
+test('#2232: an unreachable Diary answers 503 diaryUnavailable on the file listing, file save, local exchange and trash', async () => {
+  const f = fixture({ reply: () => { throw Object.assign(new TypeError('fetch failed'), { cause: { code: 'ECONNREFUSED', address: '10.1.2.3' } }); } });
+  const unavailable = { status: 503, body: { error: 'Diary is unavailable right now. Try again shortly.', code: 'diaryUnavailable' } };
+  for (const [method, path, body] of [['GET', '/api/diary/files', undefined], ['PUT', '/api/diary/file', '{}'], ['POST', '/api/diary/local-exchange', { message: 'hi' }], ['GET', '/api/diary/workspace-trash', undefined]]) {
+    assert.equal(await f.call('diary', method, path, body), true, path);
+    const answered = f.sent.pop();
+    assert.deepEqual(answered, unavailable, path);
+    assert.doesNotMatch(JSON.stringify(answered), /10\.1\.2\.3|ECONN|fetch failed/);
+  }
+});
