@@ -9,6 +9,13 @@ const { servesModel } = require('./embedding-served.cjs');
 // The one address sent is the embedding service's, to admins only, because switching the
 // embedding model (embedding settings 'set-next') needs it.
 //
+// #2252 (#2238): `state` is CONFIGURATION, never reachability. 'active' means a model or an address is set up
+// (and installed); this module is pure and sends nothing, so a service whose address is closed still reads
+// 'active' here. Whether a service answers is GET /api/models/machines?health=1 (administrators; one cached,
+// bounded probe per address, machine-health.cjs), which the Models page joins to these rows and words as
+// Running / Unreachable. A member's page has no probe and says "Configured", never "Running". A `reachable`
+// field here would need that probe on this route's every cold call (up to the probe timeout, from a member's
+// request too), so it is left out on purpose.
 // state ids: 'active' | 'switching' (a re-index to `next` is under way) | 'missing' (the
 // configured model is not installed) | 'off' (the service is not configured or turned off) |
 // 'unloaded' (#1795: embedding only, the configured model is installed but not loaded).
