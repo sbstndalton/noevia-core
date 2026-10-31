@@ -10,8 +10,7 @@
 // GET /api/connectors and PUT /api/connectors/nextcloud/policy followed in sbstndalton/noevia#2202 round 2
 // (rust-connectors.cjs): the Nextcloud half lists the toolbox tools the live MCP servers offer and whether each
 // writes, which this process publishes for the front (mcp-discovery-snapshot.cjs). The store calls it used to make
-// for that page (`gdriveView`, `toolPolicySet`) are gone from the client; the front's `/v1/gdrive/view` and
-// `/v1/gdrive/policy` ops stay served for the old Core of a rollback pair.
+// for that page are gone from the client and from the front.
 //
 // Node's chat tools hold no refresh token: they ask the broker for a short-lived access token over the
 // internal store (gdrive-broker.cjs) and re-ask when the broker's state file moves. This file names
