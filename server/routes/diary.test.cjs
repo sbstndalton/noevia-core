@@ -225,7 +225,7 @@ test('#1607: when the sidecar cannot say which kind of account it is, the hold s
 // word, with a stable code and no address or error text; it used to reach http.cjs as a bare 500. Only a
 // network or abort failure is "unavailable": a redirect (fetchJson uses redirect:'error') or a failure while
 // building the tenant headers is a bug and stays a 500, and is logged by class.
-const refused = () => Object.assign(new TypeError('fetch failed'), { cause: Object.assign(new Error('connect ECONNREFUSED 10.1.2.3:8010'), { code: 'ECONNREFUSED', address: '10.1.2.3' }) });
+const refused = (code = 'ECONNREFUSED') => Object.assign(new TypeError('fetch failed'), { cause: Object.assign(new Error(`connect ${code} 10.1.2.3:8010`), { code, address: '10.1.2.3' }) });
 const ROUTES = [['GET', '/api/diary/files', undefined], ['PUT', '/api/diary/file', '{}'], ['POST', '/api/diary/local-exchange', { message: 'hi' }], ['GET', '/api/diary/workspace-trash', undefined],
   ['GET', '/api/diary/history', undefined], ['GET', '/api/diary/external-sources', undefined],
   ['POST', '/api/diary/external-sources/import', { sourcePath: '/a', relPath: 'b' }],
@@ -233,14 +233,15 @@ const ROUTES = [['GET', '/api/diary/files', undefined], ['PUT', '/api/diary/file
 
 test('#2232: an unreachable Diary answers 503 diaryUnavailable on every Node-owned Diary route', async () => {
   const unavailable = { status: 503, body: { error: 'Diary is unavailable right now. Try again shortly.', code: 'diaryUnavailable' } };
-  for (const reply of [() => { throw refused(); }, () => { throw Object.assign(new Error('The operation was aborted'), { name: 'TimeoutError' }); }]) {
+  // EAI_AGAIN (the resolver is down while the sidecar restarts) has an underscore: #2245.
+  for (const reply of [() => { throw refused(); }, () => { throw refused('EAI_AGAIN'); }, () => { throw refused('ENOTFOUND'); }, () => { throw Object.assign(new Error('The operation was aborted'), { name: 'TimeoutError' }); }]) {
     const lines = [];
     const f = fixture({ admin: true, reply, readMonth: async () => reply(), log: (l) => lines.push(l) });
     for (const [method, path, body] of ROUTES) {
       assert.equal(await f.call('diary', method, path, body), true, path);
       const answered = f.sent.pop();
       assert.deepEqual(answered, unavailable, path);
-      assert.doesNotMatch(JSON.stringify(answered), /10\.1\.2\.3|ECONN|fetch failed/);
+      assert.doesNotMatch(JSON.stringify(answered), /10\.1\.2\.3|ECONN|EAI_|ENOTFOUND|fetch failed/);
     }
     assert.ok(lines.length > 0 && lines.every((l) => /unavailable/.test(l) && !/10\.1\.2\.3/.test(l)), 'logged by class');
   }
