@@ -257,7 +257,7 @@ test('#2252: ERR_* codes (a bad DIARY_BASE, a TLS fault) stay internal; socket, 
     assert.equal(f.sent.length, 0, code);
     assert.match(lines[0], /\(internal\)/, code);
   }
-  for (const code of ['ECONNRESET', 'ETIMEDOUT', 'EAI_AGAIN', 'EAI_NODATA', 'UND_ERR_CONNECT_TIMEOUT', 'UND_ERR_SOCKET']) {
+  for (const code of ['ECONNRESET', 'ETIMEDOUT', 'EAI_AGAIN', 'EAI_NODATA', 'UND_ERR_CONNECT_TIMEOUT', 'UND_ERR_SOCKET', 'ERR_SOCKET_CONNECTION_TIMEOUT']) {
     const f = fixture({ reply: () => { throw refused(code); } });
     assert.equal(await f.call('diary', 'GET', '/api/diary/files'), true, code);
     assert.equal(f.sent.pop().status, 503, code);
