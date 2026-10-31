@@ -247,6 +247,23 @@ test('#2232: an unreachable Diary answers 503 diaryUnavailable on every Node-own
   }
 });
 
+// noevia#2252 (review of core#294): the code pattern also matched every ERR_* code, so a bad DIARY_BASE
+// (ERR_INVALID_URL) or a TLS fault read as "unavailable". Socket and resolver codes only.
+test('#2252: ERR_* codes (a bad DIARY_BASE, a TLS fault) stay internal; socket, resolver and undici codes are unavailable', async () => {
+  for (const code of ['ERR_INVALID_URL', 'ERR_TLS_CERT_ALTNAME_INVALID', 'ERR_SSL_WRONG_VERSION_NUMBER', 'ERR_INVALID_ARG_TYPE']) {
+    const lines = [];
+    const f = fixture({ reply: () => { throw refused(code); }, log: (l) => lines.push(l) });
+    await assert.rejects(f.call('diary', 'GET', '/api/diary/files'), /fetch failed/, code);
+    assert.equal(f.sent.length, 0, code);
+    assert.match(lines[0], /\(internal\)/, code);
+  }
+  for (const code of ['ECONNRESET', 'ETIMEDOUT', 'EAI_AGAIN', 'EAI_NODATA', 'UND_ERR_CONNECT_TIMEOUT', 'UND_ERR_SOCKET']) {
+    const f = fixture({ reply: () => { throw refused(code); } });
+    assert.equal(await f.call('diary', 'GET', '/api/diary/files'), true, code);
+    assert.equal(f.sent.pop().status, 503, code);
+  }
+});
+
 test('#2232: a redirect or a failure building the tenant headers is not "unavailable"', async () => {
   const redirect = () => { throw Object.assign(new TypeError('fetch failed'), { cause: new Error('unexpected redirect') }); };
   const lines = [];
