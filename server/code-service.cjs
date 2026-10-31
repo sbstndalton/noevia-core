@@ -212,17 +212,24 @@ function createCodeService({ repos, connect, egress = null, engine = undefined, 
     // configured but not answering ('unavailable', often a restart) or usable ('ready'). `network()` stays the boolean.
     networkState: () => (!egress ? 'unconfigured' : (typeof egress.available !== 'function' || egress.available()) ? 'ready' : 'unavailable'),
 
+    // What the Rust front's reads (rust-task-facts.cjs, #2257) cannot read from disk. Opening the store recovers
+    // this workspace's tasks from a previous process first; only this workspace's waiting cards are named.
+    facts(workspace) {
+      const { jobs } = storeFor(workspace);
+      const approvals = {};
+      for (const waiting of pending.values()) {
+        if (Object.hasOwn(approvals, waiting.taskId)) continue;
+        let own = false;
+        try { own = jobs.get(waiting.taskId)?.kind === 'code'; } catch { own = false; }
+        if (own) approvals[waiting.taskId] = { id: waiting.id, ...waiting.request };
+      }
+      return { repositories: this.repositories(), capabilities: GRANTABLE, defaultCapabilities: DEFAULT_CAPABILITIES,
+        harnesses: this.harnesses(), promptPreparation: this.promptPreparation(), sandboxed: this.sandboxed(),
+        network: this.network(), networkState: this.networkState(), approvals };
+    },
     list(workspace, project) {
       const { jobs } = storeFor(workspace);
       return jobs.list({ projectId: project.id, kind: 'code' }).map((j) => view(j, pendingFor(j.id)));
-    },
-    listActive(workspace, projectIds, limit = 100) {
-      const { jobs } = storeFor(workspace);
-      const allowed = new Set(projectIds);
-      // One journal scan for the whole account. Calling list(project) for every
-      // project would parse the same journals repeatedly on each status poll.
-      const matching = jobs.list({ kind: 'code', active: true }).filter((job) => allowed.has(job.projectId));
-      return { tasks: matching.slice(0, limit).map((job) => ({ ...view(job, pendingFor(job.id)), projectId: job.projectId })), total: matching.length };
     },
     get(workspace, project, taskId) {
       return view(owned(workspace, project, taskId), pendingFor(taskId));

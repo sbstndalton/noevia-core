@@ -1,10 +1,9 @@
 'use strict';
 // Browser mode routes (issue #274, spec-agent-execution §6 wired to §4's job primitive).
 // Admin-only, and absent (404) unless features.browserExecutor is on — same shape as
-// routes/code.cjs on purpose, so the two surfaces are easy to keep in step.
-//   GET  /api/projects/:id/browser                                   -> { capabilities, network, tasks }
+// routes/code.cjs on purpose, so the two surfaces are easy to keep in step. The reads are the Rust
+// front's (rust-task-reads.cjs, #2257).
 //   POST /api/projects/:id/browser        { domains }                -> 202 { taskId, domains }
-//   GET  /api/projects/:id/browser/:task                             -> task (incl. a waiting approval)
 //   POST /api/projects/:id/browser/:task/act     { type, ... }       -> action result
 //   POST /api/projects/:id/browser/:task/approve { decision, approvalId } -> { ok }
 //   POST /api/projects/:id/browser/:task/finish  { result }          -> { ok }
@@ -24,16 +23,10 @@ function createBrowserRoutes({ service, features, getProject, workspace, json, r
     const ws = workspace();
     try {
       if (!taskId) {
-        if (req.method === 'GET') {
-          return send(200, { capabilities: service.grantable, network: typeof service.network === 'function' ? service.network() : false,
-            networkState: typeof service.networkState === 'function' ? service.networkState() : (typeof service.network === 'function' && service.network() ? 'ready' : 'unconfigured'),
-            tasks: service.list(ws, project) });
-        }
         if (req.method !== 'POST') return send(405, { error: 'method not allowed' });
         return send(202, await service.start(ws, project, await readJson(req)));
       }
-      if (!action) return req.method === 'GET' ? send(200, service.get(ws, project, taskId)) : send(405, { error: 'method not allowed' });
-      if (req.method !== 'POST') return send(405, { error: 'method not allowed' });
+      if (!action || req.method !== 'POST') return send(405, { error: 'method not allowed' });
       if (action === 'cancel') return send(200, service.cancel(ws, project, taskId));
       const body = await readJson(req);
       if (action === 'act') return send(200, await service.act(ws, project, taskId, body));

@@ -41,7 +41,7 @@ test('the owned list is exactly the config, the instruction skills, the manifest
     ['GET', '/api/projects/p1/skills/install'], ['POST', '/api/projects//config'], ['POST', '/api/projects/a/b/config'],
     ['POST', '/api/projects/p1/config/'], ['GET', '/api/projects/p1/instruction-skills/manifests//content'],
     ['GET', '/api/projects/p1/instruction-skills/manifests/a/b/content'],
-    ['POST', '/api/projects/p1/browser'], ['POST', '/api/projects/p1/code'], ['POST', '/api/projects/p1/research'], ['GET', '/api/code/active'],
+    ['POST', '/api/projects/p1/browser'], ['POST', '/api/projects/p1/code'], ['POST', '/api/projects/p1/research'],
   ]) assert.equal(owned(m, p), false, `${m} ${p}`);
 });
 

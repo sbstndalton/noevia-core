@@ -87,23 +87,28 @@ test('one task at a time per project', { skip: skipWasm }, async () => {
   await settle(svc, ws, second.taskId);
 });
 
-test('active task summary scans once, respects project scope and caps the returned list', { skip: skipWasm }, async () => {
+test('the facts the Rust front asks for name only this workspace\'s waiting cards, and say why there is no network', { skip: skipWasm }, async () => {
   ran++;
-  const releases = [];
-  const { svc, ws } = service({ connect: async () => ({ prompt: () => new Promise((resolve) => { releases.push(() => resolve({ stopReason: 'end_turn' })); }) }) });
-  const otherProject = { id: 'p2' };
-  await svc.start(ws, project, { repository: 'noevia', prompt: 'first' });
-  await svc.start(ws, otherProject, { repository: 'noevia', prompt: 'second' });
-  const scoped = svc.listActive(ws, [project.id]);
-  assert.equal(scoped.total, 1);
-  assert.equal(scoped.tasks[0].projectId, project.id);
-  const capped = svc.listActive(ws, [project.id, otherProject.id], 1);
-  assert.equal(capped.total, 2);
-  assert.equal(capped.tasks.length, 1);
-  assert.equal(svc.listActive({ dir: temp('noevia-empty-tenant-') }, [project.id, otherProject.id]).total, 0);
-  for (let i = 0; i < 100 && releases.length < 2; i++) await new Promise((resolve) => setTimeout(resolve, 5));
-  assert.equal(releases.length, 2);
-  releases.forEach((release) => release());
+  let ask;
+  const { svc, ws } = service({ timeoutMs: 5000, connect: async ({ handlers }) => ({ prompt: async () => {
+    ask = handlers.requestPermission({ toolCall: { kind: 'edit', locations: [] }, options: [{ optionId: 'y', kind: 'allow_once' }, { optionId: 'n', kind: 'reject_once' }] });
+    await ask; return { stopReason: 'end_turn' };
+  } }) });
+  const idle = svc.facts(ws);
+  assert.deepEqual(Object.keys(idle).sort(), ['approvals', 'capabilities', 'defaultCapabilities', 'harnesses', 'network', 'networkState', 'promptPreparation', 'repositories', 'sandboxed']);
+  assert.equal(idle.network, false);
+  assert.equal(idle.networkState, 'unconfigured');
+  assert.deepEqual(idle.repositories, [{ id: 'noevia' }]);
+  assert.deepEqual(idle.approvals, {});
+  const started = await svc.start(ws, project, { repository: 'noevia', prompt: 'fix', capabilities: ['edit_file'] });
+  for (let i = 0; i < 200 && !svc.facts(ws).approvals[started.taskId]; i++) await new Promise((r) => setTimeout(r, 5));
+  const card = svc.facts(ws).approvals[started.taskId];
+  assert.equal(card.action, 'edit_file');
+  assert.equal(typeof card.id, 'string');
+  assert.deepEqual(svc.facts({ dir: temp('noevia-other-tenant-') }).approvals, {}, 'another account sees no card of this one');
+  assert.deepEqual(svc.decide(ws, project, started.taskId, 'approve', card.id), { ok: true });
+  await settle(svc, ws, started.taskId);
+  assert.deepEqual(svc.facts(ws).approvals, {});
 });
 
 test('a task from another project is not found, rather than forbidden', { skip: skipWasm }, async () => {
