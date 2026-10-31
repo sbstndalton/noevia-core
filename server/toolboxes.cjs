@@ -424,6 +424,7 @@ function createToolboxes({
       if (instructionSkills.inspect(f, project)) return instructionSkills.read(project, f, getProject(project.id), args.offset ?? 0, TOOL_RESULT_CAP);
       if (f.attachment?.state === 'stored') return `${f.name}: original stored; readable contents are unavailable. Contents have not been read.`;
       // #586: a source whose text could not be read is never offered to the model as content.
+      if (require('./source-readability.cjs').isWaiting(f)) return `${f.name}: this document is waiting to be read; document reading is not available yet and the file will be read automatically when it is. Its contents are not available yet and have not been read; do not treat it as empty.`;
       if (require('./source-readability.cjs').isUnreadable(f)) return `${f.name}: this file could not be read when it was added; its contents are unavailable. Contents have not been read.`;
       if (f.document && args.startPage !== undefined) {
         try {

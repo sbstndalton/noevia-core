@@ -52,7 +52,7 @@ function needsFigures(file, record) {
   if (typeof d.extractor !== 'string' || d.extractor.includes(FIGURES_MARK)) return false;
   if (!/^[0-9a-f]{64}$/.test(String(d.version || '')) || !/^[0-9a-f]{64}$/.test(String(d.byteHash || ''))) return false;
   if (d.figureSweep === d.version) return false; // tried at this version already
-  if (!d.availableVersion || d.state === 'failed') return false; // nothing readable to improve on
+  if (!d.availableVersion || d.state === 'failed' || d.state === 'queued') return false; // nothing readable to improve on
   if (record && scannedOnly(record)) return false;
   return true;
 }
