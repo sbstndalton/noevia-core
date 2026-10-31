@@ -25,7 +25,8 @@
 const crypto = require('node:crypto');
 const { resolveProjectFile } = require('./project-file-names.cjs');
 const { classify } = require('./uploads.cjs');
-const { isUnreadable } = require('./source-readability.cjs');
+const { isUnreadable, isWaiting } = require('./source-readability.cjs');
+const { quoteName } = require('./quoted-name.cjs');
 
 const EDIT_TOOLS = new Set(['project_append_file', 'project_replace_text']);
 
@@ -84,7 +85,10 @@ function planEdit(project, raw, { storageAccount: account = null } = {}) {
     }
   }
   if (file.attachment && file.attachment.state === 'stored') throw new Error(`"${file.name}" is stored in its original format and has no editable text.`);
-  if (isUnreadable(file)) throw new Error(`"${file.name}" could not be read when it was added, so it cannot be edited. Nothing was changed.`);
+  // #2245: a document that is only waiting for its reader was not unreadable when it was added; the name goes through
+  // quoteName (#1588), as every other line the model reads does, so it cannot start a line of its own.
+  if (isWaiting(file)) throw new Error(`${quoteName(file.name)} is waiting to be read (document reading is not available yet), so it cannot be edited yet. Nothing was changed.`);
+  if (isUnreadable(file)) throw new Error(`${quoteName(file.name)} could not be read when it was added, so it cannot be edited. Nothing was changed.`);
   if (file.document) throw new Error(`"${file.name}" is an extracted document, not an editable text file.`);
   if (file.attachment && (file.attachment.state !== 'ready' || classify(writeName) !== 'Text')) {
     throw new Error(`"${file.name}" was only read in part or in another encoding, so writing it back would lose content. Nothing was changed.`);

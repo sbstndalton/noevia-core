@@ -412,3 +412,99 @@ test('actual paired Rust binary authenticates Ready, scoped cleanup, retained re
     }
   }
 });
+
+// ---- #2243: key file reads, re-key window and three test gaps ----
+const { spawnSync, execFileSync } = require('node:child_process');
+function keyDir(prefix) {
+  const dir = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), prefix)), uid = process.getuid(), gid = process.getgid() || (uid === 0 ? 1 : 0);
+  fs.chownSync(dir, uid, gid); fs.chmodSync(dir, 0o750); return { dir, uid, gid, done: () => { fs.chmodSync(dir, 0o700); fs.rmSync(dir, { recursive: true, force: true }); } };
+}
+test('#2243: a FIFO at the key path is not opened blocking, and a key file is never read past its line', (t) => {
+  const k = keyDir('noevia-core-keyread-');
+  try {
+    const keyFile = path.join(k.dir, 'control.key'), master = Buffer.alloc(32, 8), own = publishWebKey({ masterKey: master, file: keyFile, uid: k.uid, gid: k.gid });
+    // A child process, so a blocking open() fails this test by timeout instead of hanging the runner.
+    const probe = (note) => spawnSync(process.execPath, ['-e', `
+      const { createKeyKeeper } = require(${JSON.stringify(path.join(__dirname, 'code-egress-control.cjs'))});
+      const keeper = createKeyKeeper({ deriveMaster: () => Buffer.alloc(32, 8), fileKey: Buffer.from(${JSON.stringify(own.toString('hex'))}, 'hex'), file: ${JSON.stringify(keyFile)}, uid: ${k.uid}, gid: ${k.gid} });
+      console.log(JSON.stringify({ restore: keeper.restore(), rekey: keeper.rekey() }));`], { timeout: 4000, encoding: 'utf8' });
+    fs.unlinkSync(keyFile); execFileSync('mkfifo', [keyFile]);
+    const fifo = probe('fifo');
+    assert.equal(fifo.signal, null, `a FIFO at the key path hung the web (${fifo.error?.code || fifo.stderr})`);
+    assert.deepEqual(JSON.parse(fifo.stdout), { restore: 'present', rekey: null }, 'a FIFO is not our key and is never replaced');
+    fs.unlinkSync(keyFile);
+    // The key line followed by more bytes is not the key: foreign, not replaced, and only 66 bytes are read.
+    fs.writeFileSync(keyFile, `${own.toString('hex')}\n${'x'.repeat(1 << 20)}`, { mode: 0o440 });
+    const reads = []; const realRead = fs.readSync, realReadFile = fs.readFileSync;
+    t.mock.method(fs, 'readSync', function (...a) { const n = realRead.apply(this, a); reads.push(n); return n; });
+    t.mock.method(fs, 'readFileSync', function (f, ...rest) { assert.ok(typeof f === 'string' && !Buffer.isBuffer(f), 'the key file is read through a bounded read, not readFileSync(fd)'); return realReadFile.call(this, f, ...rest); });
+    const keeper = createKeyKeeper({ deriveMaster: () => master, fileKey: own, file: keyFile, uid: k.uid, gid: k.gid });
+    assert.equal(keeper.restore(), 'superseded'); assert.equal(keeper.rekey(), null);
+    assert.ok(reads.length > 0 && reads.reduce((a, b) => a + b, 0) <= 66, `read ${reads.reduce((a, b) => a + b, 0)} bytes of a 1 MiB file`);
+  } finally { k.done(); }
+});
+test('#2243: a newer web that wrote its key after the first check is not overwritten by the re-key', () => {
+  const k = keyDir('noevia-core-rekey-race-');
+  try {
+    const keyFile = path.join(k.dir, 'control.key'), master = Buffer.alloc(32, 9), own = publishWebKey({ masterKey: master, file: keyFile, uid: k.uid, gid: k.gid });
+    let newer = null;
+    const keeper = createKeyKeeper({ fileKey: own, file: keyFile, uid: k.uid, gid: k.gid,
+      // Runs after the keeper's first check and before it renames: a newer web publishes in between.
+      deriveMaster: () => { newer = publishWebKey({ masterKey: Buffer.alloc(32, 10), file: keyFile, uid: k.uid, gid: k.gid }); return master; } });
+    assert.equal(keeper.rekey(), null, 'it must not replace a key it did not write');
+    assert.equal(fs.readFileSync(keyFile, 'utf8'), `${newer.toString('hex')}\n`, 'the newer web key is still the one on disk');
+    assert.deepEqual(fs.readdirSync(k.dir), ['control.key'], 'no temporary file is left behind');
+    assert.equal(keeper.restore(), 'superseded');
+  } finally { k.done(); }
+});
+test('#2243: a signed refusal, a failure, and a signed refusal 30 s later never add up to a re-key', async () => {
+  for (const breakWith of ['down', 'unsigned']) {
+    const p = restartable(), events = []; let shift = 0, losing = true, mode = 'up', rekeys = 0;
+    const c = createControlClient({ fileKey: file, endpoint: 'localhost:3001', autoRenew: false, retryMinMs: 1, retryMaxMs: 2, monotonic: () => performance.now() + shift, log: (e) => events.push(e.event),
+      keeper: { restore: () => 'present', rekey: () => { rekeys++; return null; } },
+      transport: async (req) => {
+        if (mode === 'down') throw Object.assign(Error('synthetic refused'), { code: 'ECONNREFUSED' });
+        if (mode === 'unsigned') return response(req, { state: 'conflict' }, 409, Buffer.alloc(32, 66));
+        const reply = await p.transport(req); if (losing && req.route === ROUTES.ready) { losing = false; shift += 11000; } return reply;
+      } });
+    await assert.rejects(c.ready());                         // the Ready commits, its reply is lost
+    await settle(); await assert.rejects(c.ready(), { reason: 'conflict' }); assert.ok(events.includes('egress.control_conflict'));
+    mode = breakWith; shift += 1000; await settle(); await assert.rejects(c.ready());   // not a signed refusal: the run is broken
+    mode = 'up'; p.expire(); shift += 30000; await settle();
+    await assert.rejects(c.ready(), { reason: 'conflict' });
+    assert.equal(rekeys, 0, `a ${breakWith} failure between two signed refusals must restart the wait, not continue it`); assert.equal(c.available(), false);
+    shift += 30000; await settle(); await assert.rejects(c.ready(), { reason: 'conflict' });
+    assert.equal(rekeys, 1, 'a fresh unbroken run does reach the re-key'); await c.close();
+  }
+});
+test('#2243: a Replace that commits with its reply lost, while a prior session is held, heals by a new key', async () => {
+  const p = restartable(), events = []; let shift = 0, losing = false, next = null;
+  const c = createControlClient({ fileKey: file, endpoint: 'localhost:3001', autoRenew: false, retryMinMs: 1, retryMaxMs: 2, monotonic: () => performance.now() + shift, log: (e) => events.push(e.event),
+    keeper: { restore: () => 'present', rekey: () => { next = Buffer.alloc(32, 11); p.rekey(next); return next; } },
+    transport: async (req) => { const reply = await p.transport(req); if (losing && req.route === ROUTES.ready) { losing = false; shift += 11000; } return reply; } });
+  await c.ready(); const held = await c.grant({ taskId: 'held.old', domains: ['example.com'] });
+  shift += 16000; p.expire(); await assert.rejects(c.ready(), { reason: 'unavailable' }); // the session ran out; the client keeps it as the prior one
+  await settle(); losing = true; await assert.rejects(c.ready());                          // it asks to Replace it and the reply is lost
+  assert.equal(c.available(), false);
+  assert.deepEqual(p.calls.filter((r) => r.route === ROUTES.ready).map((r) => r.mode), ['initial', 'replace']);
+  await settle(); await assert.rejects(c.ready(), { reason: 'conflict' }); assert.equal(next, null, 'a live unknown session is waited out');
+  p.expire(); shift += 10000; await settle(); await assert.rejects(c.ready(), { reason: 'conflict' }); assert.equal(next, null);
+  shift += 16000; await settle(); await c.ready();
+  assert.ok(next, 'the new key was written once the signed refusals outlasted any session'); assert.equal(c.available(), true); assert.ok(events.includes('egress.control_rekeyed'));
+  const fresh = await c.grant({ taskId: 'held.new', domains: ['example.com'] }); assert.ok(fresh.token && fresh.token !== held.token);
+  assert.equal((await c.revoke(held)).confirmed, false, 'a lease of the replaced session is never confirmed by the new one'); assert.equal(c.available(), true, 'and does not take the new session down');
+  await c.close();
+});
+test('#2243: close while a request is retrying and still in flight stops it for good', async () => {
+  for (const outcome of ['fails', 'commits']) {
+    const p = restartable(); let gate, entered; const waiting = new Promise((r) => { entered = r; }), release = new Promise((r) => { gate = r; }); let calls = 0;
+    const c = createControlClient({ fileKey: file, endpoint: 'localhost:3001', retryMinMs: 1, retryMaxMs: 2,
+      transport: async (req) => { calls++; if (calls === 1) { entered(); await release; if (outcome === 'fails') throw Object.assign(Error('synthetic reset'), { code: 'ECONNRESET' }); } return p.transport(req); } });
+    c.start(); await waiting;                              // the first Ready is in flight
+    const closing = c.close(); gate();
+    await closing; const after = calls; await settle(600);   // longer than the 250 ms retry pause
+    assert.equal(calls, after, `no request leaves after close (${outcome})`); assert.equal(calls, 1, `the in-flight Ready is the only one (${outcome})`);
+    assert.equal(c.available(), false, `a Ready that commits after close does not make the client available (${outcome})`);
+    await assert.rejects(c.ready()); await assert.rejects(c.grant({ taskId: 'late.1', domains: ['example.com'] }));
+  }
+});

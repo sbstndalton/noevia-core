@@ -41,6 +41,7 @@ function createCodeRoutes({ service, features, getProject, projects = () => [], 
             defaultCapabilities: service.defaultCapabilities, harnesses: service.harnesses(),
             promptPreparation: service.promptPreparation(), sandboxed: service.sandboxed(),
             network: typeof service.network === 'function' ? service.network() : false,
+            networkState: typeof service.networkState === 'function' ? service.networkState() : (typeof service.network === 'function' && service.network() ? 'ready' : 'unconfigured'),
             tasks: service.list(ws, project) });
         }
         if (req.method !== 'POST') return send(405, { error: 'method not allowed' });

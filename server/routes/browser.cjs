@@ -26,6 +26,7 @@ function createBrowserRoutes({ service, features, getProject, workspace, json, r
       if (!taskId) {
         if (req.method === 'GET') {
           return send(200, { capabilities: service.grantable, network: typeof service.network === 'function' ? service.network() : false,
+            networkState: typeof service.networkState === 'function' ? service.networkState() : (typeof service.network === 'function' && service.network() ? 'ready' : 'unconfigured'),
             tasks: service.list(ws, project) });
         }
         if (req.method !== 'POST') return send(405, { error: 'method not allowed' });

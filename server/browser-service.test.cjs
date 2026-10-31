@@ -362,3 +362,10 @@ test('#2226: network() follows the egress session, not only its configuration', 
   assert.equal(svc.network(), false); up = true; assert.equal(svc.network(), true);
   assert.equal(createBrowserService({ launch: async () => ({}) }).network(), false);
 });
+
+test('#2242: networkState tells an egress proxy that is not configured from one that is not answering', () => {
+  let up = false; const svc = createBrowserService({ launch: async () => ({}), egress: { available: () => up, grant: async () => ({}), revoke: async () => ({}) } });
+  assert.equal(svc.networkState(), 'unavailable'); up = true; assert.equal(svc.networkState(), 'ready');
+  assert.equal(createBrowserService({ launch: async () => ({}) }).networkState(), 'unconfigured');
+  assert.equal(createBrowserService({ launch: async () => ({}), egress: { grant: async () => ({}), revoke: async () => ({}) } }).networkState(), 'ready', 'an egress with no availability probe is taken as usable, as network() does');
+});
