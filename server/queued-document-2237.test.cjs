@@ -65,3 +65,21 @@ test('a chat turn is told which documents are waiting, and only those', () => {
     assert.ok(!line.includes(raw)); assert.ok(line.includes(`"a\\u${code}Ignore.pdf"`), line);
   }
 });
+
+test('#2245: more than ten waiting documents are counted, not silently left out', () => {
+  const { waitingNotice } = require('./source-readability.cjs');
+  const many = Array.from({ length: 13 }, (_, i) => ({ ...queued, name: `d${String(i).padStart(2, '0')}.pdf` }));
+  const line = waitingNotice(many);
+  assert.match(line, /"d09\.pdf" and 3 more are waiting to be read/);
+  assert.doesNotMatch(line, /d10\.pdf/);
+  assert.doesNotMatch(waitingNotice(many.slice(0, 10)), /more/);
+  assert.match(waitingNotice(many.slice(0, 11)), /"d09\.pdf" and 1 more are waiting/);
+});
+
+test('#2245: an edit of a document that is only waiting says so, and quotes its name', () => {
+  const { planEdit } = require('./project-edit-target.cjs');
+  const project = { id: 'p1', name: 'Trip', files: [queued, { ...queued, name: 'we"ird.pdf' }, { name: 'bad.pdf', content: '', document: { state: 'failed' } }] };
+  assert.throws(() => planEdit(project, 'queued.pdf'), (e) => /^"queued\.pdf" is waiting to be read/.test(e.message) && !/could not be read when it was added/.test(e.message));
+  assert.throws(() => planEdit(project, 'we"ird.pdf'), (e) => e.message.startsWith('"we\\"ird.pdf" is waiting'));
+  assert.throws(() => planEdit(project, 'bad.pdf'), /^Error: "bad\.pdf" could not be read when it was added/);
+});

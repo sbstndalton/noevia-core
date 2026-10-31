@@ -381,7 +381,8 @@ test('#1522: a new project starts on Automatic tools unless the request chose Ma
 
 // sbstndalton/noevia#2230: the store can delete a chat and fail to remove its transcript (leftovers).
 // A retention sweep, which is about to say "gone", must see that as a failure; a person's own delete
-// (the chat is gone from every list, the sweep takes the file later) stays a success.
+// (the chat is gone from every list and tombstoned, so the Rust front reads it as no transcript; the file stays
+// on disk until a delete of that id is asked again, nothing sweeps it later: #2245) stays a success.
 test('a delete with leftovers is a failure only when the caller needs the chat gone (#2230)', async () => {
   const f = fixture();
   const project = await f.store.createProject({ name: 'P' });

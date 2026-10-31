@@ -21,9 +21,11 @@ function isWaiting(file) {
 }
 // The line a chat turn adds when project documents are waiting to be read (#2237), or '' when none are.
 function waitingNotice(files) {
-  const names = (Array.isArray(files) ? files : []).filter(isWaiting).map((f) => String(f.name)).slice(0, 10);
-  if (!names.length) return '';
-  return `${quotedNames(names)} ${names.length === 1 ? 'is' : 'are'} waiting to be read (document reading is not available yet), so ${names.length === 1 ? 'its' : 'their'} contents are not available to you. Say so if asked about ${names.length === 1 ? 'it' : 'them'}; do not guess at the contents or call ${names.length === 1 ? 'it' : 'them'} empty.`;
+  const all = (Array.isArray(files) ? files : []).filter(isWaiting).map((f) => String(f.name));
+  if (!all.length) return '';
+  // At most ten names are listed; the rest are counted, not silently left out (#2245).
+  const names = all.slice(0, 10), more = all.length - names.length, one = all.length === 1;
+  return `${quotedNames(names)}${more ? ` and ${more} more` : ''} ${one ? 'is' : 'are'} waiting to be read (document reading is not available yet), so ${one ? 'its' : 'their'} contents are not available to you. Say so if asked about ${one ? 'it' : 'them'}; do not guess at the contents or call ${one ? 'it' : 'them'} empty.`;
 }
 const readable = (files) => (Array.isArray(files) ? files : []).filter((f) => !isUnreadable(f));
 module.exports = { isUnreadable, isWaiting, waitingNotice, readable };
