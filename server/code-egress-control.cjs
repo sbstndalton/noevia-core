@@ -103,8 +103,13 @@ function republishMissingKey({ fileKey, file, uid, gid }) {
 function keyFileState(file, fileKey) {
   const fs = require('node:fs'); let fd;
   try {
-    fd = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
-    return fs.readFileSync(fd, 'utf8') === `${fileKey.toString('hex')}\n` ? 'own' : 'foreign';
+    // O_NONBLOCK: a FIFO at this path must not park the web in open(). Only a regular file is read, and
+    // at most one byte more than the key line (64 hex digits and a newline), as the proxy's keyfile.rs does (#2243).
+    fd = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
+    if (!fs.fstatSync(fd).isFile()) return 'unknown';
+    const want = Buffer.from(`${fileKey.toString('hex')}\n`), buf = Buffer.alloc(want.length + 1); let got = 0;
+    while (got < buf.length) { const n = fs.readSync(fd, buf, got, buf.length - got, null); if (n === 0) break; got += n; }
+    return got === want.length && buf.subarray(0, got).equals(want) ? 'own' : 'foreign';
   } catch (e) { return e.code === 'ENOENT' ? 'missing' : 'unknown'; }
   finally { if (fd !== undefined) fs.closeSync(fd); }
 }
@@ -123,7 +128,9 @@ function createKeyKeeper({ deriveMaster, fileKey, file, uid, gid }) {
     /** A new key, written over this process's own key only; null if the file is anything else. */
     rekey() {
       if (superseded || state() !== 'own') return null;
-      try { current = writeKeyFile({ file, uid, gid, replace: true, make: () => { if (keyFileState(file, current) !== 'own') throw error('publication'); return deriveFileKey(deriveMaster(), crypto.randomBytes(32)); } }); return current; }
+      const own = () => { if (keyFileState(file, current) !== 'own') throw error('publication'); };
+      // Checked again right before the rename (#2243): a newer web may have written its key since the first check.
+      try { current = writeKeyFile({ file, uid, gid, replace: true, make: () => { own(); return deriveFileKey(deriveMaster(), crypto.randomBytes(32)); }, beforeReplace: own }); return current; }
       catch { return null; }
     },
   };
@@ -139,7 +146,7 @@ function clearInterruptedLink(fs, path, dir, file, uid, gid) {
     if (other.isFile() && other.dev === key.dev && other.ino === key.ino) { fs.unlinkSync(path.join(dir, name)); return; }
   }
 }
-function writeKeyFile({ file, uid, gid, make, replace }) {
+function writeKeyFile({ file, uid, gid, make, replace, beforeReplace }) {
   const fs = require('node:fs'), path = require('node:path');
   if (typeof file !== 'string' || !path.isAbsolute(file) || path.resolve(file) !== file || file.includes('\0') || !Number.isInteger(uid) || uid < 0 || uid >= 0xffffffff || !Number.isInteger(gid) || gid <= 0 || gid >= 0xffffffff || process.getuid?.() !== uid || !Number.isInteger(fs.constants.O_NOFOLLOW)) throw error('publication');
   const dir=path.dirname(file); let fd, temporary, created=false;
@@ -153,7 +160,7 @@ function writeKeyFile({ file, uid, gid, make, replace }) {
     fd=fs.openSync(temporary,fs.constants.O_WRONLY|fs.constants.O_CREAT|fs.constants.O_EXCL|fs.constants.O_NOFOLLOW,0o440);created=true;
     fs.fchownSync(fd,uid,gid);fs.fchmodSync(fd,0o440);fs.writeFileSync(fd,`${fileKey.toString('hex')}\n`);fs.fsyncSync(fd);fs.closeSync(fd);fd=undefined;
     const current=fs.lstatSync(dir);if(current.dev!==parent.dev||current.ino!==parent.ino) throw error('publication');
-    if(replace){fs.renameSync(temporary,file);created=false;}
+    if(replace){if(beforeReplace)beforeReplace();fs.renameSync(temporary,file);created=false;}
     else{fs.linkSync(temporary,file);fs.unlinkSync(temporary);created=false;}
     return fileKey;
   } catch {
