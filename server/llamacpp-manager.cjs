@@ -299,35 +299,51 @@ function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloa
   // settings under a running instance. #1012: it may reload with models
   // loaded when the router cannot change them (see preset-reload.cjs); they stay loaded.
   async function reloadPresets({unload=false}={}) {
+    return maintenance.exclusive(()=>reloadHeld({unload}));
+  }
+  // #2219: a models.ini write and its reload under one hold, so no reload runs between them. A hold
+  // that is refused rejects with holdRefused and write never runs: the file stays as it was.
+  async function writePresets(write,reloadIf=()=>true) {
+    let release;
+    try{release=await maintenance.hold();}catch(e){throw Object.assign(e,{holdRefused:true});}
+    try{
+      const written=await write();
+      if(!reloadIf(written))return{written,reload:null};
+      // The write stands whatever the reload does; its failure is the same "not applied yet".
+      let reload;
+      try{reload=await reloadHeld({unload:false});}catch{reload={ok:false};}
+      return{written,reload};
+    }finally{release();}
+  }
+  // The body of a reload; the caller holds the gate.
+  async function reloadHeld({unload=false}={}) {
     const {liveIds}=require('./preset-reload.cjs');
     const refuse=(ids,reason)=>({ok:false,status:409,body:{error:'A model is loaded. Unload it to apply the new settings.',loaded:ids,...(reason?{reason}:{})}});
-    return maintenance.exclusive(async()=>{
-      const listing=await rawModels();
-      if(!listing.ok)return listing;
-      const rows=Array.isArray(listing.body?.data)?listing.body.data:[];
-      // Sleeping models are running too: a reload unloads them if their preset changed (#1038).
-      const loaded=liveIds(rows);
-      let kept=[],expectText=null;
-      if(loaded.length&&!unload){
-        let judged=null;try{judged=presets?.snapshot().text??null;}catch{}
-        const verdict=reloadGuard.verdict(judged,rows,loaded);
-        if(!verdict.safe)return refuse(loaded,verdict.reason);
-        // Right before the call: list again; a model that started loading meanwhile, or a moved
-        // router, refuses (#1040). The file itself is re-read inside routerReload.
-        const again=await rawModels();
-        if(!again.ok||!Array.isArray(again.body?.data))return refuse(loaded,'unknown');
-        const now=liveIds(again.body.data);
-        if(now.some(id=>!loaded.includes(id)))return refuse(now,'loaded_changed');
-        const recheck=reloadGuard.verdict(judged,again.body.data,now);
-        if(!recheck.safe)return refuse(now,recheck.reason);
-        kept=now;expectText=judged;
-      }
-      if(!kept.length)for(const id of loaded)await post('/models/unload',{model:id},60000).catch(()=>null);
-      const result=await routerReload(120000,{expectText});
-      if(result.refused)return refuse(kept,result.refused);
-      if(!result.ok)return {ok:false,status:502,body:{error:'The engine did not reload its settings. Check the Hardware tab.'}};
-      return {ok:true,status:200,body:{reloaded:true,unloaded:kept.length?[]:loaded,...(kept.length?{kept}:{})}};
-    });
+    const listing=await rawModels();
+    if(!listing.ok)return listing;
+    const rows=Array.isArray(listing.body?.data)?listing.body.data:[];
+    // Sleeping models are running too: a reload unloads them if their preset changed (#1038).
+    const loaded=liveIds(rows);
+    let kept=[],expectText=null;
+    if(loaded.length&&!unload){
+      let judged=null;try{judged=presets?.snapshot().text??null;}catch{}
+      const verdict=reloadGuard.verdict(judged,rows,loaded);
+      if(!verdict.safe)return refuse(loaded,verdict.reason);
+      // Right before the call: list again; a model that started loading meanwhile, or a moved
+      // router, refuses (#1040). The file itself is re-read inside routerReload.
+      const again=await rawModels();
+      if(!again.ok||!Array.isArray(again.body?.data))return refuse(loaded,'unknown');
+      const now=liveIds(again.body.data);
+      if(now.some(id=>!loaded.includes(id)))return refuse(now,'loaded_changed');
+      const recheck=reloadGuard.verdict(judged,again.body.data,now);
+      if(!recheck.safe)return refuse(now,recheck.reason);
+      kept=now;expectText=judged;
+    }
+    if(!kept.length)for(const id of loaded)await post('/models/unload',{model:id},60000).catch(()=>null);
+    const result=await routerReload(120000,{expectText});
+    if(result.refused)return refuse(kept,result.refused);
+    if(!result.ok)return {ok:false,status:502,body:{error:'The engine did not reload its settings. Check the Hardware tab.'}};
+    return {ok:true,status:200,body:{reloaded:true,unloaded:kept.length?[]:loaded,...(kept.length?{kept}:{})}};
   }
   // Maps an engine-side path (/models/..., /cache/...) onto noevia's read-only mounts.
   function localFile(containerPath) {
@@ -692,6 +708,7 @@ function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloa
     quarantine,
     sizingBudgetGib,
     reloadPresets,
+    writePresets,
     // noevia#1863: the models.ini text the router is known to run on, or null when unknowable.
     async presetsInRouter(){try{const l=await rawModels();return l.ok&&Array.isArray(l.body?.data)?reloadGuard.routerText(l.body.data):null;}catch{return null;}},
     evidence, recordEvidence, importEvidence,

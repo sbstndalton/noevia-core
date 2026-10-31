@@ -149,3 +149,25 @@ test('a preset the model manager could not rewrite is reported, and no reload is
   assert.deepEqual((await setting.save({ seconds: 600 }, 'a')).apply, { state: 'failed' });
   assert.deepEqual(reloads, []);
 });
+
+test('#2219 a refused hold changes nothing; a granted one writes before its reload, inside the hold', async () => {
+  const loader = fakeLoader();
+  const audit = [], reloads = [];
+  const before = loader.state.ini;
+  const refused = createIdleUnloadSetting({ env: ENV, fetchJson: loader.fetchJson, audit: (...a) => audit.push(a), reloadPresets: async (o) => { reloads.push(o); return { ok: true }; },
+    writePresets: async () => { throw Object.assign(Error('busy'), { status: 409, holdRefused: true }); } });
+  await assert.rejects(refused.save({ seconds: 600 }, 'a'), (e) => e.status === 409 && e.errorId === 'idleUnloadBusy');
+  assert.equal(loader.state.ini, before, 'models.ini unchanged');
+  assert.deepEqual(audit, []);
+  assert.deepEqual(reloads, []);
+
+  const steps = [];
+  const granted = createIdleUnloadSetting({ env: ENV, fetchJson: loader.fetchJson, audit: (...a) => audit.push(a), reloadPresets: async (o) => { reloads.push(o); return { ok: true }; },
+    writePresets: async (write, reloadIf) => { steps.push('hold'); const written = await write(); steps.push('wrote'); assert.equal(reloadIf(written), true); steps.push('reload'); return { written, reload: { ok: true } }; } });
+  const saved = await granted.save({ seconds: 600 }, 'a');
+  assert.deepEqual(steps, ['hold', 'wrote', 'reload']);
+  assert.equal(loader.state.ini, 600);
+  assert.equal(saved.apply.state, 'applied');
+  assert.equal(audit.length, 1);
+  assert.deepEqual(reloads, [], 'the reload ran inside the hold');
+});

@@ -140,6 +140,36 @@ test('#1012 never during a chat or a held gate (auto-tune, calibration)', async 
   assert.equal(f.reloads(), 1);
 });
 
+test('#2219 writePresets: a held gate means no write; a write and its reload share one hold', async (t) => {
+  const f = managerFixture(t);
+  let writes = 0;
+  const release = f.manager.holdMaintenance('synthetic tune');
+  await assert.rejects(f.manager.writePresets(async () => { writes += 1; }), { status: 409, holdRefused: true });
+  release();
+  const leave = f.manager.enterInference();
+  await assert.rejects(f.manager.writePresets(async () => { writes += 1; }), { holdRefused: true });
+  leave();
+  assert.equal(writes, 0);
+  assert.equal(f.reloads(), 0);
+
+  // A reload from anywhere cannot run between the write and its own reload.
+  const text = fs.readFileSync(f.file, 'utf8');
+  const { written, reload } = await f.manager.writePresets(async () => {
+    fs.appendFileSync(f.file, '[gemma-synthetic]\nmodel = /models/g.gguf\n');
+    await assert.rejects(f.manager.reloadPresets(), { status: 409 });
+    return 'done';
+  });
+  assert.equal(written, 'done');
+  assert.equal(reload.status, 200);
+  assert.equal(f.reloads(), 1);
+  assert.notEqual(fs.readFileSync(f.file, 'utf8'), text);
+  // A write that changed nothing does not reload, and the hold ends either way.
+  const none = await f.manager.writePresets(async () => 'same', () => false);
+  assert.equal(none.reload, null);
+  await assert.rejects(f.manager.writePresets(async () => { throw Error('write failed'); }), /write failed/);
+  assert.equal((await f.manager.reloadPresets()).status, 200);
+});
+
 test('#1040 the file is re-read right before the reload and must be the text that was judged', async (t) => {
   const f = managerFixture(t);
   await f.manager.reloadPresets();

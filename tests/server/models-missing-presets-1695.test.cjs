@@ -8,7 +8,7 @@ const { Readable } = require('node:stream');
 const { createModelRoutes } = require('../../server/routes/models.cjs');
 const { modelAssignments } = require('../../server/model-assignments.cjs');
 
-function routes({ installed, sections, reload = { ok: true, status: 200, body: { reloaded: true } }, scan = null, cache = new Map() }) {
+function routes({ installed, sections, reload = { ok: true, status: 200, body: { reloaded: true } }, scan = null, cache = new Map(), manager = {} }) {
   const sent = [], fetched = [], reloads = [];
   let presets = sections.map((s) => ({ ...s }));
   // The router lists a preset until it re-reads models.ini (the #1695 regression).
@@ -18,7 +18,7 @@ function routes({ installed, sections, reload = { ok: true, status: 200, body: {
   const scanFiles = () => scan || installed.filter((m) => !m.missingFile).map((m) => ({ modelId: m.name, sections: [m.name] }));
   const modelManager = { enabled: true, kind: 'other', capabilities: {}, unload: async () => ({ ok: true }),
     deleteModel: async () => ({ ok: false, status: 404 }),
-    reloadPresets: async (opts) => { reloads.push(opts); if (reload.ok) routerRows = routerRows.filter((m) => presets.some((p) => p.name === m.name)); return reload; } };
+    reloadPresets: async (opts) => { reloads.push(opts); if (reload.ok) routerRows = routerRows.filter((m) => presets.some((p) => p.name === m.name)); return reload; }, ...manager };
   const handle = createModelRoutes({
     servedEmbeddingModels: async () => null,
     json: (res, status, body) => { sent.push({ status, body }); },
@@ -144,4 +144,58 @@ test('#1698 a stale cached scan is dropped before the prune reads anything', asy
   assert.ok(f.fetched.includes('GET models'), 'a fresh scan was asked for');
   assert.equal(out.status, 200);
   assert.deepEqual(out.body.removed, ['a']);
+});
+
+// #2219: a hold that is refused means models.ini is not written.
+const refusedHold = { writePresets: async () => { throw Object.assign(Error('busy'), { status: 409, holdRefused: true }); } };
+const gone = { installed: [{ name: 'gone-e2b', labels: [], missingFile: true }, { name: 'a', labels: [] }, { name: 'b', labels: [] }],
+  sections: [{ name: 'gone-e2b', hasFile: false }, { name: 'a', hasFile: true }, { name: 'b', hasFile: true }] };
+const wrote = (f) => f.fetched.filter((c) => c.startsWith('DELETE '));
+
+test('#2219 a refused hold: delete and prune leave models.ini alone and say to retry', async () => {
+  const del = routes({ ...gone, manager: refusedHold });
+  const out = await del.call('POST', '/api/models/delete', { name: 'gone-e2b' });
+  assert.equal(out.status, 409);
+  assert.equal(out.body.code, 'maintenance_held');
+  assert.equal(out.body.retryable, true);
+  assert.deepEqual(wrote(del), []);
+  assert.equal(del.presets().length, 3);
+
+  const prune = routes({ ...gone, manager: refusedHold });
+  const pruned = await prune.call('POST', '/api/models/prune-missing', {});
+  assert.equal(pruned.status, 409);
+  assert.equal(pruned.body.code, 'maintenance_held');
+  assert.deepEqual(wrote(prune), []);
+  assert.deepEqual(prune.reloads, []);
+});
+
+test('#2219 a file already deleted with the hold refused: the delete stands, the preset waits for a retry', async () => {
+  const f = routes({ installed: [{ name: 'm', labels: [] }], sections: [{ name: 'm', hasFile: true }],
+    manager: { ...refusedHold, removeModel: async () => ({ ok: true, unloaded: false }) } });
+  const out = await f.call('POST', '/api/models/delete', { name: 'm' });
+  assert.equal(out.status, 200);
+  assert.equal(out.body.presetRemoved, false);
+  assert.equal(out.body.presetBusy, true);
+  assert.deepEqual(wrote(f), []);
+});
+
+test('#2219 delete and prune write and reload inside one hold', async () => {
+  for (const [p, body] of [['/api/models/delete', { name: 'gone-e2b' }], ['/api/models/prune-missing', {}]]) {
+    const steps = [];
+    let f;
+    const writePresets = async (write, reloadIf) => {
+      steps.push('hold');
+      const written = await write();
+      steps.push(`wrote ${wrote(f).length}`);
+      const reload = reloadIf(written) ? (steps.push('reload'), { ok: true }) : null;
+      steps.push('release');
+      return { written, reload };
+    };
+    f = routes({ ...gone, manager: { writePresets } });
+    const out = await f.call('POST', p, body);
+    assert.equal(out.status, 200, p);
+    assert.deepEqual(steps, ['hold', 'wrote 1', 'reload', 'release'], p);
+    assert.deepEqual(f.reloads, [], 'not the separate reload, which would need its own hold');
+    assert.equal(out.body.presetsReloaded ?? out.body.reloaded, true, p);
+  }
 });

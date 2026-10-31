@@ -12,7 +12,8 @@
 // unload), exactly as other preset changes are. Any model the router runs (loaded, loading or
 // sleeping after its idle time) blocks that reload, so a save is usually NOT live yet: `applied`
 // says whether the router is known to run on the saved value (see presetsInRouter), and it is
-// computed on every GET, so it survives a page reload.
+// computed on every GET, so it survives a page reload. #2219: the write and the reload share one
+// maintenance hold (writePresets); a refused hold is a 409 and the file stays as it was.
 
 /** The `[*]` `sleep-idle-seconds` value in a models.ini text, as the model manager writes it
  *  (noevia-rs idle_unload.rs: `ident = value`, optional leading dashes; no key means Never, 0).
@@ -54,7 +55,7 @@ function view(body) {
   };
 }
 
-function createIdleUnloadSetting({ env = process.env, fetchJson, reloadPresets = null, presetsInRouter = null, audit = () => {} } = {}) {
+function createIdleUnloadSetting({ env = process.env, fetchJson, reloadPresets = null, writePresets = null, presetsInRouter = null, audit = () => {} } = {}) {
   const base = () => String(env.MODEL_LOADER_URL || '').replace(/\/+$/, '');
   const headers = () => ({ 'Content-Type': 'application/json', ...(env.MODEL_LOADER_TOKEN ? { 'X-Model-Loader-Token': env.MODEL_LOADER_TOKEN } : {}) });
   const fail = (status, error, errorId) => Object.assign(Error(error), { status, errorId });
@@ -92,18 +93,26 @@ function createIdleUnloadSetting({ env = process.env, fetchJson, reloadPresets =
     // writer route and saves are rare; the audit's `seconds` (from the PUT answer) is exact.
     let previous = null;
     try { previous = (await call('GET')).view.seconds; } catch { previous = null; }
-    const { view: next, preset } = await call('PUT', { seconds });
+    const put = () => call('PUT', { seconds });
+    // #2219: with a gate, the write and its reload run under one hold; a refused hold changes nothing.
+    let written, r = null, askReload = typeof reloadPresets === 'function';
+    if (typeof writePresets === 'function') {
+      askReload = false;
+      try {
+        const held = await writePresets(put, (w) => w.preset !== 'failed');
+        written = held.written; r = held.reload;
+      } catch (e) {
+        if (e?.holdRefused) throw fail(409, 'Models are busy, so the idle unload time was not changed. Try again shortly.', 'idleUnloadBusy');
+        throw e;
+      }
+    } else written = await put();
+    const { view: next, preset } = written;
     audit('models.idle_unload', actor, { seconds: next.seconds, source: next.source, previous });
     // Make the router read the new key. Running models keep their old timer until they restart.
+    if (preset !== 'failed' && askReload) { try { r = await reloadPresets({ unload: false }); } catch { r = null; } }
     let apply;
     if (preset === 'failed') apply = { state: 'failed' };
-    else if (typeof reloadPresets !== 'function') apply = { state: 'pending' };
-    else {
-      try {
-        const r = await reloadPresets({ unload: false });
-        apply = r?.ok ? { state: 'applied' } : { state: 'pending', ...(Array.isArray(r?.body?.loaded) ? { loaded: r.body.loaded.filter((x) => typeof x === 'string') } : {}) };
-      } catch { apply = { state: 'pending' }; }
-    }
+    else apply = r?.ok ? { state: 'applied' } : { state: 'pending', ...(Array.isArray(r?.body?.loaded) ? { loaded: r.body.loaded.filter((x) => typeof x === 'string') } : {}) };
     return { ...next, apply, applied: apply.state === 'applied' ? await applied(next.seconds) : false };
   }
 
