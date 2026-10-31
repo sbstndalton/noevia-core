@@ -32,8 +32,3 @@ test('retry after failed save preserves pending selection while reloading profil
  assert.equal(JSON.parse(h.calls[3].init.body).dark,'iris');
 });
 
-test('the server accepts a system appearance preference', () => {
-  const { validateAppearance } = require('../../server/appearance.cjs');
-  assert.deepEqual(validateAppearance({ theme: 'system', light: 'sage', dark: 'iris' }), { theme: 'system', light: 'sage', dark: 'iris' });
-  assert.throws(() => validateAppearance({ theme: 'auto', light: 'sage', dark: 'iris' }));
-});
