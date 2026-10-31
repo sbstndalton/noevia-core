@@ -91,14 +91,13 @@ async function waitReady(base, child) {
 const PROBES = [
   '/api/account/retention',
   '/api/admin/decision-settings', '/api/admin/features', '/api/admin/web-address',
-  '/api/chat-framing/preferences', '/api/chat-vault-mirror/preferences', '/api/code/active',
+  '/api/chat-framing/preferences', '/api/chat-vault-mirror/preferences',
   '/api/model-manager',
   '/api/models/autotune', '/api/models/autotune/settings', '/api/models/autotune/untuned', '/api/models/calibration', '/api/models/capabilities', '/api/models/evidence',
   '/api/models/hardware', '/api/models/inference-budget', '/api/models/installed', '/api/plugins/directory',
   '/api/profile/sharing',
   '/api/providers/{providerId}/models', '/api/reasoning-settings',
   '/api/toolboxes',
-  '/api/projects/{projectId}/browser', '/api/projects/{projectId}/code', '/api/projects/{projectId}/research',
 ];
 
 // Validation-path probes for writes no scenario step makes: an empty or minimal body on the
