@@ -36,7 +36,7 @@ function createDiaryRoutes({ json, readBody, readJson, fetchJson, DIARY_BASE, au
   const unavailable = (res) => json(res, 503, { error: 'Diary is unavailable right now. Try again shortly.', code: 'diaryUnavailable' });
   // Only a network or abort failure is "unavailable"; fetchJson uses redirect:'error', and the call also builds the
   // tenant headers and signs, so a redirect or a throw there is a bug and stays the generic 500 (logged by class).
-  const NETWORK = /^(E[A-Z0-9]+|UND_ERR_[A-Z_]+)$/;
+  const NETWORK = /^(E[A-Z0-9_]+|UND_ERR_[A-Z_]+)$/;
   const isUnreachable = (e) => e?.name === 'AbortError' || e?.name === 'TimeoutError' || (e instanceof TypeError && NETWORK.test(String(e.cause?.code || '')));
   const reach = async (res, call) => {
     try { return await call(); } catch (e) {
