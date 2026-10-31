@@ -8,7 +8,15 @@ function isUnreadable(file) {
   const a = file.attachment, d = file.document;
   if (a && a.state === 'stored' && (a.group === 'Text' || a.group === 'Documents')) return true;
   // A failed refresh that still has earlier text is "using previous text", which is readable.
-  return !!(d && d.state === 'failed' && !String(file.content || '').trim());
+  const blank = !String(file.content || '').trim();
+  // A document waiting for its reader (#2237: state 'queued') with no earlier text has nothing to offer yet.
+  return !!(d && (d.state === 'failed' || d.state === 'queued') && blank);
+}
+// A document the service that reads it has not read yet (#2237): kept, and read when the service is back. Unlike a
+// failed read it is not final, and the model must not take its empty text for the document's content.
+function isWaiting(file) {
+  const d = file && typeof file === 'object' ? file.document : null;
+  return !!(d && d.state === 'queued' && !String(file.content || '').trim());
 }
 const readable = (files) => (Array.isArray(files) ? files : []).filter((f) => !isUnreadable(f));
-module.exports = { isUnreadable, readable };
+module.exports = { isUnreadable, isWaiting, readable };
