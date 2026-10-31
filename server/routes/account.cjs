@@ -25,9 +25,17 @@ function createAccountRoutes({ json, readJson, dir, chatLists = null, removeChat
       let saved;
       try { saved = retention.write(dir(), body?.days); } catch (e) { return json(res, e.status || 500, { error: e.publicMessage || 'Could not save' }), true; }
       const due = retention.expired({ ...lists, days: saved.days, now: now() });
-      for (const chat of due) removeChat(chat);
+      // The 200 says the chats are gone, so wait for each removal: the store deletes the transcript
+      // under its lock after the list write, and a history read right after an early answer still
+      // returned it (#2230). A chat whose removal failed is not counted and the retention sweep
+      // (which stays armed: markSwept only runs after a clean pass) takes it again.
+      let deleted = 0, failure = null;
+      for (const chat of due) {
+        try { if ((await removeChat(chat)) !== false) deleted += 1; } catch (e) { failure = failure || e; }
+      }
+      if (failure) return json(res, [429, 503].includes(failure.status) ? failure.status : 500, { error: 'Some chats could not be deleted. Try again shortly.', days: saved.days, deleted }), true;
       if (saved.days) retention.markSwept(dir(), now());
-      return json(res, 200, { days: saved.days, deleted: due.length }), true;
+      return json(res, 200, { days: saved.days, deleted }), true;
     }
     return false;
   };

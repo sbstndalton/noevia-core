@@ -44,3 +44,46 @@ test('instructions, memory and preferences are not handled here, whatever the me
     }
   }
 });
+
+// sbstndalton/noevia#2230: the 200 means the chats are gone. removeChat is a promise (the store's
+// transcript delete runs under a lock); answering before it settled let a history read right
+// after the PUT still return the transcript.
+test('retention PUT answers only after every removal settled (#2230)', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'acct-routes-'));
+  const NOW = Date.UTC(2026, 8, 17);
+  const old = NOW - 200 * 86400000;
+  const free = [{ id: 'a', updatedAt: old }, { id: 'b', projectId: 'p', updatedAt: old }];
+  const transcripts = new Set(['a', 'b']);
+  const json = (res, status, body) => { res.writeHead(status, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(body)); };
+  const readJson = async (req) => { let raw = ''; for await (const c of req) raw += c; return JSON.parse(raw); };
+  const removeChat = async (c) => { await new Promise((r) => setTimeout(r, 60)); transcripts.delete(c.id); return true; };
+  const routes = createAccountRoutes({ json, readJson, dir: () => dir, now: () => NOW, chatLists: () => ({ freeChats: free.filter((c) => !c.projectId), projects: [{ id: 'p', chats: free.filter((c) => c.projectId) }] }), removeChat });
+  const server = http.createServer((req, res) => void routes(req, res, { path: req.url, authn: { user: { id: 'u' } } }));
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  try {
+    const res = await fetch(`http://127.0.0.1:${server.address().port}/api/account/retention`, { method: 'PUT', body: JSON.stringify({ days: 90, confirmDeletes: 2 }) });
+    assert.equal(res.status, 200);
+    assert.deepEqual(await res.json(), { days: 90, deleted: 2 });
+    assert.deepEqual([...transcripts], [], 'no transcript is readable once the PUT has answered');
+  } finally { server.close(); fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('retention PUT reports a chat whose removal failed instead of counting it (#2230)', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'acct-routes-'));
+  const NOW = Date.UTC(2026, 8, 17);
+  const old = NOW - 200 * 86400000;
+  const free = [{ id: 'a', updatedAt: old }, { id: 'b', updatedAt: old }];
+  const json = (res, status, body) => { res.writeHead(status, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(body)); };
+  const readJson = async (req) => { let raw = ''; for await (const c of req) raw += c; return JSON.parse(raw); };
+  const removeChat = async (c) => { if (c.id === 'a') throw Object.assign(new Error('internal path /x'), { status: 503 }); return true; };
+  const routes = createAccountRoutes({ json, readJson, dir: () => dir, now: () => NOW, chatLists: () => ({ freeChats: free, projects: [] }), removeChat });
+  const server = http.createServer((req, res) => void routes(req, res, { path: req.url, authn: { user: { id: 'u' } } }));
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  try {
+    const res = await fetch(`http://127.0.0.1:${server.address().port}/api/account/retention`, { method: 'PUT', body: JSON.stringify({ days: 90, confirmDeletes: 2 }) });
+    assert.equal(res.status, 503);
+    const body = await res.json();
+    assert.equal(body.deleted, 1);
+    assert.doesNotMatch(JSON.stringify(body), /\/x/);
+  } finally { server.close(); fs.rmSync(dir, { recursive: true, force: true }); }
+});
