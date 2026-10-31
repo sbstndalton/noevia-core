@@ -274,7 +274,16 @@ test('finish() refuses a result over the size limit, and records nothing', { ski
   svc.finish(workspace, project, started.taskId, { ok: true });
 });
 
-test.after(() => { if (!skipWasm) assert.equal(ran, 17, 'a wasm-guarded test body did not run'); });
+test('#2261 a workspace object dropped and read again does not make the same process interrupt its own running task', { skip: skipWasm }, async () => {
+  ran++;
+  const { svc, workspace } = service();
+  const started = await svc.start(workspace, project, { domains: ['shop.example.test'] });
+  const again = { dir: workspace.dir };
+  assert.equal(svc.get(again, project, started.taskId).status, 'running');
+  await svc.cancel(again, project, started.taskId);
+});
+
+test.after(() => { if (!skipWasm) assert.equal(ran, 18, 'a wasm-guarded test body did not run'); });
 
 test('Browser awaits grant and scoped cleanup, retaining the final native report before Forget and completion', async () => {
   const workspace = { dir: temp('noevia-browser-controlled-') }, fake = fakeBrowser(); let giveGrant, takeGrant, revokeEntered, ackEntered;

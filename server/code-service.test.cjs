@@ -525,4 +525,19 @@ test('#1062 the lease is given back when a task fails or is cancelled', { skip: 
   gate.hold('after cancel')();
 });
 
-test.after(() => { if (!skipWasm) assert.equal(ran, 28, 'a wasm-guarded test body did not run'); });
+test('#2261 a workspace object dropped and read again does not make the same process recover its own running task', { skip: skipWasm }, async () => {
+  ran++;
+  let release;
+  const { svc, ws } = service({ connect: async () => ({ prompt: () => new Promise((r) => { release = () => r({ stopReason: 'end_turn' }); }) }) });
+  const started = await svc.start(ws, project, { repository: 'noevia', prompt: 'fix' });
+  for (let i = 0; i < 100 && !release; i++) await new Promise((r) => setTimeout(r, 5));
+  assert.ok(release, 'the agent is running');
+  // A failed project save evicts the workspace object; the next open is a new object over the same directory.
+  const again = { dir: ws.dir };
+  assert.equal(svc.get(again, project, started.taskId).status, 'running', 'the same process still owns it');
+  svc.facts(again);
+  release();
+  assert.equal((await settle(svc, again, started.taskId)).status, 'completed');
+});
+
+test.after(() => { if (!skipWasm) assert.equal(ran, 29, 'a wasm-guarded test body did not run'); });

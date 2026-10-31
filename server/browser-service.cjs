@@ -54,7 +54,9 @@ function view(job, pending = null) {
 function createBrowserService({ launch, egress = null, log = () => {}, now = Date.now,
   timeoutMs = APPROVAL_TIMEOUT_MS, idleTimeoutMs = IDLE_TIMEOUT_MS, direct = false }) {
   if (typeof launch !== 'function') throw Error('A browser service needs a browser to launch.');
-  const stores = new WeakMap();
+  // Keyed on the directory, not the workspace object (#2261): see code-service.cjs; a new object over the same
+  // directory must not recover() this process's own running tasks as interrupted.
+  const stores = new Map();
   const sessions = new Map(); // jobId -> { enqueue(item) }
   // Approvals live in memory on purpose, exactly as Code mode's do: a decision that outlives the
   // request it belongs to is not a decision, and a restart must re-ask.
@@ -67,7 +69,7 @@ function createBrowserService({ launch, egress = null, log = () => {}, now = Dat
   };
 
   function storeFor(workspace) {
-    let store = stores.get(workspace);
+    let store = stores.get(workspace.dir);
     if (!store) {
       // Server-restart recovery (spec §4): anything not terminal when this store is first opened
       // for this tenant was running under a process that no longer exists. It is marked
@@ -75,7 +77,7 @@ function createBrowserService({ launch, egress = null, log = () => {}, now = Dat
       const jobs = createJobs({ dir: workspace.dir, kinds: ['browser'], maxJobs: 50, retainMs: 7 * 86400000, now });
       jobs.recover();
       store = { jobs };
-      stores.set(workspace, store);
+      stores.set(workspace.dir, store);
     }
     return store;
   }
