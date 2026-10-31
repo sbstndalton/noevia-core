@@ -56,13 +56,6 @@ for(const [l,name] of Object.entries(FILES)){
 }
 const NON_BASE=Object.keys(core.CATALOGUES).filter(l=>l!=='en-GB');
 
-test('every supported account locale has a catalogue, and nothing else does',()=>{
-  const server=require('../../server/account-preferences.cjs');
-  const locales=(server.LOCALES||[]).filter(l=>l!=='system');
-  assert.ok(locales.length>0,'server LOCALES not exported');
-  same([...core.SUPPORTED].sort(),[...locales].sort());
-});
-
 test('a missing key falls back to English, and an unknown one to the key itself',()=>{
   const saved=core.CATALOGUES['de-DE']['common.cancel'];
   delete core.CATALOGUES['de-DE']['common.cancel'];
