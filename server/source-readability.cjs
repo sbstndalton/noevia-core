@@ -1,4 +1,5 @@
 'use strict';
+const { quotedNames } = require('./quoted-name.cjs');
 // A source whose text could not be read (#586): an upload the reader rejected (binary data behind a
 // .txt name, a PDF that failed extraction) is kept as an original the user can download, but it is
 // not a text source. It must never be indexed, offered to the model, counted as a readable source or
@@ -22,7 +23,7 @@ function isWaiting(file) {
 function waitingNotice(files) {
   const names = (Array.isArray(files) ? files : []).filter(isWaiting).map((f) => String(f.name)).slice(0, 10);
   if (!names.length) return '';
-  return `${names.map((n) => JSON.stringify(n)).join(', ')} ${names.length === 1 ? 'is' : 'are'} waiting to be read (document reading is not available yet), so ${names.length === 1 ? 'its' : 'their'} contents are not available to you. Say so if asked about ${names.length === 1 ? 'it' : 'them'}; do not guess at the contents or call ${names.length === 1 ? 'it' : 'them'} empty.`;
+  return `${quotedNames(names)} ${names.length === 1 ? 'is' : 'are'} waiting to be read (document reading is not available yet), so ${names.length === 1 ? 'its' : 'their'} contents are not available to you. Say so if asked about ${names.length === 1 ? 'it' : 'them'}; do not guess at the contents or call ${names.length === 1 ? 'it' : 'them'} empty.`;
 }
 const readable = (files) => (Array.isArray(files) ? files : []).filter((f) => !isUnreadable(f));
 module.exports = { isUnreadable, isWaiting, waitingNotice, readable };

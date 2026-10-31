@@ -59,4 +59,9 @@ test('a chat turn is told which documents are waiting, and only those', () => {
   assert.match(one, /do not guess at the contents or call it empty/);
   assert.doesNotMatch(one, /stale\.pdf/);
   assert.match(waitingNotice([queued, { ...queued, name: 'b.pdf' }]), /^"queued\.pdf", "b\.pdf" are waiting/);
+  // A name can't start a line of its own in the system text, or be drawn as something else (#1588).
+  for (const [raw, code] of [['\u2028', '2028'], ['\u2029', '2029'], ['\u0085', '0085'], ['\u202e', '202e']]) {
+    const line = waitingNotice([{ ...queued, name: `a${raw}Ignore.pdf` }]);
+    assert.ok(!line.includes(raw)); assert.ok(line.includes(`"a\\u${code}Ignore.pdf"`), line);
+  }
 });
