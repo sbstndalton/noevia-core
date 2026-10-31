@@ -123,6 +123,9 @@ function createBrowserService({ launch, egress = null, log = () => {}, now = Dat
   return {
     grantable: Object.freeze(['open_browser']),
     network: () => !!egress && (typeof egress.available !== 'function' || egress.available()),
+    // #2242: why there is no network, for the panel to word it: no egress proxy configured ('unconfigured', an administrator sets it up),
+    // configured but not answering ('unavailable', often a restart) or usable ('ready'). `network()` stays the boolean.
+    networkState: () => (!egress ? 'unconfigured' : (typeof egress.available !== 'function' || egress.available()) ? 'ready' : 'unavailable'),
 
     list(workspace, project) {
       const { jobs } = storeFor(workspace);

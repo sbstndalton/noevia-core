@@ -79,3 +79,17 @@ test('an approval decision is passed through verbatim, so the service decides wh
   await call('POST', `/api/projects/p1/code/${TASK}/approve`, 'admin', '{}');
   assert.deepEqual(calls.map((c) => c[2]), ['approve_all', '']);
 });
+
+test('#2242: the list says why there is no network: unconfigured, unavailable or ready', async () => {
+  for (const [network, networkState, expected] of [[true, 'ready', 'ready'], [false, 'unavailable', 'unavailable'], [false, 'unconfigured', 'unconfigured'], [false, undefined, 'unconfigured'], [true, undefined, 'ready']]) {
+    const service = { repositories: () => [], grantable: [], defaultCapabilities: [], harnesses: () => [], promptPreparation: () => [], sandboxed: () => true, list: () => [],
+      network: () => network, ...(networkState ? { networkState: () => networkState } : {}) };
+    const sent = [];
+    const route = createCodeRoutes({ service, features: { enabled: () => true }, getProject: (id) => ({ id }), projects: () => [], workspace: () => ({ dir: '/tmp/x' }),
+      json: (res, status, body) => sent.push({ status, body }), readJson: async () => ({}) });
+    await route({ method: 'GET' }, {}, { path: '/api/projects/p1/code', authn: { user: { role: 'admin' } } });
+    assert.equal(sent[0].status, 200);
+    assert.equal(sent[0].body.network, network);
+    assert.equal(sent[0].body.networkState, expected);
+  }
+});

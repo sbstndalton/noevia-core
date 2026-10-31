@@ -208,6 +208,9 @@ function createCodeService({ repos, connect, egress = null, engine = undefined, 
     // Whether a task can be given any network at all. Without the egress proxy there is no way
     // to let one domain through, so the network capabilities are not offered as if there were.
     network: () => !!egress && (typeof egress.available !== 'function' || egress.available()),
+    // #2242: why there is no network, for the panel to word it: no egress proxy configured ('unconfigured', an administrator sets it up),
+    // configured but not answering ('unavailable', often a restart) or usable ('ready'). `network()` stays the boolean.
+    networkState: () => (!egress ? 'unconfigured' : (typeof egress.available !== 'function' || egress.available()) ? 'ready' : 'unavailable'),
 
     list(workspace, project) {
       const { jobs } = storeFor(workspace);

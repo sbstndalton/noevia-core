@@ -80,3 +80,16 @@ test('a service error carries its status and public message through, and never l
   assert.equal(res2.status, 409);
   assert.equal(res2.body.error, 'This task is not running.');
 });
+
+test('#2242: the list says why there is no network: unconfigured, unavailable or ready', async () => {
+  for (const [network, networkState, expected] of [[true, 'ready', 'ready'], [false, 'unavailable', 'unavailable'], [false, 'unconfigured', 'unconfigured'], [false, undefined, 'unconfigured'], [true, undefined, 'ready']]) {
+    const service = { grantable: ['open_browser'], network: () => network, ...(networkState ? { networkState: () => networkState } : {}), list: () => [], get: () => null };
+    const sent = [];
+    const route = createBrowserRoutes({ service, features: { enabled: () => true }, getProject: (id) => ({ id }), workspace: () => ({ dir: '/tmp/x' }),
+      json: (res, status, body) => sent.push({ status, body }), readJson: async () => ({}) });
+    await route({ method: 'GET' }, {}, { path: '/api/projects/p1/browser', authn: { user: { role: 'admin' } } });
+    assert.equal(sent[0].status, 200);
+    assert.equal(sent[0].body.network, network);
+    assert.equal(sent[0].body.networkState, expected);
+  }
+});
