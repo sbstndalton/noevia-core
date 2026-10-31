@@ -127,6 +127,24 @@ function createModelRoutes({ servedEmbeddingModels = (target) => require('../rag
     try { return !!(await modelManager.reloadPresets({ unload: false }))?.ok; } catch { return false; }
   }
 
+  // #2219: a models.ini write and its reload under one hold. { written, reload }, or { refused: true }
+  // with nothing written when the hold is refused (a tune, a load, a chat turn, another reload). A
+  // manager without a gate (not llama.cpp) writes, then reloads, as it always did.
+  const PRESETS_BUSY = 'Models are busy, so nothing was changed. Try again shortly.';
+  async function writePresetsHeld(write, reloadIf) {
+    if (typeof modelManager.writePresets !== 'function') {
+      const written = await write();
+      return { written, reloaded: reloadIf(written) ? await reloadRouterPresets() : false };
+    }
+    try {
+      const { written, reload } = await modelManager.writePresets(write, reloadIf);
+      return { written, reloaded: !!reload?.ok };
+    } catch (e) {
+      if (e?.holdRefused) return { refused: true };
+      throw e;
+    }
+  }
+
   // #1695: remove the preset of every model whose file is gone. Idempotent: a second run finds
   // nothing to do. A section is removed only when both noevia's folder scan (missingFile) and the
   // model management service (hasFile: false) say its file is gone; Laya, sidecar models and
@@ -157,16 +175,20 @@ function createModelRoutes({ servedEmbeddingModels = (target) => require('../rag
     const candidates = ordinary.filter((m) => m.missingFile === true).map((m) => m.name);
     if (candidates.length && candidates.length * 2 > ordinary.length) return { ok: false, status: 409, code: 'scanUntrusted', error: SCAN_UNTRUSTED, missing: candidates.length, presets: ordinary.length };
     const removed = [], kept = [];
-    for (const name of candidates) {
-      const r = await removePresetSection(name, { onlyWithoutFile: true });
-      (r.removed ? removed : kept).push(name);
-    }
+    if (!candidates.length) return { ok: true, status: 200, removed, kept, reloaded: false };
+    const held = await writePresetsHeld(async () => {
+      for (const name of candidates) {
+        const r = await removePresetSection(name, { onlyWithoutFile: true });
+        (r.removed ? removed : kept).push(name);
+      }
+    }, () => removed.length > 0);
+    if (held.refused) return { ok: false, status: 409, code: 'maintenance_held', error: PRESETS_BUSY, retryable: true };
     for (const name of removed) {
       clearRoleReferences(name);
       if (lastLoadedModel() === name) clearLastLoadedModel(name);
       if (typeof modelManager.forgetIdentity === 'function') modelManager.forgetIdentity(name);
     }
-    const reloaded = removed.length ? await reloadRouterPresets() : false;
+    const { reloaded } = held;
     if (removed.length) { modelScanCache.clear(); if (service.invalidateModelReads) service.invalidateModelReads(); }
     return { ok: true, status: 200, removed, kept, reloaded };
   }
@@ -612,7 +634,7 @@ function createModelRoutes({ servedEmbeddingModels = (target) => require('../rag
       if (req.method !== 'POST') return json(res, 405, { error: 'method not allowed' });
       if (!modelManager.enabled) return json(res, 404, { error: 'model management is disabled' });
       const r = await pruneMissingPresets();
-      return json(res, r.status, r.ok ? { removed: r.removed, kept: r.kept, reloaded: r.reloaded } : { error: r.error, ...(r.code ? { code: r.code } : {}) });
+      return json(res, r.status, r.ok ? { removed: r.removed, kept: r.kept, reloaded: r.reloaded } : { error: r.error, ...(r.code ? { code: r.code } : {}), ...(r.retryable ? { retryable: true } : {}) });
     }
 
     // The GET is the Rust front's (#2262). Another method used to get the list too; it is refused like any other unknown method.
@@ -705,7 +727,11 @@ function createModelRoutes({ servedEmbeddingModels = (target) => require('../rag
       // Only once the file is gone (or was already missing): a refused engine delete must keep the
       // section, or the file stays on disk with its settings lost and no card to retry from.
       const fileGone = r.ok || entry?.missingFile === true;
-      const preset = fileGone ? await removePresetSection(body.name) : { removed: false };
+      // #2219: the file is already gone when a refused hold keeps the section: the card shows "File
+      // missing" and this delete or the list's prune finishes the job.
+      const held = fileGone && env.MODEL_LOADER_URL ? await writePresetsHeld(() => removePresetSection(body.name), (w) => w.removed) : null;
+      if (held?.refused && !r.ok) return json(res, 409, { error: PRESETS_BUSY, code: 'maintenance_held', retryable: true, unloaded });
+      const preset = held?.written || { removed: false };
       const engineOk = r.ok || (entry?.missingFile === true && preset.removed);
       if (!engineOk) {
         // noevia#2115: the gate does not unload or delete a model that is answering a request.
@@ -720,10 +746,10 @@ function createModelRoutes({ servedEmbeddingModels = (target) => require('../rag
       if (lastLoadedModel() === body.name) clearLastLoadedModel(body.name);
       if (typeof modelManager.forgetIdentity === 'function') modelManager.forgetIdentity(body.name);
       // #1695: the router still lists a removed section until it re-reads models.ini.
-      const reloaded = preset.removed ? await reloadRouterPresets() : false;
+      const reloaded = !!held?.reloaded;
       modelScanCache.clear();
       if (service.invalidateModelReads) service.invalidateModelReads();
-      return json(res, 200, { ok: true, unloaded, rolesCleared, presetRemoved: preset.removed, ...(preset.removed ? { presetsReloaded: reloaded } : {}) });
+      return json(res, 200, { ok: true, unloaded, rolesCleared, presetRemoved: preset.removed, ...(held?.refused ? { presetBusy: true } : {}), ...(preset.removed ? { presetsReloaded: reloaded } : {}) });
     }
 
     for (const verb of ['load', 'unload']) {
