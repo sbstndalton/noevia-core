@@ -5,7 +5,7 @@
 // tools/gen-storage-fixtures.cjs can regenerate tests/fixtures/storage-path.v1.json and the
 // differential tests can compare it with dav-parse.wasm (sbstndalton/noevia-rs crates/storage-path).
 // Production decides with the Rust module alone (server/storage-path.cjs).
-// Moved here unchanged from server/storage-path.cjs safeRelativePathJs, cleanRootJs, joinRootJs,
+// Moved here from server/storage-path.cjs safeRelativePathJs, cleanRootJs, joinRootJs,
 // isPlainFilenameJs (noevia-core 36376b2, the code the release before the retirement ran).
 
 function safeRelativePathJs(raw) {
@@ -15,6 +15,13 @@ function safeRelativePathJs(raw) {
   // #978: no filesystem or object store names a file with NUL; refuse it rather than pass it on.
   if (value.includes('\0')) return '';
   const segments = value.split('/').filter(Boolean);
+  // #2125: the whole-value trim left white space on a last segment that a slash followed
+  // ('Reports /' -> 'Reports '), which read back as 'Reports': trim the last segment's end too and
+  // drop a last segment that is only white space. Inner segments are unchanged.
+  while (segments.length) {
+    const last = segments.pop().trimEnd();
+    if (last) { segments.push(last); break; }
+  }
   if (!segments.length) return '';
   if (segments.some((s) => s === '.' || s === '..')) return '';
   return segments.join('/');

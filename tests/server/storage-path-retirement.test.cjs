@@ -118,12 +118,13 @@ test('production (Rust) answers every hostile path exactly as the JS rules did, 
   console.log(`# storage-path retirement: ${cases.length} hostile cases; ${counts.same} identical to the JS rules; refused instead of answered: ${counts.input} not well-formed (JS answered a non-empty path in ${jsAnsweredNonEmpty.input}), ${counts.too_large} over 64 KiB (${jsAnsweredNonEmpty.too_large}), ${counts.joinRoot} non-string joinRoot parts (${jsAnsweredNonEmpty.joinRoot}); 0 other divergences`);
 });
 
-test('a path the live system stored (any non-empty answer of the JS rules) reads back as it did under JS', { skip: skipWasm }, () => {
+test('a path the rules stored (any non-empty answer) reads back as itself', { skip: skipWasm }, () => {
   // projects.cjs ownsFile requires safeRelativePath(target) === target and project source folders
-  // were saved as the JS rule's answers: every such stored value must read back as the JS rule
-  // read it. That is unchanged, including one quirk of the JS rule kept on purpose: white space is
-  // trimmed from the whole value only, so 'a /' was stored as 'a ', which reads back as 'a'.
-  let fixed = 0, quirk = 0;
+  // were saved as the rule's answers: every stored answer must read back as itself. Until #2125 one
+  // quirk broke that: white space was trimmed from the whole value only, so 'a /' was stored as
+  // 'a ', which read back as 'a'. The last segment is now trimmed too, so no answer ends in white
+  // space and every answer is stable. (A value stored before the fix still reads back trimmed.)
+  let fixed = 0;
   const cps = (s) => [...s.slice(0, 40)].map((ch) => ch.codePointAt(0).toString(16)).join(' ');
   for (const [op, a] of corpus()) {
     if (op !== 'safeRelativePath') continue;
@@ -131,15 +132,12 @@ test('a path the live system stored (any non-empty answer of the JS rules) reads
     if (!stored || !stored.isWellFormed()) continue;
     const again = paths.safeRelativePath(stored);
     assert.equal(again, oracle.safeRelativePathJs(stored), `${JSON.stringify(String(a).slice(0, 80))} -> ${cps(stored)}`);
-    if (again === stored) fixed += 1;
-    else {
-      assert.notEqual(stored.trim(), stored, `only a stored value that ends in white space reads back changed: ${cps(stored)}`);
-      quirk += 1;
-    }
+    assert.equal(again, stored, `a stored answer reads back as itself: ${cps(stored)}`);
+    fixed += 1;
     assert.equal(paths.joinRoot('root', stored), oracle.joinRootJs('root', stored));
   }
   assert.ok(fixed > 1000, `${fixed} stored paths`);
-  console.log(`# storage-path retirement: ${fixed + quirk}/${fixed + quirk} stored paths read back as under JS (${fixed} unchanged, ${quirk} ending in white space trimmed, as before)`);
+  console.log(`# storage-path retirement: ${fixed}/${fixed} stored paths read back as themselves`);
 });
 
 test('the storage client refuses every traversal, absolute or NUL path before a request leaves', { skip: skipWasm }, async (t) => {

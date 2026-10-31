@@ -155,6 +155,17 @@ function pathCases() {
   rel('251 emoji', '😀'.repeat(251));
   rel('500 chars with dot dot', `${'a'.repeat(497)}/..`);
   rel('long segment list', Array.from({ length: 200 }, () => 'a').join('/'));
+  // #2125: white space before a trailing slash on the last segment.
+  rel('trailing space before slash', 'Reports /');
+  rel('trailing space last segment', 'Reports ');
+  rel('trailing nbsp before slash', 'a/Reports \u00a0/');
+  rel('white-space-only last segment', 'a/ /');
+  rel('inner leading space kept, last end trimmed', 'a/ b /');
+  rel('inner trailing space kept', 'a /b');
+  rel('inner white-space segment kept', 'a/ /b');
+  rel('dot dot with trailing space', 'a/.. /');
+  rel('dot with nbsp', 'a/.\u00a0/');
+  rel('only white-space segments', ' / /');
   rel('query-like', 'a?b=c#d');
   rel('url', 'https://example.test/x');
   rel('tilde', '~/x');
