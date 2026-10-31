@@ -31,13 +31,29 @@ function createDiaryRoutes({ json, readBody, readJson, fetchJson, DIARY_BASE, au
   // Older fakes pass only diaryHeaders; fall back to a single send without the 428 retry.
   const diaryFetchJson = diary.diaryFetchJson || ((url, { method = 'GET', body, storageRetry = false } = {}, timeoutMs) => fetchJson(url, { method, headers: diaryHeaders(method, url, { body, storageRetry }), body }, timeoutMs));
 
+  // #2232: a Diary that cannot be reached is a status the page can word, not a bare 500. The call
+  // throws (connection refused, a stalled reply); nothing of the error is passed on.
+  const unavailable = (res) => json(res, 503, { error: 'Diary is unavailable right now. Try again shortly.', code: 'diaryUnavailable' });
+  // Only a network or abort failure is "unavailable"; fetchJson uses redirect:'error', and the call also builds the
+  // tenant headers and signs, so a redirect or a throw there is a bug and stays the generic 500 (logged by class).
+  const NETWORK = /^(E[A-Z0-9]+|UND_ERR_[A-Z_]+)$/;
+  const isUnreachable = (e) => e?.name === 'AbortError' || e?.name === 'TimeoutError' || (e instanceof TypeError && NETWORK.test(String(e.cause?.code || '')));
+  const reach = async (res, call) => {
+    try { return await call(); } catch (e) {
+      log(`[diary] sidecar call failed: ${e?.name || 'Error'}${e?.cause?.code ? ' ' + e.cause.code : ''}${isUnreachable(e) ? ' (unavailable)' : ' (internal)'}`);
+      if (isUnreachable(e)) { unavailable(res); return null; }
+      throw e;
+    }
+  };
+
   async function handle(req, res, { path: p, authn, url }) {
     if (p === '/api/diary/workspace-trash') {
       if (!authService.diaryEnabled(authn.user.id)) return json(res, 404, { error: 'Diary add-on is disabled' });
       if (!['GET', 'POST'].includes(req.method)) return json(res, 405, { error: 'Method not allowed' });
       const body = req.method === 'POST' ? await readBody(req, 4096) : undefined;
       const query = req.method === 'GET' ? '?after=' + encodeURIComponent(url.searchParams.get('after') || '') : '';
-      const r = await diaryFetchJson(`${DIARY_BASE}/api/workspace-trash${query}`, { method: req.method, body }, 60000);
+      const r = await reach(res, () => diaryFetchJson(`${DIARY_BASE}/api/workspace-trash${query}`, { method: req.method, body }, 60000));
+      if (!r) return;
       res.setHeader('Cache-Control', 'no-store');
       return json(res, r.status, r.ok ? r.body : { error: r.body?.detail || 'Diary recovery request failed. Retry or refresh Trash.' });
     }
@@ -63,7 +79,8 @@ function createDiaryRoutes({ json, readBody, readJson, fetchJson, DIARY_BASE, au
       // #1198: live QA could not tell whether a Retry press reached this point. Method, route and the
       // account's id only: no path, no storage address, no credential.
       if (storageRetry) log(`[diary] forwarding X-Cowork-Storage-Retry: 1 (${req.method} ${p}, user ${authn.user.id})`);
-      const r = await diaryFetchJson(`${DIARY_BASE}/api${suffix}`, { method: req.method, body, storageRetry }, local ? 600000 : 60000);
+      const r = await reach(res, () => diaryFetchJson(`${DIARY_BASE}/api${suffix}`, { method: req.method, body, storageRetry }, local ? 600000 : 60000));
+      if (!r) return;
       if (r.ok) {
         // #1589: an explicit Retry that works proves the saved login is good, so automatic calls resume.
         // #1607: but only when the listing really went to the storage server. A Diary account kept in the app
@@ -97,14 +114,16 @@ function createDiaryRoutes({ json, readBody, readJson, fetchJson, DIARY_BASE, au
     if (p === '/api/diary/history') {
       if (!authService.diaryEnabled(authn.user.id)) return json(res, 404, { error: 'Diary add-on is disabled' });
       const monthId = url.searchParams.get('month');
-      const data = await corpusSource.readMonth(monthId);
+      const data = await reach(res, () => corpusSource.readMonth(monthId));
+      if (!data) return;
       return json(res, 200, data);
     }
 
     if (p === '/api/diary/external-sources') {
       if (authn.user.role !== 'admin') return json(res, 403, { error: 'Administrator required for server import folders' });
       if (!authService.diaryEnabled(authn.user.id)) return json(res, 404, { error: 'Diary add-on is disabled' });
-      const r = await diaryFetchJson(`${DIARY_BASE}/api/external-sources`, {}, 30000);
+      const r = await reach(res, () => diaryFetchJson(`${DIARY_BASE}/api/external-sources`, {}, 30000));
+      if (!r) return;
       if (!r.ok) return json(res, r.status >= 500 ? 502 : r.status, { error: `diary sidecar ${r.status}` });
       return json(res, 200, r.body);
     }
@@ -122,11 +141,12 @@ function createDiaryRoutes({ json, readBody, readJson, fetchJson, DIARY_BASE, au
       if (!body || typeof body.sourcePath !== 'string' || typeof body.relPath !== 'string') {
         return json(res, 400, { error: 'sourcePath and relPath required' });
       }
-      const r = await diaryFetchJson(
+      const r = await reach(res, () => diaryFetchJson(
         `${DIARY_BASE}/api/external-sources/import`,
         { method: 'POST', body: JSON.stringify({ source_path: body.sourcePath, rel_path: body.relPath }) },
         60000,
-      );
+      ));
+      if (!r) return;
       if (!r.ok) {
         const detail = r.body?.detail || `diary sidecar ${r.status}`;
         return json(res, r.status >= 500 ? 502 : r.status, { error: String(detail) });
@@ -157,11 +177,12 @@ function createDiaryRoutes({ json, readBody, readJson, fetchJson, DIARY_BASE, au
       // Optimistic concurrency: pass the loaded exchange's hash through so the
       // sidecar can refuse a stale edit instead of silently overwriting.
       if (typeof body.base_hash === 'string') forward.base_hash = body.base_hash;
-      const r = await diaryFetchJson(
+      const r = await reach(res, () => diaryFetchJson(
         `${DIARY_BASE}/api/entries/edit`,
         { method: 'POST', body: JSON.stringify(forward) },
         60000,
-      );
+      ));
+      if (!r) return;
       // A 409 edit conflict carries current_hash/current_text the client needs
       // to keep the draft and re-base; relay that body unchanged.
       if (r.status === 409 && r.body && r.body.conflict === true) return json(res, 409, r.body);
