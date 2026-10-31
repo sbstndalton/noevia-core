@@ -112,7 +112,10 @@ function createCodeService({ repos, connect, egress = null, engine = undefined, 
   // Approvals live in memory on purpose, exactly as the chat gate does: a decision that
   // outlives the request it belongs to is not a decision, and a restart must re-ask.
   const pending = new Map(); // approvalId -> { id, taskId, request, resolve, timer }
-  const stores = new WeakMap();
+  // Keyed on the directory, not the workspace object (#2261): a failed project save evicts the object and the next
+  // open is a new one over the same directory. A store per object would run recover() again with no controllers,
+  // marking this process's own live tasks interrupted.
+  const stores = new Map();
   // A card that timed out on our own clock (never the harness's — see the pi bridge's matching
   // deadline in services/code-sandbox/pi-acp-bridge.cjs) is remembered briefly so a person who
   // was mid-click sees why their answer was rejected, instead of a generic "no longer waiting"
@@ -141,7 +144,7 @@ function createCodeService({ repos, connect, egress = null, engine = undefined, 
   const paused = () => { try { return inference?.paused?.() === true; } catch { return false; } };
 
   function storeFor(workspace) {
-    let store = stores.get(workspace);
+    let store = stores.get(workspace.dir);
     if (!store) {
       store = leased(createJobs({ dir: workspace.dir, kinds: ['code'], maxJobs: 50, retainMs: 14 * 86400000, now }));
       store.recover();
@@ -154,7 +157,7 @@ function createCodeService({ repos, connect, egress = null, engine = undefined, 
         ...(engine ? { engine } : {}), ...(review ? { review } : {}) });
       store = { jobs: store, workspaces, harness, pipeline: null };
       if (pipeline && typeof pipeline.create === 'function') store.pipeline = pipeline.create({ jobs: store.jobs, workspaces, harness, askApproval });
-      stores.set(workspace, store);
+      stores.set(workspace.dir, store);
     }
     return store;
   }
