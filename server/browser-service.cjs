@@ -122,7 +122,7 @@ function createBrowserService({ launch, egress = null, log = () => {}, now = Dat
 
   return {
     grantable: Object.freeze(['open_browser']),
-    network: () => !!egress,
+    network: () => !!egress && (typeof egress.available !== 'function' || egress.available()),
 
     list(workspace, project) {
       const { jobs } = storeFor(workspace);

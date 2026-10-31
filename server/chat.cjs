@@ -630,6 +630,8 @@ function createChatHandler({
       if (sourcesNotReady.length) {
         sysParts.push(`The user just attached ${quotedNames(sourcesNotReady.map((f) => f.name))}, but ${sourcesNotReady.length === 1 ? 'it was' : 'they were'} not ${sourcesNotReady.every((f) => f.reason === 'failed') ? 'processed' : 'finished processing'} in time, so ${sourcesNotReady.length === 1 ? 'its' : 'their'} contents are not available to you for this message. Say so if asked about ${sourcesNotReady.length === 1 ? 'it' : 'them'}; do not guess at the contents.`);
       }
+      // #2237: a document the reading service has not read yet is said to be waiting, never taken for empty.
+      { const waiting = require('./source-readability.cjs').waitingNotice(project?.files); if (waiting) sysParts.push(waiting); }
       // #1513: a source only partly read for this reply is said so, with what was read.
       { const coverageNote = require('./source-coverage.cjs').coverageNote(partialReads); if (coverageNote) sysParts.push(coverageNote); }
       // Skills index (L0): name+description only, always visible. The model

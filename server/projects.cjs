@@ -133,11 +133,13 @@ function createProjectStore({
   // running reply's late write can no longer bring a transcript back (#2154). What Node still owns
   // is the attachments project (#788: its RAG index files, which Node's indexer writes), removed
   // here once the chat is gone. Returns a promise for whether a chat was deleted.
-  function deleteChat(projectId, chatId) {
-    return deleteThroughStore(chatId, { kind: 'project', projectId });
+  // `requireGone` (the retention sweep, #2230): the caller is about to say the chat is gone, so a store
+  // that deleted the chat but could not remove its transcript (`leftovers`) is a failure, not a delete.
+  function deleteChat(projectId, chatId, { requireGone = false } = {}) {
+    return deleteThroughStore(chatId, { kind: 'project', projectId, requireGone });
   }
 
-  async function deleteThroughStore(chatId, { kind, projectId }) {
+  async function deleteThroughStore(chatId, { kind, projectId, requireGone = false }) {
     const workspace = currentWorkspace();
     if (workspace.revoked) return false;
     workspace.assertActive?.();
@@ -146,6 +148,7 @@ function createProjectStore({
     refreshLists(workspace);
     const attachments = removeChatAttachments(chatId);
     if (attachments && typeof attachments.then === 'function') await attachments.then(() => true, () => true);
+    if (requireGone && Number(done.leftovers) > 0) throw Object.assign(new Error('The chat was removed but its transcript could not be.'), { status: 503, code: 'LEFTOVERS' });
     return true;
   }
 
@@ -268,8 +271,8 @@ function createProjectStore({
     currentWorkspace().saveFreeChats();
   }
 
-  function deleteFreeChat(chatId) {
-    return deleteThroughStore(chatId, { kind: 'free' });
+  function deleteFreeChat(chatId, { requireGone = false } = {}) {
+    return deleteThroughStore(chatId, { kind: 'free', requireGone });
   }
 
   // Project DELETE (moved here from routes/projects.cjs so a chat's attachments project, #788, is

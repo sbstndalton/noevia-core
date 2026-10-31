@@ -184,6 +184,8 @@ function failed(previous, name, reason) {
 function problem(file, { notes: withNotes = true } = {}) {
   const d = file.document;
   if (!d) return '';
+  // #2237: not a failure and not final: the reading service was away and the file is read when it is back.
+  if (d.state === 'queued') return `waiting to be read; document reading is not available yet and the file will be read automatically${d.stale ? '; using STALE text from the last readable version' : ''}.`;
   const issues = (d.pageStatus || []).filter(p => !['native', 'blank', 'ocr'].includes(p.status));
   const extra = withNotes ? notes(file).map(noteText).filter(Boolean) : [];
   return `${d.state}${d.stale ? '; using STALE text from the last readable version' : ''}` +
