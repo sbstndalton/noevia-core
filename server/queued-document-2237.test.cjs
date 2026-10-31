@@ -50,3 +50,13 @@ test('the figure sweep leaves a queued document alone', () => {
   assert.equal(needsFigures(doc('ready')), true, 'control: a read document is swept');
   assert.equal(needsFigures(doc('queued')), false);
 });
+
+test('a chat turn is told which documents are waiting, and only those', () => {
+  const { waitingNotice } = require('./source-readability.cjs');
+  assert.equal(waitingNotice([staleQueued, { name: 'ok.md', content: 'x' }]), '');
+  const one = waitingNotice([queued, staleQueued]);
+  assert.match(one, /^"queued\.pdf" is waiting to be read/);
+  assert.match(one, /do not guess at the contents or call it empty/);
+  assert.doesNotMatch(one, /stale\.pdf/);
+  assert.match(waitingNotice([queued, { ...queued, name: 'b.pdf' }]), /^"queued\.pdf", "b\.pdf" are waiting/);
+});

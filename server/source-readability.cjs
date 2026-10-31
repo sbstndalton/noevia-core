@@ -18,5 +18,11 @@ function isWaiting(file) {
   const d = file && typeof file === 'object' ? file.document : null;
   return !!(d && d.state === 'queued' && !String(file.content || '').trim());
 }
+// The line a chat turn adds when project documents are waiting to be read (#2237), or '' when none are.
+function waitingNotice(files) {
+  const names = (Array.isArray(files) ? files : []).filter(isWaiting).map((f) => String(f.name)).slice(0, 10);
+  if (!names.length) return '';
+  return `${names.map((n) => JSON.stringify(n)).join(', ')} ${names.length === 1 ? 'is' : 'are'} waiting to be read (document reading is not available yet), so ${names.length === 1 ? 'its' : 'their'} contents are not available to you. Say so if asked about ${names.length === 1 ? 'it' : 'them'}; do not guess at the contents or call ${names.length === 1 ? 'it' : 'them'} empty.`;
+}
 const readable = (files) => (Array.isArray(files) ? files : []).filter((f) => !isUnreadable(f));
-module.exports = { isUnreadable, isWaiting, readable };
+module.exports = { isUnreadable, isWaiting, waitingNotice, readable };
