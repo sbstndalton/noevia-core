@@ -168,7 +168,7 @@ const featureRoutes = require('./routes/features.cjs').createFeatureRoutes({ jso
 // GET /api/export/conversations is the Rust front's (#1071): this mount only refuses a bypass.
 const exportRoutes = require('./routes/export.cjs').createExportRoutes({ json });
 const retentionLists = () => ({ freeChats: Array.from(FREE_CHATS), projects: PROJECTS.filter((proj) => !diaryExtras.internalProject(proj)) });
-const removeRetainedChat = ({ projectId, id }) => (projectId ? deleteChat(projectId, id) : deleteFreeChat(id));
+const removeRetainedChat = ({ projectId, id }) => (projectId ? deleteChat(projectId, id, { requireGone: true }) : deleteFreeChat(id, { requireGone: true }));
 const accountRoutes = require('./routes/account.cjs').createAccountRoutes({ json, readJson, dir: () => currentWorkspace().dir, chatLists: retentionLists, removeChat: removeRetainedChat });
 // Settings → Data → Import conversations: the POST is the Rust front's (#2191 round 4,
 // rust-conversation-import.cjs); this mount keeps the other methods' 405.

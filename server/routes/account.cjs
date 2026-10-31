@@ -7,7 +7,7 @@
 // rust-auth.cjs refuses them before this module runs).
 const retention = require('../chat-retention.cjs');
 
-function createAccountRoutes({ json, readJson, dir, chatLists = null, removeChat = null, now = Date.now }) {
+function createAccountRoutes({ json, readJson, dir, chatLists = null, removeChat = null, now = Date.now, clock = Date.now, deadlineMs = 30000 }) {
   return async function accountRoutes(req, res, { path, authn }) {
     if (path === '/api/account/retention' && chatLists && removeChat) {
       if (!authn) return json(res, 401, { error: 'Sign in first' }), true;
@@ -29,12 +29,22 @@ function createAccountRoutes({ json, readJson, dir, chatLists = null, removeChat
       // under its lock after the list write, and a history read right after an early answer still
       // returned it (#2230). A chat whose removal failed is not counted and the retention sweep
       // (which stays armed: markSwept only runs after a clean pass) takes it again.
-      let deleted = 0, failure = null;
+      // Bounded like the Rust sweep (retention.rs remove_due, 30 s) and stopped at the first busy store:
+      // 30 chats at a 10 s client timeout would hold this request for minutes.
+      let deleted = 0, failure = null, skipped = 0;
+      const started = clock();
       for (const chat of due) {
-        try { if ((await removeChat(chat)) !== false) deleted += 1; } catch (e) { failure = failure || e; }
+        if (clock() - started > deadlineMs) { failure = failure || Object.assign(new Error('deadline'), { status: 503 }); break; }
+        try {
+          if ((await removeChat(chat)) === false) skipped += 1; else deleted += 1;
+        } catch (e) {
+          failure = failure || e;
+          if ([429, 503].includes(e && e.status)) break;
+        }
       }
       if (failure) return json(res, [429, 503].includes(failure.status) ? failure.status : 500, { error: 'Some chats could not be deleted. Try again shortly.', days: saved.days, deleted }), true;
-      if (saved.days) retention.markSwept(dir(), now());
+      // A chat the store did not delete (already gone, or not found) leaves the sweep armed too.
+      if (saved.days && !skipped) retention.markSwept(dir(), now());
       return json(res, 200, { days: saved.days, deleted }), true;
     }
     return false;

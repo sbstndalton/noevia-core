@@ -83,7 +83,56 @@ test('retention PUT reports a chat whose removal failed instead of counting it (
     const res = await fetch(`http://127.0.0.1:${server.address().port}/api/account/retention`, { method: 'PUT', body: JSON.stringify({ days: 90, confirmDeletes: 2 }) });
     assert.equal(res.status, 503);
     const body = await res.json();
-    assert.equal(body.deleted, 1);
+    assert.equal(body.deleted, 0, 'it stops at the first busy store');
     assert.doesNotMatch(JSON.stringify(body), /\/x/);
   } finally { server.close(); fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+function retentionServer({ removeChat, clock, deadlineMs }) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'acct-routes-'));
+  const NOW = Date.UTC(2026, 8, 17), old = NOW - 200 * 86400000;
+  const free = [1, 2, 3].map((n) => ({ id: 'c' + n, updatedAt: old }));
+  const json = (res, status, body) => { res.writeHead(status, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(body)); };
+  const readJson = async (req) => { let raw = ''; for await (const c of req) raw += c; return JSON.parse(raw); };
+  const routes = createAccountRoutes({ json, readJson, dir: () => dir, now: () => NOW, clock, deadlineMs, chatLists: () => ({ freeChats: free, projects: [] }), removeChat });
+  const server = http.createServer((req, res) => void routes(req, res, { path: req.url, authn: { user: { id: 'u' } } }));
+  return new Promise((r) => server.listen(0, '127.0.0.1', () => r({
+    dir, server,
+    put: () => fetch(`http://127.0.0.1:${server.address().port}/api/account/retention`, { method: 'PUT', body: JSON.stringify({ days: 90, confirmDeletes: 3 }) }),
+    swept: () => fs.existsSync(path.join(dir, 'chat-retention.json')) && JSON.parse(fs.readFileSync(path.join(dir, 'chat-retention.json'), 'utf8')).lastSweep,
+    close() { server.close(); fs.rmSync(dir, { recursive: true, force: true }); },
+  })));
+}
+
+test('retention PUT stops at the first busy store and leaves the sweep armed (#2230)', async () => {
+  const calls = [];
+  const f = await retentionServer({ removeChat: async (c) => { calls.push(c.id); throw Object.assign(new Error('busy'), { status: 503 }); } });
+  try {
+    const res = await f.put();
+    assert.equal(res.status, 503);
+    assert.deepEqual(calls, ['c1'], 'no further chat is tried');
+    assert.ok(!f.swept());
+  } finally { f.close(); }
+});
+
+test('retention PUT stops at its deadline and does not claim the rest (#2230)', async () => {
+  let t = 0; const calls = [];
+  const f = await retentionServer({ clock: () => t, deadlineMs: 30000, removeChat: async (c) => { calls.push(c.id); t += 20000; return true; } });
+  try {
+    const res = await f.put();
+    assert.equal(res.status, 503);
+    assert.deepEqual(calls, ['c1', 'c2'], 'the third is past 30 s');
+    assert.equal((await res.json()).deleted, 2);
+    assert.ok(!f.swept());
+  } finally { f.close(); }
+});
+
+test('a chat the store skipped (false) leaves the sweep armed (#2230)', async () => {
+  const f = await retentionServer({ removeChat: async (c) => c.id !== 'c2' });
+  try {
+    const res = await f.put();
+    assert.equal(res.status, 200);
+    assert.equal((await res.json()).deleted, 2);
+    assert.ok(!f.swept());
+  } finally { f.close(); }
 });
