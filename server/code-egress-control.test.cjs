@@ -1,7 +1,7 @@
 'use strict';
 const test = require('node:test'), assert = require('node:assert/strict');
 const fs = require('node:fs'), path = require('node:path'), os = require('node:os'), crypto = require('node:crypto');
-const { CAPABILITY, ROUTES, deriveFileKey, deriveControlKey, deriveGrantKey, requestMac, responseMac, createControlClient, publishWebKey } = require('./code-egress-control.cjs');
+const { CAPABILITY, ROUTES, deriveFileKey, deriveControlKey, deriveGrantKey, requestMac, responseMac, createControlClient, publishWebKey, republishMissingKey } = require('./code-egress-control.cjs');
 const { mintGrant } = require('./code-egress.cjs');
 const vectors = require('../contracts/egress-control.v1.vectors.json');
 const file = Buffer.alloc(32, 7), boot = 'ab'.repeat(16), session = 'cd'.repeat(16), snapshot = 'ef'.repeat(16);
@@ -58,7 +58,7 @@ test('zero and negative cleanup budgets stop renewal and new grants without a mu
       assert.equal(c.revoke(lease, 10000), cleanup);
       await assert.rejects(c.grant({ taskId: 'budget.2', domains: ['example.com'] })); await assert.rejects(c.renew());
       t.mock.timers.tick(15000); await Promise.resolve(); await Promise.resolve();
-      assert.equal(f.calls.length, count, 'no revoke, renewal, or replacement Ready request may escape'); await c.close();
+      assert.equal(f.calls.length, count, 'no revoke, renewal, or replacement Ready request may escape while the lease runs'); await c.close();
     }
   } finally { t.mock.timers.reset(); }
 });
@@ -145,6 +145,139 @@ test('fresh file publication is confined to an owned profile and never repairs u
     fs.chmodSync(keyFile, 0o600); assert.throws(() => publishWebKey({ masterKey: master, file: keyFile, uid, gid })); assert.equal(fs.statSync(keyFile).mode & 0o7777, 0o600);
     assert.throws(() => publishWebKey({ masterKey: master, file: path.join(dir, 'missing', 'control.key'), uid, gid })); assert.equal(fs.existsSync(path.join(dir, 'missing')), false);
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+// A proxy with the real Ready rules: boot and session identity change on restart, a live session refuses Ready.
+function restartable() {
+  const fp = crypto.createHash('sha256').update(file).digest('hex'), calls = [];
+  let up = true, seq = 0, bootId = 'a1'.repeat(16), sessionId = null, sessionLive = false;
+  const fresh = () => crypto.randomBytes(16).toString('hex');
+  const transport = async (req) => {
+    if (!up) throw Object.assign(Error('synthetic refused'), { code: 'ECONNREFUSED' });
+    const b = JSON.parse(req.body); calls.push({ route: req.route, mode: b.mode });
+    if (req.route === ROUTES.ready) {
+      const fit = b.mode === 'initial' ? sessionId === null : (req.headers['x-noevia-boot-id'] === bootId && b.priorSession === sessionId && sessionId !== null);
+      if (sessionLive || !fit) return response(req, { state: 'conflict' }, 409);
+      sessionId = fresh(); sessionLive = true;
+      return response(req, { state: 'ready', capability: CAPABILITY, bootId, sessionId, keyFingerprint: fp, sequence: 0, leaseMs: 15000, challenge: b.challenge });
+    }
+    if (req.route === ROUTES.renew) { if (!sessionLive || b.sessionId !== sessionId) return response(req, { state: 'conflict' }, 409); return response(req, { state: 'renewed', capability: CAPABILITY, bootId, sessionId, keyFingerprint: fp, sequence: b.sequence, leaseMs: 15000 }); }
+    if (b.sessionId !== sessionId) return response(req, { state: 'conflict' }, 409);
+    seq++;
+    return response(req, { state: req.route === ROUTES.revoke ? 'revoke-confirmed' : 'activity', bootId, sessionId, taskId: b.taskId, leaseNonce: b.leaseNonce, barrierInstalled: req.route === ROUTES.revoke, drained: req.route === ROUTES.revoke, snapshot: { id: seq.toString(16).padStart(32, '0'), state: 'complete', final: req.route === ROUTES.revoke, summary: { hosts: [], allowed: 0, refused: 0 }, partial: false, overflow: false } });
+  };
+  return { calls, transport, stop() { up = false; }, restart() { up = true; bootId = fresh(); sessionId = null; sessionLive = false; }, expire() { sessionLive = false; } };
+}
+const quick = { retryMinMs: 1, retryMaxMs: 2, autoRenew: false };
+const settle = (ms = 5) => new Promise((resolve) => setTimeout(resolve, ms));
+async function until(check, ms = 20000) { const end = Date.now() + ms; for (;;) { let ok = false; try { ok = await check(); } catch { /* still down */ } if (ok) return; assert.ok(Date.now() < end, 'condition was not reached in time'); await settle(25); } }
+test('#2226: a restarted proxy gets a new Ready and new grants without replacing the client', async () => {
+  const p = restartable(), events = [], c = createControlClient({ fileKey: file, endpoint: 'localhost:3001', transport: p.transport, log: (e) => events.push(e), ...quick });
+  await c.ready(); assert.equal(c.available(), true); assert.deepEqual(events.at(-1), { event: 'egress.control_ready', recovered: false });
+  const before = await c.grant({ taskId: 'old.task', domains: ['example.com'] });
+  p.restart();
+  await assert.rejects(c.renew(), { code: 'EGRESS_UNAVAILABLE' }); assert.equal(c.available(), false);
+  assert.equal(events.at(-1).event, 'egress.control_unavailable');
+  await settle(); await c.ready(); assert.equal(c.available(), true);
+  assert.deepEqual(p.calls.filter((r) => r.route === ROUTES.ready).map((r) => r.mode), ['initial', 'replace', 'initial']);
+  assert.equal(events.at(-1).event, 'egress.control_ready'); assert.equal(events.at(-1).recovered, true);
+  const after = await c.grant({ taskId: 'new.task', domains: ['example.com'] }); assert.notEqual(after.token, before.token);
+  // The task that outlived the restart gets no invented report, and its cleanup leaves the new session alone.
+  assert.equal((await c.revoke(before)).confirmed, false); assert.equal(c.available(), true);
+  assert.equal((await c.revoke(after)).confirmed, true); await c.close();
+});
+test('#2226: an expired session on a live proxy is replaced, never reused', async () => {
+  const p = restartable(), c = createControlClient({ fileKey: file, endpoint: 'localhost:3001', transport: p.transport, ...quick });
+  await c.ready(); p.expire(); await assert.rejects(c.renew()); await settle(); await c.ready();
+  assert.deepEqual(p.calls.filter((r) => r.route === ROUTES.ready).map((r) => r.mode), ['initial', 'replace']); await c.close();
+});
+test('#2226: recovery refuses a Ready for the same session, so an uncertain revoke cannot be forgotten', async () => {
+  const f = fake(), c = createControlClient({ fileKey: file, endpoint: 'localhost:3001', transport: f.transport, ...quick });
+  const lease = await c.grant({ taskId: 'held.1', domains: ['example.com'] }); f.mode('uncertain');
+  assert.equal((await c.revoke(lease, 50)).confirmed, false); assert.equal(c.available(), false);
+  const before = f.calls.filter((r) => r.route === ROUTES.ready).length;
+  await assert.rejects(c.grant({ taskId: 'held.2', domains: ['example.com'] }));
+  assert.equal(f.calls.filter((r) => r.route === ROUTES.ready).length, before, 'no Ready while the uncertain lease is still running');
+  await c.close();
+  let clock = 0; const g = fake(), d = createControlClient({ fileKey: file, endpoint: 'localhost:3001', transport: g.transport, monotonic: () => clock, ...quick });
+  const held = await d.grant({ taskId: 'held.3', domains: ['example.com'] }); g.mode('uncertain');
+  assert.equal((await d.revoke(held, 50)).confirmed, false); clock = 16000;
+  await assert.rejects(d.grant({ taskId: 'held.4', domains: ['example.com'] }), { code: 'EGRESS_UNAVAILABLE' });
+  assert.ok(g.calls.filter((r) => r.route === ROUTES.ready).length > 1, 'it did ask'); assert.equal(d.available(), false); await d.close();
+});
+test('#2226: an outage at start refuses grants at once, retries alone and logs one outage', async () => {
+  const p = restartable(), events = []; p.stop();
+  const c = createControlClient({ fileKey: file, endpoint: 'localhost:3001', transport: p.transport, log: (e) => events.push(e), retryMinMs: 5, retryMaxMs: 10 });
+  c.start(); await until(() => events.length > 0);
+  assert.equal(c.available(), false); await assert.rejects(c.grant({ taskId: 'x.1', domains: ['example.com'] }), { code: 'EGRESS_UNAVAILABLE' });
+  p.restart(); await until(() => c.available());
+  assert.deepEqual(events.map((e) => e.event), ['egress.control_unavailable', 'egress.control_ready']);
+  assert.ok((await c.grant({ taskId: 'x.2', domains: ['example.com'] })).token); await c.close();
+});
+test('#2226: close stops recovery for good and a clock fault stays final', async () => {
+  const p = restartable(); p.stop();
+  const c = createControlClient({ fileKey: file, endpoint: 'localhost:3001', transport: p.transport, retryMinMs: 1, retryMaxMs: 1 });
+  c.start(); await settle(20); await c.close(); p.restart(); const n = p.calls.length; await settle(20);
+  assert.equal(p.calls.length, n); await assert.rejects(c.ready());
+  let clock = 100; const q = restartable(), d = createControlClient({ fileKey: file, endpoint: 'localhost:3001', transport: q.transport, monotonic: () => clock, ...quick });
+  await d.ready(); clock = 50; await assert.rejects(d.renew()); clock = 100000; await assert.rejects(d.ready()); assert.equal(d.available(), false); await d.close();
+});
+test('#2226: only a missing key file is restored, with the same key, safely', () => {
+  const dir = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), 'noevia-core-republish-'));
+  try {
+    const uid = process.getuid(), gid = process.getgid() || (uid === 0 ? 1 : 0); fs.chownSync(dir, uid, gid); fs.chmodSync(dir, 0o750);
+    const keyFile = path.join(dir, 'control.key'), own = publishWebKey({ masterKey: Buffer.alloc(32, 3), file: keyFile, uid, gid }), text = fs.readFileSync(keyFile, 'utf8');
+    assert.equal(republishMissingKey({ fileKey: Buffer.alloc(32, 4), file: keyFile, uid, gid }), false); assert.equal(fs.readFileSync(keyFile, 'utf8'), text, 'a present key is never replaced');
+    fs.unlinkSync(keyFile); assert.equal(republishMissingKey({ fileKey: own, file: keyFile, uid, gid }), true);
+    assert.equal(fs.readFileSync(keyFile, 'utf8'), text); const st = fs.statSync(keyFile); assert.equal(st.mode & 0o7777, 0o440); assert.equal(st.nlink, 1);
+    assert.deepEqual(fs.readdirSync(dir), ['control.key']);
+    fs.unlinkSync(keyFile); fs.chmodSync(dir, 0o777); assert.throws(() => republishMissingKey({ fileKey: own, file: keyFile, uid, gid })); assert.equal(fs.existsSync(keyFile), false);
+  } finally { fs.chmodSync(dir, 0o700); fs.rmSync(dir, { recursive: true, force: true }); }
+});
+test('#2226: a real proxy restart and a boot outage recover by themselves, without ever accepting an old token', async () => {
+  const { spawn } = require('node:child_process'), { once } = require('node:events'), net = require('node:net');
+  const binary = process.env.NOEVIA_EGRESS_CONTROL_BINARY; assert.ok(binary, 'explicit paired Rust binary is required');
+  const hermetic = globalThis[Symbol.for('noevia.hermetic.nativeFixture.v1')];
+  const dir = fs.mkdtempSync(path.join(hermetic?.directory || fs.realpathSync(os.tmpdir()), 'noevia-core-restart-'));
+  const uid = process.getuid(), gid = process.getgid() || (uid === 0 ? 1 : 0); fs.chownSync(dir, uid, gid); fs.chmodSync(dir, 0o750);
+  const keyFile = path.join(dir, 'control.key'), events = [];
+  let child = null, closed = null, release = null, client = null;
+  const free = await new Promise((resolve, reject) => { const s = net.createServer(); s.once('error', reject); s.listen(0, '127.0.0.1', () => { const { port } = s.address(); s.close(() => resolve(port)); }); });
+  const launch = async () => {
+    const probe = net.createServer(); await new Promise((resolve, reject) => { probe.once('error', reject); probe.listen(free, '127.0.0.1', resolve); });
+    const reservation = hermetic?.reserve(probe); await new Promise((resolve) => probe.close(resolve));
+    child = spawn(binary, ['--native-control-v1', '--control-key-file', keyFile, '--control-key-uid', String(uid), '--control-key-gid', String(gid), '--listen', `127.0.0.1:${free}`], { stdio: ['ignore', 'ignore', 'ignore'] });
+    closed = new Promise((resolve) => child.once('close', resolve)); await once(child, 'spawn');
+    if (reservation) release = reservation.adopt(child);
+  };
+  const kill = async () => { child.kill('SIGKILL'); await closed; release?.(); child = null; };
+  try {
+    // Boot outage: web starts first, with nothing listening.
+    client = require('./code-egress.cjs').startEgressFromEnv({ CODE_EGRESS_PORT: String(free), CODE_EGRESS_RUST_HOST: '127.0.0.1', CODE_EGRESS_CONTROL_KEY_FILE: keyFile, CODE_EGRESS_KEY_UID: String(uid), CODE_EGRESS_KEY_GID: String(gid) }, { secrets: { derive: () => Buffer.alloc(32, 41) }, log: (e) => events.push(e) });
+    client.start(); await until(() => events.some((e) => e.event === 'egress.control_unavailable'));
+    assert.equal(client.available(), false); await assert.rejects(client.grant({ taskId: 'boot.refused', domains: ['example.com'] }), { code: 'EGRESS_UNAVAILABLE' });
+    await launch(); await until(() => client.available(), 30000);
+    const first = await client.grant({ taskId: 'first.job', domains: ['example.com'] }); assert.equal((await client.activity(first)).final, false);
+    // Restart: everything the proxy held is gone. The old token verifies nowhere afterwards.
+    await kill(); await assert.rejects(client.renew(), { code: 'EGRESS_UNAVAILABLE' });
+    assert.equal(client.available(), false); await assert.rejects(client.grant({ taskId: 'down.refused', domains: ['example.com'] }), { code: 'EGRESS_UNAVAILABLE' });
+    await launch(); await until(() => client.available(), 30000);
+    const second = await client.grant({ taskId: 'second.job', domains: ['example.com'] }); assert.notEqual(second.token, first.token);
+    await client.renew(); assert.equal((await client.activity(second)).final, false);
+    // The data path agrees: the new token is admitted (then refused by host policy, before any lookup) and the old one is not authenticated.
+    const connect = (token) => new Promise((resolve, reject) => { const sock = net.connect({ host: '127.0.0.1', port: free }); let got = ''; sock.on('error', reject); sock.on('data', (d) => { got += d; if (got.includes('\r\n')) { sock.destroy(); resolve(Number(got.split(' ')[1])); } }); sock.write(`CONNECT refused.invalid:443 HTTP/1.1\r\nHost: refused.invalid:443\r\nProxy-Authorization: Basic ${Buffer.from(`task:${token}`).toString('base64')}\r\n\r\n`); });
+    assert.equal(await connect(first.token), 407); assert.equal(await connect(second.token), 403);
+    await assert.rejects(client.activity(first)); assert.equal((await client.revoke(first, 2000)).confirmed, false); assert.equal(client.available(), true, 'old cleanup leaves the new session alone');
+    // A lost key file comes back on its own, after the proxy has dropped the session it no longer has a key for.
+    fs.unlinkSync(keyFile); await until(() => !client.available() && fs.existsSync(keyFile) === true, 30000).catch(() => {}); await until(() => client.available(), 40000); assert.equal(fs.existsSync(keyFile), true);
+    const third = await client.grant({ taskId: 'third.job', domains: ['example.com'] });
+    const ended = await client.revoke(third); assert.equal(ended.confirmed, true); assert.equal(ended.report.final, true);
+    assert.equal((await client.forget(third, ended.report.snapshotId)).confirmed, true);
+    assert.deepEqual(events.filter((e) => e.event === 'egress.control_ready').slice(0, 2).map((e) => e.recovered), [true, true]);
+    assert.ok(events.some((e) => e.event === 'egress.key_republished'));
+    assert.ok(!JSON.stringify(events).includes(second.token));
+  } finally {
+    try { if (client) await client.close(); } finally { if (child) await kill(); fs.rmSync(dir, { recursive: true, force: true }); }
+  }
 });
 test('actual paired Rust binary authenticates Ready, scoped cleanup, retained reports and Forget', async () => {
   const { spawn } = require('node:child_process'), { once } = require('node:events'), net = require('node:net');

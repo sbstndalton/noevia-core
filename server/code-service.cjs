@@ -207,7 +207,7 @@ function createCodeService({ repos, connect, egress = null, engine = undefined, 
     sandboxed: () => sandboxKind === 'sandbox',
     // Whether a task can be given any network at all. Without the egress proxy there is no way
     // to let one domain through, so the network capabilities are not offered as if there were.
-    network: () => !!egress,
+    network: () => !!egress && (typeof egress.available !== 'function' || egress.available()),
 
     list(workspace, project) {
       const { jobs } = storeFor(workspace);
