@@ -1035,6 +1035,7 @@ test('#2276 manager preset writers acquire a hold before forwarding; reads stay 
     await f.call(method, '/api/model-manager/'+rest, { values: {} }, 'admin');
     assert.equal(f.sent.at(-1).status, 409, rest);
     assert.equal(f.sent.at(-1).body.errorId, 'modelsBusy', rest);
+    assert.equal(f.sent.at(-1).body.code, 'modelsBusy', 'busy is not a stale revision');
   }
   assert.equal(calls.length, 6);
   assert.deepEqual(f.fetched, [], 'a refused hold never writes');
