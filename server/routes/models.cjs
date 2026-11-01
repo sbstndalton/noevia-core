@@ -311,6 +311,14 @@ function createModelRoutes({ servedEmbeddingModels = (target) => require('../rag
       if(!env.MODEL_LOADER_URL)return json(res,404,{error:'Model management service is not configured'});
       const rest=p.slice('/api/model-manager/'.length);
       if(!/^[\w./%:+@-]*$/.test(rest)||rest.includes('..'))return json(res,400,{error:'Invalid path'});
+      // URL normalization must not turn an unchecked path into a section writer. Encoded
+      // separators also bypass the section's existing identity and budget checks.
+      let managerPath;
+      try {
+        const segments=rest.split('/').map(s=>decodeURIComponent(s));
+        if(segments.some(s=>s==='.'||s==='..'||s.includes('/')||s.includes('\\')))return json(res,400,{error:'Invalid path'});
+        managerPath=segments.join('/');
+      } catch { return json(res,400,{error:'Invalid path'}); }
       const method=req.method||'GET';
       const body=['GET','HEAD','DELETE'].includes(method)?undefined:await readBody(req,1024*1024);
       // The file scan reads every model header from disk (~2 s on daserver). Serve the last scan at
@@ -437,13 +445,10 @@ function createModelRoutes({ servedEmbeddingModels = (target) => require('../rag
       const forward=()=>fetchJson(`${env.MODEL_LOADER_URL.replace(/\/+$/,'')}/api/v1/${rest}${search}`,{method,headers:{'Content-Type':'application/json',...(env.MODEL_LOADER_TOKEN?{'X-Model-Loader-Token':env.MODEL_LOADER_TOKEN}:{})},body},10*60*1000).catch(()=>null);
       // #2276: these manager routes write models.ini too. Use the same hold as the preset
       // editor, retaining it through the reload; read-only section helpers need no hold.
-      // Decode before classifying: an encoded slash must not bypass the write guard.
-      let managerPath;
-      try { managerPath=decodeURIComponent(rest); } catch { return json(res,400,{error:'Invalid path'}); }
-      const presetWrite=(method==='PUT'&&managerPath==='models-ini')
+      const presetWrite=(method==='PUT'&&['models-ini','idle-unload'].includes(managerPath))
         || (['PUT','DELETE'].includes(method)&&/^sections\/[^/]+$/.test(managerPath))
         || (method==='POST'&&/^sections\/[^/]+\/(safe-defaults|rename)$/.test(managerPath));
-      const held=presetWrite?await writePresetsHeld(forward,r=>!!r?.ok):null;
+      const held=presetWrite?await writePresetsHeld(forward,r=>!!r?.ok&&r.body?.preset!=='failed'):null;
       if(held?.refused)return json(res,409,{error:PRESETS_BUSY,errorId:'modelsBusy'});
       const result=presetWrite?held.written:await forward();
       // #873: a refused start releases the gate at once. An accepted one keeps it until the model

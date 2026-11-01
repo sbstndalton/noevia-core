@@ -1031,7 +1031,7 @@ test('#2276 manager preset writers acquire a hold before forwarding; reads stay 
   const f = fixture({ env: { MODEL_LOADER_URL: 'http://loader' }, manager: {
     writePresets: async () => { calls.push('hold'); throw Object.assign(Error('busy'), { status: 409, holdRefused: true }); },
   } });
-  for (const [method, rest] of [['PUT','models-ini'], ['PUT','sections/chat-syn'], ['DELETE','sections/chat-syn'], ['POST','sections/chat-syn/rename'], ['POST','sections/chat-syn/safe-defaults'], ['POST','sections%2Fchat-syn%2Fsafe-defaults']]) {
+  for (const [method, rest] of [['PUT','models-ini'], ['PUT','idle-unload'], ['PUT','sections/chat-syn'], ['DELETE','sections/chat-syn'], ['POST','sections/chat-syn/rename'], ['POST','sections/chat-syn/safe-defaults']]) {
     await f.call(method, '/api/model-manager/'+rest, { values: {} }, 'admin');
     assert.equal(f.sent.at(-1).status, 409, rest);
     assert.equal(f.sent.at(-1).body.errorId, 'modelsBusy', rest);
@@ -1060,4 +1060,15 @@ test('#2276 manager writes retain the hold through the reload and release it on 
   assert.deepEqual(steps, ['hold','write','release']);
   assert.equal(f.sent.at(-1).status, 503);
   assert.equal(held, false);
+});
+
+ test('#2276 encoded separators and dot segments cannot evade preset writer guards', async () => {
+  const f = fixture({ env: { MODEL_LOADER_URL: 'http://loader' }, manager: {
+    writePresets: async () => { throw Error('invalid path must be refused first'); },
+  } });
+  for (const rest of ['sections/x/%2e%2e/y','sections/%2E/y','sections%2Fchat-syn%2Fsafe-defaults','sections/x%5cy','sections/%ZZ']) {
+    await f.call('PUT', '/api/model-manager/'+rest, { values: {} }, 'admin');
+    assert.equal(f.sent.at(-1).status, 400, rest);
+  }
+  assert.deepEqual(f.fetched, []);
 });
