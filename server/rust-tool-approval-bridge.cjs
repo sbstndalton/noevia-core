@@ -15,7 +15,8 @@ function createToolApprovalBridge({ secret, pendingApprovals, withActiveUser, js
   return async function handle(req, res) {
     const path = String(req.url || '').split('?')[0];
     if (path !== FACTS && path !== RESOLVE) return false;
-    if (req.method !== 'POST' || !trustedFront(req, secret)) { json(res, 404, { error: 'Not found' }); return true; }
+    const forwarded = Object.keys(req.headers || {}).some(name => name === 'x-noevia-client-ip' || name === 'forwarded' || name === 'x-real-ip' || name.startsWith('x-forwarded-'));
+    if (req.method !== 'POST' || forwarded || !trustedFront(req, secret)) { json(res, 404, { error: 'Not found' }); return true; }
     let body;
     try { body = await readJson(req); } catch { json(res, 400, { error: 'invalid JSON' }); return true; }
     if (!body || typeof body.user !== 'string' || !body.user || typeof body.id !== 'string' || !body.id) {

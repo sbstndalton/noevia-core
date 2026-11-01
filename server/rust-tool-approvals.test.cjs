@@ -22,7 +22,7 @@ test('only the exact public POST is refused before Node auth; other methods stay
 });
 test('bridge rejects untrusted peers, forwarded callers and missing token without consuming pending state', async () => {
   const f=fixture(); let calls=0; f.gate.pendingApprovals.set('a',{userId:'owner',decide:()=>{calls++;return true;}});
-  for(const extra of [{socket:{remoteAddress:'10.1.2.3'}},{headers:{'x-noevia-store-token':'synthetic-secret','x-forwarded-for':'127.0.0.1'}},{headers:{'x-noevia-store-token':'synthetic-secret','x-noevia-client-ip':'127.0.0.1'}},{headers:{}}]) assert.equal((await f.call(FACTS,{user:'owner',id:'a'},extra)).status,404);
+  for(const extra of [{socket:{remoteAddress:'10.1.2.3'}},{headers:{'x-noevia-store-token':'synthetic-secret','x-forwarded-for':'127.0.0.1'}},{headers:{'x-noevia-store-token':'synthetic-secret','x-noevia-client-ip':'127.0.0.1'}},{headers:{'x-noevia-store-token':'synthetic-secret','x-forwarded-for':''}},{headers:{'x-noevia-store-token':'synthetic-secret','forwarded':'for=127.0.0.1'}},{headers:{'x-noevia-store-token':'synthetic-secret','x-real-ip':'127.0.0.1'}},{headers:{}}]) assert.equal((await f.call(FACTS,{user:'owner',id:'a'},extra)).status,404);
   assert.equal(calls,0);
 });
 test('routing owner, generation, invalid choice and remember semantics are checked before consumption', async () => {
