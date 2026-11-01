@@ -140,6 +140,18 @@ test('#1012 never during a chat or a held gate (auto-tune, calibration)', async 
   assert.equal(f.reloads(), 1);
 });
 
+test('#2276 writePresets: a 502 from the remote hold is not holdRefused and writes nothing', async (t) => {
+  const dir = tmp(t);
+  const file = path.join(dir, 'models.ini');
+  fs.writeFileSync(file, BASE);
+  const down = Object.assign(new Error('The local model engine is not answering.'), { status: 502, code: 'engine_unavailable', retryable: true });
+  const gate = { holdMaintenance: async () => { throw down; }, hasAdmin: () => true, waiting: () => 0, adminHeaders: () => ({}) };
+  const manager = createLlamaCppManager({ baseUrl: 'http://synthetic', presetPath: file, gate });
+  let writes = 0;
+  await assert.rejects(manager.writePresets(async () => { writes += 1; }), (e) => e.status === 502 && e.code === 'engine_unavailable' && e.holdRefused !== true);
+  assert.equal(writes, 0);
+});
+
 test('#2219 writePresets: a held gate means no write; a write and its reload share one hold', async (t) => {
   const f = managerFixture(t);
   let writes = 0;
