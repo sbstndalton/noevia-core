@@ -434,7 +434,18 @@ function createModelRoutes({ servedEmbeddingModels = (target) => require('../rag
         if(budget>0)q.set('budget_gib',String(budget));
         search=q.toString()?'?'+q.toString():'';
       }
-      const result=await fetchJson(`${env.MODEL_LOADER_URL.replace(/\/+$/,'')}/api/v1/${rest}${search}`,{method,headers:{'Content-Type':'application/json',...(env.MODEL_LOADER_TOKEN?{'X-Model-Loader-Token':env.MODEL_LOADER_TOKEN}:{})},body},10*60*1000).catch(()=>null);
+      const forward=()=>fetchJson(`${env.MODEL_LOADER_URL.replace(/\/+$/,'')}/api/v1/${rest}${search}`,{method,headers:{'Content-Type':'application/json',...(env.MODEL_LOADER_TOKEN?{'X-Model-Loader-Token':env.MODEL_LOADER_TOKEN}:{})},body},10*60*1000).catch(()=>null);
+      // #2276: these manager routes write models.ini too. Use the same hold as the preset
+      // editor, retaining it through the reload; read-only section helpers need no hold.
+      // Decode before classifying: an encoded slash must not bypass the write guard.
+      let managerPath;
+      try { managerPath=decodeURIComponent(rest); } catch { return json(res,400,{error:'Invalid path'}); }
+      const presetWrite=(method==='PUT'&&managerPath==='models-ini')
+        || (['PUT','DELETE'].includes(method)&&/^sections\/[^/]+$/.test(managerPath))
+        || (method==='POST'&&/^sections\/[^/]+\/(safe-defaults|rename)$/.test(managerPath));
+      const held=presetWrite?await writePresetsHeld(forward,r=>!!r?.ok):null;
+      if(held?.refused)return json(res,409,{error:PRESETS_BUSY,errorId:'modelsBusy'});
+      const result=presetWrite?held.written:await forward();
       // #873: a refused start releases the gate at once. An accepted one keeps it until the model
       // manager reports the sweep over; so does a lost reply, since the sweep may have started.
       if(sweepRelease){ if(result&&!result.ok)sweepRelease(); else sweepGuard.watch(sweepRelease,sweepModels); }

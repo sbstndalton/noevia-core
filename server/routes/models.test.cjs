@@ -1025,3 +1025,39 @@ test('#2210: a front that does not apply the record bounds the recheck, and the 
   assert.deepEqual(applied, ['handle']);
   assert.deepEqual(f.sent.pop(), { status: 200, body: { state: 'old' } });
 });
+
+test('#2276 manager preset writers acquire a hold before forwarding; reads stay available', async () => {
+  const calls = [];
+  const f = fixture({ env: { MODEL_LOADER_URL: 'http://loader' }, manager: {
+    writePresets: async () => { calls.push('hold'); throw Object.assign(Error('busy'), { status: 409, holdRefused: true }); },
+  } });
+  for (const [method, rest] of [['PUT','models-ini'], ['PUT','sections/chat-syn'], ['DELETE','sections/chat-syn'], ['POST','sections/chat-syn/rename'], ['POST','sections/chat-syn/safe-defaults'], ['POST','sections%2Fchat-syn%2Fsafe-defaults']]) {
+    await f.call(method, '/api/model-manager/'+rest, { values: {} }, 'admin');
+    assert.equal(f.sent.at(-1).status, 409, rest);
+    assert.equal(f.sent.at(-1).body.errorId, 'modelsBusy', rest);
+  }
+  assert.equal(calls.length, 6);
+  assert.deepEqual(f.fetched, [], 'a refused hold never writes');
+  await f.call('GET', '/api/model-manager/sections/chat-syn', undefined, 'admin');
+  assert.equal(f.sent.at(-1).status, 200);
+  assert.equal(calls.length, 6, 'read does not acquire a hold');
+});
+
+test('#2276 manager writes retain the hold through the reload and release it on service failure', async () => {
+  const steps = []; let held = false, ok = true;
+  const f = fixture({ env: { MODEL_LOADER_URL: 'http://loader' }, manager: {
+    writePresets: async (write, reloadIf) => {
+      steps.push('hold'); held = true;
+      try { const written = await write(); if (reloadIf(written)) steps.push('reload'); return { written, reload: { ok: true } }; }
+      finally { steps.push('release'); held = false; }
+    },
+  }, fetchReply: async () => { assert.equal(held, true); steps.push('write'); return { ok, status: ok ? 200 : 503, body: ok ? { revision: 'new' } : { error: 'unavailable' } }; } });
+  await f.call('PUT', '/api/model-manager/sections/chat-syn', { values: {} }, 'admin');
+  assert.deepEqual(steps, ['hold','write','reload','release']);
+  assert.deepEqual(f.sent.at(-1), { status: 200, body: { revision: 'new' } });
+  steps.length = 0; ok = false;
+  await f.call('POST', '/api/model-manager/sections/chat-syn/safe-defaults', {}, 'admin');
+  assert.deepEqual(steps, ['hold','write','release']);
+  assert.equal(f.sent.at(-1).status, 503);
+  assert.equal(held, false);
+});
