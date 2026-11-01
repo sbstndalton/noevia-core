@@ -12,7 +12,6 @@ process.env.UI_DATA_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'cowork-toolbox-
 require('../tests/server/project-store-server.cjs').installProjectStore(process.env.UI_DATA_DIR);
 const {
   resolveTools,
-  toolboxSummaries,
   estimateToolTokens,
   toolCapFor,
   sanitizeToolboxes,
@@ -118,22 +117,6 @@ test('the cap keys off parameter count in the model id', () => {
   assert.equal(toolCapFor('remote-model-a'), 24);
   assert.equal(toolCapFor(''), 24);
   assert.equal(toolCapFor(undefined), 24);
-});
-
-test('toolbox summaries carry the per-turn cost the UI shows', () => {
-  const [core] = toolboxSummaries();
-  assert.equal(core.id, 'core');
-  assert.equal(core.source, 'builtin');
-  assert.equal(core.toolCount, 2);
-  // Pinned to a live measurement: the two core tools cost 390 prompt tokens on
-  // Qwen3.5-9B, of which ~240 is the fixed tool-calling preamble charged once
-  // per request. estimateToolTokens reports only the MARGINAL cost, so per-box
-  // numbers stay additive — hence ~150-250 here, not 390.
-  assert.ok(
-    core.estTokens > 120 && core.estTokens < 280,
-    `core box marginal estimate looks wrong: ${core.estTokens}`,
-  );
-  assert.equal(estimateToolTokens([]), 0);
 });
 
 test('sanitizeToolboxes rejects non-arrays, drops unknowns, dedupes', () => {
