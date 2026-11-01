@@ -1237,7 +1237,7 @@ const readyRoutes = require('./routes/health.cjs').createReadyRoutes({
 });
 // #2281: the Rust front owns the picker response; only raw live discovery/prefill facts stay here.
 const toolboxPickerFacts = require('./rust-toolbox-picker-facts.cjs').createToolboxPickerFacts({
-  secret: FRONT_SECRET, discoverMcpTools: () => discoverMcpTools(), allToolboxes, connectorBoxes: CONNECTOR_BOXES, json, readJson,
+  secret: FRONT_SECRET, discoverMcpTools: async () => { await readyFeatures(); await discoverMcpTools(); }, allToolboxes, connectorBoxes: CONNECTOR_BOXES, json, readJson,
   prefill: { targetMs: TOOL_PREFILL_TARGET_MS, stats: () => prefill.stats() },
   mcp: () => ({ enabled: mcpWiring.enabled(), state: mcpState, servers: MCP_SERVERS, manifest: MCP_TOOLBOX_MANIFEST }),
 });
