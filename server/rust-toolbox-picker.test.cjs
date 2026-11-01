@@ -40,7 +40,7 @@ test('an auth credential payload is never forwarded as an authentication kind', 
   }
 });
 test('internal facts reject public/proxied peers, wrong secrets and methods before discovery', async () => {
-  for (const req of [request({ socket: { remoteAddress: '10.0.0.2' } }), request({ headers: {} }), request({ headers: { 'x-noevia-store-token': 'wrong' } }), request({ headers: { 'x-noevia-store-token': secret, 'x-noevia-client-ip': '127.0.0.1' } }), request({ headers: { 'x-noevia-store-token': secret, 'x-forwarded-for': '127.0.0.1' } }), request({ method: 'GET' })]) {
+  for (const req of [request({ socket: { remoteAddress: '10.0.0.2' } }), request({ headers: {} }), request({ headers: { 'x-noevia-store-token': 'wrong' } }), request({ headers: { 'x-noevia-store-token': secret, 'x-noevia-client-ip': '127.0.0.1' } }), request({ headers: { 'x-noevia-store-token': secret, 'x-forwarded-for': '127.0.0.1' } }), request({ headers: { 'x-noevia-store-token': secret, 'x-forwarded-for': '' } }), request({ headers: { 'x-noevia-store-token': secret, 'x-noevia-client-ip': '' } }), request({ method: 'GET' })]) {
     const { handler, calls } = fixture({ discoverMcpTools: () => assert.fail('discovery must not run') });
     assert.equal(await handler(req, {}), true); assert.equal(calls[0].status, 404);
   }

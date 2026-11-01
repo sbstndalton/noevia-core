@@ -13,7 +13,7 @@ function serverFacts(s) {
 function createToolboxPickerFacts({ secret, discoverMcpTools, allToolboxes, connectorBoxes, prefill, mcp, json, readJson, log = m => console.warn(m) }) {
   return async function handle(req, res) {
     if (String(req.url || '').split('?')[0] !== PATH) return false;
-    if (!trustedFront(req, secret) || req.method !== 'POST') { json(res, 404, { error: 'Not found' }); return true; }
+    if (!trustedFront(req, secret) || Object.hasOwn(req.headers, 'x-noevia-client-ip') || Object.hasOwn(req.headers, 'x-forwarded-for') || req.method !== 'POST') { json(res, 404, { error: 'Not found' }); return true; }
     let body;
     try { body = await readJson(req); } catch { json(res, 400, { error: 'invalid JSON' }); return true; }
     if (!body || typeof body !== 'object' || Array.isArray(body) || Object.keys(body).length) {
