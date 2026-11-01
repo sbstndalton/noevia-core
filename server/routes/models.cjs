@@ -449,7 +449,7 @@ function createModelRoutes({ servedEmbeddingModels = (target) => require('../rag
         || (['PUT','DELETE'].includes(method)&&/^sections\/[^/]+$/.test(managerPath))
         || (method==='POST'&&/^sections\/[^/]+\/(safe-defaults|rename)$/.test(managerPath));
       const held=presetWrite?await writePresetsHeld(forward,r=>!!r?.ok&&r.body?.preset!=='failed'):null;
-      if(held?.refused)return json(res,409,{error:PRESETS_BUSY,errorId:'modelsBusy'});
+      if(held?.refused)return json(res,409,{error:PRESETS_BUSY,errorId:'modelsBusy',code:'modelsBusy'});
       const result=presetWrite?held.written:await forward();
       // #873: a refused start releases the gate at once. An accepted one keeps it until the model
       // manager reports the sweep over; so does a lost reply, since the sweep may have started.
