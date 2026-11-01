@@ -302,10 +302,10 @@ function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloa
     return maintenance.exclusive(()=>reloadHeld({unload}));
   }
   // #2219: a models.ini write and its reload under one hold, so no reload runs between them. A hold
-  // that is refused rejects with holdRefused and write never runs: the file stays as it was.
+  // that is refused (409) rejects with holdRefused; any other failure (502 engine_unavailable) passes as is and write never runs: the file stays as it was.
   async function writePresets(write,reloadIf=()=>true) {
     let release;
-    try{release=await maintenance.hold();}catch(e){throw Object.assign(e,{holdRefused:true});}
+    try{release=await maintenance.hold();}catch(e){throw e?.status===409?Object.assign(e,{holdRefused:true}):e;}
     try{
       const written=await write();
       if(!reloadIf(written))return{written,reload:null};
