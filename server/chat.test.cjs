@@ -13,7 +13,6 @@ const { createToolboxes } = require('./toolboxes.cjs');
 const { createDriveTools } = require('./gdrive-tools.cjs');
 const { createToolExchange } = require('./tool-exchange.cjs');
 const { createApprovals } = require('./approvals.cjs');
-const { createApprovalRoutes } = require('./routes/approvals.cjs');
 
 async function runDriveCall(t, { name, files = [], ragOverride = null, savedMode = null, connected = true, decision = 'approve', policyDuringApproval = null, autoDecision = null, history = [], sampling = undefined, autoSamplingEnabled = undefined, message = 'Synthetic Drive request', codeRoleConfigured = false, beforeChat = null, sourceWaitMs = undefined, projectId = undefined, realRag = false, stepSupervision = null }) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'noevia-drive-chat-'));
@@ -27,12 +26,6 @@ async function runDriveCall(t, { name, files = [], ragOverride = null, savedMode
   const executions = [], approvals = [], requests = [], events = [], audits = [];
   let currentMode = savedMode;
   const approvalGate = createApprovals();
-  const approvalRoute = createApprovalRoutes({
-    json: (_res, status) => { assert.equal(status, 200); },
-    readBody: async (req) => req.body,
-    pendingApprovals: approvalGate.pendingApprovals,
-    requestScope,
-  });
   const driveTools = { ...definitions, execute: async (_user, tool) => { executions.push(tool); return 'synthetic Drive result'; } };
   const toolbox = createToolboxes({
     boxes: [driveTools.box], driveTools, offered: (id) => id !== 'gdrive',
@@ -71,8 +64,11 @@ async function runDriveCall(t, { name, files = [], ragOverride = null, savedMode
       approvals.push(request);
       if (!policyDuringApproval) return decision;
       const waiting = approvalGate.awaitApproval(request);
-      await policyDuringApproval({ setMode: (mode) => { currentMode = mode; }, decide: async (action) => approvalRoute(
-        { method: 'POST', body: JSON.stringify({ decision: action }) }, {}, { path: `/api/tool-approvals/${request.id}` }) });
+      await policyDuringApproval({ setMode: (mode) => { currentMode = mode; }, decide: async (action) => {
+        const pending = approvalGate.pendingApprovals.get(request.id);
+        assert.equal(pending.userId, user.id);
+        assert.equal(pending.decide(action), true);
+      } });
       return waiting;
     },
     recordUsage() {}, recordToolUse() {}, ...(sourceWaitMs === undefined ? {} : { sourceWaitMs }),

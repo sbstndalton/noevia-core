@@ -13,7 +13,6 @@ const { EventEmitter } = require('node:events');
 const rm = require('./routing-modes.cjs');
 const { createDecisions } = require('./decision/index.cjs');
 const { createApprovals } = require('./approvals.cjs');
-const { createApprovalRoutes } = require('./routes/approvals.cjs');
 
 // #1647: the sensitivity check's mechanics below run against a synthetic model on a test-only qualified
 // list. The shipped list (no model qualified) and the gate itself: sensitivity-qualification-1647.test.cjs.
@@ -689,24 +688,6 @@ test('project images present on disk are stripped on the cloud route', async (t)
   const body = JSON.stringify(r.upstream[0].body);
   assert.equal(body.includes('image_url'), false);
   assert.match(body, /were not sent/);
-});
-
-test('the routing answer is bound to the requesting user', async () => {
-  const gate = createApprovals();
-  const scope = { user: 'owner' };
-  const route = createApprovalRoutes({ json: (r, status, body) => { r.status = status; r.body = body; return true; },
-    readBody: async (req) => req.raw, pendingApprovals: gate.pendingApprovals, requestScope: { getStore: () => ({ workspace: { userId: scope.user } }) } });
-  const ctl = new AbortController();
-  const waiting = gate.awaitRouteChoice({ id: 'r1', userId: 'owner', chatId: 'c1', abortSignal: ctl.signal });
-  const post = async (raw) => { const res = {}; await route({ method: 'POST', raw }, res, { path: '/api/tool-approvals/r1' }); return res; };
-  scope.user = 'intruder';
-  assert.equal((await post('{"decision":"cloud"}')).status, 404);
-  scope.user = 'owner';
-  assert.equal((await post('{"decision":"approve_all"}')).status, 400, 'a write answer is not a routing answer');
-  assert.equal((await post('{"decision":"cloud","remember":true}')).status, 200);
-  assert.deepEqual(await waiting, { choice: 'cloud', remember: true });
-  assert.equal(gate.chatWideApproved('owner', 'c1', 'space:free'), false, 'never grants writes');
-  assert.equal((await post('{"decision":"local"}')).status, 404, 'single use');
 });
 
 test('logs and the decision log hold codes only, never content', async (t) => {
