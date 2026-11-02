@@ -534,7 +534,6 @@ function createModelRoutes({ servedEmbeddingModels = (target) => require('../rag
       if(p.endsWith('/cancel')){if(req.method!=='POST')return json(res,405,{error:'Method not allowed'});result=modelManager.autotune.cancel();}
       else if(p.endsWith('/resume')){if(req.method!=='POST')return json(res,405,{error:'Method not allowed'});const body=await readJson(req);result=await modelManager.autotune.resume({confirmPause:body?.confirmPause});}
       else if(p.endsWith('/untuned')){if(req.method!=='GET')return json(res,405,{error:'Method not allowed'});result=await modelManager.autotune.untuned();}
-      else if(req.method==='GET')result=modelManager.autotune.status(url.searchParams.get('model')||'');
       else if(req.method==='POST'){const body=await readJson(req);result=await modelManager.autotune.start(String(body?.model||''),{confirmPause:body?.confirmPause,promptBudgetSeconds:body?.promptBudgetSeconds,untuned:body?.untuned===true,...(body?.mode!==undefined?{mode:body.mode}:{})});}
       else return json(res,405,{error:'Method not allowed'});
       res.setHeader('Cache-Control','no-store');
