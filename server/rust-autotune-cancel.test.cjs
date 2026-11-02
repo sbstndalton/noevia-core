@@ -8,7 +8,7 @@ const req = (over = {}) => ({ url: PREFIX + 'facts', method: 'POST', socket: { r
 function actor() {
   const calls = [];
   const state = { job: { id: 'j', model: 'synthetic', status: 'running', models: [], originalText: 'private-profile', _http: { headers: { Authorization: 'private-token' } }, unknown: 'private-extra' }, starting: false, cancelled: false, completion: Promise.resolve(),
-    child: { cancel() { calls.push('child'); } }, inflight: { abort() { calls.push('inflight'); } }, idleAbort: { abort() { calls.push('idle'); } } };
+    child: { cancellationFacts: () => ({ token: 'captured-child' }), compareAndAbort(token) { assert.equal(token, 'captured-child'); calls.push('child'); } }, inflight: { abort() { calls.push('inflight'); } }, idleAbort: { abort() { calls.push('idle'); } } };
   const control = createAutotuneCancellation(() => ({ ...state }), () => { state.cancelled = true; });
   return { state, calls, control, live: { cancellationFacts: control.facts, compareAndAbort: control.compareAndAbort } };
 }
@@ -42,7 +42,7 @@ test('exact token binds private state, process, flags and each active controller
 });
 test('reentrant cancellation listeners cannot retarget replacement job or handles or change the response target', () => {
   const a = actor();
-  a.state.child.cancel = () => {
+  a.state.child.compareAndAbort = () => {
     a.calls.push('child');
     a.state.job = { id: 'replacement', model: 'other', status: 'running', models: [] };
     a.state.completion = Promise.resolve();
@@ -54,7 +54,7 @@ test('reentrant cancellation listeners cannot retarget replacement job or handle
   assert.equal(a.state.job.id, 'replacement'); assert.notEqual(a.control.facts().generation, before.generation);
 });
 test('all captured handles are attempted when a child canceller throws; worker recovery and holds are not released here', () => {
-  const a = actor(); a.state.child.cancel = () => { a.calls.push('child'); throw Error('synthetic child failure'); };
+  const a = actor(); a.state.child.compareAndAbort = () => { a.calls.push('child'); throw Error('synthetic child failure'); };
   assert.throws(() => a.control.compareAndAbort(a.control.facts().token), /synthetic child failure/);
   assert.deepEqual(a.calls, ['child', 'inflight', 'idle']); assert.equal(a.state.cancelled, true);
 });
@@ -90,4 +90,20 @@ test('all exact public methods refuse in Node; start/status/clear and path neigh
     assert.deepEqual(sent, [{ status: 503, body: ROUTE_REFUSAL }]);
   }
   for (const url of ['/api/models/autotune', '/api/models/autotune/clear', '/api/models/autotune/cancel/', '/api/models/autotune/cancelled']) assert.equal(refuseOwned({ url }, {}, { parseRequestUrl, json: () => assert.fail('neighbor') }), false);
+});
+
+
+test('calibration child token and all handles are captured before synchronous cancellation listeners', () => {
+  const a = actor();
+  let childToken = 'original-child';
+  a.state.child.cancellationFacts = () => ({ token: childToken });
+  a.state.child.compareAndAbort = token => { assert.equal(token, 'original-child'); a.calls.push('child'); };
+  const control = createAutotuneCancellation(() => ({ ...a.state }), () => {
+    childToken = 'replacement-child';
+    a.state.child = { cancellationFacts() { assert.fail('replacement child read'); }, compareAndAbort() { assert.fail('replacement child abort'); } };
+    a.state.inflight = { abort() { assert.fail('replacement inflight abort'); } };
+    a.state.idleAbort = { abort() { assert.fail('replacement idle abort'); } };
+  });
+  assert.equal(control.compareAndAbort(control.facts().token).applied, true);
+  assert.deepEqual(a.calls, ['child', 'inflight', 'idle']);
 });
