@@ -44,7 +44,7 @@ function engineView(rows) {
 // of them records is the other's next baseline. Without a state file (tests) the baseline is in memory.
 const LOCK_STALE_MS = 30000;
 const LOCK_WAIT_MS = 5000;
-const pause = (ms) => { try { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms); } catch { /* no wait available */ } };
+const pause = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
 function readBaseline(stateFile) {
   try {
@@ -55,7 +55,7 @@ function readBaseline(stateFile) {
   return null;
 }
 
-function writeLocked(stateFile, text, { staleMs = LOCK_STALE_MS, waitMs = LOCK_WAIT_MS } = {}) {
+async function writeLocked(stateFile, text, { staleMs = LOCK_STALE_MS, waitMs = LOCK_WAIT_MS } = {}) {
   const lock = `${stateFile}.lock`;
   const started = Date.now();
   let fd = null;
@@ -67,7 +67,7 @@ function writeLocked(stateFile, text, { staleMs = LOCK_STALE_MS, waitMs = LOCK_W
       try { age = Date.now() - fs.statSync(lock).mtimeMs; } catch { continue; }
       if (age > staleMs) { try { fs.unlinkSync(lock); } catch { /* another writer took it over */ } continue; }
       if (Date.now() - started > waitMs) throw e;
-      pause(20);
+      await pause(20);
     }
   }
   const temporary = `${stateFile}.${process.pid}.tmp`;
@@ -89,23 +89,29 @@ function createReloadGuard({ stateFile = null, check = (req) => require('./dav-p
   // A write that failed (the lock timed out) may have left an old baseline on disk: unknown until a write succeeds.
   let unsaved = false;
   const current = () => (stateFile ? (unsaved ? null : readBaseline(stateFile)) : memory);
+  let pending = Promise.resolve(), generation = 0;
   const persist = (next) => {
-    if (!stateFile) { memory = next; return; }
-    try {
-      // Forgetting writes a tombstone instead of deleting, so a failed delete can never leave an
-      // old baseline behind for the next start (#1040).
-      writeLocked(stateFile, JSON.stringify(next || {}), lock);
-      unsaved = false;
-    } catch (e) { unsaved = true; log(`[models] could not save the preset reload baseline; it is treated as unknown: ${e?.message || e}`); }
+    if (!stateFile) { memory = next; return Promise.resolve(); }
+    // Do not trust an older on-disk baseline while this write (or a later queued one) waits.
+    unsaved = true;
+    const writing = ++generation;
+    pending = pending.catch(() => {}).then(async () => {
+      try {
+        // Forgetting writes a tombstone: a failed delete cannot expose an old baseline on restart.
+        await writeLocked(stateFile, JSON.stringify(next || {}), lock);
+        if (writing === generation) unsaved = false;
+      } catch (e) { unsaved = true; log(`[models] could not save the preset reload baseline; it is treated as unknown: ${e?.message || e}`); }
+    });
+    return pending;
   };
   return {
     /** After a reload noevia made: the text it read just before and the router's rows just after.
      *  `textAfter` is the file re-read after the rows; if it moved, the router may have read either. */
     record(textBefore, rows, textAfter) {
       const view = engineView(rows);
-      persist(typeof textBefore === 'string' && textBefore === textAfter && view !== null ? { text: textBefore, view } : null);
+      return persist(typeof textBefore === 'string' && textBefore === textAfter && view !== null ? { text: textBefore, view } : null);
     },
-    forget() { persist(null); },
+    forget() { return persist(null); },
     known: () => !!current(),
     /** noevia#1863: the models.ini text the router last read, when that is still knowable: the
      *  baseline of noevia's last reload, while the router's own view is unchanged since. A router

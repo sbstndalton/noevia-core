@@ -25,52 +25,52 @@ function fakeCheck({ baseline, current, loaded }) {
 function tmp(t) { const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'preset-reload-')); t.after(() => fs.rmSync(dir, { recursive: true, force: true })); return dir; }
 const rows = (loaded, presets = {}, sleeping = []) => ['loaded-model', 'other'].map((id) => ({ id, status: { value: sleeping.includes(id) ? 'sleeping' : loaded.includes(id) ? 'loaded' : 'unloaded', preset: presets[id] ?? `[${id}]` } }));
 
-test('#1012 guard: unknown without a baseline, and fails closed on a moved router or a failed check', (t) => {
+test('#1012 guard: unknown without a baseline, and fails closed on a moved router or a failed check', async (t) => {
   assert.equal(createReloadGuard({ check: fakeCheck }).mode, undefined, 'no off/on mode any more');
   assert.equal(require('./preset-reload.cjs').FLAG, undefined);
 
   const g = createReloadGuard({ check: fakeCheck });
   assert.equal(g.verdict(BASE, rows([]), ['loaded-model']).reason, 'unknown');
-  g.record(BASE, rows([]), BASE);
+  await g.record(BASE, rows([]), BASE);
   assert.equal(g.verdict(BASE + '[new]\nmodel = /models/n.gguf\n', rows(['loaded-model']), ['loaded-model']).safe, true, 'load state alone is not a router change');
   assert.equal(g.verdict(BASE, rows([], { other: '[other]\nctx-size = 1' }), ['loaded-model']).reason, 'engine_moved');
   assert.equal(g.verdict(null, rows([]), ['loaded-model']).reason, 'unreadable');
   assert.deepEqual(g.verdict(BASE.replace('8192', '4096'), rows([]), ['loaded-model']), { safe: false, reason: 'changed', changed: ['loaded-model'] });
   const throwing = createReloadGuard({ check: () => { throw new Error('trap'); } });
-  throwing.record(BASE, rows([]), BASE);
+  await throwing.record(BASE, rows([]), BASE);
   assert.equal(throwing.verdict(BASE, rows([]), ['loaded-model']).reason, 'check_failed');
   // A file that moved while the router reloaded leaves the baseline unknown.
-  g.record(BASE, rows([]), BASE + '\n[x]\n');
+  await g.record(BASE, rows([]), BASE + '\n[x]\n');
   assert.equal(g.verdict(BASE, rows([]), ['loaded-model']).reason, 'unknown');
 });
 
-test('#1012 guard: the baseline survives a core restart and forget() removes it', (t) => {
+test('#1012 guard: the baseline survives a core restart and forget() removes it', async (t) => {
   const stateFile = path.join(tmp(t), 'state.json');
   const a = createReloadGuard({ stateFile, check: fakeCheck });
-  a.record(BASE, rows([]), BASE);
+  await a.record(BASE, rows([]), BASE);
   assert.equal((fs.statSync(stateFile).mode & 0o777), 0o600);
   const b = createReloadGuard({ stateFile, check: fakeCheck });
   assert.equal(b.known(), true);
   assert.equal(b.verdict(BASE, rows([]), ['loaded-model']).safe, true);
-  b.forget();
+  await b.forget();
   assert.equal(fs.readFileSync(stateFile, 'utf8'), '{}', 'forget() leaves a tombstone, not a missing file');
   assert.equal(createReloadGuard({ stateFile, check: fakeCheck }).known(), false);
   fs.writeFileSync(stateFile, '{not json');
   assert.equal(createReloadGuard({ stateFile, check: fakeCheck }).known(), false);
 });
 
-test('#1037 a router row without a string status.preset leaves the baseline unknown', () => {
+test('#1037 a router row without a string status.preset leaves the baseline unknown', async () => {
   const bare = rows([]).map((r, i) => (i === 1 ? { ...r, status: { value: 'unloaded' } } : r));
   assert.equal(engineView(bare), null);
   assert.equal(engineView({}), null);
   const g = createReloadGuard({ check: fakeCheck });
-  g.record(BASE, bare, BASE);
+  await g.record(BASE, bare, BASE);
   assert.equal(g.known(), false, 'no baseline from a partial view');
-  g.record(BASE, rows([]), BASE);
+  await g.record(BASE, rows([]), BASE);
   assert.deepEqual(g.verdict(BASE, bare, ['loaded-model']), { safe: false, reason: 'unknown' });
 });
 
-test('#1012 engineView is order-independent and sees preset changes and new or removed models', () => {
+test('#1012 engineView is order-independent and sees preset changes and new or removed models', async () => {
   const r = rows([]);
   assert.equal(engineView(r), engineView([...r].reverse()));
   assert.notEqual(engineView(r), engineView(rows([], { other: '[other]\nx = 1' })));
@@ -235,7 +235,7 @@ test('#1012 a failed router reload forgets the baseline', async (t) => {
   assert.equal((await failing.reloadPresets()).status, 502);
 });
 
-test('#1012 dav-parse.wasm preset_reload: the real Rust check', { skip: skipWasm }, () => {
+test('#1012 dav-parse.wasm preset_reload: the real Rust check', { skip: skipWasm }, async () => {
   davParseWasm.reset();
   const add = davParseWasm.presetReload({ baseline: BASE, current: BASE + '[new]\nmodel = /models/n.gguf\n', loaded: ['loaded-model'] });
   assert.deepEqual(add, { safe: true, reason: 'unchanged', changed: [], detail: null });
@@ -257,63 +257,63 @@ test('#1012 dav-parse.wasm preset_reload: the real Rust check', { skip: skipWasm
   assert.throws(() => davParseWasm.presetReload({ baseline: 'x'.repeat(davParseWasm.MAX_RELOAD_BYTES), current: '', loaded: [] }), { reason: 'too_large' });
   // The guard wired to the real module.
   const g = createReloadGuard();
-  g.record(BASE, rows([]), BASE);
+  await g.record(BASE, rows([]), BASE);
   assert.equal(g.verdict(BASE + '[new]\nmodel = /models/n.gguf\n', rows(['loaded-model']), ['loaded-model']).safe, true);
   assert.equal(g.verdict(BASE.replace('8192', '1'), rows(['loaded-model']), ['loaded-model']).safe, false);
 });
 
 // noevia#1863: the text the router runs on is known only while its view matches the last reload.
-test('#1863 routerText is the last reload text while the router has not re-read', () => {
+test('#1863 routerText is the last reload text while the router has not re-read', async () => {
   const g = createReloadGuard({ check: fakeCheck });
   assert.equal(g.routerText(rows([])), null, 'unknown before any reload');
-  g.record('[*]\nsleep-idle-seconds = 1800\n', rows([]), '[*]\nsleep-idle-seconds = 1800\n');
+  await g.record('[*]\nsleep-idle-seconds = 1800\n', rows([]), '[*]\nsleep-idle-seconds = 1800\n');
   assert.equal(g.routerText(rows(['loaded-model'], {}, ['loaded-model'])), '[*]\nsleep-idle-seconds = 1800\n', 'loading or sleeping does not change the view');
   assert.equal(g.routerText(rows([], { other: '[other]\nctx-size = 1\n' })), null, 'a router that re-read on its own is unknown');
   assert.equal(g.routerText('not rows'), null);
-  g.forget();
+  await g.forget();
   assert.equal(g.routerText(rows([])), null);
 });
 
 // ── #2210: the Rust front is the other writer of the baseline file ─────────────────────────────────────────
 const { LOCK_STALE_MS } = require('./preset-reload.cjs');
-test('#2210 the baseline is read from the file on every use: what the other process records is seen, and forgotten', (t) => {
+test('#2210 the baseline is read from the file on every use: what the other process records is seen, and forgotten', async (t) => {
   const stateFile = path.join(tmp(t), 'state.json');
   const mine = createReloadGuard({ stateFile, check: fakeCheck }), theirs = createReloadGuard({ stateFile, check: fakeCheck });
   const router = rows(['loaded-model']);
   assert.equal(mine.known(), false);
-  theirs.record(BASE, router, BASE);
+  await theirs.record(BASE, router, BASE);
   assert.equal(mine.known(), true, 'a baseline the front recorded is mine too');
   assert.equal(mine.verdict(BASE, router, ['loaded-model']).safe, true);
   assert.equal(mine.routerText(router), BASE);
-  mine.forget();
+  await mine.forget();
   assert.equal(theirs.known(), false, 'and a baseline I forgot is forgotten for the front');
   assert.equal(theirs.verdict(BASE, router, ['loaded-model']).reason, 'unknown');
 });
 
-test('#2210 the file the front writes and the file Core writes are the same shape', (t) => {
+test('#2210 the file the front writes and the file Core writes are the same shape', async (t) => {
   const stateFile = path.join(tmp(t), 'state.json');
   const router = rows(['loaded-model']);
   // The front writes {"text","view"} with serde_json's key order (alphabetical: text, view) and mode 0600.
   fs.writeFileSync(stateFile, JSON.stringify({ text: BASE, view: engineView(router) }), { mode: 0o600 });
   const guard = createReloadGuard({ stateFile, check: fakeCheck });
   assert.equal(guard.verdict(BASE, router, ['loaded-model']).safe, true);
-  guard.record(BASE, router, BASE);
+  await guard.record(BASE, router, BASE);
   assert.equal(fs.readFileSync(stateFile, 'utf8'), JSON.stringify({ text: BASE, view: engineView(router) }));
   assert.equal(fs.statSync(stateFile).mode & 0o777, 0o600);
   assert.equal(fs.existsSync(`${stateFile}.lock`), false, 'the lock is released');
   assert.deepEqual(fs.readdirSync(path.dirname(stateFile)).sort(), ['state.json']);
 });
 
-test('#2210 a write waits for the other writer\'s lock, takes over a dead one, and never half-writes', (t) => {
+test('#2210 a write waits for the other writer\'s lock, takes over a dead one, and never half-writes', async (t) => {
   const dir = tmp(t), stateFile = path.join(dir, 'state.json'), lock = `${stateFile}.lock`;
   const logs = [];
   const router = rows(['loaded-model']);
   // A live lock (the front is writing): the write gives up after its wait, logs it, and changes nothing.
   const first = createReloadGuard({ stateFile, check: fakeCheck, log: (m) => logs.push(m), lock: { waitMs: 150 } });
-  first.record(BASE, router, BASE);
+  await first.record(BASE, router, BASE);
   const before = fs.readFileSync(stateFile, 'utf8');
   fs.writeFileSync(lock, '4242');
-  first.forget();
+  await first.forget();
   assert.equal(fs.readFileSync(stateFile, 'utf8'), before, 'the file the other writer is replacing is left alone');
   assert.equal(logs.length, 1);
   assert.match(logs[0], /could not save the preset reload baseline/);
@@ -321,36 +321,64 @@ test('#2210 a write waits for the other writer\'s lock, takes over a dead one, a
   // A lock older than the stale limit belongs to a writer that died: taken over.
   const old = new Date(Date.now() - LOCK_STALE_MS - 5000);
   fs.utimesSync(lock, old, old);
-  first.forget();
+  await first.forget();
   assert.equal(fs.readFileSync(stateFile, 'utf8'), '{}');
   assert.equal(fs.existsSync(lock), false);
   assert.equal(logs.length, 1);
 });
 
-test('#2210: a write that cannot take the lock is reported and the baseline is unknown until a write succeeds', (t) => {
+test('#2210: a write that cannot take the lock is reported and the baseline is unknown until a write succeeds', async (t) => {
   const stateFile = path.join(tmp(t), 'state.json');
   const logs = [];
   const guard = createReloadGuard({ stateFile, check: fakeCheck, log: (m) => logs.push(m), lock: { waitMs: 30 } });
-  guard.record('text', rows([]), 'text');
+  await guard.record('text', rows([]), 'text');
   assert.equal(guard.known(), true);
   // Another writer holds the lock: this forget cannot write, so the old baseline is still on disk.
   fs.writeFileSync(`${stateFile}.lock`, 'other');
-  guard.forget();
+  await guard.forget();
   assert.ok(JSON.parse(fs.readFileSync(stateFile, 'utf8')).text, 'the old baseline is still on disk');
   assert.equal(guard.known(), false, 'and is not trusted');
   assert.equal(guard.verdict('text', rows([]), []).safe, false);
   assert.match(logs.join('\n'), /could not save/);
   fs.rmSync(`${stateFile}.lock`);
-  guard.record('text', rows([]), 'text');
+  await guard.record('text', rows([]), 'text');
   assert.equal(guard.known(), true, 'a later write that succeeds restores it');
 });
 
-test('#2210: a writer does not remove a lock another writer has taken over', (t) => {
+test('#2210: a writer does not remove a lock another writer has taken over', async (t) => {
   const stateFile = path.join(tmp(t), 'state.json');
   const lock = `${stateFile}.lock`;
   const realRename = fs.renameSync;
   // While this writer is inside its write, its lock goes stale and another writer takes it over.
   t.mock.method(fs, 'renameSync', (...args) => { fs.writeFileSync(lock, 'another-writer'); return realRename(...args); });
-  createReloadGuard({ stateFile, check: fakeCheck }).forget();
+  await createReloadGuard({ stateFile, check: fakeCheck }).forget();
   assert.equal(fs.readFileSync(lock, 'utf8'), 'another-writer');
+});
+
+ test('#2216 waiting for a baseline lock yields to other requests and remains unknown meanwhile', async (t) => {
+  const stateFile = path.join(tmp(t), 'state.json'), lock = `${stateFile}.lock`;
+  const guard = createReloadGuard({ stateFile, check: fakeCheck, lock: { waitMs: 300 } });
+  await guard.record(BASE, rows([]), BASE);
+  fs.writeFileSync(lock, 'another-writer');
+  let tick = false;
+  const timer = setTimeout(() => { tick = true; fs.unlinkSync(lock); }, 20);
+  t.after(() => clearTimeout(timer));
+  const forgotten = guard.forget();
+  assert.equal(guard.known(), false, 'pending invalidation never trusts the old baseline');
+  await forgotten;
+  assert.equal(tick, true, 'the event loop ran while the other writer held the lock');
+  assert.equal(fs.readFileSync(stateFile, 'utf8'), '{}');
+});
+
+ test('#2216 overlapping baseline updates retain call order and stay unknown until the latest write', async (t) => {
+  const stateFile = path.join(tmp(t), 'state.json');
+  const guard = createReloadGuard({ stateFile, check: fakeCheck });
+  const recorded = guard.record(BASE, rows([]), BASE);
+  const forgotten = guard.forget();
+  assert.equal(guard.known(), false);
+  await Promise.all([recorded, forgotten]);
+  assert.equal(guard.known(), false);
+  assert.equal(fs.readFileSync(stateFile, 'utf8'), '{}');
+  await guard.record(BASE, rows([]), BASE);
+  assert.equal(guard.known(), true);
 });

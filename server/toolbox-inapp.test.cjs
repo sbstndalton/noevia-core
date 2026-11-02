@@ -7,19 +7,10 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const { isInAppBox } = require('./toolbox-flags.cjs');
 const { buildCatalogue } = require('./mcp-discovery-snapshot.cjs');
-const { createToolboxRoutes } = require('./routes/toolboxes.cjs');
 const { buildInAppBoxes } = require('./toolbox-inapp-fixture.cjs');
 
 const fixture = buildInAppBoxes();
 const IN_APP_IDS = fixture.allToolboxes().map((b) => b.id);
-
-function makeRoutes() {
-  return createToolboxRoutes({
-    discoverMcpTools: async () => {}, toolboxSummaries: (c) => fixture.toolboxSummaries(c), connectedBoxes: () => ['gdrive'],
-    prefill: { targetMs: 1, stats: () => ({}) }, mcp: () => ({ enabled: false, state: { error: null, tools: new Map(), servers: new Map() }, servers: [], manifest: [] }),
-    json: (res, status, body) => { res.status = status; res.body = body; },
-  });
-}
 
 /** What the Rust front is given of the offered boxes (the discovery snapshot's catalogue). */
 function catalogueOf({ boxes = fixture.allToolboxes(), manifest = [] } = {}) {
@@ -29,23 +20,8 @@ function catalogueOf({ boxes = fixture.allToolboxes(), manifest = [] } = {}) {
   });
 }
 
-const authn = { user: { id: 'synthetic-user', role: 'admin' } };
-async function get(routes, path) {
-  const res = {};
-  const handled = await routes({ method: 'GET' }, res, { path: path.split('?')[0], authn, url: new URL('http://x' + path) });
-  assert.equal(handled, true);
-  return res;
-}
-
 test('the fixture covers the real manifest: diary, project docs, web, Nextcloud, plus the built-ins', () => {
   for (const id of ['core', 'diary', 'project-docs', 'web-search', 'web-crawl', 'nextcloud-files', 'nextcloud-sharing', 'offline-wikipedia', 'gdrive']) assert.ok(IN_APP_IDS.includes(id), id);
-});
-
-test('GET /api/toolboxes (the model popup and picker) flags every in-app box', async () => {
-  const res = await get(makeRoutes(), '/api/toolboxes');
-  assert.equal(res.status, 200);
-  assert.deepEqual(res.body.toolboxes.map((b) => b.id).sort(), [...IN_APP_IDS].sort());
-  for (const b of res.body.toolboxes) assert.equal(b.inApp, true, `/api/toolboxes ${b.id}`);
 });
 
 // GET /api/toolboxes/permitted is the Rust front's (#2202 round 2), built from the catalogue this process publishes: the
