@@ -107,3 +107,19 @@ test('calibration child token and all handles are captured before synchronous ca
   assert.equal(control.compareAndAbort(control.facts().token).applied, true);
   assert.deepEqual(a.calls, ['child', 'inflight', 'idle']);
 });
+
+
+test('planned fill probe-shaped child callback is captured before reentrant listeners', () => {
+  const a = actor();
+  const cal = { cancelProbe() { a.calls.push('probe'); } };
+  const probeChild = { cancel: () => cal.cancelProbe() }; // fillCheck's production child shape
+  a.state.child = probeChild;
+  const control = createAutotuneCancellation(() => ({ ...a.state }), () => {
+    probeChild.cancel = () => assert.fail('replacement probe callback');
+    a.state.child = { cancel() { assert.fail('replacement child'); } };
+    a.state.inflight = { abort() { assert.fail('replacement inflight'); } };
+    a.state.idleAbort = { abort() { assert.fail('replacement idle'); } };
+  });
+  assert.equal(control.compareAndAbort(control.facts().token).applied, true);
+  assert.deepEqual(a.calls, ['probe', 'inflight', 'idle']);
+});

@@ -210,9 +210,11 @@ function createAutotuneCancellation(read, markCancelled) {
       const before = facts(captured);
       // Capture every target and the response before invoking any synchronous cancellation listener.
       const { child, inflight, idleAbort } = captured;
-      const childToken = child?.cancellationFacts().token;
+      const abortChild = child && typeof child.cancellationFacts === 'function'
+        ? child.compareAndAbort.bind(child, child.cancellationFacts().token)
+        : child?.cancel?.bind(child); // fillCheck's private probe wrapper has no job controller
       markCancelled();
-      try { child?.compareAndAbort(childToken); }
+      try { abortChild?.(); }
       finally { try { inflight?.abort(); } finally { idleAbort?.abort(); } }
       return { applied: true, generation: before.generation, job: before.job };
     },
