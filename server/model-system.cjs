@@ -178,7 +178,7 @@ function rerankModelNames(env = process.env) {
     if (typeof enabled === 'number' && !Number.isFinite(enabled)) throw Error();
     if (model != null && typeof model !== 'string') throw Error();
     // An enabled TEI deployment can legitimately use its unnamed default model.
-    if (/^(1|true|on)$/i.test(String(enabled || '')) && model?.trim()) names.add(model.trim());
+    if (/^(1|true|on)$/i.test(String(enabled || '').trim()) && model?.trim()) names.add(model.trim());
     return names;
   } catch {
     // Unsafe callers must not fall back to seed-only protection on an unreadable provider.

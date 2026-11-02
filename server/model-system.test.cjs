@@ -72,3 +72,19 @@ test('#2298 current rerank settings add protection without removing deployment o
     assert.deepEqual([...sidecarModelNames(env)].sort(), ['embed-seed', 'rerank-seed-a'], 'an unnamed TEI default is valid');
   } finally { settings.install(prior); }
 });
+
+
+test('#2298 current enabled flag follows runtime whitespace normalization without changing seed rules', () => {
+  const settings = require('./rerank-settings.cjs');
+  const { rerankTarget } = require('./rerank-target.cjs');
+  const prior = settings.current();
+  const seed = { NOEVIA_FEATURE_RAG_RERANK: ' true ', RERANK_MODEL: 'rerank-seed-a' };
+  const current = settings.createRerankSettings({ store: new Map(), env: { ...seed, RERANK_MODEL: 'rerank-current-b', RERANK_BACKEND: 'llamacpp', RERANK_BASE_URL: 'http://synthetic-rerank' }, machine: () => ({ url: 'http://synthetic-machine', protocol: 'llamacpp' }) });
+  settings.install(current);
+  try {
+    assert.equal(rerankTarget(current.effectiveEnv()).enabled, true);
+    assert.deepEqual([...sidecarModelNames(seed)], ['rerank-current-b']);
+    settings.install(null);
+    assert.deepEqual([...sidecarModelNames(seed)], [], 'legacy deployment-seed flag behavior stays unchanged');
+  } finally { settings.install(prior); }
+});
