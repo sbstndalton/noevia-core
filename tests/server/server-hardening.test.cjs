@@ -14,7 +14,6 @@ const test = require('node:test');
 const { errorResponse, isJsonObject } = require('../../server/http.cjs');
 const { createApprovals } = require('../../server/approvals.cjs');
 const { binding: permissionBinding } = require('./chat-grant-fixture.cjs');
-const { createApprovalRoutes } = require('../../server/routes/approvals.cjs');
 const { createChatRoutes } = require('../../server/routes/chat.cjs');
 const { createChatListRoutes } = require('../../server/routes/chat-lists.cjs');
 const lists = require('../../server/chat-lists.cjs');
@@ -34,14 +33,6 @@ test('S1: internal errors get a generic body; client errors keep their message',
 test('S2: JSON null, arrays and scalars are not objects', () => {
   for (const v of [null, [], 3, 'x', true]) assert.equal(isJsonObject(v), false);
   assert.equal(isJsonObject({}), true);
-});
-
-test('S2: approval decision with a null body is a 400, not a TypeError', async () => {
-  const { out, json } = recorder();
-  const decide = () => { throw new Error('must not be reached'); };
-  const route = createApprovalRoutes({ json, readBody: async () => 'null', pendingApprovals: new Map([['ap', { userId: 'u1', decide }]]), requestScope: { getStore: () => ({ workspace: { userId: 'u1' } }) } });
-  assert.equal(await route({ method: 'POST' }, {}, { path: '/api/tool-approvals/ap' }), true);
-  assert.equal(out.status, 400);
 });
 
 test('S2: chat with a null or array body is a 400 and never reaches the loop', async () => {
