@@ -259,9 +259,9 @@ function createFullAutotuner({ request: engineRequest, rawModels: engineRawModel
   // #1057: per-model tune settings, kept with the history: { [model]: { allowQ5Kv } }.
   state.settings ||= {};
   let cancelled = false, child = null, completion = Promise.resolve(), starting = false, inflight = null, idleAbort = null;
-  const clearProcess = crypto.randomUUID();
-  let clearGeneration = 0;
-  const save = () => { const tmp = stateFile + '.' + crypto.randomUUID(); fs.writeFileSync(tmp, JSON.stringify(state), { mode: 0o600 }); fs.renameSync(tmp, stateFile); clearGeneration++; };
+  const clearProcess = crypto.randomUUID(), settingsProcess = crypto.randomUUID();
+  let clearGeneration = 0, settingsGeneration = 0;
+  const save = () => { const tmp = stateFile + '.' + crypto.randomUUID(); fs.writeFileSync(tmp, JSON.stringify(state), { mode: 0o600 }); fs.renameSync(tmp, stateFile); clearGeneration++; settingsGeneration++; };
   const check = () => { if (cancelled) throw cancelledError(); };
   const note = (j, text) => { (j.log ||= []).push({ at: now(), text }); if (j.log.length > 400) j.log.shift(); save(); };
   const phaseOf = (item, id) => item.phases.find(p => p.id === id);
@@ -364,21 +364,33 @@ function createFullAutotuner({ request: engineRequest, rawModels: engineRawModel
   // #1079: longId and longHistory are the model's Long tune (its `<model>-long` section).
   const status = model => ({ ok: true, status: 200, body: { job: publicJob(state.job), history: model ? state.history[model] || [] : [], kvCandidates: candidatesFor(model), settings: settingsOf(model),
     modes: MODES, ...(model ? { longId: model + LONG_SUFFIX, longHistory: state.history[model + LONG_SUFFIX] || [] } : {}) } });
-  /** #1057: saves a model's tune settings; they apply from its next tune. */
-  function setSettings(model, body) {
-    if (typeof model !== 'string' || !model || model.length > 200) return { ok: false, status: 400, body: { error: 'Choose a model.' } };
-    if (!body || typeof body !== 'object' || typeof body.allowQ5Kv !== 'boolean') return { ok: false, status: 400, body: { error: 'allowQ5Kv must be true or false.' } };
-    if (isSystemModel(model)) return { ok: false, status: 400, body: { error: SYSTEM_MODEL_REASON } };
-    if (!presets.get(model).exists) return { ok: false, status: 404, body: { error: 'Choose a configured chat model.' } };
-    // #1060: a queued, running or resumable item keeps the list it started with; changing the
-    // switch under it would make its result's signature disagree with what it measured.
-    const j = state.job;
-    if (j && Array.isArray(j.models) && (j.status === 'running' || ['cancelled', 'interrupted', 'failed'].includes(j.status))
-        && j.models.some(m => (m.model === model || m.base === model) && m.status !== 'passed'))
-      return { ok: false, status: 409, body: { error: 'This model is in an unfinished tune. Let it finish, or start a new tune, before changing this setting.' } };
-    if (body.allowQ5Kv) state.settings[model] = { allowQ5Kv: true }; else delete state.settings[model];
-    save();
-    return status(model);
+  // #2287: public settings validation and the response belong to Rust. This live script remains
+  // the sole writer of its job/history/settings file. A snapshot fingerprint makes the one map
+  // mutation conditional on the exact generation, pending job and configuration Rust checked.
+  function settingsSnapshot(model) {
+    const profile = presets.get(model);
+    const job = state.job;
+    const guard = {
+      configured: !!profile.exists, system: isSystemModel(model), revision: typeof profile.revision === 'string' ? profile.revision : null,
+      starting, job: job ? { id: job.id, startedAt: job.startedAt, status: job.status,
+        models: Array.isArray(job.models) ? job.models.map(m => m && ({ model: m.model, base: m.base, status: m.status })) : job.models } : null,
+      allowQ5Kv: settingsOf(model).allowQ5Kv, allowBelowQ5Kv: allowBelowQ5Kv(),
+    };
+    const token = hash({ process: settingsProcess, generation: settingsGeneration, model, guard });
+    return { token, guard, job: publicJob(job), history: state.history[model] || [], longHistory: state.history[model + LONG_SUFFIX] || [] };
+  }
+  function commitSettings(model, allowQ5Kv, expected) {
+    if (typeof model !== 'string' || !model || model.length > 200 || typeof allowQ5Kv !== 'boolean' || typeof expected !== 'string') return { applied: false };
+    if (settingsSnapshot(model).token !== expected) return { applied: false };
+    const prior = Object.getOwnPropertyDescriptor(state.settings, model);
+    // Define an own data property even for a configured model named __proto__.
+    if (allowQ5Kv) Object.defineProperty(state.settings, model, { value: { allowQ5Kv: true }, enumerable: true, configurable: true, writable: true });
+    else delete state.settings[model];
+    try { save(); } catch (error) {
+      if (prior) Object.defineProperty(state.settings, model, prior); else delete state.settings[model];
+      throw error;
+    }
+    return { applied: true, facts: settingsSnapshot(model) };
   }
   // #1003: one recovery copy of models.ini per tune run. The first write of a job keeps the
   // writer's usual copy (the profile as it was before tuning); every later write, restores
@@ -1624,6 +1636,6 @@ function createFullAutotuner({ request: engineRequest, rawModels: engineRawModel
     } catch (e) { return { ok: false, status: 409, body: { error: clientMessage(e, 'Auto-tune could not resume.') } }; }
     finally { starting = false; }
   }
-  return { start, resume, cancel, clearFacts, compareAndClear, status, setSettings, untuned, recover, flushReload, completion: () => completion };
+  return { start, resume, cancel, clearFacts, compareAndClear, status, settingsFacts: settingsSnapshot, commitSettings, untuned, recover, flushReload, completion: () => completion };
 }
 module.exports = { createFullAutotuner, qualityCheck, qualityFailure, QUALITY, VERSION, newModel, hasHarmonyReasoning, kvCandidates, preferKv, bf16Unsupported, MODES, LONG_PROFILE_REASON };

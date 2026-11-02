@@ -5,6 +5,14 @@ const { createModelManager } = require('./model-manager.cjs');
 const { createPresetStore } = require('./llamacpp-presets.cjs');
 const { QUALITY, qualityCheck, qualityFailure, newModel } = require('./llamacpp-full-autotune.cjs');
 
+// Arrange a known-valid switch through the actor's conditional primitive. Public validation and
+// unfinished-job refusal moved to Rust; these tests only arrange the tune scripts' existing inputs.
+function setTuneSettings(manager, model, body) {
+  const facts = manager.autotune.settingsFacts(model);
+  assert.equal(manager.autotune.commitSettings(model, body.allowQ5Kv, facts.token).applied, true);
+  return { status: 200, body: manager.autotune.status(model).body };
+}
+
 // #1057: the fake engine's f16 quirks (failLoadF16, badF16, the shorter recall) hold for both
 // unquantized cache types, bf16 being the first candidate now.
 const unq = o => ['bf16', 'f16'].includes(o['cache-type-k']);
@@ -165,7 +173,7 @@ test('quality rejection followed by asynchronous unload still reaches the next K
   // bf16 is the reference, so the rejected candidate is q8_0 (it breaks arithmetic, which bf16
   // passed); with q5 allowed for this model the run still reaches q5_1 after it.
   const f = fixture(t, { badQ4: false, unloadPolls: 4, answerFor: ({ q, o }) => q.id === 'arithmetic' && o['cache-type-k'] === 'q8_0' ? '61' : null });
-  assert.equal(f.manager.autotune.setSettings('synthetic', { allowQ5Kv: true }).status, 200);
+  assert.equal(setTuneSettings(f.manager, 'synthetic', { allowQ5Kv: true }).status, 200);
   await f.manager.autotune.start('synthetic', { confirmPause: true });
   const j = await finished(f.manager), kv = phase(j.models[0], 'kv');
   assert.equal(j.status, 'passed', j.error);
@@ -398,28 +406,15 @@ test('#1060 the tune signature follows the list the run used: q5 on makes a defa
   const f = fixture(t);
   await f.manager.autotune.start('synthetic', { confirmPause: true }); await finished(f.manager);
   assert.deepEqual((await f.manager.autotune.untuned()).body.models, []);
-  assert.equal(f.manager.autotune.setSettings('synthetic', { allowQ5Kv: true }).status, 200);
+  assert.equal(setTuneSettings(f.manager, 'synthetic', { allowQ5Kv: true }).status, 200);
   assert.deepEqual((await f.manager.autotune.untuned()).body.models, ['synthetic']);
   await f.manager.autotune.start('synthetic', { confirmPause: true }); await finished(f.manager);
   assert.deepEqual((await f.manager.autotune.untuned()).body.models, [], 'tuned with q5 allowed, the switch still on');
-  f.manager.autotune.setSettings('synthetic', { allowQ5Kv: false });
+  setTuneSettings(f.manager, 'synthetic', { allowQ5Kv: false });
   assert.deepEqual((await f.manager.autotune.untuned()).body.models, ['synthetic'], 'a q5 tune is stale once q5 is off');
 });
 
-test('#1060 the switch cannot change under a queued model; after the job, the change makes it untuned', async t => {
-  const tried = [];
-  const f = fixture(t, { models: ['one', 'two'], onChat: ({ manager }) => {
-    if (!tried.length && manager.autotune.status().body.job?.model === 'one') tried.push(manager.autotune.setSettings('two', { allowQ5Kv: true }).status);
-  } });
-  await f.manager.autotune.start('', { confirmPause: true, untuned: true });
-  const j = await finished(f.manager);
-  assert.equal(j.status, 'passed', j.error);
-  assert.deepEqual(tried, [409]);
-  assert.deepEqual(j.models.map(m => m.kv), [['bf16', 'q8_0'], ['bf16', 'q8_0']]);
-  assert.deepEqual((await f.manager.autotune.untuned()).body.models, []);
-  assert.equal(f.manager.autotune.setSettings('two', { allowQ5Kv: true }).status, 200);
-  assert.deepEqual((await f.manager.autotune.untuned()).body.models, ['two']);
-});
+
 
 test('a model without an MTP head chooses measured n-gram drafting', async t => {
   const f = fixture(t, { noHead: true });
@@ -554,7 +549,7 @@ test('#1057 the override env var alone adds nothing; with the model\'s q5 opt-in
   t.after(() => { if (prior === undefined) delete process.env.NOEVIA_AUTOTUNE_ALLOW_BELOW_Q5_KV; else process.env.NOEVIA_AUTOTUNE_ALLOW_BELOW_Q5_KV = prior; });
   const f = fixture(t);
   assert.deepEqual(f.manager.autotune.status('synthetic').body.kvCandidates, ['bf16', 'q8_0']);
-  f.manager.autotune.setSettings('synthetic', { allowQ5Kv: true });
+  setTuneSettings(f.manager, 'synthetic', { allowQ5Kv: true });
   await f.manager.autotune.start('synthetic', { confirmPause: true });
   const j = await finished(f.manager), item = j.models[0];
   assert.deepEqual(phase(item, 'kv').steps.map(s => s.id), ['bf16', 'q8_0', 'q5_1', 'q5_0', 'q4_0']);
@@ -723,7 +718,7 @@ test('#328 a probe the model fails at its reference settings is skipped, and the
 
 test('#328 a candidate that breaks a probe the baseline passed still fails', async t => {
   const f = fixture(t, { badQ4: false, answerFor: ({ q, o }) => e2b({ q }) ?? (q.id === 'extraction' && o['cache-type-k'] === 'q5_0' ? 'AX-471' : null) });
-  f.manager.autotune.setSettings('synthetic', { allowQ5Kv: true });
+  setTuneSettings(f.manager, 'synthetic', { allowQ5Kv: true });
   await f.manager.autotune.start('synthetic', { confirmPause: true });
   const j = await finished(f.manager), kv = phase(j.models[0], 'kv');
   assert.equal(j.status, 'passed', j.error);
@@ -786,7 +781,7 @@ test('#1978 a restart-interrupted run keeps the phase it was in', async t => {
 
 test('#1978 clear drops a finished job record only: measurements, settings and models.ini stay', async t => {
   const f = fixture(t, { rejectAll: true });
-  await f.manager.autotune.setSettings('synthetic', { allowQ5Kv: true });
+  await setTuneSettings(f.manager, 'synthetic', { allowQ5Kv: true });
   await f.manager.autotune.start('synthetic', { confirmPause: true });
   await finished(f.manager);
   const before = JSON.parse(fs.readFileSync(f.stateFile, 'utf8'));
@@ -900,7 +895,7 @@ test('#328 status reports the KV candidates this server really tries', async t =
   const f = fixture(t);
   assert.deepEqual(f.manager.autotune.status('synthetic').body.kvCandidates, ['bf16', 'q8_0']);
   assert.deepEqual(f.manager.autotune.status('synthetic').body.settings, { allowQ5Kv: false });
-  f.manager.autotune.setSettings('synthetic', { allowQ5Kv: true });
+  setTuneSettings(f.manager, 'synthetic', { allowQ5Kv: true });
   assert.deepEqual(f.manager.autotune.status('synthetic').body.kvCandidates, ['bf16', 'q8_0', 'q5_1', 'q5_0']);
   assert.deepEqual(f.manager.autotune.status('synthetic').body.settings, { allowQ5Kv: true });
   // Per model: another model keeps the default list.
@@ -1414,41 +1409,7 @@ test('#1057 js order: q8_0 replaces bf16 only when it fits at least twice the co
   assert.ok(phase(k.models[0], 'kv').value.candidates.find(c => c.kv === 'q8_0').generation > phase(k.models[0], 'kv').value.candidates.find(c => c.kv === 'bf16').generation);
 });
 
-test('#1057 per-model settings: validated, saved with the tune state, survive a restart, never change a queued run', async t => {
-  let stop = true;
-  const f = fixture(t, { onChat: ({ manager }) => { if (stop) { stop = false; manager.autotune.cancel(); } } });
-  const set = (m, b) => f.manager.autotune.setSettings(m, b);
-  assert.equal(set('synthetic', { allowQ5Kv: 'true' }).status, 400);
-  assert.equal(set('synthetic', {}).status, 400);
-  assert.equal(set('synthetic', null).status, 400);
-  assert.equal(set('', { allowQ5Kv: true }).status, 400);
-  assert.equal(set('x'.repeat(201), { allowQ5Kv: true }).status, 400);
-  assert.equal(set('not-configured', { allowQ5Kv: true }).status, 404);
-  assert.equal(set('laya_multilingual_f16', { allowQ5Kv: true }).status, 400);
-  // Off by default; a job started now tries bf16 and q8_0 only.
-  assert.deepEqual(f.manager.autotune.status('synthetic').body.settings, { allowQ5Kv: false });
-  await f.manager.autotune.start('synthetic', { confirmPause: true });
-  const cancelled = await finished(f.manager);
-  assert.equal(cancelled.status, 'cancelled');
-  assert.deepEqual(cancelled.models[0].kv, ['bf16', 'q8_0']);
-  // #1060: not while the cancelled run can be resumed.
-  assert.equal(set('synthetic', { allowQ5Kv: true }).status, 409);
-  const resumedFirst = f.manager;
-  assert.equal((await resumedFirst.autotune.resume({ confirmPause: true })).status, 202);
-  assert.equal((await finished(resumedFirst)).status, 'passed');
-  const on = set('synthetic', { allowQ5Kv: true });
-  assert.equal(on.status, 200);
-  assert.deepEqual(on.body.settings, { allowQ5Kv: true });
-  assert.deepEqual(on.body.kvCandidates, ['bf16', 'q8_0', 'q5_1', 'q5_0']);
-  assert.deepEqual(JSON.parse(fs.readFileSync(f.stateFile, 'utf8')).settings, { synthetic: { allowQ5Kv: true } });
-  const manager = f.restart();
-  assert.deepEqual(manager.autotune.status('synthetic').body.settings, { allowQ5Kv: true });
-  // The resumed run kept the list it started with.
-  assert.deepEqual(phase(manager.autotune.status().body.job.models[0], 'kv').steps.map(s => s.id), ['bf16', 'q8_0']);
-  // Off again removes the entry.
-  manager.autotune.setSettings('synthetic', { allowQ5Kv: false });
-  assert.deepEqual(JSON.parse(fs.readFileSync(f.stateFile, 'utf8')).settings, {});
-});
+
 
 // A scripted planner that probes at 8k with the request's first type until a pass, then runs on.
 const scriptedFrom = (seen, at = r => (r.ladder.length === 1 ? r.ladder[0] : 8192)) => ({ plan: r => {
@@ -1532,7 +1493,7 @@ test('#1057 planned (wasm): the request carries the model\'s list, and q5 wins o
   // The planned job sends the model's own list.
   const seen = [];
   const f = fixture(t, { servingChecks: servingOff, autotuneExtra: planned({ planner: { plan: r => { seen.push(r); return w.autotunePlan(r); } } }) });
-  f.manager.autotune.setSettings('synthetic', { allowQ5Kv: true });
+  setTuneSettings(f.manager, 'synthetic', { allowQ5Kv: true });
   await f.manager.autotune.start('synthetic', { confirmPause: true });
   assert.equal((await finished(f.manager)).status, 'passed');
   assert.deepEqual(seen[0].kv, ['bf16', 'q8_0', 'q5_1', 'q5_0']);
@@ -2103,14 +2064,14 @@ test('#1079 without the long-profile module nothing pairs and Long refuses; Fast
   assert.equal((await finished(f.manager)).status, 'passed');
 });
 
-test('#1079 the model\'s KV switch applies to its Long tune and is locked while that tune is unfinished', async t => {
+test('#1079 the model\'s KV switch applies to its Long tune', async t => {
   let release; const gate = new Promise(r => { release = r; });
   const f = fixture(t, { reloadAddsSections: true, autotuneExtra: { longProfiles: refProfiles() }, onChat: async () => { await gate; } });
-  assert.equal(f.manager.autotune.setSettings('synthetic', { allowQ5Kv: true }).status, 200);
+  assert.equal(setTuneSettings(f.manager, 'synthetic', { allowQ5Kv: true }).status, 200);
   const r = await f.manager.autotune.start('synthetic', { confirmPause: true, mode: 'long' });
   assert.deepEqual(r.body.models[0].kv, ['bf16', 'q8_0', 'q5_1', 'q5_0']);
   for (let i = 0; i < 2000 && !f.requests.length; i++) await new Promise(res => setImmediate(res));
-  assert.equal(f.manager.autotune.setSettings('synthetic', { allowQ5Kv: false }).status, 409);
+  // The public unfinished-Long-run settings refusal is tested by the native policy/wire tests.
   f.manager.autotune.cancel(); release();
   assert.equal((await finished(f.manager)).status, 'cancelled');
 });

@@ -548,11 +548,36 @@ function createCalibrator(deps) {
       promptSeconds: record.promptSeconds ?? null, promptPerSecond: record.promptPerSecond ?? null };
   }
 
-  function cancel() {
-    if (state.job?.status !== 'running') return { ok: false, status: 409, body: { error: 'No calibration is running.' } };
+  // #2292: the worker alone owns its controller. The front checks the public job policy;
+  // this primitive compares the exact process/job/controller snapshot before setting its flag.
+  const cancelSalt = crypto.randomBytes(32);
+  const objectIds = new WeakMap();
+  let nextObjectId = 0;
+  const objectId = object => {
+    if (!object || typeof object !== 'object') return null;
+    if (!objectIds.has(object)) objectIds.set(object, ++nextObjectId);
+    return objectIds.get(object);
+  };
+  const cancelToken = () => crypto.createHmac('sha256', cancelSalt).update(JSON.stringify({
+    job: state.job, jobObject: objectId(state.job), controller: objectId(inflight), cancelRequested,
+  })).digest('hex');
+  const cancelGeneration = () => crypto.createHmac('sha256', cancelSalt).update(JSON.stringify({ jobObject: objectId(state.job) })).digest('hex');
+  function cancellationFacts() {
+    // The private original profile text never crosses the bridge. Known live job fields only;
+    // public selection, validation, method/status and HTTP serialization belong to the front.
+    const keys = ['id', 'model', 'promptBudgetSeconds', 'native', 'base', 'status', 'phase',
+      'startedAt', 'steps', 'memoryFloorGib', 'memoryGuard', 'originalRevision', 'lastRevision',
+      'result', 'error', 'restored', 'finishedAt'];
+    const job = state.job == null ? null : Object.fromEntries(keys.filter(k => Object.hasOwn(state.job, k)).map(k => [k, state.job[k]]));
+    return { token: cancelToken(), generation: cancelGeneration(), job: JSON.parse(JSON.stringify(job)) };
+  }
+  function compareAndAbort(token) {
+    if (typeof token !== 'string' || token !== cancelToken() || !state.job) return { applied: false };
+    const { job, generation } = cancellationFacts();
     cancelRequested = true;
+    // Copy before abort: synchronous abort listeners cannot make a replacement job the result.
     inflight?.abort();
-    return { ok: true, status: 202, body: publicJob(state.job) };
+    return { applied: true, job, generation };
   }
 
   function status(model) {
@@ -560,9 +585,9 @@ function createCalibrator(deps) {
   }
 
   load();
-  // A probe cancels through cancelProbe: cancel() answers only for a running calibration job.
+  // A probe has a direct canceller; auto-tune retains an internal alias of the conditional primitive.
   const cancelProbe = () => { cancelRequested = true; inflight?.abort(); };
-  return { start, cancel, cancelProbe, probe, status, recover, completion: () => completion, _state: () => state };
+  return { start, cancel: () => compareAndAbort(cancelToken()), cancellationFacts, compareAndAbort, cancelProbe, probe, status, recover, completion: () => completion, _state: () => state };
 }
 
 module.exports = { createCalibrator, ladder, readMemAvailableGib };

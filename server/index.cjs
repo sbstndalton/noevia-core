@@ -1165,6 +1165,10 @@ const diaryRoutes = require('./routes/diary.cjs').createDiaryRoutes({
   json, readBody, readJson, fetchJson, DIARY_BASE, authService, currentWorkspace, rateLimited: (userId) => llmRateLimited(userId), diary,
   storageLatch,
 });
+// #2287: the Rust front owns settings policy; the live tune script retains the state-file writer.
+const autotuneSettingsBridge = require('./rust-autotune-settings-bridge.cjs').createAutotuneSettingsBridge({
+  secret: FRONT_SECRET, json, readJson, tuner: () => modelManager.autotune,
+});
 // The router's list of the paths a signed-out browser may call. Their sign-in methods are the Rust
 // front's (#1071, refused above by rust-auth.cjs); any other method passes the gate as before.
 const publicAuthRoutes = new Set([
@@ -1242,6 +1246,10 @@ const inferenceMachineRoutes = require('./routes/inference-machines.cjs').create
 const readyRoutes = require('./routes/health.cjs').createReadyRoutes({
   json, isReady: () => processReady, version: require('./version-resolve.cjs').resolveVersion(),
 });
+// #2292: public cancellation policy is native; only the live controller stays in Node.
+const calibrationCancelBridge = require('./rust-calibration-cancel-bridge.cjs').createCalibrationCancelBridge({
+  secret: FRONT_SECRET, json, readJson, calibration: () => modelManager.calibration,
+});
 // #2281: the Rust front owns the picker response; only raw live discovery/prefill facts stay here.
 const toolboxPickerFacts = require('./rust-toolbox-picker-facts.cjs').createToolboxPickerFacts({
   secret: FRONT_SECRET, discoverMcpTools: async () => { await readyFeatures(); await discoverMcpTools(); }, allToolboxes, connectorBoxes: CONNECTOR_BOXES, json, readJson,
@@ -1292,6 +1300,8 @@ async function handleRequestInner(req, res) {
   // So are the two configuration-only model reads (#2187): GET /api/models/capabilities and /hardware.
   if (require('./rust-models.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   if (require('./rust-model-state-reads.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
+  if (require('./rust-autotune-settings.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
+  if (await autotuneSettingsBridge(req, res)) return;
   // And a project source's stored text and originals (#2191): GET sources/text, documents/original, uploads/original.
   if (require('./rust-project-reads.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   // And a project's create and delete (#2191 round 2): POST /api/projects, DELETE /api/projects/{id}.
@@ -1338,6 +1348,8 @@ async function handleRequestInner(req, res) {
   if (require('./rust-mcp-directory.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   if (require('./rust-toolboxes-permitted.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   if (require('./rust-toolbox-picker.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
+  if (require('./rust-calibration-cancel.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
+  if (await calibrationCancelBridge(req, res)) return;
   if (await toolboxPickerFacts(req, res)) return;
   if (require('./rust-connectors.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   if (require('./rust-vault-mirror-preferences.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
