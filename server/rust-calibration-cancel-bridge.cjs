@@ -10,7 +10,7 @@ function createCalibrationCancelBridge({ secret, json, readJson, calibration, lo
     let ask;
     try { ask = await readJson(req, 4096); } catch { json(res, 400, { error: 'invalid JSON' }); return true; }
     const abort = path.endsWith('/abort');
-    if (!ask || typeof ask !== 'object' || Array.isArray(ask) || Object.keys(ask).some(k => k !== 'token') || (abort ? !/^[0-9a-f]{64}$/.test(ask.token || '') : Object.hasOwn(ask, 'token'))) { json(res, 400, { error: 'Invalid cancellation state request.' }); return true; }
+    if (!ask || typeof ask !== 'object' || Array.isArray(ask) || Object.keys(ask).some(k => k !== 'token') || (abort ? typeof ask.token !== 'string' || !/^[0-9a-f]{64}$/.test(ask.token) : Object.hasOwn(ask, 'token'))) { json(res, 400, { error: 'Invalid cancellation state request.' }); return true; }
     try {
       const live = calibration();
       const available = !!live;

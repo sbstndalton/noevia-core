@@ -61,7 +61,7 @@ test('bridge selects the actor, refuses selectors/invalid tokens and compares sy
   const g = fixture({ calibration: () => f.live, readJson: async () => ({ token }) });
   await g.handle(req({ url: PREFIX + 'abort' }), {}); assert.equal(g.sent.pop().body.applied, true);
   await g.handle(req({ url: PREFIX + 'abort' }), {}); assert.equal(g.sent.pop().status, 409);
-  for (const ask of [{ model: 'other' }, { token: 'wrong' }, { token, model: 'other' }, null, []]) {
+  for (const ask of [{ model: 'other' }, { token: 'wrong' }, { token: { toString: null } }, { token: 7 }, { token, model: 'other' }, null, []]) {
     const h = fixture({ readJson: async () => ask }); await h.handle(req({ url: PREFIX + 'abort' }), {}); assert.equal(h.sent.pop().status, 400);
   }
 });
