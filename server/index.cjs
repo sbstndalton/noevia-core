@@ -1236,6 +1236,10 @@ const inferenceMachineRoutes = require('./routes/inference-machines.cjs').create
 const readyRoutes = require('./routes/health.cjs').createReadyRoutes({
   json, isReady: () => processReady, version: require('./version-resolve.cjs').resolveVersion(),
 });
+// #2292: public cancellation policy is native; only the live controller stays in Node.
+const calibrationCancelBridge = require('./rust-calibration-cancel-bridge.cjs').createCalibrationCancelBridge({
+  secret: FRONT_SECRET, json, readJson, calibration: () => modelManager.calibration,
+});
 // #2281: the Rust front owns the picker response; only raw live discovery/prefill facts stay here.
 const toolboxPickerFacts = require('./rust-toolbox-picker-facts.cjs').createToolboxPickerFacts({
   secret: FRONT_SECRET, discoverMcpTools: async () => { await readyFeatures(); await discoverMcpTools(); }, allToolboxes, connectorBoxes: CONNECTOR_BOXES, json, readJson,
@@ -1328,6 +1332,8 @@ async function handleRequestInner(req, res) {
   if (require('./rust-mcp-directory.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   if (require('./rust-toolboxes-permitted.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   if (require('./rust-toolbox-picker.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
+  if (require('./rust-calibration-cancel.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
+  if (await calibrationCancelBridge(req, res)) return;
   if (await toolboxPickerFacts(req, res)) return;
   if (require('./rust-connectors.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   if (require('./rust-vault-mirror-preferences.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;

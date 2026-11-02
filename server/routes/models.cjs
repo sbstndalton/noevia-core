@@ -543,12 +543,11 @@ function createModelRoutes({ servedEmbeddingModels = (target) => require('../rag
       res.setHeader('Cache-Control','no-store');
       return json(res,result.status,result.body);
     }
-    if (p === '/api/models/calibration' || p === '/api/models/calibration/cancel') {
+    if (p === '/api/models/calibration') {
       if(authn.user.role!=='admin')return json(res,403,{error:'Administrator required for shared model profiles'});
       if(!modelManager.calibration)return json(res,404,{error:'Native calibration is unavailable'});
       let result;
-      if(p.endsWith('/cancel')){if(req.method!=='POST')return json(res,405,{error:'Method not allowed'});result=modelManager.calibration.cancel();}
-      else if(req.method==='GET')result=modelManager.calibration.status(url.searchParams.get('model')||'');
+      if(req.method==='GET')result=modelManager.calibration.status(url.searchParams.get('model')||'');
       else if(req.method==='POST'){const body=await readJson(req);result=await modelManager.calibration.start(String(body?.model||''),{promptBudgetSeconds:body?.promptBudgetSeconds,confirmPause:body?.confirmPause});}
       else return json(res,405,{error:'Method not allowed'});
       res.setHeader('Cache-Control','no-store');
