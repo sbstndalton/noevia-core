@@ -80,3 +80,50 @@ test('#872 no models.ini write while calibration or auto-tune runs; the next tic
   const failing = createFolderSync({ busy: () => { throw Error('no manager'); }, listUnregistered: async () => ['x'], register: async () => { throw Error('must not run'); }, reloadPresets: async () => ({ ok: true }) });
   assert.equal((await failing.run()).deferred, true);
 });
+
+test('#2276 a chat starting during the scan defers registration without permanently skipping files', async () => {
+  const { createMaintenanceGate } = require('./inference-maintenance.cjs');
+  const gate = createMaintenanceGate();
+  const added = []; let endChat;
+  const sync = createFolderSync({
+    listUnregistered: async () => { endChat = gate.enter(); return ['later']; },
+    register: async s => added.push(s),
+    writePresets: async (write, reloadIf) => {
+      let release;
+      try { release = await gate.hold(); } catch (e) { throw Object.assign(e, { holdRefused: true }); }
+      try { const written = await write(); return { written, reload: reloadIf(written) ? { ok: true } : null }; }
+      finally { release(); }
+    },
+  });
+  assert.equal((await sync.run()).deferred, true);
+  assert.deepEqual(added, []);
+  assert.deepEqual(sync.skipped(), []);
+  endChat();
+});
+
+test('#2276 folder registration and its single reload keep the hold across the entire batch', async () => {
+  const { createMaintenanceGate } = require('./inference-maintenance.cjs');
+  const gate = createMaintenanceGate();
+  const added = []; let reloads = 0, refused = true;
+  const sync = createFolderSync({
+    busy: () => gate.held(), listUnregistered: async () => ['one', 'two'],
+    register: async s => { assert.throws(() => gate.enter(), e => e.status === 503); added.push(s); },
+    writePresets: async (write, reloadIf) => {
+      if (refused) throw Object.assign(Error('busy'), { status: 409, holdRefused: true });
+      const release = await gate.hold();
+      try {
+        const written = await write();
+        assert.equal(reloadIf(written), true);
+        assert.throws(() => gate.enter(), e => e.status === 503);
+        reloads++; return { written, reload: { ok: true } };
+      } finally { release(); }
+    },
+  });
+  assert.equal((await sync.run()).deferred, true);
+  assert.deepEqual(sync.skipped(), []);
+  refused = false;
+  assert.deepEqual((await sync.run()).added, ['one', 'two']);
+  assert.deepEqual(added, ['one', 'two']);
+  assert.equal(reloads, 1);
+  const exit = gate.enter(); exit();
+});

@@ -332,6 +332,7 @@ const folderSync = process.env.MODEL_LOADER_URL ? require('./model-folder-sync.c
     if (!r?.ok) throw Object.assign(Error(r?.body?.error || `model manager HTTP ${r?.status || 'unreachable'}`), { status: r?.status });
   },
   reloadPresets: () => modelManager.reloadPresets ? modelManager.reloadPresets({ unload: false }) : { ok: false },
+  writePresets: modelManager.writePresets ? (write, reloadIf) => modelManager.writePresets(write, reloadIf) : null,
   // #872: never write models.ini while calibration/auto-tune runs or the maintenance gate is held.
   busy: () => !!modelManager.tuningActive?.(),
   log: (message) => console.log(message),
