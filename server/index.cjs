@@ -1193,8 +1193,13 @@ const authRoutes = require('./routes/auth.cjs').createAuthRoutes({
 // the test, the Nextcloud sign-in and the save, #1071/sbstndalton/noevia#2190): routes/storage.cjs
 // only refuses a request that bypassed it.
 const storageRoutes = require('./routes/storage.cjs').createStorageRoutes({ json });
-// The human's answer to a pending write (routes/approvals.cjs); the gate itself is approvals.cjs.
-const approvalRoutes = require('./routes/approvals.cjs').createApprovalRoutes({ json, readBody, pendingApprovals, requestScope });
+// Public approval policy is Rust's; only pending chat Promise resolution remains here (#2282).
+const toolApprovals = require('./rust-tool-approval-bridge.cjs');
+const toolApprovalBridge = toolApprovals.createToolApprovalBridge({
+  secret: FRONT_SECRET, pendingApprovals, json, readJson,
+  withActiveUser: (id, fn) => toolApprovals.withActiveUser(authService.db, id, fn),
+  log: message => console.warn(message),
+});
 // The workspace view, free-chat metas, context meters and transcripts (routes/chat-lists.cjs); it also
 // runs the delete-old-chats sweep as the workspace loads, at most hourly.
 const chatListRoutes = require('./routes/chat-lists.cjs').createChatListRoutes({
@@ -1263,6 +1268,8 @@ function publicHeaders(res) {
 async function handleRequestInner(req, res) {
   // The ownership refusals below answer before handleRequestScoped; they carry the same headers.
   publicHeaders(res);
+  if (require('./rust-tool-approvals.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
+  if (await toolApprovalBridge(req, res)) return;
   // The Rust front's maintenance lease on this process's gate (#2210): before everything, and only the front's.
   if (await maintenanceLeases.handle(req, res)) return;
   // #2191 round 2: a toolbox discovered since the last request reaches the front's next project create
@@ -1406,7 +1413,6 @@ async function handleRequestScoped(req, res) {
     if (authn && p.startsWith('/api/projects/') && await browserRoutes(req, res, { path: p, authn })) return;
     if (await authRoutes.account(req, res, { path: p, authn })) return;
     if (await storageRoutes(req, res, { path: p, authn })) return;
-    if (await approvalRoutes(req, res, { path: p, authn })) return;
 
     if (await chatListRoutes(req, res, { path: p, authn, url })) return;
 
