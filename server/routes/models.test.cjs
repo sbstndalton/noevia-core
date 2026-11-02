@@ -1073,3 +1073,30 @@ test('#2276 manager writes retain the hold through the reload and release it on 
   }
   assert.deepEqual(f.fetched, []);
 });
+
+ test('#2278 encoded section prefixes obey identity and budget guards before forwarding', async () => {
+  const system = fixture({ env: { MODEL_LOADER_URL: 'http://loader' } });
+  await system.call('DELETE', '/api/model-manager/%73ections/laya_multilingual_f16', undefined, 'admin');
+  assert.equal(system.sent.at(-1).status, 400);
+  assert.equal(system.sent.at(-1).body.errorId, 'systemModel');
+  assert.deepEqual(system.fetched, []);
+  const calls = [];
+  const budget = fixture({ env: { MODEL_LOADER_URL: 'http://loader' }, manager: {
+    presetRefusal: async (name, options) => { calls.push({ name, options }); return { error: 'too large', code: 'overBudget' }; },
+  } });
+  await budget.call('PUT', '/api/model-manager/%73ections/chat%20name', { values: { 'ctx-size': '262144' } }, 'admin');
+  assert.equal(budget.sent.at(-1).status, 409);
+  assert.deepEqual(calls, [{ name: 'chat name', options: { 'ctx-size': '262144' } }]);
+  assert.deepEqual(budget.fetched, []);
+});
+
+ test('#2278 canonical guard matching preserves encoded section names on the upstream URL', async () => {
+  const calls = [];
+  const f = fixture({ env: { MODEL_LOADER_URL: 'http://loader' }, manager: {
+    presetRefusal: async name => { calls.push(name); return null; },
+  } });
+  await f.call('PUT', '/api/model-manager/%73ections/chat%25name', { values: {} }, 'admin');
+  assert.equal(f.sent.at(-1).status, 200);
+  assert.deepEqual(calls, ['chat%name']);
+  assert.equal(f.fetched[0].url, 'http://loader/api/v1/%73ections/chat%25name');
+});
