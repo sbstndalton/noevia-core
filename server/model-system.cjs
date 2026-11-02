@@ -155,10 +155,35 @@ function sidecarModelNames(env = process.env) {
     ? [...service.protectedNames(), ...configNamesServedElsewhere(configNames, service)]
     : [...envNames, ...configNames, ...(status ? service.protectedNames() : [])];
   for (const embed of embedNames) if (embed && embed.toLowerCase() !== 'default') names.add(embed);
+  for (const rerank of rerankModelNames(env)) names.add(rerank);
+  return names;
+}
+
+// Keep every deployment seed: a changed setting does not prove that an older sidecar stopped.
+// Also protect the stable current selection used by retrieval. This is not an assignment fence:
+// a later assignment still needs coordination with a destructive operation (noevia#2291).
+function rerankModelNames(env = process.env) {
+  const names = new Set();
   const rerankOn = /^(1|true|on)$/i.test(String(env.NOEVIA_FEATURE_RAG_RERANK || ''));
   const rerank = rerankOn ? String(env.RERANK_MODEL || '').trim() : '';
   if (rerank) names.add(rerank);
-  return names;
+  try {
+    const settings = require('./rerank-settings.cjs').current();
+    if (settings == null) return names; // not installed yet: preserve deployment-only behavior
+    const current = settings.effectiveEnv();
+    if (!current || typeof current !== 'object' || Array.isArray(current)) throw Error();
+    const enabled = current.NOEVIA_FEATURE_RAG_RERANK;
+    const model = current.RERANK_MODEL;
+    if (enabled != null && !['string', 'boolean', 'number'].includes(typeof enabled)) throw Error();
+    if (typeof enabled === 'number' && !Number.isFinite(enabled)) throw Error();
+    if (model != null && typeof model !== 'string') throw Error();
+    // An enabled TEI deployment can legitimately use its unnamed default model.
+    if (/^(1|true|on)$/i.test(String(enabled || '')) && model?.trim()) names.add(model.trim());
+    return names;
+  } catch {
+    // Unsafe callers must not fall back to seed-only protection on an unreadable provider.
+    throw Object.assign(Error('Could not confirm reranker model protection'), { status: 503 });
+  }
 }
 
 // A configured target this service does not serve (the inference engine when baseUrl is null, or
@@ -185,5 +210,5 @@ module.exports = {
   SYSTEM_MODEL_LOAD_REASON, SIDECAR_MODEL_LOAD_REASON, MISSING_MODEL_FILE_REASON,
   isSystemModel, modelPathFromArgs, SYSTEM_MODEL_REASON, SYSTEM_MODEL_DELETE_REASON, sectionRolesOf, rememberSectionRoles, useRolesBeside, refreshRoles, rolesFileFor, ROLES_FILENAME, LAYA_ROLE,
   SYSTEM_ROUTING_ROLE, LEGACY_SYSTEM_ROUTING_ROLES, isSystemRoutingRole,
-  sidecarModelNames, isSidecarModel, SIDECAR_MODEL_DELETE_REASON,
+  sidecarModelNames, rerankModelNames, isSidecarModel, SIDECAR_MODEL_DELETE_REASON,
 };
