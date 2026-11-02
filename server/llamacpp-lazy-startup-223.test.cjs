@@ -237,7 +237,7 @@ test('auto-tune: a planning failure that is not a refusal still falls back to th
   const { m } = synthetic(t, { native: 32768, inferenceBudget: { budgetGib: () => 64 }, autotuneOptions: { planFacts: async () => { throw new Error('model file unreadable'); } } });
   const r = await m.autotune.start('small', TUNE);
   assert.equal(r.status, 202);
-  m.autotune.cancel();
+  m.autotune.compareAndAbort(m.autotune.cancellationFacts().token);
   const job = await tuneSettled(m);
   ran++;
   assert.notEqual(job?.status, 'running');
