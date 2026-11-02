@@ -429,11 +429,8 @@ function createModelRoutes({ servedEmbeddingModels = (target) => require('../rag
         }
       }
       if(method!=='GET')modelScanCache.clear();
-      const scanGeneration=modelScanCache.generation?.();
-      if(method==='GET'&&rest==='models'&&!url.search){
-        const hit=modelScanCache.get('models');
-        if(hit){res.setHeader('Cache-Control','no-store');res.setHeader('X-Model-Scan','cached');if(Date.now()-hit.at>5000)refreshModelScan();return json(res,200,hit.body);}
-      }
+      // #2304: exact GET /api/model-manager/models is refused before this legacy proxy;
+      // native policy reads/publishes the same cache through its raw conditional operations.
       // #697: the model manager's autoconfig sizes against the inference budget, set here rather
       // than by the browser (any budget_gib the client sent is replaced).
       let search=url.search;
@@ -462,7 +459,6 @@ function createModelRoutes({ servedEmbeddingModels = (target) => require('../rag
       if(result.ok&&method==='GET'&&/^benchmark\/runs\/\d+$/.test(rest)&&modelManager.recordEvidence){
         for(const {model,record} of require('../benchmark-evidence.cjs').throughputRecords(detail))modelManager.recordEvidence(model,record).catch(()=>undefined);
       }
-      if(result.ok&&method==='GET'&&rest==='models'&&!url.search)modelScanCache.set('models',{at:Date.now(),body:detail},scanGeneration);
       // #302: the folder-scan delete above only removed files through the model management
       // service — it never touched the live engine or the auto-router roles. Run the same
       // cleanup /api/models/delete runs, for every engine id the deleted files backed.
