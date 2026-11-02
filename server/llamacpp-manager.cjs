@@ -642,7 +642,7 @@ function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloa
       profile:evidenceLib.identityHash([sectionText('*'),sectionText(model)]),
       hardware:[autoconfig.hardwareLabel||null,memGiB?`${memGiB}GiB`:null,JSON.stringify(build)].filter(Boolean).join(' ')||null};
   }
-  const calibrator=presets?require('./llamacpp-calibration.cjs').createCalibrator({request,rawModels,presets,maintenance,applyUnlocked,conservativeFor,onResult:({model,status,entry})=>recordEvidence(model,status==='passed'?{category:'context_capacity',result:'passed',value:{ctx:entry.verifiedCtx,appliedCtx:entry.appliedCtx,slots:entry.slots},suite:{name:'native-calibration',version:1},source:'calibration',limitations:[`prompt budget ${entry.promptBudgetSeconds} s`]}:{category:'context_capacity',result:'failed',value:null,suite:{name:'native-calibration',version:1},source:'calibration',limitations:[String(entry.error||'').slice(0,200)]}),stream:(path,opts={})=>(fetchStream||fetch)(base+path,{...opts,headers:headers(opts.headers),redirect:'error'}),stateFile:calibrationStatePath,memoryFloorGib:autoconfig.memoryFloorGib||2,...calibrationOptions}):null;
+  const calibrator=presets?require('./llamacpp-calibration.cjs').createCalibrator({request,rawModels,presets,maintenance,applyUnlocked,conservativeFor,identityFor:tuneIdentity,onResult:({model,status,entry})=>recordEvidence(model,status==='passed'?{category:'context_capacity',result:'passed',value:{ctx:entry.verifiedCtx,appliedCtx:entry.appliedCtx,slots:entry.slots},suite:{name:'native-calibration',version:1},source:'calibration',limitations:[`prompt budget ${entry.promptBudgetSeconds} s`]}:{category:'context_capacity',result:'failed',value:null,suite:{name:'native-calibration',version:1},source:'calibration',limitations:[String(entry.error||'').slice(0,200)]}),stream:(path,opts={})=>(fetchStream||fetch)(base+path,{...opts,headers:headers(opts.headers),redirect:'error'}),stateFile:calibrationStatePath,memoryFloorGib:autoconfig.memoryFloorGib||2,...calibrationOptions}):null;
   const tuneDeps={identityFor:tuneIdentity,stateFile:autotuneStatePath,memoryFloorGib:autoconfig.memoryFloorGib||2,...(calibrationOptions.readMemory?{readMemory:calibrationOptions.readMemory}:{}),...autotuneOptions};
   // Internal context checks run under the full tuner's per-model lease; standalone
   // calibration still acquires the real gate.
@@ -694,7 +694,7 @@ function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloa
     // Throws a 409 when requests are in flight or the gate is already held; with the inference
     // gate as the authority (#2187) it returns a promise of the release instead (callers await it).
     holdMaintenance: reason => maintenance.hold(reason),
-    tuningActive: () => maintenance.held() || calibrator?.status().body.job?.status === 'running' || autotuner?.status().body.job?.status === 'running',
+    tuningActive: () => maintenance.held() || calibrator?.stateFacts().job?.status === 'running' || autotuner?.status().body.job?.status === 'running',
     getPreset: model => presets ? Promise.resolve({ok:true,status:200,body:presets.get(model)}) : unsupported('Native preset editing'),
     applyPreset,
     // #697: the load guard and the budget, for the proxied benchmark start and the watchdog.
@@ -714,7 +714,7 @@ function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloa
     evidence, recordEvidence, importEvidence,
     // #2210: waits (bounded) until the front has applied a queued record (recordEvidence's handle).
     evidenceApplied: (handle,options)=>evidenceInbox?evidenceInbox.applied(handle,options):Promise.resolve(true),
-    calibration: calibrator ? { start: calibrator.start, cancellationFacts: calibrator.cancellationFacts, compareAndAbort: calibrator.compareAndAbort, status: calibrator.status, recover: calibrator.recover } : null,
+    calibration: calibrator ? { stateFacts: calibrator.stateFacts, listingFacts: calibrator.listingFacts, preparationFacts: calibrator.preparationFacts, compareAndLaunch: calibrator.compareAndLaunch, cancellationFacts: calibrator.cancellationFacts, compareAndAbort: calibrator.compareAndAbort, recover: calibrator.recover } : null,
     autotune: autotuner ? { start: (...args) => { const fault = budgetFaultReason(); return fault ? Promise.resolve({ ok: false, status: 503, body: budgetFaultBody('Auto-tune unavailable', fault) }) : autotuner.start(...args); }, resume: autotuner.resume, cancel: autotuner.cancel, clearFacts: autotuner.clearFacts, compareAndClear: autotuner.compareAndClear, status: autotuner.status, settingsFacts: autotuner.settingsFacts, commitSettings: autotuner.commitSettings, recover: autotuner.recover, untuned: autotuner.untuned } : null,
     // noevia#2115: the gate refuses to unload a model in use (409 `model_in_use`); `unloadAnyway` is the
     // admin's choice to end what it is answering, and needs INFERENCE_GATE_ADMIN_TOKEN.

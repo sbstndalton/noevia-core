@@ -59,7 +59,17 @@ function fixture(t,{loadCap=40960,longCap=Infinity,native=131072,memory=()=>20,o
   const manager=createModelManager({kind:'llamacpp',baseUrl:'http://synthetic',presetPath:ini,fetchJson,fetchStream,calibrationStatePath:stateFile,autoconfig:{},presetWriter,calibrationOptions:{sleep:async()=>{},readMemory:memory,now:()=>clock.t,timeouts:{memoryPoll:5},...extra}});
   return {manager,ini,stateFile,original,router,ctxOf};
 }
-async function finished(manager){for(let i=0;i<2000;i++){const job=manager.calibration.status().body.job;if(job&&job.status!=='running')return job;await new Promise(r=>setImmediate(r));}throw Error('calibration did not finish');}
+// Existing worker tests launch an explicit synthetic plan. Public confirmation, numeric
+// coercion, eligibility, method and HTTP policy now live in native route/wire tests.
+async function launch(calibration, model, {promptBudgetSeconds=120}={}) {
+  const {token}=calibration.stateFacts();
+  const listing=await calibration.listingFacts(model,token);
+  const facts=await calibration.preparationFacts(model,token,listing.rowToken);
+  const result=await calibration.compareAndLaunch({model,token,rowToken:listing.rowToken,preparedToken:facts.preparedToken,
+    plan:{promptBudgetSeconds,native:Number(facts.row?.meta?.n_ctx_train)||0,base:{}}});
+  return {...result,status:result.applied?202:409,body:result.job};
+}
+async function finished(manager){for(let i=0;i<2000;i++){const job=manager.calibration.stateFacts().job;if(job&&job.status!=='running')return job;await new Promise(r=>setImmediate(r));}throw Error('calibration did not finish');}
 
 test('#339 calibration survives Model Loader replies lost after every commit',async t=>{
   // Each PUT commits and then its reply is lost; the manager reads models.ini back instead of failing.
@@ -71,7 +81,7 @@ test('#339 calibration survives Model Loader replies lost after every commit',as
     fs.writeFileSync(ini,text);throw Error('socket hang up after commit');
   }});
   const f=fixture(t,{loadCap:131072,presetWriter});ini=f.ini;
-  assert.equal((await f.manager.calibration.start('synthetic',{promptBudgetSeconds:60,confirmPause:true})).status,202);
+  assert.equal((await launch(f.manager.calibration,'synthetic',{promptBudgetSeconds:60,confirmPause:true})).status,202);
   const job=await finished(f.manager);
   assert.equal(job.status,'passed',job.error);assert.ok(writes>1);
   assert.equal(f.ctxOf(),job.result.appliedCtx);assert.match(fs.readFileSync(f.ini,'utf8'),/; operator note stays/);
@@ -83,9 +93,7 @@ test('ladder covers 4096 up to the trained context, or 128K when unknown',()=>{
 
 test('load checks bound the search; long prompts start mid-range and stop at the time limit',async t=>{
   const {manager,ini,router,ctxOf}=fixture(t,{loadCap:131072,speed:1000});
-  assert.equal((await manager.calibration.start('synthetic',{promptBudgetSeconds:60})).status,400);
-  assert.equal((await manager.calibration.start('synthetic',{promptBudgetSeconds:5,confirmPause:true})).status,400);
-  const started=await manager.calibration.start('synthetic',{promptBudgetSeconds:60,confirmPause:true});
+  const started=await launch(manager.calibration,'synthetic',{promptBudgetSeconds:60,confirmPause:true});
   assert.equal(started.status,202);assert.equal(started.body.originalText,undefined);
   const job=await finished(manager);
   assert.equal(job.status,'passed',job.error);
@@ -104,14 +112,14 @@ test('load checks bound the search; long prompts start mid-range and stop at the
   assert.equal(job.result.loadCtx,131072);assert.equal(job.result.verifiedCtx,65536);assert.equal(job.result.appliedCtx,65536);
   assert.equal(ctxOf(),65536);
   const text=fs.readFileSync(ini,'utf8');assert.match(text,/; operator note stays/);assert.match(text,/\[other\]\nc = 4096/);
-  const history=manager.calibration.status('synthetic').body.history[0];
+  const history=manager.calibration.stateFacts().history.synthetic[0];
   assert.equal(history.appliedCtx,65536);assert.equal(history.promptBudgetSeconds,60);assert.equal(history.build,'b-synthetic');
   const leave=manager.enterInference();leave();
 });
 
 test('a size whose long prompt loses the start marker fails even when it is fast',async t=>{
   const {manager,ctxOf}=fixture(t,{loadCap:131072,longCap:32768});
-  await manager.calibration.start('synthetic',{promptBudgetSeconds:120,confirmPause:true});
+  await launch(manager.calibration,'synthetic',{promptBudgetSeconds:120,confirmPause:true});
   const job=await finished(manager);
   assert.equal(job.status,'passed',job.error);assert.equal(job.result.verifiedCtx,32768);assert.equal(ctxOf(),32768);
   assert.ok(job.steps.some(s=>s.kind==='long'&&s.status==='failed'&&/marker/.test(s.reason)));
@@ -119,7 +127,7 @@ test('a size whose long prompt loses the start marker fails even when it is fast
 
 test('when no size can be filled in time the run fails and keeps the original profile',async t=>{
   const {manager,ini,original}=fixture(t,{loadCap:131072,speed:10});
-  await manager.calibration.start('synthetic',{promptBudgetSeconds:60,confirmPause:true});
+  await launch(manager.calibration,'synthetic',{promptBudgetSeconds:60,confirmPause:true});
   const job=await finished(manager);
   assert.equal(job.status,'failed');assert.match(job.error,/No size passed the long-prompt test within 60 s/);
   assert.equal(fs.readFileSync(ini,'utf8'),original);
@@ -128,10 +136,10 @@ test('when no size can be filled in time the run fails and keeps the original pr
 test('chat pauses with an explanation for the whole run and resumes afterwards',async t=>{
   let release;const gate=new Promise(r=>{release=r;});
   const {manager}=fixture(t,{onLoad:ctx=>ctx===16384?gate:undefined});
-  await manager.calibration.start('synthetic',{promptBudgetSeconds:120,confirmPause:true});
+  await launch(manager.calibration,'synthetic',{promptBudgetSeconds:120,confirmPause:true});
   for(let i=0;i<50;i++)await new Promise(r=>setImmediate(r));
   assert.throws(()=>manager.enterInference(),e=>e.status===503&&/calibrates synthetic/.test(e.message));
-  assert.equal((await manager.calibration.start('synthetic',{promptBudgetSeconds:120,confirmPause:true})).status,409);
+  assert.equal((await launch(manager.calibration,'synthetic',{promptBudgetSeconds:120,confirmPause:true})).status,409);
   release();await finished(manager);
   const leave=manager.enterInference();leave();
 });
@@ -141,7 +149,7 @@ test('#1062 with a foreignWait hook (auto-tune), another client\'s model is wait
   const fx=fixture(t,{onLoad:(ctx,router)=>{if(ctx===16384&&!fired){fired=true;router.status.other='loaded';}},
     // What auto-tune's wait ends with once the other model is idle: the router's own unload.
     extra:{foreignWait:async error=>{waits.push(error.message);fx.router.status.other='unloaded';}}});
-  await fx.manager.calibration.start('synthetic',{promptBudgetSeconds:120,confirmPause:true});
+  await launch(fx.manager.calibration,'synthetic',{promptBudgetSeconds:120,confirmPause:true});
   const job=await finished(fx.manager);
   assert.equal(job.status,'passed',job.error);
   assert.deepEqual(waits,['Another client loaded a model during calibration. Stop Diary background jobs and other clients, then retry.']);
@@ -151,7 +159,7 @@ test('#1062 with a foreignWait hook (auto-tune), another client\'s model is wait
   assert.ok(sizes.includes(16384));
   // Exactly one load more at that size than an undisturbed run makes.
   const control=fixture(t);
-  await control.manager.calibration.start('synthetic',{promptBudgetSeconds:120,confirmPause:true});
+  await launch(control.manager.calibration,'synthetic',{promptBudgetSeconds:120,confirmPause:true});
   assert.equal((await finished(control.manager)).status,'passed');
   assert.equal(fx.router.loads.filter(c=>c===16384).length,control.router.loads.filter(c=>c===16384).length+1);
   assert.deepEqual(job.steps.map(s=>[s.kind,s.ctx,s.status]),(await finished(control.manager)).steps.map(s=>[s.kind,s.ctx,s.status]));
@@ -160,36 +168,33 @@ test('#1062 with a foreignWait hook (auto-tune), another client\'s model is wait
 test('#1062 a foreignWait that gives up stops calibration as before',async t=>{
   const {manager,ini,original}=fixture(t,{onLoad:(ctx,router)=>{if(ctx===16384)router.status.other='loaded';},
     extra:{foreignWait:async()=>{throw Object.assign(Error('Another client kept using other for 15 min.'),{fatal:true,foreignTimeout:true});}}});
-  await manager.calibration.start('synthetic',{promptBudgetSeconds:120,confirmPause:true});
+  await launch(manager.calibration,'synthetic',{promptBudgetSeconds:120,confirmPause:true});
   const job=await finished(manager);
   assert.equal(job.status,'failed');assert.match(job.error,/kept using other/);assert.equal(job.restored,true);
   assert.equal(fs.readFileSync(ini,'utf8'),original);
 });
 
-test('#2187: a hold the inference gate refuses for another reason than busy says so (a wrong admin token is 503, not the browser\'s 403); busy keeps its text',async t=>{
+test('#2187: failed maintenance admission returns raw safe facts and never launches a worker',async t=>{
   const {GateError}=require('./inference-gate-client.cjs');
-  for(const [err,status,match,code] of [
-    [new GateError({code:'engine_unavailable',status:502,retryable:true,message:'The local model engine is not answering. Try again shortly.'}),503,/not answering/,'engine_unavailable'],
-    [new GateError({code:'admin_required',status:403,message:"The maintenance hold needs the gate's admin token."}),503,/admin token/,'admin_required'],
-    [Object.assign(Error('Inference is busy.'),{status:409}),409,/^Requests are in progress/,undefined],
-  ]){
-    const {manager}=fixture(t,{extra:{maintenance:{hold:async()=>{throw err;}}}});
-    const r=await manager.calibration.start('synthetic',{promptBudgetSeconds:120,confirmPause:true});
-    assert.equal(r.status,status,err.message);assert.match(r.body.error,match);assert.equal(r.body.code,code);
-    assert.doesNotMatch(status===409?'':r.body.error,/Requests are in progress/);
+  for(const err of [new GateError({code:'engine_unavailable',status:502,message:'Engine unavailable'}),
+    new GateError({code:'admin_required',status:403,message:'Wrong synthetic admin key'}),Object.assign(Error('busy'),{status:409})]) {
+    const {manager,router}=fixture(t,{extra:{maintenance:{hold:async()=>{throw err;}}}});
+    const result=await launch(manager.calibration,'synthetic',{promptBudgetSeconds:120});
+    assert.equal(result.applied,false);assert.equal(result.reason,'hold');assert.equal(result.hold.status,err.status);
+    assert.equal(manager.calibration.stateFacts().job,null);assert.equal(router.loads.length,0);
   }
 });
 
 test('calibration will not start while requests are in flight',async t=>{
   const {manager}=fixture(t);
   const leave=manager.enterInference();
-  assert.equal((await manager.calibration.start('synthetic',{promptBudgetSeconds:120,confirmPause:true})).status,409);
+  assert.equal((await launch(manager.calibration,'synthetic',{promptBudgetSeconds:120,confirmPause:true})).status,409);
   leave();
 });
 
 test('another client loading a model aborts and restores the original preset',async t=>{
   const {manager,ini,original}=fixture(t,{onLoad:(ctx,router)=>{if(ctx===16384)router.status.other='loaded';}});
-  await manager.calibration.start('synthetic',{promptBudgetSeconds:120,confirmPause:true});
+  await launch(manager.calibration,'synthetic',{promptBudgetSeconds:120,confirmPause:true});
   const job=await finished(manager);
   assert.equal(job.status,'failed');assert.match(job.error,/Another client/);assert.equal(job.restored,true);
   assert.equal(fs.readFileSync(ini,'utf8'),original);
@@ -200,7 +205,7 @@ test('the memory floor turns a size into a failure without crashing the run',asy
   let loadedCtx=0,router;
   const f=fixture(t,{loadCap:131072,memory:()=>router?.status.synthetic==='loaded'&&loadedCtx>=65536?1:20,onLoad:ctx=>{loadedCtx=ctx;}});
   router=f.router;const {manager}=f;
-  await manager.calibration.start('synthetic',{promptBudgetSeconds:120,confirmPause:true});
+  await launch(manager.calibration,'synthetic',{promptBudgetSeconds:120,confirmPause:true});
   const job=await finished(manager);
   assert.equal(job.status,'passed',job.error+JSON.stringify(job.steps.map(s=>[s.ctx,s.kind,s.status,s.reason])));assert.ok(job.result.appliedCtx<65536,String(job.result.appliedCtx));
   assert.ok(job.steps.some(s=>s.memoryFloorHit&&/below 2 GiB/.test(s.reason)));
@@ -209,7 +214,7 @@ test('the memory floor turns a size into a failure without crashing the run',asy
 test('cancelling restores the original preset and releases chat',async t=>{
   let release;const gate=new Promise(r=>{release=r;});
   const {manager,ini,original}=fixture(t,{onLoad:ctx=>ctx===16384?gate:undefined});
-  await manager.calibration.start('synthetic',{promptBudgetSeconds:120,confirmPause:true});
+  await launch(manager.calibration,'synthetic',{promptBudgetSeconds:120,confirmPause:true});
   for(let i=0;i<50;i++)await new Promise(r=>setImmediate(r));
   assert.equal(manager.calibration.compareAndAbort(manager.calibration.cancellationFacts().token).applied,true);release();
   const job=await finished(manager);
@@ -220,7 +225,7 @@ test('cancelling restores the original preset and releases chat',async t=>{
 
 test('a model that cannot load at the starting size fails and keeps the original preset',async t=>{
   const {manager,ini,original}=fixture(t,{loadCap:4096});
-  await manager.calibration.start('synthetic',{promptBudgetSeconds:120,confirmPause:true});
+  await launch(manager.calibration,'synthetic',{promptBudgetSeconds:120,confirmPause:true});
   const job=await finished(manager);
   assert.equal(job.status,'failed');assert.match(job.error,/did not load even at 8,192/);assert.equal(fs.readFileSync(ini,'utf8'),original);
 });
@@ -232,18 +237,18 @@ test('an interrupted run is restored on startup only if the file is still the jo
   fs.writeFileSync(stateFile,JSON.stringify({job:{model:'synthetic',status:'running',steps:[],originalText:original,lastRevision:revision},history:{}}));
   await manager.calibration.recover();
   assert.equal(fs.readFileSync(ini,'utf8'),original);
-  const job=manager.calibration.status().body.job;assert.equal(job.status,'interrupted');assert.equal(job.originalText,undefined);
+  const job=manager.calibration.stateFacts().job;assert.equal(job.status,'interrupted');assert.equal(job.originalText,undefined);
   // A later operator edit is never overwritten.
   const edited=original+'\n; edited later\n';fs.writeFileSync(ini,edited);
   fs.writeFileSync(stateFile,JSON.stringify({job:{model:'synthetic',status:'running',steps:[],originalText:original,lastRevision:revision},history:{}}));
   await manager.calibration.recover();
   assert.equal(fs.readFileSync(ini,'utf8'),edited);
   // ...and the admin is told the calibration size may still be in the profile.
-  const kept=manager.calibration.status().body.job;
+  const kept=manager.calibration.stateFacts().job;
   assert.equal(kept.restored,false);assert.match(kept.error,/not restored/);
 });
 
-test('calibration refuses to start on Laya, by id or by --model path, and unloads nothing',async t=>{
+test('calibration raw listing identifies system id/path without model work',async t=>{
   const dir=fs.mkdtempSync(path.join(os.tmpdir(),'calibration-laya-'));t.after(()=>fs.rmSync(dir,{recursive:true,force:true}));
   const ini=path.join(dir,'models.ini'),stateFile=path.join(dir,'state.json');
   fs.writeFileSync(ini,'version = 1\n[laya_multilingual_f16]\nmodel = /models/laya_multilingual_f16.gguf\nctx-size = 8192\n[router_a]\nmodel = /models/laya_multilingual_f16.gguf\nctx-size = 8192\n[synthetic]\nmodel = /models/s.gguf\nctx-size = 8192\n');
@@ -257,18 +262,17 @@ test('calibration refuses to start on Laya, by id or by --model path, and unload
     return {ok:true,status:200,body:{}};
   };
   const manager=createModelManager({kind:'llamacpp',baseUrl:'http://synthetic',presetPath:ini,fetchJson,calibrationStatePath:stateFile,autoconfig:{},calibrationOptions:{sleep:async()=>{},readMemory:()=>20}});
-  const byId=await manager.calibration.start('laya_multilingual_f16',{promptBudgetSeconds:60,confirmPause:true});
-  assert.equal(byId.status,400);assert.equal(byId.body.error,'System routing model — not tuned');
-  const byPath=await manager.calibration.start('router_a',{promptBudgetSeconds:60,confirmPause:true});
-  assert.equal(byPath.status,400);assert.equal(byPath.body.error,'System routing model — not tuned');
+  const {token}=manager.calibration.stateFacts();
+  assert.equal((await manager.calibration.listingFacts('laya_multilingual_f16',token)).system,true);
+  assert.equal((await manager.calibration.listingFacts('router_a',token)).system,true);
   assert.equal(unloadCalls,0);
-  assert.equal(manager.calibration.status().body.job,null);
+  assert.equal(manager.calibration.stateFacts().job,null);
   assert.equal(fs.readFileSync(ini,'utf8'),'version = 1\n[laya_multilingual_f16]\nmodel = /models/laya_multilingual_f16.gguf\nctx-size = 8192\n[router_a]\nmodel = /models/laya_multilingual_f16.gguf\nctx-size = 8192\n[synthetic]\nmodel = /models/s.gguf\nctx-size = 8192\n');
 });
 
 test('memory that stays low with the model unloaded stops the run instead of failing every size',async t=>{
   const {manager,ini,original}=fixture(t,{loadCap:131072,memory:()=>1});
-  await manager.calibration.start('synthetic',{promptBudgetSeconds:120,confirmPause:true});
+  await launch(manager.calibration,'synthetic',{promptBudgetSeconds:120,confirmPause:true});
   const job=await finished(manager);
   assert.equal(job.status,'failed');assert.match(job.error,/stayed below 2 GiB even with the model unloaded/);
   assert.equal(job.steps.length,1);assert.equal(fs.readFileSync(ini,'utf8'),original);
@@ -278,7 +282,7 @@ test('#871 a restart during the first step restores the original profile',async 
   // The first load hangs (as a slow load poll would); noevia "restarts" mid-step.
   let release;const hang=new Promise(r=>{release=r;});
   const {manager,ini,stateFile,original,router,ctxOf}=fixture(t,{onLoad:ctx=>ctx===8192?hang:undefined});
-  assert.equal((await manager.calibration.start('synthetic',{promptBudgetSeconds:120,confirmPause:true})).status,202);
+  assert.equal((await launch(manager.calibration,'synthetic',{promptBudgetSeconds:120,confirmPause:true})).status,202);
   for(let i=0;i<200&&!router.loads.length;i++)await new Promise(r=>setImmediate(r));
   assert.deepEqual(router.loads,[8192]);assert.equal(ctxOf(),8192);
   assert.notEqual(fs.readFileSync(ini,'utf8'),original,'the test profile was written');
@@ -289,7 +293,7 @@ test('#871 a restart during the first step restores the original profile',async 
   const fetchJson=async url=>new URL(url).pathname==='/models'?{ok:true,status:200,body:{data:[]}}:{ok:true,status:200,body:{}};
   const restarted=createModelManager({kind:'llamacpp',baseUrl:'http://synthetic',presetPath:ini,fetchJson,calibrationStatePath:stateFile,autoconfig:{},calibrationOptions:{sleep:async()=>{},readMemory:()=>20}});
   await restarted.calibration.recover();
-  const job=restarted.calibration.status().body.job;
+  const job=restarted.calibration.stateFacts().job;
   assert.equal(job.status,'interrupted');assert.equal(job.restored,true);assert.doesNotMatch(job.error,/not restored/);
   assert.equal(fs.readFileSync(ini,'utf8'),original);
   // Let the stranded first run end; it must not overwrite the restored file.
@@ -301,7 +305,7 @@ test('#872 the manager reports a running calibration to the folder sync',async t
   let release;const gate=new Promise(r=>{release=r;});
   const {manager}=fixture(t,{onLoad:ctx=>ctx===16384?gate:undefined});
   assert.equal(manager.tuningActive(),false);assert.equal(manager.maintenanceHeld(),false);
-  await manager.calibration.start('synthetic',{promptBudgetSeconds:120,confirmPause:true});
+  await launch(manager.calibration,'synthetic',{promptBudgetSeconds:120,confirmPause:true});
   for(let i=0;i<50;i++)await new Promise(r=>setImmediate(r));
   assert.equal(manager.tuningActive(),true);assert.equal(manager.maintenanceHeld(),true);
   release();await finished(manager);
@@ -313,7 +317,7 @@ test('#1758 a sleeping model is asked to unload before calibration, so the wait 
   const f=fixture(t,{loadCap:131072,extra:{now:(()=>{let n=0;return ()=>(n+=1000);})()}});
   f.router.status.other='sleeping';
   const unloads=[];const calls=f.router.calls;
-  assert.equal((await f.manager.calibration.start('synthetic',{promptBudgetSeconds:60,confirmPause:true})).status,202);
+  assert.equal((await launch(f.manager.calibration,'synthetic',{promptBudgetSeconds:60,confirmPause:true})).status,202);
   const job=await finished(f.manager);
   assert.doesNotMatch(String(job.error||''),/did not unload in time/);
   assert.equal(f.router.status.other,'unloaded');
