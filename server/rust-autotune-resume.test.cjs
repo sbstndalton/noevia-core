@@ -12,7 +12,7 @@ function fixture(t, over = {}) {
   fs.writeFileSync(file,JSON.stringify({job,history:{kept:[]},settings:{}}),{mode:0o600});
   let revision='r1', reads=0, reloads=0, workers=0;
   const holds=[];
-  const actor=createFullAutotuner({stateFile:file,
+  const actor=createFullAutotuner({stateFile:file,now:over.now||Date.now,
     presets:{snapshot:()=>({revision,text:'private-config'}),get:()=>({exists:true})},
     request:async target=>{assert.equal(target,'/models?reload=1');reloads++;return over.reload?over.reload():{ok:true};},
     rawModels:async()=>{reads++;return over.rows?over.rows():{ok:true,body:{data:[{id:'synthetic'}]}};},
@@ -118,4 +118,17 @@ test('successful conditional writes invalidate the existing model scan, stale/fa
  await handle(req('commit'),{});assert.equal(sent.pop().status,200);assert.equal(invalidations,1);
  await handle(req('commit'),{});assert.equal(sent.pop().status,409);assert.equal(invalidations,1);
  await handle({...req('commit'),headers:{}},{});assert.equal(sent.pop().status,404);assert.equal(invalidations,1);assert.equal(f.counts().workers,0);
+});
+
+
+test('post-guard config or role changes are not adopted as an allowed own reload delta',async t=>{
+ const roles=require('./model-system.cjs');
+ try{
+  for(const change of ['revision','role']){
+   roles.rememberSectionRoles('');let f;
+   f=fixture(t,{job:{_reloadPending:true},now:()=>{if(change==='revision')f.revision('outside-change');else roles.rememberSectionRoles(JSON.stringify({synthetic:'system-routing'}));return 1000;}});
+   const out=await f.actor.prepareResume(f.actor.resumeFacts().token,{stage:'identities',selectors:[]});
+   assert.deepEqual(out,{applied:false});assert.equal(f.actor.resumeFacts().starting,false);assert.equal(f.counts().workers,0);
+  }
+ }finally{roles.rememberSectionRoles('');}
 });

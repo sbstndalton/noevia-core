@@ -1588,9 +1588,10 @@ function createFullAutotuner({ request: engineRequest, rawModels: engineRawModel
     return resumeObjects.get(value);
   };
   const resumeRun = () => hash({ process: resumeProcess, job: resumeId(state.job), completion: resumeId(completion) });
-  const resumeToken = () => hash({ process: resumeProcess, generation: resumeGeneration, state,
+  const resumeOutside = () => ({ process: resumeProcess,
     job: resumeId(state.job), completion: resumeId(completion), starting, cancelled,
     revision: presets.snapshot().revision, system: (Array.isArray(state.job?.models) ? state.job.models : []).map(item => typeof item?.model === 'string' && isSystemModel(item.model)) });
+  const resumeToken = () => hash({ ...resumeOutside(), generation: resumeGeneration, state });
   const resumeString = value => typeof value === 'string' ? value : null;
   const resumeStatus = value => ['pending', 'running', 'passed', 'failed', 'interrupted', 'cancelled', 'skipped'].includes(value) ? value : null;
   const resumeQueue = j => !Array.isArray(j?.models) ? null : j.models.map(item => !item || typeof item !== 'object' ? null : ({
@@ -1652,7 +1653,7 @@ function createFullAutotuner({ request: engineRequest, rawModels: engineRawModel
             baseListed: rows.body.data.some(row => row?.id === item?.base),
           })) : null };
       } else {
-        const before = JSON.parse(JSON.stringify(state)), beforeGeneration = resumeGeneration;
+        const before = JSON.parse(JSON.stringify(state)), beforeGeneration = resumeGeneration, outside = resumeOutside();
         const owed = !!j._reloadPending;
         await wait(flushReload(null, current));
         // The only allowed change across this await is flushReload's documented one-note commit.
@@ -1665,7 +1666,9 @@ function createFullAutotuner({ request: engineRequest, rawModels: engineRawModel
           (expectedState.job.log ||= []).push(note);
           if (expectedState.job.log.length > 400) expectedState.job.log.shift();
           if (JSON.stringify(state) !== JSON.stringify(expectedState) || resumeGeneration !== beforeGeneration + 1) throw resumeStale();
-          baseline = resumeToken();
+          const expectedToken = hash({ ...outside, generation: beforeGeneration + 1, state: expectedState });
+          if (resumeToken() !== expectedToken) throw resumeStale();
+          baseline = expectedToken;
         } else current();
         current();
         const identities = [];
