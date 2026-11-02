@@ -107,3 +107,15 @@ test('malformed secret-bearing flag/identity payloads never become bridge facts'
  const facts=f.actor.resumeFacts();assert.equal(facts.job.unsafe,true);assert.equal(facts.job.models[0].identitySet,true);assert.equal(facts.job.models[0].identity,null);
  assert.ok(!JSON.stringify(facts).includes('private-'));assert.deepEqual(f.counts(),{reads:0,reloads:0,workers:0});
 });
+
+
+test('successful conditional writes invalidate the existing model scan, stale/facts/denied calls do not',async t=>{
+ const f=fixture(t),sent=[];let invalidations=0,ask={};
+ const handle=createAutotuneResumeBridge({secret:'s',json:(_r,status,body)=>sent.push({status,body}),readJson:async()=>ask,autotune:()=>f.actor,invalidate:()=>{invalidations++;}});
+ const req=action=>({url:PREFIX+action,method:'POST',socket:{remoteAddress:'127.0.0.1'},headers:{'x-noevia-store-token':'s'}});
+ await handle(req('facts'),{});const token=sent.pop().body.token;assert.equal(invalidations,0);
+ ask={token,plan:{kind:'filter',keep:[],skipped:[{index:0,reason:'System routing model — not tuned'}],complete:true,model:null}};
+ await handle(req('commit'),{});assert.equal(sent.pop().status,200);assert.equal(invalidations,1);
+ await handle(req('commit'),{});assert.equal(sent.pop().status,409);assert.equal(invalidations,1);
+ await handle({...req('commit'),headers:{}},{});assert.equal(sent.pop().status,404);assert.equal(invalidations,1);assert.equal(f.counts().workers,0);
+});

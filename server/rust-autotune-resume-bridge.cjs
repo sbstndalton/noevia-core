@@ -2,7 +2,7 @@
 const { trustedFront } = require('./trusted-front.cjs');
 const PREFIX = '/internal/autotune-resume/';
 const MAX_BYTES = 8 * 1024 * 1024;
-function createAutotuneResumeBridge({ secret, json, readJson, autotune, log = m => console.warn(m) }) {
+function createAutotuneResumeBridge({ secret, json, readJson, autotune, invalidate = () => {}, log = m => console.warn(m) }) {
   return async function handle(req, res) {
     const path = String(req.url || '').split('?')[0];
     const action = ['facts', 'prepare', 'commit'].find(a => path === PREFIX + a);
@@ -23,6 +23,7 @@ function createAutotuneResumeBridge({ secret, json, readJson, autotune, log = m 
       const answer = !live ? { available: false } : action === 'facts' ? { available: true, ...live.resumeFacts() }
         : action === 'prepare' ? await live.prepareResume(ask.token, { stage: ask.stage, selectors: ask.selectors }, controller.signal)
         : live.compareAndResume(ask.token, ask.plan);
+      if (action === 'commit' && answer.applied === true) invalidate();
       if (Buffer.byteLength(JSON.stringify(answer)) > MAX_BYTES) throw Error('facts over cap');
       json(res, answer.applied === false ? 409 : 200, answer);
     } catch {
