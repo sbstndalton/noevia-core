@@ -1060,3 +1060,69 @@ test('#2276 manager writes retain the hold through the reload and release it on 
   assert.deepEqual(calls, ['chat%name']);
   assert.equal(f.fetched[0].url, 'http://loader/api/v1/%73ections/chat%25name');
 });
+
+
+test('#2298 stable saved reranker is protected beside the deployment seed in public model actions', async () => {
+  const settings = require('../rerank-settings.cjs');
+  const prior = settings.current();
+  const env = { NOEVIA_FEATURE_RAG_RERANK: 'true', RERANK_BACKEND: 'llamacpp', RERANK_BASE_URL: 'http://synthetic-rerank', RERANK_MODEL: 'rerank-seed-a', MODEL_LOADER_URL: 'http://synthetic-loader' };
+  const store = new Map([[settings.KEY, JSON.stringify({ enabled: true, choice: 'llamacpp:rerank-current-b' })]]);
+  settings.install(settings.createRerankSettings({ store, env }));
+  let operations = 0;
+  const forbidden = async () => { operations++; throw Error('unexpected model operation'); };
+  try {
+    for (const name of ['rerank-seed-a', 'rerank-current-b']) {
+      const f = fixture({ env, manager: { load: forbidden, unload: forbidden, deleteModel: forbidden, request: forbidden } });
+      for (const action of ['load', 'unload', 'delete']) {
+        await f.call('POST', `/api/models/${action}`, { name }, 'admin');
+        assert.equal(f.sent.at(-1)?.status, 409, `${action} must protect ${name}`);
+        if (action === 'delete') assert.equal(f.sent.at(-1).body.service, 'reranker');
+      }
+      f.scan.set('models', { at: Date.now(), body: { models: [{ key: 'synthetic.gguf', modelId: name, sections: [name] }] } });
+      await f.call('DELETE', '/api/model-manager/sections/' + name, undefined, 'admin');
+      assert.equal(f.sent.at(-1)?.status, 409, 'section deletion must protect ' + name);
+      await f.call('POST', '/api/model-manager/models/delete', { models: ['synthetic.gguf'] }, 'admin');
+      assert.equal(f.sent.at(-1)?.status, 409, 'folder deletion must protect ' + name);
+      assert.equal(f.fetched.length, 0, 'refusal must precede loader calls');
+    }
+    assert.equal(operations, 0);
+  } finally { settings.install(prior); }
+});
+
+
+test('#2298 unreadable current reranker state refuses unsafe public actions before operations', async () => {
+  const settings = require('../rerank-settings.cjs');
+  const prior = settings.current();
+  const env = { MODEL_LOADER_URL: 'http://synthetic-loader' };
+  let operations = 0;
+  const forbidden = async () => { operations++; throw Error('unexpected operation'); };
+  const { errorResponse } = require('../http.cjs');
+  try {
+    for (const current of [
+      {}, { effectiveEnv() { throw Error('private provider details'); } },
+      { effectiveEnv: () => null }, { effectiveEnv: () => [] },
+      { effectiveEnv: () => ({ NOEVIA_FEATURE_RAG_RERANK: {}, RERANK_MODEL: 'm' }) },
+      { effectiveEnv: () => ({ NOEVIA_FEATURE_RAG_RERANK: true, RERANK_MODEL: {} }) },
+    ]) {
+      settings.install(current);
+      const f = fixture({ env, manager: { load: forbidden, unload: forbidden, deleteModel: forbidden, request: forbidden } });
+      f.scan.set('models', { at: Date.now(), body: { models: [{ key: 'synthetic.gguf', modelId: 'm', sections: ['m'] }] } });
+      for (const [method, path, body] of [
+        ['POST', '/api/models/load', { name: 'm' }],
+        ['POST', '/api/models/unload', { name: 'm' }],
+        ['POST', '/api/models/delete', { name: 'm' }],
+        ['DELETE', '/api/model-manager/sections/m'],
+        ['POST', '/api/model-manager/models/delete', { models: ['synthetic.gguf'] }],
+      ]) {
+        // Public /api/models writes drop the scan; restore the synthetic known row for the proxy.
+        f.scan.set('models', { at: Date.now(), body: { models: [{ key: 'synthetic.gguf', modelId: 'm', sections: ['m'] }] } });
+        await assert.rejects(f.call(method, path, body, 'admin'), (error) => {
+          assert.deepEqual(errorResponse(error), { status: 503, body: { error: 'Internal error' } });
+          return true;
+        });
+      }
+      assert.equal(f.fetched.length, 0);
+    }
+    assert.equal(operations, 0);
+  } finally { settings.install(prior); }
+});
