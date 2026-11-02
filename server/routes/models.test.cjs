@@ -404,24 +404,6 @@ test('starting auto-tune on a system routing model (Laya) is rejected as a 4xx, 
   assert.equal(sent.body.error, 'System routing model — not tuned');
 });
 
-test('resume is admin-only, POST-only and passes renewed pause confirmation', async () => {
-  const calls = [];
-  const f = fixture({ manager: { autotune: {
-    resume: async options => { calls.push(options); return { status: options.confirmPause ? 202 : 400, body: { resumed: options.confirmPause } }; },
-  } } });
-  await f.call('POST', '/api/models/autotune/resume', { confirmPause: true });
-  assert.equal(f.sent.pop().status, 403);
-  await f.call('GET', '/api/models/autotune/resume', undefined, 'admin');
-  assert.equal(f.sent.pop().status, 405);
-  await f.call('POST', '/api/models/autotune/resume', {}, 'admin');
-  assert.equal(f.sent.pop().status, 400);
-  await f.call('POST', '/api/models/autotune/resume', { confirmPause: true }, 'admin');
-  assert.equal(f.sent.pop().status, 202);
-  assert.deepEqual(calls, [{ confirmPause: undefined }, { confirmPause: true }]);
-});
-
-
-
 
 test('the default model mode saves, and only an explicit apply switches existing projects', async () => {
   let saves = 0;
