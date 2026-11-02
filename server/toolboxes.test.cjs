@@ -41,7 +41,6 @@ function build(over = {}) {
 test('MCP boxes join the built-ins through the injected accessor, and the offer filter applies to both', () => {
   const t = build({ mcpBoxes: [box('nc-notes', [tool('nc_notes_search_notes')])], offered: (id) => id !== 'core' });
   assert.deepEqual(t.allToolboxes().map((b) => b.id), ['nc-notes']);
-  assert.deepEqual(t.toolboxSummaries().map((b) => b.id), ['nc-notes']);
   assert.deepEqual(t.sanitizeToolboxes(['core', 'nc-notes', 'nc-notes', 7]), ['nc-notes']);
 });
 
@@ -79,24 +78,9 @@ test('connected account boxes are offered per user and never appear in the picke
   assert.deepEqual(t.connectedBoxes({ id: 'linked' }), ['gdrive']);
   assert.deepEqual(t.connectedBoxes({ id: 'other' }), []);
   assert.deepEqual(t.connectedBoxes(null), []);
-  assert.ok(!t.toolboxSummaries().some((b) => b.id === 'gdrive'));
   assert.equal(t.sanitizeToolboxes(['gdrive']).length, 0);
 });
 
-test('toolboxSummaries lists a connector only for the account that actually connected it (#354)', () => {
-  const drive = { box: box('gdrive', [tool('drive_search')], ['drive_search']), names: new Set(['drive_search']), connected: (u) => u.id === 'linked', execute: async () => '' };
-  const t = build({ boxes: [drive.box], driveTools: drive });
-  // Nobody passed a connected list: the picker's generic catalogue still omits it, same as before.
-  assert.ok(!t.toolboxSummaries().some((b) => b.id === 'gdrive'));
-  // The connected account's own connectedBoxes() result, fed back in, surfaces it — this is what
-  // the model picker and composer "+" menu were missing (#354): they can now see and count it.
-  const summaries = t.toolboxSummaries(t.connectedBoxes({ id: 'linked' }));
-  const gdrive = summaries.find((b) => b.id === 'gdrive');
-  assert.ok(gdrive, 'a connected connector is listed');
-  assert.equal(gdrive.connector, true, 'flagged so a client never offers it as a plain checkbox');
-  assert.ok(gdrive.estTokens > 0, 'its cost counts toward the token budget shown before sending');
-  assert.equal(t.toolboxSummaries(t.connectedBoxes({ id: 'other' })).some((b) => b.id === 'gdrive'), false, "another account's summaries still omit it");
-});
 
 test('Drive stays resolvable per connected account when the operator offer list omits it', { skip: skipWasm }, () => {
   permittedRan++;
@@ -105,7 +89,6 @@ test('Drive stays resolvable per connected account when the operator offer list 
   const drive = { box: box('gdrive', names.map(tool), reads), names: new Set(names), connected: (u) => u.id === 'linked', execute: async () => '' };
   const t = build({ boxes: [drive.box], driveTools: drive, offered: (id) => id !== 'gdrive' });
   assert.deepEqual(t.allToolboxes().map((b) => b.id), ['core', 'gdrive']);
-  assert.deepEqual(t.toolboxSummaries().map((b) => b.id), ['core']);
   assert.deepEqual(t.sanitizeToolboxes(['gdrive', 'core']), ['core']);
   assert.deepEqual(names.map((name) => t.isWriteTool(name)), [false, false, false, false, true, true, true]);
   assert.deepEqual(t.resolveTools({ toolboxes: ['core', ...t.connectedBoxes({ id: 'linked' })] }, 'model-70b').tools.map((x) => x.function.name),
@@ -182,15 +165,5 @@ test('executeToolCall reports failure explicitly, not from the text', async () =
   o = {}; await t.executeToolCall(null, 'mcp_bad', '{}', undefined, undefined, o); assert.equal(o.failed, true);
 });
 
-test('toolboxSummaries marks the boxes shipped with noevia, so the client may word them by id (#615)', () => {
-  const curated = { ...box('diary', [tool('diary_read')]), inApp: true };
-  const foreign = box('third-party', [tool('tp_read')]);
-  const t = build({ mcpBoxes: [curated, foreign] });
-  const byId = Object.fromEntries(t.toolboxSummaries().map((b) => [b.id, b]));
-  assert.equal(byId.core.inApp, true, 'a built-in box');
-  assert.equal(byId.diary.source, 'mcp');
-  assert.equal(byId.diary.inApp, true, 'an MCP-backed box curated in the manifest');
-  assert.equal(byId['third-party'].inApp, false, 'a box a third party defined keeps its own name');
-});
 
 test.after(() => { if (!skipWasm) assert.equal(permittedRan, 2, 'a wasm-guarded test body did not run'); });

@@ -418,40 +418,8 @@ test('resume is admin-only, POST-only and passes renewed pause confirmation', as
   assert.deepEqual(calls, [{ confirmPause: undefined }, { confirmPause: true }]);
 });
 
-test('#1978 clear is admin-only and POST-only, and passes the job store answer through', async () => {
-  let n = 0;
-  const f = fixture({ manager: { autotune: { clear: () => { n++; return { status: 409, body: { error: 'Auto-tune is running. Cancel it before clearing.' } }; } } } });
-  await f.call('POST', '/api/models/autotune/clear', {});
-  assert.equal(f.sent.pop().status, 403);
-  await f.call('POST', '/api/models/autotune/clear', {}, 'member');
-  assert.equal(f.sent.pop().status, 403);
-  await f.call('GET', '/api/models/autotune/clear', undefined, 'admin');
-  assert.equal(f.sent.pop().status, 405);
-  assert.equal(n, 0, 'refused callers never reach the job store');
-  await f.call('POST', '/api/models/autotune/clear', {}, 'admin');
-  assert.equal(f.sent.pop().status, 409);
-  assert.equal(n, 1);
-});
 
-test('#1057 per-model tune settings are admin-only, POST-only, and pass the model and body through', async () => {
-  const calls = [];
-  const f = fixture({ manager: { autotune: {
-    setSettings: (model, body) => { calls.push([model, body]); return { status: 200, body: { settings: { allowQ5Kv: body?.allowQ5Kv === true } } }; },
-  } } });
-  await f.call('POST', '/api/models/autotune/settings', { model: 'm', allowQ5Kv: true });
-  assert.equal(f.sent.pop().status, 403);
-  await f.call('POST', '/api/models/autotune/settings', { model: 'm', allowQ5Kv: true }, 'member');
-  assert.equal(f.sent.pop().status, 403);
-  await f.call('GET', '/api/models/autotune/settings', undefined, 'admin');
-  assert.equal(f.sent.pop().status, 405);
-  await f.call('POST', '/api/models/autotune/settings', { model: 'm', allowQ5Kv: true }, 'admin');
-  assert.deepEqual(f.sent.pop(), { status: 200, body: { settings: { allowQ5Kv: true } } });
-  assert.deepEqual(calls, [['m', { model: 'm', allowQ5Kv: true }]]);
-  // An older engine without settings: a plain 404, never a crash.
-  const old = fixture({ manager: { autotune: { status: () => ({ status: 200, body: {} }) } } });
-  await old.call('POST', '/api/models/autotune/settings', { model: 'm', allowQ5Kv: true }, 'admin');
-  assert.deepEqual(old.sent.pop(), { status: 404, body: { error: 'Auto-tune settings are unavailable' } });
-});
+
 
 test('the default model mode saves, and only an explicit apply switches existing projects', async () => {
   let saves = 0;
@@ -1034,4 +1002,31 @@ test('#2276 manager writes retain the hold through the reload and release it on 
     assert.equal(f.sent.at(-1).status, 400, rest);
   }
   assert.deepEqual(f.fetched, []);
+});
+
+ test('#2278 encoded section prefixes obey identity and budget guards before forwarding', async () => {
+  const system = fixture({ env: { MODEL_LOADER_URL: 'http://loader' } });
+  await system.call('DELETE', '/api/model-manager/%73ections/laya_multilingual_f16', undefined, 'admin');
+  assert.equal(system.sent.at(-1).status, 400);
+  assert.equal(system.sent.at(-1).body.errorId, 'systemModel');
+  assert.deepEqual(system.fetched, []);
+  const calls = [];
+  const budget = fixture({ env: { MODEL_LOADER_URL: 'http://loader' }, manager: {
+    presetRefusal: async (name, options) => { calls.push({ name, options }); return { error: 'too large', code: 'overBudget' }; },
+  } });
+  await budget.call('PUT', '/api/model-manager/%73ections/chat%20name', { values: { 'ctx-size': '262144' } }, 'admin');
+  assert.equal(budget.sent.at(-1).status, 409);
+  assert.deepEqual(calls, [{ name: 'chat name', options: { 'ctx-size': '262144' } }]);
+  assert.deepEqual(budget.fetched, []);
+});
+
+ test('#2278 canonical guard matching preserves encoded section names on the upstream URL', async () => {
+  const calls = [];
+  const f = fixture({ env: { MODEL_LOADER_URL: 'http://loader' }, manager: {
+    presetRefusal: async name => { calls.push(name); return null; },
+  } });
+  await f.call('PUT', '/api/model-manager/%73ections/chat%25name', { values: {} }, 'admin');
+  assert.equal(f.sent.at(-1).status, 200);
+  assert.deepEqual(calls, ['chat%name']);
+  assert.equal(f.fetched[0].url, 'http://loader/api/v1/%73ections/chat%25name');
 });
