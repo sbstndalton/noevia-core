@@ -1193,12 +1193,10 @@ const authRoutes = require('./routes/auth.cjs').createAuthRoutes({
 // only refuses a request that bypassed it.
 const storageRoutes = require('./routes/storage.cjs').createStorageRoutes({ json });
 // Public approval policy is Rust's; only pending chat Promise resolution remains here (#2282).
-const toolApprovalBridge = require('./rust-tool-approval-bridge.cjs').createToolApprovalBridge({
+const toolApprovals = require('./rust-tool-approval-bridge.cjs');
+const toolApprovalBridge = toolApprovals.createToolApprovalBridge({
   secret: FRONT_SECRET, pendingApprovals, json, readJson,
-  withActiveUser: (id, fn) => authService.db.transaction(() => {
-    const user = authService.db.prepare('SELECT id FROM users WHERE id = ? AND (disabled_at IS NULL OR disabled_at = 0)').get(id);
-    return user ? fn() : null;
-  })(),
+  withActiveUser: (id, fn) => toolApprovals.withActiveUser(authService.db, id, fn),
   log: message => console.warn(message),
 });
 // The workspace view, free-chat metas, context meters and transcripts (routes/chat-lists.cjs); it also

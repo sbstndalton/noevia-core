@@ -1,7 +1,7 @@
 'use strict';
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { createToolApprovalBridge, FACTS, RESOLVE } = require('./rust-tool-approval-bridge.cjs');
+const { createToolApprovalBridge, withActiveUser, FACTS, RESOLVE } = require('./rust-tool-approval-bridge.cjs');
 const { createApprovals } = require('./approvals.cjs');
 const { owned, refuseOwned } = require('./rust-tool-approvals.cjs');
 function fixture(gate = createApprovals()) {
@@ -83,4 +83,49 @@ test('write gate checkpoint refusal never consumes an approval or creates a chat
     assert.equal(f.gate.chatWideApproved('owner','chat','project:p'),false);
   } finally {ctl.abort();}
   assert.equal(await waiting,'aborted');
+});
+
+test('active-account transaction takes IMMEDIATE lock and checks the row before consuming', () => {
+  const events=[]; let live=true;
+  const db={
+    transaction: work => Object.assign(()=>assert.fail('DEFERRED transaction must never run'), {immediate:()=>{events.push('immediate');return work();}}),
+    prepare: sql=>({get:id=>{assert.match(sql,/disabled_at/);events.push(`check:${id}`);return live ? {id} : undefined;}}),
+  };
+  assert.equal(withActiveUser(db,'owner',()=>{events.push('consume');return 'done';}),'done');
+  assert.deepEqual(events,['immediate','check:owner','consume']);
+  live=false; events.length=0;
+  assert.equal(withActiveUser(db,'owner',()=>assert.fail('inactive account cannot consume')),null);
+  assert.deepEqual(events,['immediate','check:owner']);
+});
+test('real WAL account disable/delete cannot interleave with the checked pending decision', t => {
+  const {DatabaseSync}=require('node:sqlite');
+  const fs=require('node:fs'),os=require('node:os'),path=require('node:path');
+  const dir=fs.mkdtempSync(path.join(os.tmpdir(),'noevia-approval-lock-'));
+  const file=path.join(dir,'auth.db'); const db=new DatabaseSync(file),other=new DatabaseSync(file);
+  t.after(()=>{other.close();db.close();fs.rmSync(dir,{recursive:true,force:true});});
+  db.exec("PRAGMA journal_mode=WAL; CREATE TABLE users(id TEXT PRIMARY KEY,disabled_at INTEGER); INSERT INTO users VALUES('owner',NULL)");
+  other.exec('PRAGMA busy_timeout=0');
+  const adapter={prepare:sql=>db.prepare(sql),transaction:work=>({immediate:()=>{
+    db.exec('BEGIN IMMEDIATE');
+    try {const result=work();db.exec('COMMIT');return result;} catch(e){db.exec('ROLLBACK');throw e;}
+  }})};
+  let consumed=0;
+  assert.equal(withActiveUser(adapter,'owner',()=>{
+    assert.throws(()=>other.exec("UPDATE users SET disabled_at=1 WHERE id='owner'"),/locked/);
+    assert.throws(()=>other.exec("DELETE FROM users WHERE id='owner'"),/locked/);
+    consumed++;return true;
+  }),true);
+  other.exec("UPDATE users SET disabled_at=1 WHERE id='owner'");
+  assert.equal(withActiveUser(adapter,'owner',()=>{consumed++;}),null);
+  other.exec("DELETE FROM users WHERE id='owner'");
+  assert.equal(withActiveUser(adapter,'owner',()=>{consumed++;}),null);
+  assert.equal(consumed,1);
+});
+test('busy reserved account lock is generic503 and never reaches the resolver', async () => {
+  let consumed=0;
+  const db={transaction:()=>({immediate:()=>{throw Object.assign(Error('private lock detail'),{code:'SQLITE_BUSY'});}})};
+  const handle=createToolApprovalBridge({secret:'synthetic',pendingApprovals:new Map([['a',{userId:'owner',decide:()=>{consumed++;return true;}}]]),
+    withActiveUser:(id,fn)=>withActiveUser(db,id,fn),readJson:async()=>({user:'owner',id:'a'}),json:(r,status,body)=>Object.assign(r,{status,body})});
+  const res={};await handle({method:'POST',url:FACTS,socket:{remoteAddress:'127.0.0.1'},headers:{'x-noevia-store-token':'synthetic'}},res);
+  assert.equal(res.status,503);assert.equal(JSON.stringify(res).includes('private'),false);assert.equal(consumed,0);
 });

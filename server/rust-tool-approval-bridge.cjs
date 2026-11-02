@@ -6,6 +6,14 @@ const crypto = require('node:crypto');
 const { trustedFront, sameSecret } = require('./trusted-front.cjs');
 const FACTS = '/internal/tool-approvals/facts';
 const RESOLVE = '/internal/tool-approvals/resolve';
+// Reserve the SQLite writer lock BEFORE reading the account. WAL readers alone do not
+// exclude Rust's disable/delete transaction; pending.decide must run inside the same lock.
+function withActiveUser(db, id, consume) {
+  return db.transaction(() => {
+    const user = db.prepare('SELECT id FROM users WHERE id = ? AND (disabled_at IS NULL OR disabled_at = 0)').get(id);
+    return user ? consume() : null;
+  }).immediate();
+}
 function createToolApprovalBridge({ secret, pendingApprovals, withActiveUser, json, readJson, log = () => {} }) {
   const generations = new WeakMap();
   const generation = pending => {
@@ -44,4 +52,4 @@ function createToolApprovalBridge({ secret, pendingApprovals, withActiveUser, js
     return true;
   };
 }
-module.exports = { createToolApprovalBridge, FACTS, RESOLVE };
+module.exports = { createToolApprovalBridge, withActiveUser, FACTS, RESOLVE };
