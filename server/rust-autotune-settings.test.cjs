@@ -37,7 +37,7 @@ test('stale generations/configuration reject without overwriting later actor cha
 test('a pending-job mutation invalidates the exact snapshot without a tune or model call', t=>{
   const f=fixture(t,{job:{id:'pending',status:'cancelled',models:[{model:'synthetic',status:'pending'}]}});
   const snapshot=f.tuner.settingsFacts('synthetic');
-  assert.equal(f.tuner.clear().status,200);
+  assert.equal(f.tuner.compareAndClear(f.tuner.clearFacts().token).applied,true);
   const after=fs.readFileSync(f.file,'utf8');
   assert.deepEqual(f.tuner.commitSettings('synthetic',true,snapshot.token),{applied:false});
   assert.equal(fs.readFileSync(f.file,'utf8'),after);
@@ -68,4 +68,12 @@ test('every public method is refused by Core while sibling paths stay with their
     assert.deepEqual(got,{status:503,body:refusal.ROUTE_REFUSAL});
   }
   assert.equal(refusal.refuseOwned({url:'/api/models/autotune'},{},{parseRequestUrl:r=>new URL(r.url,'http://localhost')}),false);
+});
+
+test('a settings save invalidates an earlier clear snapshot without deleting its job', t=>{
+  const f=fixture(t,{job:{id:'finished',status:'passed',models:[]}});
+  const clear=f.tuner.clearFacts(), settings=f.tuner.settingsFacts('synthetic');
+  assert.equal(f.tuner.commitSettings('synthetic',true,settings.token).applied,true);
+  assert.deepEqual(f.tuner.compareAndClear(clear.token),{applied:false});
+  assert.equal(f.read().job.id,'finished');
 });

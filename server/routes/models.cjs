@@ -527,12 +527,11 @@ function createModelRoutes({ servedEmbeddingModels = (target) => require('../rag
       return json(res,405,{error:'Method not allowed'});
     }
 
-    if (p === '/api/models/autotune' || p === '/api/models/autotune/cancel' || p === '/api/models/autotune/resume' || p === '/api/models/autotune/clear' || p === '/api/models/autotune/untuned') {
+    if (p === '/api/models/autotune' || p === '/api/models/autotune/cancel' || p === '/api/models/autotune/resume' || p === '/api/models/autotune/untuned') {
       if(authn.user.role!=='admin')return json(res,403,{error:'Administrator required for shared model profiles'});
       if(!modelManager.autotune)return json(res,404,{error:'Auto-tune is unavailable'});
       let result;
       if(p.endsWith('/cancel')){if(req.method!=='POST')return json(res,405,{error:'Method not allowed'});result=modelManager.autotune.cancel();}
-      else if(p.endsWith('/clear')){if(req.method!=='POST')return json(res,405,{error:'Method not allowed'});if(!modelManager.autotune.clear)return json(res,404,{error:'Auto-tune is unavailable'});result=modelManager.autotune.clear();}
       else if(p.endsWith('/resume')){if(req.method!=='POST')return json(res,405,{error:'Method not allowed'});const body=await readJson(req);result=await modelManager.autotune.resume({confirmPause:body?.confirmPause});}
       else if(p.endsWith('/untuned')){if(req.method!=='GET')return json(res,405,{error:'Method not allowed'});result=await modelManager.autotune.untuned();}
       else if(req.method==='GET')result=modelManager.autotune.status(url.searchParams.get('model')||'');
@@ -541,12 +540,11 @@ function createModelRoutes({ servedEmbeddingModels = (target) => require('../rag
       res.setHeader('Cache-Control','no-store');
       return json(res,result.status,result.body);
     }
-    if (p === '/api/models/calibration' || p === '/api/models/calibration/cancel') {
+    if (p === '/api/models/calibration') {
       if(authn.user.role!=='admin')return json(res,403,{error:'Administrator required for shared model profiles'});
       if(!modelManager.calibration)return json(res,404,{error:'Native calibration is unavailable'});
       let result;
-      if(p.endsWith('/cancel')){if(req.method!=='POST')return json(res,405,{error:'Method not allowed'});result=modelManager.calibration.cancel();}
-      else if(req.method==='GET')result=modelManager.calibration.status(url.searchParams.get('model')||'');
+      if(req.method==='GET')result=modelManager.calibration.status(url.searchParams.get('model')||'');
       else if(req.method==='POST'){const body=await readJson(req);result=await modelManager.calibration.start(String(body?.model||''),{promptBudgetSeconds:body?.promptBudgetSeconds,confirmPause:body?.confirmPause});}
       else return json(res,405,{error:'Method not allowed'});
       res.setHeader('Cache-Control','no-store');

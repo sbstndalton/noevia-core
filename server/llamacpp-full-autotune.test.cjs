@@ -786,8 +786,8 @@ test('#1978 clear drops a finished job record only: measurements, settings and m
   await finished(f.manager);
   const before = JSON.parse(fs.readFileSync(f.stateFile, 'utf8'));
   const ini = fs.readFileSync(f.ini, 'utf8');
-  const r = f.manager.autotune.clear();
-  assert.deepEqual([r.status, r.body], [200, { cleared: true }]);
+  const r = f.manager.autotune.compareAndClear(f.manager.autotune.clearFacts().token);
+  assert.deepEqual(r, { applied: true });
   assert.equal(f.manager.autotune.status().body.job, undefined);
   const after = JSON.parse(fs.readFileSync(f.stateFile, 'utf8'));
   assert.equal(after.job, undefined);
@@ -795,7 +795,7 @@ test('#1978 clear drops a finished job record only: measurements, settings and m
   assert.deepEqual(after.settings, before.settings);
   assert.equal(f.manager.autotune.status('synthetic').body.settings.allowQ5Kv, true);
   assert.equal(fs.readFileSync(f.ini, 'utf8'), ini);
-  assert.equal(f.manager.autotune.clear().status, 409, 'nothing left to clear');
+  assert.equal(f.manager.autotune.compareAndClear(f.manager.autotune.clearFacts().token).applied, false, 'nothing left to clear');
   assert.equal((await f.manager.autotune.resume({ confirmPause: true })).status, 409);
 });
 
@@ -805,17 +805,17 @@ test('#1978 clear keeps finished measurements in history after a passed run', as
   assert.equal((await finished(f.manager)).status, 'passed');
   const history = f.manager.autotune.status('synthetic').body.history;
   assert.ok(history.length > 0);
-  assert.equal(f.manager.autotune.clear().status, 200);
+  assert.equal(f.manager.autotune.compareAndClear(f.manager.autotune.clearFacts().token).applied, true);
   assert.deepEqual(f.manager.autotune.status('synthetic').body.history, history);
 });
 
 test('#1978 clear is refused while a run is active, and the run carries on', async t => {
   let result;
-  const f = fixture(t, { onChat: ({ manager }) => { result ||= manager.autotune.clear(); } });
+  const f = fixture(t, { onChat: ({ manager }) => { result ||= manager.autotune.compareAndClear(manager.autotune.clearFacts().token); } });
   await f.manager.autotune.start('synthetic', { confirmPause: true });
-  assert.equal(f.manager.autotune.clear().status, 409, 'refused while starting');
+  assert.equal(f.manager.autotune.compareAndClear(f.manager.autotune.clearFacts().token).applied, false, 'refused while starting');
   const j = await finished(f.manager);
-  assert.equal(result.status, 409); assert.match(result.body.error, /running/);
+  assert.equal(result.applied, false);
   assert.equal(j.status, 'passed');
 });
 
