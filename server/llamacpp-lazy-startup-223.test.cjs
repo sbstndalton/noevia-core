@@ -55,7 +55,7 @@ function freshModules(t) {
   return { autoconfig: () => require(AUTOCONFIG), calibration: () => require(CALIBRATION) };
 }
 async function settle(m) {
-  m.calibration.cancel();
+  m.calibration.compareAndAbort(m.calibration.cancellationFacts().token);
   for (let i = 0; i < 400 && m.calibration.status().body.job?.status === 'running'; i++) await new Promise((resolve) => setTimeout(resolve, 25));
   assert.notEqual(m.calibration.status().body.job?.status, 'running', 'the cancelled calibration must stop');
 }

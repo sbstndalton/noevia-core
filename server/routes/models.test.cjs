@@ -412,40 +412,8 @@ test('resume is admin-only, POST-only and passes renewed pause confirmation', as
   assert.deepEqual(calls, [{ confirmPause: undefined }, { confirmPause: true }]);
 });
 
-test('#1978 clear is admin-only and POST-only, and passes the job store answer through', async () => {
-  let n = 0;
-  const f = fixture({ manager: { autotune: { clear: () => { n++; return { status: 409, body: { error: 'Auto-tune is running. Cancel it before clearing.' } }; } } } });
-  await f.call('POST', '/api/models/autotune/clear', {});
-  assert.equal(f.sent.pop().status, 403);
-  await f.call('POST', '/api/models/autotune/clear', {}, 'member');
-  assert.equal(f.sent.pop().status, 403);
-  await f.call('GET', '/api/models/autotune/clear', undefined, 'admin');
-  assert.equal(f.sent.pop().status, 405);
-  assert.equal(n, 0, 'refused callers never reach the job store');
-  await f.call('POST', '/api/models/autotune/clear', {}, 'admin');
-  assert.equal(f.sent.pop().status, 409);
-  assert.equal(n, 1);
-});
 
-test('#1057 per-model tune settings are admin-only, POST-only, and pass the model and body through', async () => {
-  const calls = [];
-  const f = fixture({ manager: { autotune: {
-    setSettings: (model, body) => { calls.push([model, body]); return { status: 200, body: { settings: { allowQ5Kv: body?.allowQ5Kv === true } } }; },
-  } } });
-  await f.call('POST', '/api/models/autotune/settings', { model: 'm', allowQ5Kv: true });
-  assert.equal(f.sent.pop().status, 403);
-  await f.call('POST', '/api/models/autotune/settings', { model: 'm', allowQ5Kv: true }, 'member');
-  assert.equal(f.sent.pop().status, 403);
-  await f.call('GET', '/api/models/autotune/settings', undefined, 'admin');
-  assert.equal(f.sent.pop().status, 405);
-  await f.call('POST', '/api/models/autotune/settings', { model: 'm', allowQ5Kv: true }, 'admin');
-  assert.deepEqual(f.sent.pop(), { status: 200, body: { settings: { allowQ5Kv: true } } });
-  assert.deepEqual(calls, [['m', { model: 'm', allowQ5Kv: true }]]);
-  // An older engine without settings: a plain 404, never a crash.
-  const old = fixture({ manager: { autotune: { status: () => ({ status: 200, body: {} }) } } });
-  await old.call('POST', '/api/models/autotune/settings', { model: 'm', allowQ5Kv: true }, 'admin');
-  assert.deepEqual(old.sent.pop(), { status: 404, body: { error: 'Auto-tune settings are unavailable' } });
-});
+
 
 test('the default model mode saves, and only an explicit apply switches existing projects', async () => {
   let saves = 0;

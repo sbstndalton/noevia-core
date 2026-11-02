@@ -211,11 +211,11 @@ test('cancelling restores the original preset and releases chat',async t=>{
   const {manager,ini,original}=fixture(t,{onLoad:ctx=>ctx===16384?gate:undefined});
   await manager.calibration.start('synthetic',{promptBudgetSeconds:120,confirmPause:true});
   for(let i=0;i<50;i++)await new Promise(r=>setImmediate(r));
-  assert.equal(manager.calibration.cancel().status,202);release();
+  assert.equal(manager.calibration.compareAndAbort(manager.calibration.cancellationFacts().token).applied,true);release();
   const job=await finished(manager);
   assert.equal(job.status,'cancelled');assert.equal(fs.readFileSync(ini,'utf8'),original);
   const leave=manager.enterInference();leave();
-  assert.equal(manager.calibration.cancel().status,409);
+  assert.equal(manager.calibration.cancellationFacts().job.status === 'running',false);
 });
 
 test('a model that cannot load at the starting size fails and keeps the original preset',async t=>{
@@ -293,7 +293,7 @@ test('#871 a restart during the first step restores the original profile',async 
   assert.equal(job.status,'interrupted');assert.equal(job.restored,true);assert.doesNotMatch(job.error,/not restored/);
   assert.equal(fs.readFileSync(ini,'utf8'),original);
   // Let the stranded first run end; it must not overwrite the restored file.
-  manager.calibration.cancel();release();await finished(manager);
+  manager.calibration.compareAndAbort(manager.calibration.cancellationFacts().token);release();await finished(manager);
   assert.equal(fs.readFileSync(ini,'utf8'),original);
 });
 
