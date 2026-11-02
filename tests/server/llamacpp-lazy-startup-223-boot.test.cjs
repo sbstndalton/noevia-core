@@ -157,11 +157,26 @@ async function boot(t, mode) {
     let json = null; try { json = JSON.parse(res.text); } catch { /* not JSON */ }
     return { status: res.status, json, text: res.text };
   };
-  return { call, router, log: () => log.join(''), bootFaults: () => log.join('').split('\n').filter((l) => BOOT_FAULT.test(l)).length, running: () => child.exitCode === null };
+  const cancelCalibration = async () => {
+    const options = { headers: { 'x-noevia-store-token': store.token, 'content-type': 'application/json' } };
+    let generation;
+    for (let attempt = 0; attempt < 10; attempt++) {
+      const facts = await request(base, 'POST', '/internal/calibration-cancel/facts', { ...options, body: '{}' });
+      const state = JSON.parse(facts.text);
+      if (state.job?.status !== 'running') return;
+      if (generation && state.generation !== generation) throw Error('synthetic calibration was replaced');
+      generation = state.generation;
+      const aborted = await request(base, 'POST', '/internal/calibration-cancel/abort', { ...options, body: JSON.stringify({ token: state.token }) });
+      if (aborted.status === 200) return;
+      assert.equal(aborted.status, 409, aborted.text);
+    }
+    assert.fail('synthetic calibration changed too often to cancel');
+  };
+  return { call, cancelCalibration, router, log: () => log.join(''), bootFaults: () => log.join('').split('\n').filter((l) => BOOT_FAULT.test(l)).length, running: () => child.exitCode === null };
 }
 
 async function stopCalibration(s) {
-  await s.call('POST', '/api/models/calibration/cancel', {});
+  await s.cancelCalibration();
   for (let i = 0; i < 200; i++) {
     const r = await s.call('GET', '/api/models/calibration?model=small');
     if (r.json?.job?.status !== 'running') return;

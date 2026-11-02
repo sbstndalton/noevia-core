@@ -96,14 +96,14 @@ function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloa
     if(expectText!==null&&before!==expectText)return {ok:false,status:409,refused:'file_changed',body:{}};
     let result;
     try {result=await request('/models?reload=1',{},timeout);}
-    catch(e){reloadGuard.forget();throw e;}
-    if(!result.ok){reloadGuard.forget();return result;}
+    catch(e){await reloadGuard.forget();throw e;}
+    if(!result.ok){await reloadGuard.forget();return result;}
     try {
       const after=await rawModels();
       let textAfter=null;try{textAfter=presets?.snapshot().text??null;}catch{}
-      if(after.ok&&Array.isArray(after.body?.data)&&before!==null)reloadGuard.record(before,after.body.data,textAfter);
-      else reloadGuard.forget();
-    } catch {reloadGuard.forget();}
+      if(after.ok&&Array.isArray(after.body?.data)&&before!==null)await reloadGuard.record(before,after.body.data,textAfter);
+      else await reloadGuard.forget();
+    } catch {await reloadGuard.forget();}
     return result;
   }
   async function mutate(fn) {const leave=maintenance.enter();try{return await fn();}finally{leave();}}
@@ -714,8 +714,8 @@ function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloa
     evidence, recordEvidence, importEvidence,
     // #2210: waits (bounded) until the front has applied a queued record (recordEvidence's handle).
     evidenceApplied: (handle,options)=>evidenceInbox?evidenceInbox.applied(handle,options):Promise.resolve(true),
-    calibration: calibrator ? { start: calibrator.start, cancel: calibrator.cancel, status: calibrator.status, recover: calibrator.recover } : null,
-    autotune: autotuner ? { start: (...args) => { const fault = budgetFaultReason(); return fault ? Promise.resolve({ ok: false, status: 503, body: budgetFaultBody('Auto-tune unavailable', fault) }) : autotuner.start(...args); }, resume: autotuner.resume, cancel: autotuner.cancel, clear: autotuner.clear, status: autotuner.status, setSettings: autotuner.setSettings, recover: autotuner.recover, untuned: autotuner.untuned } : null,
+    calibration: calibrator ? { start: calibrator.start, cancellationFacts: calibrator.cancellationFacts, compareAndAbort: calibrator.compareAndAbort, status: calibrator.status, recover: calibrator.recover } : null,
+    autotune: autotuner ? { start: (...args) => { const fault = budgetFaultReason(); return fault ? Promise.resolve({ ok: false, status: 503, body: budgetFaultBody('Auto-tune unavailable', fault) }) : autotuner.start(...args); }, resume: autotuner.resume, cancel: autotuner.cancel, clearFacts: autotuner.clearFacts, compareAndClear: autotuner.compareAndClear, status: autotuner.status, settingsFacts: autotuner.settingsFacts, commitSettings: autotuner.commitSettings, recover: autotuner.recover, untuned: autotuner.untuned } : null,
     // noevia#2115: the gate refuses to unload a model in use (409 `model_in_use`); `unloadAnyway` is the
     // admin's choice to end what it is answering, and needs INFERENCE_GATE_ADMIN_TOKEN.
     unload: model => mutate(()=>post('/models/unload', { model })),
