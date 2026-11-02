@@ -174,7 +174,6 @@ function defaultServingChecks() {
 }
 const NO_PROBE_PASSED = 'The model failed every quality probe at its reference settings, so auto-tune cannot tell whether a setting harms it.';
 const hash = value => crypto.createHash('sha256').update(JSON.stringify(value)).digest('hex');
-const sorted = value => Object.fromEntries(Object.entries(value || {}).sort(([a], [b]) => a.localeCompare(b)));
 const cancelledError = () => Object.assign(Error('Cancelled'), { cancelled: true });
 const publicJob = job => job && JSON.parse(JSON.stringify(job, (key, value) =>
   key.startsWith('_') || ['originalText', 'lastRevision', 'originalRevision', 'beforeText'].includes(key) ? undefined : value));
@@ -385,39 +384,42 @@ function createFullAutotuner({ request: engineRequest, rawModels: engineRawModel
   const wrote = j => { if (!j._backedUp) { j._backedUp = true; save(); } };
   // kvs (#1060): the KV list the tune used (the item's snapshot) or, for the untuned scan, the one
   // the model's switch gives now; a q5 list differs from a default one either way round.
+  const scanProfile = model => { const p = presets.get(model); return { exists: !!p.exists, defaults: p.defaults || {}, options: p.options || {} }; };
+  const scanPolicy = request => require('./dav-parse-wasm.cjs').autotuneScan({ version: 1, ...request });
   async function signature(model, suppliedIdentity, kvs = candidatesFor(model)) {
     const identity = suppliedIdentity || await identityFor(model);
     if (!identity) throw publicFail('Model identity could not be read.');
-    const profile = presets.get(model);
-    // A default list adds nothing, so tunes from before #1057 stay current.
-    return hash({ version: VERSION, identity, options: sorted({ ...profile.defaults, ...profile.options }), ...(kvs.some(k => k === 'q5_1' || k === 'q5_0') ? { kv: 'q5' } : {}) });
+    return scanPolicy({ op: 'signature', row: { identity, profile: scanProfile(model), allowQ5Kv: kvs.some(k => k === 'q5_1' || k === 'q5_0') } }).signature;
   }
-  async function candidates() {
+  // Bounded per-use owner facts only; both the runner and native public discovery use Rust's
+  // same classification/signature/selection. No cache, selection duplicate or public reply here.
+  async function scanFacts({ signal } = {}) {
+    signal?.throwIfAborted();
     const r = await rawModels();
+    signal?.throwIfAborted();
     if (!r.ok || !Array.isArray(r.body?.data)) throw publicFail('The model server is not responding.');
-    const models = [], skipped = [];
-    // #1079: a long profile is tuned with Long mode from its model's page, never by a Fast scan.
+    if (r.body.data.length > 512) throw Error('scan row cap');
     const longs = new Set(longProfiles.pairsOf(r.body.data, presets).map(p => p.long));
-    for (const row of r.body.data) {
-      if (longs.has(row.id)) { skipped.push({ model: row.id, reason: LONG_PROFILE_REASON }); continue; }
-      const profile = presets.get(row.id), args = row.status?.args || [];
-      if (isSystemModel(row.id, modelPathFromArgs(args))) {
-        skipped.push({ model: row.id, reason: SYSTEM_MODEL_REASON }); continue;
-      }
-      if (fileMissing(row)) { skipped.push({ model: row.id, reason: 'Model file missing from the models folder' }); continue; }
-      if (!profile.exists || args.some(a => ['--embedding', '--embeddings', '--rerank', '--reranking'].includes(a)) ||
-          ['embedding', 'embeddings', 'rerank', 'reranking'].some(k => ['true', '1', 'on'].includes(String(profile.options[k])))) {
-        skipped.push({ model: row.id, reason: 'Not a configured chat model' }); continue;
-      }
-      const current = await signature(row.id);
-      // #1060: the newest tune is the one in models.ini; an older entry with another KV list is not.
+    const rows = r.body.data.map(row => {
+      const profile = scanProfile(row.id);
+      return { id: row.id, long: longs.has(row.id), system: isSystemModel(row.id, modelPathFromArgs(row.status?.args || [])),
+        missing: !!fileMissing(row), configured: profile.exists, profile, args: row.status?.args || [], allowQ5Kv: settingsOf(row.id).allowQ5Kv, latest: null };
+    });
+    const { eligible } = scanPolicy({ op: 'classify', rows });
+    for (const i of eligible) {
+      const row = rows[i];
+      signal?.throwIfAborted();
+      row.identity = await identityFor(row.id);
+      signal?.throwIfAborted();
+      if (!row.identity) throw publicFail('Model identity could not be read.');
+      // Preserve the owner reads after identity resolves: signature/profile then latest history.
+      row.profile = scanProfile(row.id);
       const latest = state.history[row.id]?.[0];
-      if (latest?.version === VERSION && latest.signature === current) skipped.push({ model: row.id, reason: 'Current tune already applied' });
-      else models.push(row.id);
+      row.latest = latest == null ? null : { version: latest.version, signature: latest.signature };
     }
-    return { models, skipped };
+    return { version: 1, rows };
   }
-  async function untuned() { try { return { ok: true, status: 200, body: await candidates() }; } catch (e) { return { ok: false, status: 502, body: { error: clientMessage(e, 'Could not list untuned models.') } }; } }
+  async function candidates() { return scanPolicy({ op: 'scan', ...await scanFacts() }); }
   async function unloadAll({ restoring = false } = {}) {
     for (;;) {
       const foreign = await unloadAllOnce({ restoring });
@@ -1614,6 +1616,6 @@ function createFullAutotuner({ request: engineRequest, rawModels: engineRawModel
     } catch (e) { return { ok: false, status: 409, body: { error: clientMessage(e, 'Auto-tune could not resume.') } }; }
     finally { starting = false; }
   }
-  return { start, resume, cancel, clear, status, setSettings, untuned, recover, flushReload, completion: () => completion };
+  return { start, resume, cancel, clear, status, setSettings, scanFacts, recover, flushReload, completion: () => completion };
 }
 module.exports = { createFullAutotuner, qualityCheck, qualityFailure, QUALITY, VERSION, newModel, hasHarmonyReasoning, kvCandidates, preferKv, bf16Unsupported, MODES, LONG_PROFILE_REASON };

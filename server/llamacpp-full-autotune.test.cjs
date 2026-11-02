@@ -5,6 +5,8 @@ const { createModelManager } = require('./model-manager.cjs');
 const { createPresetStore } = require('./llamacpp-presets.cjs');
 const { QUALITY, qualityCheck, qualityFailure, newModel } = require('./llamacpp-full-autotune.cjs');
 
+const testIdentity = (model, build = 'fake-v1') => ({ arch: 'synthetic', quant: 'Q8_0', artifact: 'synthetic:' + model, build, profile: '0'.repeat(64), hardware: 'fake' });
+const scanUntuned = async tuner => ({ body: require('./dav-parse-wasm.cjs').autotuneScan({ op: 'scan', ...await tuner.scanFacts() }) });
 // #1057: the fake engine's f16 quirks (failLoadF16, badF16, the shorter recall) hold for both
 // unquantized cache types, bf16 being the first candidate now.
 const unq = o => ['bf16', 'f16'].includes(o['cache-type-k']);
@@ -76,7 +78,7 @@ function fixture(t, { badSampling = false, models = ['synthetic'], onChat, onUnl
   const makeManager = () => createModelManager({ kind: 'llamacpp', baseUrl: 'http://synthetic', presetPath: ini, fetchJson, fetchStream,
     calibrationStatePath: path.join(dir, 'cal.json'), autotuneStatePath: stateFile,
     calibrationOptions: { sleep: async () => {}, readMemory: () => 20, ...calibrationExtra },
-    autotuneOptions: { ...autotuneExtra, ...(servingChecks ? { servingChecks } : {}), ...(unloadPolls || unloadStuck ? { sleep: async () => {} } : {}), betweenModelsMs: 25, idleTimeoutMs, readMemory: () => 20, identityFor: async m => (++identityReads > 1 && loseIdentityAfterStart ? null : { model: m, hardware: 'fake', build }) } });
+    autotuneOptions: { ...autotuneExtra, ...(servingChecks ? { servingChecks } : {}), ...(unloadPolls || unloadStuck ? { sleep: async () => {} } : {}), betweenModelsMs: 25, idleTimeoutMs, readMemory: () => 20, identityFor: async m => (++identityReads > 1 && loseIdentityAfterStart ? null : testIdentity(m, build)) } });
   let manager = makeManager();
   return { manager, ini, stateFile, dir, original, requests, servingRequests, options, status, restart: () => { manager = makeManager(); return manager; }, setBuild: b => { build = b; } };
 }
@@ -92,7 +94,7 @@ async function finished(manager) {
 const phase = (item, id) => item.phases.find(p => p.id === id);
 test('ordered script commits KV, context, drafting and batch with measured evidence', async t => {
   const f = fixture(t);
-  assert.deepEqual((await f.manager.autotune.untuned()).body.models, ['synthetic']);
+  assert.deepEqual((await scanUntuned(f.manager.autotune)).body.models, ['synthetic']);
   assert.equal((await f.manager.autotune.start('synthetic', { confirmPause: true })).status, 202);
   const j = await finished(f.manager), item = j.models[0];
   assert.equal(j.status, 'passed', j.error);
@@ -110,7 +112,7 @@ test('ordered script commits KV, context, drafting and batch with measured evide
   const o = f.options('synthetic');
   assert.equal(o['ctx-size'], '8192'); assert.equal(o['cache-type-k'], 'bf16');
   assert.equal(o['spec-type'], 'draft-mtp'); assert.equal(o['ubatch-size'], '1024');
-  assert.equal((await f.manager.autotune.untuned()).body.models.length, 0);
+  assert.equal((await scanUntuned(f.manager.autotune)).body.models.length, 0);
   assert.equal(f.manager.autotune.status('synthetic').body.history.length, 1);
   assert.doesNotMatch(JSON.stringify(j), /beforeText|originalText|lastRevision|_revision/);
 });
@@ -152,7 +154,7 @@ test('a job persisted before this fix that lists only Laya finishes cleanly on r
 
 test('Laya is reported as a system model, not a chat model needing tuning, and cannot be started directly', async t => {
   const f = fixture(t, { models: ['synthetic', 'laya_multilingual_f16'] });
-  const scan = (await f.manager.autotune.untuned()).body;
+  const scan = (await scanUntuned(f.manager.autotune)).body;
   assert.deepEqual(scan.models, ['synthetic']);
   assert.deepEqual(scan.skipped.find(s => s.model === 'laya_multilingual_f16'), { model: 'laya_multilingual_f16', reason: 'System routing model — not tuned' });
   assert.notEqual(scan.skipped.find(s => s.model === 'embed').reason, scan.skipped.find(s => s.model === 'laya_multilingual_f16').reason);
@@ -386,24 +388,24 @@ test('legacy running journal restores only after unloading and confirmed reload'
 test('engine identity and setting edits invalidate previously complete tunes', async t => {
   const f = fixture(t);
   await f.manager.autotune.start('synthetic', { confirmPause: true }); await finished(f.manager);
-  assert.deepEqual((await f.manager.autotune.untuned()).body.models, []);
+  assert.deepEqual((await scanUntuned(f.manager.autotune)).body.models, []);
   f.setBuild('fake-v2');
-  assert.deepEqual((await f.manager.autotune.untuned()).body.models, ['synthetic']);
+  assert.deepEqual((await scanUntuned(f.manager.autotune)).body.models, ['synthetic']);
   f.setBuild('fake-v1');
   fs.writeFileSync(f.ini, fs.readFileSync(f.ini, 'utf8').replace(/\[synthetic\]([^[]*?)ctx-size = 8192/, '[synthetic]$1ctx-size = 12288'));
-  assert.deepEqual((await f.manager.autotune.untuned()).body.models, ['synthetic']);
+  assert.deepEqual((await scanUntuned(f.manager.autotune)).body.models, ['synthetic']);
 });
 
 test('#1060 the tune signature follows the list the run used: q5 on makes a default tune stale, off makes a q5 tune stale', async t => {
   const f = fixture(t);
   await f.manager.autotune.start('synthetic', { confirmPause: true }); await finished(f.manager);
-  assert.deepEqual((await f.manager.autotune.untuned()).body.models, []);
+  assert.deepEqual((await scanUntuned(f.manager.autotune)).body.models, []);
   assert.equal(f.manager.autotune.setSettings('synthetic', { allowQ5Kv: true }).status, 200);
-  assert.deepEqual((await f.manager.autotune.untuned()).body.models, ['synthetic']);
+  assert.deepEqual((await scanUntuned(f.manager.autotune)).body.models, ['synthetic']);
   await f.manager.autotune.start('synthetic', { confirmPause: true }); await finished(f.manager);
-  assert.deepEqual((await f.manager.autotune.untuned()).body.models, [], 'tuned with q5 allowed, the switch still on');
+  assert.deepEqual((await scanUntuned(f.manager.autotune)).body.models, [], 'tuned with q5 allowed, the switch still on');
   f.manager.autotune.setSettings('synthetic', { allowQ5Kv: false });
-  assert.deepEqual((await f.manager.autotune.untuned()).body.models, ['synthetic'], 'a q5 tune is stale once q5 is off');
+  assert.deepEqual((await scanUntuned(f.manager.autotune)).body.models, ['synthetic'], 'a q5 tune is stale once q5 is off');
 });
 
 test('#1060 the switch cannot change under a queued model; after the job, the change makes it untuned', async t => {
@@ -416,9 +418,9 @@ test('#1060 the switch cannot change under a queued model; after the job, the ch
   assert.equal(j.status, 'passed', j.error);
   assert.deepEqual(tried, [409]);
   assert.deepEqual(j.models.map(m => m.kv), [['bf16', 'q8_0'], ['bf16', 'q8_0']]);
-  assert.deepEqual((await f.manager.autotune.untuned()).body.models, []);
+  assert.deepEqual((await scanUntuned(f.manager.autotune)).body.models, []);
   assert.equal(f.manager.autotune.setSettings('two', { allowQ5Kv: true }).status, 200);
-  assert.deepEqual((await f.manager.autotune.untuned()).body.models, ['two']);
+  assert.deepEqual((await scanUntuned(f.manager.autotune)).body.models, ['two']);
 });
 
 test('a model without an MTP head chooses measured n-gram drafting', async t => {
@@ -437,7 +439,7 @@ test('final saved-profile quality failure does not publish a successful tune', a
   assert.deepEqual(j.models[0].phases.map(p => p.status), ['passed','passed','passed','passed','passed']);
   assert.equal(j.models[0].result, undefined);
   assert.equal(f.manager.autotune.status('synthetic').body.history.length, 0);
-  assert.deepEqual((await f.manager.autotune.untuned()).body.models, ['synthetic']);
+  assert.deepEqual((await scanUntuned(f.manager.autotune)).body.models, ['synthetic']);
 });
 
 test('identity change during final validation does not publish measurements', async t => {
@@ -657,9 +659,9 @@ test('#545: the bulk untuned list skips presets whose model file is missing, and
   const rows = [{ id: 'present', source: 'preset', status: { args: [] } }, { id: 'ghost', source: 'preset', status: { args: [] } }];
   const presets = { get: () => ({ exists: true, options: {}, defaults: {} }), files: () => ({}) };
   const build = fileMissing => createFullAutotuner({ request: async () => ({ ok: true, body: {} }), rawModels: async () => ({ ok: true, body: { data: rows } }), presets,
-    maintenance: {}, applyUnlocked: async () => ({ ok: true }), identityFor: async m => ({ model: m }), stateFile: path.join(dir, 'tune.json'), ...(fileMissing ? { fileMissing } : {}) });
-  assert.deepEqual((await build().untuned()).body.models, ['present', 'ghost'], 'default: nothing is treated as missing');
-  const scan = (await build(row => row.id === 'ghost').untuned()).body;
+    maintenance: {}, applyUnlocked: async () => ({ ok: true }), identityFor: async m => testIdentity(m), stateFile: path.join(dir, 'tune.json'), ...(fileMissing ? { fileMissing } : {}) });
+  assert.deepEqual((await scanUntuned(build())).body.models, ['present', 'ghost'], 'default: nothing is treated as missing');
+  const scan = (await scanUntuned(build(row => row.id === 'ghost'))).body;
   assert.deepEqual(scan.models, ['present']);
   assert.deepEqual(scan.skipped, [{ model: 'ghost', reason: 'Model file missing from the models folder' }]);
 });
@@ -1844,7 +1846,7 @@ function owedReread(t, { request, rawModels }) {
   fs.writeFileSync(stateFile, JSON.stringify({ job: { status: 'interrupted', model: 'synthetic', _reloadPending: true, models: [] } }));
   const presets = { get: () => ({ exists: true, options: {}, defaults: {} }), files: () => ({}), snapshot: () => ({ text: '', revision: '' }) };
   const autotune = createFullAutotuner({ request, rawModels, presets, maintenance: {}, applyUnlocked: async () => ({ ok: true }),
-    identityFor: async m => ({ model: m }), stateFile, foreignPollMs: 1 });
+    identityFor: async m => testIdentity(m), stateFile, foreignPollMs: 1 });
   const owed = () => JSON.parse(fs.readFileSync(stateFile, 'utf8')).job._reloadPending;
   return { autotune, owed };
 }
@@ -1950,7 +1952,7 @@ test('#1079 a Fast tune never touches the -long section, and the untuned scan sk
   assert.equal((await f.manager.autotune.start('synthetic', { confirmPause: true, mode: 'long' })).status, 202);
   assert.equal((await finished(f.manager)).status, 'passed');
   const longBefore = sectionText(fs.readFileSync(f.ini, 'utf8'), 'synthetic-long');
-  const scan = (await f.manager.autotune.untuned()).body;
+  const scan = (await scanUntuned(f.manager.autotune)).body;
   assert.deepEqual(scan.skipped.find(s => s.model === 'synthetic-long'), { model: 'synthetic-long', reason: LONG_PROFILE_REASON });
   assert.ok(!scan.models.includes('synthetic-long'));
   f.requests.length = 0;
@@ -1996,7 +1998,7 @@ test('#1079 an existing -long section that loads another file is never tuned or 
   assert.match(r.body.error, /already has a section named synthetic-long that loads a different file/);
   assert.equal(fs.readFileSync(f.ini, 'utf8'), text);
   // Not a long profile, so the Fast scan treats it as a model of its own, as before.
-  assert.ok(!(await f.manager.autotune.untuned()).body.skipped.some(s => s.reason === LONG_PROFILE_REASON));
+  assert.ok(!(await scanUntuned(f.manager.autotune)).body.skipped.some(s => s.reason === LONG_PROFILE_REASON));
 });
 
 test('#1079 a section the router does not pick up is taken out again and the tune stops', async t => {

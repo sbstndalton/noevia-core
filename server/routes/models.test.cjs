@@ -377,23 +377,15 @@ test('engine-specific routes say what is unavailable and guard the method', asyn
 test('bulk tuning discovery and start are admin-only and the server owns the queue', async () => {
   const starts = [];
   const f = fixture({ manager: { autotune: {
-    untuned: async () => ({ status: 200, body: { models: ['m'], skipped: [] } }),
     start: async (model, options) => { starts.push({ model, options }); return { status: 202, body: { status: 'running' } }; },
   } } });
-  await f.call('GET', '/api/models/autotune/untuned');
-  assert.equal(f.sent.pop().status, 403);
-  await f.call('GET', '/api/models/autotune/untuned', undefined, 'admin');
-  assert.deepEqual(f.sent.pop().body.models, ['m']);
   await f.call('POST', '/api/models/autotune', { untuned: true, confirmPause: true, models: ['untrusted'] }, 'admin');
   assert.equal(f.sent.pop().status, 202);
   assert.deepEqual(starts, [{ model: '', options: { confirmPause: true, promptBudgetSeconds: undefined, untuned: true } }]);
-  await f.call('POST', '/api/models/autotune/untuned', {}, 'admin');
-  assert.equal(f.sent.pop().status, 405);
 });
 
 test('starting auto-tune on a system routing model (Laya) is rejected as a 4xx, even requested directly', async () => {
   const f = fixture({ manager: { autotune: {
-    untuned: async () => ({ status: 200, body: { models: [], skipped: [{ model: 'laya_multilingual_f16', reason: 'System routing model — not tuned' }] } }),
     start: async (model) => model === 'laya_multilingual_f16'
       ? { status: 400, body: { error: 'System routing model — not tuned' } }
       : { status: 202, body: { status: 'running' } },
