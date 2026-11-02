@@ -12,7 +12,7 @@ const fs = require('node:fs');
 
 const RETRY_NEVER = new Set([400, 409, 404]);
 
-function createFolderSync({ listUnregistered, register, reloadPresets, busy = () => false, stateFile = null, log = () => {},
+function createFolderSync({ listUnregistered, register, reloadPresets, writePresets = null, busy = () => false, stateFile = null, log = () => {},
   intervalMs = 15 * 60 * 1000, firstDelayMs = 20000, now = () => Date.now(), setTimer = setTimeout, clearTimer = clearTimeout }) {
   let timer = null, running = false;
   let skip = new Set();
@@ -35,18 +35,33 @@ function createFolderSync({ listUnregistered, register, reloadPresets, busy = ()
       const fresh = (stems || []).filter((s) => !skip.has(s));
       const added = [], failed = [];
       let deferred = false;
-      for (const stem of fresh) {
-        if (isBusy()) { deferred = true; break; }
-        try { await register(stem); added.push(stem); }
-        catch (e) {
-          if (RETRY_NEVER.has(e?.status)) { remember(stem); continue; }
-          failed.push(`${stem} (${e?.message || 'error'})`);
+      const registerFresh = async () => {
+        for (const stem of fresh) {
+          // A held batch excludes new chat/tune admissions itself. Without it keep the old
+          // per-file check, so a tune starting during the scan stops remaining writes.
+          if (!writePresets && isBusy()) { deferred = true; break; }
+          try { await register(stem); added.push(stem); }
+          catch (e) {
+            if (RETRY_NEVER.has(e?.status)) { remember(stem); continue; }
+            failed.push(`${stem} (${e?.message || 'error'})`);
+          }
         }
+        return added;
+      };
+      let reload = null;
+      if (fresh.length && writePresets) {
+        try { reload = (await writePresets(registerFresh, (written) => written.length > 0)).reload; }
+        catch (e) {
+          // Busy is transient: never put these files in the permanent refusal list.
+          if (e?.holdRefused) return { added: [], skipped: [...skip], deferred: true, at: now() };
+          throw e;
+        }
+      } else {
+        await registerFresh();
+        if (added.length) { try { reload = await reloadPresets(); } catch { /* pending */ } }
       }
       if (added.length) {
-        let note = '';
-        try { const r = await reloadPresets(); if (!r?.ok) note = ' The engine will offer them after its next reload.'; }
-        catch { note = ' The engine will offer them after its next reload.'; }
+        const note = reload?.ok ? '' : ' The engine will offer them after its next reload.';
         log(`[models] set up ${added.length} new model${added.length === 1 ? '' : 's'} from the models folder: ${added.join(', ')}.${note}`);
       }
       if (failed.length) log(`[models] could not set up: ${failed.join(', ')}`);
