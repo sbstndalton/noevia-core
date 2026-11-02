@@ -668,9 +668,36 @@ function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloa
       // #1004: tests inject their own advisor (a fake decision service).
       ...(autotuneOptions.loadAdvisor?{loadAdvisor:autotuneOptions.loadAdvisor}:{}),
       onResult:async({model,result})=>{for(const [category,value] of [['context_capacity',{ctx:result.context,appliedCtx:result.context,slots:Number(presets.get(model).options.parallel)||1}],['throughput',{rate:result.generation}],...(result.acceptance==null?[]:[['mtp_acceptance',{rate:result.acceptance/100}]])])await recordEvidence(model,{category,result:'passed',value,suite:{name:'full-autotune',version:3},source:'autotune',limitations:['Three deterministic quality smoke probes, not a general quality benchmark','120 s default prompt budget; existing MTP head only',...(result.baseline?.skipped?.length?[`Probes not used (failed at the model's reference settings): ${result.baseline.skipped.map(s=>s.id).join(', ')}`]:[])]});},
-      contextFactory:hooks=>require('./llamacpp-calibration.cjs').createCalibrator({request,rawModels,presets,applyUnlocked,conservativeFor,maintenance:managedGate,
-        stream:(path,opts={})=>(fetchStream||fetch)(base+path,{...opts,headers:headers(opts.headers),redirect:'error'}),
-        memoryFloorGib:autoconfig.memoryFloorGib||2,...calibrationOptions,stateFile:undefined,...hooks})}):null;
+      contextFactory:hooks=>{
+        // Private configured-profile worker client; no public confirmation/auth/HTTP policy.
+        const revision=presets.snapshot().revision;
+        const current=()=>hooks.contextCurrent?.() === true && maintenance.held() && presets.snapshot().revision === revision;
+        const worker=require('./llamacpp-calibration.cjs').createCalibrator({request,rawModels,presets,applyUnlocked,conservativeFor,identityFor:tuneIdentity,maintenance:managedGate,
+          stream:(path,opts={})=>(fetchStream||fetch)(base+path,{...opts,headers:headers(opts.headers),redirect:'error'}),
+          memoryFloorGib:autoconfig.memoryFloorGib||2,...calibrationOptions,stateFile:undefined,...hooks});
+        const controller=new AbortController();
+        const failed=()=>({ok:false,body:{error:'The context worker state changed or is unavailable.'}});
+        let cancelWait;
+        const departed=new Promise(resolve=>{cancelWait=()=>resolve(failed());});
+        // Cancellation always targets this captured child, even after the parent is cancelled.
+        const cancel=()=>{controller.abort();cancelWait();return worker.compareAndAbort(worker.cancellationFacts().token);};
+        return {...worker,cancel,
+          start:(model,options)=>Promise.race([(async()=>{
+            if (!current() || !Number.isInteger(options?.promptBudgetSeconds)) return failed();
+            const {token}=worker.stateFacts();
+            const row=await worker.listingFacts(model,token,{signal:controller.signal});
+            if (!current() || controller.signal.aborted || !row.rowToken) return failed();
+            const facts=await worker.preparationFacts(model,token,row.rowToken,{signal:controller.signal});
+            if (!current() || controller.signal.aborted || facts.profile?.exists !== true || facts.revision !== revision || !facts.preparedToken || !facts.ladderReady || !facts.identityReady) return failed();
+            // The configured parent has already selected/validated this model and budget.
+            const native=Number(facts.row?.meta?.n_ctx_train)||Number(facts.conservative?.native)||0;
+            const launched=await worker.compareAndLaunch({model,token,rowToken:row.rowToken,preparedToken:facts.preparedToken,
+              plan:{promptBudgetSeconds:options.promptBudgetSeconds,native,base:{}}},{signal:controller.signal,isCurrent:current});
+            return launched.applied ? {ok:true,body:launched.job} : failed();
+          })(),departed]),
+          status:()=>({body:{job:worker.stateFacts().job}}),
+        };
+      }}):null;
   return {
     kind: 'llamacpp', enabled: true, baseUrl: base, headers, request,
     capabilities: { routing: true, load: true, unload: true, download: true, deleteCached: true, runtimeOptions: false, hardware: false, presets: !!presets, autotune: !!autotuner },

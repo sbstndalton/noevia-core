@@ -3,12 +3,13 @@ const test = require('node:test'), assert = require('node:assert/strict'), {Even
 const {createCalibrationRoutesBridge} = require('./rust-calibration-routes-bridge.cjs');
 const {createCalibrator} = require('./llamacpp-calibration.cjs');
 const fs = require('node:fs'), os = require('node:os'), path = require('node:path');
-function fixture({hold, stateFile, conservativeFor}={}) {
+const validIdentity = artifact => ({arch:null,quant:null,artifact,build:null,profile:"a".repeat(64),hardware:null});
+function fixture({hold, stateFile, conservativeFor, identityFor}={}) {
   let revision='r1', artifact='artifact-A', row={id:'synthetic',meta:{n_ctx_train:32768},status:{value:'unloaded'}};
   const seen={holds:0,releases:0,requests:0,reads:0};
   const actor=createCalibrator({stateFile,rawModels:async()=>{seen.reads++;return {ok:true,body:{data:[row]}};},
     presets:{get:()=>({exists:true,options:{},fields:['parallel']}),snapshot:()=>({revision,text:'private'})},
-    conservativeFor:conservativeFor||(async()=>null),identityFor:async()=>({artifact}),request:async()=>{seen.requests++;throw Error('no worker calls allowed');},
+    conservativeFor:conservativeFor||(async()=>null),identityFor:identityFor||(async()=>validIdentity(artifact)),request:async()=>{seen.requests++;throw Error('no worker calls allowed');},
     maintenance:{hold:async()=>{seen.holds++;await hold?.();return()=>{seen.releases++;};}},readMemory:()=>20});
   return {actor,seen,rev:v=>{revision=v;},row:v=>{row=v;},artifact:v=>{artifact=v;}};
 }
@@ -51,6 +52,19 @@ test('failed initial state write releases admission and restores the previous in
   const dir=fs.mkdtempSync(path.join(os.tmpdir(),'calibration-prepare-'));t.after(()=>fs.rmSync(dir,{recursive:true,force:true}));
   const f=fixture({stateFile:path.join(dir,'absent','state.json')}),ask=await command(f.actor);
   await assert.rejects(f.actor.compareAndLaunch(ask),{code:'ENOENT'});assert.equal(f.actor.stateFacts().job,null);assert.equal(f.seen.releases,1);assert.equal(f.seen.requests,0);
+});
+test('null, throwing or malformed identity cannot issue a token or acquire admission',async()=>{
+  for(const identityFor of [async()=>null,async()=>{throw Error('unreadable');},async()=>({artifact:'incomplete'}),async()=>({...validIdentity('a'),profile:'bad'})]) {
+    const f=fixture({identityFor}),ask=await command(f.actor);
+    assert.equal(ask.preparedToken,undefined);
+    const r=await f.actor.compareAndLaunch(ask);assert.equal(r.applied,false);assert.equal(r.reason,'unavailable');
+    assert.equal(f.seen.holds,0);assert.equal(f.seen.requests,0);
+  }
+});
+test('identity failure during maintenance admission releases it without a worker',async()=>{
+  let broken=false;
+  const f=fixture({identityFor:async()=>broken?null:validIdentity('a'),hold:async()=>{broken=true;}}),ask=await command(f.actor);
+  assert.equal((await f.actor.compareAndLaunch(ask)).reason,'unavailable');assert.equal(f.seen.holds,1);assert.equal(f.seen.releases,1);assert.equal(f.seen.requests,0);assert.equal(f.actor.stateFacts().job,null);
 });
 async function bridgeCase({op='facts',ask={},peer='127.0.0.1',headers={},method='POST',live}={}) {
   const req=Object.assign(new EventEmitter(),{method,url:'/internal/calibration-routes/'+op,headers:{'x-noevia-store-token':'synthetic-secret',...headers},socket:{remoteAddress:peer}}),res=Object.assign(new EventEmitter(),{writableEnded:false});

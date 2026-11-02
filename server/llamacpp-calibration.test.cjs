@@ -56,7 +56,7 @@ function fixture(t,{loadCap=40960,longCap=Infinity,native=131072,memory=()=>20,o
     });
     return new Response(readable,{status:200});
   };
-  const manager=createModelManager({kind:'llamacpp',baseUrl:'http://synthetic',presetPath:ini,fetchJson,fetchStream,calibrationStatePath:stateFile,autoconfig:{},presetWriter,calibrationOptions:{sleep:async()=>{},readMemory:memory,now:()=>clock.t,timeouts:{memoryPoll:5},...extra}});
+  const manager=createModelManager({kind:'llamacpp',baseUrl:'http://synthetic',presetPath:ini,fetchJson,fetchStream,calibrationStatePath:stateFile,autoconfig:{},presetWriter,calibrationOptions:{identityFor:async()=>({arch:null,quant:null,artifact:'synthetic-artifact',build:null,profile:require('node:crypto').createHash('sha256').update(fs.readFileSync(ini)).digest('hex'),hardware:null}),sleep:async()=>{},readMemory:memory,now:()=>clock.t,timeouts:{memoryPoll:5},...extra}});
   return {manager,ini,stateFile,original,router,ctxOf};
 }
 // Existing worker tests launch an explicit synthetic plan. Public confirmation, numeric

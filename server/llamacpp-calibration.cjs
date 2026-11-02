@@ -510,6 +510,12 @@ function createCalibrator(deps) {
     const facts = { row: clone(row), system: !!row && isSystemModel(model, modelPathFromArgs(row.status?.args)) };
     return { backend: true, ...facts, rowToken: signed({ token, model, ...facts }) };
   }
+  const identityValid = value => value && typeof value === 'object' && !Array.isArray(value)
+    && Object.keys(value).sort().join(',') === 'arch,artifact,build,hardware,profile,quant'
+    && ['arch','quant','hardware'].every(key => value[key] === null || typeof value[key] === 'string')
+    && typeof value.artifact === 'string' && value.artifact.length > 0
+    && typeof value.profile === 'string' && /^[0-9a-f]{64}$/.test(value.profile)
+    && (value.build === null || typeof value.build === 'string' || typeof value.build === 'object' && !Array.isArray(value.build));
   async function preparationFacts(model, token, rowToken, options = {}) {
     const facts = await listingFacts(model, token, options);
     if (facts.stale || !facts.backend) return facts;
@@ -518,14 +524,16 @@ function createCalibrator(deps) {
     const revision = presets.snapshot().revision;
     const conservative = await conservativeFor(model).catch(() => null);
     const identity = await identityFor(model).catch(() => null);
+    if (!identityValid(identity)) return { identityReady: false };
     if (options.signal?.aborted || token !== launchToken() || revision !== presets.snapshot().revision) return { stale: true };
     let ladderReady = true;
     try { candidates(); } catch { ladderReady = false; }
-    const prepared = { row: facts.row, system: facts.system, profile: clone(profile), conservative: clone(conservative), identity: clone(identity), revision, ladderReady };
+    const prepared = { row: facts.row, system: facts.system, profile: clone(profile), conservative: clone(conservative), identity: clone(identity), identityReady: true, revision, ladderReady };
     return { ...prepared, preparedToken: signed({ token, model, rowToken, ...prepared }) };
   }
-  async function compareAndLaunch({ model, token, rowToken, preparedToken, plan }, { signal } = {}) {
-    if (launching || state.job?.status === 'running' || signal?.aborted || token !== launchToken()) return { applied: false, reason: 'stale' };
+  async function compareAndLaunch({ model, token, rowToken, preparedToken, plan }, { signal, isCurrent } = {}) {
+    const current = () => !signal?.aborted && (!isCurrent || isCurrent());
+    if (!current() || launching || state.job?.status === 'running' || signal?.aborted || token !== launchToken()) return { applied: false, reason: 'stale' };
     // Defensive command schema, not public selection policy. Only the trusted front may send it.
     if (!plan || !Number.isInteger(plan.promptBudgetSeconds) || plan.promptBudgetSeconds < 15 || plan.promptBudgetSeconds > 1800
       || !Number.isFinite(plan.native) || !plan.base || typeof plan.base !== 'object' || Array.isArray(plan.base)) throw Error('invalid prepared launch');
@@ -533,7 +541,8 @@ function createCalibrator(deps) {
     let release, transferred = false;
     try {
       const before = await preparationFacts(model, token, rowToken, { signal });
-      if (signal?.aborted || before.preparedToken !== preparedToken) return { applied: false, reason: 'stale' };
+      if (before.identityReady === false || before.ladderReady === false) return { applied: false, reason: 'unavailable' };
+      if (!current() || before.preparedToken !== preparedToken) return { applied: false, reason: 'stale' };
       try { release = await maintenance.hold(`Chat is paused while noevia calibrates ${model}. It will be available again when calibration finishes or is cancelled.`); }
       catch (err) {
         return { applied: false, reason: 'hold', hold: { status: Number.isInteger(err?.status) ? err.status : null,
@@ -541,7 +550,8 @@ function createCalibrator(deps) {
           code: typeof err?.code === 'string' && /^[a-zA-Z0-9_:-]{1,80}$/.test(err.code) ? err.code : null } };
       }
       const after = await preparationFacts(model, token, rowToken, { signal });
-      if (signal?.aborted || after.preparedToken !== preparedToken) return { applied: false, reason: 'stale' };
+      if (after.identityReady === false || after.ladderReady === false) return { applied: false, reason: 'unavailable' };
+      if (!current() || after.preparedToken !== preparedToken) return { applied: false, reason: 'stale' };
       const previous = state.job, previousCancel = cancelRequested;
       cancelRequested = false;
       const job = { id: crypto.randomUUID(), model, promptBudgetSeconds: plan.promptBudgetSeconds, native: plan.native, base: clone(plan.base),
