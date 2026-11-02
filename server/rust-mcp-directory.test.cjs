@@ -35,7 +35,7 @@ test('the admin directory: every method of exactly the six paths is refused, wit
 test('the permitted-tools view: every method of the exact path is refused', () => {
   assert.equal(permitted.ROUTE_REFUSAL.code, 'RUST_TOOLBOXES_PERMITTED_OWNED');
   for (const method of ['GET', 'POST', 'DELETE']) assert.deepEqual(refuse(permitted, method, '/api/toolboxes/permitted?projectId=p&mode=chat'), { status: 503, body: permitted.ROUTE_REFUSAL }, method);
-  // GET /api/toolboxes (the picker, live prefill and MCP state) stays Node's.
+  // The picker has a separate Rust refusal; this module only owns the permitted view.
   for (const url of ['/api/toolboxes', '/api/toolboxes/', '/api/toolboxes/permitted/', '/api/toolboxes/permitted/x', '/api/toolboxesx']) assert.equal(refuse(permitted, 'GET', url), null, url);
 });
 

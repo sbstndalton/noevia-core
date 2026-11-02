@@ -96,14 +96,14 @@ function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloa
     if(expectText!==null&&before!==expectText)return {ok:false,status:409,refused:'file_changed',body:{}};
     let result;
     try {result=await request('/models?reload=1',{},timeout);}
-    catch(e){reloadGuard.forget();throw e;}
-    if(!result.ok){reloadGuard.forget();return result;}
+    catch(e){await reloadGuard.forget();throw e;}
+    if(!result.ok){await reloadGuard.forget();return result;}
     try {
       const after=await rawModels();
       let textAfter=null;try{textAfter=presets?.snapshot().text??null;}catch{}
-      if(after.ok&&Array.isArray(after.body?.data)&&before!==null)reloadGuard.record(before,after.body.data,textAfter);
-      else reloadGuard.forget();
-    } catch {reloadGuard.forget();}
+      if(after.ok&&Array.isArray(after.body?.data)&&before!==null)await reloadGuard.record(before,after.body.data,textAfter);
+      else await reloadGuard.forget();
+    } catch {await reloadGuard.forget();}
     return result;
   }
   async function mutate(fn) {const leave=maintenance.enter();try{return await fn();}finally{leave();}}

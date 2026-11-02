@@ -1,5 +1,4 @@
 'use strict';
-const { isInAppBox } = require('./toolbox-flags.cjs');
 // ── Toolboxes and built-in tools ──────────────────────────────────────────
 // Everything about WHICH tools a chat is offered and how the built-in ones
 // run: the core box, the per-model count cap and token budget, the resolver,
@@ -343,27 +342,6 @@ function createToolboxes({
     return [...new Set(ids)];
   }
 
-  // `connected` (connectedBoxes(user)) includes a connector box here only for the account that
-  // actually has it connected — never offered as a pickable option to anyone else, since there is
-  // nothing to pick: a connector's on/off state lives in Settings → Connectors, not a project's
-  // toolboxes list (sanitizeToolboxes rejects a connector id there either way). Without this, the
-  // picker, the "+" menu and the token budget under-reported a connector the chat loop already
-  // sends every turn (#354).
-  function toolboxSummaries(connected = []) {
-    return allToolboxes().filter((b) => !CONNECTOR_BOXES.has(b.id) || connected.includes(b.id)).map((b) => ({
-      id: b.id,
-      label: b.label,
-      description: b.description,
-      source: b.source,
-      // An in-app box: shipped with noevia (built in, or curated in the MCP manifest), so the
-      // client may word it from its catalogue by id. A box a third party defined is never one (#615).
-      inApp: isInAppBox(b),
-      toolCount: b.tools.length,
-      estTokens: estimateToolTokens(b.tools),
-      ...(CONNECTOR_BOXES.has(b.id) ? { connector: true } : {}),
-    }));
-  }
-
   async function runToolCall(project, name, rawArgs, allowed, signal, fail, { editTarget, chatKey, exchangeKey, routes } = {}) {
     // A model can name a tool it was never offered — by hallucination, or from
     // a box the project has since deselected mid-conversation. Enforce the
@@ -457,7 +435,7 @@ function createToolboxes({
   return {
     TOOLBOXES, CONNECTOR_BOXES, DEFAULT_TOOLBOXES, connectedBoxes, allToolboxes,
     toolTokenBudgetFor, resolveTools, readOnlyToolNames, isWriteTool, sanitizeToolboxes,
-    toolboxSummaries, executeToolCall,
+    executeToolCall,
   };
 }
 
