@@ -309,8 +309,17 @@ function createModelRoutes({ servedEmbeddingModels = (target) => require('../rag
     if (p.startsWith('/api/model-manager/')) {
       if(authn.user.role!=='admin')return json(res,403,{error:'Administrator required for model management'});
       if(!env.MODEL_LOADER_URL)return json(res,404,{error:'Model management service is not configured'});
-      const rest=p.slice('/api/model-manager/'.length);
-      if(!/^[\w./%:+@-]*$/.test(rest)||rest.includes('..'))return json(res,400,{error:'Invalid path'});
+      const rawRest=p.slice('/api/model-manager/'.length);
+      if(!/^[\w./%:+@-]*$/.test(rawRest)||rawRest.includes('..'))return json(res,400,{error:'Invalid path'});
+      // URL normalization must not turn an unchecked path into a section writer. Encoded
+      // separators also bypass the section's existing identity and budget checks.
+      let managerPath;
+      try {
+        const segments=rawRest.split('/').map(s=>decodeURIComponent(s));
+        if(segments.some(s=>s==='.'||s==='..'||s.includes('/')||s.includes('\\')))return json(res,400,{error:'Invalid path'});
+        managerPath=segments.join('/');
+      } catch { return json(res,400,{error:'Invalid path'}); }
+      const rest=managerPath;
       const method=req.method||'GET';
       const body=['GET','HEAD','DELETE'].includes(method)?undefined:await readBody(req,1024*1024);
       // The file scan reads every model header from disk (~2 s on daserver). Serve the last scan at
@@ -380,7 +389,7 @@ function createModelRoutes({ servedEmbeddingModels = (target) => require('../rag
       // block that for Laya's section the same way models/delete is blocked above.
       const sectionMatch = /^sections\/([^/]+)(?:\/rename)?$/.exec(rest);
       if (sectionMatch && ['DELETE','POST','PUT'].includes(method)) {
-        const name = decodeURIComponent(sectionMatch[1]);
+        const name = sectionMatch[1];
         const scanned = modelScanCache.get('models')?.body?.models;
         const cachedEntry = Array.isArray(scanned) ? scanned.find(f => (f.sections||[]).includes(name)) : null;
         if (isSystemModel(name) || (cachedEntry && isSystemModel(cachedEntry.modelId))) {
@@ -434,7 +443,15 @@ function createModelRoutes({ servedEmbeddingModels = (target) => require('../rag
         if(budget>0)q.set('budget_gib',String(budget));
         search=q.toString()?'?'+q.toString():'';
       }
-      const result=await fetchJson(`${env.MODEL_LOADER_URL.replace(/\/+$/,'')}/api/v1/${rest}${search}`,{method,headers:{'Content-Type':'application/json',...(env.MODEL_LOADER_TOKEN?{'X-Model-Loader-Token':env.MODEL_LOADER_TOKEN}:{})},body},10*60*1000).catch(()=>null);
+      const forward=()=>fetchJson(`${env.MODEL_LOADER_URL.replace(/\/+$/,'')}/api/v1/${rawRest}${search}`,{method,headers:{'Content-Type':'application/json',...(env.MODEL_LOADER_TOKEN?{'X-Model-Loader-Token':env.MODEL_LOADER_TOKEN}:{})},body},10*60*1000).catch(()=>null);
+      // #2276: these manager routes write models.ini too. Use the same hold as the preset
+      // editor, retaining it through the reload; read-only section helpers need no hold.
+      const presetWrite=(method==='PUT'&&['models-ini','idle-unload'].includes(managerPath))
+        || (['PUT','DELETE'].includes(method)&&/^sections\/[^/]+$/.test(managerPath))
+        || (method==='POST'&&/^sections\/[^/]+\/(safe-defaults|rename)$/.test(managerPath));
+      const held=presetWrite?await writePresetsHeld(forward,r=>!!r?.ok&&r.body?.preset!=='failed'):null;
+      if(held?.refused)return json(res,409,{error:PRESETS_BUSY,errorId:'modelsBusy',code:'modelsBusy'});
+      const result=presetWrite?held.written:await forward();
       // #873: a refused start releases the gate at once. An accepted one keeps it until the model
       // manager reports the sweep over; so does a lost reply, since the sweep may have started.
       if(sweepRelease){ if(result&&!result.ok)sweepRelease(); else sweepGuard.watch(sweepRelease,sweepModels); }
