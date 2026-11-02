@@ -259,7 +259,9 @@ function createFullAutotuner({ request: engineRequest, rawModels: engineRawModel
   // #1057: per-model tune settings, kept with the history: { [model]: { allowQ5Kv } }.
   state.settings ||= {};
   let cancelled = false, child = null, completion = Promise.resolve(), starting = false, inflight = null, idleAbort = null;
-  const save = () => { const tmp = stateFile + '.' + crypto.randomUUID(); fs.writeFileSync(tmp, JSON.stringify(state), { mode: 0o600 }); fs.renameSync(tmp, stateFile); };
+  const clearProcess = crypto.randomUUID();
+  let clearGeneration = 0;
+  const save = () => { const tmp = stateFile + '.' + crypto.randomUUID(); fs.writeFileSync(tmp, JSON.stringify(state), { mode: 0o600 }); fs.renameSync(tmp, stateFile); clearGeneration++; };
   const check = () => { if (cancelled) throw cancelledError(); };
   const note = (j, text) => { (j.log ||= []).push({ at: now(), text }); if (j.log.length > 400) j.log.shift(); save(); };
   const phaseOf = (item, id) => item.phases.find(p => p.id === id);
@@ -1511,13 +1513,21 @@ function createFullAutotuner({ request: engineRequest, rawModels: engineRawModel
   // #1978: drops the finished job record the Recover card shows. History (measurements, evidence),
   // saved settings and models.ini are not touched. Refused while a run is active or starting, and
   // while a restored models.ini is still waiting for the model server to re-read it.
-  function clear() {
-    const j = state.job;
-    if (starting || j?.status === 'running') return { ok: false, status: 409, body: { error: 'Auto-tune is running. Cancel it before clearing.' } };
-    if (!j || !['failed', 'cancelled', 'interrupted', 'passed'].includes(j.status)) return { ok: false, status: 409, body: { error: 'There is no finished auto-tune to clear.' } };
-    if (j._reloadPending) return { ok: false, status: 409, body: { error: 'The model server has not re-read the restored settings yet. Try again shortly.' } };
-    delete state.job; save();
-    return { ok: true, status: 200, body: { cleared: true } };
+  function clearFacts() {
+    const job = state.job;
+    const generation = hash({ process: clearProcess, generation: clearGeneration });
+    const guard = { starting, jobPresent: !!job, status: job?.status ?? null, reloadPending: !!job?._reloadPending };
+    return { generation, token: hash({ generation, guard, job: job ?? null }), ...guard };
+  }
+  // Rust owns the public policy. This script remains the sole state writer; comparison, safety
+  // check and removal are synchronous so a checked finished job cannot become an active one.
+  function compareAndClear(token) {
+    if (typeof token !== 'string' || clearFacts().token !== token) return { applied: false };
+    const job = state.job;
+    if (starting || !job || !['failed', 'cancelled', 'interrupted', 'passed'].includes(job.status) || job._reloadPending) return { applied: false };
+    delete state.job;
+    try { save(); } catch (error) { state.job = job; throw error; }
+    return { applied: true };
   }
   async function recover() {
     const j = state.job;
@@ -1614,6 +1624,6 @@ function createFullAutotuner({ request: engineRequest, rawModels: engineRawModel
     } catch (e) { return { ok: false, status: 409, body: { error: clientMessage(e, 'Auto-tune could not resume.') } }; }
     finally { starting = false; }
   }
-  return { start, resume, cancel, clear, status, setSettings, untuned, recover, flushReload, completion: () => completion };
+  return { start, resume, cancel, clearFacts, compareAndClear, status, setSettings, untuned, recover, flushReload, completion: () => completion };
 }
 module.exports = { createFullAutotuner, qualityCheck, qualityFailure, QUALITY, VERSION, newModel, hasHarmonyReasoning, kvCandidates, preferKv, bf16Unsupported, MODES, LONG_PROFILE_REASON };

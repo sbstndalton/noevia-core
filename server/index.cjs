@@ -1194,6 +1194,7 @@ const authRoutes = require('./routes/auth.cjs').createAuthRoutes({
 // only refuses a request that bypassed it.
 const storageRoutes = require('./routes/storage.cjs').createStorageRoutes({ json });
 // Public approval policy is Rust's; only pending chat Promise resolution remains here (#2282).
+const autotuneClearBridge = require('./rust-autotune-clear-bridge.cjs').createAutotuneClearBridge({ secret: FRONT_SECRET, json, readJson, autotune: () => modelManager.autotune });
 const toolApprovals = require('./rust-tool-approval-bridge.cjs');
 const toolApprovalBridge = toolApprovals.createToolApprovalBridge({
   secret: FRONT_SECRET, pendingApprovals, json, readJson,
@@ -1269,6 +1270,8 @@ async function handleRequestInner(req, res) {
   // The ownership refusals below answer before handleRequestScoped; they carry the same headers.
   publicHeaders(res);
   if (require('./rust-tool-approvals.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
+  if (require('./rust-autotune-clear.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
+  if (await autotuneClearBridge(req, res)) return;
   if (await toolApprovalBridge(req, res)) return;
   // The Rust front's maintenance lease on this process's gate (#2210): before everything, and only the front's.
   if (await maintenanceLeases.handle(req, res)) return;
