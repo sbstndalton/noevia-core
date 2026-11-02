@@ -4,7 +4,7 @@ const fs = require('node:fs');
 const crypto = require('node:crypto');
 const { WORKLOADS, SPEC_CANDIDATES, geomean } = require('./llamacpp-tune-spec.cjs');
 const { hasHarmonyReasoning, quirksOf, toIniOptions, INI_KEY_LIST } = require('./sampling-recommendation.cjs');
-const { isSystemModel, modelPathFromArgs, SYSTEM_MODEL_REASON } = require('./model-system.cjs');
+const { isSystemModel, isSidecarModel, modelPathFromArgs, SYSTEM_MODEL_REASON } = require('./model-system.cjs');
 const VERSION = 3;
 // #1062: waits for another router client per model before the tune stops as interrupted.
 const FOREIGN_YIELDS = 6;
@@ -398,7 +398,7 @@ function createFullAutotuner({ request: engineRequest, rawModels: engineRawModel
   const wrote = j => { if (!j._backedUp) { j._backedUp = true; save(); } };
   // kvs (#1060): the KV list the tune used (the item's snapshot) or, for the untuned scan, the one
   // the model's switch gives now; a q5 list differs from a default one either way round.
-  const scanProfile = model => { const p = presets.get(model); return { exists: !!p.exists, defaults: p.defaults || {}, options: p.options || {} }; };
+  const scanProfile = model => { const p = presets.get(model); return { exists: !!p.exists, defaults: { ...(p.defaults || {}) }, options: { ...(p.options || {}) } }; };
   const scanPolicy = request => require('./dav-parse-wasm.cjs').autotuneScan({ version: 1, ...request });
   async function signature(model, suppliedIdentity, kvs = candidatesFor(model)) {
     const identity = suppliedIdentity || await identityFor(model);
@@ -414,22 +414,25 @@ function createFullAutotuner({ request: engineRequest, rawModels: engineRawModel
     if (!r.ok || !Array.isArray(r.body?.data)) throw publicFail('The model server is not responding.');
     if (r.body.data.length > 512) throw Error('scan row cap');
     const longs = new Set(longProfiles.pairsOf(r.body.data, presets).map(p => p.long));
-    const rows = r.body.data.map(row => {
-      const profile = scanProfile(row.id);
-      return { id: row.id, long: longs.has(row.id), system: isSystemModel(row.id, modelPathFromArgs(row.status?.args || [])),
-        missing: !!fileMissing(row), configured: profile.exists, profile, args: row.status?.args || [], allowQ5Kv: settingsOf(row.id).allowQ5Kv, latest: null };
-    });
-    const { eligible } = scanPolicy({ op: 'classify', rows });
-    for (const i of eligible) {
-      const row = rows[i];
+    const rows = [];
+    // Read each row's live owner facts immediately before its identity, as the legacy loop did.
+    // An earlier async identity read may allow a settings/history change for a later row.
+    for (const raw of r.body.data) {
       signal?.throwIfAborted();
-      row.identity = await identityFor(row.id);
-      signal?.throwIfAborted();
-      if (!row.identity) throw publicFail('Model identity could not be read.');
-      // Preserve the owner reads after identity resolves: signature/profile then latest history.
-      row.profile = scanProfile(row.id);
-      const latest = state.history[row.id]?.[0];
-      row.latest = latest == null ? null : { version: latest.version, signature: latest.signature };
+      const profile = scanProfile(raw.id);
+      const row = { id: raw.id, long: longs.has(raw.id), system: isSystemModel(raw.id, modelPathFromArgs(raw.status?.args || [])) || isSidecarModel(raw.id),
+        missing: !!fileMissing(raw), configured: profile.exists, profile, args: raw.status?.args || [], latest: null };
+      const { eligible } = scanPolicy({ op: 'classify', rows: [row] });
+      if (eligible.length) {
+        row.allowQ5Kv = settingsOf(row.id).allowQ5Kv;
+        row.identity = await identityFor(row.id);
+        signal?.throwIfAborted();
+        if (!row.identity) throw publicFail('Model identity could not be read.');
+        row.profile = scanProfile(row.id);
+        const latest = state.history[row.id]?.[0];
+        row.latest = latest == null ? null : { version: latest.version, signature: latest.signature };
+      }
+      rows.push(row);
     }
     return { version: 1, rows };
   }
