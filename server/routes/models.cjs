@@ -575,8 +575,7 @@ function createModelRoutes({ servedEmbeddingModels = (target) => require('../rag
         let body;try{body=await readJson(req);}catch{return json(res,400,{error:'invalid JSON'});}
         try{return json(res,200,await idleUnload.save(body,authn.user.id));}catch(e){return fail(e);}
       }
-      if(req.method!=='GET')return json(res,405,{error:'Method not allowed'});
-      try{return json(res,200,await idleUnload.get());}catch(e){return fail(e);}
+      return json(res,405,{error:'Method not allowed'});
     }
 
     if (p === '/api/models/preset') {
