@@ -74,16 +74,12 @@ function createIdleUnloadSetting({ env = process.env, fetchJson, reloadPresets =
     return { view: v, preset: ['written', 'unchanged', 'failed'].includes(r.body?.preset) ? r.body.preset : null };
   };
 
-  /** Is the router known to run on `seconds`? false when it runs on another value or that is
-   *  unknowable (it re-read the file on its own since noevia's last reload). */
-  async function applied(seconds) {
-    if (typeof presetsInRouter !== 'function') return false;
+  async function effectiveSeconds() {
+    if (typeof presetsInRouter !== 'function') return null;
     let text = null;
     try { text = await presetsInRouter(); } catch { text = null; }
-    return typeof text === 'string' && globalIdleSeconds(text) === seconds;
+    return typeof text === 'string' ? globalIdleSeconds(text) : null;
   }
-
-  async function get() { const { view: v } = await call('GET'); return { ...v, applied: await applied(v.seconds) }; }
 
   async function save(body, actor) {
     const seconds = body && Object.prototype.hasOwnProperty.call(body, 'seconds') ? body.seconds : undefined;
@@ -113,10 +109,10 @@ function createIdleUnloadSetting({ env = process.env, fetchJson, reloadPresets =
     let apply;
     if (preset === 'failed') apply = { state: 'failed' };
     else apply = r?.ok ? { state: 'applied' } : { state: 'pending', ...(Array.isArray(r?.body?.loaded) ? { loaded: r.body.loaded.filter((x) => typeof x === 'string') } : {}) };
-    return { ...next, apply, applied: apply.state === 'applied' ? await applied(next.seconds) : false };
+    return { ...next, apply, applied: apply.state === 'applied' ? (await effectiveSeconds()) === next.seconds : false };
   }
 
-  return { get, save };
+  return { effectiveSeconds, save };
 }
 
 module.exports = { createIdleUnloadSetting, validSeconds, globalIdleSeconds, MIN_SECONDS, MAX_SECONDS, DEFAULT_SECONDS };

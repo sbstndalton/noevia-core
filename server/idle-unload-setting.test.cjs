@@ -50,12 +50,11 @@ function setup({ loader = fakeLoader(), loaded = [] } = {}) {
 test('the default is 30 minutes', async () => {
   assert.equal(DEFAULT_SECONDS, 1800);
   const { setting } = setup();
-  assert.deepEqual(await setting.get(), { seconds: 1800, source: 'default', fallbackSeconds: 1800, fallbackSource: 'default', defaultSeconds: 1800, minSeconds: 300, maxSeconds: 86400, applied: true });
+  assert.equal(await setting.effectiveSeconds(), 1800);
 });
 
 test('the deployment env seeds the value and clearing the setting falls back to it', async () => {
   const { setting, loader } = setup({ loader: fakeLoader({ envSeconds: 900 }) });
-  assert.equal((await setting.get()).source, 'env');
   assert.equal((await setting.save({ seconds: 7200 }, 'admin-1')).seconds, 7200);
   const cleared = await setting.save({ seconds: null }, 'admin-1');
   assert.equal(cleared.seconds, 900);
@@ -69,8 +68,7 @@ test('a saved value persists, is audited, and takes effect without a restart', a
   assert.deepEqual(out.apply, { state: 'applied' });
   assert.equal(out.seconds, 3600);
   assert.equal(out.source, 'setting');
-  // The model manager now holds it (a fresh read sees it) and wrote the preset key.
-  assert.equal((await setting.get()).seconds, 3600);
+  assert.equal(await setting.effectiveSeconds(), 3600);
   assert.equal(loader.state.ini, 3600);
   // The router was asked to re-read its presets, never to unload a running model.
   assert.deepEqual(reloads, [{ unload: false }]);
@@ -91,22 +89,22 @@ test('with a model running the new time waits for it instead of unloading it', a
 
 // Review of web#87: a model asleep after its idle time still blocks the reload, so the saved
 // value is usually not live. Every GET says so (it survives a page reload) until a reload lands.
-test('a GET reports whether the router runs on the saved value, across reloads of the page', async () => {
+test('the owner reports only the live router timer, across reloads', async () => {
   const s = setup({ loaded: ['chat-asleep'] });
-  assert.equal((await s.setting.get()).applied, true, 'the router read 1800 at its last reload');
+  assert.equal(await s.setting.effectiveSeconds(), 1800);
   await s.setting.save({ seconds: 600 }, 'admin-1');
-  for (let i = 0; i < 2; i++) assert.equal((await s.setting.get()).applied, false, 'still not live on a fresh GET');
+  for (let i = 0; i < 2; i++) assert.equal(await s.setting.effectiveSeconds(), 1800, 'still not live on a fresh read');
   await s.reloadPresets({ unload: true });
-  assert.equal((await s.setting.get()).applied, true);
+  assert.equal(await s.setting.effectiveSeconds(), 600);
   // Saving the value the router already runs on is applied at once.
   const again = await s.setting.save({ seconds: 600 }, 'admin-1');
   assert.equal(again.applied, true);
   // Unknowable (the router re-read on its own since noevia's last reload): not claimed as applied.
   s.router.text = null;
-  assert.equal((await s.setting.get()).applied, false);
+  assert.equal(await s.setting.effectiveSeconds(), null);
   // Never: no key in [*].
   s.router.text = ini(0); s.loader.state.stored = 0;
-  assert.equal((await s.setting.get()).applied, true);
+  assert.equal(await s.setting.effectiveSeconds(), 0);
 });
 
 test('the [*] key is read the way the model manager writes it', () => {
@@ -132,14 +130,13 @@ test('values outside Never or 5 min to 24 h are refused before the model manager
 
 test('an older or unreachable model manager is reported, nothing is audited', async () => {
   const old = setup({ loader: fakeLoader({ missing: true }) });
-  await assert.rejects(old.setting.get(), (e) => e.status === 404 && e.errorId === 'idleUnloadUnavailable');
   await assert.rejects(old.setting.save({ seconds: 600 }, 'a'), (e) => e.status === 404);
   const down = setup({ loader: fakeLoader({ down: true }) });
   await assert.rejects(down.setting.save({ seconds: 600 }, 'a'), (e) => e.status === 502 && e.errorId === 'idleUnloadEngine');
   assert.deepEqual([...old.audit, ...down.audit], []);
   assert.deepEqual([...old.reloads, ...down.reloads], []);
   const noLoader = createIdleUnloadSetting({ env: {}, fetchJson: async () => { throw Error('not called'); } });
-  await assert.rejects(noLoader.get(), (e) => e.status === 404);
+  await assert.rejects(noLoader.save({ seconds: 600 }, 'a'), (e) => e.status === 404);
 });
 
 test('a preset the model manager could not rewrite is reported, and no reload is attempted', async () => {
@@ -170,4 +167,32 @@ test('#2219 a refused hold changes nothing; a granted one writes before its relo
   assert.equal(saved.apply.state, 'applied');
   assert.equal(audit.length, 1);
   assert.deepEqual(reloads, [], 'the reload ran inside the hold');
+});
+
+test('idle timer facts expose only the trusted live value and refuse forwarded traffic', async () => {
+  const { createIdleUnloadFacts, PATH } = require('./rust-idle-unload-read-facts.cjs');
+  const { refuseOwned } = require('./rust-idle-unload-read.cjs');
+  const sent = [];
+  let calls = 0;
+  const json = (_res, status, body) => sent.push({ status, body });
+  const handle = createIdleUnloadFacts({
+    secret: 'synthetic', json, effectiveSeconds: async () => { calls += 1; return 1800; },
+  });
+  const request = { url: PATH, method: 'POST', socket: { remoteAddress: '127.0.0.1' }, headers: { 'x-noevia-store-token': 'synthetic' } };
+  for (const req of [
+    { ...request, headers: {} },
+    { ...request, headers: { ...request.headers, 'x-forwarded-for': '' } },
+    { ...request, socket: { remoteAddress: '10.0.0.2' } },
+  ]) {
+    assert.equal(await handle(req, {}), true);
+    assert.equal(sent.pop().status, 404);
+  }
+  assert.equal(calls, 0);
+  assert.equal(await handle(request, {}), true);
+  assert.deepEqual(sent.pop(), { status: 200, body: { seconds: 1800 } });
+  assert.equal(calls, 1);
+  const parseRequestUrl = (req) => new URL(req.url, 'http://synthetic');
+  assert.equal(refuseOwned({ method: 'GET', url: '/api/models/idle-unload' }, {}, { parseRequestUrl, json }), true);
+  assert.equal(sent.pop().status, 503);
+  assert.equal(refuseOwned({ method: 'PUT', url: '/api/models/idle-unload' }, {}, { parseRequestUrl, json }), false);
 });
