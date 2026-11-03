@@ -1118,6 +1118,9 @@ const providerRoutes = require('./routes/providers.cjs').createProviderRoutes({
   json, chatgptOAuth, chatgptEnabled: () => features.enabled('chatgptOAuth'),
 });
 // Statistics, the auto-router roles, the model manager proxy and /api/models/* (routes/models.cjs).
+const modelManagerScanCache = require('./rust-model-manager-scan-cache.cjs').createModelManagerScanCache({
+  secret: FRONT_SECRET, json, readJson, service: modelService,
+});
 const modelRoutes = require('./routes/models.cjs').createModelRoutes({
   json, readBody, readJson, fetchJson, env: process.env, modelManager, getProvider, providerHeaders, DEFAULT_PROVIDER_ID, createVisionProbe: engineVisionProbe, currentWorkspace, service: modelService, inferenceBudget, idleUnload, decisionSettings, rerankSettings,
 });
@@ -1361,6 +1364,8 @@ async function handleRequestInner(req, res) {
   if (require('./rust-mcp-directory.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   if (require('./rust-toolboxes-permitted.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   if (require('./rust-toolbox-picker.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
+  if (require('./rust-model-manager-scan.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
+  if (await modelManagerScanCache(req, res)) return;
   if (require('./rust-autotune-cancel.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   if (await autotuneCancelBridge(req, res)) return;
   if (require('./rust-calibration-cancel.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
