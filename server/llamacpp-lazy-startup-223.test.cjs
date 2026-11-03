@@ -185,8 +185,8 @@ test('calibration: with the real evaluator a prepared worker launches and can be
 // ---- auto-tune: the ladder fault refuses instead of falling back to the standard order ----------------------
 
 async function tuneSettled(m) {
-  for (let i = 0; i < 400 && m.autotune.status().body.job?.status === 'running'; i++) await new Promise((resolve) => setTimeout(resolve, 25));
-  return m.autotune.status().body.job;
+  for (let i = 0; i < 400 && m.autotune.statusFacts().job?.status === 'running'; i++) await new Promise((resolve) => setTimeout(resolve, 25));
+  return m.autotune.statusFacts().job;
 }
 const TUNE = { confirmPause: true, promptBudgetSeconds: 30 };
 
@@ -199,7 +199,7 @@ test('auto-tune: a CTX_CANDIDATES getter fault refuses start() with 503 autoconf
   ran++;
   assert.equal(r.ok, false); assert.equal(r.status, 503); assert.equal(r.body.code, 'autoconfig_impl');
   assert.match(r.body.error, /^Auto-tune is unavailable: .*context ladder/);
-  assert.ok(!m.autotune.status().body.job, 'no job record');
+  assert.ok(!m.autotune.statusFacts().job, 'no job record');
   assert.equal(m.tuningActive(), false, 'the gate was never held');
   assert.equal(fs.readFileSync(ini, 'utf8'), before);
   assert.deepEqual(WRITES(calls), [], calls.join('\n'));
@@ -216,7 +216,7 @@ test('auto-tune: an evaluator-wide fault refuses start() the same way and loads 
   ran++;
   assert.ok(probe.ran > 0);
   assert.equal(r.status, 503); assert.equal(r.body.code, 'autoconfig_impl');
-  assert.ok(!m.autotune.status().body.job);
+  assert.ok(!m.autotune.statusFacts().job);
   assert.equal(fs.readFileSync(ini, 'utf8'), before);
   assert.deepEqual(WRITES(calls), [], calls.join('\n'));
 });

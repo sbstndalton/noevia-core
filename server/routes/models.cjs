@@ -528,7 +528,6 @@ function createModelRoutes({ servedEmbeddingModels = (target) => require('../rag
       if(!modelManager.autotune)return json(res,404,{error:'Auto-tune is unavailable'});
       let result;
       if(p.endsWith('/untuned')){if(req.method!=='GET')return json(res,405,{error:'Method not allowed'});result=await modelManager.autotune.untuned();}
-      else if(req.method==='GET')result=modelManager.autotune.status(url.searchParams.get('model')||'');
       else if(req.method==='POST'){const body=await readJson(req);result=await modelManager.autotune.start(String(body?.model||''),{confirmPause:body?.confirmPause,promptBudgetSeconds:body?.promptBudgetSeconds,untuned:body?.untuned===true,...(body?.mode!==undefined?{mode:body.mode}:{})});}
       else return json(res,405,{error:'Method not allowed'});
       res.setHeader('Cache-Control','no-store');
