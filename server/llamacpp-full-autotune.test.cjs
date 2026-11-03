@@ -2192,3 +2192,27 @@ test('#2303 a cancelled context read cannot launch in the same job after Resume 
   release();for(let i=0;i<30;i++)await new Promise(r=>setImmediate(r));
   assert.equal(loads,before.loads);assert.equal(f.requests.length,before.requests);assert.equal(fs.readFileSync(f.ini,'utf8'),before.text);
 });
+
+// #2317: use the production private adapter while its metadata owner is still pending.
+test('#2317 a wrong private context abort token has no effect on the pending read',async t=>{
+  const full=require('./llamacpp-full-autotune.cjs'),original=full.createFullAutotuner;
+  let child;
+  full.createFullAutotuner=deps=>original({...deps,contextFactory:hooks=>{child=deps.contextFactory(hooks);return child;}});
+  t.after(()=>{full.createFullAutotuner=original;});
+  let entered,release;const waiting=new Promise(r=>{entered=r;}),gate=new Promise(r=>{release=r;});let reads=0,loads=0;
+  const f=fixture(t,{onLoad:()=>{loads++;},calibrationExtra:{identityFor:async()=>{
+    if(++reads===1){entered();await gate;}
+    return {arch:null,quant:null,artifact:'synthetic-artifact',build:null,profile:require('node:crypto').createHash('sha256').update(fs.readFileSync(f.ini)).digest('hex'),hardware:null};
+  }}});
+  assert.equal((await f.manager.autotune.start('synthetic',{confirmPause:true})).status,202);
+  let timer;
+  try{await Promise.race([waiting,new Promise((_,reject)=>{timer=setTimeout(()=>reject(Error('context factory did not enter')),3000);})]);}finally{clearTimeout(timer);}
+  const before={loads,requests:f.requests.length,text:fs.readFileSync(f.ini,'utf8'),token:child.cancellationFacts().token};
+  assert.deepEqual(child.compareAndAbort('wrong-token'),{applied:false});
+  assert.deepEqual(child.compareAndAbort(null),{applied:false});
+  for(let i=0;i<30;i++)await new Promise(r=>setImmediate(r));
+  assert.equal(f.manager.autotune.status().body.job.status,'running');
+  assert.equal(child.cancellationFacts().token,before.token);
+  assert.equal(loads,before.loads);assert.equal(f.requests.length,before.requests);assert.equal(fs.readFileSync(f.ini,'utf8'),before.text);
+  release();const completed=await finished(f.manager);assert.equal(completed.status,'passed',completed.error);
+});

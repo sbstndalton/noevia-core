@@ -680,8 +680,14 @@ function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloa
         let cancelWait;
         const departed=new Promise(resolve=>{cancelWait=()=>resolve(failed());});
         // Cancellation always targets this captured child, even after the parent is cancelled.
-        const cancel=()=>{controller.abort();cancelWait();return worker.compareAndAbort(worker.cancellationFacts().token);};
-        return {...worker,cancel,
+        const compareAndAbort=expected=>{
+          if (typeof expected !== 'string' || expected !== worker.cancellationFacts().token) return {applied:false};
+          // Let the captured worker snapshot its abort targets before signal listeners run.
+          try { return worker.compareAndAbort(expected); }
+          finally { try { controller.abort(); } finally { cancelWait(); } }
+        };
+        const cancel=()=>compareAndAbort(worker.cancellationFacts().token);
+        return {...worker,cancel,compareAndAbort,
           start:(model,options)=>Promise.race([(async()=>{
             if (!current() || !Number.isInteger(options?.promptBudgetSeconds)) return failed();
             const {token}=worker.stateFacts();
