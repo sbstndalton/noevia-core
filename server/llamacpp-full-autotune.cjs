@@ -401,11 +401,30 @@ function createFullAutotuner({ request: engineRequest, rawModels: engineRawModel
   }
   // The list a queued item tries: its own snapshot, or (a job from before #1057) today's.
   const itemKv = item => (Array.isArray(item?.kv) && item.kv.length ? item.kv : candidatesFor(item?.model));
-  // kvCandidates: the list this server really tries for this model, so the panel never describes
-  // another build's (or another model's); settings: the model's own tune settings (#1057).
-  // #1079: longId and longHistory are the model's Long tune (its `<model>-long` section).
-  const status = model => ({ ok: true, status: 200, body: { job: publicJob(state.job), history: model ? state.history[model] || [] : [], kvCandidates: candidatesFor(model), settings: settingsOf(model),
-    modes: MODES, ...(model ? { longId: model + LONG_SUFFIX, longHistory: state.history[model + LONG_SUFFIX] || [] } : {}) } });
+  // #2306: raw in-memory owner data. The front chooses keys, history limits, KV/modes and
+  // public response shape; this getter does not consult an engine or start a worker.
+  function statusFacts(keys = []) {
+    if (!Array.isArray(keys) || keys.length > 2 || keys.some(k => typeof k !== 'string' || k.length > 65536)) throw Error('Invalid status keys');
+    const hidden = key => key.startsWith('_') || ['originalText', 'lastRevision', 'originalRevision', 'beforeText'].includes(key) ||
+      ['headers', 'authorization', 'apikey', 'accesstoken', 'refreshtoken', 'httpconfig', 'requestconfig', 'baseurl', 'url', 'credentials', 'password', 'secret', 'token', 'clientsecret'].includes(key.toLowerCase().replace(/[_-]/g, ''));
+    const copy = value => value == null ? value : JSON.parse(JSON.stringify(value, (key, v) => hidden(key) ? undefined : v));
+    const fields = ['id', 'model', 'bulk', 'mode', 'promptBudgetSeconds', 'status', 'phase', 'startedAt', 'log', 'models', 'queueProgress', 'finishedAt',
+      'error', 'failedPhase', 'failedStep', 'restored', 'skipped', 'waiting', 'result', 'queue', 'steps'];
+    const historyFields = ['at', 'kv', 'context', 'plan', 'probes', 'kvFallback', 'spec', 'specLabel', 'generation', 'acceptance', 'ubatch', 'promptPerSecond', 'quality', 'extensions', 'sampling', 'baseline', 'serving', 'loaded', 'version', 'signature'];
+    const rawHistory = value => {
+      if (!value) return value;
+      if (!Array.isArray(value) || value.some(row => !row || typeof row !== 'object' || Array.isArray(row))) throw Error('Invalid history metadata');
+      return value.map(row => copy(Object.fromEntries(historyFields.filter(k => Object.hasOwn(row, k)).map(k => [k, row[k]]))));
+    };
+    const job = state.job;
+    if (job != null && (typeof job !== 'object' || Array.isArray(job))) throw Error('Invalid job metadata');
+    const selectedJob = job == null ? job : copy(Object.fromEntries(fields.filter(k => Object.hasOwn(job, k)).map(k => [k, job[k]])));
+    return { jobPresent: job !== undefined, job: selectedJob,
+      entries: keys.map(key => ({ key, history: rawHistory(Object.hasOwn(state.history, key) ? state.history[key] : null),
+        allowQ5Kv: Object.hasOwn(state.settings, key) && state.settings[key]?.allowQ5Kv === true })),
+      allowBelowQ5Kv: allowBelowQ5Kv(),
+    };
+  }
   // #2287: public settings validation and the response belong to Rust. This live script remains
   // the sole writer of its job/history/settings file. A snapshot fingerprint makes the one map
   // mutation conditional on the exact generation, pending job and configuration Rust checked.
@@ -1786,6 +1805,6 @@ function createFullAutotuner({ request: engineRequest, rawModels: engineRawModel
     if (plan.kind === 'launch') { cancelled = false; completion = run(j); completion.catch(() => {}); }
     return { applied: true, ...resumeFacts(), publicJob: resumePublicJob(j) };
   }
-  return { start, resumeFacts, prepareResume, compareAndResume, cancellationFacts: cancellation.facts, compareAndAbort: cancellation.compareAndAbort, clearFacts, compareAndClear, status, settingsFacts: settingsSnapshot, commitSettings, untuned, recover, flushReload, completion: () => completion };
+  return { start, resumeFacts, prepareResume, compareAndResume, cancellationFacts: cancellation.facts, compareAndAbort: cancellation.compareAndAbort, clearFacts, compareAndClear, statusFacts, settingsFacts: settingsSnapshot, commitSettings, untuned, recover, flushReload, completion: () => completion };
 }
 module.exports = { createAutotuneCancellation, createFullAutotuner, qualityCheck, qualityFailure, QUALITY, VERSION, newModel, hasHarmonyReasoning, kvCandidates, preferKv, bf16Unsupported, MODES, LONG_PROFILE_REASON };

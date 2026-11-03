@@ -10,8 +10,9 @@ function cancelWorker(manager) { return manager.autotune.compareAndAbort(manager
 // unfinished-job refusal moved to Rust; these tests only arrange the tune scripts' existing inputs.
 function setTuneSettings(manager, model, body) {
   const facts = manager.autotune.settingsFacts(model);
-  assert.equal(manager.autotune.commitSettings(model, body.allowQ5Kv, facts.token).applied, true);
-  return { status: 200, body: manager.autotune.status(model).body };
+  const changed = manager.autotune.commitSettings(model, body.allowQ5Kv, facts.token);
+  assert.equal(changed.applied, true);
+  return changed;
 }
 
 
@@ -85,7 +86,7 @@ function fixture(t, { badSampling = false, models = ['synthetic'], onChat, onUnl
       let text = q ? q.expected : prompt.startsWith('List the whole numbers') ? Array.from({ length: 60 }, (_, i) => i + 1).join(', ') : 'Synthetic answer';
       if (q && (rejectAll || (badSampling && o.temp) || b.model === rejectModel || (badF16 && unq(o)) || (badQ4 && ['q5_0', 'q5_1', 'q4_0'].includes(o['cache-type-k'])))) text = 'wrong';
       if (badBatch && q && o['ubatch-size']) text = 'wrong';
-      if (failFinal && q && manager.autotune.status().body.job?.phase === 'Verifying saved profile') text = 'wrong';
+      if (failFinal && q && manager.autotune.statusFacts().job?.phase === 'Verifying saved profile') text = 'wrong';
       if (formattedQuality && q) text = q.id === 'extraction' ? '`' + text + '`' : '**' + text + '**';
       if (q && answerFor) text = answerFor({ q, o, text }) ?? text;
       const spec = o['spec-type'], draft = spec === 'ngram-simple' || spec === 'draft-mtp' && !noHead;
@@ -111,7 +112,7 @@ function fixture(t, { badSampling = false, models = ['synthetic'], onChat, onUnl
 }
 async function finished(manager) {
   for (let i = 0; i < 15000; i++) {
-    const j = manager.autotune.status().body.job;
+    const j = manager.autotune.statusFacts().job;
     if (j && j.status !== 'running') return j;
     await new Promise(r => setImmediate(r));
   }
@@ -140,7 +141,7 @@ test('ordered script commits KV, context, drafting and batch with measured evide
   assert.equal(o['ctx-size'], '8192'); assert.equal(o['cache-type-k'], 'bf16');
   assert.equal(o['spec-type'], 'draft-mtp'); assert.equal(o['ubatch-size'], '1024');
   assert.equal((await f.manager.autotune.untuned()).body.models.length, 0);
-  assert.equal(f.manager.autotune.status('synthetic').body.history.length, 1);
+  assert.equal((f.manager.autotune.statusFacts(['synthetic']).entries[0].history || []).length, 1);
   assert.doesNotMatch(JSON.stringify(j), /beforeText|originalText|lastRevision|_revision/);
 });
 
@@ -161,7 +162,7 @@ test('quality rejection followed by asynchronous unload still reaches the next K
   // bf16 is the reference, so the rejected candidate is q8_0 (it breaks arithmetic, which bf16
   // passed); with q5 allowed for this model the run still reaches q5_1 after it.
   const f = fixture(t, { badQ4: false, unloadPolls: 4, answerFor: ({ q, o }) => q.id === 'arithmetic' && o['cache-type-k'] === 'q8_0' ? '61' : null });
-  assert.equal(setTuneSettings(f.manager, 'synthetic', { allowQ5Kv: true }).status, 200);
+  assert.equal(setTuneSettings(f.manager, 'synthetic', { allowQ5Kv: true }).applied, true);
   await f.manager.autotune.start('synthetic', { confirmPause: true });
   const j = await finished(f.manager), kv = phase(j.models[0], 'kv');
   assert.equal(j.status, 'passed', j.error);
@@ -201,7 +202,7 @@ test('bulk tuning releases the lease between models so a chat can run', async t 
   await f.manager.autotune.start('', { confirmPause: true, untuned: true });
   let opened = false;
   for (let i = 0; i < 3000; i++) {
-    const j = f.manager.autotune.status().body.job;
+    const j = f.manager.autotune.statusFacts().job;
     if (j.models[0].status === 'passed' && j.models[1].status === 'pending') {
       const leave = f.manager.enterInference(); leave(); opened = true; break;
     }
@@ -230,7 +231,7 @@ test('model two failure preserves model one and leaves model three for Resume', 
 test('busy chat makes start wait, with cancellable bounded idle acquisition', async t => {
   const f = fixture(t, { idleTimeoutMs: 20 }), leave = f.manager.enterInference();
   assert.equal((await f.manager.autotune.start('synthetic', { confirmPause: true })).status, 202);
-  assert.equal(f.manager.autotune.status().body.job.waiting, true);
+  assert.equal(f.manager.autotune.statusFacts().job.waiting, true);
   const timedOut = await finished(f.manager);
   assert.equal(timedOut.status, 'interrupted');
   assert.match(timedOut.error, /Timed out waiting/);
@@ -257,7 +258,7 @@ test('unreadable identity after acceptance stops before writing a trial profile'
 test('cancel during drafting keeps committed KV/context and Resume starts at drafting', async t => {
   let stopped = false;
   const f = fixture(t, { onChat: ({ manager }) => {
-    const j = manager.autotune.status().body.job;
+    const j = manager.autotune.statusFacts().job;
     if (!stopped && j?.phase === 'Drafting') { stopped = true; cancelWorker(manager); }
   } });
   await f.manager.autotune.start('synthetic', { confirmPause: true });
@@ -267,7 +268,7 @@ test('cancel during drafting keeps committed KV/context and Resume starts at dra
   assert.equal(phase(j.models[0], 'drafting').status, 'interrupted');
   assert.equal(f.options('synthetic')['cache-type-k'], 'bf16');
   assert.equal(f.options('synthetic')['ctx-size'], '8192');
-  assert.equal(f.manager.autotune.status().body.history.length, 0);
+  assert.equal(f.manager.autotune.statusFacts().entries.length, 0);
   const before = f.requests.length;
   assert.equal((await resumeWorker(f.manager)).applied, true);
   const resumed = await finished(f.manager);
@@ -290,13 +291,13 @@ test('batch quality failure restores only batch settings and leaves prior phase 
   assert.equal(f.options('synthetic')['ctx-size'], '8192');
   assert.equal(f.options('synthetic')['spec-type'], 'draft-mtp');
   assert.equal(f.options('synthetic')['ubatch-size'], undefined);
-  assert.equal(f.manager.autotune.status('synthetic').body.history.length, 0);
+  assert.equal((f.manager.autotune.statusFacts(['synthetic']).entries[0].history || []).length, 0);
 });
 
 test('external preset edit stops rollback and Resume, preserving the operator text', async t => {
   let edited = false;
   const f = fixture(t, { onChat: ({ manager, ini }) => {
-    if (!edited && manager.autotune.status().body.job?.phase === 'Batch and micro-batch') {
+    if (!edited && manager.autotune.statusFacts().job?.phase === 'Batch and micro-batch') {
       edited = true; fs.appendFileSync(ini, '\n; external operator edit\n');
     }
   } });
@@ -311,7 +312,7 @@ test('external preset edit stops rollback and Resume, preserving the operator te
 test('restart rolls back active phase only, then explicit Resume skips committed phases', async t => {
   let stopped = false;
   const f = fixture(t, { onChat: ({ manager }) => {
-    if (!stopped && manager.autotune.status().body.job?.phase === 'Drafting') { stopped = true; cancelWorker(manager); }
+    if (!stopped && manager.autotune.statusFacts().job?.phase === 'Drafting') { stopped = true; cancelWorker(manager); }
   } });
   await f.manager.autotune.start('synthetic', { confirmPause: true }); await finished(f.manager);
   const state = JSON.parse(fs.readFileSync(f.stateFile, 'utf8'));
@@ -324,7 +325,7 @@ test('restart rolls back active phase only, then explicit Resume skips committed
   state.job.status = 'running'; item.status = 'running'; draft.status = 'running'; draft._beforeText = beforeText;
   fs.writeFileSync(f.stateFile, JSON.stringify(state));
   const manager = f.restart(); await manager.autotune.recover();
-  const j = manager.autotune.status().body.job;
+  const j = manager.autotune.statusFacts().job;
   assert.equal(j.status, 'interrupted'); assert.equal(phase(j.models[0], 'drafting').restored, true);
   assert.equal(fs.readFileSync(f.ini, 'utf8'), beforeText);
   const before = f.requests.length;
@@ -346,7 +347,7 @@ test('restart after every phase commit reloads and qualifies the saved profile b
   f.status.synthetic = 'unloaded';
   const before = f.requests.length;
   const manager = f.restart(); await manager.autotune.recover();
-  assert.equal(manager.autotune.status().body.job.status, 'interrupted');
+  assert.equal(manager.autotune.statusFacts().job.status, 'interrupted');
   assert.equal((await resumeWorker(manager)).applied, true);
   const resumed = await finished(manager);
   assert.equal(resumed.status, 'passed', resumed.error);
@@ -367,9 +368,9 @@ test('legacy running journal restores only after unloading and confirmed reload'
       queue: [{ model: 'synthetic', status: 'running' }], steps: [],
     } }));
     const manager = f.restart();
-    assert.doesNotMatch(JSON.stringify(manager.autotune.status().body.job), /originalText|lastRevision|version = 1/);
+    assert.doesNotMatch(JSON.stringify(manager.autotune.statusFacts().job), /originalText|lastRevision|version = 1/);
     await manager.autotune.recover();
-    const j = manager.autotune.status().body.job;
+    const j = manager.autotune.statusFacts().job;
     assert.equal(j.status, 'interrupted');
     assert.equal(j.restored, !reloadFail);
     assert.equal(f.status.synthetic, 'unloaded');
@@ -393,7 +394,7 @@ test('#1060 the tune signature follows the list the run used: q5 on makes a defa
   const f = fixture(t);
   await f.manager.autotune.start('synthetic', { confirmPause: true }); await finished(f.manager);
   assert.deepEqual((await f.manager.autotune.untuned()).body.models, []);
-  assert.equal(setTuneSettings(f.manager, 'synthetic', { allowQ5Kv: true }).status, 200);
+  assert.equal(setTuneSettings(f.manager, 'synthetic', { allowQ5Kv: true }).applied, true);
   assert.deepEqual((await f.manager.autotune.untuned()).body.models, ['synthetic']);
   await f.manager.autotune.start('synthetic', { confirmPause: true }); await finished(f.manager);
   assert.deepEqual((await f.manager.autotune.untuned()).body.models, [], 'tuned with q5 allowed, the switch still on');
@@ -418,14 +419,14 @@ test('final saved-profile quality failure does not publish a successful tune', a
   assert.equal(j.status, 'failed');
   assert.deepEqual(j.models[0].phases.map(p => p.status), ['passed','passed','passed','passed','passed']);
   assert.equal(j.models[0].result, undefined);
-  assert.equal(f.manager.autotune.status('synthetic').body.history.length, 0);
+  assert.equal((f.manager.autotune.statusFacts(['synthetic']).entries[0].history || []).length, 0);
   assert.deepEqual((await f.manager.autotune.untuned()).body.models, ['synthetic']);
 });
 
 test('identity change during final validation does not publish measurements', async t => {
   let f, changed = false;
   f = fixture(t, { onChat: ({ manager }) => {
-    if (!changed && manager.autotune.status().body.job?.phase === 'Verifying saved profile') {
+    if (!changed && manager.autotune.statusFacts().job?.phase === 'Verifying saved profile') {
       f.setBuild('fake-v2'); changed = true;
     }
   } });
@@ -435,7 +436,7 @@ test('identity change during final validation does not publish measurements', as
   assert.equal(j.status, 'failed');
   assert.match(j.error, /identity changed/i);
   assert.equal(j.models[0].result, undefined);
-  assert.equal(f.manager.autotune.status('synthetic').body.history.length, 0);
+  assert.equal((f.manager.autotune.statusFacts(['synthetic']).entries[0].history || []).length, 0);
 });
 
 test('quality suite requires each independent probe', async () => {
@@ -509,7 +510,7 @@ test('reasoning-only gpt-oss output fails all quality candidates and restores th
   assert.equal(job.models[0].phases[0].restored, true);
   assert.equal(fs.readFileSync(f.ini, 'utf8'), f.original);
   assert.equal(job.models[0].result, undefined);
-  assert.equal(f.manager.autotune.status('gpt-oss-20b').body.history.length, 0);
+  assert.equal((f.manager.autotune.statusFacts(['gpt-oss-20b']).entries[0].history || []).length, 0);
 });
 
 test('capped nonempty throughput samples remain measurable after independent quality probes pass', async t => {
@@ -535,7 +536,7 @@ test('#1057 the override env var alone adds nothing; with the model\'s q5 opt-in
   process.env.NOEVIA_AUTOTUNE_ALLOW_BELOW_Q5_KV = '1';
   t.after(() => { if (prior === undefined) delete process.env.NOEVIA_AUTOTUNE_ALLOW_BELOW_Q5_KV; else process.env.NOEVIA_AUTOTUNE_ALLOW_BELOW_Q5_KV = prior; });
   const f = fixture(t);
-  assert.deepEqual(f.manager.autotune.status('synthetic').body.kvCandidates, ['bf16', 'q8_0']);
+  assert.equal(f.manager.autotune.statusFacts(['synthetic']).entries[0].allowQ5Kv, false);
   setTuneSettings(f.manager, 'synthetic', { allowQ5Kv: true });
   await f.manager.autotune.start('synthetic', { confirmPause: true });
   const j = await finished(f.manager), item = j.models[0];
@@ -751,7 +752,7 @@ test('#1978 a failed run keeps the failing phase and step labels on the job, not
 test('#1978 a restart-interrupted run keeps the phase it was in', async t => {
   let stopped = false;
   const f = fixture(t, { onChat: ({ manager }) => {
-    if (!stopped && manager.autotune.status().body.job?.phase === 'Drafting') { stopped = true; cancelWorker(manager); }
+    if (!stopped && manager.autotune.statusFacts().job?.phase === 'Drafting') { stopped = true; cancelWorker(manager); }
   } });
   await f.manager.autotune.start('synthetic', { confirmPause: true });
   const c = await finished(f.manager);
@@ -762,7 +763,7 @@ test('#1978 a restart-interrupted run keeps the phase it was in', async t => {
   state.job.models[0].status = 'running'; draft.status = 'running'; draft._beforeText = fs.readFileSync(f.ini, 'utf8');
   fs.writeFileSync(f.stateFile, JSON.stringify(state));
   const manager = f.restart(); await manager.autotune.recover();
-  const j = manager.autotune.status().body.job;
+  const j = manager.autotune.statusFacts().job;
   assert.equal(j.status, 'interrupted'); assert.equal(j.failedPhase, 'Drafting');
 });
 
@@ -775,12 +776,12 @@ test('#1978 clear drops a finished job record only: measurements, settings and m
   const ini = fs.readFileSync(f.ini, 'utf8');
   const r = f.manager.autotune.compareAndClear(f.manager.autotune.clearFacts().token);
   assert.deepEqual(r, { applied: true });
-  assert.equal(f.manager.autotune.status().body.job, undefined);
+  assert.equal(f.manager.autotune.statusFacts().job, undefined);
   const after = JSON.parse(fs.readFileSync(f.stateFile, 'utf8'));
   assert.equal(after.job, undefined);
   assert.deepEqual(after.history, before.history);
   assert.deepEqual(after.settings, before.settings);
-  assert.equal(f.manager.autotune.status('synthetic').body.settings.allowQ5Kv, true);
+  assert.equal(f.manager.autotune.statusFacts(['synthetic']).entries[0].allowQ5Kv, true);
   assert.equal(fs.readFileSync(f.ini, 'utf8'), ini);
   assert.equal(f.manager.autotune.compareAndClear(f.manager.autotune.clearFacts().token).applied, false, 'nothing left to clear');
   assert.equal(f.manager.autotune.resumeFacts().job, null);
@@ -790,10 +791,10 @@ test('#1978 clear keeps finished measurements in history after a passed run', as
   const f = fixture(t);
   await f.manager.autotune.start('synthetic', { confirmPause: true });
   assert.equal((await finished(f.manager)).status, 'passed');
-  const history = f.manager.autotune.status('synthetic').body.history;
+  const history = (f.manager.autotune.statusFacts(['synthetic']).entries[0].history || []);
   assert.ok(history.length > 0);
   assert.equal(f.manager.autotune.compareAndClear(f.manager.autotune.clearFacts().token).applied, true);
-  assert.deepEqual(f.manager.autotune.status('synthetic').body.history, history);
+  assert.deepEqual((f.manager.autotune.statusFacts(['synthetic']).entries[0].history || []), history);
 });
 
 test('#1978 clear is refused while a run is active, and the run carries on', async t => {
@@ -877,19 +878,17 @@ test('#328 qualityCheck sends only the probes the baseline passed and reports th
   assert.equal(all.passed, false); assert.equal(all.skipped, undefined);
 });
 
-test('#328 status reports the KV candidates this server really tries', async t => {
+test('#328 status facts report only raw per-model KV switches', async t => {
   delete process.env.NOEVIA_AUTOTUNE_ALLOW_BELOW_Q5_KV;
   const f = fixture(t);
-  assert.deepEqual(f.manager.autotune.status('synthetic').body.kvCandidates, ['bf16', 'q8_0']);
-  assert.deepEqual(f.manager.autotune.status('synthetic').body.settings, { allowQ5Kv: false });
+  assert.equal(f.manager.autotune.statusFacts(['synthetic']).entries[0].allowQ5Kv, false);
+  assert.equal(f.manager.autotune.statusFacts().allowBelowQ5Kv, false);
   setTuneSettings(f.manager, 'synthetic', { allowQ5Kv: true });
-  assert.deepEqual(f.manager.autotune.status('synthetic').body.kvCandidates, ['bf16', 'q8_0', 'q5_1', 'q5_0']);
-  assert.deepEqual(f.manager.autotune.status('synthetic').body.settings, { allowQ5Kv: true });
-  // Per model: another model keeps the default list.
-  assert.deepEqual(f.manager.autotune.status('embed').body.kvCandidates, ['bf16', 'q8_0']);
+  assert.equal(f.manager.autotune.statusFacts(['synthetic']).entries[0].allowQ5Kv, true);
+  assert.equal(f.manager.autotune.statusFacts(['embed']).entries[0].allowQ5Kv, false);
   process.env.NOEVIA_AUTOTUNE_ALLOW_BELOW_Q5_KV = '1';
   t.after(() => { delete process.env.NOEVIA_AUTOTUNE_ALLOW_BELOW_Q5_KV; });
-  assert.deepEqual(f.manager.autotune.status('synthetic').body.kvCandidates, ['bf16', 'q8_0', 'q5_1', 'q5_0', 'q4_0']);
+  assert.equal(f.manager.autotune.statusFacts().allowBelowQ5Kv, true);
 });
 
 test('#872 between model leases the gate is open but the folder sync still sees auto-tune running', async t => {
@@ -898,7 +897,7 @@ test('#872 between model leases the gate is open but the folder sync still sees 
   await f.manager.autotune.start('', { confirmPause: true, untuned: true });
   let between = false;
   for (let i = 0; i < 3000; i++) {
-    const j = f.manager.autotune.status().body.job;
+    const j = f.manager.autotune.statusFacts().job;
     if (j.models[0].status === 'passed' && j.models[1].status === 'pending') {
       assert.equal(f.manager.maintenanceHeld(), false, 'chat may run between models');
       assert.equal(f.manager.tuningActive(), true, 'models.ini must still not be written');
@@ -949,7 +948,7 @@ test('#1003: a profile that cannot serve the realistic request is not signed off
   assert.equal(j.status, 'failed');
   assert.match(j.models[0].error, /cannot serve a realistic chat request with the app's tools: synthetic slot failure at \[url\]\./);
   assert.equal(j.models[0].result, undefined);
-  assert.equal(f.manager.autotune.status('synthetic').body.history.length, 0);
+  assert.equal((f.manager.autotune.statusFacts(['synthetic']).entries[0].history || []).length, 0);
 });
 
 test('#1003: an engine reply without a message fails the check too', { skip: skipWasm }, async t => {
@@ -1068,8 +1067,8 @@ test('#1003 planned: every new run is planned, whatever a retired AUTOTUNE_PLAN_
   assert.equal(j.status, 'passed', j.error);
   assert.ok(facts >= 1, 'the planner was asked for facts');
   assert.match(j.models[0].planFallback, /could not be read/, 'the item was planned, then fell back');
-  assert.equal(f.manager.autotune.status().body.planImpl, undefined);
-  assert.equal(f.manager.autotune.status().body.loadAdvisor, undefined);
+  assert.equal(f.manager.autotune.statusFacts().planImpl, undefined);
+  assert.equal(f.manager.autotune.statusFacts().loadAdvisor, undefined);
 });
 
 test('#1003 one recovery copy of models.ini per tune run in the standard order too', async t => {
@@ -1086,7 +1085,7 @@ test('#1003 planned: a cancelled run resumes from its results without repeating 
   let cancelOnce = true;
   const f = fixture(t, { servingChecks: servingOff, autotuneExtra: planned(), onChat: ({ manager, o }) => {
     // The 8k probe's quality check: cancel there, after the 16k probe has its result.
-    if (cancelOnce && o['ctx-size'] === '8192' && o['cache-type-k'] === 'bf16' && manager.autotune.status().body.job?.models[0].plan?.results.length === 1) { cancelOnce = false; cancelWorker(manager); }
+    if (cancelOnce && o['ctx-size'] === '8192' && o['cache-type-k'] === 'bf16' && manager.autotune.statusFacts().job?.models[0].plan?.results.length === 1) { cancelOnce = false; cancelWorker(manager); }
   } });
   await f.manager.autotune.start('synthetic', { confirmPause: true });
   let j = await finished(f.manager);
@@ -1189,7 +1188,7 @@ test('#1004 advisor: a rule names an out-of-memory refusal; the decision service
   assert.match(row.reason, /^The engine refused to load the model at this size\. The engine ran out of memory at this setting \(from the engine's error\)\.$/);
   assert.equal(svc.asked.length, 0);
   // The engine's own words reach neither the client nor the state file.
-  assert.ok(!JSON.stringify(f.manager.autotune.status().body).includes('ErrorOutOfDeviceMemory'));
+  assert.ok(!JSON.stringify(f.manager.autotune.statusFacts()).includes('ErrorOutOfDeviceMemory'));
   assert.ok(!fs.readFileSync(f.stateFile, 'utf8').includes('ErrorOutOfDeviceMemory'));
 });
 
@@ -1209,7 +1208,7 @@ test('#1004 advisor: no rule matches, the decision service reads a template fail
   // Nothing was planned on a template outcome, and models.ini is back.
   assert.equal(probeRows(f).length, 0);
   assert.equal(fs.readFileSync(f.ini, 'utf8'), f.original);
-  assert.ok(!JSON.stringify(f.manager.autotune.status().body).includes('SYNTHETIC-UNMATCHED'));
+  assert.ok(!JSON.stringify(f.manager.autotune.statusFacts()).includes('SYNTHETIC-UNMATCHED'));
 });
 
 test('#1004 advisor: a decision service over its budget is ignored and the calibrator\'s cause stands', { skip: skipWasm }, async t => {
@@ -1270,7 +1269,7 @@ for (const on of [false, true]) test(`#1047 a stream error's engine text never r
   const j = await finished(f.manager);
   assert.equal(j.status, 'passed', j.error);
   assert.match(phase(j.models[0], 'context').steps[0].reason, /^The engine reported an error during the long prompt\./);
-  assert.ok(!JSON.stringify(f.manager.autotune.status().body).includes('SECRET-xyz'));
+  assert.ok(!JSON.stringify(f.manager.autotune.statusFacts()).includes('SECRET-xyz'));
   assert.ok(!fs.readFileSync(f.stateFile, 'utf8').includes('SECRET-xyz'));
 });
 
@@ -1305,7 +1304,7 @@ test('#1048 advisor on: an error body that never ends is cancelled at the deadli
   const f = fixture(t, { servingChecks: servingOff, streamReply: o => (o['ctx-size'] === '16384' && o['cache-type-k'] === 'bf16' ? w.response() : null),
     autotuneExtra: planned({ loadAdvisor: createLoadAdvisor({ env: ADVISOR_ON, endpoint: svc }) }) });
   await f.manager.autotune.start('synthetic', { confirmPause: true });
-  for (let i = 0; i < 400 && f.manager.autotune.status().body.job?.status === 'running'; i++) await new Promise(r => setTimeout(r, 25));
+  for (let i = 0; i < 400 && f.manager.autotune.statusFacts().job?.status === 'running'; i++) await new Promise(r => setTimeout(r, 25));
   const j = await finished(f.manager);
   assert.equal(j.status, 'passed', j.error);
   assert.equal(w.seen.cancelled, true);
@@ -1315,7 +1314,7 @@ test('#1048 advisor on: an error body that never ends is cancelled at the deadli
 
 // ── #1049: an engine failure's own words never become a step reason, note or job error ──
 const noSecret = f => {
-  assert.ok(!JSON.stringify(f.manager.autotune.status().body).includes('SECRET-abc'));
+  assert.ok(!JSON.stringify(f.manager.autotune.statusFacts()).includes('SECRET-abc'));
   assert.ok(!fs.readFileSync(f.stateFile, 'utf8').includes('SECRET-abc'));
 };
 test('#1049 a quality-probe failure carrying engine text stays out of status() and the state file', async t => {
@@ -1436,7 +1435,7 @@ test('#1057 planned: an engine that rejects bf16 gets f16 in its place, recorded
   assert.match(rows[0].reason, /does not support a bf16 KV cache, so auto-tune uses f16/);
   assert.ok(j.log.some(l => /does not support a bf16 KV cache/.test(l.text)));
   // The engine's own words stay out of status() and the state file (#1047).
-  assert.ok(!JSON.stringify(f.manager.autotune.status().body).includes('llama_init_from_model'));
+  assert.ok(!JSON.stringify(f.manager.autotune.statusFacts()).includes('llama_init_from_model'));
   assert.ok(!fs.readFileSync(f.stateFile, 'utf8').includes('llama_init_from_model'));
   assert.deepEqual(item.plan.request.kv, ['f16', 'q8_0']);
 });
@@ -1839,8 +1838,8 @@ test('#1062 a pending re-read is re-armed after a restart and forced by the next
 
 test('#1062 a re-read that keeps waiting gives up with a note', { skip: skipContention }, async t => {
   const { f } = await gaveUpRestored(t, { foreignPollMs: 0 });
-  for (let i = 0; i < 400 && !/has not re-read/.test(logText(f.manager.autotune.status().body.job)); i++) await new Promise(r => setTimeout(r, 10));
-  assert.match(logText(f.manager.autotune.status().body.job), /The model server has not re-read the restored models\.ini; it does so before this model next loads\./);
+  for (let i = 0; i < 400 && !/has not re-read/.test(logText(f.manager.autotune.statusFacts().job)); i++) await new Promise(r => setTimeout(r, 10));
+  assert.match(logText(f.manager.autotune.statusFacts().job), /The model server has not re-read the restored models\.ini; it does so before this model next loads\./);
 });
 
 // ── #1079: Fast and Long tunes, the `<model>-long` section ──────────────────────────────────────
@@ -1881,11 +1880,10 @@ test('#1079 a Long tune adds <model>-long from the model\'s section and tunes on
   // Every chat request of the tune went to the long profile, never the model itself.
   assert.ok(f.requests.length > 0 && f.requests.every(req => req.model === 'synthetic-long'), [...new Set(f.requests.map(req => req.model))].join());
   assert.match(j.log.map(l => l.text).join('\n'), /Added the long-context profile synthetic-long/);
-  const status = f.manager.autotune.status('synthetic').body;
-  assert.equal(status.history.length, 0);
-  assert.equal(status.longId, 'synthetic-long');
-  assert.equal(status.longHistory.length, 1);
-  assert.equal(status.longHistory[0].context, j.models[0].result.context);
+  const status = f.manager.autotune.statusFacts(['synthetic', 'synthetic-long']);
+  assert.equal((status.entries[0].history || []).length, 0);
+  assert.equal(status.entries[1].history.length, 1);
+  assert.equal(status.entries[1].history[0].context, j.models[0].result.context);
   // One recovery copy per run, made by the first write (the section added), of the file before it.
   const copies = fs.readdirSync(f.dir).filter(n => n.startsWith('models.ini.noevia-backup-'));
   assert.ok(copies.some(n => fs.readFileSync(path.join(f.dir, n), 'utf8') === before), copies.join());
@@ -2054,7 +2052,7 @@ test('#1079 without the long-profile module nothing pairs and Long refuses; Fast
 test('#1079 the model\'s KV switch applies to its Long tune', async t => {
   let release; const gate = new Promise(r => { release = r; });
   const f = fixture(t, { reloadAddsSections: true, autotuneExtra: { longProfiles: refProfiles() }, onChat: async () => { await gate; } });
-  assert.equal(setTuneSettings(f.manager, 'synthetic', { allowQ5Kv: true }).status, 200);
+  assert.equal(setTuneSettings(f.manager, 'synthetic', { allowQ5Kv: true }).applied, true);
   const r = await f.manager.autotune.start('synthetic', { confirmPause: true, mode: 'long' });
   assert.deepEqual(r.body.models[0].kv, ['bf16', 'q8_0', 'q5_1', 'q5_0']);
   for (let i = 0; i < 2000 && !f.requests.length; i++) await new Promise(res => setImmediate(res));

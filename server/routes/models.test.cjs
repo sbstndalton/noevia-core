@@ -341,7 +341,7 @@ test('engine-specific routes say what is unavailable and guard the method', asyn
   assert.deepEqual(f.sent.pop(), { status: 405, body: { error: 'Method not allowed' } });
   await f.call('GET', '/api/models/presets/reload', undefined, 'member');
   assert.deepEqual(f.sent.pop(), { status: 403, body: { error: 'Administrator required for shared model profiles' } });
-  await f.call('GET', '/api/models/autotune', undefined, 'admin');
+  await f.call('POST', '/api/models/autotune', undefined, 'admin');
   assert.deepEqual(f.sent.pop(), { status: 404, body: { error: 'Auto-tune is unavailable' } });
   await f.call('GET', '/api/models/preset', undefined, 'member');
   assert.deepEqual(f.sent.pop(), { status: 403, body: { error: 'Administrator required for shared model profiles' } });
@@ -349,9 +349,9 @@ test('engine-specific routes say what is unavailable and guard the method', asyn
   assert.deepEqual(f.sent.pop(), { status: 400, body: { error: 'Invalid repository' } });
   await f.call('POST', '/api/models/installed', undefined, 'admin');
   assert.equal(f.sent.pop().status, 405, 'only the front lists, and it lists on GET');
-  const native = fixture({ manager: { autotune: { status: (model) => ({ status: 200, body: { model, state: 'idle' } }) } } });
+  const native = fixture({ manager: { autotune: { statusFacts: () => assert.fail('Node must not compose public GET status') } } });
   await native.call('GET', '/api/models/autotune', undefined, 'admin', '?model=m');
-  assert.deepEqual(native.sent.pop(), { status: 200, body: { model: 'm', state: 'idle' } });
+  assert.deepEqual(native.sent.pop(), { status: 405, body: { error: 'Method not allowed' } });
 });
 
 test('bulk tuning discovery and start are admin-only and the server owns the queue', async () => {
