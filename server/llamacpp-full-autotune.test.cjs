@@ -5,12 +5,33 @@ const { createModelManager } = require('./model-manager.cjs');
 const { createPresetStore } = require('./llamacpp-presets.cjs');
 const { QUALITY, qualityCheck, qualityFailure, newModel } = require('./llamacpp-full-autotune.cjs');
 
+function cancelWorker(manager) { return manager.autotune.compareAndAbort(manager.autotune.cancellationFacts().token); }
 // Arrange a known-valid switch through the actor's conditional primitive. Public validation and
 // unfinished-job refusal moved to Rust; these tests only arrange the tune scripts' existing inputs.
 function setTuneSettings(manager, model, body) {
   const facts = manager.autotune.settingsFacts(model);
   assert.equal(manager.autotune.commitSettings(model, body.allowQ5Kv, facts.token).applied, true);
   return { status: 200, body: manager.autotune.status(model).body };
+}
+
+
+// Arrange known-valid worker inputs through the actor's mechanical primitives. Public validation,
+// filtering and HTTP responses are tested in Rust, not reproduced by this worker fixture helper.
+async function resumeWorker(manager) {
+  const a = manager.autotune;
+  let facts = a.resumeFacts();
+  const listed = await a.prepareResume(facts.token, { stage: 'listing' });
+  assert.equal(listed.applied, true);
+  assert.ok(listed.models.every(row => !row.system), 'this worker fixture contains no protected item');
+  const selectors = listed.job.models.flatMap((item, index) => item.status === 'passed' ? [] : [{ index, field: item.base ? 'base' : 'model' }]);
+  facts = await a.prepareResume(listed.token, { stage: 'identities', selectors });
+  assert.equal(facts.applied, true);
+  const reset = facts.job.models.flatMap((item, index) => item.status === 'passed' ? [] : [{ index,
+    phases: item.phases.flatMap((p, index) => p.status === 'passed' ? [] : [{ index,
+      keepSteps: item.planned && ['context', 'verify'].includes(p.id) ? p.steps.flatMap((s, i) => ['passed', 'failed'].includes(s.status) ? [i] : []) : null,
+    }]),
+  }]);
+  return a.compareAndResume(facts.token, { kind: 'launch', reset });
 }
 
 // #1057: the fake engine's f16 quirks (failLoadF16, badF16, the shorter recall) hold for both
@@ -123,40 +144,7 @@ test('ordered script commits KV, context, drafting and batch with measured evide
   assert.doesNotMatch(JSON.stringify(j), /beforeText|originalText|lastRevision|_revision/);
 });
 
-function seedLegacyJob(f, models) {
-  const { createPresetStore } = require('./llamacpp-presets.cjs');
-  const revision = createPresetStore(f.ini).get('synthetic').revision;
-  const job = { id: 'legacy', status: 'interrupted', phase: 'Interrupted', startedAt: Date.now(), finishedAt: Date.now(),
-    log: [], _revision: revision, model: models[0], promptBudgetSeconds: 120, bulk: true,
-    queueProgress: { done: 0, total: models.length },
-    models: models.map(model => newModel(model)) };
-  fs.writeFileSync(f.stateFile, JSON.stringify({ history: {}, job }));
-  return f.restart();
-}
-
-test('a job persisted before this fix that still lists Laya in its queue drops it on resume instead of tuning it', async t => {
-  const f = fixture(t, { models: ['synthetic'] });
-  const manager = seedLegacyJob(f, ['laya_multilingual_f16', 'synthetic']);
-  const r = await manager.autotune.resume({ confirmPause: true });
-  assert.equal(r.status, 202);
-  assert.deepEqual(r.body.skipped, [{ model: 'laya_multilingual_f16', reason: 'System routing model — not tuned' }]);
-  assert.deepEqual(r.body.models.map(m => m.model), ['synthetic']);
-  const j = await finished(manager);
-  assert.equal(j.status, 'passed', j.error);
-  assert.deepEqual(j.models.map(m => m.model), ['synthetic']);
-  assert.ok(!f.requests.some(req => req.model === 'laya_multilingual_f16'), 'Laya must never be loaded or chatted with');
-});
-
-test('a job persisted before this fix that lists only Laya finishes cleanly on resume without running anything', async t => {
-  const f = fixture(t, { models: ['synthetic'] });
-  const manager = seedLegacyJob(f, ['laya_multilingual_f16']);
-  const r = await manager.autotune.resume({ confirmPause: true });
-  assert.equal(r.status, 200);
-  assert.equal(r.body.status, 'passed');
-  assert.deepEqual(r.body.skipped, [{ model: 'laya_multilingual_f16', reason: 'System routing model — not tuned' }]);
-  assert.deepEqual(r.body.models, []);
-  assert.equal(f.requests.length, 0);
-});
+// Legacy queue filtering/refusal responses are covered by the native resume fixtures.
 
 test('Laya is reported as a system model, not a chat model needing tuning, and cannot be started directly', async t => {
   const f = fixture(t, { models: ['synthetic', 'laya_multilingual_f16'] });
@@ -196,7 +184,7 @@ test('an unload that never reaches unloaded stops without writing another profil
 test('cancelling during router unload waits for safe rollback and releases chat', async t => {
   let cancelled = false;
   const f = fixture(t, { unloadPolls: 4, onUnload: ({ manager }) => {
-    if (!cancelled) { cancelled = true; manager.autotune.cancel(); }
+    if (!cancelled) { cancelled = true; cancelWorker(manager); }
   } });
   await f.manager.autotune.start('synthetic', { confirmPause: true });
   const j = await finished(f.manager);
@@ -247,11 +235,11 @@ test('busy chat makes start wait, with cancellable bounded idle acquisition', as
   assert.equal(timedOut.status, 'interrupted');
   assert.match(timedOut.error, /Timed out waiting/);
   leave();
-  assert.equal((await f.manager.autotune.resume({ confirmPause: true })).status, 202);
+  assert.equal((await resumeWorker(f.manager)).applied, true);
   assert.equal((await finished(f.manager)).status, 'passed');
   const second = fixture(t), busy = second.manager.enterInference();
   await second.manager.autotune.start('synthetic', { confirmPause: true });
-  second.manager.autotune.cancel();
+  cancelWorker(second.manager);
   assert.equal((await finished(second.manager)).status, 'cancelled');
   busy();
   const chat = second.manager.enterInference(); chat();
@@ -270,7 +258,7 @@ test('cancel during drafting keeps committed KV/context and Resume starts at dra
   let stopped = false;
   const f = fixture(t, { onChat: ({ manager }) => {
     const j = manager.autotune.status().body.job;
-    if (!stopped && j?.phase === 'Drafting') { stopped = true; manager.autotune.cancel(); }
+    if (!stopped && j?.phase === 'Drafting') { stopped = true; cancelWorker(manager); }
   } });
   await f.manager.autotune.start('synthetic', { confirmPause: true });
   const j = await finished(f.manager);
@@ -281,14 +269,13 @@ test('cancel during drafting keeps committed KV/context and Resume starts at dra
   assert.equal(f.options('synthetic')['ctx-size'], '8192');
   assert.equal(f.manager.autotune.status().body.history.length, 0);
   const before = f.requests.length;
-  assert.equal((await f.manager.autotune.resume({ confirmPause: true })).status, 202);
+  assert.equal((await resumeWorker(f.manager)).applied, true);
   const resumed = await finished(f.manager);
   assert.equal(resumed.status, 'passed', resumed.error);
   assert.ok(f.requests.length > before);
   assert.equal(resumed.models[0].phases[0].status, 'passed');
   assert.equal(resumed.models[0].phases[1].status, 'passed');
   assert.equal(resumed.models[0].result.spec, 'mtp-deep');
-  assert.equal((await f.manager.autotune.resume()).status, 400, 'resuming requires renewed pause confirmation');
 });
 
 test('batch quality failure restores only batch settings and leaves prior phase commits', async t => {
@@ -318,13 +305,13 @@ test('external preset edit stops rollback and Resume, preserving the operator te
   assert.equal(j.status, 'failed'); assert.match(j.error, /inspect models.ini/);
   assert.match(fs.readFileSync(f.ini, 'utf8'), /external operator edit/);
   assert.equal(j.models[0].phases[0].status, 'passed');
-  assert.equal((await f.manager.autotune.resume({ confirmPause: true })).status, 409);
+  assert.equal(f.manager.autotune.resumeFacts().job.unsafe, true);
 });
 
 test('restart rolls back active phase only, then explicit Resume skips committed phases', async t => {
   let stopped = false;
   const f = fixture(t, { onChat: ({ manager }) => {
-    if (!stopped && manager.autotune.status().body.job?.phase === 'Drafting') { stopped = true; manager.autotune.cancel(); }
+    if (!stopped && manager.autotune.status().body.job?.phase === 'Drafting') { stopped = true; cancelWorker(manager); }
   } });
   await f.manager.autotune.start('synthetic', { confirmPause: true }); await finished(f.manager);
   const state = JSON.parse(fs.readFileSync(f.stateFile, 'utf8'));
@@ -341,7 +328,7 @@ test('restart rolls back active phase only, then explicit Resume skips committed
   assert.equal(j.status, 'interrupted'); assert.equal(phase(j.models[0], 'drafting').restored, true);
   assert.equal(fs.readFileSync(f.ini, 'utf8'), beforeText);
   const before = f.requests.length;
-  assert.equal((await manager.autotune.resume({ confirmPause: true })).status, 202);
+  assert.equal((await resumeWorker(manager)).applied, true);
   const end = await finished(manager);
   assert.equal(end.status, 'passed', end.error);
   assert.deepEqual(end.models[0].phases.slice(0,2).map(p => p.status), ['passed','passed']);
@@ -360,7 +347,7 @@ test('restart after every phase commit reloads and qualifies the saved profile b
   const before = f.requests.length;
   const manager = f.restart(); await manager.autotune.recover();
   assert.equal(manager.autotune.status().body.job.status, 'interrupted');
-  assert.equal((await manager.autotune.resume({ confirmPause: true })).status, 202);
+  assert.equal((await resumeWorker(manager)).applied, true);
   const resumed = await finished(manager);
   assert.equal(resumed.status, 'passed', resumed.error);
   assert.ok(f.requests.length >= before + 6, 'final quality and throughput run after restart');
@@ -387,7 +374,7 @@ test('legacy running journal restores only after unloading and confirmed reload'
     assert.equal(j.restored, !reloadFail);
     assert.equal(f.status.synthetic, 'unloaded');
     assert.equal(fs.readFileSync(f.ini, 'utf8'), before);
-    assert.equal((await manager.autotune.resume({ confirmPause: true })).status, 409);
+    assert.equal(manager.autotune.resumeFacts().job.models, null);
   }
 });
 
@@ -742,7 +729,7 @@ test('#328 a model that fails every probe at its reference settings stops with a
   assert.equal(fs.readFileSync(f.ini, 'utf8'), f.original);
   // Resume measures the baseline again rather than trusting the empty one.
   const before = f.requests.length;
-  assert.equal((await f.manager.autotune.resume({ confirmPause: true })).status, 202);
+  assert.equal((await resumeWorker(f.manager)).applied, true);
   const again = await finished(f.manager);
   assert.equal(again.status, 'failed');
   assert.equal(f.requests.length - before, 3);
@@ -756,7 +743,7 @@ test('#1978 a failed run keeps the failing phase and step labels on the job, not
   assert.equal(j.failedPhase, phase(j.models[0], 'kv').label);
   assert.equal(j.failedStep, phase(j.models[0], 'kv').steps[0].label);
   // Resume clears them while it runs, and they come back for the new stop.
-  await f.manager.autotune.resume({ confirmPause: true });
+  await resumeWorker(f.manager);
   const again = await finished(f.manager);
   assert.equal(again.failedPhase, phase(again.models[0], 'kv').label);
 });
@@ -764,7 +751,7 @@ test('#1978 a failed run keeps the failing phase and step labels on the job, not
 test('#1978 a restart-interrupted run keeps the phase it was in', async t => {
   let stopped = false;
   const f = fixture(t, { onChat: ({ manager }) => {
-    if (!stopped && manager.autotune.status().body.job?.phase === 'Drafting') { stopped = true; manager.autotune.cancel(); }
+    if (!stopped && manager.autotune.status().body.job?.phase === 'Drafting') { stopped = true; cancelWorker(manager); }
   } });
   await f.manager.autotune.start('synthetic', { confirmPause: true });
   const c = await finished(f.manager);
@@ -796,7 +783,7 @@ test('#1978 clear drops a finished job record only: measurements, settings and m
   assert.equal(f.manager.autotune.status('synthetic').body.settings.allowQ5Kv, true);
   assert.equal(fs.readFileSync(f.ini, 'utf8'), ini);
   assert.equal(f.manager.autotune.compareAndClear(f.manager.autotune.clearFacts().token).applied, false, 'nothing left to clear');
-  assert.equal((await f.manager.autotune.resume({ confirmPause: true })).status, 409);
+  assert.equal(f.manager.autotune.resumeFacts().job, null);
 });
 
 test('#1978 clear keeps finished measurements in history after a passed run', async t => {
@@ -1099,13 +1086,13 @@ test('#1003 planned: a cancelled run resumes from its results without repeating 
   let cancelOnce = true;
   const f = fixture(t, { servingChecks: servingOff, autotuneExtra: planned(), onChat: ({ manager, o }) => {
     // The 8k probe's quality check: cancel there, after the 16k probe has its result.
-    if (cancelOnce && o['ctx-size'] === '8192' && o['cache-type-k'] === 'bf16' && manager.autotune.status().body.job?.models[0].plan?.results.length === 1) { cancelOnce = false; manager.autotune.cancel(); }
+    if (cancelOnce && o['ctx-size'] === '8192' && o['cache-type-k'] === 'bf16' && manager.autotune.status().body.job?.models[0].plan?.results.length === 1) { cancelOnce = false; cancelWorker(manager); }
   } });
   await f.manager.autotune.start('synthetic', { confirmPause: true });
   let j = await finished(f.manager);
   assert.equal(j.status, 'cancelled');
   assert.equal(fs.readFileSync(f.ini, 'utf8'), f.original);
-  assert.equal((await f.manager.autotune.resume({ confirmPause: true })).status, 202);
+  assert.equal((await resumeWorker(f.manager)).applied, true);
   j = await finished(f.manager);
   assert.equal(j.status, 'passed', j.error);
   const results = JSON.parse(fs.readFileSync(f.stateFile, 'utf8')).job.models[0].plan.results;
@@ -1649,7 +1636,7 @@ test('#1062 a client that stays busy past the wait stops the tune as interrupted
   // The phase that was running put models.ini back; the job can be resumed once the client is done.
   assert.ok(j.models[0].phases.every(p => p.restored !== false));
   busy = 0; f.status.outside = 'unloaded';
-  assert.equal((await f.manager.autotune.resume({ confirmPause: true })).status, 202);
+  assert.equal((await resumeWorker(f.manager)).applied, true);
   const resumed = await finished(f.manager);
   assert.equal(resumed.status, 'passed', resumed.error);
 });
@@ -1668,7 +1655,7 @@ test('#1062 cancelling while waiting for another client stops promptly', { skip:
   let injected = false;
   const f = fixture(t, { models: ['synthetic', 'outside'], autotuneExtra: foreignOptions({ foreignPollMs: 2 }),
     metricsFor: model => `llamacpp:requests_processing ${model === 'outside' ? 1 : 0}\n`,
-    onChat: ({ chats, status, manager }) => { if (chats === 3 && !injected) { injected = true; status.outside = 'loaded'; setTimeout(() => manager.autotune.cancel(), 20); } } });
+    onChat: ({ chats, status, manager }) => { if (chats === 3 && !injected) { injected = true; status.outside = 'loaded'; setTimeout(() => cancelWorker(manager), 20); } } });
   assert.equal((await f.manager.autotune.start('synthetic', { confirmPause: true })).status, 202);
   const j = await finished(f.manager);
   assert.equal(j.status, 'cancelled');
@@ -1727,7 +1714,7 @@ test('#1068 a client that keeps its model busy through the restore: cancel is pr
   const f = fixture(t, { models: ['synthetic', 'outside'], autotuneExtra: foreignOptions({ foreignPollMs: 2 }),
     metricsFor: model => `llamacpp:requests_processing ${model === 'outside' ? 1 : 0}\n`,
     onUnload: ({ model }) => { unloads.push(model); if (model === 'synthetic') f.status.outside = 'loaded'; },
-    onChat: ({ chats, status, manager }) => { if (chats === 3 && !injected) { injected = true; status.outside = 'loaded'; setTimeout(() => manager.autotune.cancel(), 20); } } });
+    onChat: ({ chats, status, manager }) => { if (chats === 3 && !injected) { injected = true; status.outside = 'loaded'; setTimeout(() => cancelWorker(manager), 20); } } });
   assert.equal((await f.manager.autotune.start('synthetic', { confirmPause: true })).status, 202);
   const t0 = Date.now();
   const j = await finished(f.manager);
@@ -1776,7 +1763,7 @@ test('#1062 a compact model already evicted at restore (unload refused with 404)
   assert.ok(j.models[0].phases.every(p => p.restored !== false), JSON.stringify(j.models[0].phases.map(p => [p.id, p.restored])));
   assert.equal(fs.readFileSync(f.ini, 'utf8'), f.original);
   f.status.outside = 'unloaded';
-  assert.equal((await f.manager.autotune.resume({ confirmPause: true })).status, 202);
+  assert.equal((await resumeWorker(f.manager)).applied, true);
   assert.equal((await finished(f.manager)).status, 'passed');
 });
 
@@ -1989,8 +1976,8 @@ test('#1093 a crash after the -long section is written resumes as "added but not
   // The crash: the file and the job as they were at the re-read, the router never having listed the section.
   fs.writeFileSync(f.ini, crashed.ini); fs.writeFileSync(f.stateFile, crashed.state);
   const manager = f.restart(); await manager.autotune.recover();
-  const r = await manager.autotune.resume({ confirmPause: true });
-  assert.equal(r.status, 202, JSON.stringify(r.body));
+  const r = await resumeWorker(manager);
+  assert.equal(r.applied, true, JSON.stringify(r.publicJob));
   const j = await finished(manager);
   assert.equal(j.status, 'failed');
   assert.match(j.error, /long-context profile synthetic-long is in models\.ini, but the model server has not picked it up yet/);
@@ -2016,8 +2003,8 @@ test('#1093 a crash between the -long write and the save of its revision does no
   job.models[0].status = 'interrupted';
   fs.writeFileSync(f.ini, crashed.ini); fs.writeFileSync(f.stateFile, JSON.stringify(state));
   const manager = f.restart(); await manager.autotune.recover();
-  const r = await manager.autotune.resume({ confirmPause: true });
-  assert.equal(r.status, 202, JSON.stringify(r.body));
+  const r = await resumeWorker(manager);
+  assert.equal(r.applied, true, JSON.stringify(r.publicJob));
   const j = await finished(manager);
   assert.doesNotMatch(j.error || '', /Settings changed outside auto-tune/);
   assert.notEqual(j.status, 'failed', j.error);
@@ -2037,9 +2024,9 @@ test('#1093 an unrelated change to models.ini still refuses the resume', async t
   job.status = 'interrupted';
   fs.writeFileSync(f.ini, crashed.ini + '# edited by hand\n'); fs.writeFileSync(f.stateFile, JSON.stringify(state));
   const manager = f.restart(); await manager.autotune.recover();
-  const r = await manager.autotune.resume({ confirmPause: true });
-  assert.equal(r.status, 409);
-  assert.match(r.body.error, /Settings changed outside auto-tune/);
+  const facts = manager.autotune.resumeFacts();
+  assert.notEqual(facts.revision, facts.job.revision);
+  assert.notEqual(facts.revision, facts.job.pendingRevision);
 });
 
 test('#1079 Long refuses up front when the section cannot be made (no model file to point at)', async t => {
@@ -2072,7 +2059,7 @@ test('#1079 the model\'s KV switch applies to its Long tune', async t => {
   assert.deepEqual(r.body.models[0].kv, ['bf16', 'q8_0', 'q5_1', 'q5_0']);
   for (let i = 0; i < 2000 && !f.requests.length; i++) await new Promise(res => setImmediate(res));
   // The public unfinished-Long-run settings refusal is tested by the native policy/wire tests.
-  f.manager.autotune.cancel(); release();
+  cancelWorker(f.manager); release();
   assert.equal((await finished(f.manager)).status, 'cancelled');
 });
 

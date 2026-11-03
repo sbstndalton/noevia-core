@@ -365,13 +365,9 @@ test('engine-specific routes say what is unavailable and guard the method', asyn
   assert.deepEqual(f.sent.pop(), { status: 400, body: { error: 'Invalid repository' } });
   await f.call('POST', '/api/models/installed', undefined, 'admin');
   assert.equal(f.sent.pop().status, 405, 'only the front lists, and it lists on GET');
-  const native = fixture({ manager: { autotune: { status: (model) => ({ status: 200, body: { model, state: 'idle' } }), cancel: () => ({ status: 200, body: { cancelled: true } }) } } });
+  const native = fixture({ manager: { autotune: { status: (model) => ({ status: 200, body: { model, state: 'idle' } }) } } });
   await native.call('GET', '/api/models/autotune', undefined, 'admin', '?model=m');
   assert.deepEqual(native.sent.pop(), { status: 200, body: { model: 'm', state: 'idle' } });
-  await native.call('GET', '/api/models/autotune/cancel', undefined, 'admin');
-  assert.deepEqual(native.sent.pop(), { status: 405, body: { error: 'Method not allowed' } });
-  await native.call('POST', '/api/models/autotune/cancel', undefined, 'admin');
-  assert.deepEqual(native.sent.pop(), { status: 200, body: { cancelled: true } });
 });
 
 test('bulk tuning discovery and start are admin-only and the server owns the queue', async () => {
@@ -403,24 +399,6 @@ test('starting auto-tune on a system routing model (Laya) is rejected as a 4xx, 
   assert.equal(sent.status, 400);
   assert.equal(sent.body.error, 'System routing model — not tuned');
 });
-
-test('resume is admin-only, POST-only and passes renewed pause confirmation', async () => {
-  const calls = [];
-  const f = fixture({ manager: { autotune: {
-    resume: async options => { calls.push(options); return { status: options.confirmPause ? 202 : 400, body: { resumed: options.confirmPause } }; },
-  } } });
-  await f.call('POST', '/api/models/autotune/resume', { confirmPause: true });
-  assert.equal(f.sent.pop().status, 403);
-  await f.call('GET', '/api/models/autotune/resume', undefined, 'admin');
-  assert.equal(f.sent.pop().status, 405);
-  await f.call('POST', '/api/models/autotune/resume', {}, 'admin');
-  assert.equal(f.sent.pop().status, 400);
-  await f.call('POST', '/api/models/autotune/resume', { confirmPause: true }, 'admin');
-  assert.equal(f.sent.pop().status, 202);
-  assert.deepEqual(calls, [{ confirmPause: undefined }, { confirmPause: true }]);
-});
-
-
 
 
 test('the default model mode saves, and only an explicit apply switches existing projects', async () => {
