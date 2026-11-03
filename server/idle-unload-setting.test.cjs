@@ -168,3 +168,31 @@ test('#2219 a refused hold changes nothing; a granted one writes before its relo
   assert.equal(audit.length, 1);
   assert.deepEqual(reloads, [], 'the reload ran inside the hold');
 });
+
+test('idle timer facts expose only the trusted live value and refuse forwarded traffic', async () => {
+  const { createIdleUnloadFacts, PATH } = require('./rust-idle-unload-read-facts.cjs');
+  const { refuseOwned } = require('./rust-idle-unload-read.cjs');
+  const sent = [];
+  let calls = 0;
+  const json = (_res, status, body) => sent.push({ status, body });
+  const handle = createIdleUnloadFacts({
+    secret: 'synthetic', json, effectiveSeconds: async () => { calls += 1; return 1800; },
+  });
+  const request = { url: PATH, method: 'POST', socket: { remoteAddress: '127.0.0.1' }, headers: { 'x-noevia-store-token': 'synthetic' } };
+  for (const req of [
+    { ...request, headers: {} },
+    { ...request, headers: { ...request.headers, 'x-forwarded-for': '' } },
+    { ...request, socket: { remoteAddress: '10.0.0.2' } },
+  ]) {
+    assert.equal(await handle(req, {}), true);
+    assert.equal(sent.pop().status, 404);
+  }
+  assert.equal(calls, 0);
+  assert.equal(await handle(request, {}), true);
+  assert.deepEqual(sent.pop(), { status: 200, body: { seconds: 1800 } });
+  assert.equal(calls, 1);
+  const parseRequestUrl = (req) => new URL(req.url, 'http://synthetic');
+  assert.equal(refuseOwned({ method: 'GET', url: '/api/models/idle-unload' }, {}, { parseRequestUrl, json }), true);
+  assert.equal(sent.pop().status, 503);
+  assert.equal(refuseOwned({ method: 'PUT', url: '/api/models/idle-unload' }, {}, { parseRequestUrl, json }), false);
+});
