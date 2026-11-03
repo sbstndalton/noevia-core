@@ -97,12 +97,17 @@ function tuner(t, rows) {
   }) };
 }
 
-test('resume drops a queued model whose --model path is Laya even under a neutral id', async (t) => {
+test('resume metadata protects a queued Laya --model path under a neutral id', async (t) => {
   const f = tuner(t, async () => ({ ok: true, body: { data: [{ id: 'router-a', status: { args: ['--model', '/m/Laya_Multilingual_F16.gguf'] } }] } }));
   const job = { id: 'j', status: 'interrupted', _revision: 'r1', model: 'router-a', bulk: true, log: [], queueProgress: { done: 0, total: 1 }, models: [newModel('router-a')] };
   fs.writeFileSync(f.stateFile, JSON.stringify({ history: {}, job }));
-  const r = await f.make().resume({ confirmPause: true });
-  assert.equal(r.status, 200);
-  assert.equal(r.body.status, 'passed');
-  assert.deepEqual(r.body.skipped, [{ model: 'router-a', reason: 'System routing model — not tuned' }]);
+  const actor = f.make();
+  const facts = await actor.prepareResume(actor.resumeFacts().token, { stage: 'listing' });
+  assert.equal(facts.applied, true);
+  assert.deepEqual(facts.models, [{ index: 0, system: true, modelListed: true, baseListed: false }]);
+  // The native route chooses this exact patch; the actor only applies it conditionally.
+  const r = actor.compareAndResume(facts.token, { kind: 'filter', keep: [], skipped: [{ index: 0, reason: 'System routing model — not tuned' }], complete: true, model: null });
+  assert.equal(r.applied, true);
+  assert.equal(r.publicJob.status, 'passed');
+  assert.deepEqual(r.publicJob.skipped, [{ model: 'router-a', reason: 'System routing model — not tuned' }]);
 });

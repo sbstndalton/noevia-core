@@ -1118,6 +1118,9 @@ const providerRoutes = require('./routes/providers.cjs').createProviderRoutes({
   json, chatgptOAuth, chatgptEnabled: () => features.enabled('chatgptOAuth'),
 });
 // Statistics, the auto-router roles, the model manager proxy and /api/models/* (routes/models.cjs).
+const modelManagerScanCache = require('./rust-model-manager-scan-cache.cjs').createModelManagerScanCache({
+  secret: FRONT_SECRET, json, readJson, service: modelService,
+});
 const modelRoutes = require('./routes/models.cjs').createModelRoutes({
   json, readBody, readJson, fetchJson, env: process.env, modelManager, getProvider, providerHeaders, DEFAULT_PROVIDER_ID, createVisionProbe: engineVisionProbe, currentWorkspace, service: modelService, inferenceBudget, idleUnload, decisionSettings, rerankSettings,
 });
@@ -1198,6 +1201,15 @@ const authRoutes = require('./routes/auth.cjs').createAuthRoutes({
 // only refuses a request that bypassed it.
 const storageRoutes = require('./routes/storage.cjs').createStorageRoutes({ json });
 // Public approval policy is Rust's; only pending chat Promise resolution remains here (#2282).
+const idleUnloadFacts = require('./rust-idle-unload-read-facts.cjs').createIdleUnloadFacts({
+  secret: FRONT_SECRET, json, effectiveSeconds: () => idleUnload?.effectiveSeconds(),
+});
+const autotuneReadBridge = require('./rust-autotune-read-bridge.cjs').createAutotuneReadBridge({
+  secret: FRONT_SECRET, json, readJson, autotune: () => modelManager.autotune,
+});
+const autotuneResumeBridge = require('./rust-autotune-resume-bridge.cjs').createAutotuneResumeBridge({
+  secret: FRONT_SECRET, json, readJson, autotune: () => modelManager.autotune, invalidate: () => modelService.modelScanCache.clear(),
+});
 const autotuneClearBridge = require('./rust-autotune-clear-bridge.cjs').createAutotuneClearBridge({ secret: FRONT_SECRET, json, readJson, autotune: () => modelManager.autotune });
 const autotuneUntunedFacts = require('./rust-autotune-untuned-facts.cjs').createAutotuneUntunedFacts({ secret: FRONT_SECRET, json, readJson, autotune: () => modelManager.autotune });
 const toolApprovals = require('./rust-tool-approval-bridge.cjs');
@@ -1252,6 +1264,9 @@ const calibrationCancelBridge = require('./rust-calibration-cancel-bridge.cjs').
   secret: FRONT_SECRET, json, readJson, calibration: () => modelManager.calibration,
 });
 // #2281: the Rust front owns the picker response; only raw live discovery/prefill facts stay here.
+const autotuneCancelBridge = require('./rust-autotune-cancel-bridge.cjs').createAutotuneCancelBridge({
+  secret: FRONT_SECRET, json, readJson, autotune: () => modelManager.autotune,
+});
 const toolboxPickerFacts = require('./rust-toolbox-picker-facts.cjs').createToolboxPickerFacts({
   secret: FRONT_SECRET, discoverMcpTools: async () => { await readyFeatures(); await discoverMcpTools(); }, allToolboxes, connectorBoxes: CONNECTOR_BOXES, json, readJson,
   prefill: { targetMs: TOOL_PREFILL_TARGET_MS, stats: () => prefill.stats() },
@@ -1279,6 +1294,12 @@ async function handleRequestInner(req, res) {
   // The ownership refusals below answer before handleRequestScoped; they carry the same headers.
   publicHeaders(res);
   if (require('./rust-tool-approvals.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
+  if (require('./rust-idle-unload-read.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
+  if (await idleUnloadFacts(req, res)) return;
+  if (require('./rust-autotune-read.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
+  if (await autotuneReadBridge(req, res)) return;
+  if (require('./rust-autotune-resume.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
+  if (await autotuneResumeBridge(req, res)) return;
   if (require('./rust-autotune-clear.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   if (await autotuneClearBridge(req, res)) return;
   if (require('./rust-autotune-untuned.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
@@ -1351,6 +1372,10 @@ async function handleRequestInner(req, res) {
   if (require('./rust-mcp-directory.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   if (require('./rust-toolboxes-permitted.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   if (require('./rust-toolbox-picker.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
+  if (require('./rust-model-manager-scan.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
+  if (await modelManagerScanCache(req, res)) return;
+  if (require('./rust-autotune-cancel.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
+  if (await autotuneCancelBridge(req, res)) return;
   if (require('./rust-calibration-cancel.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   if (await calibrationCancelBridge(req, res)) return;
   if (await toolboxPickerFacts(req, res)) return;

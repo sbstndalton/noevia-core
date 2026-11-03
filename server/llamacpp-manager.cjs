@@ -694,7 +694,7 @@ function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloa
     // Throws a 409 when requests are in flight or the gate is already held; with the inference
     // gate as the authority (#2187) it returns a promise of the release instead (callers await it).
     holdMaintenance: reason => maintenance.hold(reason),
-    tuningActive: () => maintenance.held() || calibrator?.status().body.job?.status === 'running' || autotuner?.status().body.job?.status === 'running',
+    tuningActive: () => maintenance.held() || calibrator?.status().body.job?.status === 'running' || autotuner?.statusFacts().job?.status === 'running',
     getPreset: model => presets ? Promise.resolve({ok:true,status:200,body:presets.get(model)}) : unsupported('Native preset editing'),
     applyPreset,
     // #697: the load guard and the budget, for the proxied benchmark start and the watchdog.
@@ -715,7 +715,7 @@ function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloa
     // #2210: waits (bounded) until the front has applied a queued record (recordEvidence's handle).
     evidenceApplied: (handle,options)=>evidenceInbox?evidenceInbox.applied(handle,options):Promise.resolve(true),
     calibration: calibrator ? { start: calibrator.start, cancellationFacts: calibrator.cancellationFacts, compareAndAbort: calibrator.compareAndAbort, status: calibrator.status, recover: calibrator.recover } : null,
-    autotune: autotuner ? { start: (...args) => { const fault = budgetFaultReason(); return fault ? Promise.resolve({ ok: false, status: 503, body: budgetFaultBody('Auto-tune unavailable', fault) }) : autotuner.start(...args); }, resume: autotuner.resume, cancel: autotuner.cancel, clearFacts: autotuner.clearFacts, compareAndClear: autotuner.compareAndClear, status: autotuner.status, settingsFacts: autotuner.settingsFacts, commitSettings: autotuner.commitSettings, recover: autotuner.recover, scanFacts: autotuner.scanFacts } : null,
+    autotune: autotuner ? { start: (...args) => { const fault = budgetFaultReason(); return fault ? Promise.resolve({ ok: false, status: 503, body: budgetFaultBody('Auto-tune unavailable', fault) }) : autotuner.start(...args); }, resumeFacts: autotuner.resumeFacts, prepareResume: autotuner.prepareResume, compareAndResume: autotuner.compareAndResume, cancellationFacts: autotuner.cancellationFacts, compareAndAbort: autotuner.compareAndAbort, clearFacts: autotuner.clearFacts, compareAndClear: autotuner.compareAndClear, statusFacts: autotuner.statusFacts, settingsFacts: autotuner.settingsFacts, commitSettings: autotuner.commitSettings, recover: autotuner.recover, scanFacts: autotuner.scanFacts } : null,
     // noevia#2115: the gate refuses to unload a model in use (409 `model_in_use`); `unloadAnyway` is the
     // admin's choice to end what it is answering, and needs INFERENCE_GATE_ADMIN_TOKEN.
     unload: model => mutate(()=>post('/models/unload', { model })),
