@@ -1201,6 +1201,9 @@ const authRoutes = require('./routes/auth.cjs').createAuthRoutes({
 // only refuses a request that bypassed it.
 const storageRoutes = require('./routes/storage.cjs').createStorageRoutes({ json });
 // Public approval policy is Rust's; only pending chat Promise resolution remains here (#2282).
+const presetReadBridge = require('./rust-preset-read-bridge.cjs').createPresetReadBridge({
+  secret: FRONT_SECRET, json, readJson, manager: () => modelManager,
+});
 const autotuneReadBridge = require('./rust-autotune-read-bridge.cjs').createAutotuneReadBridge({
   secret: FRONT_SECRET, json, readJson, autotune: () => modelManager.autotune,
 });
@@ -1291,6 +1294,8 @@ async function handleRequestInner(req, res) {
   publicHeaders(res);
   if (require('./rust-tool-approvals.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   if (require('./rust-autotune-read.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
+  if (require('./rust-preset-read.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
+  if (await presetReadBridge(req, res)) return;
   if (await autotuneReadBridge(req, res)) return;
   if (require('./rust-autotune-resume.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   if (await autotuneResumeBridge(req, res)) return;

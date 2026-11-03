@@ -695,7 +695,7 @@ function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloa
     // gate as the authority (#2187) it returns a promise of the release instead (callers await it).
     holdMaintenance: reason => maintenance.hold(reason),
     tuningActive: () => maintenance.held() || calibrator?.status().body.job?.status === 'running' || autotuner?.statusFacts().job?.status === 'running',
-    getPreset: model => presets ? Promise.resolve({ok:true,status:200,body:presets.get(model)}) : unsupported('Native preset editing'),
+    presetFacts: model => presets?.get(model) ?? null,
     applyPreset,
     // #697: the load guard and the budget, for the proxied benchmark start and the watchdog.
     loadRefusal: model => overBudget(model).then(r => r ? r.body : null),
