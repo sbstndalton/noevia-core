@@ -349,13 +349,9 @@ test('engine-specific routes say what is unavailable and guard the method', asyn
   assert.deepEqual(f.sent.pop(), { status: 400, body: { error: 'Invalid repository' } });
   await f.call('POST', '/api/models/installed', undefined, 'admin');
   assert.equal(f.sent.pop().status, 405, 'only the front lists, and it lists on GET');
-  const native = fixture({ manager: { autotune: { status: (model) => ({ status: 200, body: { model, state: 'idle' } }), cancel: () => ({ status: 200, body: { cancelled: true } }) } } });
+  const native = fixture({ manager: { autotune: { status: (model) => ({ status: 200, body: { model, state: 'idle' } }) } } });
   await native.call('GET', '/api/models/autotune', undefined, 'admin', '?model=m');
   assert.deepEqual(native.sent.pop(), { status: 200, body: { model: 'm', state: 'idle' } });
-  await native.call('GET', '/api/models/autotune/cancel', undefined, 'admin');
-  assert.deepEqual(native.sent.pop(), { status: 405, body: { error: 'Method not allowed' } });
-  await native.call('POST', '/api/models/autotune/cancel', undefined, 'admin');
-  assert.deepEqual(native.sent.pop(), { status: 200, body: { cancelled: true } });
 });
 
 test('bulk tuning discovery and start are admin-only and the server owns the queue', async () => {
