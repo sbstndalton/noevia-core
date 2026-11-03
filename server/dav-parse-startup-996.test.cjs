@@ -296,8 +296,20 @@ test('index.cjs refuses to start without the module even with every retired swit
 
 test('index.cjs starts with the pinned module and every retired switch left at js (a warning each, no crash)', { skip: skipWasm }, async (t) => {
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'startup-1071-ok-'));
-  t.after(() => fs.rmSync(dataDir, { recursive: true, force: true }));
-  const child = require('node:child_process').spawn(process.execPath, [path.join(__dirname, 'index.cjs')], {
+  let child, closed;
+  t.after(async () => {
+    if (child) {
+      if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
+      let timer;
+      try {
+        await Promise.race([closed, new Promise((_, reject) => {
+          timer = setTimeout(() => reject(new Error('startup child did not close within 5 seconds')), 5000);
+        })]);
+      } finally { clearTimeout(timer); }
+    }
+    fs.rmSync(dataDir, { recursive: true, force: true });
+  });
+  child = require('node:child_process').spawn(process.execPath, [path.join(__dirname, 'index.cjs')], {
     env: { ...process.env, UI_DATA_DIR: dataDir, UI_PORT: '0', PORT: '0', HOST: '127.0.0.1', PUBLIC_ORIGIN: 'http://localhost', DIARY_AUTH_TOKEN: 'test-cowork-token', DAV_PARSE_WASM: wasmFile,
       // The project store is required (sbstndalton/noevia#1071); nothing is saved in this test.
       NOEVIA_PROJECT_STORE_PORT: '9', NOEVIA_PROJECT_STORE_TOKEN: 'synthetic-store-token-'.padEnd(64, 'x'), NOEVIA_RUST_PROJECTS: '0', NOEVIA_START_ID: '0123456789abcdef0123456789abcdef',
@@ -306,8 +318,10 @@ test('index.cjs starts with the pinned module and every retired switch left at j
       POLICY_LEAVES_IMPL: 'js', CODE_REVIEW_VERDICT_IMPL: 'js', TOOL_EXCHANGE_IMPL: 'js', DECISION_IMPL: 'js', COMPLETENESS_REPORT_IMPL: 'js', TASK_LIFECYCLE_IMPL: 'js', MCP_SERVERS_IMPL: 'js', CODE_NET_GUARD_IMPL: 'js', LLAMACPP_AUTOCONFIG_IMPL: 'js', GGUF_META_IMPL: 'js', PROJECT_FILE_NAMES_IMPL: 'js', PROVIDER_EGRESS_IMPL: 'js', BROWSER_POLICY_IMPL: 'js', CODE_ACTIONS_IMPL: 'js', TOOL_GATE_IMPL: 'js', TOOLBOXES_PERMITTED_IMPL: 'js', STORAGE_PATH_IMPL: 'js', SECRET_ENVELOPE_IMPL: 'js' },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
-  t.after(() => child.kill('SIGKILL'));
+  // Track close before any assertion/kill; an exited child can still have open stdio.
+  closed = new Promise((resolve) => child.once('close', resolve));
   let out = '', err = '';
+  child.once('error', (error) => { err += String(error); });
   child.stdout.on('data', (d) => { out += d; }); child.stderr.on('data', (d) => { err += d; });
   const deadline = Date.now() + 30000;
   while (!/dav-parse\.wasm verified/.test(out) && child.exitCode === null && Date.now() < deadline) await new Promise((r) => setTimeout(r, 100));
