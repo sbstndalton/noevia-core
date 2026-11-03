@@ -2185,8 +2185,8 @@ test('#2303 a cancelled context read cannot launch in the same job after Resume 
   let timer;
   try{await Promise.race([waiting,new Promise((_,reject)=>{timer=setTimeout(()=>reject(Error('context factory did not enter')),3000);})]);}finally{clearTimeout(timer);}
   const id=f.manager.autotune.status().body.job.id;assert.equal(guards[0](),true);
-  f.manager.autotune.cancel();const cancelled=await finished(f.manager);assert.equal(cancelled.status,'cancelled');assert.equal(guards[0](),false);
-  assert.equal((await f.manager.autotune.resume({confirmPause:true})).status,202);
+  cancelWorker(f.manager);const cancelled=await finished(f.manager);assert.equal(cancelled.status,'cancelled');assert.equal(guards[0](),false);
+  assert.equal((await resumeWorker(f.manager)).applied,true);
   const completed=await finished(f.manager);assert.equal(completed.id,id);assert.equal(completed.status,'passed',completed.error);
   assert.equal(guards[0](),false);const before={loads,requests:f.requests.length,text:fs.readFileSync(f.ini,'utf8')};
   release();for(let i=0;i<30;i++)await new Promise(r=>setImmediate(r));
