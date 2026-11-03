@@ -1118,11 +1118,14 @@ const providerRoutes = require('./routes/providers.cjs').createProviderRoutes({
   json, chatgptOAuth, chatgptEnabled: () => features.enabled('chatgptOAuth'),
 });
 // Statistics, the auto-router roles, the model manager proxy and /api/models/* (routes/models.cjs).
+const modelAssignmentsFacts = require('./rust-model-assignments-facts.cjs').createModelAssignmentsFacts({
+  secret: FRONT_SECRET, json, readJson, env: process.env, modelsInstalled: modelService.modelsInstalled, decisionSettings, rerankSettings,
+});
 const modelManagerScanCache = require('./rust-model-manager-scan-cache.cjs').createModelManagerScanCache({
   secret: FRONT_SECRET, json, readJson, service: modelService,
 });
 const modelRoutes = require('./routes/models.cjs').createModelRoutes({
-  json, readBody, readJson, fetchJson, env: process.env, modelManager, getProvider, providerHeaders, DEFAULT_PROVIDER_ID, createVisionProbe: engineVisionProbe, currentWorkspace, service: modelService, inferenceBudget, idleUnload, decisionSettings, rerankSettings,
+  json, readBody, readJson, fetchJson, env: process.env, modelManager, getProvider, providerHeaders, DEFAULT_PROVIDER_ID, createVisionProbe: engineVisionProbe, currentWorkspace, service: modelService, inferenceBudget, idleUnload, rerankSettings,
 });
 // State only this process knows, published for the Rust front (published-snapshot.cjs): the retrieval
 // status behind GET /api/health (rust-health.cjs) and the served catalogue and machine models behind
@@ -1364,6 +1367,8 @@ async function handleRequestInner(req, res) {
   if (require('./rust-mcp-directory.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   if (require('./rust-toolboxes-permitted.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   if (require('./rust-toolbox-picker.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
+  if (require('./rust-model-assignments.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
+  if (await modelAssignmentsFacts(req, res)) return;
   if (require('./rust-model-manager-scan.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   if (await modelManagerScanCache(req, res)) return;
   if (require('./rust-autotune-cancel.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;

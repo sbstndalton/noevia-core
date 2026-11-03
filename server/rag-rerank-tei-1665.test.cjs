@@ -8,7 +8,6 @@ const os = require('node:os');
 const { rerankPool } = require('./rag.cjs');
 const { rerankTarget } = require('./rerank-target.cjs');
 const { teiRerankBackend } = require('./decision/backends.cjs');
-const { modelAssignments } = require('./model-assignments.cjs');
 
 const RERANK_KEYS = ['NOEVIA_FEATURE_RAG_RERANK', 'RERANK_BACKEND', 'RERANK_BASE_URL', 'RERANK_MODEL', 'RERANK_API_KEY', 'RERANK_SHARED_ENGINE', 'INFERENCE_BASE_URL', 'MODEL_MANAGER_BASE_URL', 'LEMONADE_BASE_URL', 'EMBEDDING_BASE_URL'];
 // Loopback is "on this network"; everything else counts as public (the Rust address check is not loaded here).
@@ -134,14 +133,6 @@ test('#1665: the TEI backend refuses an out-of-range index', async () => {
   await assert.rejects(backend.decide({ question: 'q', items: [{ id: 'a', label: 'x' }, { id: 'b', label: 'y' }] }), /invalid index/);
 });
 
-test('#1665: the Models page shows a TEI reranker as active or off, never missing from the GGUF list', () => {
-  const installed = [{ name: 'synthetic-chat', labels: [] }, { name: 'qwen3-reranker-0.6b-q8_0', labels: ['reranking'] }];
-  const row = (env) => modelAssignments({ installed, env, admin: true }).services.find((s) => s.id === 'reranker');
-  assert.deepEqual(row({ NOEVIA_FEATURE_RAG_RERANK: 'true', RERANK_BACKEND: 'tei', RERANK_MODEL: 'gte-multilingual-reranker-base' }),
-    { id: 'reranker', model: 'gte-multilingual-reranker-base', state: 'active', canChange: false, options: [] });
-  assert.equal(row({ RERANK_BACKEND: 'tei', RERANK_MODEL: 'gte-multilingual-reranker-base' }).state, 'off');
-  assert.equal(row({ NOEVIA_FEATURE_RAG_RERANK: 'true', RERANK_MODEL: 'gte-multilingual-reranker-base' }).state, 'missing', 'llama.cpp keeps the #1695 rule');
-});
 
 test('#1665 review: extra, repeated, out-of-range or non-integer indices are refused', async () => {
   const items = [{ id: 'a', label: 'x' }, { id: 'b', label: 'y' }];
