@@ -173,29 +173,13 @@ test('#343/#442: PUT /api/auto-roles rejects a non-chat model for fast/smart/vis
   assert.deepEqual(unreachable.sent.pop(), { status: 400, body: { error: 'The fast role needs a chat model; nomic-embed-text-v1 is an embedding, reranking or routing model.' } });
 });
 
-test('the model manager proxy is admin-only, validates the path and serves the cached scan', async () => {
-  const unset = fixture();
-  await unset.call('GET', '/api/model-manager/models', undefined, 'admin');
-  assert.deepEqual(unset.sent.pop(), { status: 404, body: { error: 'Model management service is not configured' } });
-  const f = fixture({ env: { MODEL_LOADER_URL: 'http://loader/', MODEL_LOADER_TOKEN: 'tok' } });
-  await f.call('GET', '/api/model-manager/models');
-  assert.deepEqual(f.sent.pop(), { status: 403, body: { error: 'Administrator required for model management' } });
-  await f.call('GET', '/api/model-manager/../secret', undefined, 'admin');
-  assert.deepEqual(f.sent.pop(), { status: 400, body: { error: 'Invalid path' } });
-  await f.call('GET', '/api/model-manager/models', undefined, 'admin');
-  assert.deepEqual(f.sent.pop(), { status: 200, body: { models: ['a'] } });
-  assert.equal(f.fetched[0].url, 'http://loader/api/v1/models');
-  assert.equal(f.fetched[0].init.headers['X-Model-Loader-Token'], 'tok');
-  assert.deepEqual(f.scan.get('models').body, { models: ['a'] }, 'the scan result is cached');
-  f.scan.set('models', { at: Date.now() - 6000, body: { models: ['cached'] } });
-  await f.call('GET', '/api/model-manager/models', undefined, 'admin');
-  assert.deepEqual(f.sent.pop(), { status: 200, body: { models: ['cached'] } });
-  assert.ok(f.headers.some(([k, v]) => k === 'X-Model-Scan' && v === 'cached'));
-  assert.equal(f.refreshes(), 1, 'a stale hit is refreshed behind the response');
-  assert.equal(f.fetched.length, 1);
-  await f.call('POST', '/api/model-manager/sections/x/safe-defaults', '{}', 'admin');
-  assert.equal(f.scan.has('models'), false, 'any write through the proxy drops the scan');
-  assert.equal(f.fetched.length, 2);
+test('remaining model manager proxy paths preserve administrator/config/path/token and write invalidation',async()=>{
+ const unset=fixture();await unset.call('GET','/api/model-manager/sections',undefined,'admin');assert.equal(unset.sent.pop().status,404);
+ const f=fixture({env:{MODEL_LOADER_URL:'http://loader/',MODEL_LOADER_TOKEN:'tok'}});
+ await f.call('GET','/api/model-manager/sections');assert.equal(f.sent.pop().status,403);
+ await f.call('GET','/api/model-manager/../secret',undefined,'admin');assert.equal(f.sent.pop().status,400);
+ await f.call('GET','/api/model-manager/sections',undefined,'admin');assert.equal(f.fetched[0].url,'http://loader/api/v1/sections');assert.equal(f.fetched[0].init.headers['X-Model-Loader-Token'],'tok');
+ f.scan.set('models',{body:{models:['existing']}});await f.call('POST','/api/model-manager/sections/x/safe-defaults','{}','admin');assert.equal(f.scan.has('models'),false);
 });
 
 test('the model-manager delete proxy rejects a system model by its scanned key, even though keys are opaque', async () => {
@@ -357,7 +341,7 @@ test('engine-specific routes say what is unavailable and guard the method', asyn
   assert.deepEqual(f.sent.pop(), { status: 405, body: { error: 'Method not allowed' } });
   await f.call('GET', '/api/models/presets/reload', undefined, 'member');
   assert.deepEqual(f.sent.pop(), { status: 403, body: { error: 'Administrator required for shared model profiles' } });
-  await f.call('GET', '/api/models/autotune', undefined, 'admin');
+  await f.call('POST', '/api/models/autotune', undefined, 'admin');
   assert.deepEqual(f.sent.pop(), { status: 404, body: { error: 'Auto-tune is unavailable' } });
   await f.call('GET', '/api/models/preset', undefined, 'member');
   assert.deepEqual(f.sent.pop(), { status: 403, body: { error: 'Administrator required for shared model profiles' } });
@@ -365,13 +349,9 @@ test('engine-specific routes say what is unavailable and guard the method', asyn
   assert.deepEqual(f.sent.pop(), { status: 400, body: { error: 'Invalid repository' } });
   await f.call('POST', '/api/models/installed', undefined, 'admin');
   assert.equal(f.sent.pop().status, 405, 'only the front lists, and it lists on GET');
-  const native = fixture({ manager: { autotune: { status: (model) => ({ status: 200, body: { model, state: 'idle' } }), cancel: () => ({ status: 200, body: { cancelled: true } }) } } });
+  const native = fixture({ manager: { autotune: { statusFacts: () => assert.fail('Node must not compose public GET status') } } });
   await native.call('GET', '/api/models/autotune', undefined, 'admin', '?model=m');
-  assert.deepEqual(native.sent.pop(), { status: 200, body: { model: 'm', state: 'idle' } });
-  await native.call('GET', '/api/models/autotune/cancel', undefined, 'admin');
   assert.deepEqual(native.sent.pop(), { status: 405, body: { error: 'Method not allowed' } });
-  await native.call('POST', '/api/models/autotune/cancel', undefined, 'admin');
-  assert.deepEqual(native.sent.pop(), { status: 200, body: { cancelled: true } });
 });
 
 test('bulk tuning discovery and start are admin-only and the server owns the queue', async () => {
@@ -403,24 +383,6 @@ test('starting auto-tune on a system routing model (Laya) is rejected as a 4xx, 
   assert.equal(sent.status, 400);
   assert.equal(sent.body.error, 'System routing model — not tuned');
 });
-
-test('resume is admin-only, POST-only and passes renewed pause confirmation', async () => {
-  const calls = [];
-  const f = fixture({ manager: { autotune: {
-    resume: async options => { calls.push(options); return { status: options.confirmPause ? 202 : 400, body: { resumed: options.confirmPause } }; },
-  } } });
-  await f.call('POST', '/api/models/autotune/resume', { confirmPause: true });
-  assert.equal(f.sent.pop().status, 403);
-  await f.call('GET', '/api/models/autotune/resume', undefined, 'admin');
-  assert.equal(f.sent.pop().status, 405);
-  await f.call('POST', '/api/models/autotune/resume', {}, 'admin');
-  assert.equal(f.sent.pop().status, 400);
-  await f.call('POST', '/api/models/autotune/resume', { confirmPause: true }, 'admin');
-  assert.equal(f.sent.pop().status, 202);
-  assert.deepEqual(calls, [{ confirmPause: undefined }, { confirmPause: true }]);
-});
-
-
 
 
 test('the default model mode saves, and only an explicit apply switches existing projects', async () => {

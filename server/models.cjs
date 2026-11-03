@@ -37,6 +37,11 @@ function createModelService({ fetchJson, env, modelManager, currentWorkspace, li
   const modelScanCache = (() => {
     const entries = new Map();
     let generation = 0;
+    // #2304: opaque process-instance fences, not another scan cache or TTL owner.
+    const crypto = require('node:crypto'), epoch = crypto.randomBytes(32);
+    const sign = value => crypto.createHmac('sha256', epoch).update(JSON.stringify(value)).digest('hex');
+    const token = () => sign({generation});
+    const entryToken = () => sign({generation, hit:entries.get('models') || null});
     return {
       get: (key) => entries.get(key),
       // `scanGeneration` is the generation read before the request was sent; omit it for a write
@@ -44,6 +49,15 @@ function createModelService({ fetchJson, env, modelManager, currentWorkspace, li
       set(key, value, scanGeneration = generation) { if (scanGeneration === generation) entries.set(key, value); return this; },
       clear() { generation++; entries.clear(); },
       generation: () => generation,
+      snapshot: () => ({token:token(),entryToken:entryToken(),now:Date.now(),hit:entries.get('models') || null}),
+      publish(body, expected) {
+        if (expected !== token()) return {applied:false};
+        entries.set('models',{at:Date.now(),body});return {applied:true};
+      },
+      refresh(expected) {
+        if (expected !== entryToken()) return {applied:false};
+        refreshModelScan();return {applied:true};
+      },
     };
   })();
   let modelScanInflight = null;
@@ -354,6 +368,9 @@ function createModelService({ fetchJson, env, modelManager, currentWorkspace, li
 
   return {
     managerFetch, modelScanCache, refreshModelScan, lastLoadedModel, clearLastLoadedModel,
+    modelScanSnapshot: () => modelScanCache.snapshot(),
+    publishModelScan: (body,token) => modelScanCache.publish(body,token),
+    requestModelScanRefresh: token => modelScanCache.refresh(token),
     autoRoles, setAutoRoles, clearRoleReferences, ensureModelLoaded, ensureRolesLoaded,
     servedCatalogue, modelsInstalled, modelsInstalledFresh, invalidateModelReads, installedFacts, deriveUserModelName,
   };

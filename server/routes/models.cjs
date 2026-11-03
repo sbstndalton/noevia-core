@@ -429,11 +429,8 @@ function createModelRoutes({ servedEmbeddingModels = (target) => require('../rag
         }
       }
       if(method!=='GET')modelScanCache.clear();
-      const scanGeneration=modelScanCache.generation?.();
-      if(method==='GET'&&rest==='models'&&!url.search){
-        const hit=modelScanCache.get('models');
-        if(hit){res.setHeader('Cache-Control','no-store');res.setHeader('X-Model-Scan','cached');if(Date.now()-hit.at>5000)refreshModelScan();return json(res,200,hit.body);}
-      }
+      // #2304: exact GET /api/model-manager/models is refused before this legacy proxy;
+      // native policy reads/publishes the same cache through its raw conditional operations.
       // #697: the model manager's autoconfig sizes against the inference budget, set here rather
       // than by the browser (any budget_gib the client sent is replaced).
       let search=url.search;
@@ -462,7 +459,6 @@ function createModelRoutes({ servedEmbeddingModels = (target) => require('../rag
       if(result.ok&&method==='GET'&&/^benchmark\/runs\/\d+$/.test(rest)&&modelManager.recordEvidence){
         for(const {model,record} of require('../benchmark-evidence.cjs').throughputRecords(detail))modelManager.recordEvidence(model,record).catch(()=>undefined);
       }
-      if(result.ok&&method==='GET'&&rest==='models'&&!url.search)modelScanCache.set('models',{at:Date.now(),body:detail},scanGeneration);
       // #302: the folder-scan delete above only removed files through the model management
       // service — it never touched the live engine or the auto-router roles. Run the same
       // cleanup /api/models/delete runs, for every engine id the deleted files backed.
@@ -527,14 +523,11 @@ function createModelRoutes({ servedEmbeddingModels = (target) => require('../rag
       return json(res,405,{error:'Method not allowed'});
     }
 
-    if (p === '/api/models/autotune' || p === '/api/models/autotune/cancel' || p === '/api/models/autotune/resume' || p === '/api/models/autotune/untuned') {
+    if (p === '/api/models/autotune' || p === '/api/models/autotune/untuned') {
       if(authn.user.role!=='admin')return json(res,403,{error:'Administrator required for shared model profiles'});
       if(!modelManager.autotune)return json(res,404,{error:'Auto-tune is unavailable'});
       let result;
-      if(p.endsWith('/cancel')){if(req.method!=='POST')return json(res,405,{error:'Method not allowed'});result=modelManager.autotune.cancel();}
-      else if(p.endsWith('/resume')){if(req.method!=='POST')return json(res,405,{error:'Method not allowed'});const body=await readJson(req);result=await modelManager.autotune.resume({confirmPause:body?.confirmPause});}
-      else if(p.endsWith('/untuned')){if(req.method!=='GET')return json(res,405,{error:'Method not allowed'});result=await modelManager.autotune.untuned();}
-      else if(req.method==='GET')result=modelManager.autotune.status(url.searchParams.get('model')||'');
+      if(p.endsWith('/untuned')){if(req.method!=='GET')return json(res,405,{error:'Method not allowed'});result=await modelManager.autotune.untuned();}
       else if(req.method==='POST'){const body=await readJson(req);result=await modelManager.autotune.start(String(body?.model||''),{confirmPause:body?.confirmPause,promptBudgetSeconds:body?.promptBudgetSeconds,untuned:body?.untuned===true,...(body?.mode!==undefined?{mode:body.mode}:{})});}
       else return json(res,405,{error:'Method not allowed'});
       res.setHeader('Cache-Control','no-store');
