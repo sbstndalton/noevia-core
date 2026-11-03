@@ -673,8 +673,7 @@ test('the inference budget is saved by an administrator; its GET is the Rust fro
 // noevia#1863: the idle unload time is an administrator setting.
 test('#1863 the idle unload time is read and saved by administrators only', async () => {
   const saved = [];
-  const idleUnload = { get: async () => ({ seconds: 1800, source: 'default' }),
-    save: async (body, actor) => { if (body.seconds === 60) throw Object.assign(Error('Choose Never or a time from 5 minutes to 24 hours.'), { status: 400, errorId: 'idleUnloadInvalid', minSeconds: 300, maxSeconds: 86400 }); saved.push([body, actor]); return { seconds: body.seconds, source: 'setting', apply: { state: 'applied' } }; } };
+  const idleUnload = { save: async (body, actor) => { if (body.seconds === 60) throw Object.assign(Error('Choose Never or a time from 5 minutes to 24 hours.'), { status: 400, errorId: 'idleUnloadInvalid', minSeconds: 300, maxSeconds: 86400 }); saved.push([body, actor]); return { seconds: body.seconds, source: 'setting', apply: { state: 'applied' } }; } };
   const f = fixture({ idleUnload });
   for (const [method, body] of [['GET'], ['PUT', { seconds: 3600 }]]) {
     await f.call(method, '/api/models/idle-unload', body);
@@ -682,7 +681,7 @@ test('#1863 the idle unload time is read and saved by administrators only', asyn
   }
   assert.deepEqual(saved, []);
   await f.call('GET', '/api/models/idle-unload', undefined, 'admin');
-  assert.deepEqual(f.sent.pop(), { status: 200, body: { seconds: 1800, source: 'default' } });
+  assert.deepEqual(f.sent.pop(), { status: 405, body: { error: 'Method not allowed' } });
   assert.ok(f.headers.some(([k, v]) => k === 'Cache-Control' && v === 'no-store'));
   await f.call('PUT', '/api/models/idle-unload', { seconds: 3600 }, 'admin');
   assert.deepEqual(f.sent.pop(), { status: 200, body: { seconds: 3600, source: 'setting', apply: { state: 'applied' } } });
