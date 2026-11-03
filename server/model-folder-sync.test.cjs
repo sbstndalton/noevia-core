@@ -127,3 +127,39 @@ test('#2276 folder registration and its single reload keep the hold across the e
   assert.equal(reloads, 1);
   const exit = gate.enter(); exit();
 });
+
+// Execute the real index wiring: a configured loader must not read the manager in its TDZ.
+test('#2305 configured loader wires the gated folder writer after manager creation', async () => {
+  const vm = require('node:vm');
+  const source = fs.readFileSync(path.join(__dirname, 'index.cjs'), 'utf8');
+  const from = source.indexOf('// User-created projects;');
+  const to = source.indexOf('// noevia#2115: leases still held', from);
+  assert.ok(from >= 0 && to > from);
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'folder-sync-boot-'));
+  let held = false, writes = 0, reloads = 0;
+  const manager = {
+    tuningActive: () => false,
+    async writePresets(write, reloadIf) {
+      assert.equal(this, manager); held = true; writes++;
+      try { const written = await write(); assert.equal(reloadIf(written), true); reloads++; return { reload: { ok: true } }; }
+      finally { held = false; }
+    },
+    reloadPresets: () => { throw Error('reload must stay inside the writer'); },
+  };
+  const context = {
+    process: { env: { MODEL_LOADER_URL: 'http://synthetic-loader.invalid', LLAMACPP_AUTOCONFIG_MEMORY_GIB: '8' } },
+    path, DATA_DIR: dir, MODEL_MANAGER_KIND: 'llamacpp', MODEL_MANAGER_BASE: 'http://synthetic-router.invalid', INFERENCE_KEY: 'synthetic',
+    require, console, inferenceBudget: {}, fetchJson: () => { throw Error('no network during construction'); },
+    createModelManager: () => manager,
+    modelService: { async managerFetch(route, method) {
+      if (route === 'models') return { ok: true, body: { unregistered: ['synthetic'] } };
+      assert.equal(route, 'sections/synthetic/safe-defaults'); assert.equal(method, 'POST'); assert.equal(held, true);
+      return { ok: true };
+    } },
+  };
+  try {
+    vm.runInNewContext(source.slice(from, to) + '\n;globalThis.sync = folderSync;', context, { timeout: 1000 });
+    assert.deepEqual((await context.sync.run()).added, ['synthetic']);
+    assert.equal(writes, 1); assert.equal(reloads, 1); assert.equal(held, false);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});

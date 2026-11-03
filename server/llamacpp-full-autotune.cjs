@@ -178,6 +178,48 @@ const sorted = value => Object.fromEntries(Object.entries(value || {}).sort(([a]
 const cancelledError = () => Object.assign(Error('Cancelled'), { cancelled: true });
 const publicJob = job => job && JSON.parse(JSON.stringify(job, (key, value) =>
   key.startsWith('_') || ['originalText', 'lastRevision', 'originalRevision', 'beforeText'].includes(key) ? undefined : value));
+// #2294: the live actor keeps its controllers. This small conditional primitive has no HTTP
+// status/method policy; the front chooses whether a running job may be cancelled.
+function createAutotuneCancellation(read, markCancelled) {
+  const salt = crypto.randomBytes(32), ids = new WeakMap();
+  let sequence = 0;
+  const id = value => {
+    if (!value || (typeof value !== 'object' && typeof value !== 'function')) return null;
+    if (!ids.has(value)) ids.set(value, ++sequence);
+    return ids.get(value);
+  };
+  const digest = value => crypto.createHmac('sha256', salt).update(JSON.stringify(value)).digest('hex');
+  const generation = s => digest({ job: id(s.job), run: id(s.completion) });
+  const token = s => digest({ job: s.job, object: id(s.job), run: id(s.completion), starting: s.starting,
+    cancelled: s.cancelled, child: id(s.child), inflight: id(s.inflight), idle: id(s.idleAbort) });
+  const keys = ['id', 'model', 'bulk', 'mode', 'promptBudgetSeconds', 'status', 'phase', 'startedAt',
+    'log', 'models', 'queueProgress', 'finishedAt', 'error', 'failedPhase', 'failedStep', 'restored',
+    'skipped', 'waiting', 'result'];
+  // Profile snapshots and HTTP configuration objects are not facts the front needs. Known
+  // outer job fields only, with recursive privacy at this boundary as well as in the front.
+  const hidden = key => key.startsWith('_') || ['originalText', 'lastRevision', 'originalRevision', 'beforeText',
+    'headers', 'authorization', 'apiKey', 'api_key', 'accessToken', 'refreshToken', 'httpConfig', 'requestConfig', 'baseUrl', 'url'].includes(key);
+  const facts = s => ({ token: token(s), generation: generation(s), job: s.job == null ? null :
+    JSON.parse(JSON.stringify(Object.fromEntries(keys.filter(k => Object.hasOwn(s.job, k)).map(k => [k, s.job[k]])),
+      (key, value) => hidden(key) ? undefined : value)) });
+  return {
+    facts: () => facts(read()),
+    compareAndAbort(expected) {
+      const captured = read();
+      if (typeof expected !== 'string' || expected !== token(captured) || !captured.job) return { applied: false };
+      const before = facts(captured);
+      // Capture every target and the response before invoking any synchronous cancellation listener.
+      const { child, inflight, idleAbort } = captured;
+      const abortChild = child && typeof child.cancellationFacts === 'function'
+        ? child.compareAndAbort.bind(child, child.cancellationFacts().token)
+        : child?.cancel?.bind(child); // fillCheck's private probe wrapper has no job controller
+      markCancelled();
+      try { abortChild?.(); }
+      finally { try { inflight?.abort(); } finally { idleAbort?.abort(); } }
+      return { applied: true, generation: before.generation, job: before.job };
+    },
+  };
+}
 // #1978: the phase/step a run stopped in, by our own labels, kept on the job because j.phase is
 // overwritten with "Failed"/"Cancelled"/"Interrupted". Never an engine message (#1049): only labels.
 function stoppedAt(j) {
@@ -651,7 +693,7 @@ function createFullAutotuner({ request: engineRequest, rawModels: engineRawModel
     try {
       const started = await child.start(j.model, { confirmPause: true, promptBudgetSeconds: j.promptBudgetSeconds });
       if (!started.ok) throw Error(started.body?.error || 'Context measurement could not start.');
-      if (cancelled) child.cancel();
+      if (cancelled) child.compareAndAbort(child.cancellationFacts().token);
       await child.completion(); check();
       const result = child.status(j.model).body.job;
       if (foreignStop && result.status !== 'passed') throw foreignStop;
@@ -1536,11 +1578,10 @@ function createFullAutotuner({ request: engineRequest, rawModels: engineRawModel
     } catch (e) { return { ok: false, status: 409, body: { error: clientMessage(e, 'Auto-tune could not start.') } }; }
     finally { starting = false; }
   }
-  function cancel() {
-    if (state.job?.status !== 'running') return { ok: false, status: 409, body: { error: 'No auto-tune is running.' } };
-    cancelled = true; child?.cancel(); inflight?.abort(); idleAbort?.abort();
-    return { ok: true, status: 202, body: publicJob(state.job) };
-  }
+  const cancellation = createAutotuneCancellation(
+    () => ({ job: state.job, starting, cancelled, completion, child, inflight, idleAbort }),
+    () => { cancelled = true; },
+  );
   // #1978: drops the finished job record the Recover card shows. History (measurements, evidence),
   // saved settings and models.ini are not touched. Refused while a run is active or starting, and
   // while a restored models.ini is still waiting for the model server to re-read it.
@@ -1655,6 +1696,6 @@ function createFullAutotuner({ request: engineRequest, rawModels: engineRawModel
     } catch (e) { return { ok: false, status: 409, body: { error: clientMessage(e, 'Auto-tune could not resume.') } }; }
     finally { starting = false; }
   }
-  return { start, resume, cancel, clearFacts, compareAndClear, statusFacts, settingsFacts: settingsSnapshot, commitSettings, untuned, recover, flushReload, completion: () => completion };
+  return { start, resume, cancellationFacts: cancellation.facts, compareAndAbort: cancellation.compareAndAbort, clearFacts, compareAndClear, statusFacts, settingsFacts: settingsSnapshot, commitSettings, untuned, recover, flushReload, completion: () => completion };
 }
-module.exports = { createFullAutotuner, qualityCheck, qualityFailure, QUALITY, VERSION, newModel, hasHarmonyReasoning, kvCandidates, preferKv, bf16Unsupported, MODES, LONG_PROFILE_REASON };
+module.exports = { createAutotuneCancellation, createFullAutotuner, qualityCheck, qualityFailure, QUALITY, VERSION, newModel, hasHarmonyReasoning, kvCandidates, preferKv, bf16Unsupported, MODES, LONG_PROFILE_REASON };

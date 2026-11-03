@@ -5,6 +5,7 @@ const { createModelManager } = require('./model-manager.cjs');
 const { createPresetStore } = require('./llamacpp-presets.cjs');
 const { QUALITY, qualityCheck, qualityFailure, newModel } = require('./llamacpp-full-autotune.cjs');
 
+function cancelWorker(manager) { return manager.autotune.compareAndAbort(manager.autotune.cancellationFacts().token); }
 // Arrange a known-valid switch through the actor's conditional primitive. Public validation and
 // unfinished-job refusal moved to Rust; these tests only arrange the tune scripts' existing inputs.
 function setTuneSettings(manager, model, body) {
@@ -197,7 +198,7 @@ test('an unload that never reaches unloaded stops without writing another profil
 test('cancelling during router unload waits for safe rollback and releases chat', async t => {
   let cancelled = false;
   const f = fixture(t, { unloadPolls: 4, onUnload: ({ manager }) => {
-    if (!cancelled) { cancelled = true; manager.autotune.cancel(); }
+    if (!cancelled) { cancelled = true; cancelWorker(manager); }
   } });
   await f.manager.autotune.start('synthetic', { confirmPause: true });
   const j = await finished(f.manager);
@@ -252,7 +253,7 @@ test('busy chat makes start wait, with cancellable bounded idle acquisition', as
   assert.equal((await finished(f.manager)).status, 'passed');
   const second = fixture(t), busy = second.manager.enterInference();
   await second.manager.autotune.start('synthetic', { confirmPause: true });
-  second.manager.autotune.cancel();
+  cancelWorker(second.manager);
   assert.equal((await finished(second.manager)).status, 'cancelled');
   busy();
   const chat = second.manager.enterInference(); chat();
@@ -271,7 +272,7 @@ test('cancel during drafting keeps committed KV/context and Resume starts at dra
   let stopped = false;
   const f = fixture(t, { onChat: ({ manager }) => {
     const j = manager.autotune.statusFacts().job;
-    if (!stopped && j?.phase === 'Drafting') { stopped = true; manager.autotune.cancel(); }
+    if (!stopped && j?.phase === 'Drafting') { stopped = true; cancelWorker(manager); }
   } });
   await f.manager.autotune.start('synthetic', { confirmPause: true });
   const j = await finished(f.manager);
@@ -325,7 +326,7 @@ test('external preset edit stops rollback and Resume, preserving the operator te
 test('restart rolls back active phase only, then explicit Resume skips committed phases', async t => {
   let stopped = false;
   const f = fixture(t, { onChat: ({ manager }) => {
-    if (!stopped && manager.autotune.statusFacts().job?.phase === 'Drafting') { stopped = true; manager.autotune.cancel(); }
+    if (!stopped && manager.autotune.statusFacts().job?.phase === 'Drafting') { stopped = true; cancelWorker(manager); }
   } });
   await f.manager.autotune.start('synthetic', { confirmPause: true }); await finished(f.manager);
   const state = JSON.parse(fs.readFileSync(f.stateFile, 'utf8'));
@@ -765,7 +766,7 @@ test('#1978 a failed run keeps the failing phase and step labels on the job, not
 test('#1978 a restart-interrupted run keeps the phase it was in', async t => {
   let stopped = false;
   const f = fixture(t, { onChat: ({ manager }) => {
-    if (!stopped && manager.autotune.statusFacts().job?.phase === 'Drafting') { stopped = true; manager.autotune.cancel(); }
+    if (!stopped && manager.autotune.statusFacts().job?.phase === 'Drafting') { stopped = true; cancelWorker(manager); }
   } });
   await f.manager.autotune.start('synthetic', { confirmPause: true });
   const c = await finished(f.manager);
@@ -1098,7 +1099,7 @@ test('#1003 planned: a cancelled run resumes from its results without repeating 
   let cancelOnce = true;
   const f = fixture(t, { servingChecks: servingOff, autotuneExtra: planned(), onChat: ({ manager, o }) => {
     // The 8k probe's quality check: cancel there, after the 16k probe has its result.
-    if (cancelOnce && o['ctx-size'] === '8192' && o['cache-type-k'] === 'bf16' && manager.autotune.statusFacts().job?.models[0].plan?.results.length === 1) { cancelOnce = false; manager.autotune.cancel(); }
+    if (cancelOnce && o['ctx-size'] === '8192' && o['cache-type-k'] === 'bf16' && manager.autotune.statusFacts().job?.models[0].plan?.results.length === 1) { cancelOnce = false; cancelWorker(manager); }
   } });
   await f.manager.autotune.start('synthetic', { confirmPause: true });
   let j = await finished(f.manager);
@@ -1667,7 +1668,7 @@ test('#1062 cancelling while waiting for another client stops promptly', { skip:
   let injected = false;
   const f = fixture(t, { models: ['synthetic', 'outside'], autotuneExtra: foreignOptions({ foreignPollMs: 2 }),
     metricsFor: model => `llamacpp:requests_processing ${model === 'outside' ? 1 : 0}\n`,
-    onChat: ({ chats, status, manager }) => { if (chats === 3 && !injected) { injected = true; status.outside = 'loaded'; setTimeout(() => manager.autotune.cancel(), 20); } } });
+    onChat: ({ chats, status, manager }) => { if (chats === 3 && !injected) { injected = true; status.outside = 'loaded'; setTimeout(() => cancelWorker(manager), 20); } } });
   assert.equal((await f.manager.autotune.start('synthetic', { confirmPause: true })).status, 202);
   const j = await finished(f.manager);
   assert.equal(j.status, 'cancelled');
@@ -1726,7 +1727,7 @@ test('#1068 a client that keeps its model busy through the restore: cancel is pr
   const f = fixture(t, { models: ['synthetic', 'outside'], autotuneExtra: foreignOptions({ foreignPollMs: 2 }),
     metricsFor: model => `llamacpp:requests_processing ${model === 'outside' ? 1 : 0}\n`,
     onUnload: ({ model }) => { unloads.push(model); if (model === 'synthetic') f.status.outside = 'loaded'; },
-    onChat: ({ chats, status, manager }) => { if (chats === 3 && !injected) { injected = true; status.outside = 'loaded'; setTimeout(() => manager.autotune.cancel(), 20); } } });
+    onChat: ({ chats, status, manager }) => { if (chats === 3 && !injected) { injected = true; status.outside = 'loaded'; setTimeout(() => cancelWorker(manager), 20); } } });
   assert.equal((await f.manager.autotune.start('synthetic', { confirmPause: true })).status, 202);
   const t0 = Date.now();
   const j = await finished(f.manager);
@@ -2070,7 +2071,7 @@ test('#1079 the model\'s KV switch applies to its Long tune', async t => {
   assert.deepEqual(r.body.models[0].kv, ['bf16', 'q8_0', 'q5_1', 'q5_0']);
   for (let i = 0; i < 2000 && !f.requests.length; i++) await new Promise(res => setImmediate(res));
   // The public unfinished-Long-run settings refusal is tested by the native policy/wire tests.
-  f.manager.autotune.cancel(); release();
+  cancelWorker(f.manager); release();
   assert.equal((await finished(f.manager)).status, 'cancelled');
 });
 
