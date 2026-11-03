@@ -178,6 +178,48 @@ const sorted = value => Object.fromEntries(Object.entries(value || {}).sort(([a]
 const cancelledError = () => Object.assign(Error('Cancelled'), { cancelled: true });
 const publicJob = job => job && JSON.parse(JSON.stringify(job, (key, value) =>
   key.startsWith('_') || ['originalText', 'lastRevision', 'originalRevision', 'beforeText'].includes(key) ? undefined : value));
+// #2294: the live actor keeps its controllers. This small conditional primitive has no HTTP
+// status/method policy; the front chooses whether a running job may be cancelled.
+function createAutotuneCancellation(read, markCancelled) {
+  const salt = crypto.randomBytes(32), ids = new WeakMap();
+  let sequence = 0;
+  const id = value => {
+    if (!value || (typeof value !== 'object' && typeof value !== 'function')) return null;
+    if (!ids.has(value)) ids.set(value, ++sequence);
+    return ids.get(value);
+  };
+  const digest = value => crypto.createHmac('sha256', salt).update(JSON.stringify(value)).digest('hex');
+  const generation = s => digest({ job: id(s.job), run: id(s.completion) });
+  const token = s => digest({ job: s.job, object: id(s.job), run: id(s.completion), starting: s.starting,
+    cancelled: s.cancelled, child: id(s.child), inflight: id(s.inflight), idle: id(s.idleAbort) });
+  const keys = ['id', 'model', 'bulk', 'mode', 'promptBudgetSeconds', 'status', 'phase', 'startedAt',
+    'log', 'models', 'queueProgress', 'finishedAt', 'error', 'failedPhase', 'failedStep', 'restored',
+    'skipped', 'waiting', 'result'];
+  // Profile snapshots and HTTP configuration objects are not facts the front needs. Known
+  // outer job fields only, with recursive privacy at this boundary as well as in the front.
+  const hidden = key => key.startsWith('_') || ['originalText', 'lastRevision', 'originalRevision', 'beforeText',
+    'headers', 'authorization', 'apiKey', 'api_key', 'accessToken', 'refreshToken', 'httpConfig', 'requestConfig', 'baseUrl', 'url'].includes(key);
+  const facts = s => ({ token: token(s), generation: generation(s), job: s.job == null ? null :
+    JSON.parse(JSON.stringify(Object.fromEntries(keys.filter(k => Object.hasOwn(s.job, k)).map(k => [k, s.job[k]])),
+      (key, value) => hidden(key) ? undefined : value)) });
+  return {
+    facts: () => facts(read()),
+    compareAndAbort(expected) {
+      const captured = read();
+      if (typeof expected !== 'string' || expected !== token(captured) || !captured.job) return { applied: false };
+      const before = facts(captured);
+      // Capture every target and the response before invoking any synchronous cancellation listener.
+      const { child, inflight, idleAbort } = captured;
+      const abortChild = child && typeof child.cancellationFacts === 'function'
+        ? child.compareAndAbort.bind(child, child.cancellationFacts().token)
+        : child?.cancel?.bind(child); // fillCheck's private probe wrapper has no job controller
+      markCancelled();
+      try { abortChild?.(); }
+      finally { try { inflight?.abort(); } finally { idleAbort?.abort(); } }
+      return { applied: true, generation: before.generation, job: before.job };
+    },
+  };
+}
 // #1978: the phase/step a run stopped in, by our own labels, kept on the job because j.phase is
 // overwritten with "Failed"/"Cancelled"/"Interrupted". Never an engine message (#1049): only labels.
 function stoppedAt(j) {
@@ -260,8 +302,8 @@ function createFullAutotuner({ request: engineRequest, rawModels: engineRawModel
   state.settings ||= {};
   let cancelled = false, child = null, completion = Promise.resolve(), starting = false, inflight = null, idleAbort = null;
   const clearProcess = crypto.randomUUID(), settingsProcess = crypto.randomUUID();
-  let clearGeneration = 0, settingsGeneration = 0;
-  const save = () => { const tmp = stateFile + '.' + crypto.randomUUID(); fs.writeFileSync(tmp, JSON.stringify(state), { mode: 0o600 }); fs.renameSync(tmp, stateFile); clearGeneration++; settingsGeneration++; };
+  let clearGeneration = 0, settingsGeneration = 0, resumeGeneration = 0;
+  const save = () => { const tmp = stateFile + '.' + crypto.randomUUID(); fs.writeFileSync(tmp, JSON.stringify(state), { mode: 0o600 }); fs.renameSync(tmp, stateFile); clearGeneration++; settingsGeneration++; resumeGeneration++; };
   const check = () => { if (cancelled) throw cancelledError(); };
   const note = (j, text) => { (j.log ||= []).push({ at: now(), text }); if (j.log.length > 400) j.log.shift(); save(); };
   const phaseOf = (item, id) => item.phases.find(p => p.id === id);
@@ -359,11 +401,30 @@ function createFullAutotuner({ request: engineRequest, rawModels: engineRawModel
   }
   // The list a queued item tries: its own snapshot, or (a job from before #1057) today's.
   const itemKv = item => (Array.isArray(item?.kv) && item.kv.length ? item.kv : candidatesFor(item?.model));
-  // kvCandidates: the list this server really tries for this model, so the panel never describes
-  // another build's (or another model's); settings: the model's own tune settings (#1057).
-  // #1079: longId and longHistory are the model's Long tune (its `<model>-long` section).
-  const status = model => ({ ok: true, status: 200, body: { job: publicJob(state.job), history: model ? state.history[model] || [] : [], kvCandidates: candidatesFor(model), settings: settingsOf(model),
-    modes: MODES, ...(model ? { longId: model + LONG_SUFFIX, longHistory: state.history[model + LONG_SUFFIX] || [] } : {}) } });
+  // #2306: raw in-memory owner data. The front chooses keys, history limits, KV/modes and
+  // public response shape; this getter does not consult an engine or start a worker.
+  function statusFacts(keys = []) {
+    if (!Array.isArray(keys) || keys.length > 2 || keys.some(k => typeof k !== 'string' || k.length > 65536)) throw Error('Invalid status keys');
+    const hidden = key => key.startsWith('_') || ['originalText', 'lastRevision', 'originalRevision', 'beforeText'].includes(key) ||
+      ['headers', 'authorization', 'apikey', 'accesstoken', 'refreshtoken', 'httpconfig', 'requestconfig', 'baseurl', 'url', 'credentials', 'password', 'secret', 'token', 'clientsecret'].includes(key.toLowerCase().replace(/[_-]/g, ''));
+    const copy = value => value == null ? value : JSON.parse(JSON.stringify(value, (key, v) => hidden(key) ? undefined : v));
+    const fields = ['id', 'model', 'bulk', 'mode', 'promptBudgetSeconds', 'status', 'phase', 'startedAt', 'log', 'models', 'queueProgress', 'finishedAt',
+      'error', 'failedPhase', 'failedStep', 'restored', 'skipped', 'waiting', 'result', 'queue', 'steps'];
+    const historyFields = ['at', 'kv', 'context', 'plan', 'probes', 'kvFallback', 'spec', 'specLabel', 'generation', 'acceptance', 'ubatch', 'promptPerSecond', 'quality', 'extensions', 'sampling', 'baseline', 'serving', 'loaded', 'version', 'signature'];
+    const rawHistory = value => {
+      if (!value) return value;
+      if (!Array.isArray(value) || value.some(row => !row || typeof row !== 'object' || Array.isArray(row))) throw Error('Invalid history metadata');
+      return value.map(row => copy(Object.fromEntries(historyFields.filter(k => Object.hasOwn(row, k)).map(k => [k, row[k]]))));
+    };
+    const job = state.job;
+    if (job != null && (typeof job !== 'object' || Array.isArray(job))) throw Error('Invalid job metadata');
+    const selectedJob = job == null ? job : copy(Object.fromEntries(fields.filter(k => Object.hasOwn(job, k)).map(k => [k, job[k]])));
+    return { jobPresent: job !== undefined, job: selectedJob,
+      entries: keys.map(key => ({ key, history: rawHistory(Object.hasOwn(state.history, key) ? state.history[key] : null),
+        allowQ5Kv: Object.hasOwn(state.settings, key) && state.settings[key]?.allowQ5Kv === true })),
+      allowBelowQ5Kv: allowBelowQ5Kv(),
+    };
+  }
   // #2287: public settings validation and the response belong to Rust. This live script remains
   // the sole writer of its job/history/settings file. A snapshot fingerprint makes the one map
   // mutation conditional on the exact generation, pending job and configuration Rust checked.
@@ -632,7 +693,7 @@ function createFullAutotuner({ request: engineRequest, rawModels: engineRawModel
     try {
       const started = await child.start(j.model, { confirmPause: true, promptBudgetSeconds: j.promptBudgetSeconds });
       if (!started.ok) throw Error(started.body?.error || 'Context measurement could not start.');
-      if (cancelled) child.cancel();
+      if (cancelled) child.compareAndAbort(child.cancellationFacts().token);
       await child.completion(); check();
       const result = child.status(j.model).body.job;
       if (foreignStop && result.status !== 'passed') throw foreignStop;
@@ -929,13 +990,14 @@ function createFullAutotuner({ request: engineRequest, rawModels: engineRawModel
   /** #1068: before the compact model loads again (chat or a new tune), the router re-reads the restored
    *  file even with another client live (its unchanged preset keeps it running), so it never serves
    *  the test profile. A no-op unless a re-read is pending (for `model`, when given). */
-  async function flushReload(model = null) {
+  async function flushReload(model = null, guard = null) {
     const j = state.job;
     if (!j?._reloadPending || (model && model !== j.model)) return;
     clearTimeout(reloadTimer);
     // #1072: a request that throws (the server unreachable) is the same refusal as a bad answer, and the
     // re-read is still owed, so it is re-armed rather than left for the next flush alone.
     const r = await request('/models?reload=1', {}, 120000).catch(() => null);
+    guard?.();
     if (!r?.ok) {
       scheduleReload(j);
       throw publicFail('The model server has not re-read the restored settings yet. Try again shortly.');
@@ -1517,11 +1579,10 @@ function createFullAutotuner({ request: engineRequest, rawModels: engineRawModel
     } catch (e) { return { ok: false, status: 409, body: { error: clientMessage(e, 'Auto-tune could not start.') } }; }
     finally { starting = false; }
   }
-  function cancel() {
-    if (state.job?.status !== 'running') return { ok: false, status: 409, body: { error: 'No auto-tune is running.' } };
-    cancelled = true; child?.cancel(); inflight?.abort(); idleAbort?.abort();
-    return { ok: true, status: 202, body: publicJob(state.job) };
-  }
+  const cancellation = createAutotuneCancellation(
+    () => ({ job: state.job, starting, cancelled, completion, child, inflight, idleAbort }),
+    () => { cancelled = true; },
+  );
   // #1978: drops the finished job record the Recover card shows. History (measurements, evidence),
   // saved settings and models.ini are not touched. Refused while a run is active or starting, and
   // while a restored models.ini is still waiting for the model server to re-read it.
@@ -1578,64 +1639,172 @@ function createFullAutotuner({ request: engineRequest, rawModels: engineRawModel
       : 'Restart interrupted tuning. Completed settings remain saved.';
     save();
   }
-  async function resume({ confirmPause } = {}) {
-    if (confirmPause !== true) return { ok: false, status: 400, body: { error: 'Confirm that chat can pause before resuming auto-tune.' } };
+  // #2301: snapshots/metadata and the sole live writer. Public resume decisions stay in Rust.
+  const resumeProcess = crypto.randomUUID(), resumeObjects = new WeakMap();
+  let resumeSequence = 0, resumePreparing = null;
+  const resumeId = value => {
+    if (!value || (typeof value !== 'object' && typeof value !== 'function')) return null;
+    if (!resumeObjects.has(value)) resumeObjects.set(value, ++resumeSequence);
+    return resumeObjects.get(value);
+  };
+  const resumeRun = () => hash({ process: resumeProcess, job: resumeId(state.job), completion: resumeId(completion) });
+  const resumeOutside = () => ({ process: resumeProcess,
+    job: resumeId(state.job), completion: resumeId(completion), starting, cancelled,
+    revision: presets.snapshot().revision, system: (Array.isArray(state.job?.models) ? state.job.models : []).map(item => typeof item?.model === 'string' && isSystemModel(item.model)) });
+  const resumeToken = () => hash({ ...resumeOutside(), generation: resumeGeneration, state });
+  const resumeString = value => typeof value === 'string' ? value : null;
+  const resumeStatus = value => ['pending', 'running', 'passed', 'failed', 'interrupted', 'cancelled', 'skipped'].includes(value) ? value : null;
+  const resumeQueue = j => !Array.isArray(j?.models) ? null : j.models.map(item => !item || typeof item !== 'object' ? null : ({
+    model: resumeString(item.model), base: resumeString(item.base), mode: resumeString(item.mode), status: resumeStatus(item.status), sectionCreated: !!item.sectionCreated,
+    identitySet: !!item._identity, identity: typeof item._identity === 'string' && /^[0-9a-f]{64}$/.test(item._identity) ? item._identity : null, planned: !!item.plan,
+    configured: typeof item.model === 'string' ? presets.get(item.model).exists : false,
+    baseConfigured: typeof item.base === 'string' ? presets.get(item.base).exists : false,
+    phases: !Array.isArray(item.phases) ? null : item.phases.map(p => !p || typeof p !== 'object' ? null : ({
+      id: resumeString(p.id), status: resumeStatus(p.status), restored: typeof p.restored === 'boolean' ? p.restored : null,
+      steps: !Array.isArray(p.steps) ? null : p.steps.map(step => ({ status: resumeStatus(step?.status) })),
+    })),
+  }));
+  function resumeFacts() {
     const j = state.job;
-    if (starting || !j || !['cancelled', 'interrupted', 'failed'].includes(j.status) || !Array.isArray(j.models))
-      return { ok: false, status: 409, body: { error: 'No resumable auto-tune is available.' } };
-    if (j._unsafe || j.models.some(m => m.phases.some(p => p.restored === false)))
-      return { ok: false, status: 409, body: { error: 'Settings could not safely be restored; inspect models.ini before starting a new tune.' } };
-    adoptPendingRevision(j);
-    if (presets.snapshot().revision !== j._revision)
-      return { ok: false, status: 409, body: { error: 'Settings changed outside auto-tune. Start a new tune after reviewing them.' } };
-    // A job persisted by a pre-patch build may still list a system routing model (e.g. Laya) in
-    // its queue. Never resume tuning it — drop it from the queue and record why, same as a fresh
-    // scan would have. If nothing tunable remains, the job is done rather than resumable.
-    // The router's --model path counts too: a neutral id can still point at Laya's weights.
-    let rows;
-    try { rows = await rawModels(); } catch { rows = null; }
-    if (!rows?.ok || !Array.isArray(rows.body?.data)) return { ok: false, status: 409, body: { error: 'The model server is not responding.' } };
-    const pathOf = id => modelPathFromArgs(rows.body.data.find(row => row.id === id)?.status?.args || []);
-    const isSystem = id => isSystemModel(id, pathOf(id));
-    const systemItems = j.models.filter(item => isSystem(item.model));
-    if (systemItems.length) {
-      j.models = j.models.filter(item => !isSystem(item.model));
-      j.skipped = [...(j.skipped || []), ...systemItems.map(item => ({ model: item.model, reason: SYSTEM_MODEL_REASON }))];
-      if (j.model && isSystem(j.model)) j.model = j.models[0]?.model || j.model;
-      if (!j.models.length) {
-        j.status = 'passed'; j.phase = 'Done'; j.finishedAt = now(); j.error = undefined;
-        save();
-        return { ok: true, status: 200, body: publicJob(j) };
-      }
-      save();
+    return { token: resumeToken(), generation: resumeRun(), starting, revision: presets.snapshot().revision,
+      job: !j ? null : { status: resumeStatus(j.status), model: resumeString(j.model), unsafe: !!j._unsafe,
+        revision: resumeString(j._revision), pendingRevision: resumeString(j._pendingRevision), models: resumeQueue(j) } };
+  }
+  const resumeStale = () => Object.assign(Error('Resume state changed'), { code: 'resume_stale' });
+  async function prepareResume(expected, { stage, selectors = [] } = {}, signal) {
+    if (typeof expected !== 'string' || resumePreparing || starting || !state.job || expected !== resumeToken()) return { applied: false };
+    if (!['listing', 'identities'].includes(stage) || !Array.isArray(selectors) || selectors.length > 512) throw Error('Invalid preparation request');
+    const j = state.job, run = completion, owner = {};
+    if (!Array.isArray(j.models) || j.models.length > 512) throw Error('Resume queue exceeds preparation bounds');
+    const seen = new Set();
+    for (const pick of selectors) {
+      if (!pick || !Number.isSafeInteger(pick.index) || pick.index < 0 || pick.index >= j.models.length || seen.has(pick.index) ||
+          !['model', 'base'].includes(pick.field) || typeof j.models[pick.index]?.[pick.field] !== 'string') throw Error('Invalid queued identity request');
+      seen.add(pick.index);
     }
-    starting = true;
+    resumePreparing = owner; starting = true;
+    let baseline = resumeToken(), result;
+    const deadline = Date.now() + 120000;
+    const wait = async pending => {
+      let timer, abort;
+      try {
+        return await Promise.race([pending, new Promise((_, reject) => {
+          abort = () => reject(resumeStale());
+          timer = setTimeout(abort, Math.max(0, deadline - Date.now()));
+          timer.unref?.();
+          signal?.addEventListener('abort', abort, { once: true });
+          if (signal?.aborted) abort();
+        })]);
+      } finally { clearTimeout(timer); signal?.removeEventListener('abort', abort); }
+    };
+    const current = () => {
+      if (signal?.aborted || Date.now() >= deadline || resumePreparing !== owner || !starting || state.job !== j || completion !== run || resumeToken() !== baseline) throw resumeStale();
+    };
     try {
-      await flushReload();
-      for (const item of j.models.filter(m => m.status !== 'passed')) {
-        // #1079: a Long item stopped before its section was added is checked by its model. #1093: so is
-        // one whose section this job wrote, which the router may not list yet (ensureLongSection decides).
-        const id = item.mode === 'long' && (!presets.get(item.model).exists || item.sectionCreated) ? item.base : item.model;
-        if (!id || !rows.body.data.some(row => row.id === id) || !presets.get(id).exists) throw publicFail('A queued model is no longer configured.');
-        const identity = await identityFor(id);
-        if (!identity) throw publicFail('A queued model identity could not be read.');
-        if (item._identity && item._identity !== hash({ ...identity, profile: undefined })) throw publicFail('A queued model changed since tuning began.');
+      current();
+      if (stage === 'listing') {
+        // This synchronous, existing owner repair happens only after exact state comparison.
+        adoptPendingRevision(j); baseline = resumeToken();
+        const rows = await wait(rawModels().catch(() => null)); current();
+        result = { models: rows?.ok && Array.isArray(rows.body?.data) && rows.body.data.length <= 8192
+          ? j.models.map((item, index) => ({ index, system: isSystemModel(item?.model,
+            modelPathFromArgs(rows.body.data.find(row => row?.id === item?.model)?.status?.args || [])),
+            modelListed: rows.body.data.some(row => row?.id === item?.model),
+            baseListed: rows.body.data.some(row => row?.id === item?.base),
+          })) : null };
+      } else {
+        const before = JSON.parse(JSON.stringify(state)), beforeGeneration = resumeGeneration, outside = resumeOutside();
+        const owed = !!j._reloadPending;
+        await wait(flushReload(null, current));
+        // The only allowed change across this await is flushReload's documented one-note commit.
+        // Guard ran inside flushReload before that write; no unrelated delta is accepted here.
+        if (owed) {
+          const expectedState = before;
+          expectedState.job._reloadPending = false;
+          const note = j.log?.at(-1);
+          if (!note || note.text !== 'The model server re-read the restored models.ini.' || !Number.isFinite(note.at)) throw resumeStale();
+          (expectedState.job.log ||= []).push(note);
+          if (expectedState.job.log.length > 400) expectedState.job.log.shift();
+          if (JSON.stringify(state) !== JSON.stringify(expectedState) || resumeGeneration !== beforeGeneration + 1) throw resumeStale();
+          const expectedToken = hash({ ...outside, generation: beforeGeneration + 1, state: expectedState });
+          if (resumeToken() !== expectedToken) throw resumeStale();
+          baseline = expectedToken;
+        } else current();
+        current();
+        const identities = [];
+        for (const pick of selectors) {
+          const id = j.models[pick.index][pick.field];
+          const identity = await wait(Promise.resolve().then(() => identityFor(id)).catch(() => null)); current();
+          identities.push({ index: pick.index, field: pick.field,
+            identity: identity ? hash({ ...identity, profile: undefined }) : null });
+        }
+        result = { identities };
       }
-      cancelled = false; j.status = 'running'; j.error = undefined; j.finishedAt = undefined; delete j.failedPhase; delete j.failedStep;
-      for (const item of j.models) if (item.status !== 'passed') {
-        item.status = 'pending'; delete item.error; delete item._foreignYields;
-        for (const p of item.phases) if (p.status !== 'passed') {
-          p.status = 'pending'; delete p.reason; delete p.restored;
-          // Planned stages (#1003) keep the rows the planner has results for; the rest re-run.
-          p.steps = item.plan && ['context', 'verify'].includes(p.id) ? p.steps.filter(s => ['passed', 'failed'].includes(s.status))
-            : p.steps.map(s => ({ ...s, status: 'pending', reason: undefined }));
+    } catch (error) {
+      if (error?.code === 'resume_stale' || signal?.aborted) return { applied: false };
+      if (error?.publicMessage === 'The model server has not re-read the restored settings yet. Try again shortly.') return { applied: false, fault: 'reload' };
+      throw error;
+    } finally {
+      if (resumePreparing === owner) { resumePreparing = null; starting = false; }
+    }
+    // starting participates in the fingerprint: never emit a token from inside the try/finally.
+    if (state.job !== j || completion !== run || signal?.aborted) return { applied: false };
+    return { applied: true, ...resumeFacts(), ...result };
+  }
+  const resumePublicJob = job => {
+    const keys = ['id', 'model', 'bulk', 'mode', 'promptBudgetSeconds', 'status', 'phase', 'startedAt',
+      'log', 'models', 'queueProgress', 'finishedAt', 'error', 'failedPhase', 'failedStep', 'restored', 'skipped', 'waiting', 'result'];
+    const hidden = key => key.startsWith('_') || ['originalText', 'lastRevision', 'originalRevision', 'beforeText',
+      'headers', 'authorization', 'apiKey', 'api_key', 'accessToken', 'refreshToken', 'httpConfig', 'requestConfig', 'baseUrl', 'url'].includes(key);
+    return JSON.parse(JSON.stringify(Object.fromEntries(keys.filter(k => Object.hasOwn(job, k)).map(k => [k, job[k]])),
+      (key, value) => hidden(key) ? undefined : value));
+  };
+  function compareAndResume(expected, plan) {
+    if (typeof expected !== 'string' || resumePreparing || starting || !state.job || expected !== resumeToken()) return { applied: false };
+    const j = state.job;
+    if (!Array.isArray(j.models) || j.models.length > 512 || !plan || typeof plan !== 'object' || Array.isArray(plan)) throw Error('Invalid resume patch');
+    const indices = (list, length) => Array.isArray(list) && list.length <= length && list.every((n, i) => Number.isSafeInteger(n) && n >= 0 && n < length && (!i || list[i - 1] < n));
+    if (plan.kind === 'filter') {
+      if (!indices(plan.keep, j.models.length) || !Array.isArray(plan.skipped) || typeof plan.complete !== 'boolean' ||
+          !(plan.model === null || Number.isSafeInteger(plan.model) && plan.keep.includes(plan.model))) throw Error('Invalid queue patch');
+      const removed = j.models.map((_, i) => i).filter(i => !plan.keep.includes(i));
+      if (plan.skipped.length !== removed.length || plan.skipped.some((p, i) => p?.index !== removed[i] || typeof p.reason !== 'string' || p.reason.length > 256)) throw Error('Invalid skipped queue patch');
+    } else if (plan.kind === 'launch') {
+      if (!Array.isArray(plan.reset) || !indices(plan.reset.map(p => p?.index), j.models.length)) throw Error('Invalid item reset patch');
+      for (const item of plan.reset) {
+        const phases = j.models[item.index]?.phases;
+        if (!Array.isArray(phases) || !Array.isArray(item.phases) || !indices(item.phases.map(p => p?.index), phases.length)) throw Error('Invalid phase reset patch');
+        for (const p of item.phases) if (!Array.isArray(phases[p.index]?.steps) || !(p.keepSteps === null || indices(p.keepSteps, phases[p.index].steps.length))) throw Error('Invalid step reset patch');
+      }
+    } else throw Error('Invalid resume patch kind');
+    const before = JSON.parse(JSON.stringify(j));
+    try {
+      if (plan.kind === 'filter') {
+        const old = j.models;
+        j.models = plan.keep.map(i => old[i]);
+        j.skipped = [...(j.skipped || []), ...plan.skipped.map(p => ({ model: old[p.index].model, reason: p.reason }))];
+        if (plan.model !== null) j.model = old[plan.model].model;
+        if (plan.complete) { j.status = 'passed'; j.phase = 'Done'; j.finishedAt = now(); j.error = undefined; }
+      } else {
+        j.status = 'running'; j.error = undefined; j.finishedAt = undefined; delete j.failedPhase; delete j.failedStep;
+        for (const item of plan.reset) {
+          const row = j.models[item.index]; row.status = 'pending'; delete row.error; delete row._foreignYields;
+          for (const patch of item.phases) {
+            const p = row.phases[patch.index]; p.status = 'pending'; delete p.reason; delete p.restored;
+            p.steps = patch.keepSteps === null ? p.steps.map(s => ({ ...s, status: 'pending', reason: undefined })) : patch.keepSteps.map(i => p.steps[i]);
+          }
         }
       }
-      save(); completion = run(j); completion.catch(() => {});
-      return { ok: true, status: 202, body: publicJob(j) };
-    } catch (e) { return { ok: false, status: 409, body: { error: clientMessage(e, 'Auto-tune could not resume.') } }; }
-    finally { starting = false; }
+      save();
+    } catch (error) {
+      // The worker has not started. Keep the live object identity and restore only this patch.
+      for (const key of Object.keys(j)) delete j[key];
+      Object.assign(j, before);
+      throw error;
+    }
+    if (plan.kind === 'launch') { cancelled = false; completion = run(j); completion.catch(() => {}); }
+    return { applied: true, ...resumeFacts(), publicJob: resumePublicJob(j) };
   }
-  return { start, resume, cancel, clearFacts, compareAndClear, status, settingsFacts: settingsSnapshot, commitSettings, untuned, recover, flushReload, completion: () => completion };
+  return { start, resumeFacts, prepareResume, compareAndResume, cancellationFacts: cancellation.facts, compareAndAbort: cancellation.compareAndAbort, clearFacts, compareAndClear, statusFacts, settingsFacts: settingsSnapshot, commitSettings, untuned, recover, flushReload, completion: () => completion };
 }
-module.exports = { createFullAutotuner, qualityCheck, qualityFailure, QUALITY, VERSION, newModel, hasHarmonyReasoning, kvCandidates, preferKv, bf16Unsupported, MODES, LONG_PROFILE_REASON };
+module.exports = { createAutotuneCancellation, createFullAutotuner, qualityCheck, qualityFailure, QUALITY, VERSION, newModel, hasHarmonyReasoning, kvCandidates, preferKv, bf16Unsupported, MODES, LONG_PROFILE_REASON };
