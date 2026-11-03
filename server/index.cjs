@@ -1201,6 +1201,9 @@ const authRoutes = require('./routes/auth.cjs').createAuthRoutes({
 // only refuses a request that bypassed it.
 const storageRoutes = require('./routes/storage.cjs').createStorageRoutes({ json });
 // Public approval policy is Rust's; only pending chat Promise resolution remains here (#2282).
+const idleUnloadFacts = require('./rust-idle-unload-read-facts.cjs').createIdleUnloadFacts({
+  secret: FRONT_SECRET, json, effectiveSeconds: () => idleUnload?.effectiveSeconds(),
+});
 const presetReadBridge = require('./rust-preset-read-bridge.cjs').createPresetReadBridge({
   secret: FRONT_SECRET, json, readJson, manager: () => modelManager,
 });
@@ -1293,6 +1296,8 @@ async function handleRequestInner(req, res) {
   // The ownership refusals below answer before handleRequestScoped; they carry the same headers.
   publicHeaders(res);
   if (require('./rust-tool-approvals.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
+  if (require('./rust-idle-unload-read.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
+  if (await idleUnloadFacts(req, res)) return;
   if (require('./rust-autotune-read.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   if (require('./rust-preset-read.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   if (await presetReadBridge(req, res)) return;
