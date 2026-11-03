@@ -320,24 +320,6 @@ shutdownHooks.install();
 // and text files (pasted/uploaded text injected into context; true doc-RAG is a
 // later feature — flagged in MIGRATION.md).
 
-const folderSync = process.env.MODEL_LOADER_URL ? require('./model-folder-sync.cjs').createFolderSync({
-  stateFile: path.join(DATA_DIR, 'model-folder-sync.json'),
-  listUnregistered: async () => {
-    const r = await modelService.managerFetch('models');
-    if (!r?.ok) throw Object.assign(Error(r?.body?.error || `model manager HTTP ${r?.status || 'unreachable'}`), { status: r?.status });
-    return Array.isArray(r.body?.unregistered) ? r.body.unregistered : [];
-  },
-  register: async (stem) => {
-    const r = await modelService.managerFetch(`sections/${encodeURIComponent(stem)}/safe-defaults`, 'POST');
-    if (!r?.ok) throw Object.assign(Error(r?.body?.error || `model manager HTTP ${r?.status || 'unreachable'}`), { status: r?.status });
-  },
-  reloadPresets: () => modelManager.reloadPresets ? modelManager.reloadPresets({ unload: false }) : { ok: false },
-  writePresets: modelManager.writePresets ? (write, reloadIf) => modelManager.writePresets(write, reloadIf) : null,
-  // #872: never write models.ini while calibration/auto-tune runs or the maintenance gate is held.
-  busy: () => !!modelManager.tuningActive?.(),
-  log: (message) => console.log(message),
-}) : null;
-
 // #223: an evaluator fault reading LLAMACPP_MEMORY_LIMIT must not stop the service. The budget is then
 // unknown (0, which sizes nothing), the reason is kept and logged once, and the features that need it
 // refuse per request with that reason (llamacpp-manager.cjs). A fault never yields a guessed figure.
@@ -383,6 +365,24 @@ const modelManager = createModelManager({
   // noevia#2115: the inference gate's admin token, for an admin's "unload anyway" and the memory watchdog.
   gateAdminToken: process.env.INFERENCE_GATE_ADMIN_TOKEN || null,
 });
+const folderSync = process.env.MODEL_LOADER_URL ? require('./model-folder-sync.cjs').createFolderSync({
+  stateFile: path.join(DATA_DIR, 'model-folder-sync.json'),
+  listUnregistered: async () => {
+    const r = await modelService.managerFetch('models');
+    if (!r?.ok) throw Object.assign(Error(r?.body?.error || `model manager HTTP ${r?.status || 'unreachable'}`), { status: r?.status });
+    return Array.isArray(r.body?.unregistered) ? r.body.unregistered : [];
+  },
+  register: async (stem) => {
+    const r = await modelService.managerFetch(`sections/${encodeURIComponent(stem)}/safe-defaults`, 'POST');
+    if (!r?.ok) throw Object.assign(Error(r?.body?.error || `model manager HTTP ${r?.status || 'unreachable'}`), { status: r?.status });
+  },
+  reloadPresets: () => modelManager.reloadPresets ? modelManager.reloadPresets({ unload: false }) : { ok: false },
+  writePresets: modelManager.writePresets ? (write, reloadIf) => modelManager.writePresets(write, reloadIf) : null,
+  // #872: never write models.ini while calibration/auto-tune runs or the maintenance gate is held.
+  busy: () => !!modelManager.tuningActive?.(),
+  log: (message) => console.log(message),
+}) : null;
+
 // noevia#2115: leases still held when the process is told to stop are given back (best effort, a short wait); the
 // gate would otherwise end them only after its idle time, holding its queue for that long.
 if (typeof modelManager.releaseLeases === 'function') shutdownHooks.add(() => modelManager.releaseLeases({ timeoutMs: 2000 }));
@@ -1254,6 +1254,9 @@ const calibrationCancelBridge = require('./rust-calibration-cancel-bridge.cjs').
   secret: FRONT_SECRET, json, readJson, calibration: () => modelManager.calibration,
 });
 // #2281: the Rust front owns the picker response; only raw live discovery/prefill facts stay here.
+const autotuneCancelBridge = require('./rust-autotune-cancel-bridge.cjs').createAutotuneCancelBridge({
+  secret: FRONT_SECRET, json, readJson, autotune: () => modelManager.autotune,
+});
 const toolboxPickerFacts = require('./rust-toolbox-picker-facts.cjs').createToolboxPickerFacts({
   secret: FRONT_SECRET, discoverMcpTools: async () => { await readyFeatures(); await discoverMcpTools(); }, allToolboxes, connectorBoxes: CONNECTOR_BOXES, json, readJson,
   prefill: { targetMs: TOOL_PREFILL_TARGET_MS, stats: () => prefill.stats() },
@@ -1353,6 +1356,8 @@ async function handleRequestInner(req, res) {
   if (require('./rust-mcp-directory.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   if (require('./rust-toolboxes-permitted.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   if (require('./rust-toolbox-picker.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
+  if (require('./rust-autotune-cancel.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
+  if (await autotuneCancelBridge(req, res)) return;
   if (require('./rust-calibration-cancel.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   if (await calibrationCancelBridge(req, res)) return;
   if (await toolboxPickerFacts(req, res)) return;

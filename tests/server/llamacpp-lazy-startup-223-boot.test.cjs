@@ -115,7 +115,7 @@ async function boot(t, mode) {
     PATH: process.env.PATH, NODE_ENV: 'production', TZ: 'UTC', LANG: 'C.UTF-8',
     UI_PORT: String(port), UI_HOST: '127.0.0.1', UI_DATA_DIR: dataDir, PUBLIC_ORIGIN: base,
     INFERENCE_BASE_URL: `http://127.0.0.1:${router.port}`, DIARY_BASE_URL: `http://127.0.0.1:${diary.port}`,
-    MODEL_LOADER_URL: '', MCP_SERVERS: '', COWORK_DECISION_URL: '', COWORK_SYSTEM_ONE_URL: '', DIARY_BACKUP_WORKER_INTERVAL_MS: '3600000',
+    MODEL_LOADER_URL: `http://127.0.0.1:${router.port}`, MCP_SERVERS: '', COWORK_DECISION_URL: '', COWORK_SYSTEM_ONE_URL: '', DIARY_BACKUP_WORKER_INTERVAL_MS: '3600000',
     MODEL_MANAGER_KIND: 'llamacpp', MODEL_MANAGER_BASE_URL: `http://127.0.0.1:${router.port}`,
     LLAMACPP_PRESET_PATH: ini, LLAMACPP_MODELS_PATH: modelsDir,
     NOEVIA_PROJECT_STORE_PORT: String(store.port), NOEVIA_PROJECT_STORE_TOKEN: store.token,
