@@ -90,81 +90,23 @@ test('Node list mount has no move handler even if an injected store offers one',
  const route=createChatListRoutes({json:()=>{throw Error('duplicate reply');},readBody:async()=>{throw Error('body read behind front');},currentWorkspace:()=>({}),store:f.store});
  assert.equal(await route({method:'POST'},{},{path:'/api/chats/qa/move'}),false);
 });
-test('#1471 a chat exports as one Markdown file from its own lists; unknown, deleted and other-list ids answer 404', async () => {
+// GET /api/chats/search (#1450) and GET /api/chats/:id/export (#1471) are the Rust front's (noevia-rs
+// bins/noevia-server tests/chat_lists_read.rs and the Node-differential crates/server-projects tests/chat_lists_oracle.rs
+// hold their behaviour): this mount no longer answers either, and index.cjs refuses both GETs first
+// (rust-chat-search-export.test.cjs).
+test('the chat search and the single-chat download are not this mount\'s any more', async () => {
   const f = fixture();
-  f.histories.set('f1', [{ role: 'user', content: 'What is 12 times 3?' }, { role: 'assistant', content: 'Thirty-six.' }]);
-  f.projects[0].chats = [{ id: 'c1', title: 'Project chat' }];
-  f.histories.set('c1', [{ role: 'user', content: 'Project question' }]);
-  const reply = async (method, path) => {
-    const res = { headers: null, body: null, writeHead(status, headers) { this.status = status; this.headers = headers; }, end(value) { this.body = Buffer.from(value); } };
-    const req = Readable.from([]);
-    req.method = method;
-    const handled = await f.routes(req, res, { path, authn: { user: { id: 'u1', role: 'member' } } });
-    return { handled, res };
-  };
-  const routes = f.routes;
-  assert.equal(typeof routes, 'function', 'fixture exposes the routes');
-  const free = await reply('GET', '/api/chats/f1/export');
-  assert.equal(free.handled, true);
-  assert.equal(free.res.status, 200);
-  assert.equal(free.res.headers['Content-Type'], 'text/markdown; charset=utf-8');
-  assert.match(free.res.headers['Content-Disposition'], /^attachment; filename="noevia-chat-free-f1\.md"$/);
-  const text = free.res.body.toString('utf8');
-  assert.match(text, /^# Free\n/);
-  assert.match(text, /## You\n\nWhat is 12 times 3\?/);
-  assert.match(text, /## Assistant\n\nThirty-six\./);
-  const project = await reply('GET', '/api/chats/c1/export');
-  assert.equal(project.res.status, 200);
-  assert.match(project.res.body.toString('utf8'), /Project question/);
-  const unknown = await reply('GET', '/api/chats/c-nope/export');
-  assert.equal(unknown.handled, true);
-  assert.deepEqual(f.sent.pop(), { status: 404, body: { error: 'This chat was not found.' } });
-  f.histories.set('diary-x', []);
-  f.projects.push({ id: 'diary-extras', name: 'Diary', chats: [{ id: 'dx', title: 'Diary' }] });
-  await reply('GET', '/api/chats/dx/export');
-  assert.equal(f.sent.pop().status, 404, 'a chat in the internal project is not a chat of this list');
-  const bad = await reply('GET', '/api/chats/bad%20id!/export');
-  assert.equal(bad.handled, true);
-  assert.equal(await reply('POST', '/api/chats/f1/export').then(r => r.handled), false, 'only GET reads the export');
-});
-
-// #1450: the transcript search finds the chats whose message text holds the query, within this person's own lists.
-test('#1450 search matches message text in this person chats, not the internal list, and answers a short query with nothing', async () => {
-  const f = fixture();
-  f.histories.set('f1', [{ role: 'user', content: 'What is 12 times 3?' }, { role: 'assistant', content: 'Thirty-six.' }]);
-  f.projects[0].chats = [{ id: 'c1', title: 'Project chat' }];
-  f.histories.set('c1', [{ role: 'user', content: 'PINEAPPLE recipe' }]);
-  f.projects.push({ id: 'diary-extras', name: 'Diary', chats: [{ id: 'dx', title: 'Diary' }] });
-  f.histories.set('dx', [{ role: 'user', content: 'PINEAPPLE in the diary' }]);
-  const search = async (q) => {
-    const req = Readable.from([]);
-    req.method = 'GET';
-    const url = new URL(`http://localhost/api/chats/search?q=${encodeURIComponent(q)}`);
-    const handled = await f.routes(req, {}, { path: '/api/chats/search', authn: { user: { id: 'u1', role: 'member' } }, url });
-    assert.equal(handled, true);
-    return f.sent.pop();
-  };
-  assert.deepEqual(await search('thirty'), { status: 200, body: { chats: ['f1'], truncated: false } });
-  assert.deepEqual(await search('pineapple'), { status: 200, body: { chats: ['c1'], truncated: false } }, 'the internal diary project is not searched');
-  assert.deepEqual(await search('x'), { status: 200, body: { chats: [], truncated: false } }, 'a one-letter query reads nothing');
-  assert.deepEqual(await search('nothing-matches-this'), { status: 200, body: { chats: [], truncated: false } });
-  assert.equal((await search('a'.repeat(201))).status, 400);
-});
-
-test('#1450 search reads only the chats that are still in the lists', async () => {
-  const f = fixture();
-  f.histories.set('f1', [{ role: 'user', content: 'findme' }]);
-  f.histories.set('c1', [{ role: 'user', content: 'findme' }]);
-  f.projects[0].chats = [{ id: 'c1', title: 'x' }];
-  const search = async (q) => {
-    const req = Readable.from([]); req.method = 'GET';
-    await f.routes(req, {}, { path: '/api/chats/search', authn: { user: { id: 'u1', role: 'member' } }, url: new URL(`http://localhost/api/chats/search?q=${encodeURIComponent(q)}`) });
-    return f.sent.pop();
-  };
-  assert.deepEqual((await search('findme')).body.chats.sort(), ['c1', 'f1']);
-  f.freeChats.length = 0;
-  f.projects[0].chats = [];
-  assert.deepEqual((await search('findme')).body.chats, [], 'a chat no longer in the lists is not reported');
+  f.histories.set('f1', [{ role: 'user', content: 'thirty' }]);
+  f.store.readHistory = () => { throw new Error('transcript read behind the front'); };
+  for (const [m, p] of [['GET', '/api/chats/search'], ['GET', '/api/chats/f1/export'], ['POST', '/api/chats/f1/export'], ['GET', '/api/chats/bad%20id!/export']]) {
+    const url = new URL(`http://localhost${p}?q=thirty`);
+    const req = Readable.from([]); req.method = m;
+    assert.equal(await f.routes(req, {}, { path: p, authn: { user: { id: 'u1', role: 'member' } }, url }), false, `${m} ${p}`);
+  }
+  assert.equal(f.sent.length, 0);
+  const source = fs.readFileSync(path.join(__dirname, 'chat-lists.cjs'), 'utf8');
+  assert.equal(source.includes("p === '/api/chats/search'"), false);
+  assert.equal(source.includes('chatMarkdown('), false);
 });
 
 test('#1507: a saved transcript supersedes a saved partial reply (which the Rust front\'s GET offers, #1071)', async () => {

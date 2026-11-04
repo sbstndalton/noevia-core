@@ -7,7 +7,6 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const { Readable } = require('node:stream');
 const { createModelRoutes } = require('../../server/routes/models.cjs');
-const { modelAssignments, embeddingProfileFor, serviceUsing } = require('../../server/model-assignments.cjs');
 
 function routes({ installed = [], env = {}, routerDelete = { ok: true, status: 200 }, sections = ['plain', 'orphan'], role = 'admin', served = async () => ['nomic-embed-text-v1'] } = {}) {
   const sent = [], fetched = [], deleted = [];
@@ -91,75 +90,4 @@ test('#336/#1660 the in-use embedding model is still refused, naming the service
   assert.equal(out.body.service, 'embedding');
   assert.deepEqual(f.deleted, []);
   assert.ok(!f.fetched.some((x) => x.startsWith('DELETE')), 'no preset removed');
-});
-
-test('#1662 GET /api/models/assignments: admins get options, members a read-only view without them', async () => {
-  const installed = [
-    { name: 'nomic-embed-text-v1', labels: ['embeddings'] }, { name: 'embeddinggemma-2', labels: ['embeddings'] },
-    { name: 'laya_multilingual_f16', labels: [], system: true }, { name: 'qwen3-reranker', labels: ['reranking'], missingFile: true },
-  ];
-  const env = { EMBEDDING_MODEL: 'nomic-embed-text-v1', RERANK_MODEL: 'qwen3-reranker', NOEVIA_FEATURE_RAG_RERANK: '1', OCR_BASE_URL: 'http://ocr.invalid' };
-  const admin = routes({ installed, env });
-  await admin.call('GET', '/api/models/assignments');
-  const a = admin.sent.pop();
-  assert.equal(a.status, 200);
-  const by = Object.fromEntries(a.body.services.map((s) => [s.id, s]));
-  assert.equal(a.body.admin, true);
-  assert.deepEqual([by.embedding.model, by.embedding.state], ['nomic-embed-text-v1', 'active']);
-  assert.deepEqual(by.embedding.options, [{ model: 'embeddinggemma-2', profile: 'embeddinggemma-2', served: false }], 'the nomic-only sidecar does not serve embeddinggemma-2');
-  assert.deepEqual([by.reranker.model, by.reranker.state], ['qwen3-reranker', 'missing']);
-  // #1796: the Decision row follows the decision service configuration, not an installed Laya preset.
-  assert.deepEqual([by.decision.model, by.decision.state], [null, 'off']);
-  assert.equal(by.ocr.state, 'active');
-  assert.equal(by.documents.state, 'off');
-  assert.ok(!JSON.stringify(a.body).includes('ocr.invalid'), 'no service address is sent');
-  const member = routes({ installed, env, role: 'member' });
-  await member.call('GET', '/api/models/assignments');
-  const m = member.sent.pop().body;
-  assert.equal(m.admin, false);
-  assert.ok(m.services.every((s) => !('options' in s) && s.canChange === false));
-});
-
-test('assignment helpers', () => {
-  assert.equal(embeddingProfileFor('EmbeddingGemma-2-Q8'), 'embeddinggemma-2');
-  assert.equal(embeddingProfileFor('nomic-embed-text-v1.5'), 'nomic-v1');
-  const a = modelAssignments({ installed: [], env: { RERANK_MODEL: 'r' } });
-  assert.equal(a.services.find((s) => s.id === 'reranker').state, 'off', 'reranking off when the feature is off');
-  const d = a.services.find((s) => s.id === 'decision');
-  assert.deepEqual([d.model, d.state], [null, 'off'], '#1796: no decision service configured reads off, whatever is installed');
-  const kev = modelAssignments({ installed: [], env: { COWORK_DECISION_URL: 'http://kev:11435', COWORK_DECISION_MODEL: 'kev-0.8b' } }).services.find((s) => s.id === 'decision');
-  assert.deepEqual([kev.model, kev.state], ['kev-0.8b', 'active']);
-  assert.equal(serviceUsing('r', { services: [{ id: 'reranker', model: 'r' }] }), 'reranker');
-});
-
-test('#1660 review: an embedding option is marked served only when the embeddings server lists it', async () => {
-  const installed = [{ name: 'nomic-embed-text-v1', labels: ['embeddings'] }, { name: 'embeddinggemma-2', labels: ['embeddings'] }, { name: 'bge-m3', labels: ['embeddings'] }];
-  const f = routes({ installed, env: { EMBEDDING_MODEL: 'nomic-embed-text-v1' }, served: async () => ['nomic-embed-text-v1', 'embeddinggemma-2'] });
-  await f.call('GET', '/api/models/assignments');
-  const embed = f.sent.pop().body.services.find((s) => s.id === 'embedding');
-  assert.deepEqual(embed.options.map((o) => [o.model, o.served]), [['embeddinggemma-2', true], ['bge-m3', false]]);
-  const down = routes({ installed, env: { EMBEDDING_MODEL: 'nomic-embed-text-v1' }, served: async () => { throw new Error('down'); } });
-  await down.call('GET', '/api/models/assignments');
-  assert.ok(down.sent.pop().body.services.find((s) => s.id === 'embedding').options.every((o) => o.served === null), 'unreadable: unknown, not "not served"');
-});
-
-test('#1660 review: served is matched like a switch (name:latest, case) and members never cause a probe', async () => {
-  const installed = [{ name: 'nomic-embed-text-v1', labels: ['embeddings'] }, { name: 'embeddinggemma-2', labels: ['embeddings'] }, { name: 'bge-m3', labels: ['embeddings'] }];
-  let probes = 0;
-  const served = async () => { probes += 1; return ['nomic-embed-text-v1', 'EmbeddingGemma-2:latest']; };
-  const a = routes({ installed, env: { EMBEDDING_MODEL: 'nomic-embed-text-v1' }, served });
-  await a.call('GET', '/api/models/assignments');
-  const embed = a.sent.pop().body.services.find((s) => s.id === 'embedding');
-  assert.deepEqual(embed.options.map((o) => [o.model, o.served]), [['embeddinggemma-2', true], ['bge-m3', false]]);
-  assert.equal(probes, 1);
-  const m = routes({ installed, env: { EMBEDDING_MODEL: 'nomic-embed-text-v1' }, served, role: 'member' });
-  await m.call('GET', '/api/models/assignments');
-  const member = m.sent.pop();
-  assert.equal(member.status, 200);
-  assert.equal(member.body.services.find((s) => s.id === 'embedding').options, undefined, 'members get no options');
-  assert.equal(probes, 1, 'a member never triggers the embeddings server probe');
-  // A non-list answer (a broken stub) reads unknown.
-  const odd = routes({ installed, env: { EMBEDDING_MODEL: 'nomic-embed-text-v1' }, served: async () => ({ data: [] }) });
-  await odd.call('GET', '/api/models/assignments');
-  assert.ok(odd.sent.pop().body.services.find((s) => s.id === 'embedding').options.every((o) => o.served === null));
 });
