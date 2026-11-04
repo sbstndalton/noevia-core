@@ -79,7 +79,7 @@ test('every write under /api/models/ is refused for members before anything else
   const f = fixture();
   assert.equal(await f.call('POST', '/api/models/anything-at-all'), true);
   assert.deepEqual(f.sent.pop(), { status: 403, body: { error: 'administrator required' } });
-  assert.equal(await f.call('GET', '/api/models/downloads'), true, 'reads stay open to members');
+  assert.equal(await f.call('HEAD', '/api/models/downloads'), true, 'the legacy HEAD stays open to members');
   assert.deepEqual(f.sent.pop(), { status: 200, body: [{ id: 'j1', model: 'm', progress: 0.4, status: 'running' }] });
   assert.equal(await f.call('GET', '/api/model'), false);
   assert.equal(await f.call('DELETE', '/api/auto-roles'), false, 'an unhandled method keeps falling through');
@@ -325,7 +325,7 @@ test('any write under /api/models/ drops the scan, and pull/delete/load keep the
   const off = fixture({ enabled: false });
   await off.call('POST', '/api/models/load', { name: 'm' }, 'admin');
   assert.deepEqual(off.sent.pop(), { status: 404, body: { error: 'model management is disabled' } });
-  await off.call('GET', '/api/models/downloads');
+  await off.call('HEAD', '/api/models/downloads');
   assert.deepEqual(off.sent.pop(), { status: 200, body: [] });
 });
 
@@ -912,7 +912,7 @@ test('a model or role write drops the shared reads before it and again once its 
   f.response().emit('close');
   assert.equal(f.invalidations.length, 4);
   // Reads never register the second drop.
-  await f.call('GET', '/api/models/downloads');
+  await f.call('HEAD', '/api/models/downloads');
   assert.equal(f.invalidations.length, 4);
   f.response().emit('finish');
   f.response().emit('close');
@@ -1028,4 +1028,102 @@ test('#2276 manager writes retain the hold through the reload and release it on 
   assert.equal(f.sent.at(-1).status, 200);
   assert.deepEqual(calls, ['chat%name']);
   assert.equal(f.fetched[0].url, 'http://loader/api/v1/%73ections/chat%25name');
+});
+
+test('download GET pairs an exact refusal with bounded trusted adapter facts', async () => {
+  const { refuseOwned } = require('../rust-model-downloads-read.cjs');
+  const { createModelDownloadsFacts, PATH } = require('../rust-model-downloads-read-facts.cjs');
+  const sent = [];
+  const json = (_res, status, body) => sent.push({ status, body });
+  const ctx = { parseRequestUrl: req => new URL(req.url, 'http://localhost'), json };
+  assert.equal(refuseOwned({ method: 'HEAD', url: '/api/models/downloads' }, {}, ctx), false);
+  assert.equal(refuseOwned({ method: 'GET', url: '/api/models/downloads/' }, {}, ctx), false);
+  assert.equal(refuseOwned({ method: 'GET', url: '/api/models/downloads?x=1' }, {}, ctx), true);
+  assert.equal(sent.pop().status, 503);
+
+  let polls = 0;
+  let body = {
+    jobs: [{ id: 0, job_id: 'j', percent: Infinity, progress: 0.9, private: 'hidden' }, null, 'text'],
+    downloads: [{ id: 'unchosen' }],
+  };
+  const manager = {
+    enabled: true,
+    async downloads() {
+      polls++;
+      return { ok: true, body };
+    },
+  };
+  const bridge = createModelDownloadsFacts({ secret: 'secret', json, manager: () => manager });
+  const request = {
+    method: 'POST', url: PATH, socket: { remoteAddress: '127.0.0.1' },
+    headers: { 'x-noevia-store-token': 'secret' },
+  };
+  for (const untrusted of [
+    { ...request, method: 'GET' },
+    { ...request, socket: { remoteAddress: '192.0.2.1' } },
+    { ...request, headers: {} },
+    { ...request, headers: { ...request.headers, 'x-forwarded-for': '' } },
+    { ...request, headers: { ...request.headers, 'x-noevia-client-ip': '' } },
+  ]) {
+    assert.equal(await bridge(untrusted, {}), true);
+    assert.equal(sent.pop().status, 404);
+  }
+  assert.equal(polls, 0);
+  const facts = async (value) => {
+    body = value;
+    assert.equal(await bridge(request, {}), true);
+    return sent.pop();
+  };
+  assert.deepEqual(await facts(body), { status: 200, body: { kind: 'listing', rows: [
+    { fields: { job_id: 'j' }, infinite: ['percent'] }, null, { fields: {} },
+  ] } });
+  assert.equal(polls, 1);
+  // The old route's choice, exactly: an array body, else jobs || downloads || [].
+  assert.deepEqual((await facts([{ id: 'direct' }])).body, { kind: 'listing', rows: [{ fields: { id: 'direct' } }] });
+  assert.deepEqual((await facts({ jobs: 0, downloads: [{ id: 'fallback' }] })).body,
+    { kind: 'listing', rows: [{ fields: { id: 'fallback' } }] });
+  assert.deepEqual((await facts({ jobs: [], downloads: true })).body, { kind: 'listing', rows: [] });
+  for (const empty of [null, 'text', 7, {}]) assert.deepEqual((await facts(empty)).body, { kind: 'listing', rows: [] });
+  for (const unmappable of [{ jobs: true }, { jobs: 'x' }, { downloads: { 0: {} } }]) {
+    assert.deepEqual((await facts(unmappable)).body, { kind: 'fault' });
+  }
+  // An unchosen alternative is never expanded, however large; a chosen one is never capped.
+  const huge = 'x'.repeat(17 * 1024 * 1024);
+  assert.deepEqual((await facts({ jobs: [{ id: 'small' }], downloads: [{ id: huge }] })).body,
+    { kind: 'listing', rows: [{ fields: { id: 'small' } }] });
+  const chosen = (await facts({ jobs: [{ id: huge, model: 'm' }] })).body;
+  assert.equal(chosen.kind, 'listing');
+  assert.equal(chosen.rows[0].fields.id, huge);
+  assert.equal(chosen.rows[0].fields.model, 'm');
+  // The old public expression never touches the ignored fallback, even when
+  // JSON.parse accepts nesting that JSON.stringify cannot traverse.
+  const deep = JSON.parse('['.repeat(10000) + '0' + ']'.repeat(10000));
+  const ignoredBody = { jobs: [{ id: 'small', job_id: deep, model_name: 'm', model: deep, status: 'done', state: deep, percent: 25, progress: deep }] };
+  const ignored = await facts(ignoredBody);
+  assert.deepEqual(ignored.body, { kind: 'listing', rows: [{ fields: { id: 'small', model_name: 'm', status: 'done', percent: 25 } }] });
+  assert.doesNotThrow(() => JSON.stringify(ignored.body));
+  const legacy = fixture({ manager: { downloads: async () => ({ ok: true, body: ignoredBody }) } });
+  await legacy.call('HEAD', '/api/models/downloads');
+  assert.equal(JSON.stringify(legacy.sent.pop().body),
+    '[{"id":"small","model":"m","progress":0.25,"status":"done"}]');
+  const unicode = String.fromCodePoint(0x10f800, 0x10ffff);
+  assert.equal((await facts([{ id: unicode }])).body.rows[0].fields.id, unicode);
+  const selectedDeep = JSON.parse('['.repeat(200) + '0' + ']'.repeat(200));
+  assert.equal((await facts([{ id: selectedDeep }])).body.rows[0].fields.id, selectedDeep);
+  const selectedBody = [{ id: unicode, model: selectedDeep }];
+  const legacySelected = fixture({ manager: { downloads: async () => ({ ok: true, body: selectedBody }) } });
+  await legacySelected.call('HEAD', '/api/models/downloads');
+  assert.equal(JSON.stringify(legacySelected.sent.pop().body),
+    JSON.stringify([{ id: unicode, model: selectedDeep, progress: null, status: '' }]));
+  assert.equal(JSON.stringify((await facts(selectedBody)).body.rows[0].fields),
+    JSON.stringify({ id: unicode, model: selectedDeep }));
+  const polled = polls;
+  manager.downloads = async () => { polls++; return { ok: false, status: 500 }; };
+  assert.deepEqual((await facts(null)).body, { kind: 'failed' });
+  manager.downloads = async () => { polls++; throw Error('Invalid router download listing'); };
+  assert.deepEqual((await facts(null)).body, { kind: 'fault' });
+  assert.equal(polls, polled + 2, 'one engine poll per facts call');
+  manager.enabled = false;
+  assert.deepEqual((await facts(null)).body, { kind: 'disabled' });
+  assert.equal(polls, polled + 2);
 });

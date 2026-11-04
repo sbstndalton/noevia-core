@@ -794,7 +794,8 @@ function createModelRoutes({ json, readBody, readJson, fetchJson, env, modelMana
       }
     }
 
-    if (p === '/api/models/downloads') {
+    // Exact GET is native; retain the historical behavior for other methods.
+    if (p === '/api/models/downloads' && req.method !== 'GET') {
       if (!modelManager.enabled) return json(res, 200, []);
       const r = await modelManager.downloads();
       if (!r.ok) return json(res, 502, {error:'Download status unavailable'});
