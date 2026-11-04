@@ -72,10 +72,11 @@ test('the history read, the trash proxy and the local exchange keep their shapes
   await f.call('diary', 'POST', '/api/diary/local-exchange', { message: 'hi' });
   assert.equal(f.sent.pop().status, 200);
   assert.equal(f.fetched.at(-1).init.headers['X-Cowork-User-ID'], 'u1', 'the tenant headers ride on every sidecar call');
+  // Chat port S6: the shared `llm:` budget is the Rust front's; this mount counts nothing, even given a limiter.
   const busy = fixture({ limited: true });
   await busy.call('diary', 'POST', '/api/diary/local-exchange', { message: 'hi' });
-  assert.deepEqual(busy.sent.pop(), { status: 429, body: { error: 'Please wait before sending another message' } });
-  assert.equal(busy.fetched.length, 0);
+  assert.equal(busy.sent.pop().status, 200);
+  assert.equal(busy.fetched.length, 1);
 });
 
 test('operator import folders are admin-only and the entry edit validates before forwarding', async () => {

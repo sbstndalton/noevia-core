@@ -21,11 +21,10 @@ const PASS = Symbol('unhandled');
  * @param {string} deps.DIARY_BASE
  * @param {object} deps.authService
  * @param {() => object} deps.currentWorkspace
- * @param {(userId:string) => boolean} deps.rateLimited      the shared LLM throttle, for the local exchange
  * @param {object} deps.diary             diary.cjs: diaryHeaders, corpusSource, diaryFetchJson, withStorageCredential
  * @param {object} [deps.storageLatch]    storage-latch.cjs: an explicit Retry that works clears the hold (#1589)
  */
-function createDiaryRoutes({ json, readBody, readJson, fetchJson, DIARY_BASE, authService, currentWorkspace, rateLimited, diary, storageLatch = null }) {
+function createDiaryRoutes({ json, readBody, readJson, fetchJson, DIARY_BASE, authService, currentWorkspace, diary, storageLatch = null }) {
   const { diaryHeaders, corpusSource } = diary;
   const log = diary.log || ((line) => console.info(line));
   // Older fakes pass only diaryHeaders; fall back to a single send without the 428 retry.
@@ -65,7 +64,7 @@ function createDiaryRoutes({ json, readBody, readJson, fetchJson, DIARY_BASE, au
       const local = p.endsWith('/local-exchange');
       const listing = p.endsWith('/files');
       if (!(listing ? req.method === 'GET' : local ? req.method === 'POST' : ['POST', 'PUT'].includes(req.method))) return json(res, 405, { error: 'Method not allowed' });
-      if (local && rateLimited(authn.user.id)) return json(res, 429, { error: 'Please wait before sending another message' });
+      // Chat port S6: the local exchange's share of the `llm:` budget is counted by the Rust front (rust-chat-edge.cjs).
       const parsed = local ? await readJson(req, 16 * 1024 * 1024) : undefined;
       const body = local ? JSON.stringify(parsed) : listing ? undefined : await readBody(req, 1024 * 1024);
       const suffix = listing ? '/files?path=' + encodeURIComponent(url.searchParams.get('path') || '') : local ? '/local-exchange' : '/file';

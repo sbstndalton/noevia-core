@@ -33,11 +33,12 @@ test('other paths and methods are left alone', async () => {
   assert.equal(f.handled.length, 0);
 });
 
-test('the shared endpoint is rate limited before the body is even read', async () => {
-  const f = fixture({ limited: true, readError: new Error('must not be called') });
+test('chat port S6: the shared endpoint budget is the Rust front\'s; the route counts nothing, even given a limiter', async () => {
+  const f = fixture({ limited: true });
   await f.routes({ method: 'POST' }, {}, { path: '/api/chat', authn: f.authn });
-  assert.equal(f.sent[0].status, 429);
-  assert.equal(f.handled.length, 0);
+  assert.equal(f.sent.length, 0);
+  assert.deepEqual(f.handled, [{ body: { message: 'hi' }, authn: f.authn }]);
+  assert.equal(/rateLimited|429/.test(require('node:fs').readFileSync(require.resolve('./chat.cjs'), 'utf8')), false);
 });
 
 test('an oversized chat is refused with advice, a bad read with 400, bad JSON with 400', async () => {

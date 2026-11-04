@@ -13,10 +13,10 @@
 //   /api/profile/diary-connectors       GET, POST (the connector credentials)
 //   /api/profile/diary-connectors/{id}  DELETE
 //
-// What stays Node's, and why: POST /api/diary/local-exchange takes the model throttle that chat shares
-// (llmRateLimited) and, from index.cjs handleRequest, the inference maintenance gate for the whole life
-// of its response (llamacpp-manager `maintenance`), so that a preset apply or a tune waits for it.
-// Both are this process's memory, beside the chat turn that takes them. The paths the web client does
+// What stays Node's, and why: POST /api/diary/local-exchange takes, from index.cjs handleRequest, the
+// inference maintenance gate for the whole life of its response (llamacpp-manager `maintenance`), so that a
+// preset apply or a tune waits for it: this process's memory, beside the chat turn that takes it. Its share of
+// the model throttle chat uses is the Rust front's since chat port S6 (rust-chat-edge.cjs). The paths the web client does
 // not name (history, files, file, workspace-trash, external-sources, entries/edit) are not in the
 // front's route table either.
 //

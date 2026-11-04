@@ -41,7 +41,7 @@ const documentSources = require('./document-sources.cjs');
 const { TOOL_RESULT_CAP, TOOL_PREFILL_TARGET_MS, estimateToolTokens, toolCapFor, createToolboxes } = require('./toolboxes.cjs');
 const { createVisionProbe } = require('./vision.cjs');
 const { createModelManager } = require('./model-manager.cjs');
-const { createAuth, createRateLimiter } = require('./auth.cjs');
+const { createAuth } = require('./auth.cjs');
 const { createWorkspaceStore } = require('./workspace.cjs');
 const { createSecretStore } = require('./secrets.cjs');
 const { isPublicUrl, createEndpointApproved } = require('./ssrf.cjs');
@@ -202,17 +202,9 @@ const workspaceStore = createWorkspaceStore(DATA_DIR, { id: DEFAULT_PROVIDER_ID,
   // The Rust front deletes accounts (rust-admin-users.cjs): a workspace is never made for a user the database no longer has.
   userExists: (userId) => !!authService.db.prepare('SELECT 1 FROM users WHERE id=?').get(userId) });
 
-// Per-user throttle for LLM-backed routes. Every hit is a full model call
-// against the shared inference endpoint, so one member (or a runaway client)
-// must not be able to hog it. Fixed window, shared bucket across chat and
-// diary conversations. Admins are throttled like everyone else. Raise
-// LLM_RATE_LIMIT for a beefier inference host.
-const LLM_RATE_LIMIT = Math.max(1, Number(process.env.LLM_RATE_LIMIT || 60));
-const LLM_RATE_WINDOW_MS = 60 * 1000;
-const llmRateLimiter = createRateLimiter();
-function llmRateLimited(userId) {
-  return llmRateLimiter.rateLimited(`llm:${userId}`, LLM_RATE_LIMIT, LLM_RATE_WINDOW_MS);
-}
+// Chat port S6: the per-user `llm:` budget that chat and the Diary local exchange share (LLM_RATE_LIMIT a minute) is
+// the Rust front's (rust-chat-edge.cjs); this process keeps no limiter for it.
+const chatEdge = require('./rust-chat-edge.cjs');
 const requestScope = new AsyncLocalStorage();
 function currentWorkspace() {
   const workspace = requestScope.getStore()?.workspace;
@@ -1100,9 +1092,9 @@ const { handleChat } = require('./chat.cjs').createChatHandler({
   // #659: the Google Drive writes name the Drive file they change on the approval card.
   writeTargetFor: (name, rawArgs, { user }) => (driveTools.names.has(name) ? driveTools.describeTarget(user, name, rawArgs) : null),
 });
-// POST /api/chat: rate limit, body cap and the Diary gate, then the loop (routes/chat.cjs).
+// POST /api/chat: body cap and the Diary gate, then the loop (routes/chat.cjs); the front answered them first (S6).
 const chatRoutes = require('./routes/chat.cjs').createChatRoutes({
-  json, readBody, bodyCap: STORED_HISTORY_BYTES, rateLimited: (userId) => llmRateLimited(userId),
+  json, readBody, bodyCap: STORED_HISTORY_BYTES,
   diaryEnabled: (userId) => authService.diaryEnabled(userId), handleChat,
   // Cowork sessions (#236) start a task on the existing code path; the route guards admin and the flag.
   harnessEnabled: () => features.enabled('codeHarness'),
@@ -1171,10 +1163,10 @@ const modelRoutes = require('./routes/models.cjs').createModelRoutes({
 // The connector credentials and the connector endpoint are the Rust front's (#2206, rust-diary-routes.cjs);
 // the table is still created here, at boot, in the shape a rollback reads.
 require('./diary-connectors.cjs').ensureTable(authService.db);
-// The Diary routes that stay: the local exchange (the model throttle and the inference gate), the
+// The Diary routes that stay: the local exchange (the inference gate; its model throttle is the front's, S6), the
 // files, the trash, the history, the operator import folders and the entry edit (routes/diary.cjs).
 const diaryRoutes = require('./routes/diary.cjs').createDiaryRoutes({
-  json, readBody, readJson, fetchJson, DIARY_BASE, authService, currentWorkspace, rateLimited: (userId) => llmRateLimited(userId), diary,
+  json, readBody, readJson, fetchJson, DIARY_BASE, authService, currentWorkspace, diary,
   storageLatch,
 });
 // #2287: the Rust front owns settings policy; the live tune script retains the state-file writer.
@@ -1544,6 +1536,8 @@ async function handleRequest(req,res) {
   try {if(inference)leave=await chatAdmission.enterChatInference(modelManager,{signal:aborted.signal});}
   catch(error){
     const status=error.status||503;
+    // Chat port S6: the front counted this call on the `llm:` budget; Node never did (rust-chat-edge.cjs).
+    chatEdge.markGateRefused(res,relay,pathname);
     if(pathname==='/api/chat'&&status===503){chatAdmission.log503('maintenance');res.setHeader('Retry-After','3');return json(res,503,chatAdmission.refusalBody(error));}
     return json(res,status,{error:error.message});
   }
