@@ -16,8 +16,8 @@ const skipWasm = !fs.existsSync(process.env.DAV_PARSE_WASM || davParseWasm.DEFAU
 const AUTOCONFIG = path.join(__dirname, 'llamacpp-autoconfig.cjs');
 const CALIBRATION = path.join(__dirname, 'llamacpp-calibration.cjs');
 const HOST = path.join(__dirname, 'llamacpp-autoconfig-host.cjs');
-// 31 since #2189 moved the suggestion and the estimate to the Rust front (noevia-rs model_sizing.rs).
-const EXPECTED_RAN = 31;
+// 30 since #2303 moved calibration public validation to Rust; 31 since #2189 moved the suggestion and the estimate to the Rust front (noevia-rs model_sizing.rs).
+const EXPECTED_RAN = 30;
 
 let ran = 0;
 test.after(() => { assert.equal(ran, skipWasm ? 0 : EXPECTED_RAN, 'every guarded body must have run'); });
@@ -54,10 +54,19 @@ function freshModules(t) {
   drop(); t.after(drop);
   return { autoconfig: () => require(AUTOCONFIG), calibration: () => require(CALIBRATION) };
 }
+async function prepared(calibration,model) {
+  const {token}=calibration.stateFacts(),{rowToken}=await calibration.listingFacts(model,token);
+  return {model,token,rowToken,...await calibration.preparationFacts(model,token,rowToken)};
+}
+async function launch(calibration,model,{promptBudgetSeconds=120}={}) {
+  const facts=await prepared(calibration,model);
+  return calibration.compareAndLaunch({model,token:facts.token,rowToken:facts.rowToken,preparedToken:facts.preparedToken,
+    plan:{promptBudgetSeconds,native:Number(facts.row?.meta?.n_ctx_train)||0,base:{}}});
+}
 async function settle(m) {
   m.calibration.compareAndAbort(m.calibration.cancellationFacts().token);
-  for (let i = 0; i < 400 && m.calibration.status().body.job?.status === 'running'; i++) await new Promise((resolve) => setTimeout(resolve, 25));
-  assert.notEqual(m.calibration.status().body.job?.status, 'running', 'the cancelled calibration must stop');
+  for (let i = 0; i < 400 && m.calibration.stateFacts().job?.status === 'running'; i++) await new Promise((resolve) => setTimeout(resolve, 25));
+  assert.notEqual(m.calibration.stateFacts().job?.status, 'running', 'the cancelled calibration must stop');
 }
 
 function synthetic(t, { autoconfig = {}, inferenceBudget, native, autotuneOptions } = {}) {
@@ -138,42 +147,38 @@ test('calibration: the normal ladder is unchanged by the lazy read', { skip: ski
   ran++;
 });
 
-test('calibration: start() refuses with 503 autoconfig_impl before holding the gate, touching the preset or loading anything', { skip: skipWasm }, async (t) => {
+test('calibration: preparation reports a ladder fault before holding the gate, touching the preset or loading anything', { skip: skipWasm }, async (t) => {
   const probe = faultyEvaluator(t);
   freshModules(t);
   const { m, calls, ini } = synthetic(t, { native: 32768 });
   const before = fs.readFileSync(ini, 'utf8');
-  const r = await m.calibration.start('small', { confirmPause: true, promptBudgetSeconds: 30 });
+  const r = await prepared(m.calibration,'small');
   ran++;
   assert.ok(probe.ran > 0);
-  assert.equal(r.ok, false); assert.equal(r.status, 503); assert.equal(r.body.code, 'autoconfig_impl');
-  assert.match(r.body.error, /^Calibration is unavailable: .*context ladder/);
+  assert.equal(r.ladderReady,false);
   assert.equal(fs.readFileSync(ini, 'utf8'), before, 'the preset file is untouched');
   assert.deepEqual(WRITES(calls), [], calls.join('\n'));
-  assert.equal(m.calibration.status().body.job, null);
+  assert.equal(m.calibration.stateFacts().job, null);
   assert.equal(m.tuningActive(), false, 'the maintenance gate was never held');
 });
 
-test('calibration: a getter-level fault refuses the same way, and other validation answers first and unchanged', { skip: skipWasm }, async (t) => {
+test('calibration: preparation reports a getter-level ladder fault without writes', { skip: skipWasm }, async (t) => {
   const mods = freshModules(t);
   Object.defineProperty(mods.autoconfig(), 'CTX_CANDIDATES', { get() { throw new Error('synthetic getter fault'); }, configurable: true, enumerable: true });
   const { m, calls } = synthetic(t, { native: 32768 });
-  const r = await m.calibration.start('small', { confirmPause: true, promptBudgetSeconds: 30 });
+  const r = await prepared(m.calibration,'small');
   ran++;
-  assert.equal(r.status, 503); assert.equal(r.body.code, 'autoconfig_impl');
+  assert.equal(r.ladderReady,false);
   assert.deepEqual(WRITES(calls), []);
-  assert.equal((await m.calibration.start('small', { promptBudgetSeconds: 30 })).status, 400);
-  assert.equal((await m.calibration.start('small', { confirmPause: true, promptBudgetSeconds: 5 })).status, 400);
-  assert.equal((await m.calibration.start('missing', { confirmPause: true, promptBudgetSeconds: 30 })).status, 404);
-  ran++;
+
 });
 
-test('calibration: with the real evaluator start() is accepted (202) and can be cancelled', { skip: skipWasm }, async (t) => {
+test('calibration: with the real evaluator a prepared worker launches and can be cancelled', { skip: skipWasm }, async (t) => {
   freshModules(t);
   const { m } = synthetic(t, { native: 8192 });
-  const r = await m.calibration.start('small', { confirmPause: true, promptBudgetSeconds: 30 });
+  const r = await launch(m.calibration,'small',{promptBudgetSeconds:30});
   ran++;
-  assert.equal(r.ok, true); assert.equal(r.status, 202);
+  assert.equal(r.applied,true);
   await settle(m);
 });
 
@@ -269,8 +274,8 @@ test('manager: a budget fault supplies no figure: sizing stays 0 and calibration
   ran++;
   // Calibration measures the context, so it still starts; the start values it would take from a suggestion
   // sized against a stand-in budget are simply absent (conservativeFor is null under the fault).
-  const started = await m.calibration.start('small', { confirmPause: true, promptBudgetSeconds: 30 });
-  assert.equal(started.status, 202);
+  const started = await launch(m.calibration,'small',{promptBudgetSeconds:30});
+  assert.equal(started.applied,true);
   await settle(m);
   ran++;
 });
