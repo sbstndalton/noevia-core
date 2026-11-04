@@ -138,7 +138,8 @@ async function main() {
   // refuses to start without one (sbstndalton/noevia#1071): a loopback stand-in with the same
   // protocol, on this throwaway data dir.
   const store = await startProjectStore(dataDir);
-  const env = serverEnv({ port, dataDir, origin: base, mocks, record: exchanges });
+  // A real front binary pairs Core when one is given (NOEVIA_SERVER_BIN); otherwise a synthetic stand-in.
+  const env = serverEnv({ port, dataDir, origin: base, mocks, record: exchanges, front: process.env.NOEVIA_SERVER_BIN });
   // The stand-in also answers the feature runtime's context exchange, under this run's start id.
   Object.assign(env, { NOEVIA_PROJECT_STORE_PORT: String(store.port), NOEVIA_PROJECT_STORE_TOKEN: store.token, NOEVIA_START_ID: require('node:crypto').randomBytes(16).toString('hex') });
   env.NOEVIA_CORPUS_ALLOWED_PORTS = `${env.NOEVIA_CORPUS_ALLOWED_PORTS},${store.port}`;

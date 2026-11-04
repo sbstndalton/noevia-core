@@ -43,7 +43,7 @@ async function main(){
  const start=crypto.randomBytes(16).toString('hex'),token=crypto.randomBytes(32).toString('hex');
  const env={PATH:process.env.PATH,NODE_PATH:process.env.NODE_PATH,DAV_PARSE_WASM:process.env.DAV_PARSE_WASM,
   UI_DATA_DIR:dir,UI_HOST:'127.0.0.1',PUBLIC_ORIGIN:origin,TRUST_PROXY:'true',LEGACY_AUTH_COMPAT:'false',
-  NOEVIA_START_ID:start,NOEVIA_PROJECT_STORE_PORT:String(internal),NOEVIA_PROJECT_STORE_TOKEN:token,
+  NOEVIA_SERVER_BIN:binary,NOEVIA_START_ID:start,NOEVIA_PROJECT_STORE_PORT:String(internal),NOEVIA_PROJECT_STORE_TOKEN:token,
   INFERENCE_BASE_URL:'http://127.0.0.1:9',MODEL_MANAGER_KIND:'none',MODEL_MANAGER_BASE_URL:'http://127.0.0.1:9',MCP_SERVERS:'',MCP_SERVER_URL:'',MCP_INTERNAL_PORT:'',
  };
  const nativeEnv={...env,UI_PORT:String(front),NOEVIA_LEGACY_UPSTREAM:`http://127.0.0.1:${backend}`};
