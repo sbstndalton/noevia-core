@@ -203,7 +203,9 @@ const workspaceStore = createWorkspaceStore(DATA_DIR, { id: DEFAULT_PROVIDER_ID,
   userExists: (userId) => !!authService.db.prepare('SELECT 1 FROM users WHERE id=?').get(userId) });
 
 // Chat port S6: the per-user `llm:` budget that chat and the Diary local exchange share (LLM_RATE_LIMIT a minute) is
-// the Rust front's (rust-chat-edge.cjs); this process keeps no limiter for it.
+// the Rust front's (rust-chat-edge.cjs); this process keeps no limiter for it. This require is also the edge's pairing
+// marker for the launch supervisor and assemble-release.
+// eslint-disable-next-line no-unused-vars
 const chatEdge = require('./rust-chat-edge.cjs');
 // Chat port S7: a relayed turn's failure after the headers is written on the wire its front reads.
 const chatWire = require('./rust-chat-wire.cjs');
@@ -1537,7 +1539,7 @@ async function handleRequest(req,res) {
   const aborted=new AbortController();res.once('close',()=>aborted.abort());
   // Chat port S8: a call the front already took the gate for (its admission lease, rust-chat-admission.cjs) does not
   // enter it again: the front's lease is its one gate count, and the front gives it back when the answer has ended.
-  const frontAdmitted=inference&&inferenceAdmission.covers(req,relay==='turn'?'chat':pathname===chatEdge.LOCAL_EXCHANGE?'diary':'');
+  const frontAdmitted=inference&&inferenceAdmission.covers(req,require('./rust-chat-admission.cjs').gateRoute(relay,pathname));
   try {if(inference&&!frontAdmitted)leave=await chatAdmission.enterChatInference(modelManager,{signal:aborted.signal});}
   catch(error){
     const status=error.status||503;

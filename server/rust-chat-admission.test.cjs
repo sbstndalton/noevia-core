@@ -30,6 +30,12 @@ test('the capability marker and the names the front pairs with', () => {
   assert.equal(front.FRONT_CAPABILITY, 'rust-chat-admission');
   assert.equal(front.LEASE_HEADER, 'x-noevia-admission-lease');
   assert.deepEqual(front.GATE_ROUTES, ['chat', 'diary']);
+  // The route a request's lease must be for (index.cjs): the relay is chat's (a turn or a Cowork start).
+  assert.equal(front.gateRoute('turn', '/api/chat'), 'chat');
+  assert.equal(front.gateRoute(null, '/api/diary/local-exchange'), 'diary');
+  for (const [relay, pathname] of [[null, '/api/chat'], [null, '/api/diary/other'], [undefined, '/api/diary/local-exchange/'], ['done', '/api/chat']]) {
+    assert.equal(front.gateRoute(relay, pathname), '', `${relay} ${pathname}`);
+  }
 });
 
 test('a free gate: the lease is one gate count, held until the front deletes it', async (t) => {

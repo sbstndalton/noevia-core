@@ -61,7 +61,7 @@ test('index.cjs: a call the front\'s admission lease covers enters no gate; no l
   const source = fs.readFileSync(path.join(__dirname, 'index.cjs'), 'utf8');
   const top = source.slice(source.indexOf('async function handleRequest(req,res) {'));
   const at = (needle) => { const i = top.indexOf(needle); assert.ok(i >= 0, needle); return i; };
-  assert.ok(at("inferenceAdmission.covers(req,relay==='turn'?'chat':pathname===chatEdge.LOCAL_EXCHANGE?'diary':'')") < at('enterChatInference('));
+  assert.ok(at("inferenceAdmission.covers(req,require('./rust-chat-admission.cjs').gateRoute(relay,pathname))") < at('enterChatInference('));
   assert.match(top, /try \{if\(inference&&!frontAdmitted\)leave=await chatAdmission\.enterChatInference\(/);
   assert.equal(/chatEdge\.leases|relay==='gate'/.test(top), false);
   assert.match(source, /^const chatEdge = require\('\.\/rust-chat-edge\.cjs'\);$/m);

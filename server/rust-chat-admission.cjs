@@ -23,5 +23,12 @@
 const FRONT_CAPABILITY = 'rust-chat-admission';
 const LEASE_HEADER = 'x-noevia-admission-lease';
 const GATE_ROUTES = Object.freeze(['chat', 'diary']);
+const { LOCAL_EXCHANGE } = require('./rust-chat-edge.cjs');
 
-module.exports = { FRONT_CAPABILITY, LEASE_HEADER, GATE_ROUTES };
+/** The gate route a request's front lease must be for: a relayed turn or Cowork start 'chat', the local exchange 'diary'. */
+function gateRoute(relay, pathname) {
+  if (relay === 'turn') return 'chat';
+  return pathname === LOCAL_EXCHANGE ? 'diary' : '';
+}
+
+module.exports = { FRONT_CAPABILITY, LEASE_HEADER, GATE_ROUTES, gateRoute };
