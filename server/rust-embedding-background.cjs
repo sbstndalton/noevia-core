@@ -5,11 +5,12 @@ const path = require('node:path');
 const { execFileSync } = require('node:child_process');
 const { trustedFront } = require('./trusted-front.cjs');
 const RUST_EMBEDDING_OWNED = 'rust-embedding-background-v1';
+const RUST_INDEX_OUTBOX_OWNED = require('./rust-index-outbox.cjs').RUST_INDEX_OUTBOX_OWNED;
 const PROTOCOL = 'rust-embedding-worker-v1';
 // frontSecret: the per-start store secret, captured before project-store-client deletes it from process.env (#1916).
-function createOwner({ env = process.env, frontSecret = '', dataDir, now = Date.now, verifyPair = true, features = () => execFileSync(env.NOEVIA_SERVER_BIN || '/usr/local/bin/noevia-server', ['--features'], { encoding: 'utf8', timeout: 5000 }) }) {
+function createOwner({ foregroundBusy = () => require('./rag.cjs').foregroundBusy(), env = process.env, frontSecret = '', dataDir, now = Date.now, verifyPair = true, features = () => execFileSync(env.NOEVIA_SERVER_BIN || '/usr/local/bin/noevia-server', ['--features'], { encoding: 'utf8', timeout: 5000 }) }) {
   const start = String(env.NOEVIA_START_ID || '');
-  if (verifyPair && (!start || !frontSecret || !features().split(/\s+/).includes(RUST_EMBEDDING_OWNED))) throw Error('Embedding background requires a coherent paired front and current start');
+  if (verifyPair && (!start || !frontSecret || ![RUST_EMBEDDING_OWNED, RUST_INDEX_OUTBOX_OWNED].every(f => features().split(/\s+/).includes(f)))) throw Error('Embedding background requires a coherent paired front and current start');
   let stopped = false, sequence = 0;
   return {
     snapshot() {
@@ -30,7 +31,7 @@ function createOwner({ env = process.env, frontSecret = '', dataDir, now = Date.
     handle(req, res, json) {
       if (req.url !== '/internal/embedding-worker-owner') return false;
       if (req.method !== 'GET' || !verifyPair || stopped || !trustedFront(req, frontSecret)) json(res, 404, { error: 'Not found' });
-      else json(res, 200, { protocol: PROTOCOL, start, nodeWorkersStopped: true });
+      else json(res, 200, { protocol: PROTOCOL, start, nodeWorkersStopped: true, indexOutboxStopped: true, foregroundBusy: !!foregroundBusy() });
       return true;
     },
     stop() { stopped = true; },
