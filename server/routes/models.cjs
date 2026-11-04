@@ -567,23 +567,7 @@ function createModelRoutes({ servedEmbeddingModels = (target) => require('../rag
     if (p === '/api/models/hardware' && req.method !== 'GET') return json(res,405,{error:'Method not allowed'});
 
     // #1662: what each model-backed service uses, for every signed-in user (read-only for members).
-    if (p === '/api/models/assignments') {
-      if (req.method !== 'GET') return json(res, 405, { error: 'method not allowed' });
-      let installed = null;
-      try { installed = await modelsInstalled(); } catch { installed = null; }
-      let embedding = null;
-      try { embedding = require('../embedding-config.cjs').current()?.get() || null; } catch { embedding = null; }
-      const { modelAssignments } = require('../model-assignments.cjs');
-      const admin = authn.user.role === 'admin';
-      // Which models the active embeddings server serves (admins only: members get no switch, and
-      // never cause a probe). Cached per address with a short timeout (rag.servedModelsCached);
-      // null = unknown. Advisory only: set-next checks the server itself.
-      let served = null;
-      if (admin) { try { served = await servedEmbeddingModels({ baseUrl: embedding?.active?.baseUrl || null }); } catch { served = null; } }
-      if (!Array.isArray(served)) served = null;
-      const service = require('../embedding-service.cjs').current()?.status() || null;
-      return json(res, 200, { ...modelAssignments({ installed, env, embedding, isSystem: (n) => isSystemModel(n), admin, served, service, decision: decisionSettings ? decisionSettings.describe() : null, rerank: rerankSettings }), available: Array.isArray(installed) });
-    }
+    if (p === '/api/models/assignments') return json(res, 405, { error: 'method not allowed' });
 
     // #1665: the reranker's runtime switch. Administrators only, for reading too (the options name what this
     // server can rerank with); CSRF/origin run before routes. GET -> { enabled, choice, source, options };
@@ -794,7 +778,8 @@ function createModelRoutes({ servedEmbeddingModels = (target) => require('../rag
       }
     }
 
-    if (p === '/api/models/downloads') {
+    // Exact GET is native; retain the historical behavior for other methods.
+    if (p === '/api/models/downloads' && req.method !== 'GET') {
       if (!modelManager.enabled) return json(res, 200, []);
       const r = await modelManager.downloads();
       if (!r.ok) return json(res, 502, {error:'Download status unavailable'});
