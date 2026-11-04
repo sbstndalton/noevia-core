@@ -1,7 +1,7 @@
 'use strict';
 // #2303: with CALIBRATION_WORKER_OWNER exported, the Rust front owns the calibration job. The real index.cjs boot,
 // with production options, must construct no public calibrator and must not recover the job (nothing at boot reads
-// the manager's calibration). This boots index.cjs itself under a recording preload
+// the manager's calibration), and must hand the front's load bridge the manager's own load decision. This boots index.cjs itself under a recording preload
 // (native-calibration-boot.probe.cjs), with a running job a native front left in the state file, instead of reading
 // source shapes. The fixtures rewrite the real modules as they load, to prove the check fails when either is
 // reintroduced, including behind a comment-prefixed line or split across lines.
@@ -17,7 +17,7 @@ const davParseWasm = require('./dav-parse-wasm.cjs');
 const wasmFile = process.env.DAV_PARSE_WASM || davParseWasm.DEFAULT_WASM;
 const skipWasm = !fs.existsSync(wasmFile) && process.env.DAV_PARSE_WASM_REQUIRED !== '1' && 'dav-parse.wasm not built';
 const BASE = 'http://127.0.0.1:9';
-const INI = '[*]\nn-gpu-layers = 99\n\n[synth]\nmodel = /models/synth.gguf\nctx-size = 12288\n';
+const INI = '[*]\nn-gpu-layers = 99\n\n[synth]\nmodel = /models/synth.gguf\nctx-size = 12288\n\n[synth-invalid]\nmodel = /models/synth.gguf\nctx-size = 4096.5\n';
 const RUNNING = JSON.stringify({ job: { id: 'native-job', model: 'synth', status: 'running', phase: 'Long-prompt test at 12,288 tokens', steps: [], originalText: '[*]\nn-gpu-layers = 99\n\n[synth]\nmodel = /models/synth.gguf\nctx-size = 4096\n', originalRevision: 'a'.repeat(64), lastRevision: crypto.createHash('sha256').update(INI).digest('hex') }, history: {} });
 const AUTOTUNE_RECOVER = '    modelManager.autotune?.recover().catch(() => undefined);';
 const GATED = 'const calibrator=presets&&publicCalibrator?require(';
@@ -72,13 +72,16 @@ function violations({ records, state, ini }) {
 }
 
 test('#2303 Core exports the worker marker this boot check stands behind', () => {
-  assert.equal(require('./rust-calibration-routes.cjs').CALIBRATION_WORKER_OWNER, 'noevia-calibration-worker-rust/1');
+  assert.equal(require('./rust-calibration-routes.cjs').CALIBRATION_WORKER_OWNER, 'noevia-calibration-worker-rust/2');
 });
 
 test('#2303 the real boot builds no public calibrator and leaves the front\'s running job alone', { skip: skipWasm }, async (t) => {
   const result = await boot(t);
   assert.ok(result.records.some((r) => r.manager === 'llamacpp'), JSON.stringify(result.records));
   assert.deepEqual(violations(result), []);
+  // Generation 2: the front's loads are decided by this process's own overBudget(), wired from the manager.
+  assert.ok(result.records.some((r) => r.loadRefusalRoute === 'function'), JSON.stringify(result.records));
+  assert.ok(result.records.some((r) => r.loadRefusalAnswer === 'invalid_size'), JSON.stringify(result.records));
 });
 
 test('#2303 fixture: a boot recover() behind a comment-prefixed line is caught', { skip: skipWasm }, async (t) => {

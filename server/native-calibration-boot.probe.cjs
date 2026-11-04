@@ -48,6 +48,20 @@ Module._load = function loadWithReadyRuntime(request, parent, isMain) {
   return runtimeModule;
 };
 
+// The load decision the front's calibration asks before each load (#2303 generation 2): what index.cjs hands
+// the bridge, and what it answers for the boot test's invalid-size model.
+const loadRoutes = require('./model-load-refusal.cjs');
+const createLoadRefusalRoute = loadRoutes.createLoadRefusalRoute;
+loadRoutes.createLoadRefusalRoute = (options = {}) => {
+  const decide = options.loadRefusal;
+  log({ loadRefusalRoute: typeof decide });
+  if (typeof decide === 'function') {
+    Promise.resolve().then(() => decide('synth-invalid'))
+      .then((r) => log({ loadRefusalAnswer: r?.code ?? null }), () => log({ loadRefusalAnswer: 'threw' }));
+  }
+  return createLoadRefusalRoute(options);
+};
+
 const calibration = require('./llamacpp-calibration.cjs');
 const createCalibrator = calibration.createCalibrator;
 calibration.createCalibrator = (deps = {}) => {

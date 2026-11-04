@@ -1285,6 +1285,11 @@ const maintenanceLeases = require('./model-maintenance-lease.cjs').createLeaseRo
   secret: FRONT_SECRET, json, hold: typeof modelManager.holdMaintenance === 'function' ? () => modelManager.holdMaintenance() : null,
 });
 
+// #2303: the front's calibration loads ask this process's load decision (overBudget) first.
+const loadRefusalRoute = require('./model-load-refusal.cjs').createLoadRefusalRoute({
+  secret: FRONT_SECRET, json, loadRefusal: typeof modelManager.loadRefusal === 'function' ? (model) => modelManager.loadRefusal(model) : null,
+});
+
 // The headers every page and API reply carries, the refusals answered before authentication too.
 function publicHeaders(res) {
   res.setHeader('X-Content-Type-Options', 'nosniff');
@@ -1314,6 +1319,8 @@ async function handleRequestInner(req, res) {
   if (await toolApprovalBridge(req, res)) return;
   // The Rust front's maintenance lease on this process's gate (#2210): before everything, and only the front's.
   if (await maintenanceLeases.handle(req, res)) return;
+  // ... and the load decision its calibration asks before each load (#2303).
+  if (await loadRefusalRoute.handle(req, res)) return;
   // #2191 round 2: a toolbox discovered since the last request reaches the front's next project create
   // (project-catalogue.cjs; written only when it changed).
   projectCatalogue.publish();

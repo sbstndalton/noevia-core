@@ -55,7 +55,7 @@ test('#2303 the internal bridges answer available:false over the production mana
 
 test('#2303 Core exports the calibration worker marker the release pairs on', () => {
   const { CALIBRATION_WORKER_OWNER } = require('./rust-calibration-routes.cjs');
-  assert.equal(CALIBRATION_WORKER_OWNER, 'noevia-calibration-worker-rust/1');
+  assert.equal(CALIBRATION_WORKER_OWNER, 'noevia-calibration-worker-rust/2');
 });
 
 // The boot itself (no public calibrator, no boot recover()) is checked by booting index.cjs:
