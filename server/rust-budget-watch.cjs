@@ -1,5 +1,5 @@
 'use strict';
-// #697 runtime safety net, now the Rust front's (--features rust-budget-watch-v2, noevia-rs
+// #697 runtime safety net, now the Rust front's (--features rust-budget-watch-v3, noevia-rs
 // bins/noevia-server/src/model_maint/budget_watch.rs). The front samples the inference memory every
 // interval, keeps the strikes, the idle baseline and the cooldown, and unloads through the inference
 // gate exactly as inference-budget-watch.cjs did here. This process no longer starts that watch;
@@ -21,7 +21,7 @@
 // The budget itself is the existing facts call (rust-model-facts.cjs {want: 'budget'}).
 const { trustedFront } = require('./trusted-front.cjs');
 
-const BUDGET_WATCH_OWNER = 'noevia-budget-watch-rust/2';
+const BUDGET_WATCH_OWNER = 'noevia-budget-watch-rust/3';
 const PATH = '/internal/budget-watch';
 // A model id the router lists; the pairing limit the front already applies to router ids.
 const MAX_MODEL_BYTES = 512;

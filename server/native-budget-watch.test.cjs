@@ -25,7 +25,7 @@ function manager() {
 }
 
 test('#697 Core exports the budget watch marker the release pairs on', () => {
-  assert.equal(BUDGET_WATCH_OWNER, 'noevia-budget-watch-rust/2');
+  assert.equal(BUDGET_WATCH_OWNER, 'noevia-budget-watch-rust/3');
   assert.equal(PATH, '/internal/budget-watch');
 });
 
@@ -127,4 +127,28 @@ test('#697 a durable pre-unload fence refuses Core admissions through IPC loss a
   assert.deepEqual(sent.pop().body, { ok: true, invalidated: true }, 'do not quarantine a newer preset on retry');
   fs.writeFileSync(file, 'incomplete');
   assert.equal((await m.loadRefusal('chat')).code, 'inference_budget_pending', 'damaged fences fail closed');
+});
+
+test('#697 a damaged fence affects only its hash and its durable context releases admission on configuration change', async (t) => {
+  const os = require('node:os'), { createHash } = require('node:crypto');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'watch-damage-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const ini = path.join(dir,'models.ini'); fs.writeFileSync(ini,'[chat]\nctx-size=1024\n[other]\n[third]\n');
+  let budget=12;
+  const opts={kind:'llamacpp',baseUrl:'http://synthetic',presetPath:ini,budgetWatchDir:dir,inferenceBudget:{budgetGib:()=>budget},gate:require('./fixtures/fake-inference-gate.cjs').fakeGate(),fetchJson:async()=>({ok:true,status:200,body:{data:[]}})};
+  const m=createModelManager(opts), revision=m.presetFacts('chat').revision;
+  const hash=model=>createHash('sha256').update(model).digest('hex');
+  for (const [model,budgetGib] of [['chat',12],['other',8],['third',12]]) {
+    fs.writeFileSync(path.join(dir,hash(model)+'.json'),JSON.stringify({model,revision,budgetGib,at:0,recorded:false}));
+    fs.writeFileSync(path.join(dir,hash(model)+'.context'),JSON.stringify({revision,revisionKnown:true,budgetGib}));
+  }
+  fs.writeFileSync(path.join(dir,hash('chat')+'.json'),'damaged');
+  assert.equal((await m.loadRefusal('chat')).code,'inference_budget_pending');
+  assert.equal(await m.loadRefusal('other'),null);
+  assert.equal((await m.loadRefusal('third')).code,'inference_budget_unloaded');
+  fs.renameSync(path.join(dir,hash('chat')+'.json'),path.join(dir,hash('chat')+'.json.damaged-1'));
+  assert.equal((await createModelManager(opts).loadRefusal('chat')).code,'inference_budget_pending','renamed damage remains fenced after restart');
+  budget=24; assert.equal(await m.loadRefusal('chat'),null);
+  budget=12; fs.writeFileSync(ini,'[chat]\nctx-size=2048\n[other]\n[third]\n');
+  assert.equal(await m.loadRefusal('chat'),null,'a changed revision releases damaged state without IPC');
 });
