@@ -642,7 +642,7 @@ function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloa
       profile:evidenceLib.identityHash([sectionText('*'),sectionText(model)]),
       hardware:[autoconfig.hardwareLabel||null,memGiB?`${memGiB}GiB`:null,JSON.stringify(build)].filter(Boolean).join(' ')||null};
   }
-  const calibrator=presets?require('./llamacpp-calibration.cjs').createCalibrator({request,rawModels,presets,maintenance,applyUnlocked,conservativeFor,onResult:({model,status,entry})=>recordEvidence(model,status==='passed'?{category:'context_capacity',result:'passed',value:{ctx:entry.verifiedCtx,appliedCtx:entry.appliedCtx,slots:entry.slots},suite:{name:'native-calibration',version:1},source:'calibration',limitations:[`prompt budget ${entry.promptBudgetSeconds} s`]}:{category:'context_capacity',result:'failed',value:null,suite:{name:'native-calibration',version:1},source:'calibration',limitations:[String(entry.error||'').slice(0,200)]}),stream:(path,opts={})=>(fetchStream||fetch)(base+path,{...opts,headers:headers(opts.headers),redirect:'error'}),stateFile:calibrationStatePath,memoryFloorGib:autoconfig.memoryFloorGib||2,...calibrationOptions}):null;
+  const calibrator=presets?require('./llamacpp-calibration.cjs').createCalibrator({request,rawModels,presets,maintenance,applyUnlocked,conservativeFor,identityFor:tuneIdentity,onResult:({model,status,entry})=>recordEvidence(model,status==='passed'?{category:'context_capacity',result:'passed',value:{ctx:entry.verifiedCtx,appliedCtx:entry.appliedCtx,slots:entry.slots},suite:{name:'native-calibration',version:1},source:'calibration',limitations:[`prompt budget ${entry.promptBudgetSeconds} s`]}:{category:'context_capacity',result:'failed',value:null,suite:{name:'native-calibration',version:1},source:'calibration',limitations:[String(entry.error||'').slice(0,200)]}),stream:(path,opts={})=>(fetchStream||fetch)(base+path,{...opts,headers:headers(opts.headers),redirect:'error'}),stateFile:calibrationStatePath,memoryFloorGib:autoconfig.memoryFloorGib||2,...calibrationOptions}):null;
   const tuneDeps={identityFor:tuneIdentity,stateFile:autotuneStatePath,memoryFloorGib:autoconfig.memoryFloorGib||2,...(calibrationOptions.readMemory?{readMemory:calibrationOptions.readMemory}:{}),...autotuneOptions};
   // Internal context checks run under the full tuner's per-model lease; standalone
   // calibration still acquires the real gate.
@@ -668,9 +668,42 @@ function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloa
       // #1004: tests inject their own advisor (a fake decision service).
       ...(autotuneOptions.loadAdvisor?{loadAdvisor:autotuneOptions.loadAdvisor}:{}),
       onResult:async({model,result})=>{for(const [category,value] of [['context_capacity',{ctx:result.context,appliedCtx:result.context,slots:Number(presets.get(model).options.parallel)||1}],['throughput',{rate:result.generation}],...(result.acceptance==null?[]:[['mtp_acceptance',{rate:result.acceptance/100}]])])await recordEvidence(model,{category,result:'passed',value,suite:{name:'full-autotune',version:3},source:'autotune',limitations:['Three deterministic quality smoke probes, not a general quality benchmark','120 s default prompt budget; existing MTP head only',...(result.baseline?.skipped?.length?[`Probes not used (failed at the model's reference settings): ${result.baseline.skipped.map(s=>s.id).join(', ')}`]:[])]});},
-      contextFactory:hooks=>require('./llamacpp-calibration.cjs').createCalibrator({request,rawModels,presets,applyUnlocked,conservativeFor,maintenance:managedGate,
-        stream:(path,opts={})=>(fetchStream||fetch)(base+path,{...opts,headers:headers(opts.headers),redirect:'error'}),
-        memoryFloorGib:autoconfig.memoryFloorGib||2,...calibrationOptions,stateFile:undefined,...hooks})}):null;
+      contextFactory:hooks=>{
+        // Private configured-profile worker client; no public confirmation/auth/HTTP policy.
+        const revision=presets.snapshot().revision;
+        const current=()=>hooks.contextCurrent?.() === true && maintenance.held() && presets.snapshot().revision === revision;
+        const worker=require('./llamacpp-calibration.cjs').createCalibrator({request,rawModels,presets,applyUnlocked,conservativeFor,identityFor:tuneIdentity,maintenance:managedGate,
+          stream:(path,opts={})=>(fetchStream||fetch)(base+path,{...opts,headers:headers(opts.headers),redirect:'error'}),
+          memoryFloorGib:autoconfig.memoryFloorGib||2,...calibrationOptions,stateFile:undefined,...hooks});
+        const controller=new AbortController();
+        const failed=()=>({ok:false,body:{error:'The context worker state changed or is unavailable.'}});
+        let cancelWait;
+        const departed=new Promise(resolve=>{cancelWait=()=>resolve(failed());});
+        // Cancellation always targets this captured child, even after the parent is cancelled.
+        const compareAndAbort=expected=>{
+          if (typeof expected !== 'string' || expected !== worker.cancellationFacts().token) return {applied:false};
+          // Let the captured worker snapshot its abort targets before signal listeners run.
+          try { return worker.compareAndAbort(expected); }
+          finally { try { controller.abort(); } finally { cancelWait(); } }
+        };
+        const cancel=()=>compareAndAbort(worker.cancellationFacts().token);
+        return {...worker,cancel,compareAndAbort,
+          start:(model,options)=>Promise.race([(async()=>{
+            if (!current() || !Number.isInteger(options?.promptBudgetSeconds)) return failed();
+            const {token}=worker.stateFacts();
+            const row=await worker.listingFacts(model,token,{signal:controller.signal});
+            if (!current() || controller.signal.aborted || !row.rowToken) return failed();
+            const facts=await worker.preparationFacts(model,token,row.rowToken,{signal:controller.signal});
+            if (!current() || controller.signal.aborted || facts.profile?.exists !== true || facts.revision !== revision || !facts.preparedToken || !facts.ladderReady || !facts.identityReady) return failed();
+            // The configured parent has already selected/validated this model and budget.
+            const native=Number(facts.row?.meta?.n_ctx_train)||Number(facts.conservative?.native)||0;
+            const launched=await worker.compareAndLaunch({model,token,rowToken:row.rowToken,preparedToken:facts.preparedToken,
+              plan:{promptBudgetSeconds:options.promptBudgetSeconds,native,base:{}}},{signal:controller.signal,isCurrent:current});
+            return launched.applied ? {ok:true,body:launched.job} : failed();
+          })(),departed]),
+          status:()=>({body:{job:worker.stateFacts().job}}),
+        };
+      }}):null;
   return {
     kind: 'llamacpp', enabled: true, baseUrl: base, headers, request,
     capabilities: { routing: true, load: true, unload: true, download: true, deleteCached: true, runtimeOptions: false, hardware: false, presets: !!presets, autotune: !!autotuner },
@@ -694,7 +727,7 @@ function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloa
     // Throws a 409 when requests are in flight or the gate is already held; with the inference
     // gate as the authority (#2187) it returns a promise of the release instead (callers await it).
     holdMaintenance: reason => maintenance.hold(reason),
-    tuningActive: () => maintenance.held() || calibrator?.status().body.job?.status === 'running' || autotuner?.statusFacts().job?.status === 'running',
+    tuningActive: () => maintenance.held() || calibrator?.stateFacts().job?.status === 'running' || autotuner?.statusFacts().job?.status === 'running',
     presetFacts: model => presets?.get(model) ?? null,
     applyPreset,
     // #697: the load guard and the budget, for the proxied benchmark start and the watchdog.
@@ -714,7 +747,7 @@ function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloa
     evidence, recordEvidence, importEvidence,
     // #2210: waits (bounded) until the front has applied a queued record (recordEvidence's handle).
     evidenceApplied: (handle,options)=>evidenceInbox?evidenceInbox.applied(handle,options):Promise.resolve(true),
-    calibration: calibrator ? { start: calibrator.start, cancellationFacts: calibrator.cancellationFacts, compareAndAbort: calibrator.compareAndAbort, status: calibrator.status, recover: calibrator.recover } : null,
+    calibration: calibrator ? { stateFacts: calibrator.stateFacts, listingFacts: calibrator.listingFacts, preparationFacts: calibrator.preparationFacts, compareAndLaunch: calibrator.compareAndLaunch, cancellationFacts: calibrator.cancellationFacts, compareAndAbort: calibrator.compareAndAbort, recover: calibrator.recover } : null,
     autotune: autotuner ? { start: (...args) => { const fault = budgetFaultReason(); return fault ? Promise.resolve({ ok: false, status: 503, body: budgetFaultBody('Auto-tune unavailable', fault) }) : autotuner.start(...args); }, resumeFacts: autotuner.resumeFacts, prepareResume: autotuner.prepareResume, compareAndResume: autotuner.compareAndResume, cancellationFacts: autotuner.cancellationFacts, compareAndAbort: autotuner.compareAndAbort, clearFacts: autotuner.clearFacts, compareAndClear: autotuner.compareAndClear, statusFacts: autotuner.statusFacts, settingsFacts: autotuner.settingsFacts, commitSettings: autotuner.commitSettings, recover: autotuner.recover, untuned: autotuner.untuned } : null,
     // noevia#2115: the gate refuses to unload a model in use (409 `model_in_use`); `unloadAnyway` is the
     // admin's choice to end what it is answering, and needs INFERENCE_GATE_ADMIN_TOKEN.
