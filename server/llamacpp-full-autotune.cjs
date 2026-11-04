@@ -4,7 +4,7 @@ const fs = require('node:fs');
 const crypto = require('node:crypto');
 const { WORKLOADS, SPEC_CANDIDATES, geomean } = require('./llamacpp-tune-spec.cjs');
 const { hasHarmonyReasoning, quirksOf, toIniOptions, INI_KEY_LIST } = require('./sampling-recommendation.cjs');
-const { isSystemModel, modelPathFromArgs, SYSTEM_MODEL_REASON } = require('./model-system.cjs');
+const { isSystemModel, isSidecarModel, modelPathFromArgs, SYSTEM_MODEL_REASON } = require('./model-system.cjs');
 const VERSION = 3;
 // #1062: waits for another router client per model before the tune stops as interrupted.
 const FOREIGN_YIELDS = 6;
@@ -174,7 +174,6 @@ function defaultServingChecks() {
 }
 const NO_PROBE_PASSED = 'The model failed every quality probe at its reference settings, so auto-tune cannot tell whether a setting harms it.';
 const hash = value => crypto.createHash('sha256').update(JSON.stringify(value)).digest('hex');
-const sorted = value => Object.fromEntries(Object.entries(value || {}).sort(([a], [b]) => a.localeCompare(b)));
 const cancelledError = () => Object.assign(Error('Cancelled'), { cancelled: true });
 const publicJob = job => job && JSON.parse(JSON.stringify(job, (key, value) =>
   key.startsWith('_') || ['originalText', 'lastRevision', 'originalRevision', 'beforeText'].includes(key) ? undefined : value));
@@ -460,39 +459,45 @@ function createFullAutotuner({ request: engineRequest, rawModels: engineRawModel
   const wrote = j => { if (!j._backedUp) { j._backedUp = true; save(); } };
   // kvs (#1060): the KV list the tune used (the item's snapshot) or, for the untuned scan, the one
   // the model's switch gives now; a q5 list differs from a default one either way round.
+  const scanProfile = model => { const p = presets.get(model); return { exists: !!p.exists, defaults: { ...(p.defaults || {}) }, options: { ...(p.options || {}) } }; };
+  const scanPolicy = request => require('./dav-parse-wasm.cjs').autotuneScan({ version: 1, ...request });
   async function signature(model, suppliedIdentity, kvs = candidatesFor(model)) {
     const identity = suppliedIdentity || await identityFor(model);
     if (!identity) throw publicFail('Model identity could not be read.');
-    const profile = presets.get(model);
-    // A default list adds nothing, so tunes from before #1057 stay current.
-    return hash({ version: VERSION, identity, options: sorted({ ...profile.defaults, ...profile.options }), ...(kvs.some(k => k === 'q5_1' || k === 'q5_0') ? { kv: 'q5' } : {}) });
+    return scanPolicy({ op: 'signature', row: { identity, profile: scanProfile(model), allowQ5Kv: kvs.some(k => k === 'q5_1' || k === 'q5_0') } }).signature;
   }
-  async function candidates() {
+  // Bounded per-use owner facts only; both the runner and native public discovery use Rust's
+  // same classification/signature/selection. No cache, selection duplicate or public reply here.
+  async function scanFacts({ signal } = {}) {
+    signal?.throwIfAborted();
     const r = await rawModels();
+    signal?.throwIfAborted();
     if (!r.ok || !Array.isArray(r.body?.data)) throw publicFail('The model server is not responding.');
-    const models = [], skipped = [];
-    // #1079: a long profile is tuned with Long mode from its model's page, never by a Fast scan.
+    if (r.body.data.length > 512) throw Error('scan row cap');
     const longs = new Set(longProfiles.pairsOf(r.body.data, presets).map(p => p.long));
-    for (const row of r.body.data) {
-      if (longs.has(row.id)) { skipped.push({ model: row.id, reason: LONG_PROFILE_REASON }); continue; }
-      const profile = presets.get(row.id), args = row.status?.args || [];
-      if (isSystemModel(row.id, modelPathFromArgs(args))) {
-        skipped.push({ model: row.id, reason: SYSTEM_MODEL_REASON }); continue;
+    const rows = [];
+    // Read each row's live owner facts immediately before its identity, as the legacy loop did.
+    // An earlier async identity read may allow a settings/history change for a later row.
+    for (const raw of r.body.data) {
+      signal?.throwIfAborted();
+      const profile = scanProfile(raw.id);
+      const row = { id: raw.id, long: longs.has(raw.id), system: isSystemModel(raw.id, modelPathFromArgs(raw.status?.args || [])) || isSidecarModel(raw.id),
+        missing: !!fileMissing(raw), configured: profile.exists, profile, args: raw.status?.args || [], latest: null };
+      const { eligible } = scanPolicy({ op: 'classify', rows: [row] });
+      if (eligible.length) {
+        row.allowQ5Kv = settingsOf(row.id).allowQ5Kv;
+        row.identity = await identityFor(row.id);
+        signal?.throwIfAborted();
+        if (!row.identity) throw publicFail('Model identity could not be read.');
+        row.profile = scanProfile(row.id);
+        const latest = state.history[row.id]?.[0];
+        row.latest = latest == null ? null : { version: latest.version, signature: latest.signature };
       }
-      if (fileMissing(row)) { skipped.push({ model: row.id, reason: 'Model file missing from the models folder' }); continue; }
-      if (!profile.exists || args.some(a => ['--embedding', '--embeddings', '--rerank', '--reranking'].includes(a)) ||
-          ['embedding', 'embeddings', 'rerank', 'reranking'].some(k => ['true', '1', 'on'].includes(String(profile.options[k])))) {
-        skipped.push({ model: row.id, reason: 'Not a configured chat model' }); continue;
-      }
-      const current = await signature(row.id);
-      // #1060: the newest tune is the one in models.ini; an older entry with another KV list is not.
-      const latest = state.history[row.id]?.[0];
-      if (latest?.version === VERSION && latest.signature === current) skipped.push({ model: row.id, reason: 'Current tune already applied' });
-      else models.push(row.id);
+      rows.push(row);
     }
-    return { models, skipped };
+    return { version: 1, rows };
   }
-  async function untuned() { try { return { ok: true, status: 200, body: await candidates() }; } catch (e) { return { ok: false, status: 502, body: { error: clientMessage(e, 'Could not list untuned models.') } }; } }
+  async function candidates() { return scanPolicy({ op: 'scan', ...await scanFacts() }); }
   async function unloadAll({ restoring = false } = {}) {
     for (;;) {
       const foreign = await unloadAllOnce({ restoring });
@@ -1809,6 +1814,6 @@ function createFullAutotuner({ request: engineRequest, rawModels: engineRawModel
     if (plan.kind === 'launch') { cancelled = false; completion = run(j); completion.catch(() => {}); }
     return { applied: true, ...resumeFacts(), publicJob: resumePublicJob(j) };
   }
-  return { start, resumeFacts, prepareResume, compareAndResume, cancellationFacts: cancellation.facts, compareAndAbort: cancellation.compareAndAbort, clearFacts, compareAndClear, statusFacts, settingsFacts: settingsSnapshot, commitSettings, untuned, recover, flushReload, completion: () => completion };
+  return { start, resumeFacts, prepareResume, compareAndResume, cancellationFacts: cancellation.facts, compareAndAbort: cancellation.compareAndAbort, clearFacts, compareAndClear, statusFacts, settingsFacts: settingsSnapshot, commitSettings, scanFacts, recover, flushReload, completion: () => completion };
 }
 module.exports = { createAutotuneCancellation, createFullAutotuner, qualityCheck, qualityFailure, QUALITY, VERSION, newModel, hasHarmonyReasoning, kvCandidates, preferKv, bf16Unsupported, MODES, LONG_PROFILE_REASON };
