@@ -13,7 +13,6 @@ const { rerankTarget } = require('../../server/rerank-target.cjs');
 const { createDecisionSettings, describeDecision } = require('../../server/decision-settings.cjs');
 const { rustSavesDecision, rustResetsDecision } = require('./rust-decision-row.cjs');
 const { createModelRoutes } = require('../../server/routes/models.cjs');
-const { modelAssignments } = require('../../server/model-assignments.cjs');
 const { createModelService } = require('../../server/models.cjs');
 
 // The live shape (#1665 core#121): the TEI gte sidecar, on.
@@ -164,17 +163,6 @@ test('#1665 the route saves, refuses with an error id, and resets by DELETE or {
   assert.deepEqual([del.status, del.body.source, del.body.enabled], [200, 'deployment', true]);
 });
 
-test('#1665 the Reranker row: admins get the switch (no address), members the read-only state', async () => {
-  const f = rerankFixture();
-  f.settings.save({ enabled: false }, 'admin-1', INSTALLED);
-  const admin = modelAssignments({ installed: INSTALLED, env: TEI_ENV, admin: true, rerank: f.settings }).services.find((s) => s.id === 'reranker');
-  assert.deepEqual(admin, { id: 'reranker', model: 'gte-multilingual-reranker-base', state: 'off', canChange: true, options: [], enabled: false, choice: 'tei', source: 'admin',
-    choices: [{ id: 'tei', backend: 'tei', model: 'gte-multilingual-reranker-base' }] });
-  const member = modelAssignments({ installed: INSTALLED, env: TEI_ENV, admin: false, rerank: f.settings }).services.find((s) => s.id === 'reranker');
-  assert.deepEqual(member, { id: 'reranker', model: 'gte-multilingual-reranker-base', state: 'off', canChange: false });
-  const r = routesFixture({ rerankSettings: f.settings });
-  for (const role of ['admin', 'member']) noAddress((await r.call('GET', '/api/models/assignments', { role })).body);
-});
 
 test('#1665 retrieval follows the saved switch (rag.configureRerank / reloadRerank), fail-open path unchanged', () => {
   const rag = require('../../server/rag.cjs');
@@ -203,13 +191,10 @@ function decisionFixture(env = KEV_ENV) {
   return { store, settings, save: (value) => rustSavesDecision(store, value), reset: () => rustResetsDecision(store) };
 }
 
-test('#1666 nothing chosen: the deployment model applies, the view keeps its recorded shape, admins get the choices on the row', async () => {
+test('#1666 nothing chosen: the deployment model applies, the view keeps its recorded shape', async () => {
   const f = decisionFixture();
   assert.deepEqual(f.settings.get(), { url: 'http://kev:11435', timeoutMs: 1500, source: 'deployment' }, 'unchanged (the HTTP contract corpus)');
   assert.deepEqual([f.settings.backend().model, f.settings.backend().wording], ['kev-0.8b', 'compact']);
-  const row = modelAssignments({ installed: [], env: KEV_ENV, admin: true, decision: f.settings.describe() }).services.find((s) => s.id === 'decision');
-  assert.deepEqual([row.models, row.deploymentModel], [['laya', 'kev-0.8b'], 'kev-0.8b']);
-  assert.equal('models' in modelAssignments({ installed: [], env: KEV_ENV, admin: false }).services.find((s) => s.id === 'decision'), false);
 });
 
 test('#1666 a model saved next to the URL: requests and wording follow it on the next decision', async () => {

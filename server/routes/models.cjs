@@ -68,7 +68,7 @@ function clientMessage(e, fallback) {
 const STATS_REFUSAL = Object.freeze({ error: 'Engine statistics are owned by the Rust front.' });
 const ROUTING_DEFAULT_REFUSAL = Object.freeze({ error: 'Routing default is owned by the Rust front.' });
 const AUTO_ROLES_REFUSAL = Object.freeze({ error: 'The auto-roles read is owned by the Rust front.', code: 'RUST_AUTO_ROLES_OWNED' });
-function createModelRoutes({ servedEmbeddingModels = (target) => require('../rag.cjs').servedModelsCached(target), json, readBody, readJson, fetchJson, env, modelManager, getProvider, providerHeaders, DEFAULT_PROVIDER_ID, createVisionProbe, currentWorkspace, service, inferenceBudget = null, idleUnload = null, sweepGuardOptions = {}, decisionSettings = null, rerankSettings = null }) {
+function createModelRoutes({ json, readBody, readJson, fetchJson, env, modelManager, getProvider, providerHeaders, DEFAULT_PROVIDER_ID, createVisionProbe, currentWorkspace, service, inferenceBudget = null, idleUnload = null, sweepGuardOptions = {}, rerankSettings = null }) {
   const { modelScanCache, refreshModelScan, autoRoles, setAutoRoles, ensureRolesLoaded, servedCatalogue, modelsInstalled, deriveUserModelName, lastLoadedModel, clearLastLoadedModel, clearRoleReferences } = service;
   // #1461: the installed list is shared for a moment (service.modelsInstalled). A decision that must confirm
   // the engine's state right now (a delete that checks the model exists, a load that checks it is not missing)
@@ -583,23 +583,7 @@ function createModelRoutes({ servedEmbeddingModels = (target) => require('../rag
     if (p === '/api/models/hardware' && req.method !== 'GET') return json(res,405,{error:'Method not allowed'});
 
     // #1662: what each model-backed service uses, for every signed-in user (read-only for members).
-    if (p === '/api/models/assignments') {
-      if (req.method !== 'GET') return json(res, 405, { error: 'method not allowed' });
-      let installed = null;
-      try { installed = await modelsInstalled(); } catch { installed = null; }
-      let embedding = null;
-      try { embedding = require('../embedding-config.cjs').current()?.get() || null; } catch { embedding = null; }
-      const { modelAssignments } = require('../model-assignments.cjs');
-      const admin = authn.user.role === 'admin';
-      // Which models the active embeddings server serves (admins only: members get no switch, and
-      // never cause a probe). Cached per address with a short timeout (rag.servedModelsCached);
-      // null = unknown. Advisory only: set-next checks the server itself.
-      let served = null;
-      if (admin) { try { served = await servedEmbeddingModels({ baseUrl: embedding?.active?.baseUrl || null }); } catch { served = null; } }
-      if (!Array.isArray(served)) served = null;
-      const service = require('../embedding-service.cjs').current()?.status() || null;
-      return json(res, 200, { ...modelAssignments({ installed, env, embedding, isSystem: (n) => isSystemModel(n), admin, served, service, decision: decisionSettings ? decisionSettings.describe() : null, rerank: rerankSettings }), available: Array.isArray(installed) });
-    }
+    if (p === '/api/models/assignments') return json(res, 405, { error: 'method not allowed' });
 
     // #1665: the reranker's runtime switch. Administrators only, for reading too (the options name what this
     // server can rerank with); CSRF/origin run before routes. GET -> { enabled, choice, source, options };
