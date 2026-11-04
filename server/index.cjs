@@ -777,6 +777,8 @@ const modelFactsBridge = require('./rust-model-facts.cjs').createModelFactsBridg
 // ── Deep research (#2218): the Rust front's (rust-research.cjs); what its jobs still need from this process ──
 const inferenceAdmission = require('./inference-admission-lease.cjs').createAdmissionRoutes({
   secret: FRONT_SECRET, modelManager, admitEngineModel, chatMachines, json, readJson,
+  // The front's Diary local exchange (rust-diary-local-exchange.cjs): the chat throttle and the backfill's pause.
+  diaryExchange: { rateLimited: (userId) => llmRateLimited(userId), foreground: () => rag.foreground() },
 });
 const researchBridge = require('./rust-research-bridge.cjs').createResearchBridge({
   secret: FRONT_SECRET, json, readJson,
@@ -1165,7 +1167,7 @@ require('./diary-connectors.cjs').ensureTable(authService.db);
 // The Diary routes that stay: the local exchange (the model throttle and the inference gate), the
 // files, the trash, the history, the operator import folders and the entry edit (routes/diary.cjs).
 const diaryRoutes = require('./routes/diary.cjs').createDiaryRoutes({
-  json, readBody, readJson, fetchJson, DIARY_BASE, authService, currentWorkspace, rateLimited: (userId) => llmRateLimited(userId), diary,
+  json, readBody, fetchJson, DIARY_BASE, authService, currentWorkspace, diary,
   storageLatch,
 });
 // #2287: the Rust front owns settings policy; the live tune script retains the state-file writer.
@@ -1327,6 +1329,8 @@ async function handleRequestInner(req, res) {
   // And the rest of the Diary routes the web client names but the local exchange (#2206): the storage
   // status, the exchanges, the context, the connector endpoint and the connector credentials.
   if (require('./rust-diary-routes.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
+  // And the local exchange: the front relays it and holds this process's throttle and gate by lease.
+  if (require('./rust-diary-local-exchange.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   // So are the two configuration-only model reads (#2187): GET /api/models/capabilities and /hardware.
   if (require('./rust-models.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   if (require('./rust-model-state-reads.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
@@ -1506,8 +1510,9 @@ async function handleRequest(req,res) {
   // This is a browser/core contract marker, including unauthenticated and error
   // responses. Set it before the maintenance gate, which may return early.
   if (pathname.startsWith('/api/')) res.setHeader('X-Noevia-API', '1');
-  // The Diary routes the Rust front owns (rust-diary.cjs) are refused below and never take the gate.
-  const inference=req.method!=='GET' && (pathname==='/api/chat' || (pathname.startsWith('/api/diary/') && !require('./rust-diary.cjs').owned(pathname) && !require('./rust-diary-routes.cjs').owned(req.method,pathname)));
+  // The Diary routes the Rust front owns (rust-diary.cjs, rust-diary-routes.cjs, rust-diary-local-exchange.cjs) are
+  // refused below and never take the gate; the front's local exchange takes it through its admission lease.
+  const inference=req.method!=='GET' && (pathname==='/api/chat' || (pathname.startsWith('/api/diary/') && !require('./rust-diary.cjs').owned(pathname) && !require('./rust-diary-routes.cjs').owned(req.method,pathname) && !require('./rust-diary-local-exchange.cjs').owned(pathname)));
   let leave;
   // #1896: a chat turn waits a moment (<= 3 s) for a briefly held gate, then answers a retryable 503 and logs its reason.
   const chatAdmission=require('./chat-admission.cjs');
