@@ -40,7 +40,7 @@ const AVAILABLE_STATES = new Set(['loaded', 'sleeping']);
 const isAvailable = model => AVAILABLE_STATES.has(model.status?.value);
 const alreadyRunning = result => result?.status === 400 && /already running/i.test(JSON.stringify(result?.body ?? ''));
 
-function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloadStatePath, fetchStream, autoconfig = {}, calibrationStatePath, calibrationOptions = {}, evidenceDir, autotuneStatePath, autotuneOptions = {}, presetWriter = null, inferenceBudget = null, reloadStatePath = null, reloadGuard: reloadGuardOption = null, gate = null, gateAdminToken = null }) {
+function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloadStatePath, fetchStream, autoconfig = {}, calibrationStatePath, calibrationOptions = {}, publicCalibrator = false, evidenceDir, autotuneStatePath, autotuneOptions = {}, presetWriter = null, inferenceBudget = null, reloadStatePath = null, reloadGuard: reloadGuardOption = null, gate = null, gateAdminToken = null }) {
   const base = String(baseUrl || '').replace(/\/+$/, '').replace(/\/v1$/, '');
   const url = new URL(base);
   if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password || url.search || url.hash) throw Error('Invalid llama.cpp router URL');
@@ -642,7 +642,12 @@ function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloa
       profile:evidenceLib.identityHash([sectionText('*'),sectionText(model)]),
       hardware:[autoconfig.hardwareLabel||null,memGiB?`${memGiB}GiB`:null,JSON.stringify(build)].filter(Boolean).join(' ')||null};
   }
-  const calibrator=presets?require('./llamacpp-calibration.cjs').createCalibrator({request,rawModels,presets,maintenance,applyUnlocked,conservativeFor,identityFor:tuneIdentity,onResult:({model,status,entry})=>recordEvidence(model,status==='passed'?{category:'context_capacity',result:'passed',value:{ctx:entry.verifiedCtx,appliedCtx:entry.appliedCtx,slots:entry.slots},suite:{name:'native-calibration',version:1},source:'calibration',limitations:[`prompt budget ${entry.promptBudgetSeconds} s`]}:{category:'context_capacity',result:'failed',value:null,suite:{name:'native-calibration',version:1},source:'calibration',limitations:[String(entry.error||'').slice(0,200)]}),stream:(path,opts={})=>(fetchStream||fetch)(base+path,{...opts,headers:headers(opts.headers),redirect:'error'}),stateFile:calibrationStatePath,memoryFloorGib:autoconfig.memoryFloorGib||2,...calibrationOptions}):null;
+  // #2303: the public calibration job is the Rust front's (bins/noevia-server model_maint), which writes the same
+  // native-calibration-<hash>.json and recovers it at boot. Production (index.cjs) never sets publicCalibrator; the
+  // worker stays constructible here for its tests and the oracle fixtures the native worker is checked against.
+  // Auto-tune's private calibrator (contextFactory below) is unaffected. The front's calibration hold still shows
+  // in maintenance.held() (this process's lease, or the inference gate it observes), so tuningActive() holds.
+  const calibrator=presets&&publicCalibrator?require('./llamacpp-calibration.cjs').createCalibrator({request,rawModels,presets,maintenance,applyUnlocked,conservativeFor,identityFor:tuneIdentity,onResult:({model,status,entry})=>recordEvidence(model,status==='passed'?{category:'context_capacity',result:'passed',value:{ctx:entry.verifiedCtx,appliedCtx:entry.appliedCtx,slots:entry.slots},suite:{name:'native-calibration',version:1},source:'calibration',limitations:[`prompt budget ${entry.promptBudgetSeconds} s`]}:{category:'context_capacity',result:'failed',value:null,suite:{name:'native-calibration',version:1},source:'calibration',limitations:[String(entry.error||'').slice(0,200)]}),stream:(path,opts={})=>(fetchStream||fetch)(base+path,{...opts,headers:headers(opts.headers),redirect:'error'}),stateFile:calibrationStatePath,memoryFloorGib:autoconfig.memoryFloorGib||2,...calibrationOptions}):null;
   const tuneDeps={identityFor:tuneIdentity,stateFile:autotuneStatePath,memoryFloorGib:autoconfig.memoryFloorGib||2,...(calibrationOptions.readMemory?{readMemory:calibrationOptions.readMemory}:{}),...autotuneOptions};
   // Internal context checks run under the full tuner's per-model lease; standalone
   // calibration still acquires the real gate.

@@ -2168,7 +2168,8 @@ test('#2303 standard context stage uses the private configured-profile worker ad
   assert.equal((await f.manager.autotune.start('synthetic',{confirmPause:true})).status,202);
   const job=await finished(f.manager);assert.equal(job.status,'passed',job.error);
   assert.equal(phase(job.models[0],'context').status,'passed');assert.ok(reads>=3);
-  assert.equal(f.manager.calibration.start,undefined);assert.equal(f.manager.calibration.status,undefined);
+  // #2303: no public calibrator in production wiring; auto-tune's private one did the context read.
+  assert.equal(f.manager.calibration,null);
 });
 test('#2303 a cancelled context read cannot launch in the same job after Resume changes its run',async t=>{
   const calibration=require('./llamacpp-calibration.cjs'),original=calibration.createCalibrator,guards=[];

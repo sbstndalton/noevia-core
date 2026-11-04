@@ -1261,7 +1261,8 @@ const inferenceMachineRoutes = require('./routes/inference-machines.cjs').create
 const readyRoutes = require('./routes/health.cjs').createReadyRoutes({
   json, isReady: () => processReady, version: require('./version-resolve.cjs').resolveVersion(),
 });
-// #2303: raw calibration facts and conditional launch; public policy is native.
+// #2303: raw calibration facts and conditional launch. The job is native now, so with no public
+// calibrator these answer { available: false } (an older front then reports calibration unavailable).
 const calibrationRoutesBridge = require('./rust-calibration-routes-bridge.cjs').createCalibrationRoutesBridge({
   secret: FRONT_SECRET, json, readJson, calibration: () => modelManager.calibration,
 });
@@ -1665,8 +1666,8 @@ if (require.main === module) {
     // Never blocks startup: a side-car that is still booting must not stop
     // noevia from serving.
     discoverMcpTools().catch(() => undefined);
-    // A calibration interrupted by a restart restores the preset it was testing.
-    modelManager.calibration?.recover().catch(() => undefined);
+    // #2303: a calibration interrupted by a restart is the Rust front's to recover (it owns the job and
+    // its state file); recovering it here too would interrupt a job the front is still running.
     modelManager.autotune?.recover().catch(() => undefined);
     // A GGUF that appears in the models folder becomes usable without anyone opening a page.
     folderSync?.start();

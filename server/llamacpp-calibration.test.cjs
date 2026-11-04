@@ -56,7 +56,7 @@ function fixture(t,{loadCap=40960,longCap=Infinity,native=131072,memory=()=>20,o
     });
     return new Response(readable,{status:200});
   };
-  const manager=createModelManager({kind:'llamacpp',baseUrl:'http://synthetic',presetPath:ini,fetchJson,fetchStream,calibrationStatePath:stateFile,autoconfig:{},presetWriter,calibrationOptions:{identityFor:async()=>({arch:null,quant:null,artifact:'synthetic-artifact',build:null,profile:require('node:crypto').createHash('sha256').update(fs.readFileSync(ini)).digest('hex'),hardware:null}),sleep:async()=>{},readMemory:memory,now:()=>clock.t,timeouts:{memoryPoll:5},...extra}});
+  const manager=createModelManager({kind:'llamacpp',baseUrl:'http://synthetic',presetPath:ini,fetchJson,fetchStream,publicCalibrator:true,calibrationStatePath:stateFile,autoconfig:{},presetWriter,calibrationOptions:{identityFor:async()=>({arch:null,quant:null,artifact:'synthetic-artifact',build:null,profile:require('node:crypto').createHash('sha256').update(fs.readFileSync(ini)).digest('hex'),hardware:null}),sleep:async()=>{},readMemory:memory,now:()=>clock.t,timeouts:{memoryPoll:5},...extra}});
   return {manager,ini,stateFile,original,router,ctxOf};
 }
 // Existing worker tests launch an explicit synthetic plan. Public confirmation, numeric
@@ -261,7 +261,7 @@ test('calibration raw listing identifies system id/path without model work',asyn
     if(u.pathname==='/models/unload'){unloadCalls++;status[body.model]='unloaded';return {ok:true,status:200,body:{}};}
     return {ok:true,status:200,body:{}};
   };
-  const manager=createModelManager({kind:'llamacpp',baseUrl:'http://synthetic',presetPath:ini,fetchJson,calibrationStatePath:stateFile,autoconfig:{},calibrationOptions:{sleep:async()=>{},readMemory:()=>20}});
+  const manager=createModelManager({kind:'llamacpp',baseUrl:'http://synthetic',presetPath:ini,fetchJson,publicCalibrator:true,calibrationStatePath:stateFile,autoconfig:{},calibrationOptions:{sleep:async()=>{},readMemory:()=>20}});
   const {token}=manager.calibration.stateFacts();
   assert.equal((await manager.calibration.listingFacts('laya_multilingual_f16',token)).system,true);
   assert.equal((await manager.calibration.listingFacts('router_a',token)).system,true);
@@ -291,7 +291,7 @@ test('#871 a restart during the first step restores the original profile',async 
   const sha=require('node:crypto').createHash('sha256').update(fs.readFileSync(ini,'utf8')).digest('hex');
   assert.equal(persisted.lastRevision,sha);
   const fetchJson=async url=>new URL(url).pathname==='/models'?{ok:true,status:200,body:{data:[]}}:{ok:true,status:200,body:{}};
-  const restarted=createModelManager({kind:'llamacpp',baseUrl:'http://synthetic',presetPath:ini,fetchJson,calibrationStatePath:stateFile,autoconfig:{},calibrationOptions:{sleep:async()=>{},readMemory:()=>20}});
+  const restarted=createModelManager({kind:'llamacpp',baseUrl:'http://synthetic',presetPath:ini,fetchJson,publicCalibrator:true,calibrationStatePath:stateFile,autoconfig:{},calibrationOptions:{sleep:async()=>{},readMemory:()=>20}});
   await restarted.calibration.recover();
   const job=restarted.calibration.stateFacts().job;
   assert.equal(job.status,'interrupted');assert.equal(job.restored,true);assert.doesNotMatch(job.error,/not restored/);
