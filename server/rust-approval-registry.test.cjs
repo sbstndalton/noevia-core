@@ -168,3 +168,93 @@ test('a pending revoke is dropped once no grant it shadows could still be live',
   clock += 1000;
   assert.equal(gate.revokePending('owner', 'chat'), false, 'older than any grant the front can hold');
 });
+
+// Review aadda5e P1-1 / P1-2: revocation races, driven deterministically. Each call to the front is
+// a deferred the test settles by hand; retries run only when the test fires them.
+function controlled() {
+  const calls = [];
+  const approvals = (op, payload) => new Promise((resolve, reject) => {
+    calls.push({ op, payload, ok: (body) => resolve({ status: 200, body }), fail: () => reject(Object.assign(new Error('down'), { code: 'PROJECTS_BUSY' })) });
+  });
+  const timers = [];
+  const schedule = (fn, ms) => { const t = { fn, ms, cleared: false, clear() { t.cleared = true; } }; timers.push(t); return t; };
+  const fire = async () => { const t = timers.find((x) => !x.cleared && !x.fired); assert.ok(t, 'a retry is scheduled'); t.fired = true; await t.fn(); };
+  const live = () => timers.filter((x) => !x.cleared && !x.fired).length;
+  const gate = createApprovalRegistry({ approvals, schedule, log: () => {} });
+  const flush = () => new Promise((r) => setImmediate(r));
+  const next = async (op) => { await flush(); const c = calls.find((x) => x.op === op && !x.taken); assert.ok(c, `a ${op} request`); c.taken = true; return c; };
+  return { gate, calls, fire, live, next, flush };
+}
+
+test('P1-1: a revoke confirmed while a granted:true answer is in flight wins over that answer', async () => {
+  const f = controlled();
+  const check = f.gate.chatWideApproved('owner', 'chat', 'project:p', binding);
+  const grantedCall = await f.next('granted');
+  const revoke = f.gate.revokeChatGrant('owner', 'chat');
+  (await f.next('revoke')).ok({ revoked: true });
+  assert.equal(await revoke, true);
+  assert.equal(f.gate.revokePending('owner', 'chat'), false, 'the revoke was confirmed');
+  grantedCall.ok({ granted: true }); // produced before the revoke reached the front
+  assert.equal(await check, false, 'the stale answer is refused');
+  // A check that starts after the revoke is answered on its own merits.
+  const later = f.gate.chatWideApproved('owner', 'chat', 'project:p', binding);
+  (await f.next('granted')).ok({ granted: true });
+  assert.equal(await later, true);
+});
+
+test('P1-1: a failed revoke whose retry succeeds while a granted:true answer is in flight still wins', async () => {
+  const f = controlled();
+  const check = f.gate.chatWideApproved('owner', 'chat', 'project:p', binding);
+  const grantedCall = await f.next('granted');
+  const revoke = f.gate.revokeChatGrant('owner', 'chat');
+  (await f.next('revoke')).fail();
+  assert.equal(await revoke, false);
+  assert.equal(f.gate.revokePending('owner', 'chat'), true);
+  const retry = f.fire();
+  (await f.next('revoke')).ok({ revoked: true });
+  await retry;
+  assert.equal(f.gate.revokePending('owner', 'chat'), false, 'the retry was confirmed and cleared the record');
+  grantedCall.ok({ granted: true });
+  assert.equal(await check, false, 'the stale answer is refused after the record is gone');
+});
+
+test('P1-2: an older explicit revoke confirmation never clears a newer failed revoke', async () => {
+  const f = controlled();
+  const r1 = f.gate.revokeChatGrant('owner', 'chat');
+  const r1Call = await f.next('revoke');
+  // Meanwhile a new approve_all grant is made at the front, then a target change revokes again.
+  const r2 = f.gate.revokeChatGrant('owner', 'chat');
+  (await f.next('revoke')).fail();
+  assert.equal(await r2, false);
+  r1Call.ok({ revoked: true }); // R1 reached the front before R2 started
+  await r1;
+  assert.equal(f.gate.revokePending('owner', 'chat'), true, 'R1 does not acknowledge R2');
+  assert.equal(f.live(), 1, "R2's retry is still scheduled");
+  assert.equal(await f.gate.chatWideApproved('owner', 'chat', 'project:p', binding), false, 'the renewed grant stays shadowed');
+  const retry = f.fire();
+  (await f.next('revoke')).ok({ revoked: true });
+  await retry;
+  assert.equal(f.gate.revokePending('owner', 'chat'), false, 'cleared by the retry that covers R2');
+});
+
+test('P1-2: an older retry never clears a newer failed revoke', async () => {
+  const f = controlled();
+  const r1 = f.gate.revokeChatGrant('owner', 'chat');
+  (await f.next('revoke')).fail();
+  await r1;
+  const retry1 = f.fire(); // covers R1 only
+  const retryCall = await f.next('revoke');
+  const r2 = f.gate.revokeChatGrant('owner', 'chat');
+  (await f.next('revoke')).fail();
+  assert.equal(await r2, false);
+  assert.equal(f.live(), 0, 'one try at a time: no second retry while one is in flight');
+  retryCall.ok({ revoked: true });
+  await retry1;
+  assert.equal(f.gate.revokePending('owner', 'chat'), true, 'the R1 retry does not acknowledge R2');
+  assert.equal(f.live(), 1, 'a retry covering R2 is scheduled');
+  const retry2 = f.fire();
+  (await f.next('revoke')).ok({ revoked: false });
+  await retry2;
+  assert.equal(f.gate.revokePending('owner', 'chat'), false);
+  assert.equal(f.live(), 0);
+});

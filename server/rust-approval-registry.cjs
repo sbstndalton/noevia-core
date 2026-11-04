@@ -34,7 +34,10 @@ const REVOKE_RETRY = Object.freeze({ firstMs: 1000, maxMs: 60000 });
 /** `approvals(op, payload, { wait, signal })` -> { status, body }; it throws an AbortError when
  *  `signal` aborts, and another error when the front cannot be reached (project-store-client.cjs). */
 function createApprovalRegistry({ approvals, timeoutMs = 5 * 60 * 1000, log = () => {},
-  grantTtlMs = GRANT_TTL_MS, revokeRetry = REVOKE_RETRY, now = Date.now } = {}) {
+  grantTtlMs = GRANT_TTL_MS, revokeRetry = REVOKE_RETRY, now = Date.now,
+  // How a retry is scheduled: (fn, ms) -> handle with clear(). Injected by the tests to run retries
+  // deterministically.
+  schedule = (fn, ms) => { const t = setTimeout(fn, ms); t.unref?.(); return { clear: () => clearTimeout(t) }; } } = {}) {
   const ask = (op, payload, options = {}) => {
     if (!OPS.has(op)) throw new Error(`not an approval op: ${op}`);
     return approvals(op, payload, options);
@@ -95,18 +98,39 @@ function createApprovalRegistry({ approvals, timeoutMs = 5 * 60 * 1000, log = ()
     return { choice: 'timeout' };
   }
 
-  // Revokes the front has not confirmed. A revoke follows a refusal such as "the write target
-  // changed after approval"; if the front could not be told, its grant would still auto-approve the
-  // next write in that chat for a target the person never saw. So a failed revoke is recorded here,
-  // every grant check reads this record first and treats the grant as revoked whatever the front
-  // says, and the revoke is retried with a bounded backoff. The record is cleared only once the front
-  // confirms the revoke (or once the grant would have expired anyway: a grant lives at most
-  // grantTtlMs, and the record is never younger than the grant it shadows).
-  // The record is in memory and is lost when Node restarts. That is safe: the supervisor restarts the
+  // Revocation, in two parts.
+  //
+  // Epochs. Every revoke Node starts takes a new generation from one monotonic counter, and that
+  // generation becomes the chat's revocation epoch. The epoch outlives the revoke's confirmation. A
+  // grant check reads the epoch before it asks the front and refuses the answer if the epoch moved
+  // meanwhile: a granted:true produced before a revoke can never be accepted after it, whether that
+  // revoke was confirmed at once, failed, or was retried. (Revokes the front makes itself, on a move or
+  // a delete, change the chat's live context, and the front's own check is atomic with them.)
+  //
+  // Pending records. A revoke follows a refusal such as "the write target changed after approval";
+  // if the front could not be told, its grant would still auto-approve the next write in that chat for
+  // a target the person never saw. So an unconfirmed revoke leaves a record, every grant check reads
+  // it first and denies, and the revoke is retried with a bounded backoff, one try at a time. The
+  // record is cleared only by a confirmation that covers its newest revoke: a confirmation of an older
+  // revoke (an explicit call or a retry sent before the newer revoke started) never clears it. It also
+  // lapses once no grant it shadows could still be live (a grant lives at most grantTtlMs).
+  //
+  // Both are in memory and are lost when Node restarts. That is safe: the supervisor restarts the
   // front and Node together under a new start id, and a grant names the start id it was made in, so
   // after a restart no earlier grant applies anyway.
-  const pendingRevokes = new Map(); // JSON [user, canonical chat] -> { user, chat, since, delay, timer }
+  let generations = 0;
+  const epochs = new Map(); // JSON [user, canonical chat] -> { epoch, at }
+  const pendingRevokes = new Map(); // same key -> { user, chat, latest, since, delay, timer, trying }
   const revokeKey = (userId, chatId) => JSON.stringify([userId, safeId(chatId)]);
+  const epochOf = (key) => epochs.get(key)?.epoch ?? 0;
+
+  function bump(key) {
+    const epoch = ++generations;
+    epochs.set(key, { epoch, at: now() });
+    // Bounded: an epoch only matters to a grant check in flight, far shorter than a grant's life.
+    if (epochs.size > 1024) for (const [k, v] of epochs) if (now() - v.at >= grantTtlMs) epochs.delete(k);
+    return epoch;
+  }
 
   async function tellFront(userId, chatId) {
     try {
@@ -118,44 +142,52 @@ function createApprovalRegistry({ approvals, timeoutMs = 5 * 60 * 1000, log = ()
     }
     return { confirmed: false, revoked: false };
   }
-  function clearRevoke(key) {
-    const entry = pendingRevokes.get(key);
-    if (entry?.timer) clearTimeout(entry.timer);
+  function clearRevoke(key, entry) {
+    if (pendingRevokes.get(key) !== entry) return;
+    entry.timer?.clear();
+    entry.timer = null;
     pendingRevokes.delete(key);
   }
-  function scheduleRevoke(key) {
-    const entry = pendingRevokes.get(key);
-    if (!entry || entry.timer) return;
-    entry.timer = setTimeout(async () => {
+  /** A confirmation for revoke `generation`: clears the record only when it covers its newest revoke. */
+  function confirmed(key, entry, generation) {
+    if (pendingRevokes.get(key) === entry && entry.latest === generation) clearRevoke(key, entry);
+  }
+  function scheduleRevoke(key, entry) {
+    if (pendingRevokes.get(key) !== entry || entry.timer || entry.trying) return;
+    entry.timer = schedule(async () => {
       entry.timer = null;
       if (pendingRevokes.get(key) !== entry) return;
-      if (now() - entry.since >= grantTtlMs) { clearRevoke(key); return; }
-      const { confirmed } = await tellFront(entry.user, entry.chat);
+      if (now() - entry.since >= grantTtlMs) { clearRevoke(key, entry); return; }
+      // The retry covers the revokes started so far, no newer one.
+      const covers = entry.latest;
+      entry.trying = true;
+      const answer = await tellFront(entry.user, entry.chat);
+      entry.trying = false;
+      if (answer.confirmed) confirmed(key, entry, covers);
       if (pendingRevokes.get(key) !== entry) return;
-      if (confirmed) { clearRevoke(key); return; }
-      entry.delay = Math.min(entry.delay * 2, revokeRetry.maxMs);
-      scheduleRevoke(key);
+      if (!answer.confirmed) entry.delay = Math.min(entry.delay * 2, revokeRetry.maxMs);
+      scheduleRevoke(key, entry);
     }, entry.delay);
-    entry.timer.unref?.();
   }
   /** Whether a revoke for this chat still waits for the front's confirmation. */
   function revokePending(userId, chatId) {
     const key = revokeKey(userId, chatId);
     const entry = pendingRevokes.get(key);
-    if (entry && now() - entry.since >= grantTtlMs) { clearRevoke(key); return false; }
+    if (entry && now() - entry.since >= grantTtlMs) { clearRevoke(key, entry); return false; }
     return !!entry;
   }
 
   /** approvals.cjs chatWideApproved, asked of the front. A check without a user, a chat id, a scope
-   *  or a binding never matches, and neither does one the front cannot answer, nor one whose revoke
-   *  the front has not yet confirmed. */
+   *  or a binding never matches, and neither does one the front cannot answer, one whose revoke the
+   *  front has not yet confirmed, or one a revoke started while it was asked. */
   async function chatWideApproved(userId, chatId, scope, binding) {
     if (!text(userId) || !safeId(chatId) || !text(scope) || !binding) return false;
+    const key = revokeKey(userId, chatId);
     if (revokePending(userId, chatId)) return false;
+    const epoch = epochOf(key);
     try {
       const { status, body } = await ask('granted', { user: userId, chat: chatId, scope, binding });
-      // A revoke that failed while this check was in flight still wins.
-      return status === 200 && body?.granted === true && !revokePending(userId, chatId);
+      return status === 200 && body?.granted === true && epochOf(key) === epoch && !revokePending(userId, chatId);
     } catch (e) {
       log(`[tool-approvals] grant check failed: ${why(e)}`);
       return false;
@@ -166,13 +198,19 @@ function createApprovalRegistry({ approvals, timeoutMs = 5 * 60 * 1000, log = ()
   async function revokeChatGrant(userId, chatId) {
     if (!text(userId) || !safeId(chatId)) return false;
     const key = revokeKey(userId, chatId);
-    // Recorded before asking, so a grant check racing this revoke is already denied.
-    const entry = pendingRevokes.get(key) || { user: userId, chat: chatId, since: now(), delay: revokeRetry.firstMs, timer: null };
+    // The epoch moves and the record exists before the front is asked, so a grant check racing this
+    // revoke is already denied.
+    const generation = bump(key);
+    let entry = pendingRevokes.get(key);
+    if (!entry) {
+      entry = { user: userId, chat: chatId, latest: 0, since: 0, delay: revokeRetry.firstMs, timer: null, trying: false };
+      pendingRevokes.set(key, entry);
+    }
+    entry.latest = generation;
     entry.since = now();
-    pendingRevokes.set(key, entry);
-    const { confirmed, revoked } = await tellFront(userId, chatId);
-    if (confirmed) { if (pendingRevokes.get(key) === entry) clearRevoke(key); return revoked; }
-    scheduleRevoke(key);
+    const answer = await tellFront(userId, chatId);
+    if (answer.confirmed) { confirmed(key, entry, generation); return answer.revoked; }
+    scheduleRevoke(key, entry);
     return false;
   }
 
