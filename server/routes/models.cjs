@@ -571,9 +571,9 @@ function createModelRoutes({ servedEmbeddingModels = (target) => require('../rag
 
     if (p === '/api/models/preset') {
       if(authn.user.role!=='admin')return json(res,403,{error:'Administrator required for shared model profiles'});
-      if(!modelManager.getPreset)return json(res,404,{error:'Native presets are unavailable'});
-      if(!['GET','PUT'].includes(req.method))return json(res,405,{error:'Method not allowed'});
-      const result=req.method==='GET' ? await modelManager.getPreset(url.searchParams.get('model') || '') : await modelManager.applyPreset(await readJson(req));
+      if(!modelManager.applyPreset)return json(res,404,{error:'Native presets are unavailable'});
+      if(req.method!=='PUT')return json(res,405,{error:'Method not allowed'});
+      const result=await modelManager.applyPreset(await readJson(req));
       return json(res,result.status,result.body);
     }
 

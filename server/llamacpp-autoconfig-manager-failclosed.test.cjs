@@ -77,7 +77,7 @@ test('manager: a faulty evaluator refuses a preset save, leaving the ini untouch
   const refusal = await m.presetRefusal('small', { 'ctx-size': '8192' });
   assert.ok(probe.ran > 0);
   assert.equal(refusal.code, 'autoconfig_impl'); assert.match(refusal.error, /^Not saved: /);
-  const rev = (await m.getPreset('small')).body.revision;
+  const rev = m.presetFacts('small').revision;
   const saved = await m.applyPreset({ model: 'small', baseRevision: rev, confirmReload: true, options: { 'ctx-size': '8192' } });
   assert.equal(saved.status, 409); assert.equal(saved.body.code, 'autoconfig_impl');
   assert.equal(fs.readFileSync(ini, 'utf8'), before);
