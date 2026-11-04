@@ -6,9 +6,10 @@ const { execFileSync } = require('node:child_process');
 const { trustedFront } = require('./trusted-front.cjs');
 const RUST_EMBEDDING_OWNED = 'rust-embedding-background-v1';
 const PROTOCOL = 'rust-embedding-worker-v1';
-function createOwner({ env = process.env, dataDir, now = Date.now, verifyPair = true, features = () => execFileSync(env.NOEVIA_SERVER_BIN || '/usr/local/bin/noevia-server', ['--features'], { encoding: 'utf8', timeout: 5000 }) }) {
+// frontSecret: the per-start store secret, captured before project-store-client deletes it from process.env (#1916).
+function createOwner({ env = process.env, frontSecret = '', dataDir, now = Date.now, verifyPair = true, features = () => execFileSync(env.NOEVIA_SERVER_BIN || '/usr/local/bin/noevia-server', ['--features'], { encoding: 'utf8', timeout: 5000 }) }) {
   const start = String(env.NOEVIA_START_ID || '');
-  if (verifyPair && (!start || !env.NOEVIA_PROJECT_STORE_TOKEN || !features().split(/\s+/).includes(RUST_EMBEDDING_OWNED))) throw Error('Embedding background requires a coherent paired front and current start');
+  if (verifyPair && (!start || !frontSecret || !features().split(/\s+/).includes(RUST_EMBEDDING_OWNED))) throw Error('Embedding background requires a coherent paired front and current start');
   let stopped = false, sequence = 0;
   return {
     snapshot() {
@@ -28,7 +29,7 @@ function createOwner({ env = process.env, dataDir, now = Date.now, verifyPair = 
     },
     handle(req, res, json) {
       if (req.url !== '/internal/embedding-worker-owner') return false;
-      if (req.method !== 'GET' || !verifyPair || stopped || !trustedFront(req, env.NOEVIA_PROJECT_STORE_TOKEN)) json(res, 404, { error: 'Not found' });
+      if (req.method !== 'GET' || !verifyPair || stopped || !trustedFront(req, frontSecret)) json(res, 404, { error: 'Not found' });
       else json(res, 200, { protocol: PROTOCOL, start, nodeWorkersStopped: true });
       return true;
     },
