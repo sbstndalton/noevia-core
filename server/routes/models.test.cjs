@@ -79,7 +79,7 @@ test('every write under /api/models/ is refused for members before anything else
   const f = fixture();
   assert.equal(await f.call('POST', '/api/models/anything-at-all'), true);
   assert.deepEqual(f.sent.pop(), { status: 403, body: { error: 'administrator required' } });
-  assert.equal(await f.call('GET', '/api/models/downloads'), true, 'reads stay open to members');
+  assert.equal(await f.call('HEAD', '/api/models/downloads'), true, 'the legacy HEAD stays open to members');
   assert.deepEqual(f.sent.pop(), { status: 200, body: [{ id: 'j1', model: 'm', progress: 0.4, status: 'running' }] });
   assert.equal(await f.call('GET', '/api/model'), false);
   assert.equal(await f.call('DELETE', '/api/auto-roles'), false, 'an unhandled method keeps falling through');
@@ -325,7 +325,7 @@ test('any write under /api/models/ drops the scan, and pull/delete/load keep the
   const off = fixture({ enabled: false });
   await off.call('POST', '/api/models/load', { name: 'm' }, 'admin');
   assert.deepEqual(off.sent.pop(), { status: 404, body: { error: 'model management is disabled' } });
-  await off.call('GET', '/api/models/downloads');
+  await off.call('HEAD', '/api/models/downloads');
   assert.deepEqual(off.sent.pop(), { status: 200, body: [] });
 });
 
@@ -912,7 +912,7 @@ test('a model or role write drops the shared reads before it and again once its 
   f.response().emit('close');
   assert.equal(f.invalidations.length, 4);
   // Reads never register the second drop.
-  await f.call('GET', '/api/models/downloads');
+  await f.call('HEAD', '/api/models/downloads');
   assert.equal(f.invalidations.length, 4);
   f.response().emit('finish');
   f.response().emit('close');
@@ -1028,4 +1028,54 @@ test('#2276 manager writes retain the hold through the reload and release it on 
   assert.equal(f.sent.at(-1).status, 200);
   assert.deepEqual(calls, ['chat%name']);
   assert.equal(f.fetched[0].url, 'http://loader/api/v1/%73ections/chat%25name');
+});
+
+test('download GET pairs an exact refusal with bounded trusted adapter facts', async () => {
+  const { refuseOwned } = require('../rust-model-downloads-read.cjs');
+  const { createModelDownloadsFacts, PATH } = require('../rust-model-downloads-read-facts.cjs');
+  const sent = [];
+  const json = (_res, status, body) => sent.push({ status, body });
+  const ctx = { parseRequestUrl: req => new URL(req.url, 'http://localhost'), json };
+  assert.equal(refuseOwned({ method: 'HEAD', url: '/api/models/downloads' }, {}, ctx), false);
+  assert.equal(refuseOwned({ method: 'GET', url: '/api/models/downloads/' }, {}, ctx), false);
+  assert.equal(refuseOwned({ method: 'GET', url: '/api/models/downloads?x=1' }, {}, ctx), true);
+  assert.equal(sent.pop().status, 503);
+
+  let polls = 0;
+  const manager = {
+    enabled: true,
+    async downloads() {
+      polls++;
+      return { ok: true, body: {
+        jobs: [{ id: 0, job_id: 'j', percent: Infinity, progress: 0.9, private: 'hidden' }],
+        downloads: { private: 'hidden malformed alternative' },
+      } };
+    },
+  };
+  const bridge = createModelDownloadsFacts({ secret: 'secret', json, manager: () => manager });
+  const request = {
+    method: 'POST', url: PATH, socket: { remoteAddress: '127.0.0.1' },
+    headers: { 'x-noevia-store-token': 'secret' },
+  };
+  for (const untrusted of [
+    { ...request, method: 'GET' },
+    { ...request, socket: { remoteAddress: '192.0.2.1' } },
+    { ...request, headers: {} },
+    { ...request, headers: { ...request.headers, 'x-forwarded-for': '' } },
+  ]) {
+    assert.equal(await bridge(untrusted, {}), true);
+    assert.equal(sent.pop().status, 404);
+  }
+  assert.equal(polls, 0);
+  assert.equal(await bridge(request, {}), true);
+  assert.deepEqual(sent.pop(), { status: 200, body: {
+    kind: 'listing',
+    jobs: [{ fields: { id: 0, job_id: 'j', progress: 0.9 }, infinite: ['percent'] }],
+    downloads: true,
+  } });
+  assert.equal(polls, 1);
+  manager.enabled = false;
+  assert.equal(await bridge(request, {}), true);
+  assert.deepEqual(sent.pop(), { status: 200, body: { kind: 'disabled' } });
+  assert.equal(polls, 1);
 });
