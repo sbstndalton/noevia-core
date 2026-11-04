@@ -60,6 +60,7 @@ const RUST_ROUTES = [
   ['/api/chat-framing/preferences', null],
   ['/api/account/instructions', null], ['/api/account/memory', null], ['/api/account/preferences', null],
   ['/api/account/retention', ['GET', 'PUT']],
+  ['/api/routing-default', ['PUT']],
   ['/api/admin/invitations', ['POST']], ['/api/admin/users', ['GET']], ['/api/admin/users/u1/disabled', ['PUT']], ['/api/admin/users/u1/recovery', ['POST']],
   ['/api/auth/device/approve', null], ['/api/auth/device/code', null], ['/api/auth/device/token', null], ['/api/auth/device/lookup', null],
   ['/api/auth/devices', null], ['/api/auth/devices/g1', null], ['/api/auth/invitations/accept', ['POST']],
@@ -73,7 +74,7 @@ const RUST_ROUTES = [
 const METHODS = ['GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'];
 
 test('#1071: Node refuses exactly the sign-in and account routes the Rust front answers', () => {
-  assert.equal(OWNED_ROUTES.length, 26);
+  assert.equal(OWNED_ROUTES.length, 27);
   for (const [p, methods] of RUST_ROUTES) {
     for (const m of METHODS) assert.equal(ownedRoute(m, p), methods === null || methods.includes(m), `${m} ${p}`);
   }

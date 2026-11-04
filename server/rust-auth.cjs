@@ -68,6 +68,9 @@ const OWNED_ROUTES = Object.freeze([
   [/^\/api\/account\/(?:instructions|memory|preferences)$/, ALL],
   // Settings -> Data -> Delete old chats: the native preview and retention writer.
   [/^\/api\/account\/retention$/, ['GET', 'PUT']],
+  // Settings -> Models -> Routing: the default's PUT, preferences.json and the projects it switches (sbstndalton/noevia#2384). The GET
+  // is the front's too, refused in routes/models.cjs.
+  [/^\/api\/routing-default$/, ['PUT']],
   [/^\/api\/admin\/invitations$/, ['POST']],
   [/^\/api\/admin\/users$/, ['GET']],
   [/^\/api\/admin\/users\/[^/]+\/disabled$/, ['PUT']],

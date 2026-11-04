@@ -1238,9 +1238,13 @@ const chatListRoutes = require('./routes/chat-lists.cjs').createChatListRoutes({
 // The routing configuration and the sampling-presets switch are the Rust front's (#1071): these
 // mounts only refuse a bypass. Chat still reads both settings (routing-modes.cjs, chat.cjs).
 const routingModeRoutes = require('./routes/routing-mode.cjs').createRoutingModeRoutes({ json });
-// The reasoning-effort default and per-project resolution (routes/reasoning-settings.cjs); its PUT
-// is the Rust front's.
-const reasoningSettingsRoutes = require('./routes/reasoning-settings.cjs').createReasoningSettingsRoutes({ json, authService, getProject, getProvider, reasoningEffort, DEFAULT_PROVIDER_ID });
+// /api/reasoning-settings is the Rust front's (routes/reasoning-settings.cjs only refuses a bypass).
+const reasoningSettingsRoutes = require('./routes/reasoning-settings.cjs').createReasoningSettingsRoutes({ json });
+// #2384: its GET is the front's too; this process only answers how the provider will be asked (the live rejection set).
+const reasoningReadFacts = require('./rust-reasoning-read-facts.cjs').createReasoningReadFacts({
+  secret: FRONT_SECRET, json, readJson,
+  modeFor: ({ user, provider, model, effort }) => diaryAsUser(user, () => reasoningEffort.modeFor(getProvider(provider || DEFAULT_PROVIDER_ID), model, effort)),
+});
 const samplingSettingsRoutes = require('./routes/sampling-settings.cjs').createSamplingSettingsRoutes({ json });
 // The embedding model of retrieval, for administrators (routes/embedding.cjs, #1636).
 const embeddingRoutes = require('./routes/embedding.cjs').createEmbeddingRoutes({ json, readJson, migration: embeddingMigration, authService, fetchJson, DIARY_BASE, diaryServiceHeaders: diary.serviceHeaders,
@@ -1311,6 +1315,8 @@ async function handleRequestInner(req, res) {
   if (require('./rust-tool-approvals.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   if (require('./rust-idle-unload-read.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   if (await idleUnloadFacts(req, res)) return;
+  if (require('./rust-reasoning-read.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
+  if (await reasoningReadFacts(req, res)) return;
   if (require('./rust-model-downloads-read.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   if (await modelDownloadsFacts(req, res)) return;
   if (require('./rust-autotune-read.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;

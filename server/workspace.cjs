@@ -256,6 +256,12 @@ function createWorkspaceStore(rootDir, defaultProvider, secrets, { projectStore 
     } else modesHeld.clear();
     // #1806: inline source text from before is moved to its files (backup first); see source-text.cjs.
     const textMigrated = sourceText.migrateOnLoad(dir, projects);
+    const preferencesFile = path.join(dir, 'preferences.json');
+    const preferenceRows = createReread({
+      signal: () => fileSignal(preferencesFile),
+      load: () => readJson(preferencesFile, {}) || {},
+      fallback: () => ({}),
+    });
     const workspace = {
       userId, dir, projects,
       projectsFile,
@@ -317,8 +323,10 @@ function createWorkspaceStore(rootDir, defaultProvider, secrets, { projectStore 
       // #1420: free-chats.json holding null (or any non-list) is an empty list, never a null the routes trip on.
       freeChats: (() => { const list = freeChatsFile.load(); return Array.isArray(list) ? list : []; })(),
       autoRoles: readJson(path.join(dir, 'auto-roles.json'), null),
-      // Per-user settings with no better home. defaultRouting: what new projects start as.
-      preferences: readJson(path.join(dir, 'preferences.json'), {}) || {},
+      // Per-user settings with no better home. defaultRouting: what new projects start as. The file is the Rust
+      // front's to write (PUT /api/routing-default, sbstndalton/noevia#2384): read again whenever it changed, never
+      // held from the load.
+      get preferences() { return preferenceRows.current(); },
       saveProjects() {
         this.assertActive();
         // #1806: new or changed source text goes to its file first, so projects.json never points
@@ -362,7 +370,6 @@ function createWorkspaceStore(rootDir, defaultProvider, secrets, { projectStore 
         const saved = freeChatsFile.save(this);
         if (saved && typeof saved.then === 'function') return this.storeSaved(saved, 'free-chats.json');
       },
-      savePreferences() { this.assertActive(); atomicJson(path.join(dir, 'preferences.json'), this.preferences); },
       saveAutoRoles() { this.assertActive(); atomicJson(path.join(dir, 'auto-roles.json'), this.autoRoles); },
       historyPath(id) { return path.join(dir, `history-${String(id).replace(/[^a-zA-Z0-9_-]/g, '')}.json`); },
       // sbstndalton/noevia#1071 slice 4: the transcript is written by the Rust store only, for this

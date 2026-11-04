@@ -375,36 +375,25 @@ test('starting auto-tune on a system routing model (Laya) is rejected as a 4xx, 
 });
 
 
-test('the default model mode saves, and only an explicit apply switches existing projects', async () => {
-  let saves = 0;
-  const workspace = { userId: 'u1', preferences: {}, projects: [{ id: 'a', routing: 'manual' }, { id: 'b', routing: 'auto' }],
-    savePreferences() {}, saveProjects() { saves += 1; } };
-  const f = fixture({ workspace });
-  await f.call('PUT', '/api/routing-default', { routing: 'manual' });
-  assert.deepEqual(f.sent.pop(), { status: 200, body: { routing: 'manual', updated: 0 } });
-  assert.equal(workspace.projects[1].routing, 'auto', 'changing the default alone rewrites nothing');
-  await f.call('PUT', '/api/routing-default', { routing: 'auto', applyToExisting: true });
-  assert.deepEqual(f.sent.pop(), { status: 200, body: { routing: 'auto', updated: 1 } });
-  assert.deepEqual(workspace.projects.map((p) => p.routing), ['auto', 'auto']);
-  assert.equal(saves, 1);
-  await f.call('PUT', '/api/routing-default', { routing: 'fast' });
-  assert.equal(f.sent.pop().status, 400);
-});
-
-test('#1071: GET /api/routing-default is the Rust front\'s, so Node always refuses it before reading the workspace; PUT stays Node\'s', async () => {
-  let reads = 0;
-  // Reading `preferences` is what a workspace-backed answer does; counting it shows whether the refused GET touched the workspace.
-  const workspace = { userId: 'u1', projects: [], get preferences() { reads += 1; return { defaultRouting: 'manual' }; }, set preferences(v) { this.stored = v; }, savePreferences() {}, saveProjects() {} };
+test('#2384: GET and PUT /api/routing-default are the Rust front\'s, so Node refuses both before reading or writing the workspace', async () => {
+  let touched = 0;
+  // Reading `preferences` or `projects`, or saving either, is what a workspace-backed answer does; counting shows whether a refusal touched the workspace.
+  const workspace = { userId: 'u1', get projects() { touched += 1; return []; }, get preferences() { touched += 1; return { defaultRouting: 'manual' }; },
+    set preferences(v) { touched += 1; }, saveProjects() { touched += 1; } };
+  assert.equal(workspace.savePreferences, undefined, 'the workspace has no preferences writer any more');
   // No environment hands it back to Node, a leftover retired switch included.
   for (const env of [{}, { NOEVIA_RUST_ROUTING_DEFAULT: '0' }, { NOEVIA_FRONT: 'node' }, { NOEVIA_FRONT: 'rust', NOEVIA_RUST_AUTH: '1', NOEVIA_RUST_ROUTING_DEFAULT: '1', NOEVIA_RUST_ROUTING_DEFAULT_CONFIRMED: '1' }]) {
     const f = fixture({ env, workspace });
-    await f.call('GET', '/api/routing-default');
-    assert.deepEqual(f.sent.pop(), { status: 503, body: ROUTING_DEFAULT_REFUSAL }, JSON.stringify(env));
+    for (const [method, body] of [['GET'], ['PUT', { routing: 'manual' }], ['PUT', { routing: 'auto', applyToExisting: true }], ['PUT', '{']]) {
+      await f.call(method, '/api/routing-default', body);
+      assert.deepEqual(f.sent.pop(), { status: 503, body: ROUTING_DEFAULT_REFUSAL }, `${method} ${JSON.stringify(env)}`);
+    }
+    for (const method of ['POST', 'DELETE', 'PATCH']) {
+      await f.call(method, '/api/routing-default', { routing: 'auto' });
+      assert.deepEqual(f.sent.pop(), { status: 405, body: { error: 'method not allowed' } }, method);
+    }
   }
-  assert.equal(reads, 0, 'the refused GET never reads the workspace');
-  const f = fixture({ workspace });
-  await f.call('PUT', '/api/routing-default', { routing: 'auto' });
-  assert.equal(f.sent.pop().status, 200, 'PUT keeps answering in Node');
+  assert.equal(touched, 0, 'a refusal never touches the workspace');
 });
 
 test('deleting a loaded model unloads first, clears its auto-role and the last-loaded default, and reports what changed', async () => {
