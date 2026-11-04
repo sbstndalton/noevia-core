@@ -410,6 +410,9 @@ function createChatHandler({
     // A write to a socket the client already killed must not surface as an
     // unhandled 'error' and crash the (single) server process.
     res.on('error', () => {});
+    // Chat port S7 (rust-chat-wire.cjs): the turn's headers, heartbeat and events. The front's relay reads them as
+    // NDJSON and writes the event stream itself; anyone else gets the event stream from here, as before.
+    const eventWire = require('./rust-chat-wire.cjs').createWire(res, require('./rust-chat-turn.cjs').relayedWire(req));
 
     // Captured up front rather than resolved inside the stream loop: usage is
     // recorded after the upstream response has been iterated, and pinning the
@@ -676,7 +679,7 @@ function createChatHandler({
     if (partialId) execution.partials = require('./chat-partial.cjs').startPartialSaves({ dir: chatWorkspace.dir, chatId: partialId, record });
     // An error raised after the client left is the disconnect itself (an aborted compaction or
     // request), not a failed reply: the kept reply must not be dropped as failed (#679 review).
-    const send = (obj) => { preparation?.event(obj); if (!(obj?.type === 'error' && chatSignal.signal.aborted)) record?.observe(obj); if (!res.destroyed && !chatSignal.signal.aborted) res.write(`data: ${JSON.stringify(obj)}\n\n`); };
+    const send = (obj) => { preparation?.event(obj); if (!(obj?.type === 'error' && chatSignal.signal.aborted)) record?.observe(obj); if (!res.destroyed && !chatSignal.signal.aborted) res.write(eventWire.frame(obj)); };
 
     // One streamed journaled exchange; never retry implicitly after a disconnect.
     if (spaceId === 'diary') {
@@ -714,7 +717,7 @@ function createChatHandler({
       };
       return require('./diary-stream.cjs').proxyDiaryStream(res, diaryUrl, {
         method: 'POST', headers: (secret) => diaryHeaders('POST', diaryUrl, { secret, body: diaryBody }), body: diaryBody
-      }, {job,diagnose,withStorageCredential:diaryStorageRetry});
+      }, {job,diagnose,withStorageCredential:diaryStorageRetry,wire:eventWire});
     }
 
     // ── Ordinary space / project chat: routed via the project's provider ──
@@ -907,8 +910,7 @@ function createChatHandler({
     const wantsAuto = !!((project ? project.routing === 'auto' : true) && (!projectProvider || projectProvider === DEFAULT_PROVIDER_ID) && autoRoles());
     // #778 routing modes: only Auto chats, only with the flag on and a mode chosen. A cloud route
     // marks the provider external, so every existing hard ban (provider-egress.cjs) applies to it.
-    const heartbeatStart = () => { const beat = setInterval(() => { if (!res.destroyed) res.write(': keep-alive\n\n'); }, 5000); res.once('close', () => clearInterval(beat)); res.once('finish', () => clearInterval(beat)); };
-    let routeTarget = null;
+        let routeTarget = null;
     if (wantsAuto && routingModes && routingModes.enabled() === true) {
       const rm = require('./routing-modes.cjs');
       const settings = routingModes.settings(project);
@@ -945,8 +947,7 @@ function createChatHandler({
             if (!routeUserId) return { choice: 'aborted' };
             if (!earlyStream) {
               earlyStream = true;
-              res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache, no-transform', 'X-Accel-Buffering':'no', Connection: 'keep-alive' });
-              heartbeatStart();
+              eventWire.open();
             }
             const id = crypto.randomUUID();
             send({ type: 'route_pending', id, flag });
@@ -1427,10 +1428,7 @@ function createChatHandler({
     // chat that never replies — and would do it to every message in the project,
     // not just the one asking about an image.
     if (!earlyStream) {
-    res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache, no-transform', 'X-Accel-Buffering':'no', Connection: 'keep-alive' });
-    const heartbeat=setInterval(()=>{if(!res.destroyed)res.write(': keep-alive\n\n');},5000);
-    res.once('close',()=>clearInterval(heartbeat));
-    res.once('finish',()=>clearInterval(heartbeat));
+    eventWire.open();
     }
     send({ type: 'meta', model, chatId: chatId || undefined, route: routedRole || undefined, sourcesNotReady: sourcesNotReady.length ? sourcesNotReady : undefined,
       routing: routeTarget ? { route: routeTarget.route, reason: routeTarget.reason, ...(routeTarget.detail ? { detail: routeTarget.detail } : {}) } : undefined,

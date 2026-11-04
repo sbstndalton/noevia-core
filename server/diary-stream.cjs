@@ -51,14 +51,15 @@ const CONNECT_REFUSED = new Set(['ECONNREFUSED', 'ENOTFOUND', 'EAI_AGAIN']);
 // with the storage secret when the sidecar answers 428 before any stream starts.
 // diagnose (optional): async () => { code, ...extra } | null, asked once when the companion fails
 // while generating, to name a cause that the companion's own error event does not carry (#1422).
-async function proxyDiaryStream(res, url, options, { heartbeatMs = 5000, onEvent, job, withStorageCredential = (send) => send(true), diagnose } = {}) {
+// wire (optional): the chat turn's writer (rust-chat-wire.cjs createWire); without one, the event stream as always.
+async function proxyDiaryStream(res, url, options, { heartbeatMs = 5000, onEvent, job, withStorageCredential = (send) => send(true), diagnose, wire } = {}) {
   const controller = new AbortController();
   const close = () => { if (!res.writableEnded && !job) controller.abort(); };
   res.on('close', close);
   res.on('error', () => {});
-  res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache, no-transform', 'X-Accel-Buffering': 'no', Connection: 'keep-alive' });
-  const send = event => { job?.event(event); if (!res.destroyed) res.write(`data: ${JSON.stringify(event)}\n\n`); };
-  const heartbeat = setInterval(() => { if (!res.destroyed) res.write(': keep-alive\n\n'); }, heartbeatMs);
+  const out = wire || require('./rust-chat-wire.cjs').createWire(res, 'sse', { heartbeatMs });
+  out.open();
+  const send = event => { job?.event(event); if (!res.destroyed) res.write(out.frame(event)); };
   const deadline = setTimeout(() => controller.abort(), 15 * 60 * 1000);
   // 'start' (the companion has not reported a recognised step: nothing can be claimed) -> 'context' ->
   // 'model' (generating) -> 'save' (the companion began saving, or sent a step this proxy does not know).
@@ -124,11 +125,11 @@ async function proxyDiaryStream(res, url, options, { heartbeatMs = 5000, onEvent
             // #228, #232: `reason` is relayed only as a token the companion sent, on a `modelFailed` event (the
             // rule is checked on what is finally sent, so a verbatim event is held to it as well).
             const refined = withoutDisallowedReason(await refine(event));
-            if (refined !== event) { event = refined; frame = `data: ${JSON.stringify(event)}\n\n`; }
+            if (refined !== event) { event = refined; frame = null; }
             if (onEvent) { try { onEvent(event); } catch { /* Optional telemetry must never break diary capture. */ } }
             if (job) { try { job.event(event); } catch { /* A failed recovery write must not look like an interrupted stream. */ } }
           }
-          if (!res.destroyed) res.write(frame);
+          if (!res.destroyed) res.write(frame === null ? out.frame(event) : out.raw(frame));
           buffer = buffer.slice(boundary + 2);
         }
       }
@@ -154,7 +155,7 @@ async function proxyDiaryStream(res, url, options, { heartbeatMs = 5000, onEvent
     const failure = error?.failure || (CONNECT_REFUSED.has(error?.cause?.code) ? notSaved('diaryUnavailable') : null);
     try { send(failure || {type:'error',text:'The diary connection was interrupted. The entry may still be saving; check the saved diary before sending again.'}); } catch { /* Failed recovery storage must not turn into an unhandled rejection. */ }
   } finally {
-    clearInterval(heartbeat); clearTimeout(deadline); res.off('close', close);
+    out.stop(); clearTimeout(deadline); res.off('close', close);
     try { job?.finish(); } catch { /* A running record will recover as uncertain after restart. */ }
     if (!res.destroyed) res.end();
   }

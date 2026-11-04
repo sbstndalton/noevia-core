@@ -31,6 +31,7 @@
 // make two processes answer a turn. Other methods are not chat turns and keep Node's answers.
 const { trustedFront } = require('./trusted-front.cjs');
 const edge = require('./rust-chat-edge.cjs');
+const wire = require('./rust-chat-wire.cjs');
 
 // The route in routes.toml's spelling, for noevia's deploy/tools/assemble-release.sh.
 const OWNED_ROUTES = Object.freeze(new Set(['POST /api/chat']));
@@ -61,6 +62,11 @@ function relayedUser(req) {
   return (req && req[RELAYED] && req[RELAYED].user) || null;
 }
 
+/** The wire this request's events are written on: 'ndjson' for a relayed turn whose front asked for it, else 'sse'. */
+function relayedWire(req) {
+  return (req && req[RELAYED] && req[RELAYED].wire) || 'sse';
+}
+
 /**
  * The front's loopback calls. `accept` runs first in index.cjs handleRequest and answers:
  *   null      not a relay path; carry on
@@ -80,13 +86,15 @@ function createTurnBridge({ secret, json }) {
     if (turn && (typeof user !== 'string' || !user)) { json(res, 400, { error: 'A user is required.' }); return 'done'; }
     const client = req.headers[RELAY_CLIENT_HEADER];
     const forwarded = req.headers[RELAY_FORWARDED_HEADER];
-    for (const name of [TOKEN_HEADER, USER_HEADER, RELAY_CLIENT_HEADER, RELAY_FORWARDED_HEADER]) delete req.headers[name];
+    // Chat port S7 (rust-chat-wire.cjs): the wire the front reads this turn's events on.
+    const kind = wire.wireOf(req.headers[wire.WIRE_HEADER]);
+    for (const name of [TOKEN_HEADER, USER_HEADER, RELAY_CLIENT_HEADER, RELAY_FORWARDED_HEADER, wire.WIRE_HEADER]) delete req.headers[name];
     if (typeof client === 'string' && client) req.headers['x-noevia-client-ip'] = client;
     if (typeof forwarded === 'string' && forwarded) req.headers['x-forwarded-for'] = forwarded;
     // The gate probe for the Diary local exchange meets the gate as that route does (rust-chat-edge.cjs).
     const diaryGate = !turn && new URLSearchParams(query).get('route') === edge.DIARY_GATE_ROUTE;
     req.url = diaryGate ? edge.LOCAL_EXCHANGE : PATH;
-    req[RELAYED] = { user: turn ? user : null, cowork: pathname === edge.COWORK_PATH };
+    req[RELAYED] = { user: turn ? user : null, cowork: pathname === edge.COWORK_PATH, wire: turn ? kind : 'sse' };
     return turn ? 'turn' : 'gate';
   }
   return { accept };
@@ -94,5 +102,5 @@ function createTurnBridge({ secret, json }) {
 
 module.exports = {
   OWNED_ROUTES, ROUTE_REFUSAL, PATH, TURN_PATH, GATE_PATH, TOKEN_HEADER, USER_HEADER, RELAY_CLIENT_HEADER, RELAY_FORWARDED_HEADER,
-  owned, refuseOwned, relayedUser, createTurnBridge,
+  owned, refuseOwned, relayedUser, relayedWire, createTurnBridge,
 };

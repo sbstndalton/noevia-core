@@ -205,6 +205,8 @@ const workspaceStore = createWorkspaceStore(DATA_DIR, { id: DEFAULT_PROVIDER_ID,
 // Chat port S6: the per-user `llm:` budget that chat and the Diary local exchange share (LLM_RATE_LIMIT a minute) is
 // the Rust front's (rust-chat-edge.cjs); this process keeps no limiter for it.
 const chatEdge = require('./rust-chat-edge.cjs');
+// Chat port S7: a relayed turn's failure after the headers is written on the wire its front reads.
+const chatWire = require('./rust-chat-wire.cjs');
 const requestScope = new AsyncLocalStorage();
 function currentWorkspace() {
   const workspace = requestScope.getStore()?.workspace;
@@ -1502,7 +1504,7 @@ async function handleRequestScoped(req, res) {
   } catch (err) {
     if (res.destroyed || res.writableEnded) return;
     if (res.headersSent) {
-      res.end(`data: ${JSON.stringify({ type: 'error', text: 'The request could not be completed. Please retry.' })}\n\n`);
+      res.end(chatWire.failedFrame(require('./rust-chat-turn.cjs').relayedWire(req)));
     } else {
       const failure = errorResponse(err);
       if (failure.status >= 500) console.error('[request] unhandled error:', err);
