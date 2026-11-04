@@ -645,8 +645,11 @@ function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloa
   // #2303: the public calibration job is the Rust front's (bins/noevia-server model_maint), which writes the same
   // native-calibration-<hash>.json and recovers it at boot. Production (index.cjs) never sets publicCalibrator; the
   // worker stays constructible here for its tests and the oracle fixtures the native worker is checked against.
-  // Auto-tune's private calibrator (contextFactory below) is unaffected. The front's calibration hold still shows
-  // in maintenance.held() (this process's lease, or the inference gate it observes), so tuningActive() holds.
+  // Auto-tune's private calibrator (contextFactory below) is unaffected. The front's calibration hold shows in
+  // maintenance.held(): at once when it is this process's lease (no inference gate, the default), and within
+  // observeMs (3 s) when the front holds the inference gate itself. Inside that window #872's presetWriter.busy()
+  // can still read false; chat and inference are excluded by the gate regardless, and a preset write that lands
+  // then only fails the run's revision check, which is safe.
   const calibrator=presets&&publicCalibrator?require('./llamacpp-calibration.cjs').createCalibrator({request,rawModels,presets,maintenance,applyUnlocked,conservativeFor,identityFor:tuneIdentity,onResult:({model,status,entry})=>recordEvidence(model,status==='passed'?{category:'context_capacity',result:'passed',value:{ctx:entry.verifiedCtx,appliedCtx:entry.appliedCtx,slots:entry.slots},suite:{name:'native-calibration',version:1},source:'calibration',limitations:[`prompt budget ${entry.promptBudgetSeconds} s`]}:{category:'context_capacity',result:'failed',value:null,suite:{name:'native-calibration',version:1},source:'calibration',limitations:[String(entry.error||'').slice(0,200)]}),stream:(path,opts={})=>(fetchStream||fetch)(base+path,{...opts,headers:headers(opts.headers),redirect:'error'}),stateFile:calibrationStatePath,memoryFloorGib:autoconfig.memoryFloorGib||2,...calibrationOptions}):null;
   const tuneDeps={identityFor:tuneIdentity,stateFile:autotuneStatePath,memoryFloorGib:autoconfig.memoryFloorGib||2,...(calibrationOptions.readMemory?{readMemory:calibrationOptions.readMemory}:{}),...autotuneOptions};
   // Internal context checks run under the full tuner's per-model lease; standalone
