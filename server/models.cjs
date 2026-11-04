@@ -206,7 +206,7 @@ function createModelService({ fetchJson, env, modelManager, currentWorkspace, li
       const fresh = await fetchJson(`${env.MODEL_LOADER_URL.replace(/\/+$/, '')}/api/v1/models`, { method: 'GET', headers: { 'Content-Type': 'application/json', ...(env.MODEL_LOADER_TOKEN ? { 'X-Model-Loader-Token': env.MODEL_LOADER_TOKEN } : {}) } }, 8000).catch(() => null);
       if (fresh?.ok && fresh.body && typeof fresh.body === 'object') {
         modelScanCache.set('models', { at: Date.now(), body: fresh.body }, generation);
-        files = fresh.body.models;
+        files = generation === modelScanCache.generation() ? fresh.body.models : null;
       }
     }
     return Array.isArray(files) && files.length ? files : null;
@@ -253,17 +253,26 @@ function createModelService({ fetchJson, env, modelManager, currentWorkspace, li
   // names and reports (embedding service state) and the shared folder scan. A list read used to name the first loaded model
   // as a side effect, which the code roles fall back to; the front's read keeps that by naming it here.
   async function installedFacts({ ids, scan, firstLoaded }) {
+    const generation = modelScanCache.generation();
     if (!LAST_LOADED_MODEL && firstLoaded) LAST_LOADED_MODEL = firstLoaded;
     const sidecarLoaded = await sidecarLoadedAmong(ids);
     const files = scan ? await scanRead.get().catch(() => null) : null;
     return {
       sidecarNames: [...sidecarModelNames(env)],
       sidecarLoaded: [...sidecarLoaded],
-      scan: files ? files.map((f) => ({ modelId: f?.modelId, sections: f?.sections, bytes: f?.bytes, shape: f?.shape })) : null,
+      scan: generation === modelScanCache.generation() && files ? files.map((f) => ({ modelId: f?.modelId, sections: f?.sections, bytes: f?.bytes, shape: f?.shape })) : null,
     };
   }
 
   async function modelsInstalledFresh() {
+    const native = require('./rust-model-facts.cjs').current();
+    if (native) {
+      const rows = await native.installed();
+      if (!Array.isArray(rows)) throw Object.assign(Error('Model facts are unavailable.'), {status:503});
+      const first = rows.find(m=>m.loaded && !m.sidecarProtected && !m.system);
+      if (!LAST_LOADED_MODEL && first) LAST_LOADED_MODEL=first.name;
+      return rows;
+    }
     modelManager.requireEnabled();
     const [list, health] = await Promise.allSettled([
       modelManager.listModels(),
@@ -367,6 +376,7 @@ function createModelService({ fetchJson, env, modelManager, currentWorkspace, li
   }
 
   return {
+    rememberFirstLoaded: name => { if (!LAST_LOADED_MODEL && name) LAST_LOADED_MODEL=name; },
     managerFetch, modelScanCache, refreshModelScan, lastLoadedModel, clearLastLoadedModel,
     modelScanSnapshot: () => modelScanCache.snapshot(),
     publishModelScan: (body,token) => modelScanCache.publish(body,token),

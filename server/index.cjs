@@ -150,7 +150,7 @@ require('./document-workers.cjs').useMachines((kind) => inferenceMachines.urlFor
 const rerankSettings = require('./rerank-settings.cjs').install(require('./rerank-settings.cjs').createRerankSettings({ store: require('./features.cjs').settingsStore(authService.db), audit: (action,actor,detail)=>authService.audit(action,actor,actor,detail), onChange: () => rag.reloadRerank(),
   machine: () => { const url = inferenceMachines.urlFor('reranker'); return url ? { url, protocol: inferenceMachines.rerankProtocol() } : null; } }));
 // #697: the inference memory budget (admin setting; INFERENCE_MEMORY_BUDGET_GIB is its initial value).
-const inferenceBudget = require('./inference-budget.cjs').createInferenceBudget({ store: require('./features.cjs').settingsStore(authService.db), audit: (action,actor,detail)=>authService.audit(action,actor,actor,detail) });
+const inferenceBudget = require('./rust-model-facts.cjs').install(require('./rust-model-facts.cjs').createNativeFacts({ dataDir: DATA_DIR, start: process.env.NOEVIA_START_ID, storeClient: PROJECT_STORE, configRevision: () => require('./rust-model-config.cjs').configuration().revision, audit: (action,actor,detail)=>authService.audit(action,actor,actor,detail) }));
 let featureRuntime;
 const featureSetup = require('./features.cjs').createReadOnlyFeatures({ db:authService.db, runtime:()=>featureRuntime, availability:{stepSupervision:()=>decisionSettings.unavailable('choice'),toolGate:()=>decisionSettings.unavailable('choice'),systemOneRouting:()=>decisionSettings.unavailable() && require('./system-one-router.cjs').configuration().reason,chatFraming:()=>decisionSettings.unavailable('choice'),framingReasoner:()=>decisionSettings.unavailable('choice')} });
 const features = featureSetup.features, featureConstruction = featureSetup.construction;
@@ -757,10 +757,6 @@ const taskFactsBridge = require('./rust-task-facts.cjs').createTaskFactsBridge({
   workspace: () => currentWorkspace(), asUser: (userId, fn) => diaryAsUser(userId, fn),
 });
 
-// #2262: GET inference-budget and GET installed are the Rust front's; this is what they cannot read for themselves.
-const modelFactsBridge = require('./rust-model-facts.cjs').createModelFactsBridge({
-  secret: FRONT_SECRET, json, readJson, inferenceBudget, service: modelService,
-});
 // #697: the memory watchdog's facts and quarantine, for the Rust front that runs it (rust-budget-watch.cjs).
 const budgetWatchBridge = require('./rust-budget-watch.cjs').createBudgetWatchBridge({
   secret: FRONT_SECRET, json, readJson, modelManager,
@@ -1118,6 +1114,7 @@ const modelAssignmentsFacts = require('./rust-model-assignments-facts.cjs').crea
 const modelManagerScanCache = require('./rust-model-manager-scan-cache.cjs').createModelManagerScanCache({
   secret: FRONT_SECRET, json, readJson, service: modelService,
 });
+const modelConfigBridge = require('./rust-model-config.cjs').createBridge({ secret: FRONT_SECRET, json, readJson, env: process.env, service: modelService });
 const modelRoutes = require('./routes/models.cjs').createModelRoutes({
   json, readBody, readJson, fetchJson, env: process.env, modelManager, currentWorkspace, service: modelService, inferenceBudget, idleUnload, decisionSettings, rerankSettings,
 });
@@ -1314,6 +1311,7 @@ async function handleRequestInner(req, res) {
   if (require('./rust-autotune-read.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   if (embeddingOwner.handle(req, res, json)) return;
   if (require('./rust-preset-read.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
+  if (await modelConfigBridge(req, res)) return;
   if (await presetReadBridge(req, res)) return;
   if (await autotuneReadBridge(req, res)) return;
   if (require('./rust-autotune-resume.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
@@ -1370,7 +1368,6 @@ async function handleRequestInner(req, res) {
   // And the Code and Browser task reads, and the front's loopback call for what only this process knows (#2257).
   if (require('./rust-task-reads.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   if (await taskFactsBridge(req, res)) return;
-  if (await modelFactsBridge(req, res)) return;
   if (await budgetWatchBridge(req, res)) return;
   // And a project's configuration, its instruction skills and a published skill's install (#2191 round 9).
   if (require('./rust-project-config.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;

@@ -539,7 +539,7 @@ function createModelRoutes({ servedEmbeddingModels = (target) => require('../rag
       res.setHeader('Cache-Control','no-store');
       if(req.method!=='PUT')return json(res,405,{error:'Method not allowed'});
       let body;try{body=await readJson(req);}catch{return json(res,400,{error:'invalid JSON'});}
-      try{return json(res,200,inferenceBudget.save(body,authn.user.id));}
+      try{return json(res,200,await inferenceBudget.save(body,authn.user.id));}
       catch(e){return json(res,e.status||500,{error:e.status?e.message:'Could not save the budget',...(e.messageId?{errorId:e.messageId,minGib:e.minGib,maxGib:e.maxGib}:{})});}
     }
 

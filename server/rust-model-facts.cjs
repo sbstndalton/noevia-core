@@ -1,41 +1,32 @@
 'use strict';
-// sbstndalton/noevia#2262: what the Rust front's model state reads cannot read for themselves, because only this process has
-// it. Reached only by the front's own loopback calls (the same check as its other ones); anything else gets the 404 of an
-// unknown path, because with file sharing on this listener is not bound to loopback alone. Deployment-wide facts: no
-// workspace is opened and no user is named.
-//
-//   POST /internal/models/facts {want: 'budget'}
-//     -> {budget}   inferenceBudget.get(): the figure this process enforces on loads and in its watchdog. That is the truth
-//                   of the setting, not the settings row: a row this process could not read at boot is not being enforced,
-//                   and the answer has to say so.
-//   POST /internal/models/facts {want: 'installed', ids: string[], scan: boolean, firstLoaded?: string}
-//     -> {sidecarNames, sidecarLoaded, scan}   see models.cjs installedFacts
-const { trustedFront } = require('./trusted-front.cjs');
-
-const PATH = '/internal/models/facts';
-const MAX_IDS = 4096;
-
-function createModelFactsBridge({ secret, inferenceBudget, service, json, readJson, log = (m) => console.warn(m) }) {
-  return async function handle(req, res) {
-    if (String(req.url || '').split('?')[0] !== PATH) return false;
-    if (!trustedFront(req, secret) || req.method !== 'POST') { json(res, 404, { error: 'Not found' }); return true; }
-    let body;
-    try { body = await readJson(req); } catch { json(res, 400, { error: 'invalid JSON' }); return true; }
-    const { want, ids, scan, firstLoaded } = body || {};
-    const installed = want === 'installed';
-    const validIds = Array.isArray(ids) && ids.length <= MAX_IDS && ids.every((id) => typeof id === 'string');
-    if ((want !== 'budget' && !installed) || (installed && (!validIds || (firstLoaded !== undefined && typeof firstLoaded !== 'string')))) {
-      json(res, 400, { error: 'A known fact is required.' });
-      return true;
-    }
+// Paired authority: Rust writes model-facts.json; Node never derives an enforcement budget.
+const fs = require('node:fs');
+const path = require('node:path');
+const MODEL_FACTS_OWNER = 'rust-model-facts-v1';
+function unavailable() { return Object.assign(Error('Model facts are unavailable.'), { status: 503, code: 'MODEL_FACTS_UNAVAILABLE' }); }
+function createNativeFacts({ dataDir, start, storeClient, now = Date.now, configRevision = null, audit = () => {} }) {
+  let generation = -1;
+  function snapshot() {
     try {
-      json(res, 200, installed ? await service.installedFacts({ ids, scan: scan === true, firstLoaded }) : { budget: inferenceBudget.get() });
-    } catch (e) {
-      log(`[models] facts failed: ${e?.code || e?.name || 'error'}`);
-      json(res, 503, { error: 'Model facts are unavailable.' });
-    }
-    return true;
+      const bytes = fs.readFileSync(path.join(dataDir, 'model-facts.json'));
+      if (bytes.length > 1024 * 1024) throw unavailable();
+      const s = JSON.parse(bytes);
+      if (s.protocol !== 'model-facts/1' || !start || s.start !== start || !Number.isSafeInteger(s.generation) || s.generation < generation || !Number.isFinite(s.at) || s.at > now() || now() - s.at > 15000) throw unavailable();
+      generation = s.generation;
+      return s;
+    } catch { throw unavailable(); }
+  }
+  function get() {
+    const b = snapshot().budget;
+    if (!b || !Number.isFinite(b.budgetGib) || b.budgetGib < 2) throw unavailable();
+    return b;
+  }
+  return { get, budgetGib: () => get().budgetGib, range: () => { const { minGib, maxGib, hostRamGib } = get(); return { minGib, maxGib, hostRamGib }; },
+    sidecarNames: () => { const s=snapshot(); if(configRevision && s.configRevision!==configRevision()) throw unavailable(); const names = s.sidecarNames; if (!Array.isArray(names) || !names.every(n => typeof n === 'string')) throw unavailable(); return new Set(names); },
+    async save(body, actor) { const result = await storeClient.modelBudget(body); audit('inference.budget', actor, { budgetGib: result.budgetGib }); return result; },
+    installed: () => storeClient.modelInstalled(),
   };
 }
-
-module.exports = { createModelFactsBridge, PATH, MAX_IDS };
+let current = null;
+function install(value) { current = value; return value; }
+module.exports = { MODEL_FACTS_OWNER, createNativeFacts, install, current: () => current };

@@ -146,6 +146,8 @@ const SYSTEM_MODEL_DELETE_REASON = 'System routing model — not deleted';
 // set to serve, may still hold, or reports loaded. If that answer is stale (the model manager did
 // not answer lately) the env names and the saved configuration are protected as well: fail closed.
 function sidecarModelNames(env = process.env) {
+  const native = require('./rust-model-facts.cjs').current();
+  if (native) return native.sidecarNames();
   const names = new Set();
   const service = require('./embedding-service.cjs').current();
   const status = service?.managed() ? service.status() : null;

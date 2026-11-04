@@ -135,6 +135,16 @@ function createClient({ port, token, fetchImpl = globalThis.fetch, timeoutMs = T
   return {
     featureContext,
     presetBaseline,
+    async modelBudget(value) {
+      const {status,body}=await call('model-facts/budget',value);
+      if(status!==200) throw Object.assign(Error(body?.error||'Model facts are unavailable.'),body||{}, {status,messageId:body?.errorId});
+      return body;
+    },
+    async modelInstalled() {
+      const {status,body}=await call('model-facts/installed',{},20000);
+      if(status!==200 || !Array.isArray(body)) throw Object.assign(Error('Model facts are unavailable.'),{status:503});
+      return body;
+    },
     async grantContext(user, chat) {
       const { status, body } = await call('chat/grant-context', { user, chat });
       if (status !== 200) throw moveFailure(status, body);
