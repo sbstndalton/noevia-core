@@ -26,8 +26,9 @@ const PREFIX = '/internal/model-maintenance/lease';
 const TTL_MS = 180000;
 const RENEW_MS = 10000;
 const HARD_MS = 60 * 60 * 1000;
-// The longest hard cap a lease may ask for. Liveness is unchanged: an unrenewed lease still ends after ttlMs.
-const MAX_MS = 8 * 60 * 60 * 1000;
+// The longest hard cap a lease may ask for (only the front's calibration asks: a run's worst case, which at 1M
+// context passes 8 h). Liveness is unchanged: an unrenewed lease still ends after ttlMs (180 s).
+const MAX_MS = 24 * 60 * 60 * 1000;
 const BODY_LIMIT = 4096;
 /** The cap a lease gets for `requested` (undefined: the default). */
 const capFor = (requested, hardMs, maxMs) => (requested === undefined ? hardMs : Math.min(Math.max(requested, hardMs), Math.max(hardMs, maxMs)));

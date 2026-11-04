@@ -155,9 +155,9 @@ test('other paths are not this route\'s', async (t) => {
 });
 
 // Calibration (a Rust front run of hours) asks for a longer hard cap, bounded; renewal liveness is unchanged.
-test('the hard cap defaults to HARD_MS and a requested maxMs is clamped to [HARD_MS, 8 h]', async (t) => {
+test('the hard cap defaults to HARD_MS and a requested maxMs is clamped to [HARD_MS, 24 h]', async (t) => {
   assert.equal(HARD_MS, 60 * 60 * 1000);
-  assert.equal(MAX_MS, 8 * 60 * 60 * 1000);
+  assert.equal(MAX_MS, 24 * 60 * 60 * 1000);
   const manager = realManager();
   const { ask } = await serve(t, { hold: () => manager.holdMaintenance() });
   const cases = [[undefined, HARD_MS], ['{}', HARD_MS], ['', HARD_MS], [JSON.stringify({ maxMs: 1000 }), HARD_MS], [JSON.stringify({ maxMs: 3 * HARD_MS }), 3 * HARD_MS],
