@@ -41,6 +41,8 @@ async function boot(t, mutations = []) {
   });
   child = spawn(process.execPath, ['--require', path.join(__dirname, 'native-calibration-boot.probe.cjs'), path.join(__dirname, 'index.cjs')], {
     env: { ...process.env, UI_DATA_DIR: dir, UI_PORT: '0', PORT: '0', HOST: '127.0.0.1', PUBLIC_ORIGIN: 'http://localhost', DIARY_AUTH_TOKEN: 'test-cowork-token', DAV_PARSE_WASM: wasmFile,
+      // The paired front Core probes at boot (rust-embedding-background.cjs); without it Core exits at createOwner.
+      NOEVIA_SERVER_BIN: require('../tests/server/project-store-server.cjs').syntheticFrontBin(dir),
       NOEVIA_PROJECT_STORE_PORT: '9', NOEVIA_PROJECT_STORE_TOKEN: 'synthetic-store-token-'.padEnd(64, 'x'), NOEVIA_START_ID: '0123456789abcdef0123456789abcdef',
       MODEL_MANAGER_KIND: 'llamacpp', MODEL_MANAGER_BASE_URL: BASE, LLAMACPP_PRESET_PATH: ini,
       CALIBRATION_BOOT_PROBE_OUT: out, CALIBRATION_BOOT_PROBE_MUTATE: JSON.stringify(mutations) },
