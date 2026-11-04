@@ -4,7 +4,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const http = require('node:http');
-const { createLeaseRoutes, PREFIX } = require('./model-maintenance-lease.cjs');
+const { createLeaseRoutes, PREFIX, HARD_MS, MAX_MS } = require('./model-maintenance-lease.cjs');
 const { createMaintenanceGate } = require('./inference-maintenance.cjs');
 const { createLlamaCppManager } = require('./llamacpp-manager.cjs');
 
@@ -31,8 +31,8 @@ async function serve(t, { hold, ...options }) {
   await new Promise((r) => server.listen(0, '127.0.0.1', r));
   t.after(() => new Promise((r) => { server.closeAllConnections(); server.close(r); }));
   const base = `http://127.0.0.1:${server.address().port}`;
-  const ask = async (method, path = PREFIX, headers = { 'x-noevia-store-token': SECRET }) => {
-    const r = await fetch(base + path, { method, headers });
+  const ask = async (method, path = PREFIX, headers = { 'x-noevia-store-token': SECRET }, body) => {
+    const r = await fetch(base + path, { method, headers, ...(body === undefined ? {} : { body }) });
     const text = await r.text();
     return { status: r.status, body: text ? JSON.parse(text) : null };
   };
@@ -152,4 +152,51 @@ test('other paths are not this route\'s', async (t) => {
   const manager = realManager();
   const { ask } = await serve(t, { hold: () => manager.holdMaintenance() });
   assert.equal((await ask('POST', '/internal/model-maintenance/leases')).status, 418);
+});
+
+// Calibration (a Rust front run of hours) asks for a longer hard cap, bounded; renewal liveness is unchanged.
+test('the hard cap defaults to HARD_MS and a requested maxMs is clamped to [HARD_MS, 8 h]', async (t) => {
+  assert.equal(HARD_MS, 60 * 60 * 1000);
+  assert.equal(MAX_MS, 8 * 60 * 60 * 1000);
+  const manager = realManager();
+  const { ask } = await serve(t, { hold: () => manager.holdMaintenance() });
+  const cases = [[undefined, HARD_MS], ['{}', HARD_MS], ['', HARD_MS], [JSON.stringify({ maxMs: 1000 }), HARD_MS], [JSON.stringify({ maxMs: 3 * HARD_MS }), 3 * HARD_MS],
+    [JSON.stringify({ maxMs: MAX_MS }), MAX_MS], [JSON.stringify({ maxMs: 100 * MAX_MS }), MAX_MS], [JSON.stringify({ maxMs: -5 }), HARD_MS]];
+  for (const [body, cap] of cases) {
+    const r = await ask('POST', PREFIX, { 'x-noevia-store-token': SECRET }, body);
+    assert.equal(r.status, 201, String(body));
+    assert.equal(r.body.hardMs, cap, String(body));
+    assert.equal((await ask('DELETE', `${PREFIX}/${r.body.lease}`)).status, 204);
+  }
+});
+
+test('a maxMs that is not a whole number (or a body that is not {maxMs}) is a 400 and holds nothing', async (t) => {
+  const manager = realManager();
+  const { ask, routes } = await serve(t, { hold: () => manager.holdMaintenance() });
+  for (const body of [JSON.stringify({ maxMs: 1.5 }), JSON.stringify({ maxMs: '3600000' }), JSON.stringify({ maxMs: null }), JSON.stringify({ maxMs: 2 ** 60 }),
+    JSON.stringify({ other: 1 }), '[]', 'not json', 'x'.repeat(5000)]) {
+    const r = await ask('POST', PREFIX, { 'x-noevia-store-token': SECRET }, body);
+    assert.equal(r.status, 400, body.slice(0, 40));
+    assert.equal(manager.maintenanceHeld(), false);
+    assert.equal(routes.leases.size(), 0);
+  }
+});
+
+test('a lease ends at its requested cap, and an unrenewed one still ends after ttlMs whatever its cap', async (t) => {
+  const manager = realManager();
+  const { ask } = await serve(t, { hold: () => manager.holdMaintenance(), ttlMs: 5000, hardMs: 100, maxMs: 1000 });
+  const long = (await ask('POST', PREFIX, { 'x-noevia-store-token': SECRET }, JSON.stringify({ maxMs: 300 }))).body;
+  assert.equal(long.hardMs, 300);
+  await delay(180);
+  assert.equal((await ask('POST', `${PREFIX}/${long.lease}/renew`)).status, 200, 'past the default cap, inside the requested one');
+  assert.equal(manager.maintenanceHeld(), true);
+  await delay(220);
+  assert.equal(manager.maintenanceHeld(), false, 'over at the requested cap');
+  assert.equal((await ask('POST', `${PREFIX}/${long.lease}/renew`)).status, 404);
+  const quick = await serve(t, { hold: () => manager.holdMaintenance(), ttlMs: 120, hardMs: 100, maxMs: 10000 });
+  const lease = (await quick.ask('POST', PREFIX, { 'x-noevia-store-token': SECRET }, JSON.stringify({ maxMs: 10000 }))).body;
+  assert.equal(lease.hardMs, 10000);
+  assert.equal(lease.ttlMs, 120, 'liveness unchanged');
+  await delay(260);
+  assert.equal(manager.maintenanceHeld(), false, 'not renewed: over by itself long before its cap');
 });
