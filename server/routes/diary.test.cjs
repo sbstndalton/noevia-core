@@ -15,12 +15,18 @@
 //   (redirect_and_configuration_failures_remain_internal_errors), :299
 //   (valid_js_json_and_conflict_text_match_the_actual_core_handlers), and on the wire in
 //   bins/noevia-server/tests/diary.rs:1028 (moved_proxy_headers_survive_the_front_response_adapter).
+//   The browser's explicit Retry (#1168: only exactly one "1", not 0/true/"1,1"/empty/repeated; forwarded
+//   on the listing and a POST or PUT file call only) and the hold it may clear (#1589/#1607: only a working
+//   call whose storage-status says legacy; not managed, a failed or erroring proof, or a failed call) are
+//   driven through the front's request handling in bins/noevia-server/tests/diary.rs:1206
+//   (only_the_browsers_exact_retry_header_is_forwarded_on_a_files_or_file_call) and :1274
+//   (an_explicit_retry_clears_the_hold_only_with_legacy_proof).
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const { Readable } = require('node:stream');
 const { createDiaryRoutes } = require('./diary.cjs');
 
-function fixture({ diaryOn = true, limited = false, admin = false, reply, log } = {}) {
+function fixture({ diaryOn = true, limited = false, admin = false, reply, log, diaryHeaders } = {}) {
   const sent = [], fetched = [], headers = [];
   const routes = createDiaryRoutes({
     json: (res, status, body, extra) => { sent.push({ status, body, ...(extra ? { headers: extra } : {}) }); },
@@ -30,7 +36,7 @@ function fixture({ diaryOn = true, limited = false, admin = false, reply, log } 
     authService: { diaryEnabled: () => diaryOn, getStorage: () => ({ kind: 'nextcloud', baseUrl: 'https://cloud.example/dav', username: 'ada', secret: 'synthetic-pw' }) },
     rateLimited: () => limited,
     diary: {
-      diaryHeaders: (method, url, opts) => ({ 'X-Cowork-User-ID': 'u1', ...(opts?.storageRetry ? { 'X-Cowork-Storage-Retry': '1' } : {}) }),
+      diaryHeaders: diaryHeaders || ((method, url, opts) => ({ 'X-Cowork-User-ID': 'u1', ...(opts?.storageRetry ? { 'X-Cowork-Storage-Retry': '1' } : {}) })),
       log: log || (() => {}),
     },
   });
@@ -178,8 +184,20 @@ test('#2232: a redirect or a failure building the tenant headers is not "unavail
   await assert.rejects(f.call('diary', ...LOCAL), /fetch failed/);
   assert.equal(f.sent.length, 0);
   assert.match(lines[0], /TypeError.*\(internal\)/);
-  const g = fixture({ reply: () => { throw new Error('storage row unreadable /srv/secret'); }, log: (l) => lines.push(l) });
-  await assert.rejects(g.call('diary', ...LOCAL), /storage row/);
+  // The tenant headers carry the storage secret, so a failure while building them must reach neither the
+  // log nor the browser: it is thrown from diaryHeaders itself, and answered by the server's last-resort
+  // handler (index.cjs uiHandler -> http.cjs answerUnhandled) as a generic 500.
+  const SECRET = 'storage row unreadable /srv/secret synthetic-pw';
+  const g = fixture({ diaryHeaders: () => { throw new Error(SECRET); }, log: (l) => lines.push(l) });
+  const err = await g.call('diary', ...LOCAL).then(() => null, (e) => e);
+  assert.ok(err && err.message === SECRET, 'the header failure propagates as an internal error');
   assert.equal(g.sent.length, 0);
-  assert.ok(lines.every((l) => !l.includes('/srv/secret')));
+  assert.equal(g.fetched.length, 0, 'nothing is sent without its tenant headers');
+  let status, text = '';
+  const res = { writeHead: (code) => { status = code; }, end: (body) => { text += body; } };
+  require('../http.cjs').answerUnhandled(res, err, () => {});
+  assert.equal(status, 500);
+  assert.deepEqual(JSON.parse(text), { error: 'Internal error' });
+  assert.ok(!text.includes('/srv/secret') && !text.includes('synthetic-pw') && !text.includes('storage row'), 'the message is not in the response');
+  assert.ok(lines.every((l) => !l.includes('/srv/secret') && !l.includes('synthetic-pw')), 'nor in the route\'s log');
 });
