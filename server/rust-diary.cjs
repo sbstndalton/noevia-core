@@ -5,9 +5,15 @@
 // refused before authentication and before the inference gate, whoever asks, so the sidecar is only
 // ever reached by the front's signed requests and a stale route table cannot make two processes answer.
 //
-// The remaining proxies and Diary backup loop move as a pair. Top compares this immutable
-// export with the front's compiled feature before either process starts; an environment value
-// cannot activate a second worker. Import/edit retain their unmatched-method fallthrough.
+// The rest of the Diary routes the web client names moved with #2206 (rust-diary-routes.cjs) and the
+// local exchange after them (rust-diary-local-exchange.cjs). The remaining proxies (/api/diary/history,
+// files, file, workspace-trash, external-sources, entries/edit) and the Diary backup loop move here as a
+// pair, so no Diary route stays in Node. Top compares this immutable export with the front's compiled
+// feature before either process starts; an environment value cannot activate a second worker.
+// Import/edit retain their unmatched-method fallthrough.
+//
+// The list is exactly noevia-rs contracts/http/routes.toml's owner = "rust" entries under /api/diary/
+// (every method: each route answers its own 405 after the add-on gate, as Node did).
 const OWNED_PATHS = Object.freeze([
   '/api/diary/files',
   '/api/diary/file',

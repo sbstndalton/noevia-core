@@ -51,8 +51,6 @@ function fixture({ env = {}, enabled = true, kind = 'llamacpp', manager = {}, wo
     readJson: async (req) => { let s = ''; for await (const c of req) s += c; return s ? JSON.parse(s) : {}; },
     fetchJson: async (url, init) => { fetched.push({ url, init }); return fetchReply ? fetchReply(url, init) : { ok: true, status: 200, body: { models: ['a'] } }; },
     env, modelManager, inferenceBudget, idleUnload, sweepGuardOptions, ...(machineModels ? { machineModels } : {}),
-    getProvider: () => ({ baseUrl: 'http://engine', apiKey: 'local' }), providerHeaders: () => ({}), DEFAULT_PROVIDER_ID: 'default',
-    createVisionProbe: () => async () => ({ supported: true }),
     missingRoles: (r, catalogue) => ({ roles: r, catalogue }),
     currentWorkspace: () => workspace,
     service: {
@@ -357,23 +355,15 @@ test('engine-specific routes say what is unavailable and guard the method', asyn
 test('bulk tuning discovery and start are admin-only and the server owns the queue', async () => {
   const starts = [];
   const f = fixture({ manager: { autotune: {
-    untuned: async () => ({ status: 200, body: { models: ['m'], skipped: [] } }),
     start: async (model, options) => { starts.push({ model, options }); return { status: 202, body: { status: 'running' } }; },
   } } });
-  await f.call('GET', '/api/models/autotune/untuned');
-  assert.equal(f.sent.pop().status, 403);
-  await f.call('GET', '/api/models/autotune/untuned', undefined, 'admin');
-  assert.deepEqual(f.sent.pop().body.models, ['m']);
   await f.call('POST', '/api/models/autotune', { untuned: true, confirmPause: true, models: ['untrusted'] }, 'admin');
   assert.equal(f.sent.pop().status, 202);
   assert.deepEqual(starts, [{ model: '', options: { confirmPause: true, promptBudgetSeconds: undefined, untuned: true } }]);
-  await f.call('POST', '/api/models/autotune/untuned', {}, 'admin');
-  assert.equal(f.sent.pop().status, 405);
 });
 
 test('starting auto-tune on a system routing model (Laya) is rejected as a 4xx, even requested directly', async () => {
   const f = fixture({ manager: { autotune: {
-    untuned: async () => ({ status: 200, body: { models: [], skipped: [{ model: 'laya_multilingual_f16', reason: 'System routing model — not tuned' }] } }),
     start: async (model) => model === 'laya_multilingual_f16'
       ? { status: 400, body: { error: 'System routing model — not tuned' } }
       : { status: 202, body: { status: 'running' } },
@@ -919,42 +909,6 @@ test('a model or role write drops the shared reads before it and again once its 
   assert.equal(f.invalidations.length, 4, 'a read changes nothing');
 });
 
-test('#2210: the recheck waits for the front to apply its record, so the answer shows the new state', async () => {
-  const fs = require('node:fs'), os = require('node:os'), path = require('node:path');
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'noevia-recheck-'));
-  try {
-    const { createInbox } = require('../evidence-inbox.cjs');
-    const inbox = createInbox({ dir });
-    let state = 'old';
-    const f = fixture({ manager: {
-      recordEvidence: async (model, record) => inbox.put({ kind: 'record', model, record }),
-      evidenceApplied: (handle) => inbox.applied(handle, { timeoutMs: 3000, stepMs: 10 }),
-      evidence: async () => ({ ok: true, status: 200, body: { state } }),
-    } });
-    // The fake front: takes the entry about 100 ms later.
-    const front = setTimeout(() => {
-      const [name] = fs.readdirSync(dir).filter((n) => n.endsWith('.json'));
-      state = 'verified';
-      fs.rmSync(path.join(dir, name));
-    }, 100);
-    await f.call('POST', '/api/models/evidence/recheck', { model: 'm', category: 'vision' }, 'admin');
-    clearTimeout(front);
-    assert.deepEqual(f.sent.pop(), { status: 200, body: { state: 'verified' } });
-  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
-});
-
-test('#2210: a front that does not apply the record bounds the recheck, and the answer is the state as it stands', async () => {
-  const applied = [];
-  const f = fixture({ manager: {
-    recordEvidence: async () => 'handle',
-    evidenceApplied: async (handle) => { applied.push(handle); return false; },
-    evidence: async () => ({ ok: true, status: 200, body: { state: 'old' } }),
-  } });
-  await f.call('POST', '/api/models/evidence/recheck', { model: 'm', category: 'vision' }, 'admin');
-  assert.deepEqual(applied, ['handle']);
-  assert.deepEqual(f.sent.pop(), { status: 200, body: { state: 'old' } });
-});
-
 test('#2276 manager preset writers acquire a hold before forwarding; reads stay available', async () => {
   const calls = [];
   const f = fixture({ env: { MODEL_LOADER_URL: 'http://loader' }, manager: {
@@ -1030,6 +984,87 @@ test('#2276 manager writes retain the hold through the reload and release it on 
   assert.equal(f.fetched[0].url, 'http://loader/api/v1/%73ections/chat%25name');
 });
 
+test('native embedding protection missing or stale refuses all delete entrypoints before mutation', async t => {
+  const mod = require('../embedding-service.cjs');
+  const prior = mod.current();
+  t.after(() => mod.install(prior));
+  mod.install({ protectionKnown: () => false, managed: () => false });
+  const f = fixture({ env: { MODEL_LOADER_URL: 'http://loader' } });
+  for (const [method, route, body] of [
+    ['POST', '/api/models/delete', { name: 'synthetic' }],
+    ['POST', '/api/model-manager/models/delete', { models: ['synthetic'] }],
+    ['DELETE', '/api/model-manager/sections/synthetic'],
+  ]) {
+    await f.call(method, route, body, 'admin');
+    assert.equal(f.sent.pop().status, 409, route);
+  }
+  assert.equal(f.fetched.length, 0);
+});
+
+test('#2298 stable saved reranker is protected beside the deployment seed in public model actions', async () => {
+  const settings = require('../rerank-settings.cjs');
+  const prior = settings.current();
+  const env = { NOEVIA_FEATURE_RAG_RERANK: 'true', RERANK_BACKEND: 'llamacpp', RERANK_BASE_URL: 'http://synthetic-rerank', RERANK_MODEL: 'rerank-seed-a', MODEL_LOADER_URL: 'http://synthetic-loader' };
+  const store = new Map([[settings.KEY, JSON.stringify({ enabled: true, choice: 'llamacpp:rerank-current-b' })]]);
+  settings.install(settings.createRerankSettings({ store, env }));
+  let operations = 0;
+  const forbidden = async () => { operations++; throw Error('unexpected model operation'); };
+  try {
+    for (const name of ['rerank-seed-a', 'rerank-current-b']) {
+      const f = fixture({ env, manager: { load: forbidden, unload: forbidden, deleteModel: forbidden, request: forbidden } });
+      for (const action of ['load', 'unload', 'delete']) {
+        await f.call('POST', `/api/models/${action}`, { name }, 'admin');
+        assert.equal(f.sent.at(-1)?.status, 409, `${action} must protect ${name}`);
+        if (action === 'delete') assert.equal(f.sent.at(-1).body.service, 'reranker');
+      }
+      f.scan.set('models', { at: Date.now(), body: { models: [{ key: 'synthetic.gguf', modelId: name, sections: [name] }] } });
+      await f.call('DELETE', '/api/model-manager/sections/' + name, undefined, 'admin');
+      assert.equal(f.sent.at(-1)?.status, 409, 'section deletion must protect ' + name);
+      await f.call('POST', '/api/model-manager/models/delete', { models: ['synthetic.gguf'] }, 'admin');
+      assert.equal(f.sent.at(-1)?.status, 409, 'folder deletion must protect ' + name);
+      assert.equal(f.fetched.length, 0, 'refusal must precede loader calls');
+    }
+    assert.equal(operations, 0);
+  } finally { settings.install(prior); }
+});
+
+
+test('#2298 unreadable current reranker state refuses unsafe public actions before operations', async () => {
+  const settings = require('../rerank-settings.cjs');
+  const prior = settings.current();
+  const env = { MODEL_LOADER_URL: 'http://synthetic-loader' };
+  let operations = 0;
+  const forbidden = async () => { operations++; throw Error('unexpected operation'); };
+  const { errorResponse } = require('../http.cjs');
+  try {
+    for (const current of [
+      {}, { effectiveEnv() { throw Error('private provider details'); } },
+      { effectiveEnv: () => null }, { effectiveEnv: () => [] },
+      { effectiveEnv: () => ({ NOEVIA_FEATURE_RAG_RERANK: {}, RERANK_MODEL: 'm' }) },
+      { effectiveEnv: () => ({ NOEVIA_FEATURE_RAG_RERANK: true, RERANK_MODEL: {} }) },
+    ]) {
+      settings.install(current);
+      const f = fixture({ env, manager: { load: forbidden, unload: forbidden, deleteModel: forbidden, request: forbidden } });
+      f.scan.set('models', { at: Date.now(), body: { models: [{ key: 'synthetic.gguf', modelId: 'm', sections: ['m'] }] } });
+      for (const [method, path, body] of [
+        ['POST', '/api/models/load', { name: 'm' }],
+        ['POST', '/api/models/unload', { name: 'm' }],
+        ['POST', '/api/models/delete', { name: 'm' }],
+        ['DELETE', '/api/model-manager/sections/m'],
+        ['POST', '/api/model-manager/models/delete', { models: ['synthetic.gguf'] }],
+      ]) {
+        // Public /api/models writes drop the scan; restore the synthetic known row for the proxy.
+        f.scan.set('models', { at: Date.now(), body: { models: [{ key: 'synthetic.gguf', modelId: 'm', sections: ['m'] }] } });
+        await assert.rejects(f.call(method, path, body, 'admin'), (error) => {
+          assert.deepEqual(errorResponse(error), { status: 503, body: { error: 'Internal error' } });
+          return true;
+        });
+      }
+      assert.equal(f.fetched.length, 0);
+    }
+    assert.equal(operations, 0);
+  } finally { settings.install(prior); }
+});
 test('download GET pairs an exact refusal with bounded trusted adapter facts', async () => {
   const { refuseOwned } = require('../rust-model-downloads-read.cjs');
   const { createModelDownloadsFacts, PATH } = require('../rust-model-downloads-read-facts.cjs');

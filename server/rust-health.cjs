@@ -46,9 +46,9 @@ async function ragState(rag) {
 }
 
 /** The publisher of rag-status.json. `watch(service)` also republishes after the embedding service refreshes. */
-function createRagStatusPublisher({ dataDir, rag, demand = null, env = process.env, onError = (err) => console.warn('[rag-status] could not publish:', err?.message || err) }) {
+function createRagStatusPublisher({ dataDir, rag, ownerReady = () => true, demand = null, env = process.env, onError = (err) => console.warn('[rag-status] could not publish:', err?.message || err) }) {
   const everyMs = intervalFrom(env.RAG_STATUS_PUBLISH_MS, DEFAULT_EVERY_MS);
-  const publisher = createPublisher({ file: path.join(dataDir, SNAPSHOT_FILE), kind: KIND, everyMs, build: () => ragState(rag), onError, demand });
+  const publisher = createPublisher({ file: path.join(dataDir, SNAPSHOT_FILE), kind: KIND, everyMs, build: () => ownerReady() ? ragState(rag) : { ragAvailable: false, retrieval: 'unavailable' }, onError, demand });
   return {
     ...publisher,
     everyMs,

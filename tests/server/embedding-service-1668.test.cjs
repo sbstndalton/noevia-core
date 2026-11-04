@@ -299,25 +299,6 @@ test('a chat model load only ever talks to the chat engine, never to the embeddi
 
 // ── Models page overview row ──────────────────────────────────────────────────────────────────
 
-test('overview: a managed service offers every installed embedding model and "turn off"; off reads off', () => {
-  const { modelAssignments } = require('../../server/model-assignments.cjs');
-  const installed = [{ name: 'nomic-embed-text-v1', labels: ['embedding'] }, { name: 'embeddinggemma-2', labels: ['embedding'] }, { name: 'chat-a' }];
-  const embedding = { active: { model: 'nomic-embed-text-v1', profile: 'nomic-v1', baseUrl: SVC }, next: null };
-  const on = modelAssignments({ installed, embedding, admin: true, served: ['nomic-embed-text-v1'], service: { managed: true, enabled: true } }).services[0];
-  assert.equal(on.managed, true);
-  assert.equal(on.canTurnOff, true);
-  assert.deepEqual(on.options, [{ model: 'embeddinggemma-2', profile: 'embeddinggemma-2', served: true }], 'not yet served is fine: the service loads it first');
-  const off = modelAssignments({ installed, embedding, admin: true, service: { managed: true, enabled: false } }).services[0];
-  assert.equal(off.state, 'off');
-  assert.equal(off.canTurnOff, false);
-  assert.deepEqual(off.options.map((o) => o.model), ['nomic-embed-text-v1', 'embeddinggemma-2'], 'turning back on may pick the same model');
-  const unmanaged = modelAssignments({ installed, embedding, admin: true, served: ['nomic-embed-text-v1'] }).services[0];
-  assert.equal(unmanaged.managed, undefined);
-  assert.equal(unmanaged.options[0].served, false, 'unmanaged: unchanged #1660 behaviour');
-  const member = modelAssignments({ installed, embedding, admin: false, service: { managed: true, enabled: true } }).services[0];
-  assert.equal(member.canTurnOff, undefined);
-  assert.equal(member.options, undefined);
-});
 
 test('addresses with and without /v1 or a trailing slash name the same service', () => {
   const { sameAddress } = require('../../server/embedding-service.cjs');

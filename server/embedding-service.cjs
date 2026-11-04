@@ -27,23 +27,43 @@ function sameAddress(a, b) {
 }
 const STALE_MS = 15000;
 
-function createEmbeddingService({ env = process.env, fetchJson, now = Date.now, sleep = (ms) => new Promise((r) => setTimeout(r, ms)), log = (line) => console.info(line) } = {}) {
+function createEmbeddingService({ nativeOwner = null, env = process.env, fetchJson, now = Date.now, sleep = (ms) => new Promise((r) => setTimeout(r, ms)), log = (line) => console.info(line) } = {}) {
   const loaderUrl = String(env.MODEL_LOADER_URL || '').replace(/\/+$/, '');
   const baseUrl = String(env.EMBEDDING_SERVICE_URL || '').trim().replace(/\/+$/, '') || null;
   let last = null; // { at, body }
   let lastError = null;
   let inFlight = null;
+  let generation = 0, mutationAt = 0, mutations = 0;
+  const protection = new Set();
+  const remember = (body) => {
+    for (const e of [...(body?.models || []), ...(body?.previous || [])]) {
+      if (e?.model) protection.add(e.model);
+      if (e?.file) { protection.add(e.file); protection.add(String(e.file).split('/').pop().replace(/\.gguf$/i, '')); }
+    }
+    for (const name of body?.running?.loaded || []) protection.add(name);
+  };
+  function observeNative() {
+    if (!nativeOwner) return;
+    const s = nativeOwner.snapshot();
+    if (!s?.service || !Number.isFinite(s.serviceAt) || s.serviceAt > now()) return;
+    // Native timestamps the completed GET. Its 6s bound fences a GET started before PUT.
+    if (mutations || s.serviceAt <= mutationAt + 6000 || (last && s.serviceAt < last.at)) { remember(s.service); return; }
+    last = { at: s.serviceAt, body: s.service };
+    if (!s.service.stale && now() - s.serviceAt <= STALE_MS) { protection.clear(); remember(s.service); }
+  }
 
   const headers = () => ({ 'Content-Type': 'application/json', ...(env.MODEL_LOADER_TOKEN ? { 'X-Model-Loader-Token': env.MODEL_LOADER_TOKEN } : {}) });
   const url = `${loaderUrl}/api/v1/embedding-service`;
 
-  async function refresh() {
+  async function refresh({ direct = false } = {}) {
+    if (nativeOwner && !direct) { observeNative(); return api.status(); }
     if (!loaderUrl || !fetchJson) return null;
     if (inFlight) return inFlight;
+    const observedGeneration = generation;
     inFlight = (async () => {
       try {
         const r = await fetchJson(url, { method: 'GET', headers: headers() }, 6000);
-        if (r?.ok && r.body && r.body.managed === true) { last = { at: now(), body: r.body }; lastError = null; }
+        if (r?.ok && r.body && r.body.managed === true) { if (observedGeneration === generation && !mutations) { last = { at: now(), body: r.body }; lastError = null; if (nativeOwner) { protection.clear(); remember(r.body); } } else if (nativeOwner) remember(r.body); }
         else if (r && r.status === 404 && !last) { lastError = 'notManaged'; }
         else lastError = `HTTP ${r?.status ?? 'error'}`;
       } catch (err) { lastError = String(err?.message || err).slice(0, 200); }
@@ -57,18 +77,22 @@ function createEmbeddingService({ env = process.env, fetchJson, now = Date.now, 
     /** True when `address` (a target's baseUrl) is this service. */
     isAt: (address) => !!baseUrl && sameAddress(address, baseUrl),
     /** True once the model manager has said it manages the service. Sticky for this process. */
-    managed: () => !!last,
-    status: () => (last ? { ...last.body, stale: now() - last.at > STALE_MS, ...(lastError ? { lastError } : {}) } : null),
-    enabled: () => !!last && last.body.enabled === true,
+    managed: () => { observeNative(); return !!last; },
+    status: () => { observeNative(); return last ? { ...last.body, stale: !!last.body.stale || now() - last.at > STALE_MS || !!mutations, ...(lastError ? { lastError } : {}) } : null; },
+    enabled: () => { const s = api.status(); return s ? (s.stale ? null : s.enabled === true) : (nativeOwner ? null : false); },
+    protectionKnown: () => !nativeOwner || !!api.status() && !api.status().stale,
     refresh,
     async serve(models) {
       if (!loaderUrl || !fetchJson) throw Object.assign(Error('The model manager is not configured.'), { status: 503, code: 'serviceUnavailable' });
-      const r = await fetchJson(url, { method: 'PUT', headers: headers(), body: JSON.stringify({ models }) }, 60000);
+      if (nativeOwner) { observeNative(); remember(last?.body); remember({ models }); }
+      generation++; mutations++;
+      let r;
+      try { r = await fetchJson(url, { method: 'PUT', headers: headers(), body: JSON.stringify({ models }) }, 60000); } finally { mutations--; mutationAt = now(); generation++; nativeOwner?.kick(); }
       if (!r?.ok) {
         const detail = String(r?.body?.detail || r?.body?.error || `HTTP ${r?.status}`).slice(0, 300);
         throw Object.assign(Error(`The embedding service could not be changed: ${detail}`), { status: r?.status === 400 ? 400 : 502, code: 'serviceRefused' });
       }
-      if (r.body?.managed) last = { at: now(), body: r.body };
+      if (r.body?.managed) { if (nativeOwner) remember(r.body); last = { at: now(), body: r.body }; }
       log(`[embedding] service now serves ${models.length ? models.map((m) => m.model).join(', ') : 'nothing (off)'}`);
       return api.status();
     },
@@ -76,7 +100,7 @@ function createEmbeddingService({ env = process.env, fetchJson, now = Date.now, 
     async waitLoaded(names, { timeoutMs = 180000 } = {}) {
       const deadline = now() + timeoutMs;
       for (;;) {
-        const s = await refresh();
+        const s = await refresh({ direct: true });
         const loaded = new Set(s?.running?.loaded || []);
         if (s && names.every((n) => loaded.has(n))) return true;
         if (now() >= deadline) return false;
@@ -84,7 +108,8 @@ function createEmbeddingService({ env = process.env, fetchJson, now = Date.now, 
       }
     },
     protectedNames() {
-      const names = new Set();
+      observeNative();
+      const names = new Set(nativeOwner ? protection : []);
       if (!last) return names;
       const b = last.body;
       for (const e of [...(b.models || []), ...(b.previous || [])]) {
@@ -96,6 +121,7 @@ function createEmbeddingService({ env = process.env, fetchJson, now = Date.now, 
     },
     /** The file the service serves (or last served) under `model`, if known. */
     fileOf(model) {
+      observeNative();
       const b = last?.body;
       return [...(b?.models || []), ...(b?.previous || [])].find((e) => e.model === model)?.file || null;
     },

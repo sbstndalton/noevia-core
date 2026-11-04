@@ -10,7 +10,7 @@
 const test = require('node:test'), assert = require('node:assert/strict'), fs = require('node:fs'), os = require('node:os'), path = require('node:path');
 const http = require('node:http');
 const { spawn, execFile } = require('node:child_process');
-const { startProjectStore } = require('./project-store-server.cjs');
+const { startProjectStore, syntheticFrontBin } = require('./project-store-server.cjs');
 const davParseWasm = require('../../server/dav-parse-wasm.cjs');
 
 const serverRequire = require('node:module').createRequire(path.join(__dirname, '..', '..', 'server', 'package.json'));
@@ -99,7 +99,7 @@ async function boot(t) {
     MODEL_LOADER_URL: '', MCP_SERVERS: '', COWORK_DECISION_URL: '', COWORK_SYSTEM_ONE_URL: '', DIARY_BACKUP_WORKER_INTERVAL_MS: '3600000',
     MODEL_MANAGER_KIND: 'llamacpp', MODEL_MANAGER_BASE_URL: `http://127.0.0.1:${router.port}`,
     LLAMACPP_PRESET_PATH: ini, LLAMACPP_MODELS_PATH: modelsDir,
-    NOEVIA_PROJECT_STORE_PORT: String(store.port), NOEVIA_PROJECT_STORE_TOKEN: store.token,
+    NOEVIA_SERVER_BIN: syntheticFrontBin(root), NOEVIA_PROJECT_STORE_PORT: String(store.port), NOEVIA_PROJECT_STORE_TOKEN: store.token,
     NOEVIA_START_ID: require('node:crypto').randomBytes(16).toString('hex'),
     ...(process.env.DAV_PARSE_WASM ? { DAV_PARSE_WASM: process.env.DAV_PARSE_WASM } : {}),
     ...(process.env.DAV_PARSE_WASM_REQUIRED ? { DAV_PARSE_WASM_REQUIRED: process.env.DAV_PARSE_WASM_REQUIRED } : {}),

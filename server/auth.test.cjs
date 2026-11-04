@@ -71,26 +71,27 @@ test.before(() => {
 });
 
 test('rejects API requests without a token', async () => {
-  const response = await request('/api/chats/search');
+  // GET /api/chats/search is the Rust front's (rust-chat-search.cjs); a GET of the framing suggestion
+  // is still Node's, behind the same gate (405 once signed in).
+  const response = await request('/api/chat-framing/suggest');
   assert.equal(response.status, 401);
   assert.match(response.headers['WWW-Authenticate'] || '', /^Bearer /);
   assert.deepEqual(JSON.parse(response.text), { error: 'unauthorized' });
 });
 
 test('rejects API requests with the wrong token', async () => {
-  const response = await request('/api/chats/search', {
+  const response = await request('/api/chat-framing/suggest', {
     headers: { authorization: 'Bearer wrong-token' },
   });
   assert.equal(response.status, 401);
 });
 
 test('accepts a valid bearer token', async () => {
-  const response = await request('/api/chats/search', {
+  const response = await request('/api/chat-framing/suggest', {
     headers: { authorization: 'Bearer test-cowork-token' },
   });
-  assert.equal(response.status, 200);
-  const body = JSON.parse(response.text);
-  assert.ok(Array.isArray(body.chats));
+  assert.equal(response.status, 405, 'signed in: the route itself answers');
+  assert.deepEqual(JSON.parse(response.text), { error: 'method not allowed' });
 });
 
 test('provider creation is the Rust front\'s: Node refuses it before authentication and creates nothing', async () => {
