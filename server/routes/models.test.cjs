@@ -1042,14 +1042,15 @@ test('download GET pairs an exact refusal with bounded trusted adapter facts', a
   assert.equal(sent.pop().status, 503);
 
   let polls = 0;
+  let body = {
+    jobs: [{ id: 0, job_id: 'j', percent: Infinity, progress: 0.9, private: 'hidden' }, null, 'text'],
+    downloads: [{ id: 'unchosen' }],
+  };
   const manager = {
     enabled: true,
     async downloads() {
       polls++;
-      return { ok: true, body: {
-        jobs: [{ id: 0, job_id: 'j', percent: Infinity, progress: 0.9, private: 'hidden' }],
-        downloads: { private: 'hidden malformed alternative' },
-      } };
+      return { ok: true, body };
     },
   };
   const bridge = createModelDownloadsFacts({ secret: 'secret', json, manager: () => manager });
@@ -1062,20 +1063,45 @@ test('download GET pairs an exact refusal with bounded trusted adapter facts', a
     { ...request, socket: { remoteAddress: '192.0.2.1' } },
     { ...request, headers: {} },
     { ...request, headers: { ...request.headers, 'x-forwarded-for': '' } },
+    { ...request, headers: { ...request.headers, 'x-noevia-client-ip': '' } },
   ]) {
     assert.equal(await bridge(untrusted, {}), true);
     assert.equal(sent.pop().status, 404);
   }
   assert.equal(polls, 0);
-  assert.equal(await bridge(request, {}), true);
-  assert.deepEqual(sent.pop(), { status: 200, body: {
-    kind: 'listing',
-    jobs: [{ fields: { id: 0, job_id: 'j', progress: 0.9 }, infinite: ['percent'] }],
-    downloads: true,
-  } });
+  const facts = async (value) => {
+    body = value;
+    assert.equal(await bridge(request, {}), true);
+    return sent.pop();
+  };
+  assert.deepEqual(await facts(body), { status: 200, body: { kind: 'listing', rows: [
+    { fields: { id: 0, job_id: 'j', progress: 0.9 }, infinite: ['percent'] }, null, { fields: {} },
+  ] } });
   assert.equal(polls, 1);
+  // The old route's choice, exactly: an array body, else jobs || downloads || [].
+  assert.deepEqual((await facts([{ id: 'direct' }])).body, { kind: 'listing', rows: [{ fields: { id: 'direct' } }] });
+  assert.deepEqual((await facts({ jobs: 0, downloads: [{ id: 'fallback' }] })).body,
+    { kind: 'listing', rows: [{ fields: { id: 'fallback' } }] });
+  assert.deepEqual((await facts({ jobs: [], downloads: true })).body, { kind: 'listing', rows: [] });
+  for (const empty of [null, 'text', 7, {}]) assert.deepEqual((await facts(empty)).body, { kind: 'listing', rows: [] });
+  for (const unmappable of [{ jobs: true }, { jobs: 'x' }, { downloads: { 0: {} } }]) {
+    assert.deepEqual((await facts(unmappable)).body, { kind: 'fault' });
+  }
+  // An unchosen alternative is never expanded, however large; a chosen one is never capped.
+  const huge = 'x'.repeat(17 * 1024 * 1024);
+  assert.deepEqual((await facts({ jobs: [{ id: 'small' }], downloads: [{ id: huge }] })).body,
+    { kind: 'listing', rows: [{ fields: { id: 'small' } }] });
+  const chosen = (await facts({ jobs: [{ id: huge, model: 'm' }] })).body;
+  assert.equal(chosen.kind, 'listing');
+  assert.equal(chosen.rows[0].fields.id, huge);
+  assert.equal(chosen.rows[0].fields.model, 'm');
+  const polled = polls;
+  manager.downloads = async () => { polls++; return { ok: false, status: 500 }; };
+  assert.deepEqual((await facts(null)).body, { kind: 'failed' });
+  manager.downloads = async () => { polls++; throw Error('Invalid router download listing'); };
+  assert.deepEqual((await facts(null)).body, { kind: 'fault' });
+  assert.equal(polls, polled + 2, 'one engine poll per facts call');
   manager.enabled = false;
-  assert.equal(await bridge(request, {}), true);
-  assert.deepEqual(sent.pop(), { status: 200, body: { kind: 'disabled' } });
-  assert.equal(polls, 1);
+  assert.deepEqual((await facts(null)).body, { kind: 'disabled' });
+  assert.equal(polls, polled + 2);
 });
