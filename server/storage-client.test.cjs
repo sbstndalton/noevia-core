@@ -487,7 +487,7 @@ async function sourceText(projectId, name) {
 // A project as the store holds it. (GET /api/workspace, which this used, is the Rust front's since the #2191
 // close-out; any Node request refreshes this process's view at its start, as the canary read does.)
 async function workspaceProject(id) {
-  await request('/api/chats/search', { headers: { cookie } });
+  await request('/api/chat-framing/suggest', { headers: { cookie } });
   const stored = JSON.parse(fs.readFileSync(path.join(testDataDir, 'users', frontUserId, 'projects.json'), 'utf8'));
   return stored.projects.find((p) => p.id === id);
 }

@@ -3,6 +3,8 @@
 // OpenAI-compatible model server with fixed answers and a Diary that always answers 503, plus the
 // clean server environment both generate.cjs and serve.cjs give server/index.cjs.
 const http = require('node:http');
+const fs = require('node:fs');
+const os = require('node:os');
 const path = require('node:path');
 
 const MODEL = 'synthetic-chat-model';
@@ -66,8 +68,21 @@ async function startMocks() {
 // corpus-launcher / tools/front/replay-front.sh, which run them) all state this one instant.
 const CORPUS_NOW = '2026-10-12T12:00:00Z';
 
-/** The whole environment server/index.cjs gets: nothing is inherited but PATH. */
-function serverEnv({ port, dataDir, origin, mocks, record }) {
+// The paired Rust front index.cjs probes at boot (`noevia-server --features`, server/rust-embedding-background.cjs):
+// a caller's real front binary when it has one, else one synthetic stand-in per process, outside any data directory.
+let syntheticFront = null;
+function frontBin(front) {
+  if (front) return path.resolve(front);
+  if (!syntheticFront) {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'noevia-synthetic-front-'));
+    process.once('exit', () => fs.rmSync(dir, { recursive: true, force: true }));
+    syntheticFront = require('../../tests/server/project-store-server.cjs').syntheticFrontBin(dir);
+  }
+  return syntheticFront;
+}
+
+/** The whole environment server/index.cjs gets: nothing is inherited but PATH (and the front binary, given as `front`). */
+function serverEnv({ port, dataDir, origin, mocks, record, front }) {
   const inferenceUrl = `http://127.0.0.1:${mocks.inference.address().port}`;
   return {
     PATH: process.env.PATH, NODE_ENV: 'production', TZ: 'UTC', LANG: 'C.UTF-8', NOEVIA_CONTRACT_FIXED_NOW: CORPUS_NOW,
@@ -75,9 +90,10 @@ function serverEnv({ port, dataDir, origin, mocks, record }) {
     INFERENCE_BASE_URL: inferenceUrl, MODEL_MANAGER_KIND: 'none', MODEL_MANAGER_BASE_URL: inferenceUrl,
     DIARY_BASE_URL: `http://127.0.0.1:${mocks.diary.address().port}`, MODEL_LOADER_URL: '', MCP_SERVERS: '',
     COWORK_DECISION_URL: '', COWORK_SYSTEM_ONE_URL: '', DIARY_BACKUP_WORKER_INTERVAL_MS: '3600000',
+    NOEVIA_SERVER_BIN: frontBin(front),
     ...(record ? { NOEVIA_CONTRACT_RECORD: record } : {}),
     NOEVIA_CORPUS_ALLOWED_PORTS: [mocks.inference.address().port, mocks.diary.address().port].join(','),
   };
 }
 
-module.exports = { MODEL, SERVER, GUARD, CORPUS_NOW, startMocks, serverEnv, readBody };
+module.exports = { MODEL, SERVER, GUARD, CORPUS_NOW, startMocks, serverEnv, frontBin, readBody };

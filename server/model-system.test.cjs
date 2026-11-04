@@ -53,3 +53,38 @@ test('#336: sidecarModelNames can hold both the embedding model and the reranker
 test('SIDECAR_MODEL_DELETE_REASON is distinct wording from the system-model delete reason', () => {
   assert.notEqual(SIDECAR_MODEL_DELETE_REASON, 'System routing model — not deleted');
 });
+
+
+test('#2298 current rerank settings add protection without removing deployment or embedding seeds', () => {
+  const settings = require('./rerank-settings.cjs');
+  const prior = settings.current();
+  const env = { EMBEDDING_MODEL: 'embed-seed', NOEVIA_FEATURE_RAG_RERANK: 'true', RERANK_BACKEND: 'llamacpp', RERANK_BASE_URL: 'http://synthetic-rerank', RERANK_MODEL: 'rerank-seed-a' };
+  const store = new Map([[settings.KEY, JSON.stringify({ enabled: true, choice: 'llamacpp:rerank-current-b' })]]);
+  const current = settings.createRerankSettings({ store, env });
+  settings.install(current);
+  try {
+    assert.deepEqual([...sidecarModelNames(env)].sort(), ['embed-seed', 'rerank-current-b', 'rerank-seed-a']);
+    current.save({ enabled: false, choice: 'llamacpp:rerank-current-b' }, 'synthetic-admin', [{ name: 'rerank-current-b', labels: ['reranking'] }]);
+    assert.deepEqual([...sidecarModelNames(env)].sort(), ['embed-seed', 'rerank-seed-a']);
+    current.reset('synthetic-admin', []);
+    assert.deepEqual([...sidecarModelNames(env)].sort(), ['embed-seed', 'rerank-seed-a']);
+    settings.install({ effectiveEnv: () => ({ NOEVIA_FEATURE_RAG_RERANK: 'true', RERANK_BACKEND: 'tei' }) });
+    assert.deepEqual([...sidecarModelNames(env)].sort(), ['embed-seed', 'rerank-seed-a'], 'an unnamed TEI default is valid');
+  } finally { settings.install(prior); }
+});
+
+
+test('#2298 current enabled flag follows runtime whitespace normalization without changing seed rules', () => {
+  const settings = require('./rerank-settings.cjs');
+  const { rerankTarget } = require('./rerank-target.cjs');
+  const prior = settings.current();
+  const seed = { NOEVIA_FEATURE_RAG_RERANK: ' true ', RERANK_MODEL: 'rerank-seed-a' };
+  const current = settings.createRerankSettings({ store: new Map(), env: { ...seed, RERANK_MODEL: 'rerank-current-b', RERANK_BACKEND: 'llamacpp', RERANK_BASE_URL: 'http://synthetic-rerank' }, machine: () => ({ url: 'http://synthetic-machine', protocol: 'llamacpp' }) });
+  settings.install(current);
+  try {
+    assert.equal(rerankTarget(current.effectiveEnv()).enabled, true);
+    assert.deepEqual([...sidecarModelNames(seed)], ['rerank-current-b']);
+    settings.install(null);
+    assert.deepEqual([...sidecarModelNames(seed)], [], 'legacy deployment-seed flag behavior stays unchanged');
+  } finally { settings.install(prior); }
+});
