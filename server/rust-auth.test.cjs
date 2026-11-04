@@ -59,7 +59,7 @@ test('#1071: the guard is unconditional: no option or environment turns it off',
 const RUST_ROUTES = [
   ['/api/chat-framing/preferences', null],
   ['/api/account/instructions', null], ['/api/account/memory', null], ['/api/account/preferences', null],
-  ['/api/account/retention', ['GET']],
+  ['/api/account/retention', ['GET', 'PUT']],
   ['/api/admin/invitations', ['POST']], ['/api/admin/users', ['GET']], ['/api/admin/users/u1/disabled', ['PUT']], ['/api/admin/users/u1/recovery', ['POST']],
   ['/api/auth/device/approve', null], ['/api/auth/device/code', null], ['/api/auth/device/token', null], ['/api/auth/device/lookup', null],
   ['/api/auth/devices', null], ['/api/auth/devices/g1', null], ['/api/auth/invitations/accept', ['POST']],
@@ -78,12 +78,12 @@ test('#1071: Node refuses exactly the sign-in and account routes the Rust front 
     for (const m of METHODS) assert.equal(ownedRoute(m, p), methods === null || methods.includes(m), `${m} ${p}`);
   }
   // What stays Node's (an account's deletion is rust-admin-users.cjs's, a separate refuser): Settings -> Web address, (the Diary connectors are rust-diary-routes.cjs's),
-  // retention's PUT, the feature switches, the device approval page (rust-public-pages.cjs's since #2190),
+  // the feature switches, the device approval page (rust-public-pages.cjs's since #2190),
   // and look-alike paths.
   for (const [m, p] of [
     ['DELETE', '/api/admin/users/u1'], ['GET', '/api/admin/web-address'], ['POST', '/api/admin/web-address'], ['POST', '/api/admin/secrets/rotate'],
     ['GET', '/api/admin/features'], ['POST', '/api/profile/sharing'], ['GET', '/api/profile/diary-connectors'],
-    ['PUT', '/api/account/retention'], ['GET', '/api/chat-framing/preferences/'], ['GET', '/api/chat-framing/suggest'], ['GET', '/device'], ['GET', '/api/auth/sessionx'], ['GET', '/api/profile/'],
+    ['GET', '/api/chat-framing/preferences/'], ['GET', '/api/chat-framing/suggest'], ['GET', '/device'], ['GET', '/api/auth/sessionx'], ['GET', '/api/profile/'],
     ['GET', '/api/auth/session/x'], ['DELETE', '/api/auth/passkeys/a/b'], ['GET', '/api/workspace'], ['GET', '/api/auth/status'],
   ]) assert.equal(ownedRoute(m, p), false, `${m} ${p}`);
   const sent = [];

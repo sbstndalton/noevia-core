@@ -5,7 +5,7 @@ const {ladder}=require('./llamacpp-calibration.cjs');
 
 // Synthetic llama.cpp router: a model loads only while its preset context is at or below
 // `loadCap`, and recalls the start marker only at or below `longCap`.
-function fixture(t,{loadCap=40960,longCap=Infinity,native=131072,memory=()=>20,other=false,onLoad,speed=100000,presetWriter,extra={}}={}){
+function fixture(t,{loadCap=40960,longCap=Infinity,native=131072,memory=()=>20,other=false,onLoad,speed=100000,presetWriter,extra={},bridge=null,reloadStatePath=null}={}){
   const dir=fs.mkdtempSync(path.join(os.tmpdir(),'calibration-'));t.after(()=>fs.rmSync(dir,{recursive:true,force:true}));
   const ini=path.join(dir,'models.ini'),stateFile=path.join(dir,'state.json');
   const original='version = 1\n[*]\ncache-type-k = q8_0\n[synthetic]\n; operator note stays\nmodel = /models/s.gguf\nc = 8192\nparallel = 1\n[other]\nc = 4096\n';
@@ -13,7 +13,7 @@ function fixture(t,{loadCap=40960,longCap=Infinity,native=131072,memory=()=>20,o
   const router={status:{synthetic:'unloaded',other:other?'loaded':'unloaded'},calls:[],loads:[]};
   const ctxOf=()=>Number(/\[synthetic\][^[]*?(?:^|\n)(?:c|ctx-size)\s*=\s*(\d+)/.exec(fs.readFileSync(ini,'utf8'))?.[1]);
   const fetchJson=async(url,opts={})=>{
-    const u=new URL(url),body=opts.body?JSON.parse(opts.body):{};router.calls.push(u.pathname);
+    const u=new URL(url),body=opts.body?JSON.parse(opts.body):{};router.calls.push(u.searchParams.has('reload')?'RELOAD':u.pathname);
     if(opts.signal?.aborted)throw Object.assign(Error('aborted'),{name:'AbortError'});
     if(u.pathname==='/models'&&(!opts.method||opts.method==='GET'))return {ok:true,status:200,body:{data:Object.entries(router.status).map(([id,value])=>({id,status:{value},meta:id==='synthetic'?{n_ctx_train:native}:{}}))}};
     if(u.pathname==='/models/load'){const ctx=ctxOf();router.loads.push(ctx);await onLoad?.(ctx,router);router.status.synthetic=ctx<=loadCap?'loaded':'unloaded';return {ok:true,status:200,body:{}};}
@@ -56,7 +56,8 @@ function fixture(t,{loadCap=40960,longCap=Infinity,native=131072,memory=()=>20,o
     });
     return new Response(readable,{status:200});
   };
-  const manager=createModelManager({kind:'llamacpp',baseUrl:'http://synthetic',presetPath:ini,fetchJson,fetchStream,publicCalibrator:true,calibrationStatePath:stateFile,autoconfig:{},presetWriter,calibrationOptions:{identityFor:async()=>({arch:null,quant:null,artifact:'synthetic-artifact',build:null,profile:require('node:crypto').createHash('sha256').update(fs.readFileSync(ini)).digest('hex'),hardware:null}),sleep:async()=>{},readMemory:memory,now:()=>clock.t,timeouts:{memoryPoll:5},...extra}});
+  const presetBaselineClient=bridge?bridge(router.calls):null;
+  const manager=createModelManager({kind:'llamacpp',baseUrl:'http://synthetic',presetPath:ini,fetchJson,fetchStream,publicCalibrator:true,calibrationStatePath:stateFile,autoconfig:{},presetWriter,presetBaselineClient,reloadStatePath,calibrationOptions:{identityFor:async()=>({arch:null,quant:null,artifact:'synthetic-artifact',build:null,profile:require('node:crypto').createHash('sha256').update(fs.readFileSync(ini)).digest('hex'),hardware:null}),sleep:async()=>{},readMemory:memory,now:()=>clock.t,timeouts:{memoryPoll:5},...extra}});
   return {manager,ini,stateFile,original,router,ctxOf};
 }
 // Existing worker tests launch an explicit synthetic plan. Public confirmation, numeric
@@ -322,4 +323,74 @@ test('#1758 a sleeping model is asked to unload before calibration, so the wait 
   assert.doesNotMatch(String(job.error||''),/did not unload in time/);
   assert.equal(f.router.status.other,'unloaded');
   assert.ok(calls.includes('/models/unload'),unloads);
+});
+
+// noevia-rs model_maint/reload.rs: calibration's restore re-reads skip the guarded reload, so each one
+// first makes the front's preset reload baseline unknown.
+const {createFakePresetBaseline}=require('./preset-baseline-fixture.cjs');
+const bridge=log=>createFakePresetBaseline({check:()=>({safe:false,reason:'changed',changed:[]}),log});
+const reReadsAfter=calls=>calls.flatMap((c,i)=>c==='RELOAD'?[calls[i-1]]:[]);
+
+test('a failed run invalidates the baseline before the router re-reads the restored profile',async t=>{
+  const {manager,ini,original,router}=fixture(t,{loadCap:4096,bridge});
+  await launch(manager.calibration,'synthetic',{promptBudgetSeconds:120,confirmPause:true});
+  const job=await finished(manager);
+  assert.equal(job.status,'failed');assert.equal(fs.readFileSync(ini,'utf8'),original);
+  const before=reReadsAfter(router.calls);
+  assert.ok(before.includes('bridge invalidate:calibration'),router.calls.join(', '));
+  for(const c of before)assert.ok(['bridge begin:node','bridge invalidate:calibration'].includes(c),router.calls.join(', '));
+});
+
+test('recovery invalidates the baseline before the router re-reads the restored profile',async t=>{
+  const {manager,ini,stateFile,original,router}=fixture(t,{bridge});
+  const written=original.replace('c = 8192','ctx-size = 65536');fs.writeFileSync(ini,written);
+  const revision=require('node:crypto').createHash('sha256').update(written).digest('hex');
+  fs.writeFileSync(stateFile,JSON.stringify({job:{model:'synthetic',status:'running',steps:[],originalText:original,lastRevision:revision},history:{}}));
+  await manager.calibration.recover();
+  assert.equal(fs.readFileSync(ini,'utf8'),original);
+  assert.deepEqual(reReadsAfter(router.calls),['bridge invalidate:calibration']);
+});
+
+// The same re-reads when the invalidation is not acknowledged: the front cannot be reached (bridge),
+// or the local guard cannot write its tombstone (legacy). The router is not asked to re-read, the
+// file is still restored, and the job says the reload is not confirmed.
+const noFront=log=>createFakePresetBaseline({check:()=>({safe:false,reason:'changed',changed:[]}),log,unreachable:['invalidate']});
+const UNCONFIRMED=/Reload failed or timed out\. Previous preset file restored; check router health before retrying\./;
+const rawAfterInvalidate=calls=>{const at=calls.indexOf('bridge invalidate:calibration');return at<0?-1:calls.slice(at).filter(c=>c==='RELOAD').length;};
+
+test('an unacknowledged invalidation: a failed run restores the file without asking the router to re-read it',async t=>{
+  const {manager,ini,original,router}=fixture(t,{loadCap:4096,bridge:noFront});
+  await launch(manager.calibration,'synthetic',{promptBudgetSeconds:120,confirmPause:true});
+  const job=await finished(manager);
+  assert.equal(job.status,'failed');assert.equal(fs.readFileSync(ini,'utf8'),original);
+  assert.equal(rawAfterInvalidate(router.calls),0,router.calls.join(', '));
+  assert.equal(job.restored,true);assert.match(job.error,UNCONFIRMED);
+});
+
+test('an unacknowledged invalidation: recovery restores the file without asking the router to re-read it',async t=>{
+  const {manager,ini,stateFile,original,router}=fixture(t,{bridge:noFront});
+  const written=original.replace('c = 8192','ctx-size = 65536');fs.writeFileSync(ini,written);
+  const revision=require('node:crypto').createHash('sha256').update(written).digest('hex');
+  fs.writeFileSync(stateFile,JSON.stringify({job:{model:'synthetic',status:'running',steps:[],originalText:original,lastRevision:revision},history:{}}));
+  await manager.calibration.recover();
+  assert.equal(fs.readFileSync(ini,'utf8'),original);
+  assert.ok(router.calls.includes('bridge invalidate:calibration'));
+  assert.equal(router.calls.filter(c=>c==='RELOAD').length,0);
+  const job=manager.calibration.stateFacts().job;assert.equal(job.restored,true);assert.match(job.error,UNCONFIRMED);
+});
+
+test('legacy guard: a tombstone that cannot be written is treated the same (no re-read)',async t=>{
+  const dir=fs.mkdtempSync(path.join(os.tmpdir(),'calibration-lock-'));t.after(()=>fs.rmSync(dir,{recursive:true,force:true}));
+  const reloadStatePath=path.join(dir,'reload.json');
+  const {manager,ini,stateFile,original,router}=fixture(t,{reloadStatePath});
+  const written=original.replace('c = 8192','ctx-size = 65536');fs.writeFileSync(ini,written);
+  const revision=require('node:crypto').createHash('sha256').update(written).digest('hex');
+  fs.writeFileSync(stateFile,JSON.stringify({job:{model:'synthetic',status:'running',steps:[],originalText:original,lastRevision:revision},history:{}}));
+  // Another writer holds the baseline lock (fresh, so it is waited for, then the write gives up).
+  fs.writeFileSync(`${reloadStatePath}.lock`,'other');
+  await manager.calibration.recover();
+  assert.equal(fs.readFileSync(ini,'utf8'),original);
+  assert.equal(router.calls.filter(c=>c==='RELOAD').length,0);
+  assert.match(manager.calibration.stateFacts().job.error,UNCONFIRMED);
+  assert.equal(fs.existsSync(reloadStatePath),false,'the old state was not replaced');
 });
