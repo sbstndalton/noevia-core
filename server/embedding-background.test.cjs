@@ -12,12 +12,15 @@ function fixture(t) {
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
   const env = { NOEVIA_START_ID: 'synthetic-start', NOEVIA_PROJECT_STORE_TOKEN: 'synthetic-token', MODEL_LOADER_URL: 'http://127.0.0.1:9999' };
   let clock = 100000;
-  const owner = createOwner({ dataDir: dir, env, now: () => clock, features: () => 'rust-embedding-background-v1' });
+  const owner = createOwner({ dataDir: dir, env, frontSecret: 'synthetic-token', now: () => clock, features: () => 'rust-embedding-background-v1' });
   return { dir, env, owner, now: () => clock, advance: ms => { clock += ms; } };
 }
 test('compiled owner refuses missing start, secret or capability', () => {
   assert.throws(() => createOwner({ env: {}, features: () => '' }));
-  assert.throws(() => createOwner({ env: { NOEVIA_START_ID: 'a', NOEVIA_PROJECT_STORE_TOKEN: 'b' }, features: () => 'old' }));
+  assert.throws(() => createOwner({ env: { NOEVIA_START_ID: 'a' }, frontSecret: 'b', features: () => 'old' }));
+  // #1916: the secret is gone from the environment by the time index.cjs builds the owner; only the captured one counts.
+  assert.throws(() => createOwner({ env: { NOEVIA_START_ID: 'a', NOEVIA_PROJECT_STORE_TOKEN: 'b' }, features: () => 'rust-embedding-background-v1' }));
+  assert.doesNotThrow(() => createOwner({ env: { NOEVIA_START_ID: 'a' }, frontSecret: 'b', features: () => 'rust-embedding-background-v1' }));
 });
 test('paired boot never registers Node timers; shutdown cannot activate fallback', async t => {
   const { owner, env } = fixture(t);
@@ -109,7 +112,7 @@ test('unconfirmed native embedding ownership cannot publish healthy retrieval', 
 
 test('no-loader host still requires a native migration owner and sends start-bound kicks', t => {
   const f = fixture(t), env = { ...f.env }; delete env.MODEL_LOADER_URL;
-  const owner = createOwner({ env, dataDir: f.dir, now: f.now, features: () => 'rust-embedding-background-v1' });
+  const owner = createOwner({ env, frontSecret: 'synthetic-token', dataDir: f.dir, now: f.now, features: () => 'rust-embedding-background-v1' });
   const config = createEmbeddingConfig({ env: { EMBEDDING_NEXT_MODEL: 'next' }, log() {} });
   const migration = createEmbeddingMigration({ config, nativeOwner: owner, rag: { listIndexes: () => [] } });
   assert.equal(owner.healthy(), false, 'absence of loader is not proof of a migration owner');

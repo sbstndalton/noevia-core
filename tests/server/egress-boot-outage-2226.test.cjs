@@ -6,7 +6,7 @@
 const test = require('node:test'), assert = require('node:assert/strict'), fs = require('node:fs'), os = require('node:os'), path = require('node:path');
 const http = require('node:http');
 const { spawn, execFile } = require('node:child_process');
-const { startProjectStore } = require('./project-store-server.cjs');
+const { startProjectStore, syntheticFrontBin } = require('./project-store-server.cjs');
 const davParseWasm = require('../../server/dav-parse-wasm.cjs');
 
 const serverRequire = require('node:module').createRequire(path.join(__dirname, '..', '..', 'server', 'package.json'));
@@ -29,7 +29,7 @@ test('web becomes ready with native egress down, and reports the outage', { skip
     PATH: process.env.PATH, NODE_ENV: 'production', TZ: 'UTC', LANG: 'C.UTF-8',
     UI_PORT: String(port), UI_HOST: '127.0.0.1', UI_DATA_DIR: dataDir, PUBLIC_ORIGIN: `http://127.0.0.1:${port}`,
     INFERENCE_BASE_URL: 'http://127.0.0.1:1', DIARY_BASE_URL: 'http://127.0.0.1:1', MODEL_LOADER_URL: '', MCP_SERVERS: '', COWORK_DECISION_URL: '', COWORK_SYSTEM_ONE_URL: '', MODEL_MANAGER_KIND: 'none',
-    NOEVIA_PROJECT_STORE_PORT: String(store.port), NOEVIA_PROJECT_STORE_TOKEN: store.token, NOEVIA_START_ID: require('node:crypto').randomBytes(16).toString('hex'),
+    NOEVIA_SERVER_BIN: syntheticFrontBin(root), NOEVIA_PROJECT_STORE_PORT: String(store.port), NOEVIA_PROJECT_STORE_TOKEN: store.token, NOEVIA_START_ID: require('node:crypto').randomBytes(16).toString('hex'),
     CODE_EGRESS_PORT: String(egressPort), CODE_EGRESS_IMPL: 'rust', CODE_EGRESS_RUST_HOST: '127.0.0.1', CODE_EGRESS_CONTROL_KEY_FILE: path.join(keyDir, 'current.key'), CODE_EGRESS_KEY_UID: String(uid), CODE_EGRESS_KEY_GID: String(gid),
     ...(process.env.DAV_PARSE_WASM ? { DAV_PARSE_WASM: process.env.DAV_PARSE_WASM } : {}),
   } });
