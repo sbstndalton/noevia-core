@@ -34,11 +34,11 @@ const wasmFile = process.env.DAV_PARSE_WASM || davParseWasm.DEFAULT_WASM;
 const skipWasm = !fs.existsSync(wasmFile) && process.env.DAV_PARSE_WASM_REQUIRED !== '1' && 'dav-parse.wasm not built';
 
 const PINS = {
-  frozen: '85d8b16f1451099d8c710fb092b50ee4ba7049772699bd9bd7a12a6a4c25262a',
+  frozen: 'eb4788d7e79fdee76d4b3e0296958f8d43d06bd5e967d08269ccc49b1f954bb0',
   fixture: '430f13c7cef59e4b473f94af6296bf65a317f10ab7fc5d2285f2e07981225e39',
   oracle: '6235e2ceaffd571f78f1cfaadc7b5d70e01e5edad60819b36e645b2dcda202a6',
-  wasm: '1ac7c7e3aa32c9f951666f2347110167af272b25fe88d1aea088754b55f06b94',
-  noeviaRs: '176bbebf0a1b8b54f5017df0a20f71fd8b102794',
+  wasm: '2305d64d1a75a57b3c52eda673b384c819718aae540c570837b4aeb4ef5e5cb9',
+  noeviaRs: '6e4730c65cc956de7aabf05c3ef87c99a3d3f38e',
   coreCommit: 'b2582357c93cad605524a276090114082de1b2e1',
 };
 const COUNTS = {

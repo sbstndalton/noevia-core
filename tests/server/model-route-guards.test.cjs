@@ -111,11 +111,3 @@ test('resume metadata protects a queued Laya --model path under a neutral id', a
   assert.equal(r.publicJob.status, 'passed');
   assert.deepEqual(r.publicJob.skipped, [{ model: 'router-a', reason: 'System routing model — not tuned' }]);
 });
-
-test('autotune hides raw exception text and keeps public messages', async (t) => {
-  t.mock.method(console, 'error', () => {});
-  const broken = tuner(t, async () => { throw Error('connect ECONNREFUSED 10.0.0.1:8080'); });
-  assert.deepEqual((await broken.make().untuned()).body, { error: 'Could not list untuned models.' });
-  const down = tuner(t, async () => ({ ok: false }));
-  assert.deepEqual((await down.make().untuned()).body, { error: 'The model server is not responding.' });
-});

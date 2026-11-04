@@ -150,6 +150,8 @@ test('#2305 configured loader wires the gated folder writer after manager creati
     process: { env: { MODEL_LOADER_URL: 'http://synthetic-loader.invalid', LLAMACPP_AUTOCONFIG_MEMORY_GIB: '8' } },
     path, DATA_DIR: dir, MODEL_MANAGER_KIND: 'llamacpp', MODEL_MANAGER_BASE: 'http://synthetic-router.invalid', INFERENCE_KEY: 'synthetic',
     require, console, inferenceBudget: {}, fetchJson: () => { throw Error('no network during construction'); },
+    // The front's store client (index.cjs PROJECT_STORE); none here, so the manager keeps the local preset reload guard.
+    PROJECT_STORE: null,
     createModelManager: () => manager,
     modelService: { async managerFetch(route, method) {
       if (route === 'models') return { ok: true, body: { unregistered: ['synthetic'] } };

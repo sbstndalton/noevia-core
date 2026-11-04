@@ -135,9 +135,9 @@ test('through the router: owned routes are refused signed out and signed in, kep
     assert.equal(off.status, 404, `${url} without the add-on`);
     assert.deepEqual(off.json, { error: 'Diary add-on is disabled' });
   }
-  // The local exchange keeps its method guard and its add-on gate here.
-  const wrong = await request('/api/diary/local-exchange', { method: 'GET', headers: as(withDiary) });
-  assert.deepEqual([wrong.status, wrong.json], [405, { error: 'Method not allowed' }]);
+  // The local exchange is the front's too now (rust-diary-local-exchange.test.cjs), refused by its own module.
+  const moved = await request('/api/diary/local-exchange', { method: 'GET', headers: as(withDiary) });
+  assert.deepEqual([moved.status, moved.json], [503, require('./rust-diary-local-exchange.cjs').ROUTE_REFUSAL]);
   // A trailing slash is not the owned route: it falls through to the static 404, as it always did.
   const slash = await request('/api/diary/source/', { headers: as(withDiary) });
   assert.equal(slash.status, 404);
