@@ -675,7 +675,11 @@ function createFullAutotuner({ request: engineRequest, rawModels: engineRawModel
     // A wait for another client that gave up (or was cancelled) inside the calibrator stops the
     // tune as that, not as a context failure.
     let foreignStop = null;
+    // #2303: a cancelled context's pending reads cannot launch after Resume reuses this job.
+    const parentCompletion = completion, parentModel = j.model;
     child = contextFactory({
+      contextCurrent: () => state.job === j && completion === parentCompletion && j.model === parentModel
+        && j.status === 'running' && !cancelled && !starting,
       applyUnlocked: guardedApply(j),
       // #1062: the calibrator waits for another client the same way, then repeats its step.
       foreignHeld: rows => heldForeign(rows, j.model),

@@ -15,7 +15,7 @@
 const fs = require('node:fs');
 const crypto = require('node:crypto');
 const autoconfig = require('./llamacpp-autoconfig.cjs');
-const { isSystemModel, modelPathFromArgs, SYSTEM_MODEL_REASON } = require('./model-system.cjs');
+const { isSystemModel, modelPathFromArgs } = require('./model-system.cjs');
 
 const PAD = 'This is synthetic padding for a context allocation validation.\n';
 const GIB = 1024 ** 3;
@@ -57,6 +57,7 @@ function createCalibrator(deps) {
     request, rawModels, presets, maintenance, applyUnlocked, stateFile,
     stream = async () => { throw Error('Streaming is not configured.'); },
     conservativeFor = async () => null,
+    identityFor = async () => null,
     readMemory = readMemAvailableGib,
     memoryFloorGib = 2,
     onResult = () => {},
@@ -86,7 +87,6 @@ function createCalibrator(deps) {
     fs.writeFileSync(temp, JSON.stringify(state), { mode: 0o600 });
     fs.renameSync(temp, stateFile);
   }
-  const publicJob = job => job && (({ originalText, ...rest }) => rest)(job);
   // #1004: a failed step's engine evidence, by step record (see finish in step()).
   const evidenceOf = new WeakMap();
 
@@ -491,46 +491,81 @@ function createCalibrator(deps) {
     }
   }
 
-  async function start(model, { promptBudgetSeconds = 120, confirmPause } = {}) {
-    if (confirmPause !== true) return { ok: false, status: 400, body: { error: 'Confirm that chat can pause and that Diary background jobs and other clients are stopped.' } };
-    promptBudgetSeconds = Number(promptBudgetSeconds);
-    if (!Number.isInteger(promptBudgetSeconds) || promptBudgetSeconds < 15 || promptBudgetSeconds > 1800) return { ok: false, status: 400, body: { error: 'Choose a prompt time limit between 15 and 1800 seconds.' } };
-    if (state.job?.status === 'running') return { ok: false, status: 409, body: { error: 'A calibration is already running.' } };
+  // #2303: the public start/status policy lives in Rust. These are raw per-use reads
+  // and a conditional worker launch, not an alternate public handler or cached reservation.
+  const launchSalt = crypto.randomBytes(32);
+  let launching = false;
+  const signed = value => crypto.createHmac('sha256', launchSalt).update(JSON.stringify(value)).digest('hex');
+  const launchToken = () => signed({ job: state.job, jobObject: objectId(state.job), cancelRequested, controller: objectId(inflight) });
+  const clone = value => value === undefined ? null : JSON.parse(JSON.stringify(value));
+  function stateFacts() {
+    return { token: launchToken(), starting: launching, job: cancellationFacts().job, history: clone(state.history) };
+  }
+  async function listingFacts(model, token, { signal } = {}) {
+    if (signal?.aborted || token !== launchToken()) return { stale: true };
     let models;
-    try { models = await listing(); } catch { return { ok: false, status: 502, body: { error: 'The model server is not responding.' } }; }
-    const row = models.find(m => m.id === model);
-    if (!row) return { ok: false, status: 404, body: { error: 'Choose an installed model.' } };
-    if (isSystemModel(model, modelPathFromArgs(row.status?.args))) return { ok: false, status: 400, body: { error: SYSTEM_MODEL_REASON } };
-    let base = {}, native = Number(row.meta?.n_ctx_train) || 0;
+    try { models = await listing(signal); } catch { return { backend: false }; }
+    if (signal?.aborted || token !== launchToken()) return { stale: true };
+    const row = models.find(m => m.id === model) || null;
+    const facts = { row: clone(row), system: !!row && isSystemModel(model, modelPathFromArgs(row.status?.args)) };
+    return { backend: true, ...facts, rowToken: signed({ token, model, ...facts }) };
+  }
+  const identityValid = value => value && typeof value === 'object' && !Array.isArray(value)
+    && Object.keys(value).sort().join(',') === 'arch,artifact,build,hardware,profile,quant'
+    && ['arch','quant','hardware'].every(key => value[key] === null || typeof value[key] === 'string')
+    && typeof value.artifact === 'string' && value.artifact.length > 0
+    && typeof value.profile === 'string' && /^[0-9a-f]{64}$/.test(value.profile)
+    && (value.build === null || typeof value.build === 'string' || typeof value.build === 'object' && !Array.isArray(value.build));
+  async function preparationFacts(model, token, rowToken, options = {}) {
+    const facts = await listingFacts(model, token, options);
+    if (facts.stale || !facts.backend) return facts;
+    if (rowToken !== facts.rowToken) return { stale: true };
     const profile = presets.get(model);
+    const revision = presets.snapshot().revision;
     const conservative = await conservativeFor(model).catch(() => null);
-    if (!native && conservative?.native) native = conservative.native;
-    // A model with no profile yet starts from the estimator's settings (context aside).
-    if (!profile.exists && conservative?.values) {
-      for (const [key, value] of Object.entries(conservative.values)) if (key !== 'ctx-size' && profile.fields.includes(key)) base[key] = value;
+    const identity = await identityFor(model).catch(() => null);
+    if (!identityValid(identity)) return { identityReady: false };
+    if (options.signal?.aborted || token !== launchToken() || revision !== presets.snapshot().revision) return { stale: true };
+    let ladderReady = true;
+    try { candidates(); } catch { ladderReady = false; }
+    const prepared = { row: facts.row, system: facts.system, profile: clone(profile), conservative: clone(conservative), identity: clone(identity), identityReady: true, revision, ladderReady };
+    return { ...prepared, preparedToken: signed({ token, model, rowToken, ...prepared }) };
+  }
+  async function compareAndLaunch({ model, token, rowToken, preparedToken, plan }, { signal, isCurrent } = {}) {
+    const current = () => !signal?.aborted && (!isCurrent || isCurrent());
+    if (!current() || launching || state.job?.status === 'running' || signal?.aborted || token !== launchToken()) return { applied: false, reason: 'stale' };
+    // Defensive command schema, not public selection policy. Only the trusted front may send it.
+    if (!plan || !Number.isInteger(plan.promptBudgetSeconds) || plan.promptBudgetSeconds < 15 || plan.promptBudgetSeconds > 1800
+      || !Number.isFinite(plan.native) || !plan.base || typeof plan.base !== 'object' || Array.isArray(plan.base)) throw Error('invalid prepared launch');
+    launching = true;
+    let release, transferred = false;
+    try {
+      const before = await preparationFacts(model, token, rowToken, { signal });
+      if (before.identityReady === false || before.ladderReady === false) return { applied: false, reason: 'unavailable' };
+      if (!current() || before.preparedToken !== preparedToken) return { applied: false, reason: 'stale' };
+      try { release = await maintenance.hold(`Chat is paused while noevia calibrates ${model}. It will be available again when calibration finishes or is cancelled.`); }
+      catch (err) {
+        return { applied: false, reason: 'hold', hold: { status: Number.isInteger(err?.status) ? err.status : null,
+          publicMessage: typeof err?.publicMessage === 'string' ? err.publicMessage.slice(0, 512) : null,
+          code: typeof err?.code === 'string' && /^[a-zA-Z0-9_:-]{1,80}$/.test(err.code) ? err.code : null } };
+      }
+      const after = await preparationFacts(model, token, rowToken, { signal });
+      if (after.identityReady === false || after.ladderReady === false) return { applied: false, reason: 'unavailable' };
+      if (!current() || after.preparedToken !== preparedToken) return { applied: false, reason: 'stale' };
+      const previous = state.job, previousCancel = cancelRequested;
+      cancelRequested = false;
+      const job = { id: crypto.randomUUID(), model, promptBudgetSeconds: plan.promptBudgetSeconds, native: plan.native, base: clone(plan.base),
+        status: 'running', phase: 'Preparing', startedAt: now(), steps: [], memoryFloorGib, memoryGuard: readMemory() == null ? 'unavailable' : 'active' };
+      state.job = job;
+      try { save(); } catch (error) { state.job = previous; cancelRequested = previousCancel; throw error; }
+      completion = run(job, release);
+      transferred = true;
+      completion.catch(() => {});
+      return { applied: true, job: cancellationFacts().job };
+    } finally {
+      launching = false;
+      if (release && !transferred) release();
     }
-    if (!profile.exists && !base.parallel) base.parallel = '1';
-    // #223: the ladder needs the evaluator's candidate list; a fault refuses here, before the gate is held
-    // or any preset is touched, and never falls back to a list of our own.
-    try { ladder(native); } catch (err) {
-      if (err?.code !== 'autoconfig_impl') throw err;
-      return { ok: false, status: err.status || 503, body: { error: `Calibration is unavailable: ${err.message}`, code: 'autoconfig_impl' } };
-    }
-    let release;
-    try { release = await maintenance.hold(`Chat is paused while noevia calibrates ${model}. It will be available again when calibration finishes or is cancelled.`); }
-    catch (err) {
-      if (err?.status === 409 || !err?.status) return { ok: false, status: 409, body: { error: 'Requests are in progress. Wait for them to finish, then start calibration.' } };
-      // #2187: the inference gate refused the hold for another reason (not answering, a wrong admin token).
-      // A token mismatch is this server's configuration, not the browser's credentials: 503, as models-ini-writer does.
-      return { ok: false, status: err.status >= 500 || err.status === 401 || err.status === 403 ? 503 : err.status, body: { error: `Calibration could not pause chat: ${err.publicMessage || 'the inference gate refused the maintenance hold.'}`, ...(err.code ? { code: err.code } : {}) } };
-    }
-    cancelRequested = false;
-    const job = { id: crypto.randomUUID(), model, promptBudgetSeconds, native, base, status: 'running', phase: 'Preparing', startedAt: now(), steps: [], memoryFloorGib, memoryGuard: readMemory() == null ? 'unavailable' : 'active' };
-    state.job = job;
-    save();
-    completion = run(job, release);
-    completion.catch(() => {});
-    return { ok: true, status: 202, body: publicJob(job) };
   }
 
   // #1003: one fill-and-recall step for auto-tune's planner (planned runs). Writes
@@ -580,14 +615,11 @@ function createCalibrator(deps) {
     return { applied: true, job, generation };
   }
 
-  function status(model) {
-    return { ok: true, status: 200, body: { job: publicJob(state.job), history: model ? state.history[model] || [] : undefined } };
-  }
 
   load();
   // A probe has a direct canceller; auto-tune retains an internal alias of the conditional primitive.
   const cancelProbe = () => { cancelRequested = true; inflight?.abort(); };
-  return { start, cancel: () => compareAndAbort(cancelToken()), cancellationFacts, compareAndAbort, cancelProbe, probe, status, recover, completion: () => completion, _state: () => state };
+  return { stateFacts, listingFacts, preparationFacts, compareAndLaunch, cancel: () => compareAndAbort(cancelToken()), cancellationFacts, compareAndAbort, cancelProbe, probe, recover, completion: () => completion, _state: () => state };
 }
 
 module.exports = { createCalibrator, ladder, readMemAvailableGib };
