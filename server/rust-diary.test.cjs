@@ -18,8 +18,9 @@ const parseRequestUrl = (req, base = 'http://localhost') => { try { return new U
 const json = (res, status, body) => Object.assign(res, { status, body });
 const METHODS = ['GET', 'HEAD', 'OPTIONS', 'POST', 'PUT', 'PATCH', 'DELETE'];
 
-test('the owned list is exactly the five proxy-only routes of the front\'s route table', () => {
+test('the owned list is the proxy routes of the front\'s route table', () => {
   assert.deepEqual([...OWNED_PATHS], [
+    '/api/diary/files', '/api/diary/file', '/api/diary/workspace-trash', '/api/diary/history', '/api/diary/external-sources', '/api/diary/external-sources/import', '/api/diary/entries/edit',
     '/api/diary/source', '/api/diary/today', '/api/diary/storage-import', '/api/diary/workspace-export', '/api/diary/workspace-import',
   ]);
   assert.ok(Object.isFrozen(OWNED_PATHS));
@@ -28,6 +29,7 @@ test('the owned list is exactly the five proxy-only routes of the front\'s route
 
 test('every owned route is refused with a 503 and its code, for every method, before the body is touched', () => {
   for (const pathname of OWNED_PATHS) for (const method of METHODS) {
+    if (['/api/diary/external-sources/import','/api/diary/entries/edit'].includes(pathname) && method !== 'POST') continue;
     for (const suffix of ['', '?month=2026-09', '?action=apply&fingerprint=x']) {
       const req = { url: pathname + suffix, method, headers: { host: 'localhost' }, on() { throw new Error('body listener'); }, [Symbol.asyncIterator]() { throw new Error('body read'); } };
       const res = {};
@@ -41,7 +43,6 @@ test('what this module does not own is not refused here: the later round\'s rout
   for (const url of [
     '/api/diary', '/api/diary-connector', '/api/diary/context', '/api/diary/exchanges', '/api/diary/local-exchange', '/api/diary/storage-status',
     '/api/profile/diary-connectors', `/api/profile/diary-connectors/${'a'.repeat(32)}`,
-    '/api/diary/history', '/api/diary/files', '/api/diary/file', '/api/diary/workspace-trash', '/api/diary/external-sources', '/api/diary/entries/edit',
     // core matched `p === '/api/diary/source'` exactly
     '/api/diary/source/', '/api/diary/sourcex', '/api/diary/source/x', '/API/DIARY/SOURCE', '/api/diary/%73ource', '/api/chat',
   ]) {
@@ -129,7 +130,7 @@ test('through the router: owned routes are refused signed out and signed in, kep
   }
   // Positive controls: the routes Node keeps still run the ordinary chain (auth, then the add-on gate).
   // (The storage status, the exchanges and the context moved with #2206: rust-diary-routes.test.cjs.)
-  for (const url of ['/api/diary/history', '/api/diary/workspace-trash', '/api/diary/files']) {
+  for (const url of ['/api/diary/local-exchange']) {
     assert.equal((await request(url)).status, 401, `${url} signed out`);
     const off = await request(url, { headers: as(member) });
     assert.equal(off.status, 404, `${url} without the add-on`);

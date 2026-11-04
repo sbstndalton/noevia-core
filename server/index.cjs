@@ -1631,29 +1631,7 @@ if (require.main === module) {
     internalServer.headersTimeout = 15000;
   }
 
-  const readStorage = (userId) => authService.getStorage(userId, true);
-  require('./diary-backup-worker.cjs').startDiaryBackupWorker({
-    users: () => authService.listUsers(),
-    enabled: id => authService.diaryEnabled(id),
-    // #1429: an account whose saved login was refused (or is throttled) gets no automatic backup
-    // until its credentials change or the backoff passes; it is not counted as a failure either.
-    suspended: user => storageLatch.suspendedFor(user.id, readStorage),
-    // Default 30 s so an idle tenant does not build a new ManagedCorpusBackend every
-    // 3 s; DIARY_BACKUP_WORKER_INTERVAL_MS keeps the old cadence available for tests.
-    interval: Number(process.env.DIARY_BACKUP_WORKER_INTERVAL_MS) > 0 ? Number(process.env.DIARY_BACKUP_WORKER_INTERVAL_MS) : 30000,
-    run: user => requestScope.run({ workspace: workspaceStore.get(user.id), authn: { user, legacy: false } }, async () => {
-      // The backup copies to the remote destination on every run, so it is the one call that
-      // always carries the storage secret (#292); every other call sends only its ref.
-      const target = `${DIARY_BASE}/api/storage-backup`;
-      const r = await fetchJson(target, { method: 'POST', headers: diaryHeaders('POST', target, { secret: true }) }, 300000);
-      // #1429: the Diary tags a refused login (424 storageLoginRejected) and a throttle (503 storageThrottled);
-      // either one holds this account's automatic calls (storage-latch.cjs) until the credentials change.
-      storageLatch.noteDiaryReply(user.id, readStorage, r.body, r.ok);
-      if (!r.ok) throw new Error(`storage-backup failed: ${r.status}`);
-      return r.body;
-    }),
-    onError: userId => console.warn(`[diary-backup] ${userId ? `backup failed for ${userId}` : 'backup tick failed'}, backing off`),
-  });
+  // Diary backup is owned by the paired front build (rust-diary.cjs marker).
   server.requestTimeout = 20 * 60 * 1000;
   // A stray rejected promise in one request or task must not take the whole web process (and
   // every other tenant's session) down with it. Logged loudly with its stack, never silent.

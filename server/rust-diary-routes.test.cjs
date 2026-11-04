@@ -168,7 +168,7 @@ test('through the router: owned routes are refused signed out and signed in; the
     }
   }
   // Positive controls: what Node keeps still runs the ordinary chain (auth, then the add-on gate).
-  for (const url of ['/api/diary/history', '/api/diary/workspace-trash', '/api/diary/files']) {
+  for (const url of ['/api/diary/local-exchange']) {
     assert.equal((await request(url)).status, 401, `${url} signed out`);
     const off = await request(url, { headers: as(member) });
     assert.equal(off.status, 404, `${url} without the add-on`);
