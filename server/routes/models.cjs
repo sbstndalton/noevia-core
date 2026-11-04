@@ -533,16 +533,7 @@ function createModelRoutes({ servedEmbeddingModels = (target) => require('../rag
       res.setHeader('Cache-Control','no-store');
       return json(res,result.status,result.body);
     }
-    if (p === '/api/models/calibration') {
-      if(authn.user.role!=='admin')return json(res,403,{error:'Administrator required for shared model profiles'});
-      if(!modelManager.calibration)return json(res,404,{error:'Native calibration is unavailable'});
-      let result;
-      if(req.method==='GET')result=modelManager.calibration.status(url.searchParams.get('model')||'');
-      else if(req.method==='POST'){const body=await readJson(req);result=await modelManager.calibration.start(String(body?.model||''),{promptBudgetSeconds:body?.promptBudgetSeconds,confirmPause:body?.confirmPause});}
-      else return json(res,405,{error:'Method not allowed'});
-      res.setHeader('Cache-Control','no-store');
-      return json(res,result.status,result.body);
-    }
+    // #2303: every method of /api/models/calibration is owned by the Rust front.
 
     // GET /api/models/preset/suggest and GET /api/models/estimate are the Rust front's (#2189,
     // noevia-rs model_sizing.rs; rust-model-sizing.cjs refuses them before authentication). Their

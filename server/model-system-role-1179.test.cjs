@@ -172,13 +172,9 @@ test('the callers that keep a system model out of chat and tuning follow the rol
     const manager = createModelManager({ kind: 'llamacpp', baseUrl: 'http://synthetic', presetPath: ini, fetchJson, calibrationStatePath: path.join(dir, 'state.json'), autoconfig: {}, calibrationOptions: { sleep: async () => {}, readMemory: () => 20 } });
     assert.equal(isChatGenerationModel('box'), !system, `chat: ${role}`);
     assert.equal(isNonChatRow({ id: 'box', status: { args: [] } }), system, `role engine: ${role}`);
-    const started = await manager.calibration.start('box', { promptBudgetSeconds: 60, confirmPause: true });
-    if (system) {
-      assert.equal(started.status, 400, `tuning: ${role}`);
-      assert.equal(started.body.error, sys.SYSTEM_MODEL_REASON);
-      assert.equal(unloads, 0);
-    } else {
-      assert.notEqual(started.body?.error, sys.SYSTEM_MODEL_REASON, 'an unrelated role is tuned like any chat model');
-    }
+    const {token}=manager.calibration.stateFacts();
+    const facts=await manager.calibration.listingFacts('box',token);
+    assert.equal(facts.system,system,`calibration role fact: ${role}`);
+    assert.equal(unloads,0);
   }
 });
