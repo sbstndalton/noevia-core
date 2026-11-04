@@ -258,7 +258,7 @@ async function* withIdleLimit(iterable, ms, onIdle = null) {
 }
 
 function createChatHandler({
-  stepSupervision = null, chatMachines = null, fs, path, crypto, fetch, codeTasksFor = () => [], heuristicWantsCode = require('./auto-router.cjs').createAutoRouter({}).heuristicWantsCode, reasoningEffort, diaryExtras, createToolExchange, rag, prefill, reduceToolResult, HISTORY_CAP, DEFAULT_PROVIDER_ID, DIARY_BASE, TOOL_RESULT_CAP, authService, toolPolicy, modelManager, requestScope, currentWorkspace, json, getProject, getProvider, providerHeaders, saveChats, endpointApproved, diaryHeaders, diaryStorageRetry = (send) => send(true), autoRoles, lastLoadedModel, classifyFastOrSmart, servedCatalogue, modelsInstalled, missingRoles, staleRolesError, visionProbe, visionDescriptions, skillsIndexFor, chatSkillRouter, chatToolRouter, toolGate = null, chatFramingEnabled = () => false, freeChats = () => [], framingReasoner = null, reasoningTraces = null, brainContext = null, DEFAULT_TOOLBOXES, CONNECTOR_BOXES, connectedBoxes, allToolboxes, resolveTools, isWriteTool, executeToolCall, oauthServerIds, accountReady, chatWideApproved, awaitApproval, recordUsage, recordToolUse, chatListHolder = () => undefined, revokeChatGrant = () => {}, grantContext = (chat) => currentWorkspace().chatPermissions.context(chat),
+  stepSupervision = null, chatMachines = null, fs, path, crypto, fetch, codeTasksFor = () => [], heuristicWantsCode = require('./auto-router.cjs').createAutoRouter({}).heuristicWantsCode, reasoningEffort, diaryExtras, createToolExchange, rag, prefill, reduceToolResult, HISTORY_CAP, DEFAULT_PROVIDER_ID, DIARY_BASE, TOOL_RESULT_CAP, authService, toolPolicy, modelManager, requestScope, currentWorkspace, json, getProject, getProvider, providerHeaders, saveChats, endpointApproved, diaryHeaders, diaryStorageRetry = (send) => send(true), autoRoles, lastLoadedModel, classifyFastOrSmart, servedCatalogue, modelsInstalled, missingRoles, staleRolesError, visionProbe, visionDescriptions, skillsIndexFor, chatSkillRouter, chatToolRouter, toolGate = null, chatFramingEnabled = () => false, freeChats = () => [], framingReasoner = null, reasoningTraces = null, brainContext = null, DEFAULT_TOOLBOXES, CONNECTOR_BOXES, connectedBoxes, allToolboxes, resolveTools, isWriteTool, executeToolCall, oauthServerIds, accountReady, chatWideApproved, awaitApproval, openApproval = async () => true, recordUsage, recordToolUse, chatListHolder = () => undefined, revokeChatGrant = () => {}, grantContext = (chat) => currentWorkspace().chatPermissions.context(chat),
   // #1550: per request, whether a box Automatic may add is usable by this account (its Nextcloud connection, for one).
   automaticToolsReady = () => () => true,
   chatgptOAuth = null, chatgptEnabled = () => false, skillHistory = null,
@@ -288,6 +288,7 @@ function createChatHandler({
   // #1079: a chat or project with Context: High is served by its model's `<model>-long` profile.
   longProfiles = require('./long-profile.cjs').createLongProfiles(),
   // #778 (features.routingModes): { enabled(), settings(), sensitivity(digest), awaitChoice(...),
+  // openChoice(...) (port contract S9: opens the question at the front first; optional),
   // setChatFlags(projectId, chatId, patch), log(entry) }. Not wired or flag off: nothing changes.
   routingModes = null,
   // #1441: how a turn waits for the project's file jobs still running; the wait is bounded.
@@ -949,6 +950,8 @@ function createChatHandler({
               heartbeatStart();
             }
             const id = crypto.randomUUID();
+            // Port contract S9: opened at the front's registry before the card is shown.
+            if (typeof routingModes.openChoice === 'function' && !(await routingModes.openChoice({ id, userId: routeUserId, chatId }))) return { choice: 'timeout' };
             send({ type: 'route_pending', id, flag });
             return routingModes.awaitChoice({ id, userId: routeUserId, chatId, abortSignal: chatSignal.signal });
           },
@@ -2367,7 +2370,7 @@ function createChatHandler({
               } catch {
                 return 'ERROR: the chat permission context could not be verified; the tool was not run. Nothing was changed. Ask again.';
               }
-              usedGrant = chatWideApproved(userId, grantChat, writeGrantScope, permissionBinding);
+              usedGrant = await chatWideApproved(userId, grantChat, writeGrantScope, permissionBinding);
             }
             const askedPerCall = permission === 'ask' && (!usedGrant || provenanceHits.length > 0 || automaticOnlyWrites.has(tc.name));
             if (askedPerCall) {
@@ -2375,6 +2378,15 @@ function createChatHandler({
               // #658: the same tool, target and arguments as a write that already succeeded in this
               // chat. Only a flag on the card: the person still decides, with all three actions.
               const repeat = writePrint !== null && (writesDone.has(userId, chatId, writePrint) || recentWriteFps.has(writePrint));
+              // Port contract S9: the question is opened at the front's approval registry before
+              // the card is shown, so the person's answer always finds it.
+              const notAsked = () => {
+                result = `ERROR: the approval for ${tc.name} could not be asked, so it was not run. Nothing was changed. Ask again.`;
+                authService.audit('tool.denied', userId, userId, { tool: tc.name, reason: 'unavailable' });
+                notRunResults.add(result);
+                return result;
+              };
+              if (!(await openApproval({ id: approvalId, userId, chatId: grantChat, scope: writeGrantScope, binding: permissionBinding }))) return notAsked();
               send({
                 type: 'tool_pending',
                 id: approvalId,
@@ -2395,6 +2407,7 @@ function createChatHandler({
                 // dying or the chip hanging with no result.
                 // #679: the client went away while the card was open. Nobody declined, and the
                 // write did not run; the kept reply shows the call as stopped, not declined.
+                if (decision === 'unavailable') return notAsked();
                 if (decision === 'aborted') {
                   result = `ERROR: the reply was stopped before ${tc.name} was approved, so it was not run. Nothing was changed.`;
                   authService.audit('tool.denied', userId, userId, { tool: tc.name, reason: decision });
@@ -2436,7 +2449,7 @@ function createChatHandler({
               const target = typeof targetNow?.target === 'string' && targetNow.target ? targetNow.target : null;
               const kind = typeof targetNow?.kind === 'string' ? targetNow.kind : null;
               if (targetNow?.error || target !== cardTarget || kind !== (targetKind || null)) {
-                revokeChatGrant(userId, grantChat);
+                await revokeChatGrant(userId, grantChat);
                 return 'ERROR: the write target changed after approval; the tool was not run. Ask again.';
               }
             }
@@ -2444,11 +2457,11 @@ function createChatHandler({
               try {
                 const finalBinding = await permissionContext(); // LAST await before dispatch.
                 if ((chatId && !grantContexts.matches(permissionBinding, finalBinding)) ||
-                    (usedGrant && !askedPerCall && !chatWideApproved(userId, grantChat, writeGrantScope, finalBinding)) ||
+                    (usedGrant && !askedPerCall && !(await chatWideApproved(userId, grantChat, writeGrantScope, finalBinding))) ||
                     approvalTarget() !== shownTarget || currentWorkspace().userId !== userId || currentWorkspace().revoked) throw grantContexts.invalid();
               } catch {
                 // Even Allow once refuses a move-away-and-back, restart, deletion or failed read.
-                revokeChatGrant(userId, grantChat);
+                await revokeChatGrant(userId, grantChat);
                 return 'ERROR: the chat or permission target changed after approval; the tool was not run. Nothing was changed. Ask again.';
               }
             }
@@ -2456,7 +2469,7 @@ function createChatHandler({
             if (editTarget !== null) {
               const nowTarget = editTargets.resolveEditTarget(project ? getProject(project.id) : null, tc.args, { storageAccount: editStorageAccount(userId) });
               if (nowTarget.path !== editTarget || (nowTarget.account || null) !== editAccount) {
-                revokeChatGrant(userId, grantChat);
+                await revokeChatGrant(userId, grantChat);
                 return 'ERROR: the project target changed before dispatch; tool was not run. Ask again.';
               }
             }

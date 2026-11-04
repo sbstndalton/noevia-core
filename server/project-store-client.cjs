@@ -132,9 +132,16 @@ function createClient({ port, token, fetchImpl = globalThis.fetch, timeoutMs = T
     if (!PRESET_BASELINE_OPS.has(op)) throw new Error(`not a preset baseline op: ${op}`);
     return call(`preset-baseline/${op}`, payload, wait);
   }
+  // Port contract S9 (rust-approval-registry.cjs): the front's approval registry. { status, body };
+  // `signal` drops a wait (the turn stopped), which withdraws its question at the front.
+  async function approvals(op, payload, { wait = timeoutMs, signal = null } = {}) {
+    if (!require('./rust-approval-registry.cjs').OPS.has(op)) throw new Error(`not an approval op: ${op}`);
+    return call(`approvals/${op}`, payload, wait, signal);
+  }
   return {
     featureContext,
     presetBaseline,
+    approvals,
     async grantContext(user, chat) {
       const { status, body } = await call('chat/grant-context', { user, chat });
       if (status !== 200) throw moveFailure(status, body);

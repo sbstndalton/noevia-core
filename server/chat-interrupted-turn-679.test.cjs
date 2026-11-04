@@ -38,7 +38,7 @@ const store = (ws, id, history) => fs.writeFileSync(ws.historyPath(id), JSON.str
 
 /** One handler. Each scripted model turn is a list of chunks; DISCONNECT in it closes the client
  *  connection at that point (the stream then ends the way an aborted fetch does). */
-function harness(t, { approvals = createApprovals(), onPending = null, workspaces = null } = {}) {
+function harness(t, { approvals = createApprovals(), onPending = null, workspaces = null, openApproval = undefined } = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'noevia-679-'));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
   fs.mkdirSync(path.join(root, 'a')); fs.mkdirSync(path.join(root, 'b'));
@@ -83,6 +83,7 @@ function harness(t, { approvals = createApprovals(), onPending = null, workspace
     executeToolCall: async (_p, name, args) => { state.executed.push({ name, args: JSON.parse(args) }); return name === 'synthetic_read' ? 'Zahl: 1' : `Appended 10 chars to "${TARGET}".`; },
     grantContext: async raw => require('../tests/server/chat-grant-fixture.cjs').context(raw, { holder: { kind: 'absent' } }), chatWideApproved: () => false,
     awaitApproval: (card) => { const p = approvals.awaitApproval(card); if (onPending) onPending(card, state, disconnect); return p; },
+    ...(openApproval ? { openApproval } : {}),
     recordUsage() {}, recordToolUse() {},
     writeTargetFor: async (name) => (name === 'synthetic_append' ? { target: TARGET } : null),
   });
@@ -163,6 +164,50 @@ test('a reload while an approval card is open: the write never runs, is not "dec
   assert.match(call.result, /stopped before synthetic_append was approved, so it was not run/);
   assert.equal(history[1].paused, undefined, 'nothing was saved, so no change note');
   assert.equal(history[1].model, 'Stopped');
+});
+
+// Port contract S9: the same rule through the Rust front's approval registry (a loopback stand-in
+// for its /v1/approvals ops). The turn's Stop drops its wait, so the front withdraws the question.
+test('S9: a reload while a registry approval card is open: stopped, not declined, and the front withdraws it', async (t) => {
+  const { startFakeApprovalStore } = require('../tests/server/fake-approval-store.cjs');
+  const fake = await startFakeApprovalStore();
+  t.after(() => fake.close());
+  const client = require('./project-store-client.cjs').createClient({ port: fake.port, token: fake.token });
+  const registry = require('./rust-approval-registry.cjs').createApprovalRegistry({ approvals: client.approvals });
+  let approvalId = null;
+  const h = harness(t, {
+    approvals: registry, openApproval: registry.openApproval,
+    onPending: (card, _state, disconnect) => { approvalId = card.id; setTimeout(disconnect, 50); },
+  });
+  store(h.a, 'chat-679', [{ role: 'user', content: 'Append it.' }]);
+  h.state.turns.push([toolCall('synthetic_append', APPEND, 'call-1')], [say('never requested')]);
+  const events = await h.send({ message: 'Append it.' });
+  const pending = events.find((e) => e.type === 'tool_pending');
+  assert.equal(pending.id, approvalId);
+  const opened = fake.seen.find((s) => s.op === 'open');
+  assert.deepEqual({ id: opened.body.id, user: opened.body.user, kind: opened.body.kind, chat: opened.body.chat },
+    { id: approvalId, user: 'synthetic-user-a', kind: 'write', chat: 'chat-679' }, 'opened at the front before the card was shown');
+  assert.ok(fake.seen.indexOf(opened) < fake.seen.findIndex((s) => s.op === 'wait'));
+  for (let i = 0; i < 100 && !fake.dropped.includes(approvalId); i++) await new Promise((r) => setTimeout(r, 10));
+  assert.deepEqual(fake.dropped, [approvalId], 'the wait was dropped when the client left');
+  assert.equal(fake.answer('synthetic-user-a', approvalId, { outcome: 'approve' }), false, 'a late Allow has nothing to approve');
+  assert.equal(h.state.executed.length, 0, 'the pending write did not run');
+  const call = readStored(h.a, 'chat-679')[1].toolCalls[0];
+  assert.equal(call.status, 'stopped', 'shown as stopped, not declined');
+  assert.match(call.result, /stopped before synthetic_append was approved, so it was not run/);
+});
+
+test('S9: a registry that cannot be asked leaves the write not run and the card never shown', async (t) => {
+  const h = harness(t, { openApproval: async () => false, onPending: () => assert.fail('no card without an open question') });
+  store(h.a, 'chat-679', [{ role: 'user', content: 'Append it.' }]);
+  h.state.turns.push([toolCall('synthetic_append', APPEND, 'call-1')], [say('Could not ask.')]);
+  const events = await h.send({ message: 'Append it.' });
+  assert.equal(events.some((e) => e.type === 'tool_pending'), false);
+  assert.equal(h.state.executed.length, 0);
+  const result = events.find((e) => e.type === 'tool_result');
+  assert.equal(result.notRun, true);
+  assert.equal(result.declined, undefined, 'not reported as the person declining');
+  assert.match(result.text, /approval for synthetic_append could not be asked, so it was not run/);
 });
 
 test('nothing is written when the reply finishes, when someone already saved past the turn, or for a deleted chat', async (t) => {
