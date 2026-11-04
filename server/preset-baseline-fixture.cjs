@@ -8,7 +8,7 @@
 const { engineView } = require('./preset-reload.cjs');
 
 function createFakePresetBaseline({ check, session = 200, begin = 200, staleSettle = false, unreachable = [], log = [] } = {}) {
-  let baseline = null, gen = 0, n = 0, epoch = 'fake-epoch-1', starts = 1;
+  let baseline = null, gen = 0, n = 0, epoch = 'fake-epoch-1', starts = 1, nodeSession = null;
   const open = new Map();
   const boots = [];
   const answer = (status, body) => ({ status, body });
@@ -21,13 +21,19 @@ function createFakePresetBaseline({ check, session = 200, begin = 200, staleSett
       case 'session':
         if (session !== 200) return answer(session, { error: 'Not found' });
         boots.push(body.nodeBoot);
+        // Like reload.rs session(): a new boot id ends every open ticket of another session
+        // (one begun before any session included) as a forget.
+        if (body.nodeBoot !== nodeSession) {
+          nodeSession = body.nodeBoot;
+          for (const [k, t] of open) if (t.session !== nodeSession) { open.delete(k); gen += 1; baseline = null; }
+        }
         return answer(200, { epoch, protocol: 1 });
       case 'begin': {
         if (begin !== 200) return answer(begin, { error: 'preset reload baseline unavailable' });
         const g = ++gen, ticket = `${epoch}-${++n}`;
         const overlapped = open.size > 0;
         for (const t of open.values()) t.overlapped = true;
-        open.set(ticket, { gen: g, overlapped });
+        open.set(ticket, { gen: g, overlapped, session: nodeSession });
         return answer(200, { ticket, gen: g, epoch, deadlineMs: 180000 });
       }
       case 'settle': {
@@ -62,8 +68,8 @@ function createFakePresetBaseline({ check, session = 200, begin = 200, staleSett
     }
   }
   /** A front restarted on its own: a new epoch, nothing open, no session, the baseline unknown. */
-  const restart = () => { starts += 1; epoch = `fake-epoch-${starts}`; open.clear(); baseline = null; gen = 0; boots.length = 0; };
-  return { presetBaseline, log, restart, state: () => ({ baseline, open: open.size, gen, epoch, boots: [...boots] }) };
+  const restart = () => { starts += 1; epoch = `fake-epoch-${starts}`; open.clear(); baseline = null; gen = 0; boots.length = 0; nodeSession = null; };
+  return { presetBaseline, log, restart, state: () => ({ baseline, open: open.size, gen, epoch, boots: [...boots], nodeSession }) };
 }
 
 module.exports = { createFakePresetBaseline };

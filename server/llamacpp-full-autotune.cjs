@@ -294,8 +294,9 @@ function createFullAutotuner({ request: engineRequest, rawModels: engineRawModel
   // #1079: a Long tune's `<model>-long` section (long-profile.cjs, Rust's decisions) and the router
   // re-read after it is added (the manager's guarded reload; the plain router call by default).
   longProfiles = require('./long-profile.cjs').createLongProfiles(), reloadRouter: routerReload = null,
-  // The preset reload baseline is made unknown before each raw router re-read (preset-reload.cjs).
-  invalidateBaseline = async () => {} }) {
+  // The preset reload baseline is made unknown before each raw router re-read (preset-reload.cjs);
+  // false: that was not acknowledged, so the re-read is not made and stays owed (_reloadPending).
+  invalidateBaseline = async () => true }) {
   const request = engineBoundary(engineRequest), rawModels = engineBoundary(engineRawModels);
   let state;
   try { state = JSON.parse(fs.readFileSync(stateFile, 'utf8')); } catch { state = {}; }
@@ -968,10 +969,17 @@ function createFullAutotuner({ request: engineRequest, rawModels: engineRawModel
   }
   async function reloadRouter(j) {
     if ((await othersLiveNow(j.model)) === false) {
-      await invalidateBaseline('autotune');
-      const reload = await request('/models?reload=1', {}, 120000);
-      if (!reload.ok) throw Error('The router did not confirm restored settings.');
-      j._reloadPending = false; save();
+      if (await invalidateBaseline('autotune')) {
+        const reload = await request('/models?reload=1', {}, 120000);
+        if (!reload.ok) throw Error('The router did not confirm restored settings.');
+        j._reloadPending = false; save();
+        return;
+      }
+      // Not re-read: owed, like a re-read deferred for another client (retried, and flushed before
+      // this model loads again).
+      j._reloadPending = true;
+      note(j, 'The model server has not re-read the restored models.ini; it does so before this model next loads.');
+      scheduleReload(j);
       return;
     }
     j._reloadPending = true;
@@ -988,7 +996,7 @@ function createFullAutotuner({ request: engineRequest, rawModels: engineRawModel
       if ((await othersLiveNow(j.model)) === false) {
         // #1072: a flush may have re-read the file while this check was in flight; no second re-read.
         if (!j._reloadPending) return;
-        try { await invalidateBaseline('autotune'); const r = await request('/models?reload=1', {}, 120000); if (r.ok) { j._reloadPending = false; note(j, 'The model server re-read the restored models.ini.'); return; } } catch { /* retried below */ }
+        try { if (await invalidateBaseline('autotune')) { const r = await request('/models?reload=1', {}, 120000); if (r.ok) { j._reloadPending = false; note(j, 'The model server re-read the restored models.ini.'); return; } } } catch { /* retried below */ }
       }
       scheduleReload(j, tries + 1);
     }, Math.max(foreignPollMs * 15, 1));
@@ -1003,8 +1011,8 @@ function createFullAutotuner({ request: engineRequest, rawModels: engineRawModel
     clearTimeout(reloadTimer);
     // #1072: a request that throws (the server unreachable) is the same refusal as a bad answer, and the
     // re-read is still owed, so it is re-armed rather than left for the next flush alone.
-    await invalidateBaseline('autotune');
-    const r = await request('/models?reload=1', {}, 120000).catch(() => null);
+    // Not acknowledged: no re-read, the same refusal as a failed one (re-armed below).
+    const r = (await invalidateBaseline('autotune')) ? await request('/models?reload=1', {}, 120000).catch(() => null) : null;
     guard?.();
     if (!r?.ok) {
       scheduleReload(j);
@@ -1623,7 +1631,8 @@ function createFullAutotuner({ request: engineRequest, rawModels: engineRawModel
         const unloaded = await request('/models/unload', { method: 'POST', body: JSON.stringify({ model: j.model }) }, 60000);
         if (!unloaded.ok) throw Error('Could not unload the test model.');
         await presets.commit({ baseRevision: j.lastRevision, text: j.originalText });
-        await invalidateBaseline('autotune');
+        // Not acknowledged: no re-read now; it stays owed and is retried in the background.
+        if (!(await invalidateBaseline('autotune'))) { j._reloadPending = true; throw Error('The router did not confirm restored settings.'); }
         const reload = await request('/models?reload=1', {}, 120000);
         if (!reload.ok) throw Error('The router did not confirm restored settings.');
         j.restored = true;
@@ -1631,7 +1640,9 @@ function createFullAutotuner({ request: engineRequest, rawModels: engineRawModel
       delete j.originalText; j.status = 'interrupted';
       j.error = j.restored ? 'An older tuning run was interrupted and restored. Start a new tune.'
         : 'An older tuning run was interrupted; settings could not safely be restored. Inspect models.ini before tuning again.';
-      save(); return;
+      save();
+      if (j._reloadPending) scheduleReload(j);
+      return;
     }
     const item = j.models.find(m => m.status === 'running');
     const p = item?.phases.find(p => p.status === 'running');

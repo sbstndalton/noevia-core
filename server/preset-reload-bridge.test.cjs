@@ -21,16 +21,18 @@ function managerWith(t, front, { log } = {}) {
   const dir = tmp(t), file = path.join(dir, 'models.ini'), stateFile = path.join(dir, 'reload.json');
   fs.writeFileSync(file, BASE);
   const state = { loaded: [], calls: log || [] };
+  const openAtReload = [];
   const fetchJson = async (url, opts = {}) => {
     const u = new URL(url);
     state.calls.push(`${opts.method || 'GET'} ${u.pathname}${u.search}`);
+    if (u.search.includes('reload=1') && typeof front.state === 'function') openAtReload.push(front.state().open);
     if (u.pathname === '/models/unload') { const id = JSON.parse(opts.body).model; state.loaded = state.loaded.filter((x) => x !== id); return { ok: true, status: 200, body: { success: true } }; }
     return { ok: true, status: 200, body: { data: rows(state.loaded) } };
   };
   const logs = [];
   const reloadGuard = createBridgeReloadGuard({ client: front, legacy: () => createReloadGuard({ check: same, stateFile }), log: (m) => logs.push(m), retryMs: 1 });
   const manager = createLlamaCppManager({ baseUrl: 'http://synthetic', presetPath: file, fetchJson, reloadGuard });
-  return { manager, state, stateFile, logs, reloadGuard, reloads: () => state.calls.filter((c) => c === 'GET /models?reload=1').length };
+  return { manager, state, stateFile, logs, reloadGuard, openAtReload, reloads: () => state.calls.filter((c) => c === 'GET /models?reload=1').length };
 }
 
 test('the boot session decides bridge mode, and the front then holds the baseline', async (t) => {
@@ -118,7 +120,11 @@ test('a front restarted on its own: begin shows a new epoch and the session is s
   assert.equal((await f.manager.reloadPresets()).status, 200);
   assert.equal(f.reloadGuard.epoch(), 'fake-epoch-2');
   assert.equal(front.state().boots.length, 1, 'the same boot id, sent to the new front');
-  assert.deepEqual(front.log.slice(at), ['bridge begin:node', 'bridge session', 'bridge settle'], 'the session went out before the reload was settled');
+  // The re-session ends the first ticket (Rust's session does), so a fresh one carries the reload.
+  assert.deepEqual(front.log.slice(at), ['bridge begin:node', 'bridge session', 'bridge begin:node', 'bridge settle']);
+  assert.deepEqual(f.openAtReload.at(-1), 1, 'the ticket was open through the engine call');
+  assert.equal(front.state().baseline?.text, BASE, 'the settle recorded (200), not stale');
+  assert.ok(!f.logs.some((m) => /stale/.test(m)), f.logs.join('\n'));
   assert.ok(f.logs.some((m) => /front restarted.*fake-epoch-1 -> fake-epoch-2/.test(m)), f.logs.join('\n'));
   // The same epoch again: no further session.
   await f.manager.reloadPresets();
@@ -157,4 +163,62 @@ test('the store client sends the bridge ops to the internal listener with the se
   assert.equal(seen[0].opts.headers['x-noevia-store-token'], 'x'.repeat(32));
   assert.equal(BRIDGE_TIMEOUT_MS, 5000);
   await assert.rejects(client.presetBaseline('write', {}), /not a preset baseline op/);
+});
+
+test('a front whose epoch moves again after the re-session is not trusted with the reload (502, no reload)', async (t) => {
+  const front = createFakePresetBaseline({ check: same });
+  // Every session after the boot one lands on a front that restarts right after answering it.
+  let sessions = 0;
+  const client = { state: front.state, presetBaseline: async (op, body, o) => {
+    const answer = await front.presetBaseline(op, body, o);
+    if (op === 'session' && ++sessions > 1) front.restart();
+    return answer;
+  } };
+  const f = managerWith(t, client);
+  assert.equal((await f.manager.reloadPresets()).status, 200);
+  front.restart();
+  const r = await f.manager.reloadPresets();
+  assert.equal(r.status, 502);
+  assert.equal(r.body.error, 'The engine did not reload its settings. Check the Hardware tab.');
+  assert.equal(f.reloads(), 1, 'only the first reload reached the router');
+  assert.equal(front.log.filter((c) => c === 'bridge begin:node').length, 3, 'one retry, no more');
+});
+
+test('a re-session the front does not answer means no ticket: 502, no reload', async (t) => {
+  const front = createFakePresetBaseline({ check: same });
+  let down = false;
+  const client = { state: front.state, presetBaseline: async (op, body, o) => {
+    if (down && op === 'session') throw new Error('The project store is busy. Try again shortly.');
+    return front.presetBaseline(op, body, o);
+  } };
+  const f = managerWith(t, client);
+  assert.equal((await f.manager.reloadPresets()).status, 200);
+  front.restart(); down = true;
+  assert.equal((await f.manager.reloadPresets()).status, 502);
+  assert.equal(f.reloads(), 1);
+});
+
+test('the fake front retires another session\'s tickets on session, as reload.rs does', async () => {
+  const front = createFakePresetBaseline({ check: same });
+  const opts = { timeoutMs: 5000 };
+  const early = (await front.presetBaseline('begin', { origin: 'node' }, opts)).body.ticket;
+  await front.presetBaseline('session', { nodeBoot: 'boot-a', protocol: 1 }, opts);
+  assert.equal(front.state().open, 0);
+  assert.equal((await front.presetBaseline('settle', { ticket: early, outcome: 'forget' }, opts)).status, 409);
+  const mine = (await front.presetBaseline('begin', { origin: 'node' }, opts)).body.ticket;
+  await front.presetBaseline('session', { nodeBoot: 'boot-a', protocol: 1 }, opts);
+  assert.equal(front.state().open, 1, 'the same boot id again is a no-op');
+  assert.equal((await front.presetBaseline('settle', { ticket: mine, outcome: 'forget' }, opts)).status, 200);
+});
+
+test('invalidate answers saved only when the front or the local file took the tombstone', async (t) => {
+  const ok = createBridgeReloadGuard({ client: createFakePresetBaseline({ check: same }) });
+  assert.deepEqual(await ok.invalidate('calibration'), { saved: true });
+  const down = createBridgeReloadGuard({ client: createFakePresetBaseline({ check: same, unreachable: ['invalidate'] }) });
+  assert.deepEqual(await down.invalidate('calibration'), { saved: false });
+  const stateFile = path.join(tmp(t), 'reload.json');
+  const local = createReloadGuard({ stateFile, check: same, lock: { waitMs: 30 } });
+  assert.deepEqual(await local.invalidate(), { saved: true });
+  fs.writeFileSync(`${stateFile}.lock`, 'other');
+  assert.deepEqual(await local.invalidate(), { saved: false });
 });

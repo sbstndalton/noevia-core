@@ -119,8 +119,10 @@ function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloa
     return result;
   }
   // Before a raw router re-read that skips routerReload (calibration and auto-tune restores, #1068):
-  // the baseline is unknown from then on. Never throws; a failure is logged by the guard.
-  const invalidateBaseline=async origin=>{try{await reloadGuard.invalidate(origin);}catch{}};
+  // the baseline is unknown from then on. True only when that was acknowledged (saved); on false the
+  // caller must not re-read, or the router would run on text the baseline may still vouch for.
+  // Never throws; a failure is logged by the guard.
+  const invalidateBaseline=async origin=>{try{return (await reloadGuard.invalidate(origin))?.saved===true;}catch{return false;}};
   async function mutate(fn) {const leave=maintenance.enter();try{return await fn();}finally{leave();}}
   // #1079: which rows are a model and its `<model>-long` profile (Rust's pairing; none on failure).
   const longProfiles=autotuneOptions.longProfiles||require('./long-profile.cjs').createLongProfiles();

@@ -91,16 +91,18 @@ function createReloadGuard({ stateFile = null, check = (req) => require('./dav-p
   const current = () => (stateFile ? (unsaved ? null : readBaseline(stateFile)) : memory);
   let pending = Promise.resolve(), generation = 0;
   const persist = (next) => {
-    if (!stateFile) { memory = next; return Promise.resolve(); }
+    if (!stateFile) { memory = next; return Promise.resolve(true); }
     // Do not trust an older on-disk baseline while this write (or a later queued one) waits.
     unsaved = true;
     const writing = ++generation;
+    // Resolves true when this write reached the file, false when it failed (logged).
     pending = pending.catch(() => {}).then(async () => {
       try {
         // Forgetting writes a tombstone: a failed delete cannot expose an old baseline on restart.
         await writeLocked(stateFile, JSON.stringify(next || {}), lock);
         if (writing === generation) unsaved = false;
-      } catch (e) { unsaved = true; log(`[models] could not save the preset reload baseline; it is treated as unknown: ${e?.message || e}`); }
+        return true;
+      } catch (e) { unsaved = true; log(`[models] could not save the preset reload baseline; it is treated as unknown: ${e?.message || e}`); return false; }
     });
     return pending;
   };
@@ -117,11 +119,12 @@ function createReloadGuard({ stateFile = null, check = (req) => require('./dav-p
     // one shape: a local reload ticket, its settle as record/forget, and invalidate as forget.
     async begin() { return { ticket: null, local: true }; },
     async settle(_ticket, outcome, { before = null, rows = null, after = null } = {}) {
-      await (outcome === 'record' ? record(before, rows, after) : persist(null));
-      return { saved: !unsaved };
+      return { saved: (await (outcome === 'record' ? record(before, rows, after) : persist(null))) === true };
     },
-    /** Before a raw router re-read (calibration, auto-tune): the baseline is unknown from now on. */
-    async invalidate() { await persist(null); return { saved: !unsaved }; },
+    /** Before a raw router re-read (calibration, auto-tune): the baseline is unknown from now on.
+     *  `saved: false` (the tombstone could not be written; the old baseline may still be on disk
+     *  for a restart or the front): the caller must not re-read. */
+    async invalidate() { return { saved: (await persist(null)) === true }; },
     known: () => !!current(),
     /** noevia#1863: the models.ini text the router last read, when that is still knowable: the
      *  baseline of noevia's last reload, while the router's own view is unchanged since. A router
@@ -194,17 +197,21 @@ function createBridgeReloadGuard({ client, legacy = () => createReloadGuard(), l
     log(`[models] the front does not hold the preset reload baseline (${why}); this process keeps its own guard`);
     return 'legacy';
   })();
+  // Resolves true once the front answered the session again (epoch updated), false otherwise.
   let resending = null;
-  const resession = (seen) => (resending ||= (async () => {
+  const resession = () => (resending ||= (async () => {
     try {
       const { status, body } = await call('session', { nodeBoot, protocol: BRIDGE_PROTOCOL });
       if (status === 200 && body?.protocol === BRIDGE_PROTOCOL && typeof body.epoch === 'string') {
         if (body.epoch !== epoch) log(`[models] the front restarted (preset reload baseline ${epoch} -> ${body.epoch}); this process's session was sent again`);
         epoch = body.epoch;
-      } else failed('session', `answered ${status}`);
+        return true;
+      }
+      failed('session', `answered ${status}`);
     } catch (e) { failed('session', e?.message || e); }
     finally { resending = null; }
-  })()).then(() => seen);
+    return false;
+  })());
   const failed = (op, detail) => log(`[models] the preset reload baseline ${op} did not reach the front; it is treated as unknown: ${detail}`);
   // A write op's answer: { gen, saved } on 200; anything else is logged and read as not saved.
   const write = async (op, body) => {
@@ -232,14 +239,26 @@ function createBridgeReloadGuard({ client, legacy = () => createReloadGuard(), l
      *  front gives none: the caller must not reload then. */
     async begin(origin = 'node') {
       if ((await decided) === 'legacy') return legacyGuard().begin(origin);
-      let status, body;
-      try { ({ status, body } = await call('begin', { origin: originOf(origin) })); }
-      catch (e) { failed('begin', e?.message || e); throw Object.assign(new Error('The preset reload baseline is unavailable.'), { cause: e }); }
-      if (status !== 200 || typeof body?.ticket !== 'string') {
-        failed('begin', `answered ${status}`);
-        throw new Error('The preset reload baseline is unavailable.');
+      const unavailable = (cause) => Object.assign(new Error('The preset reload baseline is unavailable.'), cause ? { cause } : {});
+      const once = async () => {
+        let status, body;
+        try { ({ status, body } = await call('begin', { origin: originOf(origin) })); }
+        catch (e) { failed('begin', e?.message || e); throw unavailable(e); }
+        if (status !== 200 || typeof body?.ticket !== 'string') { failed('begin', `answered ${status}`); throw unavailable(); }
+        return body;
+      };
+      let body = await once();
+      if (typeof body.epoch === 'string' && body.epoch !== epoch) {
+        // A front that restarted on its own: the session goes out again, and that session ends
+        // every ticket from before it (this one included), so a fresh ticket is taken. Once only:
+        // a front whose epoch moves again is not trusted with this reload.
+        if (!(await resession())) throw unavailable();
+        body = await once();
+        if (body.epoch !== epoch) {
+          failed('begin', `the front restarted again (${epoch} -> ${body.epoch})`);
+          throw unavailable();
+        }
       }
-      if (typeof body.epoch === 'string' && body.epoch !== epoch) await resession();
       return { ticket: body.ticket, gen: body.gen, epoch: body.epoch, deadlineMs: body.deadlineMs };
     },
     /** After the reload: `record` with the text before, the router's raw rows after and the text

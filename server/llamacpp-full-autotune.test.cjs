@@ -2252,7 +2252,7 @@ test('the legacy journal restore makes the front\'s baseline unknown before the 
 test('an owed re-read, in the background and as a flush, makes the baseline unknown first', async t => {
   const log = [];
   const request = async url => { if (url.startsWith('/models?reload')) log.push('RELOAD'); return { ok: true, body: {} }; };
-  const invalidateBaseline = async origin => { log.push(`bridge invalidate:${origin}`); };
+  const invalidateBaseline = async origin => { log.push(`bridge invalidate:${origin}`); return true; };
   const background = owedReread(t, { request, rawModels: async () => ({ ok: true, body: { data: [] } }), invalidateBaseline });
   await background.autotune.recover();
   for (let i = 0; i < 100 && background.owed(); i++) await new Promise(r => setTimeout(r, 5));
@@ -2263,4 +2263,62 @@ test('an owed re-read, in the background and as a flush, makes the baseline unkn
   await flushed.autotune.flushReload();
   assert.equal(flushed.owed(), false);
   assert.deepEqual(reReadsAfter(log), ['bridge invalidate:autotune']);
+});
+
+// The same six re-reads when the front cannot acknowledge the invalidation (transport failure): the
+// router is never asked to re-read, and the re-read stays owed (_reloadPending) where it is retried.
+const owedOnDisk = f => JSON.parse(fs.readFileSync(f.stateFile, 'utf8')).job?._reloadPending === true;
+const noFront = log => createFakePresetBaseline({ check: sameText, log, unreachable: ['invalidate'] });
+const rawReReads = log => log.filter((e, i) => e === 'RELOAD' && log[i - 1] !== 'bridge begin:node').length;
+
+test('an unacknowledged invalidation: a phase restore does not re-read, and the re-read stays owed', async t => {
+  const log = [];
+  const f = fixture(t, { badBatch: true, presetBaselineClient: noFront(log), onReload: () => log.push('RELOAD') });
+  await f.manager.autotune.start('synthetic', { confirmPause: true });
+  const j = await finished(f.manager);
+  assert.equal(phase(j.models[0], 'batch').restored, true, 'the file itself is restored');
+  assert.ok(log.includes('bridge invalidate:autotune'));
+  assert.equal(rawReReads(log), 0, log.join(', '));
+  assert.equal(owedOnDisk(f), true);
+  assert.ok(JSON.stringify(j).includes('The model server has not re-read the restored models.ini; it does so before this model next loads.'));
+});
+
+test('an unacknowledged invalidation: the legacy journal restore does not re-read, reports it unconfirmed and owes the re-read', async t => {
+  const log = [];
+  const f = fixture(t, { presetBaselineClient: noFront(log), onReload: () => log.push('RELOAD') });
+  fs.writeFileSync(f.ini, f.original.replace('ctx-size = 8192', 'ctx-size = 16384'));
+  const revision = createPresetStore(f.ini).snapshot().revision;
+  fs.writeFileSync(f.stateFile, JSON.stringify({ history: {}, job: { id: 'legacy', model: 'synthetic', status: 'running', originalText: f.original, lastRevision: revision, queue: [{ model: 'synthetic', status: 'running' }], steps: [] } }));
+  const manager = f.restart();
+  await manager.autotune.recover();
+  const j = manager.autotune.statusFacts().job;
+  assert.equal(j.restored, false);
+  assert.match(j.error, /settings could not safely be restored/);
+  assert.equal(log.filter(e => e === 'RELOAD').length, 0);
+  assert.equal(owedOnDisk(f), true);
+});
+
+test('an unacknowledged invalidation: the background re-read keeps retrying without re-reading', async t => {
+  const log = [];
+  const f = fixture(t, { presetBaselineClient: noFront(log), onReload: () => log.push('RELOAD'), autotuneExtra: { foreignPollMs: 1 } });
+  fs.writeFileSync(f.stateFile, JSON.stringify({ history: {}, job: { status: 'interrupted', model: 'synthetic', _reloadPending: true, models: [] } }));
+  const manager = f.restart();
+  await manager.autotune.recover();
+  for (let i = 0; i < 100 && log.filter(e => e === 'bridge invalidate:autotune').length < 2; i++) await new Promise(r => setTimeout(r, 10));
+  assert.ok(log.filter(e => e === 'bridge invalidate:autotune').length >= 2, 'retried: ' + log.join(', '));
+  assert.equal(log.filter(e => e === 'RELOAD').length, 0);
+  assert.equal(manager.autotune.clearFacts().reloadPending, true);
+});
+
+test('an unacknowledged invalidation: the flush before a load refuses the load and keeps the re-read owed', async t => {
+  const log = [];
+  const f = fixture(t, { presetBaselineClient: noFront(log), onReload: () => log.push('RELOAD') });
+  fs.writeFileSync(f.stateFile, JSON.stringify({ history: {}, job: { status: 'interrupted', model: 'synthetic', _reloadPending: true, models: [] } }));
+  const manager = f.restart();
+  const refused = await manager.load('synthetic').catch(e => e);
+  assert.match(String(refused?.publicMessage || JSON.stringify(refused)), /has not re-read the restored settings yet/);
+  assert.equal(f.status.synthetic, 'unloaded', 'nothing was loaded');
+  assert.ok(log.includes('bridge invalidate:autotune'));
+  assert.equal(log.filter(e => e === 'RELOAD').length, 0);
+  assert.equal(manager.autotune.clearFacts().reloadPending, true);
 });
