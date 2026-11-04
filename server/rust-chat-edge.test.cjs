@@ -43,80 +43,27 @@ test('the front\'s Cowork start is a relayed turn bound to its user; only the fr
   assert.equal(bridge.accept(request({ url: `${edge.COWORK_PATH}/x` }), {}), null);
 });
 
-test('the gate probe meets the gate as the Diary local exchange when the front asks for that route', () => {
-  const { json } = sink();
+test('chat port S8: the S6 gate probe and hold are gone; the front takes an admission lease instead', () => {
+  const { sent, json } = sink();
   const bridge = turn.createTurnBridge({ secret: SECRET, json });
-  const diary = request({ url: `${turn.GATE_PATH}?route=${edge.DIARY_GATE_ROUTE}`, headers: { [turn.USER_HEADER]: undefined } });
-  assert.equal(bridge.accept(diary, {}), 'gate');
-  assert.equal(diary.url, '/api/diary/local-exchange');
-  assert.equal(turn.relayedUser(diary), null);
-  for (const url of [turn.GATE_PATH, `${turn.GATE_PATH}?route=other`, `${turn.GATE_PATH}?x=${edge.DIARY_GATE_ROUTE}`]) {
-    const chat = request({ url });
-    assert.equal(bridge.accept(chat, {}), 'gate', url);
-    assert.equal(chat.url, '/api/chat', url);
+  for (const url of ['/internal/chat/gate', '/internal/chat/gate?hold=1', '/internal/chat/gate?route=diary-local-exchange&hold=1']) {
+    const r = request({ url, headers: { [turn.USER_HEADER]: undefined } });
+    assert.equal(bridge.accept(r, {}), null, url);
+    assert.equal(r.url, url, 'not rewritten');
   }
+  assert.equal(sent.length, 0);
+  assert.equal(turn.GATE_PATH, undefined);
+  assert.equal(edge.createLeases, undefined);
+  assert.equal(edge.LEASE_HEADER, undefined);
 });
 
-test('a gate probe asking for a hold keeps it for the front\'s call; any other probe is the S5 probe', () => {
-  const { json } = sink();
-  const bridge = turn.createTurnBridge({ secret: SECRET, json });
-  const ask = (url) => { const r = request({ url, headers: { [turn.USER_HEADER]: undefined } }); assert.equal(bridge.accept(r, {}), 'gate', url); return [r.url, turn.relayedGate(r)]; };
-  assert.deepEqual(ask(`${turn.GATE_PATH}?hold=1`), ['/api/chat', { hold: true, route: 'chat' }]);
-  assert.deepEqual(ask(`${turn.GATE_PATH}?route=${edge.DIARY_GATE_ROUTE}&hold=1`), ['/api/diary/local-exchange', { hold: true, route: 'diary' }]);
-  assert.deepEqual(ask(turn.GATE_PATH), ['/api/chat', { hold: false, route: 'chat' }]);
-  assert.deepEqual(ask(`${turn.GATE_PATH}?hold=true`), ['/api/chat', { hold: false, route: 'chat' }]);
-  const t = request({ url: turn.TURN_PATH });
-  bridge.accept(t, {});
-  assert.equal(turn.relayedGate(t), null, 'a turn is not a probe');
-  assert.equal(turn.relayedGate({ headers: {} }), null);
-});
-
-function fakeRes() {
-  const { EventEmitter } = require('node:events');
-  const res = new EventEmitter();
-  Object.assign(res, { head: null, body: '', writeHead(status, h) { this.head = { status, h }; }, write(c) { this.body += c; } });
-  return res;
-}
-
-test('a hold answers 200 with its lease and gives the gate back when it closes, unless a call adopted it', () => {
-  let n = 0;
-  const leases = edge.createLeases({ newId: () => `lease-${++n}` });
-  const released = [];
-  // Closed without a call adopting it: the gate is given back once.
-  const a = fakeRes();
-  leases.hold(a, 'chat', () => released.push('a'));
-  assert.deepEqual(a.head, { status: 200, h: { 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': 'no-store', 'x-noevia-gate-lease': 'lease-1' } });
-  assert.equal(a.body, 'held\n');
-  a.emit('close');
-  assert.deepEqual(released, ['a']);
-  assert.equal(leases.adopt({ headers: { 'x-noevia-gate-lease': 'lease-1' } }, 'chat'), null, 'unknown once closed');
-  // Adopted: the call's leave is the hold's, and closing the hold no longer gives the gate back.
-  const b = fakeRes();
-  leases.hold(b, 'chat', () => released.push('b'));
-  const wrong = { headers: { 'x-noevia-gate-lease': 'lease-2' } };
-  assert.equal(leases.adopt(wrong, 'diary'), null, 'bound to its route');
-  assert.deepEqual(wrong.headers, {}, 'the header is removed whatever happens');
-  const call = { headers: { 'x-noevia-gate-lease': 'lease-2', cookie: 'c' } };
-  const leave = leases.adopt(call, 'chat');
-  assert.equal(typeof leave, 'function');
-  assert.deepEqual(call.headers, { cookie: 'c' });
-  assert.equal(leases.adopt({ headers: { 'x-noevia-gate-lease': 'lease-2' } }, 'chat'), null, 'single use');
-  b.emit('close');
-  assert.deepEqual(released, ['a']);
-  leave();
-  assert.deepEqual(released, ['a', 'b']);
-  assert.equal(leases.size(), 0);
-  assert.equal(leases.adopt({ headers: {} }, 'chat'), null);
-  assert.equal(leases.adopt({ headers: { 'x-noevia-gate-lease': ['x'] } }, 'chat'), null);
-});
-
-test('index.cjs: a call adopts the front\'s hold instead of entering the gate; a hold probe keeps it; no llm: limiter', () => {
+test('index.cjs: a call the front\'s admission lease covers enters no gate; no llm: limiter', () => {
   const source = fs.readFileSync(path.join(__dirname, 'index.cjs'), 'utf8');
   const top = source.slice(source.indexOf('async function handleRequest(req,res) {'));
   const at = (needle) => { const i = top.indexOf(needle); assert.ok(i >= 0, needle); return i; };
-  assert.ok(at("chatEdge.leases.adopt(req,relay==='turn'?'chat':pathname===chatEdge.LOCAL_EXCHANGE?'diary':'')") < at('enterChatInference('));
-  assert.match(top, /try \{if\(adopted\)leave=adopted;else if\(inference\)leave=await chatAdmission\.enterChatInference\(/);
-  assert.ok(at('return chatEdge.leases.hold(res,ask.route,leave);') < at("if(leave){res.once('finish',leave)"));
+  assert.ok(at("inferenceAdmission.covers(req,relay==='turn'?'chat':pathname===chatEdge.LOCAL_EXCHANGE?'diary':'')") < at('enterChatInference('));
+  assert.match(top, /try \{if\(inference&&!frontAdmitted\)leave=await chatAdmission\.enterChatInference\(/);
+  assert.equal(/chatEdge\.leases|relay==='gate'/.test(top), false);
   assert.match(source, /^const chatEdge = require\('\.\/rust-chat-edge\.cjs'\);$/m);
   assert.equal(/llmRateLimit|createRateLimiter|rateLimited:|markGateRefused/.test(source), false);
   for (const route of ['routes/chat.cjs', 'routes/diary.cjs']) {

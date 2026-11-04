@@ -106,9 +106,6 @@ test('the relay names its wire: only a turn that asks for ndjson/1 gets it, and 
     assert.equal(turn.relayedWire(r), 'sse', String(value));
     assert.equal(r.headers[wire.WIRE_HEADER], undefined);
   }
-  const probe = req(turn.GATE_PATH, { [turn.USER_HEADER]: undefined, [wire.WIRE_HEADER]: wire.WIRE });
-  assert.equal(bridge.accept(probe, {}), 'gate');
-  assert.equal(turn.relayedWire(probe), 'sse');
   // A request that did not come through the bridge (a client sending the header itself) is never NDJSON.
   assert.equal(turn.relayedWire({ headers: { [wire.WIRE_HEADER]: wire.WIRE } }), 'sse');
   assert.equal(turn.relayedWire(null), 'sse');

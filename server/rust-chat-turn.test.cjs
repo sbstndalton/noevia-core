@@ -53,7 +53,7 @@ test('only the front reaches the relay: anything else is the 404 of an unknown p
     request({ headers: { 'x-noevia-client-ip': '203.0.113.9' } }),
     request({ headers: { 'x-forwarded-for': '203.0.113.9' } }),
     request({ method: 'GET' }),
-    request({ url: turn.GATE_PATH, method: 'PUT' }),
+    request({ url: `${turn.TURN_PATH}`, method: 'PUT' }),
   ];
   for (const req of refused) {
     assert.equal(bridge.accept(req, {}), 'done');
@@ -90,11 +90,10 @@ test('a trusted turn becomes POST /api/chat with the client headers back and the
   const bare = request();
   bridge.accept(bare, {});
   assert.deepEqual(bare.headers, {});
-  // The gate probe carries no user.
-  const probe = request({ url: turn.GATE_PATH, headers: { [turn.USER_HEADER]: undefined } });
-  assert.equal(bridge.accept(probe, {}), 'gate');
-  assert.equal(probe.url, '/api/chat');
-  assert.equal(turn.relayedUser(probe), null);
+  // Chat port S8: there is no gate probe any more (the front takes an admission lease); a turn needs its user.
+  const probe = request({ url: turn.TURN_PATH, headers: { [turn.USER_HEADER]: undefined } });
+  assert.equal(bridge.accept(probe, {}), 'done');
+  assert.deepEqual(sent.pop(), { status: 400, body: { error: 'A user is required.' } });
   assert.equal(sent.length, 0);
 });
 
@@ -105,8 +104,7 @@ test('index.cjs: the relay is accepted before the gate, refused direct turns tak
   assert.ok(at('chatTurnBridge.accept(req,res)') < at('enterChatInference('));
   assert.match(top, /const chatTurnOwned=!relay && require\('\.\/rust-chat-turn\.cjs'\)\.owned\(req\.method,pathname\);/);
   assert.match(top, /\(pathname==='\/api\/chat' && !chatTurnOwned\)/);
-  assert.ok(at("if(leave)leave();res.statusCode=204;res.end();return;}") < at("if(leave){res.once('finish',leave)"));
-  assert.ok(at("if(relay==='gate'){") < at("if(leave)leave();res.statusCode=204;res.end();return;}"));
+  assert.equal(top.includes("relay==='gate'"), false, 'chat port S8: no gate probe');
   const inner = source.slice(source.indexOf('async function handleRequestInner(req, res) {'), source.indexOf('async function handleRequestScoped('));
   assert.match(inner, /if \(require\('\.\/rust-chat-turn\.cjs'\)\.refuseOwned\(req, res, \{ parseRequestUrl, json \}\)\) return;/);
   assert.ok(inner.indexOf("rust-chat-turn.cjs').refuseOwned") < inner.indexOf('requestAuth.authenticate(req)'));

@@ -137,11 +137,10 @@ test('chat port S5: only the front\'s relay runs a turn; the relay is bound to i
   // Not from the front (no loopback peer): the 404 of an unknown path, nothing run.
   const stranger = await request(url, { ...init, peer: undefined });
   assert.equal(stranger.status, 404);
-  // The gate probe: no gate is held here, so a turn would get in; 204 and nothing else.
+  // Chat port S8: the front's gate is an admission lease (rust-chat-admission.cjs); the old probe path is gone.
   const [, probeInit] = frontTurn({ method: 'POST', headers: {} }, '');
-  const probe = await request(require('./rust-chat-turn.cjs').GATE_PATH, probeInit);
-  assert.equal(probe.status, 204);
-  assert.equal(probe.text, '');
+  const probe = await request('/internal/chat/gate', probeInit);
+  assert.notEqual(probe.status, 204);
 });
 
 test('chat reports upstream errors in SSE without writing headers twice', async (t) => {
