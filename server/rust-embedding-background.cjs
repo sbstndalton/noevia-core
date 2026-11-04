@@ -17,7 +17,7 @@ function createOwner({ env = process.env, dataDir, now = Date.now, verifyPair = 
         return s.protocol === PROTOCOL && s.start === start && Number.isFinite(s.at) && s.at <= now() && now() - s.at <= 15000 ? s : null;
       } catch { return null; }
     },
-    healthy() { const s = this.snapshot(); return !stopped && (!env.MODEL_LOADER_URL || !!s && s.configValid !== false); },
+    healthy() { const s = this.snapshot(); return !stopped && verifyPair && !!s && s.configValid !== false; },
     kick() {
       if (stopped) return;
       fs.mkdirSync(dataDir, { recursive: true });

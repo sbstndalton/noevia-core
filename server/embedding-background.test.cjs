@@ -106,3 +106,28 @@ test('unconfirmed native embedding ownership cannot publish healthy retrieval', 
   ready = true; await p.publish();
   assert.equal(JSON.parse(fs.readFileSync(p.file)).retrieval, 'available');
 });
+
+test('no-loader host still requires a native migration owner and sends start-bound kicks', t => {
+  const f = fixture(t), env = { ...f.env }; delete env.MODEL_LOADER_URL;
+  const owner = createOwner({ env, dataDir: f.dir, now: f.now, features: () => 'rust-embedding-background-v1' });
+  const config = createEmbeddingConfig({ env: { EMBEDDING_NEXT_MODEL: 'next' }, log() {} });
+  const migration = createEmbeddingMigration({ config, nativeOwner: owner, rag: { listIndexes: () => [] } });
+  assert.equal(owner.healthy(), false, 'absence of loader is not proof of a migration owner');
+  migration.kick();
+  assert.equal(JSON.parse(fs.readFileSync(path.join(f.dir, 'embedding-worker-request.json'))).sequence, 1);
+  fs.writeFileSync(path.join(f.dir, 'embedding-worker-status.json'), JSON.stringify({ protocol: PROTOCOL, start: env.NOEVIA_START_ID, at: f.now(), configValid: true }));
+  assert.equal(owner.healthy(), true); owner.stop(); migration.stop(); assert.equal(owner.healthy(), false);
+});
+
+test('paired coverage counts shared custom-directory and orphan indexes supplied by the existing RAG enumerator', t => {
+  const f = fixture(t), seen = [];
+  const config = createEmbeddingConfig({ env: { EMBEDDING_NEXT_MODEL: 'next' }, log() {} });
+  const indexes = [{ userId: null, projectId: 'shared' }, { userId: 'tenant', projectId: 'orphan' }];
+  const migration = createEmbeddingMigration({ config, nativeOwner: f.owner, rag: {
+    listIndexes: () => indexes,
+    indexCoverage(entry, target) { seen.push(entry); return { chunks: 3, vectors: target.model === 'next' ? 2 : 3 }; },
+  } });
+  const c = migration.status().coverage.next;
+  assert.deepEqual(c, { indexes: 2, chunks: 6, vectors: 4, unavailable: 0, complete: false, ready: false });
+  assert.ok(seen.includes(indexes[0])); assert.ok(seen.includes(indexes[1])); migration.stop();
+});
