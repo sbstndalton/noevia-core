@@ -1,5 +1,5 @@
 'use strict';
-// #697 runtime safety net, now the Rust front's (--features rust-budget-watch, noevia-rs
+// #697 runtime safety net, now the Rust front's (--features rust-budget-watch-v2, noevia-rs
 // bins/noevia-server/src/model_maint/budget_watch.rs). The front samples the inference memory every
 // interval, keeps the strikes, the idle baseline and the cooldown, and unloads through the inference
 // gate exactly as inference-budget-watch.cjs did here. This process no longer starts that watch;
@@ -21,7 +21,7 @@
 // The budget itself is the existing facts call (rust-model-facts.cjs {want: 'budget'}).
 const { trustedFront } = require('./trusted-front.cjs');
 
-const BUDGET_WATCH_OWNER = 'noevia-budget-watch-rust/1';
+const BUDGET_WATCH_OWNER = 'noevia-budget-watch-rust/2';
 const PATH = '/internal/budget-watch';
 // A model id the router lists; the pairing limit the front already applies to router ids.
 const MAX_MODEL_BYTES = 512;
@@ -48,7 +48,15 @@ function createBudgetWatchBridge({ secret, modelManager, json, readJson, log = (
       const validBudget = typeof budgetGib === 'number' && Number.isFinite(budgetGib) && budgetGib > 0;
       if (!validModel || !validBudget) { json(res, 400, { error: 'A model and a budget are required.' }); return true; }
       if (typeof modelManager.quarantine !== 'function') { json(res, 200, { ok: false }); return true; }
-      try { modelManager.quarantine(model, budgetGib); } catch (e) {
+      try {
+        if (Object.hasOwn(body, 'revision')) {
+          if (body.revision !== null && (typeof body.revision !== 'string' || !/^[a-f0-9]{64}$/.test(body.revision))) { json(res, 400, { error: 'Invalid revision.' }); return true; }
+          if (typeof modelManager.acknowledgeQuarantine !== 'function') { json(res, 200, { ok: false }); return true; }
+          json(res, 200, modelManager.acknowledgeQuarantine(model, budgetGib, body.revision));
+          return true;
+        }
+        modelManager.quarantine(model, budgetGib);
+      } catch (e) {
         log(`[inference-budget] quarantine failed: ${e?.code || e?.name || 'error'}`);
         json(res, 503, { error: 'The quarantine is unavailable.' });
         return true;

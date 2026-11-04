@@ -25,7 +25,7 @@ function manager() {
 }
 
 test('#697 Core exports the budget watch marker the release pairs on', () => {
-  assert.equal(BUDGET_WATCH_OWNER, 'noevia-budget-watch-rust/1');
+  assert.equal(BUDGET_WATCH_OWNER, 'noevia-budget-watch-rust/2');
   assert.equal(PATH, '/internal/budget-watch');
 });
 
@@ -92,4 +92,39 @@ test('#697 a manager without the quarantine answers ok:false, and a failing one 
   const none = bridge({});
   await none.handle(trusted({ want: 'held' }), {});
   assert.deepEqual(none.sent, [{ status: 200, body: { held: false } }], 'no maintenance gate is never held (Node: !undefined)');
+});
+
+test('#697 a durable pre-unload fence refuses Core admissions through IPC loss and process restart', async (t) => {
+  const os = require('node:os');
+  const { createHash } = require('node:crypto');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'watch-fence-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const ini = path.join(dir, 'models.ini');
+  fs.writeFileSync(ini, '[chat]\nctx-size = 8192\n');
+  let budget = 12;
+  const opts = { kind: 'llamacpp', baseUrl: 'http://synthetic', presetPath: ini, budgetWatchDir: dir, inferenceBudget: { budgetGib: () => budget }, gate: require('./fixtures/fake-inference-gate.cjs').fakeGate(), fetchJson: async () => ({ ok: true, status: 200, body: { data: [] } }) };
+  const m = createModelManager(opts);
+  const revision = m.presetFacts('chat').revision;
+  const file = path.join(dir, createHash('sha256').update('chat').digest('hex') + '.json');
+  fs.writeFileSync(file, JSON.stringify({ model: 'chat', revision, budgetGib: 12, at: 1000, recorded: false }));
+  for (const live of [m, createModelManager(opts)]) {
+    assert.equal((await live.loadRefusal('chat')).code, 'inference_budget_unloaded');
+    await assert.rejects(live.prepareLoad('chat'), /stays unloaded/);
+  }
+  const { handle, sent } = bridge(m);
+  // Lost acknowledgements are retried idempotently against exactly the old revision/budget.
+  for (let i = 0; i < 2; i++) await handle(trusted({ want: 'quarantine', model: 'chat', budgetGib: 12, revision }), {});
+  assert.deepEqual(sent, [{ status: 200, body: { ok: true, invalidated: false } }, { status: 200, body: { ok: true, invalidated: false } }]);
+  assert.equal((await m.loadRefusal('chat')).code, 'inference_budget_unloaded');
+  budget = 16;
+  assert.equal(await m.loadRefusal('chat'), null);
+  await handle(trusted({ want: 'quarantine', model: 'chat', budgetGib: 12, revision }), {});
+  assert.deepEqual(sent.pop().body, { ok: true, invalidated: true });
+  budget = 12;
+  fs.writeFileSync(ini, '[chat]\nctx-size = 4096\n');
+  assert.equal(await m.loadRefusal('chat'), null);
+  await handle(trusted({ want: 'quarantine', model: 'chat', budgetGib: 12, revision }), {});
+  assert.deepEqual(sent.pop().body, { ok: true, invalidated: true }, 'do not quarantine a newer preset on retry');
+  fs.writeFileSync(file, 'incomplete');
+  assert.equal((await m.loadRefusal('chat')).code, 'inference_budget_pending', 'damaged fences fail closed');
 });

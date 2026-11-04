@@ -40,7 +40,7 @@ const AVAILABLE_STATES = new Set(['loaded', 'sleeping']);
 const isAvailable = model => AVAILABLE_STATES.has(model.status?.value);
 const alreadyRunning = result => result?.status === 400 && /already running/i.test(JSON.stringify(result?.body ?? ''));
 
-function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloadStatePath, fetchStream, autoconfig = {}, calibrationStatePath, calibrationOptions = {}, evidenceDir, autotuneStatePath, autotuneOptions = {}, presetWriter = null, inferenceBudget = null, reloadStatePath = null, reloadGuard: reloadGuardOption = null, gate = null, gateAdminToken = null }) {
+function createLlamaCppManager({ budgetWatchDir = null, baseUrl, apiKey, fetchJson, presetPath, downloadStatePath, fetchStream, autoconfig = {}, calibrationStatePath, calibrationOptions = {}, evidenceDir, autotuneStatePath, autotuneOptions = {}, presetWriter = null, inferenceBudget = null, reloadStatePath = null, reloadGuard: reloadGuardOption = null, gate = null, gateAdminToken = null }) {
   const base = String(baseUrl || '').replace(/\/+$/, '').replace(/\/v1$/, '');
   const url = new URL(base);
   if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password || url.search || url.hash) throw Error('Invalid llama.cpp router URL');
@@ -461,6 +461,10 @@ function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloa
     if (badKnob) return { body: { error: `${model} was not loaded: ${badKnob}`, code: 'invalid_size' } };
     const budgetGib = Number(inferenceBudget?.budgetGib?.());
     if (!(budgetGib > 0)) return null;
+    let liveRevision = null;
+    try { liveRevision = presets ? presets.get(model).revision : null; } catch { return { body: { error: 'Preset state is unavailable.', code: 'inference_budget_pending' } }; }
+    const pending = require('./budget-watch-pending.cjs').pendingRefusal(budgetWatchDir, model, liveRevision, budgetGib);
+    if (pending) return pending;
     const held = quarantineRefusal(model, budgetGib);
     if (held) return held;
     // The Rust-owned estimator returns either its confirmed footprint or a fail-closed 503;
@@ -739,6 +743,14 @@ function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloa
       return presetRefusal(model, checked.options);
     },
     quarantine,
+    // A replay must never quarantine a newer revision or a different effective budget.
+    acknowledgeQuarantine(model, budgetGib, revision) {
+      const current = presets ? presets.get(model).revision : null;
+      if (current !== revision || Number(inferenceBudget?.budgetGib?.()) !== budgetGib) return { ok: true, invalidated: true };
+      const previous = quarantined.get(model);
+      if (!previous || previous.revision !== revision || previous.budgetGib !== budgetGib) quarantine(model, budgetGib);
+      return { ok: true, invalidated: false };
+    },
     sizingBudgetGib,
     reloadPresets,
     writePresets,
