@@ -470,8 +470,8 @@ test('saving a preset whose estimate exceeds the budget is refused and nothing i
   const calls = [];
   const manager = createModelManager({ kind: 'llamacpp', baseUrl: 'http://synthetic', presetPath: file, autoconfig: { modelsPath: dir }, inferenceBudget: { budgetGib: () => 3 },
     fetchJson: async (url) => { calls.push(new URL(url).pathname); return { ok: true, status: 200, body: { data: [{ id: 'm', status: { value: 'unloaded' } }] } }; } });
-  const rev = () => manager.getPreset('m').then(r => r.body.revision);
-  const refused = await manager.applyPreset({ model: 'm', baseRevision: await rev(), confirmReload: true, options: { 'ctx-size': '262144', 'cache-type-k': 'f16', 'cache-type-v': 'f16' } });
+  const rev = () => manager.presetFacts('m').revision;
+  const refused = await manager.applyPreset({ model: 'm', baseRevision: rev(), confirmReload: true, options: { 'ctx-size': '262144', 'cache-type-k': 'f16', 'cache-type-v': 'f16' } });
   assert.equal(refused.status, 409); assert.equal(refused.body.code, 'inference_budget');
   assert.match(refused.body.error, /^Not saved: with these settings m needs about [\d.]+ GiB .*above the 3 GiB/);
   assert.equal(fs.readFileSync(file, 'utf8'), before); assert.ok(!calls.includes('/models'.concat('?reload=1')));
