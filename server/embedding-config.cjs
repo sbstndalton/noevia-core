@@ -98,7 +98,8 @@ function readState(stateFile) {
  * @param {string} [o.fallbackModel]  model when the environment names none
  * @param {(line:string) => void} [o.log]  seeding warnings
  */
-function createEmbeddingConfig({ env = process.env, stateFile = null, fallbackModel = 'default', log = (line) => console.warn(line) } = {}) {
+function createEmbeddingConfig({ env = process.env, stateFile = null, fallbackModel = 'default', log = (line) => console.warn(line), nativeOwner = null } = {}) {
+  let inHold = false;
   const saved = readState(stateFile);
   let state = saved || seedFromEnv(env, fallbackModel, log);
   let locked = null; // set by refuseSeeded: changes are refused until the operator fixes the environment
@@ -117,6 +118,7 @@ function createEmbeddingConfig({ env = process.env, stateFile = null, fallbackMo
     fs.renameSync(tmp, stateFile);
   }
   function change(next) {
+    if (nativeOwner && stateFile && !inHold) throw Error('Embedding configuration requires the publication lock');
     if (locked) throw Object.assign(Error(locked), { status: 409, code: 'badState' });
     const before = state;
     state = next;
@@ -135,6 +137,14 @@ function createEmbeddingConfig({ env = process.env, stateFile = null, fallbackMo
     return { active: copy(state.active), next: copy(state.next), previous: copy(state.previous), source: savedChange || saved ? 'saved' : source, version };
   }
   const api = {
+    withLock(action) {
+      if (!nativeOwner || !stateFile || inHold) return action();
+      fs.mkdirSync(path.dirname(stateFile), { recursive: true });
+      return require('./embedding-config-lock.cjs').withFlock(`${stateFile}.lock`, () => {
+        inHold = true;
+        try { return action(); } finally { inHold = false; }
+      });
+    },
     get,
     active: () => copy(state.active),
     next: () => copy(state.next),
@@ -209,9 +219,9 @@ function createEmbeddingConfig({ env = process.env, stateFile = null, fallbackMo
  * unknown, so every embed call refuses and retrieval reports degraded, and nothing is saved over
  * the damaged file until an operator fixes or deletes it.
  */
-function loadEmbeddingConfig({ env = process.env, stateFile = null, log = (line) => console.error(line) } = {}) {
+function loadEmbeddingConfig({ env = process.env, stateFile = null, nativeOwner = null, log = (line) => console.error(line) } = {}) {
   try {
-    return createEmbeddingConfig({ env, stateFile, log });
+    return createEmbeddingConfig({ env, stateFile, log, nativeOwner });
   } catch (err) {
     if (err?.code !== 'badState') throw err;
     log(`[embedding] ${err.message} Embeddings are off until then.`);

@@ -232,8 +232,9 @@ function arrayProxy(field) {
 }
 // #1636/#1638: the one embedding configuration (endpoint, model, profile), seeded from the environment
 // and saved beside the data once changed through /api/embedding (embedding-migration.cjs).
+const embeddingOwner = require('./rust-embedding-background.cjs').createOwner({ env: process.env, dataDir: DATA_DIR, verifyPair: require.main === module });
 const embeddingConfig = require('./embedding-config.cjs').install(require('./embedding-config.cjs').loadEmbeddingConfig({
-  env: process.env, stateFile: path.join(DATA_DIR, 'embedding-config.json') }));
+  env: process.env, nativeOwner: embeddingOwner, stateFile: path.join(DATA_DIR, 'embedding-config.json') }));
 rag.init({ dataDir: DATA_DIR, inferenceUrl: INFERENCE_BASE, headersFn: () => inferenceHeaders(), userDataDirFn: workspaceStore.userDir,
   userActive: (userId) => !workspaceStore.isRemoved(userId), inferenceGuard: () => modelManager.enterInference?.() || (() => {}),
   embeddingConfig, listUserIds: () => authService.db.prepare('SELECT id FROM users').all().map((r) => r.id) });
@@ -243,17 +244,17 @@ rag.configureRerank(() => rerankSettings.effectiveEnv());
 require('./embedding-address.cjs').guardSeededAddresses(embeddingConfig);
 // #1762: embeddings are local-only; say so at start-up if the address they would use (the inference one when no embeddings URL is set) is public.
 require('./embedding-address.cjs').warnPublicEmbeddingUrl({ inferenceBase: INFERENCE_BASE });
-const embeddingMigration = require('./embedding-migration.cjs').createEmbeddingMigration({ config: embeddingConfig, rag });
+const embeddingMigration = require('./embedding-migration.cjs').createEmbeddingMigration({ config: embeddingConfig, rag, nativeOwner: embeddingOwner });
 // #1668: the embedding service as the model manager runs it (which models cowork-embed serves, or
 // off). Refreshed in the background so the delete guard (model-system.cjs) follows it.
-const embeddingService = require('./embedding-service.cjs').install(require('./embedding-service.cjs').createEmbeddingService({ env: process.env, fetchJson }));
-if (process.env.MODEL_LOADER_URL) afterNativeReady(() => { embeddingService.refresh(); setInterval(() => embeddingService.refresh(), 10000).unref(); });
+const embeddingService = require('./embedding-service.cjs').install(require('./embedding-service.cjs').createEmbeddingService({ env: process.env, fetchJson, nativeOwner: embeddingOwner }));
 // A re-index under way also covers files indexed meanwhile; with none under way nothing runs.
 rag.onIndexed(() => { if (embeddingConfig.next()) embeddingMigration.kick(); });
-if (embeddingConfig.next()) afterNativeReady(() => setTimeout(() => embeddingMigration.kick(), 30000).unref());
+
 // What runs when the process is told to stop (shutdown-hooks.cjs): the sweeps below, and the inference gate leases
 // further down. One handler runs them all, bounded, and then lets the process end.
 const shutdownHooks = require('./shutdown-hooks.cjs').createShutdownHooks();
+shutdownHooks.add(require('./rust-embedding-background.cjs').scheduleLegacy({ owner: embeddingOwner, env: process.env, config: embeddingConfig, service: embeddingService, migration: embeddingMigration, afterReady: afterNativeReady }));
 shutdownHooks.install();
 
 // #1726: multimodal RAG (NOEVIA_MULTIMODAL_RAG, off by default). On, the rate-limited media pass embeds
@@ -1131,7 +1132,7 @@ const modelRoutes = require('./routes/models.cjs').createModelRoutes({
   // Both run only while the front's demand marker is young: it touches it on each signed-in GET of the two routes.
   const snapshots = require('./published-snapshot.cjs');
   const demand = snapshots.createDemand({ dir: DATA_DIR, pollMs: snapshots.intervalFrom(process.env.SNAPSHOT_DEMAND_POLL_MS, snapshots.DEMAND_POLL_MS, 200, 10000) });
-  const ragStatus = require('./rust-health.cjs').createRagStatusPublisher({ dataDir: DATA_DIR, rag, demand });
+  const ragStatus = require('./rust-health.cjs').createRagStatusPublisher({ dataDir: DATA_DIR, rag, demand, ownerReady: () => embeddingOwner.healthy() });
   ragStatus.watch(embeddingService);
   const autoRolesSnapshot = require('./rust-auto-roles.cjs').createAutoRolesPublisher({
     dataDir: DATA_DIR, servedCatalogue: () => modelService.servedCatalogue(),
@@ -1259,7 +1260,7 @@ const inferenceMachineRoutes = require('./routes/inference-machines.cjs').create
 // GET /api/ready (#297): unauthenticated, mounted before the session gate below alongside the
 // sign-in routes. isReady is set once startup wiring under require.main finishes (see below).
 const readyRoutes = require('./routes/health.cjs').createReadyRoutes({
-  json, isReady: () => processReady, version: require('./version-resolve.cjs').resolveVersion(),
+  json, isReady: () => processReady && embeddingOwner.healthy(), version: require('./version-resolve.cjs').resolveVersion(),
 });
 // #2303: raw calibration facts and conditional launch; public policy is native.
 const calibrationRoutesBridge = require('./rust-calibration-routes-bridge.cjs').createCalibrationRoutesBridge({
@@ -1303,6 +1304,7 @@ async function handleRequestInner(req, res) {
   if (require('./rust-idle-unload-read.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   if (await idleUnloadFacts(req, res)) return;
   if (require('./rust-autotune-read.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
+  if (embeddingOwner.handle(req, res, json)) return;
   if (require('./rust-preset-read.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   if (await presetReadBridge(req, res)) return;
   if (await autotuneReadBridge(req, res)) return;

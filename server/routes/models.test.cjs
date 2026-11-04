@@ -1029,3 +1029,20 @@ test('#2276 manager writes retain the hold through the reload and release it on 
   assert.deepEqual(calls, ['chat%name']);
   assert.equal(f.fetched[0].url, 'http://loader/api/v1/%73ections/chat%25name');
 });
+
+test('native embedding protection missing or stale refuses all delete entrypoints before mutation', async t => {
+  const mod = require('../embedding-service.cjs');
+  const prior = mod.current();
+  t.after(() => mod.install(prior));
+  mod.install({ protectionKnown: () => false, managed: () => false });
+  const f = fixture({ env: { MODEL_LOADER_URL: 'http://loader' } });
+  for (const [method, route, body] of [
+    ['POST', '/api/models/delete', { name: 'synthetic' }],
+    ['POST', '/api/model-manager/models/delete', { models: ['synthetic'] }],
+    ['DELETE', '/api/model-manager/sections/synthetic'],
+  ]) {
+    await f.call(method, route, body, 'admin');
+    assert.equal(f.sent.pop().status, 409, route);
+  }
+  assert.equal(f.fetched.length, 0);
+});
