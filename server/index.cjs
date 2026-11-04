@@ -1204,6 +1204,9 @@ const storageRoutes = require('./routes/storage.cjs').createStorageRoutes({ json
 const idleUnloadFacts = require('./rust-idle-unload-read-facts.cjs').createIdleUnloadFacts({
   secret: FRONT_SECRET, json, effectiveSeconds: () => idleUnload?.effectiveSeconds(),
 });
+const presetReadBridge = require('./rust-preset-read-bridge.cjs').createPresetReadBridge({
+  secret: FRONT_SECRET, json, readJson, manager: () => modelManager,
+});
 const autotuneReadBridge = require('./rust-autotune-read-bridge.cjs').createAutotuneReadBridge({
   secret: FRONT_SECRET, json, readJson, autotune: () => modelManager.autotune,
 });
@@ -1259,6 +1262,10 @@ const inferenceMachineRoutes = require('./routes/inference-machines.cjs').create
 const readyRoutes = require('./routes/health.cjs').createReadyRoutes({
   json, isReady: () => processReady, version: require('./version-resolve.cjs').resolveVersion(),
 });
+// #2303: raw calibration facts and conditional launch; public policy is native.
+const calibrationRoutesBridge = require('./rust-calibration-routes-bridge.cjs').createCalibrationRoutesBridge({
+  secret: FRONT_SECRET, json, readJson, calibration: () => modelManager.calibration,
+});
 // #2292: public cancellation policy is native; only the live controller stays in Node.
 const calibrationCancelBridge = require('./rust-calibration-cancel-bridge.cjs').createCalibrationCancelBridge({
   secret: FRONT_SECRET, json, readJson, calibration: () => modelManager.calibration,
@@ -1297,6 +1304,8 @@ async function handleRequestInner(req, res) {
   if (require('./rust-idle-unload-read.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   if (await idleUnloadFacts(req, res)) return;
   if (require('./rust-autotune-read.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
+  if (require('./rust-preset-read.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
+  if (await presetReadBridge(req, res)) return;
   if (await autotuneReadBridge(req, res)) return;
   if (require('./rust-autotune-resume.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   if (await autotuneResumeBridge(req, res)) return;
@@ -1372,6 +1381,8 @@ async function handleRequestInner(req, res) {
   if (require('./rust-mcp-directory.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   if (require('./rust-toolboxes-permitted.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   if (require('./rust-toolbox-picker.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
+  if (require('./rust-calibration-routes.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
+  if (await calibrationRoutesBridge(req, res)) return;
   if (require('./rust-model-manager-scan.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   if (await modelManagerScanCache(req, res)) return;
   if (require('./rust-autotune-cancel.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;

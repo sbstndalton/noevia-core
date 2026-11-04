@@ -107,7 +107,7 @@ function fixture(t, { badSampling = false, models = ['synthetic'], onChat, onUnl
   };
   const makeManager = () => createModelManager({ kind: 'llamacpp', baseUrl: 'http://synthetic', presetPath: ini, fetchJson, fetchStream,
     calibrationStatePath: path.join(dir, 'cal.json'), autotuneStatePath: stateFile,
-    calibrationOptions: { sleep: async () => {}, readMemory: () => 20, ...calibrationExtra },
+    calibrationOptions: { identityFor: async()=>({arch:null,quant:null,artifact:'synthetic-artifact',build:null,profile:require('node:crypto').createHash('sha256').update(fs.readFileSync(ini)).digest('hex'),hardware:null}), sleep: async () => {}, readMemory: () => 20, ...calibrationExtra },
     autotuneOptions: { ...autotuneExtra, ...(servingChecks ? { servingChecks } : {}), ...(unloadPolls || unloadStuck ? { sleep: async () => {} } : {}), betweenModelsMs: 25, idleTimeoutMs, readMemory: () => 20, identityFor: async m => (++identityReads > 1 && loseIdentityAfterStart ? null : testIdentity(m, build)) } });
   let manager = makeManager();
   return { manager, ini, stateFile, dir, original, requests, servingRequests, options, status, restart: () => { manager = makeManager(); return manager; }, setBuild: b => { build = b; } };
@@ -2158,4 +2158,61 @@ test('entire raw evaluator fault stops independent KV sizing before load or pres
   assert.equal(job.status, 'failed');
   assert.match(String(job.error), /could not be confirmed by the Rust sizing port/);
   assert.equal(phase(job.models[0], 'kv')?.status, 'failed');
+});
+
+// #2303: exercise the actual manager factory, not a replacement context worker.
+test('#2303 standard context stage uses the private configured-profile worker adapter',async t=>{
+  let reads=0;
+  const f=fixture(t,{calibrationExtra:{identityFor:async()=>{
+    reads++;assert.equal(f.manager.maintenanceHeld(),true);
+    return {arch:null,quant:null,artifact:'synthetic-artifact',build:null,profile:require('node:crypto').createHash('sha256').update(fs.readFileSync(f.ini)).digest('hex'),hardware:null};
+  }}});
+  assert.equal((await f.manager.autotune.start('synthetic',{confirmPause:true})).status,202);
+  const job=await finished(f.manager);assert.equal(job.status,'passed',job.error);
+  assert.equal(phase(job.models[0],'context').status,'passed');assert.ok(reads>=3);
+  assert.equal(f.manager.calibration.start,undefined);assert.equal(f.manager.calibration.status,undefined);
+});
+test('#2303 a cancelled context read cannot launch in the same job after Resume changes its run',async t=>{
+  const calibration=require('./llamacpp-calibration.cjs'),original=calibration.createCalibrator,guards=[];
+  calibration.createCalibrator=deps=>{if(deps.contextCurrent)guards.push(deps.contextCurrent);return original(deps);};
+  t.after(()=>{calibration.createCalibrator=original;});
+  let entered,release;const waiting=new Promise(r=>{entered=r;}),gate=new Promise(r=>{release=r;});let reads=0,loads=0;
+  const f=fixture(t,{onLoad:()=>{loads++;},calibrationExtra:{identityFor:async()=>{
+    if(++reads===1){entered();await gate;}
+    return {arch:null,quant:null,artifact:'synthetic-artifact',build:null,profile:require('node:crypto').createHash('sha256').update(fs.readFileSync(f.ini)).digest('hex'),hardware:null};
+  }}});
+  assert.equal((await f.manager.autotune.start('synthetic',{confirmPause:true})).status,202);
+  let timer;
+  try{await Promise.race([waiting,new Promise((_,reject)=>{timer=setTimeout(()=>reject(Error('context factory did not enter')),3000);})]);}finally{clearTimeout(timer);}
+  const id=f.manager.autotune.statusFacts().job.id;assert.equal(guards[0](),true);
+  cancelWorker(f.manager);const cancelled=await finished(f.manager);assert.equal(cancelled.status,'cancelled');assert.equal(guards[0](),false);
+  assert.equal((await resumeWorker(f.manager)).applied,true);
+  const completed=await finished(f.manager);assert.equal(completed.id,id);assert.equal(completed.status,'passed',completed.error);
+  assert.equal(guards[0](),false);const before={loads,requests:f.requests.length,text:fs.readFileSync(f.ini,'utf8')};
+  release();for(let i=0;i<30;i++)await new Promise(r=>setImmediate(r));
+  assert.equal(loads,before.loads);assert.equal(f.requests.length,before.requests);assert.equal(fs.readFileSync(f.ini,'utf8'),before.text);
+});
+
+// #2317: use the production private adapter while its metadata owner is still pending.
+test('#2317 a wrong private context abort token has no effect on the pending read',async t=>{
+  const full=require('./llamacpp-full-autotune.cjs'),original=full.createFullAutotuner;
+  let child;
+  full.createFullAutotuner=deps=>original({...deps,contextFactory:hooks=>{child=deps.contextFactory(hooks);return child;}});
+  t.after(()=>{full.createFullAutotuner=original;});
+  let entered,release;const waiting=new Promise(r=>{entered=r;}),gate=new Promise(r=>{release=r;});let reads=0,loads=0;
+  const f=fixture(t,{onLoad:()=>{loads++;},calibrationExtra:{identityFor:async()=>{
+    if(++reads===1){entered();await gate;}
+    return {arch:null,quant:null,artifact:'synthetic-artifact',build:null,profile:require('node:crypto').createHash('sha256').update(fs.readFileSync(f.ini)).digest('hex'),hardware:null};
+  }}});
+  assert.equal((await f.manager.autotune.start('synthetic',{confirmPause:true})).status,202);
+  let timer;
+  try{await Promise.race([waiting,new Promise((_,reject)=>{timer=setTimeout(()=>reject(Error('context factory did not enter')),3000);})]);}finally{clearTimeout(timer);}
+  const before={loads,requests:f.requests.length,text:fs.readFileSync(f.ini,'utf8'),token:child.cancellationFacts().token};
+  assert.deepEqual(child.compareAndAbort('wrong-token'),{applied:false});
+  assert.deepEqual(child.compareAndAbort(null),{applied:false});
+  for(let i=0;i<30;i++)await new Promise(r=>setImmediate(r));
+  assert.equal(f.manager.autotune.statusFacts().job.status,'running');
+  assert.equal(child.cancellationFacts().token,before.token);
+  assert.equal(loads,before.loads);assert.equal(f.requests.length,before.requests);assert.equal(fs.readFileSync(f.ini,'utf8'),before.text);
+  release();const completed=await finished(f.manager);assert.equal(completed.status,'passed',completed.error);
 });

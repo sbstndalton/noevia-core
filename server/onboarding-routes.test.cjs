@@ -86,7 +86,10 @@ test('a member who has not finished onboarding gets no administrator or global m
   const cancelled = await request('/api/models/calibration/cancel', { method: 'POST', headers: headers(member), body: '{}' });
   assert.equal(cancelled.status, 503);
   assert.equal(JSON.parse(cancelled.text).code, 'RUST_CALIBRATION_CANCEL_OWNED');
-  for (const url of ['/api/models/download', '/api/models/calibration', '/api/model-manager/sections', '/api/model-manager/backends/cowork-llama-1/logs']) {
+  const calibration = await request('/api/models/calibration', { method: 'POST', headers: headers(member), body: '{}' });
+  assert.equal(calibration.status, 503);
+  assert.equal(JSON.parse(calibration.text).code, 'RUST_CALIBRATION_OWNED');
+  for (const url of ['/api/models/download', '/api/model-manager/sections', '/api/model-manager/backends/cowork-llama-1/logs']) {
     const method = url.endsWith('/logs') ? 'GET' : 'POST';
     assert.equal((await request(url, { method, headers: headers(member), body: method === 'POST' ? '{}' : '' })).status, 403, url);
   }

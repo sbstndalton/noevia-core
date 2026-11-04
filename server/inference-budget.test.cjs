@@ -69,6 +69,21 @@ test('a saved budget larger than a smaller host can hold is limited on read', ()
   assert.equal(later.budgetGib, 25); assert.equal(later.limited, true);
 });
 
+test('#2266: a failed boot read is diagnosed without leaking the row or error', () => {
+  const logs = [];
+  let row = '{"budgetGib":24}';
+  const store = { get: () => { throw Error('sensitive storage detail'); }, set: (_, v) => { row = v; } };
+  const b = createInferenceBudget({ store, env: { INFERENCE_MEMORY_BUDGET_GIB: '8' }, readMeminfo: meminfo(64), log: m => logs.push(m) });
+  assert.equal(b.budgetGib(), 8);
+  assert.equal(JSON.parse(row).budgetGib, 24);
+  assert.equal(logs.length, 1);
+  assert.match(logs[0], /startup.*deployment limit/);
+  assert.doesNotMatch(logs[0], /sensitive|24/);
+  b.save({ budgetGib: 12 }, 'admin');
+  assert.equal(b.budgetGib(), 12);
+  assert.equal(logs.length, 1);
+});
+
 // ── Prompt cache limits ─────────────────────────────────────────────────────
 
 test('cache-ram limits default to a 1024 MiB cap and a 2048 MiB hard maximum', () => {
@@ -455,8 +470,8 @@ test('saving a preset whose estimate exceeds the budget is refused and nothing i
   const calls = [];
   const manager = createModelManager({ kind: 'llamacpp', baseUrl: 'http://synthetic', presetPath: file, autoconfig: { modelsPath: dir }, inferenceBudget: { budgetGib: () => 3 },
     fetchJson: async (url) => { calls.push(new URL(url).pathname); return { ok: true, status: 200, body: { data: [{ id: 'm', status: { value: 'unloaded' } }] } }; } });
-  const rev = () => manager.getPreset('m').then(r => r.body.revision);
-  const refused = await manager.applyPreset({ model: 'm', baseRevision: await rev(), confirmReload: true, options: { 'ctx-size': '262144', 'cache-type-k': 'f16', 'cache-type-v': 'f16' } });
+  const rev = () => manager.presetFacts('m').revision;
+  const refused = await manager.applyPreset({ model: 'm', baseRevision: rev(), confirmReload: true, options: { 'ctx-size': '262144', 'cache-type-k': 'f16', 'cache-type-v': 'f16' } });
   assert.equal(refused.status, 409); assert.equal(refused.body.code, 'inference_budget');
   assert.match(refused.body.error, /^Not saved: with these settings m needs about [\d.]+ GiB .*above the 3 GiB/);
   assert.equal(fs.readFileSync(file, 'utf8'), before); assert.ok(!calls.includes('/models'.concat('?reload=1')));
