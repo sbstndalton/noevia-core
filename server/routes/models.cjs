@@ -23,7 +23,7 @@ const PATH_OPTION_ALIASES = Object.fromEntries([
   ['mmproj', ['mmproj', 'mm', 'LLAMA_ARG_MMPROJ']],
   ['model-draft', ['model-draft', 'md', 'LLAMA_ARG_MODEL_DRAFT']],
 ].flatMap(([canonical, names]) => names.map(n => [n, canonical])));
-const { isSystemModel, modelPathFromArgs, SYSTEM_MODEL_DELETE_REASON, SYSTEM_MODEL_LOAD_REASON, SIDECAR_MODEL_LOAD_REASON, MISSING_MODEL_FILE_REASON, isSidecarModel, SIDECAR_MODEL_DELETE_REASON } = require('../model-system.cjs');
+const { isSystemModel, modelPathFromArgs, SYSTEM_MODEL_DELETE_REASON, SYSTEM_MODEL_LOAD_REASON, SIDECAR_MODEL_LOAD_REASON, MISSING_MODEL_FILE_REASON, rerankModelNames, isSidecarModel, SIDECAR_MODEL_DELETE_REASON } = require('../model-system.cjs');
 
 // noevia#2115: a refusal from the inference gate, as { status, code, error, retryable }, or null. The gate answers in
 // the router's error shape; the model manager passes on a refusal it got while asking for a lease in its own shape.
@@ -55,10 +55,6 @@ function clientMessage(e, fallback) {
  * @param {(url:string, init:object, timeoutMs?:number) => Promise<{ok:boolean,status:number,body:any}>} deps.fetchJson
  * @param {object} deps.env                       process.env, read at call time
  * @param {object} deps.modelManager
- * @param {(id:string) => object|null} deps.getProvider
- * @param {(provider:object, extra?:object) => object} deps.providerHeaders
- * @param {string} deps.DEFAULT_PROVIDER_ID
- * @param {() => Function} deps.createVisionProbe
  * @param {() => object} deps.currentWorkspace
  * @param {object} deps.service   models.cjs
  */
@@ -68,7 +64,7 @@ function clientMessage(e, fallback) {
 const STATS_REFUSAL = Object.freeze({ error: 'Engine statistics are owned by the Rust front.' });
 const ROUTING_DEFAULT_REFUSAL = Object.freeze({ error: 'Routing default is owned by the Rust front.' });
 const AUTO_ROLES_REFUSAL = Object.freeze({ error: 'The auto-roles read is owned by the Rust front.', code: 'RUST_AUTO_ROLES_OWNED' });
-function createModelRoutes({ servedEmbeddingModels = (target) => require('../rag.cjs').servedModelsCached(target), json, readBody, readJson, fetchJson, env, modelManager, getProvider, providerHeaders, DEFAULT_PROVIDER_ID, createVisionProbe, currentWorkspace, service, inferenceBudget = null, idleUnload = null, sweepGuardOptions = {}, decisionSettings = null, rerankSettings = null }) {
+function createModelRoutes({ servedEmbeddingModels = (target) => require('../rag.cjs').servedModelsCached(target), json, readBody, readJson, fetchJson, env, modelManager, currentWorkspace, service, inferenceBudget = null, idleUnload = null, sweepGuardOptions = {}, decisionSettings = null, rerankSettings = null }) {
   const { modelScanCache, refreshModelScan, autoRoles, setAutoRoles, ensureRolesLoaded, servedCatalogue, modelsInstalled, deriveUserModelName, lastLoadedModel, clearLastLoadedModel, clearRoleReferences } = service;
   // #1461: the installed list is shared for a moment (service.modelsInstalled). A decision that must confirm
   // the engine's state right now (a delete that checks the model exists, a load that checks it is not missing)
@@ -88,7 +84,7 @@ function createModelRoutes({ servedEmbeddingModels = (target) => require('../rag
   /** Which sidecar holds `name`: the embedding service (any of its active/next/previous models) or the reranker. */
   function sidecarServiceOf(name) {
     const n = String(name || '').trim();
-    return n && n === String(env.RERANK_MODEL || '').trim() ? 'reranker' : 'embedding';
+    return n && rerankModelNames(env).has(n) ? 'reranker' : 'embedding';
   }
 
   // #1661: drop the models.ini section named `name` through the model management service. Never
@@ -498,22 +494,10 @@ function createModelRoutes({ servedEmbeddingModels = (target) => require('../rag
     // GET /api/models/evidence is the Rust front's (#2210, noevia-rs model_maint/evidence_live.rs;
     // rust-model-maintenance.cjs refuses it before authentication).
 
-    // Re-run the cheap image probe for one model and record the result. It may load the model.
+    // POST recheck is Rust's (#2286); Node keeps the other methods' role check and 405.
     if (p === '/api/models/evidence/recheck') {
       if(authn.user.role!=='admin')return json(res,403,{error:'Administrator required for shared model evidence'});
-      if(req.method!=='POST')return json(res,405,{error:'Method not allowed'});
-      if(!modelManager.recordEvidence)return json(res,404,{error:'Qualification evidence needs the native engine'});
-      const body=await readJson(req).catch(()=>null);
-      const model=typeof body?.model==='string'?body.model:'';
-      if(!model||model.length>200)return json(res,400,{error:'Choose a model'});
-      if(body.category!=='vision')return json(res,400,{error:'Only image input can be rechecked here; use Measure context for context capacity.'});
-      const provider=getProvider(DEFAULT_PROVIDER_ID);
-      const vision=await createVisionProbe()(provider.baseUrl,providerHeaders(provider),model);
-      if(!vision.supported&&!/projector|mmproj/i.test(vision.reason||''))return json(res,503,{error:vision.reason||'The engine could not run the image probe.'});
-      // The front files the record (#2210): wait, bounded, so the answer shows it.
-      const queued=await modelManager.recordEvidence(model,{category:'vision',result:vision.supported?'passed':'failed',value:null,suite:{name:'vision-probe',version:1},source:'recheck',limitations:vision.supported?['1×1 image accepted; not an accuracy test']:[String(vision.reason||'').slice(0,200)]});
-      if(queued)await modelManager.evidenceApplied?.(queued);
-      return json(res,200,(await modelManager.evidence(model)).body);
+      return json(res,405,{error:'Method not allowed'});
     }
 
     // POST /api/models/evidence/import is the Rust front's (#2210, noevia-rs model_maint/evidence_live.rs;
@@ -523,12 +507,11 @@ function createModelRoutes({ servedEmbeddingModels = (target) => require('../rag
       return json(res,405,{error:'Method not allowed'});
     }
 
-    if (p === '/api/models/autotune' || p === '/api/models/autotune/untuned') {
+    if (p === '/api/models/autotune') {
       if(authn.user.role!=='admin')return json(res,403,{error:'Administrator required for shared model profiles'});
       if(!modelManager.autotune)return json(res,404,{error:'Auto-tune is unavailable'});
       let result;
-      if(p.endsWith('/untuned')){if(req.method!=='GET')return json(res,405,{error:'Method not allowed'});result=await modelManager.autotune.untuned();}
-      else if(req.method==='POST'){const body=await readJson(req);result=await modelManager.autotune.start(String(body?.model||''),{confirmPause:body?.confirmPause,promptBudgetSeconds:body?.promptBudgetSeconds,untuned:body?.untuned===true,...(body?.mode!==undefined?{mode:body.mode}:{})});}
+      if(req.method==='POST'){const body=await readJson(req);result=await modelManager.autotune.start(String(body?.model||''),{confirmPause:body?.confirmPause,promptBudgetSeconds:body?.promptBudgetSeconds,untuned:body?.untuned===true,...(body?.mode!==undefined?{mode:body.mode}:{})});}
       else return json(res,405,{error:'Method not allowed'});
       res.setHeader('Cache-Control','no-store');
       return json(res,result.status,result.body);
@@ -583,23 +566,7 @@ function createModelRoutes({ servedEmbeddingModels = (target) => require('../rag
     if (p === '/api/models/hardware' && req.method !== 'GET') return json(res,405,{error:'Method not allowed'});
 
     // #1662: what each model-backed service uses, for every signed-in user (read-only for members).
-    if (p === '/api/models/assignments') {
-      if (req.method !== 'GET') return json(res, 405, { error: 'method not allowed' });
-      let installed = null;
-      try { installed = await modelsInstalled(); } catch { installed = null; }
-      let embedding = null;
-      try { embedding = require('../embedding-config.cjs').current()?.get() || null; } catch { embedding = null; }
-      const { modelAssignments } = require('../model-assignments.cjs');
-      const admin = authn.user.role === 'admin';
-      // Which models the active embeddings server serves (admins only: members get no switch, and
-      // never cause a probe). Cached per address with a short timeout (rag.servedModelsCached);
-      // null = unknown. Advisory only: set-next checks the server itself.
-      let served = null;
-      if (admin) { try { served = await servedEmbeddingModels({ baseUrl: embedding?.active?.baseUrl || null }); } catch { served = null; } }
-      if (!Array.isArray(served)) served = null;
-      const service = require('../embedding-service.cjs').current()?.status() || null;
-      return json(res, 200, { ...modelAssignments({ installed, env, embedding, isSystem: (n) => isSystemModel(n), admin, served, service, decision: decisionSettings ? decisionSettings.describe() : null, rerank: rerankSettings }), available: Array.isArray(installed) });
-    }
+    if (p === '/api/models/assignments') return json(res, 405, { error: 'method not allowed' });
 
     // #1665: the reranker's runtime switch. Administrators only, for reading too (the options name what this
     // server can rerank with); CSRF/origin run before routes. GET -> { enabled, choice, source, options };
@@ -810,7 +777,8 @@ function createModelRoutes({ servedEmbeddingModels = (target) => require('../rag
       }
     }
 
-    if (p === '/api/models/downloads') {
+    // Exact GET is native; retain the historical behavior for other methods.
+    if (p === '/api/models/downloads' && req.method !== 'GET') {
       if (!modelManager.enabled) return json(res, 200, []);
       const r = await modelManager.downloads();
       if (!r.ok) return json(res, 502, {error:'Download status unavailable'});
