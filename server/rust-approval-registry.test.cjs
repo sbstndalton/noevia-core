@@ -104,7 +104,7 @@ test('an unreachable front fails closed: nothing is asked, approved or granted',
   assert.deepEqual(await gate.awaitRouteChoice({ id: 'x', userId: 'owner', abortSignal: ctl.signal }), { choice: 'timeout' });
   assert.equal(await gate.chatWideApproved('owner', 'chat', 'project:p', binding), false);
   assert.equal(await gate.revokeChatGrant('owner', 'chat'), false);
-  assert.ok(logs.length >= 4 && logs.every((m) => /^\[tool-approvals\] \w+ failed: [A-Z_a-z]+$/.test(m)), logs.join('\n'));
+  assert.ok(logs.length >= 4 && logs.every((m) => /^\[tool-approvals\] [a-z ]+ failed: [A-Z_a-z]+$/.test(m)), logs.join('\n'));
 });
 
 test('a grant is checked and revoked at the front, and never without a user, chat, scope and binding', async (t) => {
