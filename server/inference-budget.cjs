@@ -50,9 +50,9 @@ function clampCacheRam(value, { hardMaxMib } = cacheRamLimits()) {
   return n < 0 || n > hardMaxMib ? String(hardMaxMib) : String(n);
 }
 
-function createInferenceBudget({ store, env = process.env, readMeminfo, audit = () => {} } = {}) {
+function createInferenceBudget({ store, env = process.env, readMeminfo, audit = () => {}, log = (m) => console.warn(m) } = {}) {
   let saved = null;
-  try { const v = Number(JSON.parse(store?.get(KEY) || 'null')?.budgetGib); saved = v > 0 ? v : null; } catch { saved = null; }
+  try { const v = Number(JSON.parse(store?.get(KEY) || 'null')?.budgetGib); saved = v > 0 ? v : null; } catch { saved = null; log('[inference-budget] saved budget could not be read at startup; using deployment limit.'); }
   function range() {
     const host = hostRamGib(readMeminfo);
     const maxGib = host ? Math.max(MIN_BUDGET_GIB, Math.floor(host - HOST_HEADROOM_GIB)) : FALLBACK_MAX_GIB;
