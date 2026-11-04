@@ -58,12 +58,8 @@ test('#2303 Core exports the calibration worker marker the release pairs on', ()
   assert.equal(CALIBRATION_WORKER_OWNER, 'noevia-calibration-worker-rust/1');
 });
 
-test('#2303 index.cjs does not recover the calibration job at boot', () => {
-  // Recovering here would interrupt a job the front is still running after a Node-only restart.
-  const source = fs.readFileSync(path.join(__dirname, 'index.cjs'), 'utf8');
-  assert.equal(/calibration\s*\?\.\s*recover\s*\(/.test(source), false);
-  assert.equal(/publicCalibrator/.test(source), false);
-});
+// The boot itself (no public calibrator, no boot recover()) is checked by booting index.cjs:
+// native-calibration-boot-2303.test.cjs.
 
 test('#2303 the public calibrator stays constructible for the oracle fixtures only when asked', (t) => {
   const f = synthetic(t, { publicCalibrator: true });
