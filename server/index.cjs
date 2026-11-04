@@ -167,9 +167,7 @@ const featureRoutes = require('./routes/features.cjs').createFeatureRoutes({ jso
 // Settings → Data: the signed-in user's conversations as a ZIP (routes/export.cjs).
 // GET /api/export/conversations is the Rust front's (#1071): this mount only refuses a bypass.
 const exportRoutes = require('./routes/export.cjs').createExportRoutes({ json });
-const retentionLists = () => ({ freeChats: Array.from(FREE_CHATS), projects: PROJECTS.filter((proj) => !diaryExtras.internalProject(proj)) });
-const removeRetainedChat = ({ projectId, id }) => (projectId ? deleteChat(projectId, id, { requireGone: true }) : deleteFreeChat(id, { requireGone: true }));
-const accountRoutes = require('./routes/account.cjs').createAccountRoutes({ json, readJson, dir: () => currentWorkspace().dir, chatLists: retentionLists, removeChat: removeRetainedChat });
+const accountRoutes = require('./routes/account.cjs').createAccountRoutes({ json });
 // Settings → Data → Import conversations: the POST is the Rust front's (#2191 round 4,
 // rust-conversation-import.cjs); this mount keeps the other methods' 405.
 const importRoutes = require('./routes/import.cjs').createImportRoutes({ json });
@@ -1231,8 +1229,8 @@ const toolApprovalBridge = toolApprovals.createToolApprovalBridge({
   withActiveUser: (id, fn) => toolApprovals.withActiveUser(authService.db, id, fn),
   log: message => console.warn(message),
 });
-// The workspace view, free-chat metas, context meters and transcripts (routes/chat-lists.cjs); it also
-// runs the delete-old-chats sweep as the workspace loads, at most hourly.
+// The workspace view, free-chat metas, context meters and transcripts (routes/chat-lists.cjs).
+// The native workspace owns the hourly old-chat sweep.
 const chatListRoutes = require('./routes/chat-lists.cjs').createChatListRoutes({
   json, readBody, currentWorkspace, PROJECTS, FREE_CHATS, diaryExtras, crypto, STORED_HISTORY_BYTES, STORED_HISTORY_CAP,
   store: projectStore,
