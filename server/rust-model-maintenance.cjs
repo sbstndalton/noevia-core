@@ -12,10 +12,10 @@
 //   POST /api/models/evidence/import  the model-card import (Hugging Face), recorded as external evidence
 //
 // The evidence store (evidence-<hash>/) is the front's to write. This process's producers (a chat's vision probe
-// and MTP acceptance, a benchmark run, auto-tune, the recheck route, a finished download) queue their records in
+// and MTP acceptance, a benchmark run, auto-tune, a finished download) queue their records in
 // evidence-inbox-<hash>/ (evidence-inbox.cjs), which the front drains, and read the log back (evidence.cjs
-// createReader). POST /api/models/evidence/recheck stays here: its image probe may load the model after this
-// process's admission check (the inference budget, the memory-watchdog quarantine, the probe cache).
+// createReader). The image recheck is also native (#2286, rust-model-evidence-recheck.cjs);
+// its normal inference lease still enters this process's live admission gate.
 //
 // What stays here with the other model routes, and why (each is chat-bound or engine-live, or reads
 // this process's memory): /api/model-manager/* (the folder scan cache, the loader proxy), /api/models/
