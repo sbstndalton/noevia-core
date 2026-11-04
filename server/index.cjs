@@ -1204,6 +1204,9 @@ const storageRoutes = require('./routes/storage.cjs').createStorageRoutes({ json
 const idleUnloadFacts = require('./rust-idle-unload-read-facts.cjs').createIdleUnloadFacts({
   secret: FRONT_SECRET, json, effectiveSeconds: () => idleUnload?.effectiveSeconds(),
 });
+const presetReadBridge = require('./rust-preset-read-bridge.cjs').createPresetReadBridge({
+  secret: FRONT_SECRET, json, readJson, manager: () => modelManager,
+});
 const autotuneReadBridge = require('./rust-autotune-read-bridge.cjs').createAutotuneReadBridge({
   secret: FRONT_SECRET, json, readJson, autotune: () => modelManager.autotune,
 });
@@ -1300,6 +1303,8 @@ async function handleRequestInner(req, res) {
   if (require('./rust-idle-unload-read.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   if (await idleUnloadFacts(req, res)) return;
   if (require('./rust-autotune-read.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
+  if (require('./rust-preset-read.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
+  if (await presetReadBridge(req, res)) return;
   if (await autotuneReadBridge(req, res)) return;
   if (require('./rust-autotune-resume.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   if (await autotuneResumeBridge(req, res)) return;
