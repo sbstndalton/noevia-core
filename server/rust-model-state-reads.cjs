@@ -1,9 +1,9 @@
 'use strict';
 // sbstndalton/noevia#2262 (group rust-model-state-reads): GET /api/models/inference-budget and GET /api/models/installed are
-// the Rust front's (noevia-rs bins/noevia-server model_state_routes.rs). Node keeps the budget's PUT (its cache of the saved
-// figure and the audit) and every internal reader of the installed list; what the front cannot know comes over the loopback
-// bridge (rust-model-facts.cjs). A direct Node GET is refused before authentication, whoever asks, so a stale route table
-// cannot make two processes answer. Kept separate from rust-models.cjs so the supervisor and the release assembly can tell a
+// the Rust front's (noevia-rs bins/noevia-server model_state_routes.rs). Node retains the budget PUT wrapper and audit,
+// but forwards the write to Rust; synchronous enforcement consumes Rust's start-bound snapshot. Internal installed-list
+// readers consume Rust's projection too. A direct Node GET is refused before authentication so a stale route table cannot
+// make two processes answer. Kept separate from rust-models.cjs so the supervisor and release assembly can distinguish a
 // Core with this refusal from one without it.
 //
 // The list is exactly noevia-rs contracts/http/routes.toml's rows for this group, GET only.

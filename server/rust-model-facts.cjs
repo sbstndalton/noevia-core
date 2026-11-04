@@ -11,7 +11,7 @@ function createNativeFacts({ dataDir, start, storeClient, now = Date.now, config
       const bytes = fs.readFileSync(path.join(dataDir, 'model-facts.json'));
       if (bytes.length > 1024 * 1024) throw unavailable();
       const s = JSON.parse(bytes);
-      if (s.protocol !== 'model-facts/1' || !start || s.start !== start || !Number.isSafeInteger(s.generation) || s.generation < generation || !Number.isFinite(s.at) || s.at > now() || now() - s.at > 15000) throw unavailable();
+      if (s.protocol !== 'model-facts/1' || !start || s.start !== start || !Number.isSafeInteger(s.generation) || s.generation < 0 || s.generation < generation || !Number.isFinite(s.at) || s.at > now() || now() - s.at > 15000) throw unavailable();
       generation = s.generation;
       return s;
     } catch { throw unavailable(); }

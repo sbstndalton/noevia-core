@@ -50,6 +50,8 @@ function clampCacheRam(value, { hardMaxMib } = cacheRamLimits()) {
   return n < 0 || n > hardMaxMib ? String(hardMaxMib) : String(n);
 }
 
+// Legacy budget oracle for synthetic tests. index.cjs installs the native facts reader instead;
+// this factory is never a budget writer in the paired runtime. The cache-RAM helpers above remain shared.
 function createInferenceBudget({ store, env = process.env, readMeminfo, audit = () => {}, log = (m) => console.warn(m) } = {}) {
   let saved = null;
   try { const v = Number(JSON.parse(store?.get(KEY) || 'null')?.budgetGib); saved = v > 0 ? v : null; } catch { saved = null; log('[inference-budget] saved budget could not be read at startup; using deployment limit.'); }

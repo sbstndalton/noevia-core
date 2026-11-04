@@ -138,6 +138,7 @@ function createClient({ port, token, fetchImpl = globalThis.fetch, timeoutMs = T
     async modelBudget(value) {
       const {status,body}=await call('model-facts/budget',value);
       if(status!==200) throw Object.assign(Error(body?.error||'Model facts are unavailable.'),body||{}, {status,messageId:body?.errorId});
+      if (!Number.isFinite(body?.budgetGib) || body.budgetGib < 2) throw Object.assign(Error('Model facts are unavailable.'),{status:503});
       return body;
     },
     async modelInstalled() {

@@ -18,7 +18,7 @@
 //                 refused on the next load until its preset revision or the budget changes (the
 //                 load guard that reads it, overBudget, is this process's).
 //
-// The budget itself is the existing facts call (rust-model-facts.cjs {want: 'budget'}).
+// The budget itself is Rust's live authority; both the watch and Node enforcement read its start-bound snapshot.
 const { trustedFront } = require('./trusted-front.cjs');
 
 const BUDGET_WATCH_OWNER = 'noevia-budget-watch-rust/3';

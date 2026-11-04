@@ -249,7 +249,7 @@ function createModelService({ fetchJson, env, modelManager, currentWorkspace, li
     return sidecarLoaded;
   }
 
-  // sbstndalton/noevia#2262: what the Rust front's installed list needs of this process (rust-model-facts.cjs): the sidecar
+  // Legacy installed-facts oracle for synthetic tests; the paired runtime uses the native projection below. The sidecar
   // names and reports (embedding service state) and the shared folder scan. A list read used to name the first loaded model
   // as a side effect, which the code roles fall back to; the front's read keeps that by naming it here.
   async function installedFacts({ ids, scan, firstLoaded }) {

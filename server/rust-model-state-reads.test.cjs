@@ -59,7 +59,7 @@ test('Node budget enforcement and sidecar protection read the native snapshot',t
 });
 test('missing, torn, stale and wrong-start snapshots fail closed',t=>{
  const {root,write,state}=fixture(t); const native=createNativeFacts({dataDir:root,start:state.start,now:()=>17000});
- for(const value of ['{"protocol":', {...state,at:1000},{...state,at:17000,start:'other-start'},{...state,at:18000},{...state,at:17000,budget:{budgetGib:0}}]) {
+ for(const value of ['{"protocol":', {...state,at:17000,generation:-1}, {...state,at:1000},{...state,at:17000,start:'other-start'},{...state,at:18000},{...state,at:17000,budget:{budgetGib:0}}]) {
   write(value);assert.throws(()=>native.budgetGib(),{status:503});
  }
  fs.unlinkSync(path.join(root,'model-facts.json'));assert.throws(()=>native.budgetGib(),{status:503});
@@ -114,4 +114,9 @@ test('raw config export is bounded to model config and rejects forwarded callers
  let answer;const bridge=createBridge({secret:'s'.repeat(40),json:(_,status,body)=>{answer={status,body};},readJson:async()=>({}),env:{},service:{}});
  await bridge({method:'POST',url:'/internal/model-config',headers:{'x-noevia-store-token':'s'.repeat(40),'x-forwarded-for':''},socket:{remoteAddress:'127.0.0.1'}},{});
  assert.equal(answer.status,404);
+});
+
+test('a malformed native save acknowledgement is unavailable, never a successful save',async()=>{
+ const client=createClient({port:12345,token:'s'.repeat(40),fetchImpl:async()=>new Response('{}',{status:200})});
+ await assert.rejects(client.modelBudget({budgetGib:9}),{status:503});
 });
