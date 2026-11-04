@@ -1,20 +1,28 @@
 'use strict';
 const { trustedFront } = require('./trusted-front.cjs');
 const PATH = '/internal/model-downloads-read/facts';
-const FIELDS = ['id', 'job_id', 'model_name', 'model', 'checkpoint', 'percent', 'progress', 'status', 'state'];
 
 function row(value) {
   // routes/models.cjs read every field of a null row and threw; Rust keeps that as its fault.
   if (value == null) return null;
   const fields = {};
   const infinite = [];
-  for (const key of FIELDS) {
-    const field = value[key];
+  function keep(key, field) {
     // JSON.parse accepts overflowing numbers; JSON.stringify would silently turn
     // them into null before Rust can apply the original truthiness/type rules.
-    if (field === Infinity || field === -Infinity) infinite.push(key);
+    if (typeof field === 'number' && !Number.isFinite(field)) infinite.push(key);
     else if (field !== undefined) fields[key] = field;
   }
+  // Match the old expression's short circuit: an ignored fallback must never be
+  // traversed or serialized (it may be much larger/deeper than the selected value).
+  for (const keys of [['id', 'job_id'], ['model_name', 'model', 'checkpoint'], ['status', 'state']]) {
+    for (const key of keys) {
+      const field = value[key];
+      if (field) { keep(key, field); break; }
+    }
+  }
+  if (typeof value.percent === 'number') keep('percent', value.percent);
+  else if (typeof value.progress === 'number') keep('progress', value.progress);
   return infinite.length ? { fields, infinite } : { fields };
 }
 

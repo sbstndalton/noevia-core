@@ -1075,7 +1075,7 @@ test('download GET pairs an exact refusal with bounded trusted adapter facts', a
     return sent.pop();
   };
   assert.deepEqual(await facts(body), { status: 200, body: { kind: 'listing', rows: [
-    { fields: { id: 0, job_id: 'j', progress: 0.9 }, infinite: ['percent'] }, null, { fields: {} },
+    { fields: { job_id: 'j' }, infinite: ['percent'] }, null, { fields: {} },
   ] } });
   assert.equal(polls, 1);
   // The old route's choice, exactly: an array body, else jobs || downloads || [].
@@ -1095,6 +1095,28 @@ test('download GET pairs an exact refusal with bounded trusted adapter facts', a
   assert.equal(chosen.kind, 'listing');
   assert.equal(chosen.rows[0].fields.id, huge);
   assert.equal(chosen.rows[0].fields.model, 'm');
+  // The old public expression never touches the ignored fallback, even when
+  // JSON.parse accepts nesting that JSON.stringify cannot traverse.
+  const deep = JSON.parse('['.repeat(10000) + '0' + ']'.repeat(10000));
+  const ignoredBody = { jobs: [{ id: 'small', job_id: deep, model_name: 'm', model: deep, status: 'done', state: deep, percent: 25, progress: deep }] };
+  const ignored = await facts(ignoredBody);
+  assert.deepEqual(ignored.body, { kind: 'listing', rows: [{ fields: { id: 'small', model_name: 'm', status: 'done', percent: 25 } }] });
+  assert.doesNotThrow(() => JSON.stringify(ignored.body));
+  const legacy = fixture({ manager: { downloads: async () => ({ ok: true, body: ignoredBody }) } });
+  await legacy.call('HEAD', '/api/models/downloads');
+  assert.equal(JSON.stringify(legacy.sent.pop().body),
+    '[{"id":"small","model":"m","progress":0.25,"status":"done"}]');
+  const unicode = String.fromCodePoint(0x10f800, 0x10ffff);
+  assert.equal((await facts([{ id: unicode }])).body.rows[0].fields.id, unicode);
+  const selectedDeep = JSON.parse('['.repeat(200) + '0' + ']'.repeat(200));
+  assert.equal((await facts([{ id: selectedDeep }])).body.rows[0].fields.id, selectedDeep);
+  const selectedBody = [{ id: unicode, model: selectedDeep }];
+  const legacySelected = fixture({ manager: { downloads: async () => ({ ok: true, body: selectedBody }) } });
+  await legacySelected.call('HEAD', '/api/models/downloads');
+  assert.equal(JSON.stringify(legacySelected.sent.pop().body),
+    JSON.stringify([{ id: unicode, model: selectedDeep, progress: null, status: '' }]));
+  assert.equal(JSON.stringify((await facts(selectedBody)).body.rows[0].fields),
+    JSON.stringify({ id: unicode, model: selectedDeep }));
   const polled = polls;
   manager.downloads = async () => { polls++; return { ok: false, status: 500 }; };
   assert.deepEqual((await facts(null)).body, { kind: 'failed' });
