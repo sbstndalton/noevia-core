@@ -40,7 +40,7 @@ const AVAILABLE_STATES = new Set(['loaded', 'sleeping']);
 const isAvailable = model => AVAILABLE_STATES.has(model.status?.value);
 const alreadyRunning = result => result?.status === 400 && /already running/i.test(JSON.stringify(result?.body ?? ''));
 
-function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloadStatePath, fetchStream, autoconfig = {}, calibrationStatePath, calibrationOptions = {}, evidenceDir, autotuneStatePath, autotuneOptions = {}, presetWriter = null, inferenceBudget = null, reloadStatePath = null, reloadGuard: reloadGuardOption = null, gate = null, gateAdminToken = null }) {
+function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloadStatePath, fetchStream, autoconfig = {}, calibrationStatePath, calibrationOptions = {}, evidenceDir, autotuneStatePath, autotuneOptions = {}, presetWriter = null, inferenceBudget = null, reloadStatePath = null, reloadGuard: reloadGuardOption = null, presetBaselineClient = null, gate = null, gateAdminToken = null }) {
   const base = String(baseUrl || '').replace(/\/+$/, '').replace(/\/v1$/, '');
   const url = new URL(base);
   if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password || url.search || url.hash) throw Error('Invalid llama.cpp router URL');
@@ -85,27 +85,44 @@ function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloa
   const maintenance=require('./inference-maintenance.cjs').createMaintenanceGate({remote:typeof gateClient.holdMaintenance==='function'&&gateClient.hasAdmin?.()===true?gateClient:null,observeMs:gate?0:3000});
   holdHeaders=maintenance.holdHeaders;
   // #1012: what the router last read, so a reload can keep loaded models (preset-reload.cjs, #1071: always on).
-  const reloadGuard=reloadGuardOption||require('./preset-reload.cjs').createReloadGuard({stateFile:reloadStatePath,log:m=>console.log(m)});
+  // With the front's store client the baseline is the front's (bridge mode, preset-reload.cjs
+  // createBridgeReloadGuard); an older front keeps this process's own guard on the same file.
+  const reloadGuard=reloadGuardOption||(()=>{
+    const {createReloadGuard,createBridgeReloadGuard}=require('./preset-reload.cjs');
+    const legacy=()=>createReloadGuard({stateFile:reloadStatePath,log:m=>console.log(m)});
+    return presetBaselineClient?createBridgeReloadGuard({client:presetBaselineClient,legacy,log:m=>console.log(m)}):legacy();
+  })();
   // Every router preset reload noevia makes goes through here: re-read the file just before the
-  // call, and afterwards record that text with the router's own view of it (or forget the
-  // baseline when the outcome is unclear), so the next reload can be judged.
+  // call, open a reload ticket (the baseline is unknown while it is open), and afterwards settle it
+  // with that text and the router's own view of it (or as forget when the outcome is unclear), so
+  // the next reload can be judged. No ticket, no reload: it answers as a failed reload.
   // `expectText`: the text a
   // reload that keeps loaded models was judged on; the file is re-read here and must still match.
   async function routerReload(timeout=120000,{expectText=null}={}) {
     let before=null;try{before=presets?.snapshot().text??null;}catch{}
     if(expectText!==null&&before!==expectText)return {ok:false,status:409,refused:'file_changed',body:{}};
+    let ticket;
+    try{ticket=await reloadGuard.begin('node');}
+    catch{return {ok:false,status:502,body:{error:'The preset reload baseline is unavailable, so the engine was not asked to reload.'}};}
+    let settled=false;
+    const settle=async(outcome,detail)=>{if(settled)return;settled=true;try{await reloadGuard.settle(ticket,outcome,detail);}catch{}};
     let result;
     try {result=await request('/models?reload=1',{},timeout);}
-    catch(e){await reloadGuard.forget();throw e;}
-    if(!result.ok){await reloadGuard.forget();return result;}
+    catch(e){await settle('forget');throw e;}
+    if(!result.ok){await settle('forget');return result;}
     try {
       const after=await rawModels();
       let textAfter=null;try{textAfter=presets?.snapshot().text??null;}catch{}
-      if(after.ok&&Array.isArray(after.body?.data)&&before!==null)await reloadGuard.record(before,after.body.data,textAfter);
-      else await reloadGuard.forget();
-    } catch {await reloadGuard.forget();}
+      if(after.ok&&Array.isArray(after.body?.data)&&before!==null)await settle('record',{before,rows:after.body.data,after:textAfter});
+      else await settle('forget');
+    } catch {await settle('forget');}
     return result;
   }
+  // Before a raw router re-read that skips routerReload (calibration and auto-tune restores, #1068):
+  // the baseline is unknown from then on. True only when that was acknowledged (saved); on false the
+  // caller must not re-read, or the router would run on text the baseline may still vouch for.
+  // Never throws; a failure is logged by the guard.
+  const invalidateBaseline=async origin=>{try{return (await reloadGuard.invalidate(origin))?.saved===true;}catch{return false;}};
   async function mutate(fn) {const leave=maintenance.enter();try{return await fn();}finally{leave();}}
   // #1079: which rows are a model and its `<model>-long` profile (Rust's pairing; none on failure).
   const longProfiles=autotuneOptions.longProfiles||require('./long-profile.cjs').createLongProfiles();
@@ -327,7 +344,7 @@ function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloa
     let kept=[],expectText=null;
     if(loaded.length&&!unload){
       let judged=null;try{judged=presets?.snapshot().text??null;}catch{}
-      const verdict=reloadGuard.verdict(judged,rows,loaded);
+      const verdict=await reloadGuard.verdict(judged,rows,loaded);
       if(!verdict.safe)return refuse(loaded,verdict.reason);
       // Right before the call: list again; a model that started loading meanwhile, or a moved
       // router, refuses (#1040). The file itself is re-read inside routerReload.
@@ -335,7 +352,7 @@ function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloa
       if(!again.ok||!Array.isArray(again.body?.data))return refuse(loaded,'unknown');
       const now=liveIds(again.body.data);
       if(now.some(id=>!loaded.includes(id)))return refuse(now,'loaded_changed');
-      const recheck=reloadGuard.verdict(judged,again.body.data,now);
+      const recheck=await reloadGuard.verdict(judged,again.body.data,now);
       if(!recheck.safe)return refuse(now,recheck.reason);
       kept=now;expectText=judged;
     }
@@ -642,12 +659,12 @@ function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloa
       profile:evidenceLib.identityHash([sectionText('*'),sectionText(model)]),
       hardware:[autoconfig.hardwareLabel||null,memGiB?`${memGiB}GiB`:null,JSON.stringify(build)].filter(Boolean).join(' ')||null};
   }
-  const calibrator=presets?require('./llamacpp-calibration.cjs').createCalibrator({request,rawModels,presets,maintenance,applyUnlocked,conservativeFor,identityFor:tuneIdentity,onResult:({model,status,entry})=>recordEvidence(model,status==='passed'?{category:'context_capacity',result:'passed',value:{ctx:entry.verifiedCtx,appliedCtx:entry.appliedCtx,slots:entry.slots},suite:{name:'native-calibration',version:1},source:'calibration',limitations:[`prompt budget ${entry.promptBudgetSeconds} s`]}:{category:'context_capacity',result:'failed',value:null,suite:{name:'native-calibration',version:1},source:'calibration',limitations:[String(entry.error||'').slice(0,200)]}),stream:(path,opts={})=>(fetchStream||fetch)(base+path,{...opts,headers:headers(opts.headers),redirect:'error'}),stateFile:calibrationStatePath,memoryFloorGib:autoconfig.memoryFloorGib||2,...calibrationOptions}):null;
+  const calibrator=presets?require('./llamacpp-calibration.cjs').createCalibrator({request,rawModels,presets,maintenance,applyUnlocked,invalidateBaseline,conservativeFor,identityFor:tuneIdentity,onResult:({model,status,entry})=>recordEvidence(model,status==='passed'?{category:'context_capacity',result:'passed',value:{ctx:entry.verifiedCtx,appliedCtx:entry.appliedCtx,slots:entry.slots},suite:{name:'native-calibration',version:1},source:'calibration',limitations:[`prompt budget ${entry.promptBudgetSeconds} s`]}:{category:'context_capacity',result:'failed',value:null,suite:{name:'native-calibration',version:1},source:'calibration',limitations:[String(entry.error||'').slice(0,200)]}),stream:(path,opts={})=>(fetchStream||fetch)(base+path,{...opts,headers:headers(opts.headers),redirect:'error'}),stateFile:calibrationStatePath,memoryFloorGib:autoconfig.memoryFloorGib||2,...calibrationOptions}):null;
   const tuneDeps={identityFor:tuneIdentity,stateFile:autotuneStatePath,memoryFloorGib:autoconfig.memoryFloorGib||2,...(calibrationOptions.readMemory?{readMemory:calibrationOptions.readMemory}:{}),...autotuneOptions};
   // Internal context checks run under the full tuner's per-model lease; standalone
   // calibration still acquires the real gate.
   const managedGate={hold:()=>()=>{}};
-  const autotuner=presets&&autotuneStatePath?require('./llamacpp-full-autotune.cjs').createFullAutotuner({fileMissing:presetFileMissing,request,rawModels,presets,maintenance,applyUnlocked,identityFor:tuneDeps.identityFor,stateFile:autotuneStatePath,
+  const autotuner=presets&&autotuneStatePath?require('./llamacpp-full-autotune.cjs').createFullAutotuner({fileMissing:presetFileMissing,request,rawModels,presets,maintenance,applyUnlocked,invalidateBaseline,identityFor:tuneDeps.identityFor,stateFile:autotuneStatePath,
       samplingFor,
       // #1079: a Long tune adds its `<model>-long` section, then the router re-reads models.ini the
       // way every other noevia write does (recorded for the preset reload guard).
@@ -672,7 +689,7 @@ function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloa
         // Private configured-profile worker client; no public confirmation/auth/HTTP policy.
         const revision=presets.snapshot().revision;
         const current=()=>hooks.contextCurrent?.() === true && maintenance.held() && presets.snapshot().revision === revision;
-        const worker=require('./llamacpp-calibration.cjs').createCalibrator({request,rawModels,presets,applyUnlocked,conservativeFor,identityFor:tuneIdentity,maintenance:managedGate,
+        const worker=require('./llamacpp-calibration.cjs').createCalibrator({request,rawModels,presets,applyUnlocked,invalidateBaseline,conservativeFor,identityFor:tuneIdentity,maintenance:managedGate,
           stream:(path,opts={})=>(fetchStream||fetch)(base+path,{...opts,headers:headers(opts.headers),redirect:'error'}),
           memoryFloorGib:autoconfig.memoryFloorGib||2,...calibrationOptions,stateFile:undefined,...hooks});
         const controller=new AbortController();
@@ -743,7 +760,7 @@ function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloa
     reloadPresets,
     writePresets,
     // noevia#1863: the models.ini text the router is known to run on, or null when unknowable.
-    async presetsInRouter(){try{const l=await rawModels();return l.ok&&Array.isArray(l.body?.data)?reloadGuard.routerText(l.body.data):null;}catch{return null;}},
+    async presetsInRouter(){try{const l=await rawModels();return l.ok&&Array.isArray(l.body?.data)?await reloadGuard.routerText(l.body.data):null;}catch{return null;}},
     evidence, recordEvidence, importEvidence,
     // #2210: waits (bounded) until the front has applied a queued record (recordEvidence's handle).
     evidenceApplied: (handle,options)=>evidenceInbox?evidenceInbox.applied(handle,options):Promise.resolve(true),
