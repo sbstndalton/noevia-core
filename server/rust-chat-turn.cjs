@@ -18,6 +18,8 @@
 //
 //   POST /internal/chat/gate   -> 204 when the gate would let a turn in (the hold is given back at once), or the
 //                                 gate's own refusal (503 + Retry-After: 3 + body, one `[chat] 503` line)
+//   POST /internal/chat/gate?hold=1   -> chat port S6: the same, but a 200 keeps the gate for the front's call (its
+//                                        lease, rust-chat-edge.cjs), which the relayed turn then adopts
 //
 // and the front answers its refusal only after a 204. The precedence a client sees is Node's.
 //
@@ -57,6 +59,12 @@ function refuseOwned(req, res, { parseRequestUrl, json }) {
   return true;
 }
 
+/** A trusted gate probe's ask: `{ hold, route }` ('chat' or 'diary'), or null for any other request. */
+function relayedGate(req) {
+  const r = req && req[RELAYED];
+  return r && !r.user ? { hold: r.hold === true, route: r.route } : null;
+}
+
 /** The user the front authenticated this relayed turn as, or null for any other request. */
 function relayedUser(req) {
   return (req && req[RELAYED] && req[RELAYED].user) || null;
@@ -92,9 +100,12 @@ function createTurnBridge({ secret, json }) {
     if (typeof client === 'string' && client) req.headers['x-noevia-client-ip'] = client;
     if (typeof forwarded === 'string' && forwarded) req.headers['x-forwarded-for'] = forwarded;
     // The gate probe for the Diary local exchange meets the gate as that route does (rust-chat-edge.cjs).
-    const diaryGate = !turn && new URLSearchParams(query).get('route') === edge.DIARY_GATE_ROUTE;
+    // and a probe with hold=1 keeps the gate it entered for the front's call (rust-chat-edge.cjs leases).
+    const params = new URLSearchParams(query);
+    const diaryGate = !turn && params.get('route') === edge.DIARY_GATE_ROUTE;
     req.url = diaryGate ? edge.LOCAL_EXCHANGE : PATH;
-    req[RELAYED] = { user: turn ? user : null, cowork: pathname === edge.COWORK_PATH, wire: turn ? kind : 'sse' };
+    req[RELAYED] = { user: turn ? user : null, cowork: pathname === edge.COWORK_PATH, wire: turn ? kind : 'sse',
+      hold: !turn && params.get('hold') === '1', route: diaryGate ? 'diary' : 'chat' };
     return turn ? 'turn' : 'gate';
   }
   return { accept };
@@ -102,5 +113,5 @@ function createTurnBridge({ secret, json }) {
 
 module.exports = {
   OWNED_ROUTES, ROUTE_REFUSAL, PATH, TURN_PATH, GATE_PATH, TOKEN_HEADER, USER_HEADER, RELAY_CLIENT_HEADER, RELAY_FORWARDED_HEADER,
-  owned, refuseOwned, relayedUser, relayedWire, createTurnBridge,
+  owned, refuseOwned, relayedUser, relayedWire, relayedGate, createTurnBridge,
 };

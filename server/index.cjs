@@ -1535,16 +1535,16 @@ async function handleRequest(req,res) {
   // #1896: a chat turn waits a moment (<= 3 s) for a briefly held gate, then answers a retryable 503 and logs its reason.
   const chatAdmission=require('./chat-admission.cjs');
   const aborted=new AbortController();res.once('close',()=>aborted.abort());
-  try {if(inference)leave=await chatAdmission.enterChatInference(modelManager,{signal:aborted.signal});}
+  // Chat port S6: a call the front already took the gate for adopts that hold (rust-chat-edge.cjs leases).
+  const adopted=inference&&relay!=='gate'?chatEdge.leases.adopt(req,relay==='turn'?'chat':pathname===chatEdge.LOCAL_EXCHANGE?'diary':''):null;
+  try {if(adopted)leave=adopted;else if(inference)leave=await chatAdmission.enterChatInference(modelManager,{signal:aborted.signal});}
   catch(error){
     const status=error.status||503;
-    // Chat port S6: the front counted this call on the `llm:` budget; Node never did (rust-chat-edge.cjs).
-    chatEdge.markGateRefused(res,relay,pathname);
     if(pathname==='/api/chat'&&status===503){chatAdmission.log503('maintenance');res.setHeader('Retry-After','3');return json(res,503,chatAdmission.refusalBody(error));}
     return json(res,status,{error:error.message});
   }
   // The front's probe of the gate alone, for a request it refuses (401/403): Node's gate answers first.
-  if(relay==='gate'){if(leave)leave();res.statusCode=204;res.end();return;}
+  if(relay==='gate'){const ask=require('./rust-chat-turn.cjs').relayedGate(req);if(ask&&ask.hold)return chatEdge.leases.hold(res,ask.route,leave);if(leave)leave();res.statusCode=204;res.end();return;}
   if(leave){res.once('finish',leave);res.once('close',leave);}
   // #1881: while a chat or Diary turn runs, the long-document backfill makes no embed request (rag.cjs foreground).
   if(inference){const fg=rag.foreground();res.once('finish',fg);res.once('close',fg);}

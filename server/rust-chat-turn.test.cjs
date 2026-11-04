@@ -105,7 +105,8 @@ test('index.cjs: the relay is accepted before the gate, refused direct turns tak
   assert.ok(at('chatTurnBridge.accept(req,res)') < at('enterChatInference('));
   assert.match(top, /const chatTurnOwned=!relay && require\('\.\/rust-chat-turn\.cjs'\)\.owned\(req\.method,pathname\);/);
   assert.match(top, /\(pathname==='\/api\/chat' && !chatTurnOwned\)/);
-  assert.ok(at("if(relay==='gate'){if(leave)leave();res.statusCode=204;res.end();return;}") < at("if(leave){res.once('finish',leave)"));
+  assert.ok(at("if(leave)leave();res.statusCode=204;res.end();return;}") < at("if(leave){res.once('finish',leave)"));
+  assert.ok(at("if(relay==='gate'){") < at("if(leave)leave();res.statusCode=204;res.end();return;}"));
   const inner = source.slice(source.indexOf('async function handleRequestInner(req, res) {'), source.indexOf('async function handleRequestScoped('));
   assert.match(inner, /if \(require\('\.\/rust-chat-turn\.cjs'\)\.refuseOwned\(req, res, \{ parseRequestUrl, json \}\)\) return;/);
   assert.ok(inner.indexOf("rust-chat-turn.cjs').refuseOwned") < inner.indexOf('requestAuth.authenticate(req)'));
