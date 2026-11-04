@@ -356,6 +356,8 @@ const modelManager = createModelManager({
   calibrationStatePath: path.join(DATA_DIR,'native-calibration-'+require('node:crypto').createHash('sha256').update(MODEL_MANAGER_BASE).digest('hex').slice(0,16)+'.json'),
   autotuneStatePath: path.join(DATA_DIR,'native-autotune-'+require('node:crypto').createHash('sha256').update(MODEL_MANAGER_BASE).digest('hex').slice(0,16)+'.json'),
   // #1012: the models.ini text the router last read after a reload noevia made.
+  // noevia-rs model_maint/reload.rs: the front holds that baseline when it serves it (preset-reload.cjs).
+  presetBaselineClient: PROJECT_STORE,
   reloadStatePath: path.join(DATA_DIR,'native-preset-reload-'+require('node:crypto').createHash('sha256').update(MODEL_MANAGER_BASE).digest('hex').slice(0,16)+'.json'),
   downloadStatePath: path.join(DATA_DIR,'native-downloads-'+require('node:crypto').createHash('sha256').update(MODEL_MANAGER_BASE).digest('hex').slice(0,16)+'.json'),
   baseUrl: MODEL_MANAGER_BASE,

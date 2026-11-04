@@ -38,7 +38,7 @@ async function resumeWorker(manager) {
 // #1057: the fake engine's f16 quirks (failLoadF16, badF16, the shorter recall) hold for both
 // unquantized cache types, bf16 being the first candidate now.
 const unq = o => ['bf16', 'f16'].includes(o['cache-type-k']);
-function fixture(t, { badSampling = false, models = ['synthetic'], onChat, onUnload, badQ4 = true, badF16 = false, noHead = false, rejectAll = false, rejectModel = '', badBatch = false, failFinal = false, formattedQuality = false, reasoningOnly = false, truncatedWorkloads = false, idleTimeoutMs = 300000, loseIdentityAfterStart = false, reloadFail = false, unloadPolls = 0, unloadStuck = false, answerFor = null, failLoadF16 = false, failLoadBf16 = false, httpFor = null, chatTemplate = null, servingFor = null, servingChecks = null, autotuneExtra = {}, onLoad = null, loadHang = null, calibrationExtra = {}, loadReply = null, streamReply = null, metricsFor = null, strictUnload = false, onReload = null, reloadAddsSections = false } = {}) {
+function fixture(t, { badSampling = false, models = ['synthetic'], onChat, onUnload, badQ4 = true, badF16 = false, noHead = false, rejectAll = false, rejectModel = '', badBatch = false, failFinal = false, formattedQuality = false, reasoningOnly = false, truncatedWorkloads = false, idleTimeoutMs = 300000, loseIdentityAfterStart = false, reloadFail = false, unloadPolls = 0, unloadStuck = false, answerFor = null, failLoadF16 = false, failLoadBf16 = false, httpFor = null, chatTemplate = null, servingFor = null, servingChecks = null, autotuneExtra = {}, onLoad = null, loadHang = null, calibrationExtra = {}, loadReply = null, streamReply = null, metricsFor = null, strictUnload = false, onReload = null, reloadAddsSections = false, presetBaselineClient = null } = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'full-tune-'));
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
   const ini = path.join(dir, 'models.ini'), stateFile = path.join(dir, 'tune.json');
@@ -103,7 +103,7 @@ function fixture(t, { badSampling = false, models = ['synthetic'], onChat, onUnl
     const content = Number(o['ctx-size']) <= (unq(o) ? 8192 : 16384) ? marker : 'forgot';
     return new Response(`data: ${JSON.stringify({ choices: [{ delta: { content } }], timings: { prompt_n: Math.floor(text.length / 5), prompt_ms: 100, prompt_per_second: 100000 } })}\n\ndata: [DONE]\n\n`);
   };
-  const makeManager = () => createModelManager({ kind: 'llamacpp', baseUrl: 'http://synthetic', presetPath: ini, fetchJson, fetchStream,
+  const makeManager = () => createModelManager({ kind: 'llamacpp', baseUrl: 'http://synthetic', presetPath: ini, fetchJson, fetchStream, presetBaselineClient,
     calibrationStatePath: path.join(dir, 'cal.json'), autotuneStatePath: stateFile,
     calibrationOptions: { identityFor: async()=>({arch:null,quant:null,artifact:'synthetic-artifact',build:null,profile:require('node:crypto').createHash('sha256').update(fs.readFileSync(ini)).digest('hex'),hardware:null}), sleep: async () => {}, readMemory: () => 20, ...calibrationExtra },
     autotuneOptions: { ...autotuneExtra, ...(servingChecks ? { servingChecks } : {}), ...(unloadPolls || unloadStuck ? { sleep: async () => {} } : {}), betweenModelsMs: 25, idleTimeoutMs, readMemory: () => 20, identityFor: async m => (++identityReads > 1 && loseIdentityAfterStart ? null : { model: m, hardware: 'fake', build }) } });
@@ -1783,7 +1783,7 @@ test('#1062 a deferred re-read happens before the compact model next loads, and 
 });
 
 // #1072: a re-read owed by an interrupted job, with the model server reached through a fake request.
-function owedReread(t, { request, rawModels }) {
+function owedReread(t, { request, rawModels, invalidateBaseline }) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'full-tune-owed-'));
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
   const { createFullAutotuner } = require('./llamacpp-full-autotune.cjs');
@@ -1791,7 +1791,7 @@ function owedReread(t, { request, rawModels }) {
   fs.writeFileSync(stateFile, JSON.stringify({ job: { status: 'interrupted', model: 'synthetic', _reloadPending: true, models: [] } }));
   const presets = { get: () => ({ exists: true, options: {}, defaults: {} }), files: () => ({}), snapshot: () => ({ text: '', revision: '' }) };
   const autotune = createFullAutotuner({ request, rawModels, presets, maintenance: {}, applyUnlocked: async () => ({ ok: true }),
-    identityFor: async m => ({ model: m }), stateFile, foreignPollMs: 1 });
+    identityFor: async m => ({ model: m }), stateFile, foreignPollMs: 1, ...(invalidateBaseline ? { invalidateBaseline } : {}) });
   const owed = () => JSON.parse(fs.readFileSync(stateFile, 'utf8')).job._reloadPending;
   return { autotune, owed };
 }
@@ -2213,4 +2213,54 @@ test('#2317 a wrong private context abort token has no effect on the pending rea
   assert.equal(child.cancellationFacts().token,before.token);
   assert.equal(loads,before.loads);assert.equal(f.requests.length,before.requests);assert.equal(fs.readFileSync(f.ini,'utf8'),before.text);
   release();const completed=await finished(f.manager);assert.equal(completed.status,'passed',completed.error);
+});
+
+// ── noevia-rs model_maint/reload.rs: the front holds the preset reload baseline ─────────────────────────────
+// Auto-tune's own re-reads of a restored models.ini skip the guarded reload (#1068, #1072), so each one
+// first makes the baseline unknown; a guarded reload opens a ticket instead. Every re-read the router
+// sees is preceded by one or the other.
+const { createFakePresetBaseline } = require('./preset-baseline-fixture.cjs');
+const sameText = ({ baseline, current }) => ({ safe: baseline === current, reason: baseline === current ? 'unchanged' : 'changed', changed: [] });
+function reReadsAfter(log) {
+  const before = log.flatMap((entry, i) => (entry === 'RELOAD' ? [log[i - 1]] : []));
+  assert.ok(before.length > 0, 'the router re-read');
+  for (const entry of before) assert.ok(['bridge begin:node', 'bridge invalidate:autotune'].includes(entry), `a re-read after ${entry}: ${log.join(', ')}`);
+  return before;
+}
+
+test('a phase restore makes the front\'s baseline unknown before the router re-reads it', async t => {
+  const log = [];
+  const f = fixture(t, { badBatch: true, presetBaselineClient: createFakePresetBaseline({ check: sameText, log }), onReload: () => log.push('RELOAD') });
+  await f.manager.autotune.start('synthetic', { confirmPause: true });
+  const j = await finished(f.manager);
+  assert.equal(phase(j.models[0], 'batch').restored, true);
+  assert.ok(reReadsAfter(log).includes('bridge invalidate:autotune'), 'the restore re-read was invalidated first');
+});
+
+test('the legacy journal restore makes the front\'s baseline unknown before the router re-reads it', async t => {
+  const log = [];
+  const f = fixture(t, { presetBaselineClient: createFakePresetBaseline({ check: sameText, log }), onReload: () => log.push('RELOAD') });
+  fs.writeFileSync(f.ini, f.original.replace('ctx-size = 8192', 'ctx-size = 16384'));
+  const revision = createPresetStore(f.ini).snapshot().revision;
+  fs.writeFileSync(f.stateFile, JSON.stringify({ history: {}, job: { id: 'legacy', model: 'synthetic', status: 'running', originalText: f.original, lastRevision: revision, queue: [{ model: 'synthetic', status: 'running' }], steps: [] } }));
+  const manager = f.restart();
+  await manager.autotune.recover();
+  assert.equal(manager.autotune.statusFacts().job.restored, true);
+  assert.deepEqual(reReadsAfter(log), ['bridge invalidate:autotune']);
+});
+
+test('an owed re-read, in the background and as a flush, makes the baseline unknown first', async t => {
+  const log = [];
+  const request = async url => { if (url.startsWith('/models?reload')) log.push('RELOAD'); return { ok: true, body: {} }; };
+  const invalidateBaseline = async origin => { log.push(`bridge invalidate:${origin}`); };
+  const background = owedReread(t, { request, rawModels: async () => ({ ok: true, body: { data: [] } }), invalidateBaseline });
+  await background.autotune.recover();
+  for (let i = 0; i < 100 && background.owed(); i++) await new Promise(r => setTimeout(r, 5));
+  assert.equal(background.owed(), false, 'the background re-read ran');
+  assert.deepEqual(reReadsAfter(log), ['bridge invalidate:autotune']);
+  log.length = 0;
+  const flushed = owedReread(t, { request, rawModels: async () => ({ ok: true, body: { data: [{ id: 'other', status: { value: 'loaded' } }] } }), invalidateBaseline });
+  await flushed.autotune.flushReload();
+  assert.equal(flushed.owed(), false);
+  assert.deepEqual(reReadsAfter(log), ['bridge invalidate:autotune']);
 });

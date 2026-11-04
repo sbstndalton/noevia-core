@@ -5,7 +5,7 @@ const {ladder}=require('./llamacpp-calibration.cjs');
 
 // Synthetic llama.cpp router: a model loads only while its preset context is at or below
 // `loadCap`, and recalls the start marker only at or below `longCap`.
-function fixture(t,{loadCap=40960,longCap=Infinity,native=131072,memory=()=>20,other=false,onLoad,speed=100000,presetWriter,extra={}}={}){
+function fixture(t,{loadCap=40960,longCap=Infinity,native=131072,memory=()=>20,other=false,onLoad,speed=100000,presetWriter,extra={},bridge=null}={}){
   const dir=fs.mkdtempSync(path.join(os.tmpdir(),'calibration-'));t.after(()=>fs.rmSync(dir,{recursive:true,force:true}));
   const ini=path.join(dir,'models.ini'),stateFile=path.join(dir,'state.json');
   const original='version = 1\n[*]\ncache-type-k = q8_0\n[synthetic]\n; operator note stays\nmodel = /models/s.gguf\nc = 8192\nparallel = 1\n[other]\nc = 4096\n';
@@ -13,7 +13,7 @@ function fixture(t,{loadCap=40960,longCap=Infinity,native=131072,memory=()=>20,o
   const router={status:{synthetic:'unloaded',other:other?'loaded':'unloaded'},calls:[],loads:[]};
   const ctxOf=()=>Number(/\[synthetic\][^[]*?(?:^|\n)(?:c|ctx-size)\s*=\s*(\d+)/.exec(fs.readFileSync(ini,'utf8'))?.[1]);
   const fetchJson=async(url,opts={})=>{
-    const u=new URL(url),body=opts.body?JSON.parse(opts.body):{};router.calls.push(u.pathname);
+    const u=new URL(url),body=opts.body?JSON.parse(opts.body):{};router.calls.push(u.searchParams.has('reload')?'RELOAD':u.pathname);
     if(opts.signal?.aborted)throw Object.assign(Error('aborted'),{name:'AbortError'});
     if(u.pathname==='/models'&&(!opts.method||opts.method==='GET'))return {ok:true,status:200,body:{data:Object.entries(router.status).map(([id,value])=>({id,status:{value},meta:id==='synthetic'?{n_ctx_train:native}:{}}))}};
     if(u.pathname==='/models/load'){const ctx=ctxOf();router.loads.push(ctx);await onLoad?.(ctx,router);router.status.synthetic=ctx<=loadCap?'loaded':'unloaded';return {ok:true,status:200,body:{}};}
@@ -56,7 +56,8 @@ function fixture(t,{loadCap=40960,longCap=Infinity,native=131072,memory=()=>20,o
     });
     return new Response(readable,{status:200});
   };
-  const manager=createModelManager({kind:'llamacpp',baseUrl:'http://synthetic',presetPath:ini,fetchJson,fetchStream,calibrationStatePath:stateFile,autoconfig:{},presetWriter,calibrationOptions:{identityFor:async()=>({arch:null,quant:null,artifact:'synthetic-artifact',build:null,profile:require('node:crypto').createHash('sha256').update(fs.readFileSync(ini)).digest('hex'),hardware:null}),sleep:async()=>{},readMemory:memory,now:()=>clock.t,timeouts:{memoryPoll:5},...extra}});
+  const presetBaselineClient=bridge?bridge(router.calls):null;
+  const manager=createModelManager({kind:'llamacpp',baseUrl:'http://synthetic',presetPath:ini,fetchJson,fetchStream,calibrationStatePath:stateFile,autoconfig:{},presetWriter,presetBaselineClient,calibrationOptions:{identityFor:async()=>({arch:null,quant:null,artifact:'synthetic-artifact',build:null,profile:require('node:crypto').createHash('sha256').update(fs.readFileSync(ini)).digest('hex'),hardware:null}),sleep:async()=>{},readMemory:memory,now:()=>clock.t,timeouts:{memoryPoll:5},...extra}});
   return {manager,ini,stateFile,original,router,ctxOf};
 }
 // Existing worker tests launch an explicit synthetic plan. Public confirmation, numeric
@@ -322,4 +323,30 @@ test('#1758 a sleeping model is asked to unload before calibration, so the wait 
   assert.doesNotMatch(String(job.error||''),/did not unload in time/);
   assert.equal(f.router.status.other,'unloaded');
   assert.ok(calls.includes('/models/unload'),unloads);
+});
+
+// noevia-rs model_maint/reload.rs: calibration's restore re-reads skip the guarded reload, so each one
+// first makes the front's preset reload baseline unknown.
+const {createFakePresetBaseline}=require('./preset-baseline-fixture.cjs');
+const bridge=log=>createFakePresetBaseline({check:()=>({safe:false,reason:'changed',changed:[]}),log});
+const reReadsAfter=calls=>calls.flatMap((c,i)=>c==='RELOAD'?[calls[i-1]]:[]);
+
+test('a failed run invalidates the baseline before the router re-reads the restored profile',async t=>{
+  const {manager,ini,original,router}=fixture(t,{loadCap:4096,bridge});
+  await launch(manager.calibration,'synthetic',{promptBudgetSeconds:120,confirmPause:true});
+  const job=await finished(manager);
+  assert.equal(job.status,'failed');assert.equal(fs.readFileSync(ini,'utf8'),original);
+  const before=reReadsAfter(router.calls);
+  assert.ok(before.includes('bridge invalidate:calibration'),router.calls.join(', '));
+  for(const c of before)assert.ok(['bridge begin:node','bridge invalidate:calibration'].includes(c),router.calls.join(', '));
+});
+
+test('recovery invalidates the baseline before the router re-reads the restored profile',async t=>{
+  const {manager,ini,stateFile,original,router}=fixture(t,{bridge});
+  const written=original.replace('c = 8192','ctx-size = 65536');fs.writeFileSync(ini,written);
+  const revision=require('node:crypto').createHash('sha256').update(written).digest('hex');
+  fs.writeFileSync(stateFile,JSON.stringify({job:{model:'synthetic',status:'running',steps:[],originalText:original,lastRevision:revision},history:{}}));
+  await manager.calibration.recover();
+  assert.equal(fs.readFileSync(ini,'utf8'),original);
+  assert.deepEqual(reReadsAfter(router.calls),['bridge invalidate:calibration']);
 });

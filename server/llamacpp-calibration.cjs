@@ -62,6 +62,8 @@ function createCalibrator(deps) {
     memoryFloorGib = 2,
     onResult = () => {},
     onUpdate = () => {}, onWrite = () => {},
+    // The preset reload baseline is made unknown before each raw router re-read below (preset-reload.cjs).
+    invalidateBaseline = async () => {},
     // #1062: set by auto-tune only. Called with the error this calibrator would throw when another
     // client has a model live; resolves once it may go on (the step is then repeated) or throws.
     foreignWait = null,
@@ -104,6 +106,7 @@ function createCalibrator(deps) {
       if (job.originalText != null && job.lastRevision) {
         await presets.commit({ baseRevision: job.lastRevision, text: job.originalText });
         job.restored = true;
+        await invalidateBaseline('calibration');
         await request('/models?reload=1', {}, 120000).catch(() => {});
       }
     } catch { job.restored = false; }
@@ -475,6 +478,7 @@ function createCalibrator(deps) {
         if (job.originalText != null && job.lastRevision && presets.snapshot().revision === job.lastRevision) {
           await presets.commit({ baseRevision: job.lastRevision, text: job.originalText });
           onWrite(presets.snapshot().revision);
+          await invalidateBaseline('calibration');
           await request('/models?reload=1', {}, 120000).catch(() => {});
           job.restored = true;
         } else if (job.originalText != null && job.lastRevision) job.restored = false;

@@ -293,7 +293,9 @@ function createFullAutotuner({ request: engineRequest, rawModels: engineRawModel
   contention = req => require('./dav-parse-wasm.cjs').tuneContention(req),
   // #1079: a Long tune's `<model>-long` section (long-profile.cjs, Rust's decisions) and the router
   // re-read after it is added (the manager's guarded reload; the plain router call by default).
-  longProfiles = require('./long-profile.cjs').createLongProfiles(), reloadRouter: routerReload = null }) {
+  longProfiles = require('./long-profile.cjs').createLongProfiles(), reloadRouter: routerReload = null,
+  // The preset reload baseline is made unknown before each raw router re-read (preset-reload.cjs).
+  invalidateBaseline = async () => {} }) {
   const request = engineBoundary(engineRequest), rawModels = engineBoundary(engineRawModels);
   let state;
   try { state = JSON.parse(fs.readFileSync(stateFile, 'utf8')); } catch { state = {}; }
@@ -966,6 +968,7 @@ function createFullAutotuner({ request: engineRequest, rawModels: engineRawModel
   }
   async function reloadRouter(j) {
     if ((await othersLiveNow(j.model)) === false) {
+      await invalidateBaseline('autotune');
       const reload = await request('/models?reload=1', {}, 120000);
       if (!reload.ok) throw Error('The router did not confirm restored settings.');
       j._reloadPending = false; save();
@@ -985,7 +988,7 @@ function createFullAutotuner({ request: engineRequest, rawModels: engineRawModel
       if ((await othersLiveNow(j.model)) === false) {
         // #1072: a flush may have re-read the file while this check was in flight; no second re-read.
         if (!j._reloadPending) return;
-        try { const r = await request('/models?reload=1', {}, 120000); if (r.ok) { j._reloadPending = false; note(j, 'The model server re-read the restored models.ini.'); return; } } catch { /* retried below */ }
+        try { await invalidateBaseline('autotune'); const r = await request('/models?reload=1', {}, 120000); if (r.ok) { j._reloadPending = false; note(j, 'The model server re-read the restored models.ini.'); return; } } catch { /* retried below */ }
       }
       scheduleReload(j, tries + 1);
     }, Math.max(foreignPollMs * 15, 1));
@@ -1000,6 +1003,7 @@ function createFullAutotuner({ request: engineRequest, rawModels: engineRawModel
     clearTimeout(reloadTimer);
     // #1072: a request that throws (the server unreachable) is the same refusal as a bad answer, and the
     // re-read is still owed, so it is re-armed rather than left for the next flush alone.
+    await invalidateBaseline('autotune');
     const r = await request('/models?reload=1', {}, 120000).catch(() => null);
     guard?.();
     if (!r?.ok) {
@@ -1619,6 +1623,7 @@ function createFullAutotuner({ request: engineRequest, rawModels: engineRawModel
         const unloaded = await request('/models/unload', { method: 'POST', body: JSON.stringify({ model: j.model }) }, 60000);
         if (!unloaded.ok) throw Error('Could not unload the test model.');
         await presets.commit({ baseRevision: j.lastRevision, text: j.originalText });
+        await invalidateBaseline('autotune');
         const reload = await request('/models?reload=1', {}, 120000);
         if (!reload.ok) throw Error('The router did not confirm restored settings.');
         j.restored = true;
