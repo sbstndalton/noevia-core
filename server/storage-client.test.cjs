@@ -6,6 +6,7 @@ const http = require('node:http');
 const os = require('node:os');
 const path = require('node:path');
 const { Readable, Writable } = require('node:stream');
+const { frontTurn } = require('../tests/server/front-chat-turn.cjs');
 const test = require('node:test');
 // #2191 round 2: POST /api/projects is the Rust front's; fixtures are written as its create leaves them.
 const { createProjectAs } = require('../tests/server/front-projects.cjs');
@@ -386,11 +387,12 @@ test.after(() => {
   fs.rmSync(testDataDir, { recursive: true, force: true });
 });
 
-async function request(url, { method = 'GET', headers = {}, body = '' } = {}) {
+async function request(url, { method = 'GET', headers = {}, body = '', peer } = {}) {
   const req = Readable.from(body ? [body] : []);
   req.url = url;
   req.method = method;
   req.headers = { host: 'localhost', ...headers };
+  if (peer) req.socket = { remoteAddress: peer };
   const chunks = [];
   const responseHeaders = {};
   const res = new Writable({
@@ -508,7 +510,7 @@ test('repeated tool calls in separate inference rounds keep distinct UI identiti
     return new Response(`data: ${JSON.stringify({ choices: [{ delta }] })}\n\ndata: [DONE]\n\n`, { headers: { 'Content-Type': 'text/event-stream' } });
   };
   try {
-    const response = await request('/api/chat', { method: 'POST', headers: mutationHeaders(), body: JSON.stringify({ projectId: project.id, spaceId: project.id, message: 'Use the clock twice', history: [] }) });
+    const response = await request(...frontTurn({ method: 'POST', headers: mutationHeaders(), body: JSON.stringify({ projectId: project.id, spaceId: project.id, message: 'Use the clock twice', history: [] }) }, accountId));
     assert.equal(response.status, 200, response.text);
     const events = response.text.split('\n').filter((l) => l.startsWith('data: ')).map((l) => JSON.parse(l.slice(6)));
     assert.deepEqual(events.filter((e) => e.type === 'tool').map((e) => e.index), [0, 1]);
