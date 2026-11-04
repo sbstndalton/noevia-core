@@ -1,24 +1,38 @@
 'use strict';
-// noevia#2252 (#2238): GET /api/models/assignments reports what is configured, not what answers. A set-up
-// service whose address is closed reads 'active' (the Models page words it from the machines probe, and a
-// member's page says "Configured"). The contract this pins: the builder is pure (it has no way to send a
-// request) and adds no reachability claim of its own. Synthetic fakes only.
+// The public configured-vs-reachable projection is covered by the native Node-oracle wire fixtures.
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { modelAssignments } = require('../../server/model-assignments.cjs');
+const { createModelAssignmentsFacts, PATH } = require('../../server/rust-model-assignments-facts.cjs');
 
-const CLOSED = { OCR_BASE_URL: 'http://127.0.0.1:9', DOCLING_BASE_URL: 'http://127.0.0.1:9', EMBEDDING_MODEL: 'embed-x' };
-
-test('#2238: set-up services read active whether or not they answer, for members and administrators', () => {
-  const installed = [{ name: 'embed-x', labels: ['embedding'] }];
-  for (const admin of [false, true]) {
-    const { services } = modelAssignments({ installed, env: CLOSED, admin });
-    const by = Object.fromEntries(services.map((s) => [s.id, s]));
-    assert.equal(by.ocr.state, 'active');
-    assert.equal(by.documents.state, 'active');
-    assert.equal(by.embedding.state, 'active');
-    // No reachability claim of any kind, and no address reaches a member.
-    for (const svc of services) assert.ok(!('reachable' in svc) && !('health' in svc), svc.id);
-    assert.equal(JSON.stringify(services).includes('127.0.0.1'), false);
+test('#2238 assignments facts reuse only the administrator served probe and redact member inputs', async () => {
+  const sent = [];
+  let admin = false;
+  const probes = [];
+  const handle = createModelAssignmentsFacts({
+    secret: 'synthetic', readJson: async () => ({ admin }), json: (_res, status, body) => sent.push({ status, body }),
+    env: { OCR_BASE_URL: 'http://127.0.0.1:9', EMBEDDING_API_KEY: 'secret-marker' },
+    modelsInstalled: async () => [{ name: 'EmbeddingGemma-2', modelPath: '/private/path', labels: [] }],
+    embeddingConfig: () => ({ active: { model: 'nomic', baseUrl: 'http://embedding.internal:9' } }),
+    servedEmbeddingModels: async (target) => { probes.push(target); return ['EMBEDDINGGEMMA-2:latest', '/private/model.gguf']; },
+    embeddingService: () => null, workerAssigned: () => false,
+  });
+  const request = { url: PATH, method: 'POST', socket: { remoteAddress: '127.0.0.1' }, headers: { 'x-noevia-store-token': 'synthetic' } };
+  assert.equal(await handle({ ...request, headers: { ...request.headers, 'x-forwarded-for': '' } }, {}), true);
+  assert.equal(sent.pop().status, 404);
+  assert.equal(await handle(request, {}), true);
+  const member = sent.pop().body;
+  assert.deepEqual(probes, []);
+  assert.equal(member.ocr, true);
+  assert.equal(member.embedding.baseUrl, undefined);
+  assert.equal(member.installed[0].served, undefined);
+  for (const secret of ['embedding.internal', '127.0.0.1', 'secret-marker', '/private/']) {
+    assert.ok(!JSON.stringify(member).includes(secret));
   }
+  admin = true;
+  await handle(request, {});
+  const owner = sent.pop().body;
+  assert.deepEqual(probes, [{ baseUrl: 'http://embedding.internal:9' }]);
+  assert.equal(owner.installed[0].served, true);
+  assert.equal(owner.embedding.baseUrl, 'http://embedding.internal:9');
+  assert.ok(!JSON.stringify(owner).includes('/private/'));
 });

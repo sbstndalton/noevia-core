@@ -169,7 +169,7 @@ test('the callers that keep a system model out of chat and tuning follow the rol
       if (u.pathname === '/models/unload') unloads++;
       return { ok: true, status: 200, body: {} };
     };
-    const manager = createModelManager({ kind: 'llamacpp', baseUrl: 'http://synthetic', presetPath: ini, fetchJson, calibrationStatePath: path.join(dir, 'state.json'), autoconfig: {}, calibrationOptions: { sleep: async () => {}, readMemory: () => 20 } });
+    const manager = createModelManager({ kind: 'llamacpp', baseUrl: 'http://synthetic', presetPath: ini, fetchJson, publicCalibrator: true, calibrationStatePath: path.join(dir, 'state.json'), autoconfig: {}, calibrationOptions: { sleep: async () => {}, readMemory: () => 20 } });
     assert.equal(isChatGenerationModel('box'), !system, `chat: ${role}`);
     assert.equal(isNonChatRow({ id: 'box', status: { args: [] } }), system, `role engine: ${role}`);
     const {token}=manager.calibration.stateFacts();

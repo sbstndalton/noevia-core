@@ -84,7 +84,6 @@ const workspaceDir = () => {
 const projectIds = () => JSON.parse(fs.readFileSync(path.join(workspaceDir(), 'projects.json'), 'utf8')).projects.map((p) => p.id);
 const ctx = (chatId) => `cowork-chat-context-${chatId}`;
 const PNG = Buffer.from('89504e470d0a1a0a', 'hex').toString('base64');
-const until = async (check) => { for (let i = 0; i < 100 && !check(); i++) await new Promise((r) => setTimeout(r, 10)); };
 
 // The image upload and the free-chat save are the Rust front's (sbstndalton/noevia#1071): here they
 // are the files the front writes (the bytes under project-assets, the row in projects.json, the
@@ -113,7 +112,7 @@ function frontSaveFree(metas) {
 const frontDelete = (projectId, chatId) => require('../tests/server/project-store-server.cjs').rustChatDelete(testDataDir, path.basename(workspaceDir()), projectId, chatId);
 
 async function openWithImage(chatId) {
-  await request('/api/chats/search', { headers: { cookie } }); // the account's directory exists
+  await request('/api/chat-framing/suggest', { headers: { cookie } }); // the account's directory exists
   const file = path.join(workspaceDir(), 'projects.json');
   const data = JSON.parse(fs.readFileSync(file, 'utf8'));
   data.projects.push({ id: ctx(chatId), name: 'Synthetic context', files: [], assets: [], chats: [] });
@@ -126,7 +125,6 @@ async function openWithImage(chatId) {
   fs.mkdirSync(path.dirname(rag), { recursive: true }); fs.writeFileSync(rag, 'synthetic');
   return { assetDir, rag };
 }
-const gone = async ({ assetDir, rag }) => { await until(() => !fs.existsSync(assetDir)); return !fs.existsSync(assetDir) && !fs.existsSync(rag); };
 
 test('deleting a free chat removes its attachments project, and a stale tab cannot recreate it (#788)', async () => {
   const regular = createProjectAs(testDataDir, frontUserId, { name: 'Synthetic regular' });
@@ -167,15 +165,26 @@ test('a moved chat and Delete old chats take their attachments projects along (#
   const fresh = await openWithImage('c788-fresh');
   const longAgo = Date.now() - 100 * 86400000;
   frontSaveFree([{ id: 'c788-old', title: 'o', updatedAt: longAgo }, { id: 'c788-fresh', title: 'f' }]);
-  // The preview GET is the Rust front's (#1071); an unconfirmed PUT answers it too (409).
-  const unconfirmed = await request('/api/account/retention', { method: 'PUT', headers: mutationHeaders(), body: JSON.stringify({ days: 90 }) });
-  assert.equal(unconfirmed.status, 409);
-  const preview = JSON.parse(unconfirmed.text).preview;
-  assert.equal(preview[90], 1);
-  const swept = await request('/api/account/retention', { method: 'PUT', headers: mutationHeaders(), body: JSON.stringify({ days: 90, confirmDeletes: preview[90] }) });
-  assert.equal(swept.status, 200);
-  assert.ok(await gone(old));
-  assert.ok(!projectIds().includes(ctx('c788-old')));
-  assert.ok(projectIds().includes(ctx('c788-fresh')) && fs.existsSync(fresh.assetDir));
-  assert.equal((await request('/api/account/retention', { method: 'PUT', headers: mutationHeaders(), body: JSON.stringify({ days: 0 }) })).status, 200);
+  // Delete old chats (GET preview and PUT, with its 409 unconfirmed-delete guard) is the Rust front's
+  // (noevia-rs crates/server-projects retention.rs): rust-auth.cjs refuses both before any route reads a
+  // body, and Node deletes nothing.
+  for (const body of [{ days: 90 }, { days: 90, confirmDeletes: 1 }]) {
+    const refused = await request('/api/account/retention', { method: 'PUT', headers: mutationHeaders(), body: JSON.stringify(body) });
+    assert.equal(refused.status, 503);
+    assert.equal(JSON.parse(refused.text).code, 'RUST_AUTH_OWNED');
+  }
+  const preview = await request('/api/account/retention', { headers: { cookie } });
+  assert.equal(preview.status, 503, 'the preview is the Rust front\'s too');
+  assert.equal(JSON.parse(preview.text).code, 'RUST_AUTH_OWNED');
+  assert.ok(!require('./chat-lists.cjs').readTombstones(workspaceDir()).has('c788-old'), 'a refused PUT deletes nothing');
+  assert.ok(fs.existsSync(old.assetDir) && fs.existsSync(old.rag) && projectIds().includes(ctx('c788-old')));
+  assert.equal(fs.existsSync(path.join(workspaceDir(), 'chat-retention.json')), false, 'a refused PUT saves no setting');
+
+  // The front's sweep removes each due chat through its chat delete; the attachments project is
+  // then freed by the front's workspace list, as for any chat the front deleted.
+  assert.equal(frontDelete(null, 'c788-old').status, 200);
+  assert.ok(require('./chat-lists.cjs').readTombstones(workspaceDir()).has('c788-old'));
+  assert.ok(fs.existsSync(old.assetDir), 'the front\'s list, not Node, frees the project of a chat the front deleted');
+  assert.ok(projectIds().includes(ctx('c788-fresh')) && fs.existsSync(fresh.assetDir) && fs.existsSync(fresh.rag), 'a fresh chat keeps its attachments');
+  assert.ok(!require('./chat-lists.cjs').readTombstones(workspaceDir()).has('c788-fresh'));
 });

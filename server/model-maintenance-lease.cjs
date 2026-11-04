@@ -7,6 +7,8 @@
 // enter() (chat admission) reads the same flag, so there is no window between the check and the act.
 //
 //   POST   /internal/model-maintenance/lease             201 {lease, ttlMs, renewMs, hardMs}; 409 {error, chatActive} while busy
+//          body (optional): {maxMs}: the hard cap this lease asks for (a calibration run), clamped to
+//          [HARD_MS, MAX_MS]; absent, HARD_MS. A maxMs that is not an integer is a 400 and holds nothing.
 //   POST   /internal/model-maintenance/lease/<id>/renew  200 {ttlMs}; 404 when it has ended
 //   DELETE /internal/model-maintenance/lease/<id>        204, also when it has already ended
 //
@@ -24,7 +26,13 @@ const PREFIX = '/internal/model-maintenance/lease';
 const TTL_MS = 180000;
 const RENEW_MS = 10000;
 const HARD_MS = 60 * 60 * 1000;
-function createLeases({ hold, ttlMs = TTL_MS, hardMs = HARD_MS, log = (m) => console.warn(m), now = () => Date.now() }) {
+// The longest hard cap a lease may ask for (only the front's calibration asks: a run's worst case, which at 1M
+// context passes 8 h). Liveness is unchanged: an unrenewed lease still ends after ttlMs (180 s).
+const MAX_MS = 24 * 60 * 60 * 1000;
+const BODY_LIMIT = 4096;
+/** The cap a lease gets for `requested` (undefined: the default). */
+const capFor = (requested, hardMs, maxMs) => (requested === undefined ? hardMs : Math.min(Math.max(requested, hardMs), Math.max(hardMs, maxMs)));
+function createLeases({ hold, ttlMs = TTL_MS, hardMs = HARD_MS, maxMs = MAX_MS, log = (m) => console.warn(m), now = () => Date.now() }) {
   const leases = new Map();
   function end(id, why) {
     const lease = leases.get(id);
@@ -45,12 +53,13 @@ function createLeases({ hold, ttlMs = TTL_MS, hardMs = HARD_MS, log = (m) => con
   }
   return {
     /** Takes the hold, or rejects as hold() does (409 while busy). */
-    async acquire() {
+    async acquire(requested) {
+      const cap = capFor(requested, hardMs, maxMs);
       const release = await hold();
       const id = crypto.randomBytes(16).toString('hex');
-      leases.set(id, { release, timer: null, hardAt: now() + hardMs });
+      leases.set(id, { release, timer: null, hardAt: now() + cap });
       arm(id);
-      return { lease: id, ttlMs, renewMs: Math.min(RENEW_MS, Math.max(1, Math.floor(ttlMs / 3))), hardMs };
+      return { lease: id, ttlMs, renewMs: Math.min(RENEW_MS, Math.max(1, Math.floor(ttlMs / 3))), hardMs: cap };
     },
     renew(id) {
       const lease = leases.get(id);
@@ -61,6 +70,29 @@ function createLeases({ hold, ttlMs = TTL_MS, hardMs = HARD_MS, log = (m) => con
     release: (id) => end(id, null),
     size: () => leases.size,
   };
+}
+
+/** The acquire body: `{ maxMs }` or `{}` (empty is `{}`); null when it is not one (a 400). Bounded in size and time. */
+function readAsk(req) {
+  return new Promise((resolve) => {
+    const chunks = [];
+    let size = 0, done = false;
+    const finish = (value) => { if (!done) { done = true; clearTimeout(timer); resolve(value); } };
+    const timer = setTimeout(() => finish(null), 10000);
+    timer.unref?.();
+    req.on('data', (chunk) => { size += chunk.length; if (size > BODY_LIMIT) { finish(null); req.resume(); } else chunks.push(chunk); });
+    req.on('error', () => finish(null));
+    req.on('end', () => {
+      const text = Buffer.concat(chunks).toString('utf8');
+      if (!text.trim()) return finish({});
+      let ask;
+      try { ask = JSON.parse(text); } catch { return finish(null); }
+      if (!ask || typeof ask !== 'object' || Array.isArray(ask)) return finish(null);
+      if (Object.keys(ask).some((k) => k !== 'maxMs')) return finish(null);
+      if (Object.hasOwn(ask, 'maxMs') && !Number.isSafeInteger(ask.maxMs)) return finish(null);
+      finish(ask);
+    });
+  });
 }
 
 /** The route, answered before authentication and the request gate. True when it was this route's. */
@@ -74,7 +106,9 @@ function createLeaseRoutes({ secret, hold, json, ...options }) {
     if (!trusted(req) || !leases) return notFound();
     if (target === PREFIX) {
       if (req.method !== 'POST') return notFound();
-      try { json(res, 201, await leases.acquire()); }
+      const ask = await readAsk(req);
+      if (!ask) { json(res, 400, { error: 'maxMs must be a whole number of milliseconds.' }); return true; }
+      try { json(res, 201, await leases.acquire(ask.maxMs)); }
       catch (e) {
         if (e?.status === 409) json(res, 409, { error: e.message, chatActive: e.chatActive === true });
         else json(res, 503, { error: 'The maintenance hold could not be taken.' });
@@ -99,4 +133,4 @@ function createLeaseRoutes({ secret, hold, json, ...options }) {
   return { handle, leases };
 }
 
-module.exports = { createLeaseRoutes, createLeases, PREFIX, TTL_MS };
+module.exports = { createLeaseRoutes, createLeases, PREFIX, TTL_MS, HARD_MS, MAX_MS };
