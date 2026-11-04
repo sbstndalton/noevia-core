@@ -1394,6 +1394,8 @@ async function handleRequestInner(req, res) {
   if (require('./rust-health.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   if (require('./rust-auto-roles.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   if (require('./rust-workspace.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
+  if (require('./rust-chat-search.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
+  if (require('./rust-chat-export.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   await readyFeatures();
   const preAuth = requestAuth.authenticate(req);
   // accountRole: a device token acts as a member, but its account's workspace is the same one.
