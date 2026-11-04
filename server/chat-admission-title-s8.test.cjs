@@ -25,6 +25,9 @@ process.env.UI_DATA_DIR = testDataDir;
 require('../tests/server/project-store-server.cjs').installProjectStore(testDataDir);
 process.env.LEGACY_AUTH_COMPAT = 'true';
 process.env.PUBLIC_ORIGIN = 'http://localhost';
+// The engine manager with its maintenance gate (engineBusy reads its counts); the engine itself is a stub address.
+process.env.MODEL_MANAGER_KIND = 'llamacpp';
+process.env.INFERENCE_BASE_URL = 'http://default.invalid';
 
 const { handleRequest } = require('./index.cjs');
 const { LEASE_HEADER } = require('./rust-chat-admission.cjs');
@@ -35,7 +38,8 @@ test.after(() => fs.rmSync(testDataDir, { recursive: true, force: true }));
 
 async function request(url, { method = 'GET', headers = {}, body = '', peer } = {}) {
   const req = Readable.from(body ? [body] : []);
-  Object.assign(req, { url, method, headers: { host: 'localhost', ...headers } });
+  // `complete` as an IncomingMessage has it once its body arrived: a request read to its end is not a caller gone.
+  Object.assign(req, { url, method, headers: { host: 'localhost', ...headers }, complete: true });
   if (peer) req.socket = { remoteAddress: peer };
   const chunks = [];
   const res = new Writable({ write(chunk, _e, cb) { chunks.push(Buffer.from(chunk)); cb(); } });
@@ -72,7 +76,12 @@ async function giveBack(lease) {
 /** A QA-style turn against the stub engine; how many title requests it made and whether a title event came back. */
 async function qaTurn(t, chatId, headers = {}) {
   let titles = 0;
-  t.mock.method(global, 'fetch', async (_url, opts) => {
+  t.mock.method(global, 'fetch', async (url, opts = {}) => {
+    const u = new URL(String(url));
+    // The stub engine: no inference gate in front of it (turns run without a model lease), the model loaded.
+    if (u.pathname.startsWith('/gate/')) return Response.json({ error: { code: 'not_found' } }, { status: 404 });
+    if (u.pathname === '/models') return Response.json({ data: [{ id: 'model', status: { value: 'loaded' } }] });
+    if (u.pathname === '/props') return Response.json({ default_generation_settings: { n_ctx: 32768 }, total_slots: 1, build_info: 'synthetic' });
     if (JSON.parse(opts.body).messages?.[0]?.content === TITLE_SYSTEM) { titles++; return Response.json({ choices: [{ message: { content: 'Synthetic Title' } }] }); }
     const frame = (f) => `data: ${JSON.stringify(f)}\n\n`;
     return new Response(frame({ choices: [{ delta: { content: 'QA-SYNTH answer.' } }] }) + frame({ choices: [{ delta: {}, finish_reason: 'stop' }] }) + 'data: [DONE]\n\n', { status: 200, headers: { 'content-type': 'text/event-stream' } });
