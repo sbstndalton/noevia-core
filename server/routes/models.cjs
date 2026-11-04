@@ -23,7 +23,7 @@ const PATH_OPTION_ALIASES = Object.fromEntries([
   ['mmproj', ['mmproj', 'mm', 'LLAMA_ARG_MMPROJ']],
   ['model-draft', ['model-draft', 'md', 'LLAMA_ARG_MODEL_DRAFT']],
 ].flatMap(([canonical, names]) => names.map(n => [n, canonical])));
-const { isSystemModel, modelPathFromArgs, SYSTEM_MODEL_DELETE_REASON, SYSTEM_MODEL_LOAD_REASON, SIDECAR_MODEL_LOAD_REASON, MISSING_MODEL_FILE_REASON, isSidecarModel, SIDECAR_MODEL_DELETE_REASON } = require('../model-system.cjs');
+const { isSystemModel, modelPathFromArgs, SYSTEM_MODEL_DELETE_REASON, SYSTEM_MODEL_LOAD_REASON, SIDECAR_MODEL_LOAD_REASON, MISSING_MODEL_FILE_REASON, rerankModelNames, isSidecarModel, SIDECAR_MODEL_DELETE_REASON } = require('../model-system.cjs');
 
 // noevia#2115: a refusal from the inference gate, as { status, code, error, retryable }, or null. The gate answers in
 // the router's error shape; the model manager passes on a refusal it got while asking for a lease in its own shape.
@@ -84,7 +84,7 @@ function createModelRoutes({ servedEmbeddingModels = (target) => require('../rag
   /** Which sidecar holds `name`: the embedding service (any of its active/next/previous models) or the reranker. */
   function sidecarServiceOf(name) {
     const n = String(name || '').trim();
-    return n && n === String(env.RERANK_MODEL || '').trim() ? 'reranker' : 'embedding';
+    return n && rerankModelNames(env).has(n) ? 'reranker' : 'embedding';
   }
 
   // #1661: drop the models.ini section named `name` through the model management service. Never
@@ -507,12 +507,11 @@ function createModelRoutes({ servedEmbeddingModels = (target) => require('../rag
       return json(res,405,{error:'Method not allowed'});
     }
 
-    if (p === '/api/models/autotune' || p === '/api/models/autotune/untuned') {
+    if (p === '/api/models/autotune') {
       if(authn.user.role!=='admin')return json(res,403,{error:'Administrator required for shared model profiles'});
       if(!modelManager.autotune)return json(res,404,{error:'Auto-tune is unavailable'});
       let result;
-      if(p.endsWith('/untuned')){if(req.method!=='GET')return json(res,405,{error:'Method not allowed'});result=await modelManager.autotune.untuned();}
-      else if(req.method==='POST'){const body=await readJson(req);result=await modelManager.autotune.start(String(body?.model||''),{confirmPause:body?.confirmPause,promptBudgetSeconds:body?.promptBudgetSeconds,untuned:body?.untuned===true,...(body?.mode!==undefined?{mode:body.mode}:{})});}
+      if(req.method==='POST'){const body=await readJson(req);result=await modelManager.autotune.start(String(body?.model||''),{confirmPause:body?.confirmPause,promptBudgetSeconds:body?.promptBudgetSeconds,untuned:body?.untuned===true,...(body?.mode!==undefined?{mode:body.mode}:{})});}
       else return json(res,405,{error:'Method not allowed'});
       res.setHeader('Cache-Control','no-store');
       return json(res,result.status,result.body);

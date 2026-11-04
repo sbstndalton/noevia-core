@@ -1220,6 +1220,7 @@ const autotuneResumeBridge = require('./rust-autotune-resume-bridge.cjs').create
   secret: FRONT_SECRET, json, readJson, autotune: () => modelManager.autotune, invalidate: () => modelService.modelScanCache.clear(),
 });
 const autotuneClearBridge = require('./rust-autotune-clear-bridge.cjs').createAutotuneClearBridge({ secret: FRONT_SECRET, json, readJson, autotune: () => modelManager.autotune });
+const autotuneUntunedFacts = require('./rust-autotune-untuned-facts.cjs').createAutotuneUntunedFacts({ secret: FRONT_SECRET, json, readJson, autotune: () => modelManager.autotune });
 const toolApprovals = require('./rust-tool-approval-bridge.cjs');
 const toolApprovalBridge = toolApprovals.createToolApprovalBridge({
   secret: FRONT_SECRET, pendingApprovals, json, readJson,
@@ -1318,6 +1319,8 @@ async function handleRequestInner(req, res) {
   if (await autotuneResumeBridge(req, res)) return;
   if (require('./rust-autotune-clear.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   if (await autotuneClearBridge(req, res)) return;
+  if (require('./rust-autotune-untuned.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
+  if (await autotuneUntunedFacts(req, res)) return;
   if (await toolApprovalBridge(req, res)) return;
   // The Rust front's maintenance lease on this process's gate (#2210): before everything, and only the front's.
   if (await maintenanceLeases.handle(req, res)) return;
