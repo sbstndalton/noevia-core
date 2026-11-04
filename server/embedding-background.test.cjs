@@ -131,3 +131,67 @@ test('paired coverage counts shared custom-directory and orphan indexes supplied
   assert.deepEqual(c, { indexes: 2, chunks: 6, vectors: 4, unavailable: 0, complete: false, ready: false });
   assert.ok(seen.includes(indexes[0])); assert.ok(seen.includes(indexes[1])); migration.stop();
 });
+
+for (const action of ['clear-next', 'rollback', 'finish']) {
+  test(`paired ${action} catches asynchronous refusal, still calls the other scope and audits`, { skip: process.platform !== 'linux' }, async t => {
+    const f = fixture(t);
+    const stateFile = path.join(f.dir, 'embedding-config.json');
+    const config = createEmbeddingConfig({ stateFile, nativeOwner: f.owner, env: {} });
+    // clear-next's real change() refusal occurs inside the same asynchronous
+    // publication lock as the noPrevious errors for rollback and finish.
+    if (action === 'clear-next') config.refuseSeeded({ active: 'synthetic address refusal' });
+    const migration = createEmbeddingMigration({ config, nativeOwner: f.owner, rag: { listIndexes: () => [] }, log() {} });
+    const audits = [], diaryCalls = [], replies = [];
+    let diaryRefuses = false;
+    const routes = require('./routes/embedding.cjs').createEmbeddingRoutes({
+      json: (_, status, body) => replies.push({ status, body }),
+      readJson: async req => req.body,
+      migration, authService: { audit: (...args) => audits.push(args) },
+      DIARY_BASE: 'http://diary.invalid', fetchJson: async (_, options) => {
+        diaryCalls.push(options);
+        return diaryRefuses ? { ok: false, status: 409, body: { error: 'No previous target', code: 'noPrevious' } } : { ok: true, body: { done: true } };
+      },
+    });
+    const call = async scope => routes({ method: 'POST', body: { action, scope } }, { setHeader() {} }, { path: '/api/embedding', authn: { user: { id: 'synthetic', role: 'admin' } } });
+    await call('projects');
+    assert.equal(replies.at(-1).status, 409);
+    assert.equal(replies.at(-1).body.projects.code, action === 'clear-next' ? 'badState' : 'noPrevious');
+    assert.equal(diaryCalls.length, 0);
+    await call('all');
+    assert.equal(replies.at(-1).status, 207);
+    assert.equal(replies.at(-1).body.projects.status, 409);
+    assert.deepEqual(replies.at(-1).body.diary, { done: true });
+    assert.equal(diaryCalls.length, 1);
+    diaryRefuses = true; await call('all');
+    assert.equal(replies.at(-1).status, 409);
+    assert.equal(audits.length, 3);
+    assert.equal(audits[1][0], `embedding.${action}`);
+    assert.equal(audits[1][3].projects, 'refused'); assert.equal(audits[1][3].diary, 'ok');
+    assert.equal(audits[2][3].diary, 'refused');
+    migration.stop();
+  });
+}
+
+for (const scenario of ['damaged config', 'unknown profile', 'long pass']) {
+  test(`${scenario} degrades retrieval while the initialized process stays ready`, async t => {
+    const f = fixture(t);
+    const configFile = path.join(f.dir, 'embedding-config.json');
+    if (scenario === 'damaged config') fs.writeFileSync(configFile, '{damaged');
+    const config = require('./embedding-config.cjs').loadEmbeddingConfig({
+      stateFile: configFile, env: scenario === 'unknown profile' ? { EMBEDDING_PROFILE: 'unknown' } : {}, log() {},
+    });
+    if (scenario === 'damaged config') assert.ok(config.damaged);
+    if (scenario === 'unknown profile') assert.equal(config.active().profile, 'unknown');
+    const snapshot = { protocol: PROTOCOL, start: f.env.NOEVIA_START_ID, at: f.now(), configValid: scenario === 'long pass', configInvalid: scenario === 'long pass' ? null : scenario };
+    fs.writeFileSync(path.join(f.dir, 'embedding-worker-status.json'), JSON.stringify(snapshot));
+    if (scenario === 'long pass') f.advance(30000); // no native observation until the pass completes
+    assert.equal(f.owner.healthy(), false);
+    const replies = [];
+    const routes = require('./routes/health.cjs').createReadyRoutes({ json: (_, status, body) => replies.push({ status, body }), isReady: () => true, version: 'synthetic' });
+    await routes({ method: 'GET' }, {}, { path: '/api/ready' });
+    assert.deepEqual(replies, [{ status: 200, body: { ready: true, version: 'synthetic' } }]);
+    const health = require('./rust-health.cjs').createRagStatusPublisher({ dataDir: f.dir, ownerReady: () => f.owner.healthy(), rag: { ragAvailable: () => true, retrievalStatus: async () => 'available' } });
+    await health.publish();
+    assert.equal(JSON.parse(fs.readFileSync(health.file)).retrieval, 'unavailable');
+  });
+}

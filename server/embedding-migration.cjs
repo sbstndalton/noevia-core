@@ -205,7 +205,7 @@ function createEmbeddingMigration({ config, rag, nativeOwner = null, env = proce
       ...(c.next ? { nextServed: verified.has(keyOf(c.next)) ? true : nextHeld?.key === keyOf(c.next) ? false : null } : {}),
       ...(c.next && nextHeld?.key === keyOf(c.next) ? { nextHeld: { code: nextHeld.code, error: nextHeld.error } } : {}),
       running: !!running, lastPass, duty, batch,
-      ...(nativeOwner ? { running: snapshot?.running ?? null, lastPass: snapshot?.lastPass ?? null, nextServed: snapshot?.nextServed ?? null, nextHeld: snapshot?.nextHeld ?? null, stale: !snapshot } : {}), ...(config.damaged ? { damaged: config.damaged } : {}),
+      ...(nativeOwner ? { running: snapshot?.running ?? null, lastPass: snapshot?.lastPass ?? null, nextServed: snapshot?.nextServed ?? null, nextHeld: snapshot?.nextHeld ?? null, stale: !snapshot, configValid: snapshot?.configValid ?? null, configInvalid: snapshot?.configInvalid ?? null } : {}), ...(config.damaged ? { damaged: config.damaged } : {}),
     };
   }
 

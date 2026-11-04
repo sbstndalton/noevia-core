@@ -17,6 +17,7 @@ function createOwner({ env = process.env, dataDir, now = Date.now, verifyPair = 
         return s.protocol === PROTOCOL && s.start === start && Number.isFinite(s.at) && s.at <= now() && now() - s.at <= 15000 ? s : null;
       } catch { return null; }
     },
+    // Retrieval health only: optional embedding work never gates process readiness.
     healthy() { const s = this.snapshot(); return !stopped && verifyPair && !!s && s.configValid !== false; },
     kick() {
       if (stopped) return;

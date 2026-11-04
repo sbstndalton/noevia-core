@@ -1260,7 +1260,7 @@ const inferenceMachineRoutes = require('./routes/inference-machines.cjs').create
 // GET /api/ready (#297): unauthenticated, mounted before the session gate below alongside the
 // sign-in routes. isReady is set once startup wiring under require.main finishes (see below).
 const readyRoutes = require('./routes/health.cjs').createReadyRoutes({
-  json, isReady: () => processReady && embeddingOwner.healthy(), version: require('./version-resolve.cjs').resolveVersion(),
+  json, isReady: () => processReady, version: require('./version-resolve.cjs').resolveVersion(),
 });
 // #2303: raw calibration facts and conditional launch; public policy is native.
 const calibrationRoutesBridge = require('./rust-calibration-routes-bridge.cjs').createCalibrationRoutesBridge({
