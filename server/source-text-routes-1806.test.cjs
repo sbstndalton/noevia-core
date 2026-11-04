@@ -50,7 +50,7 @@ const mutation = () => ({ origin: 'http://localhost', cookie, 'content-type': 'a
 // The projects as the store holds them: sources are metadata and a pointer, never the text. (The list the client
 // reads, GET /api/workspace, is the Rust front's since the #2191 close-out; a Node request refreshes this process's view.)
 const workspace = async () => {
-  await request('/api/chats/search', { headers: { cookie } });
+  await request('/api/chat-framing/suggest', { headers: { cookie } });
   return JSON.parse(fs.readFileSync(path.join(testDataDir, 'users', frontUserId, 'projects.json'), 'utf8'));
 };
 const textUrl = (id, name) => `/api/projects/${encodeURIComponent(id)}/sources/text?name=${encodeURIComponent(name)}`;

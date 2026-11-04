@@ -113,7 +113,7 @@ function frontSaveFree(metas) {
 const frontDelete = (projectId, chatId) => require('../tests/server/project-store-server.cjs').rustChatDelete(testDataDir, path.basename(workspaceDir()), projectId, chatId);
 
 async function openWithImage(chatId) {
-  await request('/api/chats/search', { headers: { cookie } }); // the account's directory exists
+  await request('/api/chat-framing/suggest', { headers: { cookie } }); // the account's directory exists
   const file = path.join(workspaceDir(), 'projects.json');
   const data = JSON.parse(fs.readFileSync(file, 'utf8'));
   data.projects.push({ id: ctx(chatId), name: 'Synthetic context', files: [], assets: [], chats: [] });

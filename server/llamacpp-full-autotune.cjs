@@ -4,7 +4,7 @@ const fs = require('node:fs');
 const crypto = require('node:crypto');
 const { WORKLOADS, SPEC_CANDIDATES, geomean } = require('./llamacpp-tune-spec.cjs');
 const { hasHarmonyReasoning, quirksOf, toIniOptions, INI_KEY_LIST } = require('./sampling-recommendation.cjs');
-const { isSystemModel, modelPathFromArgs, SYSTEM_MODEL_REASON } = require('./model-system.cjs');
+const { isSystemModel, isSidecarModel, modelPathFromArgs, SYSTEM_MODEL_REASON } = require('./model-system.cjs');
 const VERSION = 3;
 // #1062: waits for another router client per model before the tune stops as interrupted.
 const FOREIGN_YIELDS = 6;
@@ -174,7 +174,6 @@ function defaultServingChecks() {
 }
 const NO_PROBE_PASSED = 'The model failed every quality probe at its reference settings, so auto-tune cannot tell whether a setting harms it.';
 const hash = value => crypto.createHash('sha256').update(JSON.stringify(value)).digest('hex');
-const sorted = value => Object.fromEntries(Object.entries(value || {}).sort(([a], [b]) => a.localeCompare(b)));
 const cancelledError = () => Object.assign(Error('Cancelled'), { cancelled: true });
 const publicJob = job => job && JSON.parse(JSON.stringify(job, (key, value) =>
   key.startsWith('_') || ['originalText', 'lastRevision', 'originalRevision', 'beforeText'].includes(key) ? undefined : value));
@@ -293,7 +292,10 @@ function createFullAutotuner({ request: engineRequest, rawModels: engineRawModel
   contention = req => require('./dav-parse-wasm.cjs').tuneContention(req),
   // #1079: a Long tune's `<model>-long` section (long-profile.cjs, Rust's decisions) and the router
   // re-read after it is added (the manager's guarded reload; the plain router call by default).
-  longProfiles = require('./long-profile.cjs').createLongProfiles(), reloadRouter: routerReload = null }) {
+  longProfiles = require('./long-profile.cjs').createLongProfiles(), reloadRouter: routerReload = null,
+  // The preset reload baseline is made unknown before each raw router re-read (preset-reload.cjs);
+  // false: that was not acknowledged, so the re-read is not made and stays owed (_reloadPending).
+  invalidateBaseline = async () => true }) {
   const request = engineBoundary(engineRequest), rawModels = engineBoundary(engineRawModels);
   let state;
   try { state = JSON.parse(fs.readFileSync(stateFile, 'utf8')); } catch { state = {}; }
@@ -460,39 +462,45 @@ function createFullAutotuner({ request: engineRequest, rawModels: engineRawModel
   const wrote = j => { if (!j._backedUp) { j._backedUp = true; save(); } };
   // kvs (#1060): the KV list the tune used (the item's snapshot) or, for the untuned scan, the one
   // the model's switch gives now; a q5 list differs from a default one either way round.
+  const scanProfile = model => { const p = presets.get(model); return { exists: !!p.exists, defaults: { ...(p.defaults || {}) }, options: { ...(p.options || {}) } }; };
+  const scanPolicy = request => require('./dav-parse-wasm.cjs').autotuneScan({ version: 1, ...request });
   async function signature(model, suppliedIdentity, kvs = candidatesFor(model)) {
     const identity = suppliedIdentity || await identityFor(model);
     if (!identity) throw publicFail('Model identity could not be read.');
-    const profile = presets.get(model);
-    // A default list adds nothing, so tunes from before #1057 stay current.
-    return hash({ version: VERSION, identity, options: sorted({ ...profile.defaults, ...profile.options }), ...(kvs.some(k => k === 'q5_1' || k === 'q5_0') ? { kv: 'q5' } : {}) });
+    return scanPolicy({ op: 'signature', row: { identity, profile: scanProfile(model), allowQ5Kv: kvs.some(k => k === 'q5_1' || k === 'q5_0') } }).signature;
   }
-  async function candidates() {
+  // Bounded per-use owner facts only; both the runner and native public discovery use Rust's
+  // same classification/signature/selection. No cache, selection duplicate or public reply here.
+  async function scanFacts({ signal } = {}) {
+    signal?.throwIfAborted();
     const r = await rawModels();
+    signal?.throwIfAborted();
     if (!r.ok || !Array.isArray(r.body?.data)) throw publicFail('The model server is not responding.');
-    const models = [], skipped = [];
-    // #1079: a long profile is tuned with Long mode from its model's page, never by a Fast scan.
+    if (r.body.data.length > 512) throw Error('scan row cap');
     const longs = new Set(longProfiles.pairsOf(r.body.data, presets).map(p => p.long));
-    for (const row of r.body.data) {
-      if (longs.has(row.id)) { skipped.push({ model: row.id, reason: LONG_PROFILE_REASON }); continue; }
-      const profile = presets.get(row.id), args = row.status?.args || [];
-      if (isSystemModel(row.id, modelPathFromArgs(args))) {
-        skipped.push({ model: row.id, reason: SYSTEM_MODEL_REASON }); continue;
+    const rows = [];
+    // Read each row's live owner facts immediately before its identity, as the legacy loop did.
+    // An earlier async identity read may allow a settings/history change for a later row.
+    for (const raw of r.body.data) {
+      signal?.throwIfAborted();
+      const profile = scanProfile(raw.id);
+      const row = { id: raw.id, long: longs.has(raw.id), system: isSystemModel(raw.id, modelPathFromArgs(raw.status?.args || [])) || isSidecarModel(raw.id),
+        missing: !!fileMissing(raw), configured: profile.exists, profile, args: raw.status?.args || [], latest: null };
+      const { eligible } = scanPolicy({ op: 'classify', rows: [row] });
+      if (eligible.length) {
+        row.allowQ5Kv = settingsOf(row.id).allowQ5Kv;
+        row.identity = await identityFor(row.id);
+        signal?.throwIfAborted();
+        if (!row.identity) throw publicFail('Model identity could not be read.');
+        row.profile = scanProfile(row.id);
+        const latest = state.history[row.id]?.[0];
+        row.latest = latest == null ? null : { version: latest.version, signature: latest.signature };
       }
-      if (fileMissing(row)) { skipped.push({ model: row.id, reason: 'Model file missing from the models folder' }); continue; }
-      if (!profile.exists || args.some(a => ['--embedding', '--embeddings', '--rerank', '--reranking'].includes(a)) ||
-          ['embedding', 'embeddings', 'rerank', 'reranking'].some(k => ['true', '1', 'on'].includes(String(profile.options[k])))) {
-        skipped.push({ model: row.id, reason: 'Not a configured chat model' }); continue;
-      }
-      const current = await signature(row.id);
-      // #1060: the newest tune is the one in models.ini; an older entry with another KV list is not.
-      const latest = state.history[row.id]?.[0];
-      if (latest?.version === VERSION && latest.signature === current) skipped.push({ model: row.id, reason: 'Current tune already applied' });
-      else models.push(row.id);
+      rows.push(row);
     }
-    return { models, skipped };
+    return { version: 1, rows };
   }
-  async function untuned() { try { return { ok: true, status: 200, body: await candidates() }; } catch (e) { return { ok: false, status: 502, body: { error: clientMessage(e, 'Could not list untuned models.') } }; } }
+  async function candidates() { return scanPolicy({ op: 'scan', ...await scanFacts() }); }
   async function unloadAll({ restoring = false } = {}) {
     for (;;) {
       const foreign = await unloadAllOnce({ restoring });
@@ -966,9 +974,17 @@ function createFullAutotuner({ request: engineRequest, rawModels: engineRawModel
   }
   async function reloadRouter(j) {
     if ((await othersLiveNow(j.model)) === false) {
-      const reload = await request('/models?reload=1', {}, 120000);
-      if (!reload.ok) throw Error('The router did not confirm restored settings.');
-      j._reloadPending = false; save();
+      if (await invalidateBaseline('autotune')) {
+        const reload = await request('/models?reload=1', {}, 120000);
+        if (!reload.ok) throw Error('The router did not confirm restored settings.');
+        j._reloadPending = false; save();
+        return;
+      }
+      // Not re-read: owed, like a re-read deferred for another client (retried, and flushed before
+      // this model loads again).
+      j._reloadPending = true;
+      note(j, 'The model server has not re-read the restored models.ini; it does so before this model next loads.');
+      scheduleReload(j);
       return;
     }
     j._reloadPending = true;
@@ -985,7 +1001,7 @@ function createFullAutotuner({ request: engineRequest, rawModels: engineRawModel
       if ((await othersLiveNow(j.model)) === false) {
         // #1072: a flush may have re-read the file while this check was in flight; no second re-read.
         if (!j._reloadPending) return;
-        try { const r = await request('/models?reload=1', {}, 120000); if (r.ok) { j._reloadPending = false; note(j, 'The model server re-read the restored models.ini.'); return; } } catch { /* retried below */ }
+        try { if (await invalidateBaseline('autotune')) { const r = await request('/models?reload=1', {}, 120000); if (r.ok) { j._reloadPending = false; note(j, 'The model server re-read the restored models.ini.'); return; } } } catch { /* retried below */ }
       }
       scheduleReload(j, tries + 1);
     }, Math.max(foreignPollMs * 15, 1));
@@ -1000,7 +1016,8 @@ function createFullAutotuner({ request: engineRequest, rawModels: engineRawModel
     clearTimeout(reloadTimer);
     // #1072: a request that throws (the server unreachable) is the same refusal as a bad answer, and the
     // re-read is still owed, so it is re-armed rather than left for the next flush alone.
-    const r = await request('/models?reload=1', {}, 120000).catch(() => null);
+    // Not acknowledged: no re-read, the same refusal as a failed one (re-armed below).
+    const r = (await invalidateBaseline('autotune')) ? await request('/models?reload=1', {}, 120000).catch(() => null) : null;
     guard?.();
     if (!r?.ok) {
       scheduleReload(j);
@@ -1619,6 +1636,8 @@ function createFullAutotuner({ request: engineRequest, rawModels: engineRawModel
         const unloaded = await request('/models/unload', { method: 'POST', body: JSON.stringify({ model: j.model }) }, 60000);
         if (!unloaded.ok) throw Error('Could not unload the test model.');
         await presets.commit({ baseRevision: j.lastRevision, text: j.originalText });
+        // Not acknowledged: no re-read now; it stays owed and is retried in the background.
+        if (!(await invalidateBaseline('autotune'))) { j._reloadPending = true; throw Error('The router did not confirm restored settings.'); }
         const reload = await request('/models?reload=1', {}, 120000);
         if (!reload.ok) throw Error('The router did not confirm restored settings.');
         j.restored = true;
@@ -1626,7 +1645,9 @@ function createFullAutotuner({ request: engineRequest, rawModels: engineRawModel
       delete j.originalText; j.status = 'interrupted';
       j.error = j.restored ? 'An older tuning run was interrupted and restored. Start a new tune.'
         : 'An older tuning run was interrupted; settings could not safely be restored. Inspect models.ini before tuning again.';
-      save(); return;
+      save();
+      if (j._reloadPending) scheduleReload(j);
+      return;
     }
     const item = j.models.find(m => m.status === 'running');
     const p = item?.phases.find(p => p.status === 'running');
@@ -1809,6 +1830,6 @@ function createFullAutotuner({ request: engineRequest, rawModels: engineRawModel
     if (plan.kind === 'launch') { cancelled = false; completion = run(j); completion.catch(() => {}); }
     return { applied: true, ...resumeFacts(), publicJob: resumePublicJob(j) };
   }
-  return { start, resumeFacts, prepareResume, compareAndResume, cancellationFacts: cancellation.facts, compareAndAbort: cancellation.compareAndAbort, clearFacts, compareAndClear, statusFacts, settingsFacts: settingsSnapshot, commitSettings, untuned, recover, flushReload, completion: () => completion };
+  return { start, resumeFacts, prepareResume, compareAndResume, cancellationFacts: cancellation.facts, compareAndAbort: cancellation.compareAndAbort, clearFacts, compareAndClear, statusFacts, settingsFacts: settingsSnapshot, commitSettings, scanFacts, recover, flushReload, completion: () => completion };
 }
 module.exports = { createAutotuneCancellation, createFullAutotuner, qualityCheck, qualityFailure, QUALITY, VERSION, newModel, hasHarmonyReasoning, kvCandidates, preferKv, bf16Unsupported, MODES, LONG_PROFILE_REASON };

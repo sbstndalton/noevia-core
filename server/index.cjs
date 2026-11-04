@@ -356,6 +356,8 @@ const modelManager = createModelManager({
   calibrationStatePath: path.join(DATA_DIR,'native-calibration-'+require('node:crypto').createHash('sha256').update(MODEL_MANAGER_BASE).digest('hex').slice(0,16)+'.json'),
   autotuneStatePath: path.join(DATA_DIR,'native-autotune-'+require('node:crypto').createHash('sha256').update(MODEL_MANAGER_BASE).digest('hex').slice(0,16)+'.json'),
   // #1012: the models.ini text the router last read after a reload noevia made.
+  // noevia-rs model_maint/reload.rs: the front holds that baseline when it serves it (preset-reload.cjs).
+  presetBaselineClient: PROJECT_STORE,
   reloadStatePath: path.join(DATA_DIR,'native-preset-reload-'+require('node:crypto').createHash('sha256').update(MODEL_MANAGER_BASE).digest('hex').slice(0,16)+'.json'),
   downloadStatePath: path.join(DATA_DIR,'native-downloads-'+require('node:crypto').createHash('sha256').update(MODEL_MANAGER_BASE).digest('hex').slice(0,16)+'.json'),
   baseUrl: MODEL_MANAGER_BASE,
@@ -1120,11 +1122,14 @@ const providerRoutes = require('./routes/providers.cjs').createProviderRoutes({
   json, chatgptOAuth, chatgptEnabled: () => features.enabled('chatgptOAuth'),
 });
 // Statistics, the auto-router roles, the model manager proxy and /api/models/* (routes/models.cjs).
+const modelAssignmentsFacts = require('./rust-model-assignments-facts.cjs').createModelAssignmentsFacts({
+  secret: FRONT_SECRET, json, readJson, env: process.env, modelsInstalled: modelService.modelsInstalled, decisionSettings, rerankSettings,
+});
 const modelManagerScanCache = require('./rust-model-manager-scan-cache.cjs').createModelManagerScanCache({
   secret: FRONT_SECRET, json, readJson, service: modelService,
 });
 const modelRoutes = require('./routes/models.cjs').createModelRoutes({
-  json, readBody, readJson, fetchJson, env: process.env, modelManager, getProvider, providerHeaders, DEFAULT_PROVIDER_ID, createVisionProbe: engineVisionProbe, currentWorkspace, service: modelService, inferenceBudget, idleUnload, decisionSettings, rerankSettings,
+  json, readBody, readJson, fetchJson, env: process.env, modelManager, currentWorkspace, service: modelService, inferenceBudget, idleUnload, decisionSettings, rerankSettings,
 });
 // State only this process knows, published for the Rust front (published-snapshot.cjs): the retrieval
 // status behind GET /api/health (rust-health.cjs) and the served catalogue and machine models behind
@@ -1206,6 +1211,9 @@ const storageRoutes = require('./routes/storage.cjs').createStorageRoutes({ json
 const idleUnloadFacts = require('./rust-idle-unload-read-facts.cjs').createIdleUnloadFacts({
   secret: FRONT_SECRET, json, effectiveSeconds: () => idleUnload?.effectiveSeconds(),
 });
+const modelDownloadsFacts = require('./rust-model-downloads-read-facts.cjs').createModelDownloadsFacts({
+  secret: FRONT_SECRET, json, manager: () => modelManager,
+});
 const presetReadBridge = require('./rust-preset-read-bridge.cjs').createPresetReadBridge({
   secret: FRONT_SECRET, json, readJson, manager: () => modelManager,
 });
@@ -1216,6 +1224,7 @@ const autotuneResumeBridge = require('./rust-autotune-resume-bridge.cjs').create
   secret: FRONT_SECRET, json, readJson, autotune: () => modelManager.autotune, invalidate: () => modelService.modelScanCache.clear(),
 });
 const autotuneClearBridge = require('./rust-autotune-clear-bridge.cjs').createAutotuneClearBridge({ secret: FRONT_SECRET, json, readJson, autotune: () => modelManager.autotune });
+const autotuneUntunedFacts = require('./rust-autotune-untuned-facts.cjs').createAutotuneUntunedFacts({ secret: FRONT_SECRET, json, readJson, autotune: () => modelManager.autotune });
 const toolApprovals = require('./rust-tool-approval-bridge.cjs');
 const toolApprovalBridge = toolApprovals.createToolApprovalBridge({
   secret: FRONT_SECRET, pendingApprovals, json, readJson,
@@ -1304,6 +1313,8 @@ async function handleRequestInner(req, res) {
   if (require('./rust-tool-approvals.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   if (require('./rust-idle-unload-read.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   if (await idleUnloadFacts(req, res)) return;
+  if (require('./rust-model-downloads-read.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
+  if (await modelDownloadsFacts(req, res)) return;
   if (require('./rust-autotune-read.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   if (require('./rust-preset-read.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   if (await presetReadBridge(req, res)) return;
@@ -1312,6 +1323,8 @@ async function handleRequestInner(req, res) {
   if (await autotuneResumeBridge(req, res)) return;
   if (require('./rust-autotune-clear.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   if (await autotuneClearBridge(req, res)) return;
+  if (require('./rust-autotune-untuned.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
+  if (await autotuneUntunedFacts(req, res)) return;
   if (await toolApprovalBridge(req, res)) return;
   // The Rust front's maintenance lease on this process's gate (#2210): before everything, and only the front's.
   if (await maintenanceLeases.handle(req, res)) return;
@@ -1367,6 +1380,7 @@ async function handleRequestInner(req, res) {
   if (require('./rust-model-sizing.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   // And the model maintenance authorities (#2210): POST /api/models/presets/reload.
   if (require('./rust-model-maintenance.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
+  if (require('./rust-model-evidence-recheck.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   // #2190: the public pages and the device approval page, and the plugin directory.
   if (require('./rust-public-pages.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   if (require('./rust-plugin-directory.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
@@ -1382,6 +1396,8 @@ async function handleRequestInner(req, res) {
   if (require('./rust-mcp-directory.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   if (require('./rust-toolboxes-permitted.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   if (require('./rust-toolbox-picker.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
+  if (require('./rust-model-assignments.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
+  if (await modelAssignmentsFacts(req, res)) return;
   if (require('./rust-calibration-routes.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   if (await calibrationRoutesBridge(req, res)) return;
   if (require('./rust-model-manager-scan.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
@@ -1398,6 +1414,8 @@ async function handleRequestInner(req, res) {
   if (require('./rust-health.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   if (require('./rust-auto-roles.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   if (require('./rust-workspace.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
+  if (require('./rust-chat-search.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
+  if (require('./rust-chat-export.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   await readyFeatures();
   const preAuth = requestAuth.authenticate(req);
   // accountRole: a device token acts as a member, but its account's workspace is the same one.

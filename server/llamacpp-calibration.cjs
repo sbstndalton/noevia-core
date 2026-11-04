@@ -62,6 +62,9 @@ function createCalibrator(deps) {
     memoryFloorGib = 2,
     onResult = () => {},
     onUpdate = () => {}, onWrite = () => {},
+    // The preset reload baseline is made unknown before each raw router re-read below (preset-reload.cjs);
+    // false: that was not acknowledged, so the router is not asked to re-read.
+    invalidateBaseline = async () => true,
     // #1062: set by auto-tune only. Called with the error this calibrator would throw when another
     // client has a model live; resolves once it may go on (the step is then repeated) or throws.
     foreignWait = null,
@@ -93,6 +96,9 @@ function createCalibrator(deps) {
   // A run that was still marked running when noevia stopped: put the preset back if the
   // file is still exactly what the job last wrote, so an operator's later edit survives.
   const NOT_RESTORED = ' The original profile was not restored because models.ini changed since the run started; check this model\'s context size.';
+  // The file is back but the router was not asked to re-read it (the reload baseline could not be
+  // made unknown first): the manager's words for a restore whose reload is not confirmed.
+  const NOT_RELOADED = ' Reload failed or timed out. Previous preset file restored; check router health before retrying.';
   async function recover() {
     load();
     const job = state.job;
@@ -104,7 +110,8 @@ function createCalibrator(deps) {
       if (job.originalText != null && job.lastRevision) {
         await presets.commit({ baseRevision: job.lastRevision, text: job.originalText });
         job.restored = true;
-        await request('/models?reload=1', {}, 120000).catch(() => {});
+        if (await invalidateBaseline('calibration')) await request('/models?reload=1', {}, 120000).catch(() => {});
+        else job.error += NOT_RELOADED;
       }
     } catch { job.restored = false; }
     if (job.restored === false) job.error += NOT_RESTORED;
@@ -475,7 +482,8 @@ function createCalibrator(deps) {
         if (job.originalText != null && job.lastRevision && presets.snapshot().revision === job.lastRevision) {
           await presets.commit({ baseRevision: job.lastRevision, text: job.originalText });
           onWrite(presets.snapshot().revision);
-          await request('/models?reload=1', {}, 120000).catch(() => {});
+          if (await invalidateBaseline('calibration')) await request('/models?reload=1', {}, 120000).catch(() => {});
+          else job.error = (job.error || (e.cancelled ? 'Calibration cancelled.' : 'Calibration failed.')) + NOT_RELOADED;
           job.restored = true;
         } else if (job.originalText != null && job.lastRevision) job.restored = false;
       } catch { job.restored = false; }
