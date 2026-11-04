@@ -393,30 +393,16 @@ if (typeof modelManager.releaseMaintenanceHold === 'function') shutdownHooks.add
   const warning = typeof modelManager.gateAdmin === 'function' && !modelManager.gateAdmin() ? require('./inference-gate-client.cjs').adminTokenWarning() : null;
   if (warning) console.warn(warning);
 }
-// #697 runtime safety net: unload the engine's models when measured inference memory stays
-// above the budget by more than INFERENCE_BUDGET_OVERSHOOT_PCT (default 10). Native engine only.
 // noevia#1863: the chat-model idle unload time (admin setting, stored by the model manager).
 const idleUnload = process.env.MODEL_LOADER_URL ? require('./idle-unload-setting.cjs').createIdleUnloadSetting({ env: process.env, fetchJson,
   reloadPresets: (o) => modelManager.reloadPresets ? modelManager.reloadPresets(o) : { ok: false },
   writePresets: modelManager.writePresets || null,
   presetsInRouter: () => modelManager.presetsInRouter ? modelManager.presetsInRouter() : null,
   audit: (action, actor, detail) => authService.audit(action, actor, actor, detail) }) : null;
-const inferenceBudgetWatch = modelManager.kind === 'llamacpp' ? (() => {
-  const watch = require('./inference-budget-watch.cjs');
-  const files = watch.gpuMemoryFiles(process.env);
-  return watch.createInferenceBudgetWatch({
-    budgetGib: inferenceBudget.budgetGib,
-    readGpu: () => watch.readGpuMemory(files),
-    readEngine: watch.engineReaderFromModelLoader({ env: process.env, fetchJson }),
-    // #874: null (unknown) on a failed listing, so the watchdog skips that tick instead of treating it as idle.
-    listLoaded: async () => watch.loadedFromListing(await modelManager.listModels()),
-    unload: model => modelManager.emergencyUnload(model),
-    onUnloaded: (model, budgetGib) => modelManager.quarantine?.(model, budgetGib),
-    // #873 follow-up: a sweep's llama-bench memory (gate held) must never become the idle baseline.
-    baselineAllowed: () => !modelManager.maintenanceHeld?.(),
-  });
-})() : null;
-afterNativeReady(() => inferenceBudgetWatch?.start());
+// #697 runtime safety net (the memory watchdog) is the Rust front's (rust-budget-watch.cjs
+// BUDGET_WATCH_OWNER, --features rust-budget-watch): it samples, unloads through the inference gate and
+// asks this process only for the maintenance state and the quarantine (budgetWatchBridge below). It is
+// not started here, so it never runs twice; the release and the supervisor refuse a mixed pair.
 // #697: every web caller of the shared engine checks its model first against the inference memory
 // budget. Throws a 409 with a publicMessage when the model would not fit. A no-op for other managers.
 // noevia#2115: switching models is the inference gate's. A request for another model waits in the
@@ -772,6 +758,10 @@ const taskFactsBridge = require('./rust-task-facts.cjs').createTaskFactsBridge({
 // #2262: GET inference-budget and GET installed are the Rust front's; this is what they cannot read for themselves.
 const modelFactsBridge = require('./rust-model-facts.cjs').createModelFactsBridge({
   secret: FRONT_SECRET, json, readJson, inferenceBudget, service: modelService,
+});
+// #697: the memory watchdog's facts and quarantine, for the Rust front that runs it (rust-budget-watch.cjs).
+const budgetWatchBridge = require('./rust-budget-watch.cjs').createBudgetWatchBridge({
+  secret: FRONT_SECRET, json, readJson, modelManager,
 });
 
 // ── Deep research (#2218): the Rust front's (rust-research.cjs); what its jobs still need from this process ──
@@ -1360,6 +1350,7 @@ async function handleRequestInner(req, res) {
   if (require('./rust-task-reads.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   if (await taskFactsBridge(req, res)) return;
   if (await modelFactsBridge(req, res)) return;
+  if (await budgetWatchBridge(req, res)) return;
   // And a project's configuration, its instruction skills and a published skill's install (#2191 round 9).
   if (require('./rust-project-config.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   // And an account's deletion, complete (#2190, #2191 round 9): DELETE /api/admin/users/{id}.
