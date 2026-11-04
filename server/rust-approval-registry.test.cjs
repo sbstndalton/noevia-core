@@ -121,3 +121,50 @@ test('a grant is checked and revoked at the front, and never without a user, cha
   assert.equal(await gate.chatWideApproved('owner', 'chat', 'project:p', binding), false);
   assert.equal(await gate.revokeChatGrant('owner', null), false);
 });
+
+test('a revoke the front did not confirm denies the grant, even after the front is back, until the retry lands', async (t) => {
+  const { store, gate, logs } = await fixture(t, { revokeRetry: { firstMs: 150, maxMs: 150 } });
+  store.grants.set('owner\nchat', 'project:p');
+  assert.equal(await gate.chatWideApproved('owner', 'chat', 'project:p', binding), true);
+  store.down.add('revoke');
+  assert.equal(await gate.revokeChatGrant('owner', 'chat'), false, 'the front is down');
+  assert.equal(gate.revokePending('owner', 'chat'), true);
+  assert.equal(store.grants.has('owner\nchat'), true, 'the front still holds the grant');
+  const asked = store.seen.filter((x) => x.op === 'granted').length;
+  assert.equal(await gate.chatWideApproved('owner', 'chat', 'project:p', binding), false, 'denied while the front is down');
+  // The front comes back (its grant still there), but the retry has not landed yet.
+  store.down.delete('revoke');
+  assert.equal(await gate.chatWideApproved('owner', 'chat', 'project:p', binding), false, 'denied though the front would say granted');
+  assert.equal(store.seen.filter((x) => x.op === 'granted').length, asked, 'the record is read first; the front is not asked');
+  assert.equal(await gate.chatWideApproved('owner', 'other-chat', 'project:p', binding), false);
+  await until(() => !gate.revokePending('owner', 'chat'));
+  assert.equal(gate.revokePending('owner', 'chat'), false, 'cleared once the front confirmed the retried revoke');
+  assert.equal(store.grants.has('owner\nchat'), false, 'the retry revoked the grant at the front');
+  assert.ok(logs.some((m) => /revoke failed/.test(m)));
+});
+
+test('retries back off, and a successful retry clears the record', async (t) => {
+  const { store, gate } = await fixture(t, { revokeRetry: { firstMs: 20, maxMs: 80 } });
+  store.down.add('revoke');
+  await gate.revokeChatGrant('owner', 'chat');
+  await until(() => store.seen.filter((x) => x.op === 'revoke').length >= 4);
+  assert.equal(gate.revokePending('owner', 'chat'), true, 'still pending while every retry fails');
+  store.down.delete('revoke');
+  await until(() => !gate.revokePending('owner', 'chat'));
+  assert.equal(gate.revokePending('owner', 'chat'), false);
+  const tries = store.seen.filter((x) => x.op === 'revoke');
+  assert.ok(tries.length >= 5 && tries.at(-1).down !== true, 'the last try reached the front');
+  // A later grant in that chat is honoured again.
+  store.grants.set('owner\nchat', 'project:p');
+  assert.equal(await gate.chatWideApproved('owner', 'chat', 'project:p', binding), true);
+});
+
+test('a pending revoke is dropped once no grant it shadows could still be live', async (t) => {
+  let clock = 1_000_000;
+  const { store, gate } = await fixture(t, { now: () => clock, grantTtlMs: 1000, revokeRetry: { firstMs: 60_000, maxMs: 60_000 } });
+  store.down.add('revoke');
+  await gate.revokeChatGrant('owner', 'chat');
+  assert.equal(gate.revokePending('owner', 'chat'), true);
+  clock += 1000;
+  assert.equal(gate.revokePending('owner', 'chat'), false, 'older than any grant the front can hold');
+});

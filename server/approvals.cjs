@@ -1,5 +1,8 @@
 'use strict';
 
+// TEST REFERENCE ONLY: production does not load this file (index.cjs uses rust-approval-registry.cjs).
+// It is the in-process test reference for the chat-loop tests.
+//
 // The write-approval gate's reference behaviour: pending single-use approvals and the per-chat
 // "allow for this chat" grants, in memory. Port contract S9: the running server no longer uses it;
 // the state is the Rust front's approval registry (rust-approval-registry.cjs, noevia-rs

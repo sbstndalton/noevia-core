@@ -26,10 +26,15 @@ const { safeId } = require('./chat-grant-context.cjs');
 const OPS = new Set(['open', 'wait', 'cancel', 'granted', 'revoke']);
 // The front times a question out itself; Node's own deadline is only a backstop past that.
 const WAIT_SLACK_MS = 30000;
+// The front's grant lifetime (approval_registry.rs GRANT_TTL): no grant outlives it.
+const GRANT_TTL_MS = 60 * 60 * 1000;
+// A failed revoke is retried after 1 s, doubling to at most 1 min between tries.
+const REVOKE_RETRY = Object.freeze({ firstMs: 1000, maxMs: 60000 });
 
 /** `approvals(op, payload, { wait, signal })` -> { status, body }; it throws an AbortError when
  *  `signal` aborts, and another error when the front cannot be reached (project-store-client.cjs). */
-function createApprovalRegistry({ approvals, timeoutMs = 5 * 60 * 1000, log = () => {} }) {
+function createApprovalRegistry({ approvals, timeoutMs = 5 * 60 * 1000, log = () => {},
+  grantTtlMs = GRANT_TTL_MS, revokeRetry = REVOKE_RETRY, now = Date.now } = {}) {
   const ask = (op, payload, options = {}) => {
     if (!OPS.has(op)) throw new Error(`not an approval op: ${op}`);
     return approvals(op, payload, options);
@@ -90,32 +95,88 @@ function createApprovalRegistry({ approvals, timeoutMs = 5 * 60 * 1000, log = ()
     return { choice: 'timeout' };
   }
 
+  // Revokes the front has not confirmed. A revoke follows a refusal such as "the write target
+  // changed after approval"; if the front could not be told, its grant would still auto-approve the
+  // next write in that chat for a target the person never saw. So a failed revoke is recorded here,
+  // every grant check reads this record first and treats the grant as revoked whatever the front
+  // says, and the revoke is retried with a bounded backoff. The record is cleared only once the front
+  // confirms the revoke (or once the grant would have expired anyway: a grant lives at most
+  // grantTtlMs, and the record is never younger than the grant it shadows).
+  // The record is in memory and is lost when Node restarts. That is safe: the supervisor restarts the
+  // front and Node together under a new start id, and a grant names the start id it was made in, so
+  // after a restart no earlier grant applies anyway.
+  const pendingRevokes = new Map(); // JSON [user, canonical chat] -> { user, chat, since, delay, timer }
+  const revokeKey = (userId, chatId) => JSON.stringify([userId, safeId(chatId)]);
+
+  async function tellFront(userId, chatId) {
+    try {
+      const { status, body } = await ask('revoke', { user: userId, chat: chatId });
+      if (status === 200 && typeof body?.revoked === 'boolean') return { confirmed: true, revoked: body.revoked };
+      log(`[tool-approvals] revoke refused: ${status}`);
+    } catch (e) {
+      log(`[tool-approvals] revoke failed: ${why(e)}`);
+    }
+    return { confirmed: false, revoked: false };
+  }
+  function clearRevoke(key) {
+    const entry = pendingRevokes.get(key);
+    if (entry?.timer) clearTimeout(entry.timer);
+    pendingRevokes.delete(key);
+  }
+  function scheduleRevoke(key) {
+    const entry = pendingRevokes.get(key);
+    if (!entry || entry.timer) return;
+    entry.timer = setTimeout(async () => {
+      entry.timer = null;
+      if (pendingRevokes.get(key) !== entry) return;
+      if (now() - entry.since >= grantTtlMs) { clearRevoke(key); return; }
+      const { confirmed } = await tellFront(entry.user, entry.chat);
+      if (pendingRevokes.get(key) !== entry) return;
+      if (confirmed) { clearRevoke(key); return; }
+      entry.delay = Math.min(entry.delay * 2, revokeRetry.maxMs);
+      scheduleRevoke(key);
+    }, entry.delay);
+    entry.timer.unref?.();
+  }
+  /** Whether a revoke for this chat still waits for the front's confirmation. */
+  function revokePending(userId, chatId) {
+    const key = revokeKey(userId, chatId);
+    const entry = pendingRevokes.get(key);
+    if (entry && now() - entry.since >= grantTtlMs) { clearRevoke(key); return false; }
+    return !!entry;
+  }
+
   /** approvals.cjs chatWideApproved, asked of the front. A check without a user, a chat id, a scope
-   *  or a binding never matches, and neither does one the front cannot answer. */
+   *  or a binding never matches, and neither does one the front cannot answer, nor one whose revoke
+   *  the front has not yet confirmed. */
   async function chatWideApproved(userId, chatId, scope, binding) {
     if (!text(userId) || !safeId(chatId) || !text(scope) || !binding) return false;
+    if (revokePending(userId, chatId)) return false;
     try {
       const { status, body } = await ask('granted', { user: userId, chat: chatId, scope, binding });
-      return status === 200 && body?.granted === true;
+      // A revoke that failed while this check was in flight still wins.
+      return status === 200 && body?.granted === true && !revokePending(userId, chatId);
     } catch (e) {
       log(`[tool-approvals] grant check failed: ${why(e)}`);
       return false;
     }
   }
 
-  /** approvals.cjs revokeChatGrant, asked of the front. */
+  /** approvals.cjs revokeChatGrant, asked of the front. Unconfirmed: recorded and retried (above). */
   async function revokeChatGrant(userId, chatId) {
     if (!text(userId) || !safeId(chatId)) return false;
-    try {
-      const { status, body } = await ask('revoke', { user: userId, chat: chatId });
-      return status === 200 && body?.revoked === true;
-    } catch (e) {
-      log(`[tool-approvals] revoke failed: ${why(e)}`);
-      return false;
-    }
+    const key = revokeKey(userId, chatId);
+    // Recorded before asking, so a grant check racing this revoke is already denied.
+    const entry = pendingRevokes.get(key) || { user: userId, chat: chatId, since: now(), delay: revokeRetry.firstMs, timer: null };
+    entry.since = now();
+    pendingRevokes.set(key, entry);
+    const { confirmed, revoked } = await tellFront(userId, chatId);
+    if (confirmed) { if (pendingRevokes.get(key) === entry) clearRevoke(key); return revoked; }
+    scheduleRevoke(key);
+    return false;
   }
 
-  return { openApproval, openRouteChoice, awaitApproval, awaitRouteChoice, chatWideApproved, revokeChatGrant };
+  return { openApproval, openRouteChoice, awaitApproval, awaitRouteChoice, chatWideApproved, revokeChatGrant, revokePending };
 }
 
-module.exports = { createApprovalRegistry, OPS, WAIT_SLACK_MS };
+module.exports = { createApprovalRegistry, OPS, WAIT_SLACK_MS, GRANT_TTL_MS, REVOKE_RETRY };

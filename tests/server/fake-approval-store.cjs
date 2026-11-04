@@ -11,6 +11,7 @@ async function startFakeApprovalStore({ token = 'synthetic-store-token-012345678
   const grants = new Map(); // `${user}\n${chat}` -> scope
   const seen = []; // { op, body }
   const dropped = []; // ids whose wait Node dropped
+  const down = new Set(); // ops answered by dropping the connection, as a front that is down
   const server = http.createServer((req, res) => {
     let raw = '';
     req.on('data', (c) => { raw += c; });
@@ -22,6 +23,7 @@ async function startFakeApprovalStore({ token = 'synthetic-store-token-012345678
       };
       if (req.headers['x-noevia-store-token'] !== token) return reply(401, { error: 'unauthorised' });
       const op = String(req.url).replace(/^\/v1\/approvals\//, '');
+      if (down.has(op)) { seen.push({ op, down: true }); req.socket.destroy(); return undefined; }
       let body;
       try { body = JSON.parse(raw); } catch { return reply(400, { error: 'invalid JSON' }); }
       seen.push({ op, body });
@@ -64,7 +66,7 @@ async function startFakeApprovalStore({ token = 'synthetic-store-token-012345678
     return true;
   }
   const close = () => new Promise((resolve) => { server.closeAllConnections?.(); server.close(() => resolve()); });
-  return { port, token, seen, dropped, questions, grants, answer, close };
+  return { port, token, seen, dropped, down, questions, grants, answer, close };
 }
 
 module.exports = { startFakeApprovalStore };
