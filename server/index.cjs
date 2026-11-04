@@ -858,7 +858,7 @@ const { state: mcpState, oauthServerIds, accountReady, discoverMcpTools, execute
 // Port contract S9: the approval gate's state (pending write approvals, routing questions and chat-wide
 // grants) is the Rust front's approval registry (rust-approval-registry.cjs); the chat loop below asks
 // it through the private store. Node holds none of it.
-const { openApproval, openRouteChoice, chatWideApproved, revokeChatGrant, awaitApproval, awaitRouteChoice } = require('./rust-approval-registry.cjs').createApprovalRegistry({
+const { openApproval, openRouteChoice, chatWideApproved, redeemChatGrant, revokeChatGrant, awaitApproval, awaitRouteChoice } = require('./rust-approval-registry.cjs').createApprovalRegistry({
   approvals: (op, payload, options) => PROJECT_STORE.approvals(op, payload, options),
   log: (message) => console.warn(message),
 });
@@ -1090,7 +1090,7 @@ const { handleChat } = require('./chat.cjs').createChatHandler({
     chats: () => [...Array.from(FREE_CHATS), ...PROJECTS.filter((proj) => !diaryExtras.internalProject(proj)).flatMap((proj) => proj.chats || [])],
     read: (chatId) => chatBrainLib.readBrain(currentWorkspace().dir, chatId) },
   DEFAULT_TOOLBOXES, CONNECTOR_BOXES, connectedBoxes, allToolboxes, resolveTools, isWriteTool, executeToolCall,
-  oauthServerIds, accountReady, chatWideApproved, openApproval, awaitApproval, revokeChatGrant, recordUsage, recordToolUse, automaticToolsReady,
+  oauthServerIds, accountReady, chatWideApproved, redeemChatGrant, openApproval, awaitApproval, revokeChatGrant, recordUsage, recordToolUse, automaticToolsReady,
   // #917: which of the signed-in workspace's lists holds a chat id ('free', a project id, or null).
   chatListHolder,
   chatgptOAuth, chatgptEnabled: () => features.enabled('chatgptOAuth'),

@@ -258,7 +258,7 @@ async function* withIdleLimit(iterable, ms, onIdle = null) {
 }
 
 function createChatHandler({
-  stepSupervision = null, chatMachines = null, fs, path, crypto, fetch, codeTasksFor = () => [], heuristicWantsCode = require('./auto-router.cjs').createAutoRouter({}).heuristicWantsCode, reasoningEffort, diaryExtras, createToolExchange, rag, prefill, reduceToolResult, HISTORY_CAP, DEFAULT_PROVIDER_ID, DIARY_BASE, TOOL_RESULT_CAP, authService, toolPolicy, modelManager, requestScope, currentWorkspace, json, getProject, getProvider, providerHeaders, saveChats, endpointApproved, diaryHeaders, diaryStorageRetry = (send) => send(true), autoRoles, lastLoadedModel, classifyFastOrSmart, servedCatalogue, modelsInstalled, missingRoles, staleRolesError, visionProbe, visionDescriptions, skillsIndexFor, chatSkillRouter, chatToolRouter, toolGate = null, chatFramingEnabled = () => false, freeChats = () => [], framingReasoner = null, reasoningTraces = null, brainContext = null, DEFAULT_TOOLBOXES, CONNECTOR_BOXES, connectedBoxes, allToolboxes, resolveTools, isWriteTool, executeToolCall, oauthServerIds, accountReady, chatWideApproved, awaitApproval, openApproval = async () => true, recordUsage, recordToolUse, chatListHolder = () => undefined, revokeChatGrant = () => {}, grantContext = (chat) => currentWorkspace().chatPermissions.context(chat),
+  stepSupervision = null, chatMachines = null, fs, path, crypto, fetch, codeTasksFor = () => [], heuristicWantsCode = require('./auto-router.cjs').createAutoRouter({}).heuristicWantsCode, reasoningEffort, diaryExtras, createToolExchange, rag, prefill, reduceToolResult, HISTORY_CAP, DEFAULT_PROVIDER_ID, DIARY_BASE, TOOL_RESULT_CAP, authService, toolPolicy, modelManager, requestScope, currentWorkspace, json, getProject, getProvider, providerHeaders, saveChats, endpointApproved, diaryHeaders, diaryStorageRetry = (send) => send(true), autoRoles, lastLoadedModel, classifyFastOrSmart, servedCatalogue, modelsInstalled, missingRoles, staleRolesError, visionProbe, visionDescriptions, skillsIndexFor, chatSkillRouter, chatToolRouter, toolGate = null, chatFramingEnabled = () => false, freeChats = () => [], framingReasoner = null, reasoningTraces = null, brainContext = null, DEFAULT_TOOLBOXES, CONNECTOR_BOXES, connectedBoxes, allToolboxes, resolveTools, isWriteTool, executeToolCall, oauthServerIds, accountReady, chatWideApproved, redeemChatGrant = null, awaitApproval, openApproval = async () => true, recordUsage, recordToolUse, chatListHolder = () => undefined, revokeChatGrant = () => {}, grantContext = (chat) => currentWorkspace().chatPermissions.context(chat),
   // #1550: per request, whether a box Automatic may add is usable by this account (its Nextcloud connection, for one).
   automaticToolsReady = () => () => true,
   chatgptOAuth = null, chatgptEnabled = () => false, skillHistory = null,
@@ -2453,17 +2453,34 @@ function createChatHandler({
                 return 'ERROR: the write target changed after approval; the tool was not run. Ask again.';
               }
             }
+            let redeemUnavailable = false;
             if (permission === 'ask') {
               try {
-                const finalBinding = await permissionContext(); // LAST await before dispatch.
+                const finalBinding = await permissionContext();
                 if ((chatId && !grantContexts.matches(permissionBinding, finalBinding)) ||
-                    (usedGrant && !askedPerCall && !(await chatWideApproved(userId, grantChat, writeGrantScope, finalBinding))) ||
                     approvalTarget() !== shownTarget || currentWorkspace().userId !== userId || currentWorkspace().revoked) throw grantContexts.invalid();
+                if (usedGrant && !askedPerCall) {
+                  // Port contract S9 (re-review 1ed3a14): the chat-wide grant is redeemed at the front,
+                  // ordered there against every revocation; this is the LAST await before dispatch.
+                  // (In-process gates without redeem check the grant again instead.)
+                  const redeemed = redeemChatGrant
+                    ? await redeemChatGrant(userId, grantChat, writeGrantScope, finalBinding, usedGrant)
+                    : await chatWideApproved(userId, grantChat, writeGrantScope, finalBinding);
+                  if (redeemed === 'unavailable') redeemUnavailable = true;
+                  else if (redeemed !== true) throw grantContexts.invalid();
+                }
               } catch {
                 // Even Allow once refuses a move-away-and-back, restart, deletion or failed read.
                 await revokeChatGrant(userId, grantChat);
                 return 'ERROR: the chat or permission target changed after approval; the tool was not run. Nothing was changed. Ask again.';
               }
+            }
+            if (redeemUnavailable) {
+              // The grant could not be checked at the front: not run, and not a decline.
+              result = `ERROR: the permission for ${tc.name} could not be checked, so it was not run. Nothing was changed. Ask again.`;
+              authService.audit('tool.denied', userId, userId, { tool: tc.name, reason: 'unavailable' });
+              notRunResults.add(result);
+              return result;
             }
             // Synchronous targets may change during the final store await too.
             if (editTarget !== null) {

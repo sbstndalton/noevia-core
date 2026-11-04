@@ -38,7 +38,7 @@ const store = (ws, id, history) => fs.writeFileSync(ws.historyPath(id), JSON.str
 
 /** One handler. Each scripted model turn is a list of chunks; DISCONNECT in it closes the client
  *  connection at that point (the stream then ends the way an aborted fetch does). */
-function harness(t, { approvals = createApprovals(), onPending = null, workspaces = null, openApproval = undefined } = {}) {
+function harness(t, { approvals = createApprovals(), onPending = null, workspaces = null, openApproval = undefined, grants = null } = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'noevia-679-'));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
   fs.mkdirSync(path.join(root, 'a')); fs.mkdirSync(path.join(root, 'b'));
@@ -84,6 +84,7 @@ function harness(t, { approvals = createApprovals(), onPending = null, workspace
     grantContext: async raw => require('../tests/server/chat-grant-fixture.cjs').context(raw, { holder: { kind: 'absent' } }), chatWideApproved: () => false,
     awaitApproval: (card) => { const p = approvals.awaitApproval(card); if (onPending) onPending(card, state, disconnect); return p; },
     ...(openApproval ? { openApproval } : {}),
+    ...(grants ? { chatWideApproved: grants.check, redeemChatGrant: grants.redeem, revokeChatGrant: grants.revoke } : {}),
     recordUsage() {}, recordToolUse() {},
     writeTargetFor: async (name) => (name === 'synthetic_append' ? { target: TARGET } : null),
   });
@@ -208,6 +209,50 @@ test('S9: a registry that cannot be asked leaves the write not run and the card 
   assert.equal(result.notRun, true);
   assert.equal(result.declined, undefined, 'not reported as the person declining');
   assert.match(result.text, /approval for synthetic_append could not be asked, so it was not run/);
+});
+
+// Re-review 1ed3a14: a write that uses a chat-wide grant runs only if the front redeems its ticket
+// just before dispatch. Every grant check here answers true, as a granted:true already produced and
+// in flight would; the front's redeem answer stands for a move, a delete or a failed move ordered
+// before it (noevia-rs tests/tool_approvals.rs pins the front's side of each).
+function grantTurn(t, redeem) {
+  const log = [];
+  const grants = {
+    check: async () => { log.push('check'); return Object.freeze({ ticket: 'synthetic-ticket', epoch: 0 }); },
+    redeem: async (...args) => { log.push('redeem'); return redeem(...args); },
+    revoke: async () => { log.push('revoke'); return true; },
+  };
+  const h = harness(t, { grants, onPending: () => assert.fail('a granted write shows no card') });
+  store(h.a, 'chat-679', [{ role: 'user', content: 'Append it.' }]);
+  h.state.turns.push([toolCall('synthetic_append', APPEND, 'call-1')], [say('Done.')]);
+  return { h, log };
+}
+for (const why of ['a front move', 'a front delete', 'a failed front move']) {
+  test(`S9: ${why} revoking while granted:true is in flight: the redeem is refused and the write never runs`, async (t) => {
+    const { h, log } = grantTurn(t, async () => false);
+    const events = await h.send({ message: 'Append it.' });
+    assert.equal(h.state.executed.length, 0, 'not run');
+    assert.deepEqual(log, ['check', 'redeem', 'revoke']);
+    assert.match(events.find((e) => e.type === 'tool_result').text, /permission target changed after approval; the tool was not run/);
+  });
+}
+test('S9: a front unreachable at redeem: not run, and not a decline', async (t) => {
+  const { h } = grantTurn(t, async () => 'unavailable');
+  const events = await h.send({ message: 'Append it.' });
+  assert.equal(h.state.executed.length, 0);
+  const result = events.find((e) => e.type === 'tool_result');
+  assert.equal(result.notRun, true);
+  assert.equal(result.declined, undefined);
+  assert.match(result.text, /permission for synthetic_append could not be checked, so it was not run/);
+});
+test('S9: a redeemed grant runs the write once, with its ticket, right after the redeem', async (t) => {
+  let seen = null;
+  const { h, log } = grantTurn(t, async (user, chat, scope, binding, grant) => { seen = { user, chat, scope, ticket: grant.ticket, binding: !!binding }; return true; });
+  const execute = h.state.executed;
+  await h.send({ message: 'Append it.' });
+  assert.equal(execute.length, 1);
+  assert.deepEqual(seen, { user: 'synthetic-user-a', chat: 'chat-679', scope: seen.scope, ticket: 'synthetic-ticket', binding: true });
+  assert.deepEqual(log, ['check', 'redeem']);
 });
 
 test('nothing is written when the reply finishes, when someone already saved past the turn, or for a deleted chat', async (t) => {

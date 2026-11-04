@@ -25,7 +25,7 @@ const binding = { user: 'owner', canonicalChatId: 'chat', scope: 'project:p', co
 const until = async (fn) => { for (let i = 0; i < 200 && !fn(); i++) await new Promise((r) => setTimeout(r, 5)); };
 
 test('Node can only open, wait for, withdraw and check its own questions; it can never answer one', () => {
-  assert.deepEqual([...OPS].sort(), ['cancel', 'granted', 'open', 'revoke', 'wait']);
+  assert.deepEqual([...OPS].sort(), ['cancel', 'granted', 'open', 'redeem', 'revoke', 'wait']);
   assert.equal(fs.existsSync(path.join(__dirname, 'rust-tool-approval-bridge.cjs')), false, 'the #2282 facts/resolve bridge is gone');
   const index = fs.readFileSync(path.join(__dirname, 'index.cjs'), 'utf8');
   assert.match(index, /require\('\.\/rust-approval-registry\.cjs'\)\.createApprovalRegistry\(/);
@@ -110,7 +110,7 @@ test('an unreachable front fails closed: nothing is asked, approved or granted',
 test('a grant is checked and revoked at the front, and never without a user, chat, scope and binding', async (t) => {
   const { store, gate } = await fixture(t);
   store.grants.set('owner\nchat', 'project:p');
-  assert.equal(await gate.chatWideApproved('owner', 'chat', 'project:p', binding), true);
+  assert.ok(await gate.chatWideApproved('owner', 'chat', 'project:p', binding));
   assert.equal(await gate.chatWideApproved('owner', 'chat', 'space:free', binding), false);
   const before = store.seen.length;
   for (const args of [[null, 'chat', 'project:p', binding], ['owner', null, 'project:p', binding], ['owner', '', 'project:p', binding], ['owner', '!!', 'project:p', binding], ['owner', 'chat', '', binding], ['owner', 'chat', 'project:p', null]]) {
@@ -125,7 +125,7 @@ test('a grant is checked and revoked at the front, and never without a user, cha
 test('a revoke the front did not confirm denies the grant, even after the front is back, until the retry lands', async (t) => {
   const { store, gate, logs } = await fixture(t, { revokeRetry: { firstMs: 150, maxMs: 150 } });
   store.grants.set('owner\nchat', 'project:p');
-  assert.equal(await gate.chatWideApproved('owner', 'chat', 'project:p', binding), true);
+  assert.ok(await gate.chatWideApproved('owner', 'chat', 'project:p', binding));
   store.down.add('revoke');
   assert.equal(await gate.revokeChatGrant('owner', 'chat'), false, 'the front is down');
   assert.equal(gate.revokePending('owner', 'chat'), true);
@@ -156,7 +156,7 @@ test('retries back off, and a successful retry clears the record', async (t) => 
   assert.ok(tries.length >= 5 && tries.at(-1).down !== true, 'the last try reached the front');
   // A later grant in that chat is honoured again.
   store.grants.set('owner\nchat', 'project:p');
-  assert.equal(await gate.chatWideApproved('owner', 'chat', 'project:p', binding), true);
+  assert.ok(await gate.chatWideApproved('owner', 'chat', 'project:p', binding));
 });
 
 test('a pending revoke is dropped once no grant it shadows could still be live', async (t) => {
@@ -194,12 +194,12 @@ test('P1-1: a revoke confirmed while a granted:true answer is in flight wins ove
   (await f.next('revoke')).ok({ revoked: true });
   assert.equal(await revoke, true);
   assert.equal(f.gate.revokePending('owner', 'chat'), false, 'the revoke was confirmed');
-  grantedCall.ok({ granted: true }); // produced before the revoke reached the front
+  grantedCall.ok({ granted: true, ticket: 't-stale' }); // produced before the revoke reached the front
   assert.equal(await check, false, 'the stale answer is refused');
   // A check that starts after the revoke is answered on its own merits.
   const later = f.gate.chatWideApproved('owner', 'chat', 'project:p', binding);
-  (await f.next('granted')).ok({ granted: true });
-  assert.equal(await later, true);
+  (await f.next('granted')).ok({ granted: true, ticket: 't-later' });
+  assert.equal((await later).ticket, 't-later');
 });
 
 test('P1-1: a failed revoke whose retry succeeds while a granted:true answer is in flight still wins', async () => {
@@ -214,7 +214,7 @@ test('P1-1: a failed revoke whose retry succeeds while a granted:true answer is 
   (await f.next('revoke')).ok({ revoked: true });
   await retry;
   assert.equal(f.gate.revokePending('owner', 'chat'), false, 'the retry was confirmed and cleared the record');
-  grantedCall.ok({ granted: true });
+  grantedCall.ok({ granted: true, ticket: 't-stale' });
   assert.equal(await check, false, 'the stale answer is refused after the record is gone');
 });
 
@@ -257,4 +257,63 @@ test('P1-2: an older retry never clears a newer failed revoke', async () => {
   await retry2;
   assert.equal(f.gate.revokePending('owner', 'chat'), false);
   assert.equal(f.live(), 0);
+});
+
+// Re-review 1ed3a14: the front, not Node, orders grant use against every revocation. A granted:true
+// answer yields only a single-use ticket; the write's redeem is what the front refuses when any
+// revocation (a move, a delete, a failed move: none of them Node's) came first.
+test('a front-only revoke after a granted:true answer: the ticket is refused at redeem', async (t) => {
+  const { store, gate } = await fixture(t);
+  store.grants.set('owner\nchat', 'project:p');
+  const grant = await gate.chatWideApproved('owner', 'chat', 'project:p', binding);
+  assert.match(grant.ticket, /^ticket-/);
+  store.grants.delete('owner\nchat'); // the front's own move, delete or failed move; Node never hears of it
+  assert.equal(await gate.redeemChatGrant('owner', 'chat', 'project:p', binding, grant), false);
+  assert.deepEqual(store.seen.at(-1), { op: 'redeem', body: { user: 'owner', chat: 'chat', scope: 'project:p', binding, ticket: grant.ticket } });
+});
+
+test('a ticket redeems once; a replay is refused', async (t) => {
+  const { store, gate } = await fixture(t);
+  store.grants.set('owner\nchat', 'project:p');
+  const grant = await gate.chatWideApproved('owner', 'chat', 'project:p', binding);
+  assert.equal(await gate.redeemChatGrant('owner', 'chat', 'project:p', binding, grant), true);
+  assert.equal(await gate.redeemChatGrant('owner', 'chat', 'project:p', binding, grant), false);
+  for (const bad of [null, true, {}, { ticket: '' }]) {
+    assert.equal(await gate.redeemChatGrant('owner', 'chat', 'project:p', binding, bad), false, JSON.stringify(bad));
+  }
+});
+
+test('a front that cannot be reached at redeem is unavailable, never an approval', async (t) => {
+  const { store, gate } = await fixture(t);
+  store.grants.set('owner\nchat', 'project:p');
+  const grant = await gate.chatWideApproved('owner', 'chat', 'project:p', binding);
+  store.down.add('redeem');
+  assert.equal(await gate.redeemChatGrant('owner', 'chat', 'project:p', binding, grant), 'unavailable');
+  const odd = createApprovalRegistry({ approvals: async () => ({ status: 503, body: {} }) });
+  assert.equal(await odd.redeemChatGrant('owner', 'chat', 'project:p', binding, grant), 'unavailable');
+});
+
+test("Node's own revoke still denies around a redeem, in either order (defence in depth)", async () => {
+  const f = controlled();
+  const check = f.gate.chatWideApproved('owner', 'chat', 'project:p', binding);
+  (await f.next('granted')).ok({ granted: true, ticket: 't1' });
+  const grant = await check;
+  // Revoke first: refused without asking the front.
+  const revoke = f.gate.revokeChatGrant('owner', 'chat');
+  (await f.next('revoke')).ok({ revoked: true });
+  await revoke;
+  const before = f.calls.length;
+  assert.equal(await f.gate.redeemChatGrant('owner', 'chat', 'project:p', binding, grant), false);
+  assert.equal(f.calls.length, before, 'not asked');
+  // Redeem in flight, then a revoke: even a front true is not accepted.
+  const fresh = f.gate.chatWideApproved('owner', 'chat', 'project:p', binding);
+  (await f.next('granted')).ok({ granted: true, ticket: 't2' });
+  const g2 = await fresh;
+  const redeem = f.gate.redeemChatGrant('owner', 'chat', 'project:p', binding, g2);
+  const call = await f.next('redeem');
+  const r2 = f.gate.revokeChatGrant('owner', 'chat');
+  (await f.next('revoke')).ok({ revoked: true });
+  await r2;
+  call.ok({ redeemed: true });
+  assert.equal(await redeem, false);
 });

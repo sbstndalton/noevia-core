@@ -11,6 +11,7 @@ async function startFakeApprovalStore({ token = 'synthetic-store-token-012345678
   const grants = new Map(); // `${user}\n${chat}` -> scope
   const seen = []; // { op, body }
   const dropped = []; // ids whose wait Node dropped
+  const tickets = Object.assign(new Map(), { count: 0 });
   const down = new Set(); // ops answered by dropping the connection, as a front that is down
   const server = http.createServer((req, res) => {
     let raw = '';
@@ -47,8 +48,19 @@ async function startFakeApprovalStore({ token = 'synthetic-store-token-012345678
         case 'cancel':
           if (mine && !q.waiter) questions.delete(body.id);
           return reply(200, { cancelled: !!mine });
-        case 'granted':
-          return reply(200, { granted: grants.get(`${body.user}\n${body.chat}`) === body.scope && !!body.binding });
+        case 'granted': {
+          const granted = grants.get(`${body.user}\n${body.chat}`) === body.scope && !!body.binding;
+          if (!granted) return reply(200, { granted: false });
+          const ticket = `ticket-${++tickets.count}`;
+          tickets.set(ticket, `${body.user}\n${body.chat}\n${body.scope}`);
+          return reply(200, { granted: true, ticket });
+        }
+        case 'redeem': {
+          // Single use; refused once the grant is gone (a revoke ordered before the redeem).
+          const want = tickets.get(body.ticket);
+          tickets.delete(body.ticket);
+          return reply(200, { redeemed: want === `${body.user}\n${body.chat}\n${body.scope}` && grants.get(`${body.user}\n${body.chat}`) === body.scope });
+        }
         case 'revoke':
           return reply(200, { revoked: grants.delete(`${body.user}\n${body.chat}`) });
         default:

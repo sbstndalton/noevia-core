@@ -23,7 +23,7 @@
 // end as 'unavailable' (the tool is not run).
 const { safeId } = require('./chat-grant-context.cjs');
 
-const OPS = new Set(['open', 'wait', 'cancel', 'granted', 'revoke']);
+const OPS = new Set(['open', 'wait', 'cancel', 'granted', 'redeem', 'revoke']);
 // The front times a question out itself; Node's own deadline is only a backstop past that.
 const WAIT_SLACK_MS = 30000;
 // The front's grant lifetime (approval_registry.rs GRANT_TTL): no grant outlives it.
@@ -177,9 +177,11 @@ function createApprovalRegistry({ approvals, timeoutMs = 5 * 60 * 1000, log = ()
     return !!entry;
   }
 
-  /** approvals.cjs chatWideApproved, asked of the front. A check without a user, a chat id, a scope
-   *  or a binding never matches, and neither does one the front cannot answer, one whose revoke the
-   *  front has not yet confirmed, or one a revoke started while it was asked. */
+  /** approvals.cjs chatWideApproved, asked of the front: false, or (truthy) the front's single-use
+   *  ticket for this grant. A ticket authorises nothing by itself: the write is dispatched only after
+   *  redeemChatGrant. A check without a user, a chat id, a scope or a binding never matches, and
+   *  neither does one the front cannot answer, one whose revoke the front has not yet confirmed, or
+   *  one a revoke Node started while it was asked. */
   async function chatWideApproved(userId, chatId, scope, binding) {
     if (!text(userId) || !safeId(chatId) || !text(scope) || !binding) return false;
     const key = revokeKey(userId, chatId);
@@ -187,10 +189,33 @@ function createApprovalRegistry({ approvals, timeoutMs = 5 * 60 * 1000, log = ()
     const epoch = epochOf(key);
     try {
       const { status, body } = await ask('granted', { user: userId, chat: chatId, scope, binding });
-      return status === 200 && body?.granted === true && epochOf(key) === epoch && !revokePending(userId, chatId);
+      if (status !== 200 || body?.granted !== true || !text(body.ticket)) return false;
+      if (epochOf(key) !== epoch || revokePending(userId, chatId)) return false;
+      return Object.freeze({ ticket: body.ticket, epoch });
     } catch (e) {
       log(`[tool-approvals] grant check failed: ${why(e)}`);
       return false;
+    }
+  }
+
+  /** Re-review 1ed3a14: uses the grant `grant` (chatWideApproved's answer) for one write, just
+   *  before it is dispatched. The front's registry lock is the one point where this and every
+   *  revocation of the chat (Node's, a move, a delete, a failed move, a restart) are ordered: the
+   *  redeem succeeds only if none came before it. The caller must dispatch at once, with no further
+   *  await. true | false | 'unavailable' (the front could not be asked: the tool is not run, and it
+   *  is not a decline). Node's own epoch and pending records still deny first, as defence in depth;
+   *  the front is the authority. */
+  async function redeemChatGrant(userId, chatId, scope, binding, grant) {
+    if (!text(userId) || !safeId(chatId) || !text(scope) || !binding || !text(grant?.ticket)) return false;
+    const key = revokeKey(userId, chatId);
+    if (revokePending(userId, chatId) || epochOf(key) !== grant.epoch) return false;
+    try {
+      const { status, body } = await ask('redeem', { user: userId, chat: chatId, scope, binding, ticket: grant.ticket });
+      if (status !== 200 || typeof body?.redeemed !== 'boolean') { log(`[tool-approvals] redeem refused: ${status}`); return 'unavailable'; }
+      return body.redeemed === true && epochOf(key) === grant.epoch && !revokePending(userId, chatId);
+    } catch (e) {
+      log(`[tool-approvals] redeem failed: ${why(e)}`);
+      return 'unavailable';
     }
   }
 
@@ -214,7 +239,7 @@ function createApprovalRegistry({ approvals, timeoutMs = 5 * 60 * 1000, log = ()
     return false;
   }
 
-  return { openApproval, openRouteChoice, awaitApproval, awaitRouteChoice, chatWideApproved, revokeChatGrant, revokePending };
+  return { openApproval, openRouteChoice, awaitApproval, awaitRouteChoice, chatWideApproved, redeemChatGrant, revokeChatGrant, revokePending };
 }
 
 module.exports = { createApprovalRegistry, OPS, WAIT_SLACK_MS, GRANT_TTL_MS, REVOKE_RETRY };
