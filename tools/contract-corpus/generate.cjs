@@ -172,10 +172,11 @@ async function main() {
 
     // Signed out, and signed in.
     // GET /api/health, /api/workspace and /api/auto-roles are the Rust front's (sbstndalton/noevia#2190, #2191 close-out):
-    // Node refuses them, and their exchanges stay in the noevia-rs corpus recorded at its core.ref. A Node-owned
-    // authenticated read stands in for the signed-out and signed-in probes.
-    await step(anon, 'GET', '/api/chats/search');
-    await step(admin, 'GET', '/api/chats/search', undefined, [200]);
+    // Node refuses them, and their exchanges stay in the noevia-rs corpus recorded at its core.ref. So is the chat
+    // search (#1450, rust-chat-search.cjs), which stood in next: a Node-owned route behind the same gate (the
+    // framing suggestion, whose GET is its signed-in 405) is the signed-out and signed-in probe now.
+    await step(anon, 'GET', '/api/chat-framing/suggest');
+    await step(admin, 'GET', '/api/chat-framing/suggest', undefined, [405]);
     // The feature settings are the Rust front's (sbstndalton/noevia-rs#338): Node refuses them.
     const featureRead = await step(admin, 'GET', '/api/features', undefined, [503]);
     if (featureRead.json?.code !== 'RUST_FEATURES_OWNED') throw new Error('Expected the Rust feature ownership refusal.');
@@ -194,7 +195,7 @@ async function main() {
     // The recorder numbers an id once it has seen it as a value (a body or query field named like an id). The project
     // list used to show it here; that read is the Rust front's, so a Node-owned read that names it does, and its
     // later paths record as <id:N> rather than as the run's literal id (the double recording must be byte-equal).
-    await step(admin, 'GET', `/api/chats/search?projectId=${encodeURIComponent(projectId)}`, undefined, [200]);
+    await step(admin, 'GET', `/api/chat-framing/suggest?projectId=${encodeURIComponent(projectId)}`, undefined, [405]);
     // A project's config is the Rust front's too (#2191 round 9): its exchange stays in the noevia-rs corpus.
     const configRefused = await step(admin, 'POST', `/api/projects/${encodeURIComponent(projectId)}/config`, { instructions: 'Answer very briefly.' }, [503]);
     if (configRefused.json?.code !== 'RUST_PROJECT_CONFIG_OWNED') throw new Error('Expected the Rust project config ownership refusal.');
@@ -210,7 +211,7 @@ async function main() {
     }
 
     // A second account (seeded above): the tenant boundary is part of the contract.
-    await step(member, 'GET', '/api/chats/search');
+    await step(member, 'GET', '/api/chat-framing/suggest');
     if (chatId) await step(member, 'GET', `/api/chats/${encodeURIComponent(chatId)}/history`);
     // Address GETs are refused before Node's auth: the Rust front owns this read for every role.
     const addressRead = await step(member, 'GET', '/api/admin/web-address', undefined, [503]);

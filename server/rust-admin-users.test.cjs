@@ -135,7 +135,7 @@ test('through the router: the delete is refused signed out and signed in, and de
     const r = await request(`/api/admin/users/${member.id}`, { method: 'DELETE', headers, body: { username: 'delete-member' } });
     assert.deepEqual([r.status, r.json], [503, ROUTE_REFUSAL]);
   }
-  assert.equal((await request('/api/chats/search', { headers: { cookie: member.cookie } })).status, 200, 'the account is still there');
+  assert.equal((await request('/api/chat-framing/suggest', { headers: { cookie: member.cookie } })).status, 405, 'the account is still there (signed in; the route answers)');
   // The other admin routes this mount answers are unchanged: a member is refused, an administrator\'s unknown path is 404.
   assert.equal((await request('/api/admin/nothing', { headers: as(member) })).status, 403);
   assert.equal((await request('/api/admin/nothing', { headers: as(admin) })).status, 404);

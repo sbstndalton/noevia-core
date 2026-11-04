@@ -59,6 +59,14 @@ test('a held lease holds chat, tune, calibration and every other hold back, unti
   await assert.rejects(manager.enterInferenceWithin(10), (e) => e.status === 503 && e.retryable === true);
   assert.equal(manager.maintenanceHeld(), true);
   assert.equal(manager.tuningActive(), true, 'tune and calibration read this');
+  assert.equal(manager.inferenceBusy(), true, 'the Rust lease is visible to optional inference');
+  let scanned = false;
+  const folders = require('./model-folder-sync.cjs').createFolderSync({
+    busy: () => manager.tuningActive(), listUnregistered: async () => { scanned = true; return ['synthetic']; },
+    register: async () => assert.fail('a held Rust lease must prevent registration'), reloadPresets: async () => assert.fail('a held Rust lease must prevent reload'),
+  });
+  assert.equal((await folders.run()).deferred, true, 'folderSync sees the Rust lease');
+  assert.equal(scanned, false);
   assert.throws(() => manager.holdMaintenance('calibration'), (e) => e.status === 409, 'a tune or calibration start is refused');
   assert.equal((await ask('POST')).status, 409, 'a second reload is refused');
   // A chat that waits within its allowance gets in as soon as the lease ends.
@@ -152,4 +160,38 @@ test('other paths are not this route\'s', async (t) => {
   const manager = realManager();
   const { ask } = await serve(t, { hold: () => manager.holdMaintenance() });
   assert.equal((await ask('POST', '/internal/model-maintenance/leases')).status, 418);
+});
+
+// #2286 group E precondition: the configured-gate path observes a foreign Rust hold too,
+// rather than relying only on Node's in-process maintenance counter.
+test('a foreign gate hold is visible to real-manager tuningActive, inferenceBusy and folderSync', {timeout:8000}, async t => {
+  let held=false; const paths=[];
+  const gate=http.createServer((req,res)=>{
+    paths.push(req.method+' '+req.url);
+    let status=200,body;
+    if(req.method==='GET'&&req.url==='/gate/v1/status') body={maintenance:{held}};
+    else if(req.method==='POST'&&req.url==='/gate/v1/maintenance') {held=true;status=201;body={hold:'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',idle_ttl_ms:60000};}
+    else if(req.method==='DELETE'&&req.url==='/gate/v1/maintenance/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa') {held=false;status=204;}
+    else {status=500;body={error:'unexpected synthetic gate request'};}
+    res.writeHead(status,{'content-type':'application/json'});res.end(body===undefined?'':JSON.stringify(body));
+  });
+  await new Promise(resolve=>gate.listen(0,'127.0.0.1',resolve));
+  t.after(()=>new Promise(resolve=>{gate.closeAllConnections();gate.close(resolve);}));
+  const base='http://127.0.0.1:'+gate.address().port;
+  assert.equal((await fetch(base+'/gate/v1/maintenance',{method:'POST'})).status,201);
+  const manager=createLlamaCppManager({baseUrl:base+'/v1',gateAdminToken:'synthetic-admin',
+    fetchStream:async()=>assert.fail('precondition never runs inference'),fetchJson:async()=>({ok:true,status:200,body:{data:[]}})});
+  t.after(()=>manager.close());
+  const until=async(predicate,ms)=>{const end=Date.now()+ms;while(!predicate()&&Date.now()<end)await delay(10);assert.equal(predicate(),true);};
+  await until(()=>manager.tuningActive(),1000);
+  assert.equal(manager.inferenceBusy(),true);
+  let scanned=false;
+  const folders=require('./model-folder-sync.cjs').createFolderSync({busy:()=>manager.tuningActive(),
+    listUnregistered:async()=>{scanned=true;return ['synthetic'];},register:async()=>assert.fail('foreign Rust hold must prevent registration'),reloadPresets:async()=>assert.fail('foreign Rust hold must prevent reload')});
+  assert.equal((await folders.run()).deferred,true);
+  assert.equal(scanned,false);
+  assert.equal((await fetch(base+'/gate/v1/maintenance/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',{method:'DELETE'})).status,204);
+  await until(()=>!manager.tuningActive(),4500);
+  assert.equal(manager.inferenceBusy(),false);
+  assert.ok(paths.every(p=>p.startsWith('GET /gate/v1/status')||p.startsWith('POST /gate/v1/maintenance')||p.startsWith('DELETE /gate/v1/maintenance/')),'no model/load/inference path was called');
 });

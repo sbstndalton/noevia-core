@@ -235,9 +235,11 @@ for (const mode of Object.keys(EXPECT)) {
 
     // Unrelated routes keep working under every fault.
     // (GET /api/health, which this used, is the Rust front's since the #2190 close-out: Node refuses it.)
-    const health = await s.call('GET', '/api/chats/search');
+    // (GET /api/chats/search, which this used next, is the Rust front's too: the framing suggestion's GET is
+    // Node's signed-in 405.)
+    const health = await s.call('GET', '/api/chat-framing/suggest');
     ran++;
-    assert.equal(health.status, 200);
+    assert.equal(health.status, 405);
     const refusedHealth = await s.call('GET', '/api/health');
     ran++;
     assert.equal(refusedHealth.status, 503);

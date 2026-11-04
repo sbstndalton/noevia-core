@@ -8,17 +8,15 @@ const assert = require('node:assert/strict');
 const { Readable } = require('node:stream');
 const { createDiaryRoutes } = require('./diary.cjs');
 
-function fixture({ dir = '/nowhere', diaryOn = true, limited = false, admin = false, reply, log, storageLatch, readMonth } = {}) {
+function fixture({ dir = '/nowhere', diaryOn = true, admin = false, reply, log, storageLatch, readMonth } = {}) {
   const sent = [], fetched = [], headers = [];
   const routes = createDiaryRoutes({
     json: (res, status, body, extra) => { sent.push({ status, body, ...(extra ? { headers: extra } : {}) }); },
     readBody: async (req) => { let s = ''; for await (const c of req) s += c; return s; },
-    readJson: require('../http.cjs').readJson,
     fetchJson: async (url, init) => { fetched.push({ url, init }); return reply ? reply(url, init) : { ok: true, status: 200, body: { ok: true } }; },
     DIARY_BASE: 'http://diary:8010',
     authService: { diaryEnabled: () => diaryOn, getStorage: () => ({ kind: 'nextcloud', baseUrl: 'https://cloud.example/dav', username: 'ada', secret: 'synthetic-pw' }) },
     currentWorkspace: () => ({ userId: 'u1', dir }),
-    rateLimited: () => limited,
     storageLatch,
     diary: {
       diaryHeaders: (method, url, opts) => ({ 'X-Cowork-User-ID': 'u1', ...(opts?.storageRetry ? { 'X-Cowork-Storage-Retry': '1' } : {}) }),
@@ -60,7 +58,7 @@ test('every /api/diary route this mount keeps is gated on the add-on and guards 
   assert.deepEqual(f.fetched, []);
 });
 
-test('the history read, the trash proxy and the local exchange keep their shapes and limits', async () => {
+test('the history read, the trash proxy and the file listing keep their shapes and limits', async () => {
   const f = fixture({ reply: (url) => (url.includes('workspace-trash') ? { ok: false, status: 502, body: null } : { ok: true, status: 200, body: { echo: url } }) });
   await f.call('diary', 'GET', '/api/diary/history', undefined, { search: '?month=2026-08' });
   assert.deepEqual(f.sent.pop(), { status: 200, body: { todayLog: '2026-08', standing: '' } });
@@ -69,13 +67,7 @@ test('the history read, the trash proxy and the local exchange keep their shapes
   assert.equal(f.fetched.at(-1).url, 'http://diary:8010/api/workspace-trash?after=x');
   await f.call('diary', 'GET', '/api/diary/files', undefined, { search: '?path=Notes' });
   assert.deepEqual(f.sent.pop(), { status: 200, body: { echo: 'http://diary:8010/api/files?path=Notes' } });
-  await f.call('diary', 'POST', '/api/diary/local-exchange', { message: 'hi' });
-  assert.equal(f.sent.pop().status, 200);
   assert.equal(f.fetched.at(-1).init.headers['X-Cowork-User-ID'], 'u1', 'the tenant headers ride on every sidecar call');
-  const busy = fixture({ limited: true });
-  await busy.call('diary', 'POST', '/api/diary/local-exchange', { message: 'hi' });
-  assert.deepEqual(busy.sent.pop(), { status: 429, body: { error: 'Please wait before sending another message' } });
-  assert.equal(busy.fetched.length, 0);
 });
 
 test('operator import folders are admin-only and the entry edit validates before forwarding', async () => {
@@ -103,11 +95,13 @@ test('operator import folders are admin-only and the entry edit validates before
 });
 
 
-test('a malformed local exchange fails before side effects', async () => {
+test('the local exchange is not this mount\'s: the Rust front relays it (rust-diary-local-exchange.cjs)', async () => {
   const f = fixture();
-  await assert.rejects(f.call('diary', 'POST', '/api/diary/local-exchange', '{broken'),
-    { status: 400, message: 'invalid JSON' });
+  for (const method of ['GET', 'POST', 'PUT']) {
+    assert.equal(await f.call('diary', method, '/api/diary/local-exchange', method === 'GET' ? undefined : { message: 'hi' }), false, method);
+  }
   assert.deepEqual(f.fetched, []);
+  assert.deepEqual(f.sent, []);
 });
 
 test('entry edits forward base_hash and relay a 409 conflict body unchanged', async () => {
@@ -178,9 +172,6 @@ test('#1168: X-Cowork-Storage-Retry: 1 from the browser reaches the sidecar only
   }
   await f.call('diary', 'POST', '/api/diary/file', { path: 'a.md' }, { reqHeaders: { 'x-cowork-storage-retry': '1' } });
   assert.equal(f.fetched.pop().init.headers['X-Cowork-Storage-Retry'], '1');
-  // Not on the chat exchange: a retry press is a file-list action.
-  await f.call('diary', 'POST', '/api/diary/local-exchange', { message: 'hi' }, { reqHeaders: { 'x-cowork-storage-retry': '1' } });
-  assert.equal('X-Cowork-Storage-Retry' in f.fetched.pop().init.headers, false);
 });
 
 // The sidecar's storage-status tells whether an account is kept in the app ('managed') or on the storage server ('legacy').
@@ -226,7 +217,7 @@ test('#1607: when the sidecar cannot say which kind of account it is, the hold s
 // network or abort failure is "unavailable": a redirect (fetchJson uses redirect:'error') or a failure while
 // building the tenant headers is a bug and stays a 500, and is logged by class.
 const refused = (code = 'ECONNREFUSED') => Object.assign(new TypeError('fetch failed'), { cause: Object.assign(new Error(`connect ${code} 10.1.2.3:8010`), { code, address: '10.1.2.3' }) });
-const ROUTES = [['GET', '/api/diary/files', undefined], ['PUT', '/api/diary/file', '{}'], ['POST', '/api/diary/local-exchange', { message: 'hi' }], ['GET', '/api/diary/workspace-trash', undefined],
+const ROUTES = [['GET', '/api/diary/files', undefined], ['PUT', '/api/diary/file', '{}'], ['GET', '/api/diary/workspace-trash', undefined],
   ['GET', '/api/diary/history', undefined], ['GET', '/api/diary/external-sources', undefined],
   ['POST', '/api/diary/external-sources/import', { sourcePath: '/a', relPath: 'b' }],
   ['POST', '/api/diary/entries/edit', { xid: 'x', me: 'm' }]];

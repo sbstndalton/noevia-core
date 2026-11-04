@@ -53,7 +53,7 @@ test('the dead Node reload handler is gone and the supervisor marker is in index
   const routes = fs.readFileSync(path.join(__dirname, 'routes', 'models.cjs'), 'utf8');
   assert.equal(routes.includes('Requests are in progress. Try again when chats finish.'), false);
   assert.equal(routes.includes('Could not reload model profiles.'), false);
-  // The evidence read and the model-card import are gone from the routes; the recheck stays (it may load the model).
+  // Evidence read/import are gone; recheck keeps only its other-method405 (POST is another native group).
   assert.equal(routes.includes("p === '/api/models/evidence' && req.method === 'GET'"), false);
   assert.equal(routes.includes('importEvidence'), false);
   assert.ok(routes.includes("p === '/api/models/evidence/recheck'"));
