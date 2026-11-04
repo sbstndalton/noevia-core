@@ -1,7 +1,7 @@
 'use strict';
 // sbstndalton/noevia#2210: how this process's evidence producers reach the evidence store's one writer, the
 // Rust front (noevia-rs bins/noevia-server model_maint/evidence_live.rs `drain_inbox`). A record (a chat's
-// vision probe or MTP acceptance, a benchmark run, an auto-tune result, the recheck route) or an import request
+// vision probe or MTP acceptance, a benchmark run or an auto-tune result) or an import request
 // (a finished download) is one file in `evidence-inbox-<hash>/`, written whole under a `.tmp` name and renamed to
 // `.json`, so the front never reads half an entry. The front applies entries oldest first and deletes each; the
 // names sort by time. The inbox is bounded (a front that is not running does not let it grow without end) and an

@@ -55,10 +55,6 @@ function clientMessage(e, fallback) {
  * @param {(url:string, init:object, timeoutMs?:number) => Promise<{ok:boolean,status:number,body:any}>} deps.fetchJson
  * @param {object} deps.env                       process.env, read at call time
  * @param {object} deps.modelManager
- * @param {(id:string) => object|null} deps.getProvider
- * @param {(provider:object, extra?:object) => object} deps.providerHeaders
- * @param {string} deps.DEFAULT_PROVIDER_ID
- * @param {() => Function} deps.createVisionProbe
  * @param {() => object} deps.currentWorkspace
  * @param {object} deps.service   models.cjs
  */
@@ -68,7 +64,7 @@ function clientMessage(e, fallback) {
 const STATS_REFUSAL = Object.freeze({ error: 'Engine statistics are owned by the Rust front.' });
 const ROUTING_DEFAULT_REFUSAL = Object.freeze({ error: 'Routing default is owned by the Rust front.' });
 const AUTO_ROLES_REFUSAL = Object.freeze({ error: 'The auto-roles read is owned by the Rust front.', code: 'RUST_AUTO_ROLES_OWNED' });
-function createModelRoutes({ json, readBody, readJson, fetchJson, env, modelManager, getProvider, providerHeaders, DEFAULT_PROVIDER_ID, createVisionProbe, currentWorkspace, service, inferenceBudget = null, idleUnload = null, sweepGuardOptions = {}, rerankSettings = null }) {
+function createModelRoutes({ servedEmbeddingModels = (target) => require('../rag.cjs').servedModelsCached(target), json, readBody, readJson, fetchJson, env, modelManager, currentWorkspace, service, inferenceBudget = null, idleUnload = null, sweepGuardOptions = {}, decisionSettings = null, rerankSettings = null }) {
   const { modelScanCache, refreshModelScan, autoRoles, setAutoRoles, ensureRolesLoaded, servedCatalogue, modelsInstalled, deriveUserModelName, lastLoadedModel, clearLastLoadedModel, clearRoleReferences } = service;
   // #1461: the installed list is shared for a moment (service.modelsInstalled). A decision that must confirm
   // the engine's state right now (a delete that checks the model exists, a load that checks it is not missing)
@@ -498,22 +494,10 @@ function createModelRoutes({ json, readBody, readJson, fetchJson, env, modelMana
     // GET /api/models/evidence is the Rust front's (#2210, noevia-rs model_maint/evidence_live.rs;
     // rust-model-maintenance.cjs refuses it before authentication).
 
-    // Re-run the cheap image probe for one model and record the result. It may load the model.
+    // POST recheck is Rust's (#2286); Node keeps the other methods' role check and 405.
     if (p === '/api/models/evidence/recheck') {
       if(authn.user.role!=='admin')return json(res,403,{error:'Administrator required for shared model evidence'});
-      if(req.method!=='POST')return json(res,405,{error:'Method not allowed'});
-      if(!modelManager.recordEvidence)return json(res,404,{error:'Qualification evidence needs the native engine'});
-      const body=await readJson(req).catch(()=>null);
-      const model=typeof body?.model==='string'?body.model:'';
-      if(!model||model.length>200)return json(res,400,{error:'Choose a model'});
-      if(body.category!=='vision')return json(res,400,{error:'Only image input can be rechecked here; use Measure context for context capacity.'});
-      const provider=getProvider(DEFAULT_PROVIDER_ID);
-      const vision=await createVisionProbe()(provider.baseUrl,providerHeaders(provider),model);
-      if(!vision.supported&&!/projector|mmproj/i.test(vision.reason||''))return json(res,503,{error:vision.reason||'The engine could not run the image probe.'});
-      // The front files the record (#2210): wait, bounded, so the answer shows it.
-      const queued=await modelManager.recordEvidence(model,{category:'vision',result:vision.supported?'passed':'failed',value:null,suite:{name:'vision-probe',version:1},source:'recheck',limitations:vision.supported?['1×1 image accepted; not an accuracy test']:[String(vision.reason||'').slice(0,200)]});
-      if(queued)await modelManager.evidenceApplied?.(queued);
-      return json(res,200,(await modelManager.evidence(model)).body);
+      return json(res,405,{error:'Method not allowed'});
     }
 
     // POST /api/models/evidence/import is the Rust front's (#2210, noevia-rs model_maint/evidence_live.rs;
