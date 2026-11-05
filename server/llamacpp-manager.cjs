@@ -40,7 +40,7 @@ const AVAILABLE_STATES = new Set(['loaded', 'sleeping']);
 const isAvailable = model => AVAILABLE_STATES.has(model.status?.value);
 const alreadyRunning = result => result?.status === 400 && /already running/i.test(JSON.stringify(result?.body ?? ''));
 
-function createLlamaCppManager({ budgetWatchDir = null, baseUrl, apiKey, fetchJson, presetPath, downloadStatePath, fetchStream, autoconfig = {}, calibrationStatePath, calibrationOptions = {}, publicCalibrator = false, evidenceDir, autotuneStatePath, autotuneOptions = {}, presetWriter = null, inferenceBudget = null, reloadStatePath = null, reloadGuard: reloadGuardOption = null, presetBaselineClient = null, gate = null, gateAdminToken = null }) {
+function createLlamaCppManager({ budgetWatchDir = null, baseUrl, apiKey, fetchJson, presetPath, downloadStatePath, fetchStream, autoconfig = {}, calibrationStatePath, calibrationOptions = {}, publicCalibrator = false, evidenceDir, autotuneStatePath, autotuneOptions = {}, presetWriter = null, inferenceBudget = null, reloadStatePath = null, reloadGuard: reloadGuardOption = null, presetBaselineClient = null, gate = null, gateAdminToken = null, maintenanceAuthority = null }) {
   const base = String(baseUrl || '').replace(/\/+$/, '').replace(/\/v1$/, '');
   const url = new URL(base);
   if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password || url.search || url.hash) throw Error('Invalid llama.cpp router URL');
@@ -82,7 +82,10 @@ function createLlamaCppManager({ budgetWatchDir = null, baseUrl, apiKey, fetchJs
   const presets=store ? {...store,commit:(candidate,options)=>commitReconciled(store,candidate,options)} : null;
   // #2187: the inference gate is the maintenance authority whenever it is configured (and has the
   // hold API); this process's own gate is the fallback without one (inference-maintenance.cjs).
-  const maintenance=require('./inference-maintenance.cjs').createMaintenanceGate({remote:typeof gateClient.holdMaintenance==='function'&&gateClient.hasAdmin?.()===true?gateClient:null,observeMs:gate?0:3000});
+  // Row J: without one, the Rust front's lease authority (model-maintenance-lease.cjs createNativeLeaseClient).
+  const gateRemote=typeof gateClient.holdMaintenance==='function'&&gateClient.hasAdmin?.()===true?gateClient:null;
+  const maintenanceRemote=gateRemote&&maintenanceAuthority?require('./model-maintenance-lease.cjs').chainRemotes(gateRemote,maintenanceAuthority):(gateRemote||maintenanceAuthority||null);
+  const maintenance=require('./inference-maintenance.cjs').createMaintenanceGate({remote:maintenanceRemote,observeMs:gate?0:3000});
   holdHeaders=maintenance.holdHeaders;
   // #1012: what the router last read, so a reload can keep loaded models (preset-reload.cjs, #1071: always on).
   // With the front's store client the baseline is the front's (bridge mode, preset-reload.cjs
@@ -756,6 +759,8 @@ function createLlamaCppManager({ budgetWatchDir = null, baseUrl, apiKey, fetchJs
     // Throws a 409 when requests are in flight or the gate is already held; with the inference
     // gate as the authority (#2187) it returns a promise of the release instead (callers await it).
     holdMaintenance: reason => maintenance.hold(reason),
+    // Row J: the latch the Rust front's lease takes (model-maintenance-lease.cjs createLeaseRoutes).
+    holdMaintenanceLocal: reason => maintenance.holdLocal(reason),
     tuningActive: () => maintenance.held() || calibrator?.stateFacts().job?.status === 'running' || autotuner?.statusFacts().job?.status === 'running',
     presetFacts: model => presets?.get(model) ?? null,
     applyPreset,

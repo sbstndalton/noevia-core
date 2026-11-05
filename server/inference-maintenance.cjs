@@ -22,7 +22,7 @@
 //
 // hold() returns the release function, or (with a remote) a promise of it: callers await it.
 function createMaintenanceGate({ remote = null, log = (line) => console.log(line), setTimer = setInterval, clearTimer = clearInterval, now = () => Date.now(), reprobeMs = 5 * 60 * 1000, retakeWaitMs = 10000, observeMs = 0 } = {}) {
-  let active=0,maintenance=false,reason='',holdToken=null,shuttingDown=false;
+  let active=0,maintenance=false,reason='',holdToken=null,holdHeader=true,shuttingDown=false;
   // sbstndalton/noevia#2210: a hold another client took at the gate (the Rust front's reload, calibration or
   // tune) is not in this process's memory. With `observeMs`, the gate is asked its state on that interval
   // and held() reports it, so the folder sync, the optional chat work and the code machine wait for it.
@@ -44,7 +44,7 @@ function createMaintenanceGate({ remote = null, log = (line) => console.log(line
   const remoteBusy=e=>e?.status===409||e?.code==='engine_busy'||e?.code==='maintenance_held';
   // The release of a hold that is now this process's (the gate's token, when there is one).
   function holding(message, granted) {
-    maintenance=true;reason=message||'';holdToken=granted?.token||null;
+    maintenance=true;reason=message||'';holdToken=granted?.token||null;holdHeader=granted?.header!==false;
     // The hold at the gate (if any) is ours now, and an answer asked before this is about someone else's.
     foreignHeld=false;generation++;
     let released=false,timer=null,renewing=false;
@@ -105,6 +105,13 @@ function createMaintenanceGate({ remote = null, log = (line) => console.log(line
       // fromGate: refused by the inference gate (another client's hold, or its engine busy), not by this process.
       throw remoteBusy(e)?Object.assign(busy(),{fromGate:true}):e;
     });
+  }
+  // Row J: a hold of this process's own admission only (the latch a lease of the Rust front's authority
+  // takes: that lease is already the authority's, so it is not asked again). Same 409s as hold().
+  function holdLocal(message) {
+    if(maintenance)throw busy();
+    if(active)throw Object.assign(busy(),{chatActive:true});
+    return holding(message,null);
   }
   async function holdWhenIdle(message,{timeoutMs=300000,signal}={}) {
     if(!Number.isFinite(timeoutMs)||timeoutMs<0)throw Error('Invalid idle wait timeout.');
@@ -167,13 +174,14 @@ function createMaintenanceGate({ remote = null, log = (line) => console.log(line
     enter() {if(maintenance)throw Object.assign(Error(reason||'Model configuration is being applied. Try again shortly.'),{status:503});active++;let released=false;return ()=>{if(!released){released=true;active--;wake();}};},
     async exclusive(fn) {const release=await hold();try{return await fn();}finally{release();}},
     hold,
+    holdLocal,
     holdWhenIdle,
     // Read-only: whether a calibration, auto-tune model or preset write holds the gate (#872).
     held: () => maintenance||(foreignHeld&&!holdToken),
     // Read-only: inference requests in flight (#1785: the chat title skips a busy engine).
     active: () => active,
     // #2187: the header this process's requests to the engine carry while it holds the gate's hold.
-    holdHeaders: () => (holdToken ? { 'X-Noevia-Maintenance': holdToken } : {}),
+    holdHeaders: () => (holdToken && holdHeader ? { 'X-Noevia-Maintenance': holdToken } : {}),
     // #2187: whether holds go to the inference gate (false: none configured, or it has no hold API).
     delegated: () => !absent(),
     // #2187: at shutdown, gives the gate's hold back (bounded) so the next process can take it at once.
