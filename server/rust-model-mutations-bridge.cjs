@@ -51,7 +51,7 @@ function createModelMutationsBridge({ secret, json, readJson, manager, service, 
         });json(res,200,{rolesCleared});return true;
       }
       json(res,404,{error:'Not found'});
-    } catch(e){json(res,e?.status===503?503:503,{error:e?.status===503?e.message:'Model activity unavailable'});}
+    } catch(e){json(res,503,{error:e?.status===503?'Internal error':'Model activity unavailable'});}
     return true;
   };
 }
