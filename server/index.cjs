@@ -160,8 +160,11 @@ featureRuntime = require('./feature-runtime.cjs').createFeatureRuntime({
 });
 // One initial barrier, shared by real startup and the existing imported request API.
 // Ordinary enabled/flags/describe never initiate an RPC or bypass the live lease.
-let featureStartup=null;
-const readyFeatures=()=>featureStartup ||= featureRuntime.ready();
+let featureStartup=null, autoRolesProof=null;
+// The native auto-roles write pairing proof is remembered once established or definitively
+// refused; a busy or unreachable store is not, so the next request asks again.
+const autoRolesReady=()=>autoRolesProof ||= PROJECT_STORE.autoRolesReady().catch((err)=>{ if (err && err.code==='PROJECTS_BUSY') autoRolesProof=null; throw err; });
+const readyFeatures=()=>Promise.all([featureStartup ||= featureRuntime.ready(), autoRolesReady()]);
 
 const featureRoutes = require('./routes/features.cjs').createFeatureRoutes({ json });
 // Settings → Data: the signed-in user's conversations as a ZIP (routes/export.cjs).
@@ -430,10 +433,8 @@ require('./models-ini-writer.cjs').reportModelsIniWriter({ mode: process.env.MOD
 // default, the auto-router roles, the manager service call and the cached folder scan (models.cjs).
 const modelService = require('./models.cjs').createModelService({
   fetchJson, env: process.env, modelManager, currentWorkspace,
-  // Auto-roles are per workspace: a deleted model's role reference must be cleared out of
-  // every workspace's config, not just whichever one happened to make the delete request.
-  listWorkspaces: () => authService.listUsers().map((u) => workspaceStore.get(u.id)),
   roleOnMachine: (role) => !!chatMachines.target(role),
+  autoRolesWriter: (user, name) => PROJECT_STORE.clearAutoRoles(user, name),
 });
 const { autoRoles, ensureRolesLoaded, servedCatalogue, modelsInstalled, lastLoadedModel } = modelService;
 
@@ -939,12 +940,15 @@ const framingReasoner = require('./framing-reasoner.cjs').createFramingReasoner(
 });
 const reasoningTraces = { enabled: (dir) => require('./chat-framing.cjs').readPreferences(dir).keepReasoningTraces === true,
   append: (dir, entry) => require('./framing-reasoner.cjs').appendTrace(dir, entry) };
-// #760: about ten suggests a minute per user (one embed + three decisions each), on the LLM limiter.
-const FRAMING_RATE_LIMIT = 10;
-const chatFramingRoutes = require('./routes/chat-framing.cjs').createChatFramingRoutes({ json, readJson, framing: chatFraming, settings: framingSettings,
-  rateLimited: (userId) => llmRateLimiter.rateLimited(`chat-frame:${userId}`, FRAMING_RATE_LIMIT, LLM_RATE_WINDOW_MS),
+const chatFramingRoutes = require('./routes/chat-framing.cjs').createChatFramingRoutes({ json, readJson, settings: framingSettings });
+// Chat port S4: POST /api/chat-framing/suggest is the Rust front's (its 10-a-minute budget too); this is
+// the front's loopback call for what only this process has: the user's lists and the decision service.
+const chatFramingSuggestBridge = require('./rust-chat-framing-suggest.cjs').createSuggestBridge({
+  secret: FRONT_SECRET, json, readJson, framing: chatFraming,
+  asUser: (userId, fn) => diaryAsUser(userId, fn),
   // #810: only Chat-mode, unarchived projects are offered as a destination; every own chat still counts for links and tags.
-  workspace: () => { const projects = PROJECTS.filter((proj) => !diaryExtras.internalProject(proj)); return { projects: projects.filter(require('./project-modes.cjs').chatDestination).map((proj) => ({ id: proj.id, name: proj.name })), chats: [...Array.from(FREE_CHATS), ...projects.flatMap((proj) => proj.chats || [])] }; } });
+  workspace: () => { const projects = PROJECTS.filter((proj) => !diaryExtras.internalProject(proj)); return { projects: projects.filter(require('./project-modes.cjs').chatDestination).map((proj) => ({ id: proj.id, name: proj.name })), chats: [...Array.from(FREE_CHATS), ...projects.flatMap((proj) => proj.chats || [])] }; },
+});
 // #741: "Mirror chats to Diary", per user and off by default. One-way, debounced, through the Diary
 // files client above, as the chat's own user. Runs only with chatFraming on and the Diary add-on on.
 const vaultMirrorLib = require('./chat-vault-mirror.cjs');
@@ -992,6 +996,8 @@ const changeJournal = require('./chat-change-journal.cjs').createChangeJournalRe
   onChange: require('./chat-change-journal.cjs').scheduleMirrorAndBrain({ chatVaultMirror, chatBrains }),
   onRescan: (userId) => chatVaultMirror.schedule(userId),
   stamp: (userId) => require('./chat-change-journal.cjs').fileStamp(DATA_DIR, userId),
+  // Chat port S3: the users the Rust front saw, so one who only uses its routes is still read.
+  activity: require('./chat-activity.cjs').createActivitySource({ dataDir: DATA_DIR }),
 });
 afterNativeReady(() => changeJournal.start());
 // #2190: the Rust front owns the mirror preferences; a save that turns the mirror on nudges it here.
@@ -1156,12 +1162,9 @@ const modelRoutes = require('./routes/models.cjs').createModelRoutes({
 // The connector credentials and the connector endpoint are the Rust front's (#2206, rust-diary-routes.cjs);
 // the table is still created here, at boot, in the shape a rollback reads.
 require('./diary-connectors.cjs').ensureTable(authService.db);
-// The Diary routes that stay: the local exchange (the model throttle and the inference gate), the
-// files, the trash, the history, the operator import folders and the entry edit (routes/diary.cjs).
-const diaryRoutes = require('./routes/diary.cjs').createDiaryRoutes({
-  json, readBody, fetchJson, DIARY_BASE, authService, currentWorkspace, diary,
-  storageLatch,
-});
+// No Diary route stays in this process: the Diary proxies (files, file, the trash, the history, the operator
+// import folders and the entry edit) and the backup loop are the front's (rust-diary.cjs), as is the local
+// exchange (rust-diary-local-exchange.cjs), which takes this process's throttle and gate by lease.
 // #2287: the Rust front owns settings policy; the live tune script retains the state-file writer.
 const autotuneSettingsBridge = require('./rust-autotune-settings-bridge.cjs').createAutotuneSettingsBridge({
   secret: FRONT_SECRET, json, readJson, tuner: () => modelManager.autotune,
@@ -1300,9 +1303,15 @@ function publicHeaders(res) {
   res.setHeader('Permissions-Policy', 'camera=(), microphone=(), geolocation=(), payment=(), usb=(), serial=(), bluetooth=(), hid=(), midi=(), magnetometer=(), gyroscope=(), accelerometer=()');
 }
 
+const autoRolesWriteBridge = require('./rust-auto-roles-write.cjs').createBridge({
+  secret: FRONT_SECRET, json, readJson, service: modelService,
+  asUser: diaryAsUser, user: id => authService.db.prepare('SELECT role FROM users WHERE id=?').get(id),
+});
 async function handleRequestInner(req, res) {
   // The ownership refusals below answer before handleRequestScoped; they carry the same headers.
   publicHeaders(res);
+  if (require('./rust-auto-roles-write.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
+  if (await autoRolesWriteBridge(req, res)) return;
   if (require('./rust-tool-approvals.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   if (require('./rust-idle-unload-read.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   if (await idleUnloadFacts(req, res)) return;
@@ -1333,6 +1342,9 @@ async function handleRequestInner(req, res) {
   // GET /api/integrations/storage is the Rust front's (#1071): refused before authentication.
   if (require('./features.cjs').refuseRustStorageRead(req, res, { parseRequestUrl, badRequestUrl, json })) return;
   if (require('./routes/chat-framing.cjs').refuseOwnedPreferences(req, res, { parseRequestUrl, json })) return;
+  // And the framing suggestion's POST (chat port S4), with the front's loopback call for the lists and the decision.
+  if (require('./rust-chat-framing-suggest.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
+  if (await chatFramingSuggestBridge(req, res)) return;
   if (require('./routes/features.cjs').refuseOwnedFeatures(req, res, { parseRequestUrl, json })) return;
   // The Diary routes that are only a proxy and a policy are the Rust front's (#2185).
   if (require('./rust-diary.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
@@ -1498,8 +1510,6 @@ async function handleRequestScoped(req, res) {
 
     if (await modelRoutes(req, res, { path: p, authn, url })) return;
 
-    if (await diaryRoutes.diary(req, res, { path: p, authn, url })) return;
-
     if (await chatRoutes(req, res, { path: p, authn })) return;
 
     // Static files with SPA fallback (spa-routes.cjs).
@@ -1646,29 +1656,7 @@ if (require.main === module) {
     internalServer.headersTimeout = 15000;
   }
 
-  const readStorage = (userId) => authService.getStorage(userId, true);
-  require('./diary-backup-worker.cjs').startDiaryBackupWorker({
-    users: () => authService.listUsers(),
-    enabled: id => authService.diaryEnabled(id),
-    // #1429: an account whose saved login was refused (or is throttled) gets no automatic backup
-    // until its credentials change or the backoff passes; it is not counted as a failure either.
-    suspended: user => storageLatch.suspendedFor(user.id, readStorage),
-    // Default 30 s so an idle tenant does not build a new ManagedCorpusBackend every
-    // 3 s; DIARY_BACKUP_WORKER_INTERVAL_MS keeps the old cadence available for tests.
-    interval: Number(process.env.DIARY_BACKUP_WORKER_INTERVAL_MS) > 0 ? Number(process.env.DIARY_BACKUP_WORKER_INTERVAL_MS) : 30000,
-    run: user => requestScope.run({ workspace: workspaceStore.get(user.id), authn: { user, legacy: false } }, async () => {
-      // The backup copies to the remote destination on every run, so it is the one call that
-      // always carries the storage secret (#292); every other call sends only its ref.
-      const target = `${DIARY_BASE}/api/storage-backup`;
-      const r = await fetchJson(target, { method: 'POST', headers: diaryHeaders('POST', target, { secret: true }) }, 300000);
-      // #1429: the Diary tags a refused login (424 storageLoginRejected) and a throttle (503 storageThrottled);
-      // either one holds this account's automatic calls (storage-latch.cjs) until the credentials change.
-      storageLatch.noteDiaryReply(user.id, readStorage, r.body, r.ok);
-      if (!r.ok) throw new Error(`storage-backup failed: ${r.status}`);
-      return r.body;
-    }),
-    onError: userId => console.warn(`[diary-backup] ${userId ? `backup failed for ${userId}` : 'backup tick failed'}, backing off`),
-  });
+  // Diary backup is owned by the paired front build (rust-diary.cjs marker).
   server.requestTimeout = 20 * 60 * 1000;
   // A stray rejected promise in one request or task must not take the whole web process (and
   // every other tenant's session) down with it. Logged loudly with its stack, never silent.
