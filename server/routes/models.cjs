@@ -786,7 +786,7 @@ function createModelRoutes({ servedEmbeddingModels = (target) => require('../rag
   const modelRoutes = async function modelRoutes(req, res, ctx) {
     const run = async () => (await handle(req, res, ctx)) !== PASS;
     const protectedAction = req.method === 'POST' && ['/api/models/prune-missing', '/api/models/delete', '/api/models/load'].includes(ctx.path) || ctx.path.startsWith('/api/model-manager/') && !['GET', 'HEAD', 'OPTIONS'].includes(req.method);
-    return protectedAction ? require('../rerank-settings.cjs').withSettings(run) : run();
+    return protectedAction && ctx.authn?.user?.role === 'admin' ? require('../rerank-settings.cjs').withSettings(run) : run();
   };
   // Settles once the startup check for a still-running sweep is done (tests await it).
   modelRoutes.sweepAdopted = sweepAdopted;

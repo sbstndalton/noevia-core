@@ -56,3 +56,18 @@ test('an identical native save still invalidates consumers through its mutation 
  const client=createClient({env,fetchImpl:async()=>new Response(JSON.stringify({...snapshot('synthetic'),revision:'0'.repeat(32)+':'+revision})),onChange:()=>changes++});
  await client.run(()=>{});revision++;await client.run(()=>{});assert.equal(changes,2);
 });
+test('existing model action permissions precede native settings availability',async()=>{
+ const prior=current();let reads=0;
+ install(createClient({env,fetchImpl:async()=>{reads++;throw Error('synthetic outage');}}));
+ try {
+  const {createModelRoutes}=require('./routes/models.cjs');let response;
+  const route=createModelRoutes({json:(_r,status,body)=>{response={status,body};},env:{},modelManager:{},service:{modelScanCache:{clear(){}}}});
+  const p='/api/model-manager/sections/synthetic';
+  const request={method:'PUT',url:p,headers:{}};
+  const context=role=>({path:p,url:new URL(p,'http://synthetic.invalid'),authn:{user:{id:'synthetic',role}}});
+  await route(request,{},context('member'));
+  assert.equal(response.status,403);assert.equal(reads,0);
+  await assert.rejects(route(request,{},context('admin')),e=>e.status===503);
+  assert.equal(reads,1);
+ }finally{install(prior);}
+});
