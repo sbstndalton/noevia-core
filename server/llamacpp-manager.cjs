@@ -25,7 +25,7 @@ function keepAlongside(env = process.env) {
   // reranker assigned to another machine is not on this engine, so it is not kept beside the chat model.
   const rerankSettings = require('./rerank-settings.cjs').current();
   let renv = env;
-  if (rerankSettings && env === process.env) { try { renv = rerankSettings.effectiveEnv() || env; } catch { renv = env; } }
+  if (rerankSettings && env === process.env) renv = rerankSettings.effectiveEnv();
   const target = require('./rerank-target.cjs').rerankTarget(renv);
   const r = target.enabled && target.shared ? target.model || '' : '';
   return [...String(e || '').split('\u0000').filter((m) => m && m !== 'default'), ...(r ? [r] : [])];

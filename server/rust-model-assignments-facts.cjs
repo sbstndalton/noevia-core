@@ -15,7 +15,7 @@ function createModelAssignmentsFacts({
   embeddingService = () => require('./embedding-service.cjs').current()?.status(),
   workerAssigned = (kind) => require('./document-workers.cjs').assigned(kind),
 }) {
-  return async function handle(req, res) {
+  async function handle(req, res) {
     if (req.url !== PATH) return false;
     if (req.method !== 'POST' || !trustedFront(req, secret) || Object.hasOwn(req.headers, 'x-forwarded-for') || Object.hasOwn(req.headers, 'x-noevia-client-ip')) {
       json(res, 404, { error: 'Not found' });
@@ -38,8 +38,9 @@ function createModelAssignmentsFacts({
         try { served = await servedEmbeddingModels({ baseUrl: embedding?.active?.baseUrl || null }); } catch { /* unknown */ }
       }
       const service = embeddingService();
-      const renv = rerankSettings?.effectiveEnv?.() || env;
-      const choices = rerankSettings?.get(Array.isArray(installed) ? installed : null);
+      const reranker = rerankSettings?.read ? await rerankSettings.read(Array.isArray(installed) ? installed : null) : null;
+      const renv = reranker ? reranker.env : rerankSettings?.effectiveEnv?.() || env;
+      const choices = reranker ? reranker.view : await rerankSettings?.get(Array.isArray(installed) ? installed : null);
       const decision = decisionSettings?.describe() || describeDecision(env);
       const facts = {
         installed: Array.isArray(installed) ? installed.map(m => ({
@@ -75,5 +76,6 @@ function createModelAssignmentsFacts({
     }
     return true;
   };
+  return handle;
 }
 module.exports = { createModelAssignmentsFacts, PATH };

@@ -156,7 +156,8 @@ function createInferenceMachineRoutes({ json, readJson, machines, health, effect
   }
 
   return async function inferenceMachineRoutes(req, res, ctx) {
-    return (await handle(req, res, ctx)) !== PASS;
+    const run = async () => (await handle(req, res, ctx)) !== PASS;
+    return ctx.path === PATH || ctx.path.startsWith(PATH + '/') ? require('../rerank-settings.cjs').withSettings(run) : run();
   };
 }
 

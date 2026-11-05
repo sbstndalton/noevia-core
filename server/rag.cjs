@@ -81,7 +81,7 @@ function init({ dataDir, embedModel, inferenceUrl, headersFn, userDataDirFn, use
   inferenceBase = inferenceUrl;
   if (headersFn) inferenceHeaders = headersFn;
   if (inferenceGuard) enterInference = inferenceGuard;
-  initRerank();
+  if (!require('./rerank-settings.cjs').current()?.run) initRerank();
   // A new init() (endpoint/model swap, or a test isolating scenarios) invalidates whatever the
   // last readiness probe found — never serve a cached verdict from before the reconfiguration.
   retrievalProbeCache = null;
@@ -118,13 +118,13 @@ let rerank = null; // { decisions, pool, keep, deadlineMs }
 let rerankEnv = () => process.env;
 function configureRerank(envFn) {
   rerankEnv = typeof envFn === 'function' ? envFn : () => process.env;
-  initRerank();
+  if (!require('./rerank-settings.cjs').current()?.run) initRerank();
 }
-function reloadRerank() { initRerank(); }
+function reloadRerank() { if (require('./rerank-settings.cjs').current()?.run) { rerank=null; return; } initRerank(); }
 function initRerank() {
   // #697: never on the shared inference engine unless the operator allows it (rerank-target.cjs).
   let env;
-  try { env = rerankEnv() || process.env; } catch { env = process.env; }
+  env = rerankEnv();
   const target = require('./rerank-target.cjs').rerankTarget(env);
   if (target.reason) console.warn('[rag] rerank off:', target.reason);
   if (!target.enabled) { rerank = null; return; }
@@ -885,6 +885,7 @@ async function searchProjectNow(projectId, query, userId) {
     if (!qvec || qvec.length !== index.slot.dim) return [];
     return await textHits(index, serializeF32(qvec), projectId, query, userId);
   } catch (err) {
+    if (err?.code === 'RERANKER_SETTINGS_UNAVAILABLE') throw err;
     console.warn(`[rag] search failed for ${projectId}: ${err.message}`);
     return [];
   } finally {
@@ -895,6 +896,10 @@ async function searchProjectNow(projectId, query, userId) {
 // The text side of a search: cosine pool, version filter, then the optional reranker. Unchanged by #1726
 // apart from the kind filter, which matches every row of an index that holds no image rows.
 async function textHits(index, qbuf, projectId, query, userId) {
+  const settings=require('./rerank-settings.cjs');
+  return settings.withSettings(() => { initRerank(); return textHitsConfigured(index,qbuf,projectId,query,userId,rerank); });
+}
+async function textHitsConfigured(index,qbuf,projectId,query,userId,rerank) {
   const rows = index.db
     .prepare(
       `SELECT c.file, c.chunk_no, c.body, c.version, 1.0 - vec_distance_cosine(v.embedding, ?) AS score
@@ -949,6 +954,7 @@ async function searchProjectWithImagesNow(projectId, query, userId) {
       .filter(Boolean);
     return { text, images, indexed };
   } catch (err) {
+    if (err?.code === 'RERANKER_SETTINGS_UNAVAILABLE') throw err;
     console.warn(`[rag] search failed for ${projectId}: ${err.message}`);
     return empty;
   } finally {

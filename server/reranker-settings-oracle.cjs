@@ -1,6 +1,6 @@
 "use strict";
 // Synthetic reference corpus for the native reranker settings owner.
-const { createRerankSettings, KEY } = require('./rerank-settings.cjs');
+const { createRerankSettings, KEY } = require('./fixtures/rerank-settings-reference.cjs');
 function oracle() {
   const installed = [{name:'synthetic-reranker',labels:['reranking']},{name:'missing-reranker',missingFile:true}];
   const cases = [

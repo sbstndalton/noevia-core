@@ -56,7 +56,7 @@ test('SIDECAR_MODEL_DELETE_REASON is distinct wording from the system-model dele
 
 
 test('#2298 current rerank settings add protection without removing deployment or embedding seeds', () => {
-  const settings = require('./rerank-settings.cjs');
+  const settings = require('./fixtures/rerank-settings-reference.cjs');
   const prior = settings.current();
   const env = { EMBEDDING_MODEL: 'embed-seed', NOEVIA_FEATURE_RAG_RERANK: 'true', RERANK_BACKEND: 'llamacpp', RERANK_BASE_URL: 'http://synthetic-rerank', RERANK_MODEL: 'rerank-seed-a' };
   const store = new Map([[settings.KEY, JSON.stringify({ enabled: true, choice: 'llamacpp:rerank-current-b' })]]);
@@ -75,7 +75,7 @@ test('#2298 current rerank settings add protection without removing deployment o
 
 
 test('#2298 current enabled flag follows runtime whitespace normalization without changing seed rules', () => {
-  const settings = require('./rerank-settings.cjs');
+  const settings = require('./fixtures/rerank-settings-reference.cjs');
   const { rerankTarget } = require('./rerank-target.cjs');
   const prior = settings.current();
   const seed = { NOEVIA_FEATURE_RAG_RERANK: ' true ', RERANK_MODEL: 'rerank-seed-a' };
