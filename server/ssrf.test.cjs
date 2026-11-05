@@ -374,7 +374,14 @@ test('the operator-approved origin rule for a provider is the Rust front\'s (noe
   } finally { delete process.env.MEMBER_OUTBOUND_ORIGINS; }
 });
 
-test('member cannot read operator import folders', async () => {
-  const response = await request('/api/diary/external-sources', {headers:memberHeaders()});
-  assert.equal(response.status, 403);
+test('operator import folders are the Rust front\'s: Node refuses a member and an admin alike', async () => {
+  // The admin-only check (403 for a member) moved with the Diary proxy port and is checked against the
+  // Core handler's oracle in noevia-rs crates/server-diary/tests/proxy_parity.rs:25.
+  for (const headers of [memberHeaders(), adminHeaders]) {
+    for (const [method, url] of [['GET', '/api/diary/external-sources'], ['POST', '/api/diary/external-sources/import']]) {
+      const response = await request(url, {method, headers, body: method === 'POST' ? JSON.stringify({sourcePath:'/synthetic', relPath:'a.md'}) : ''});
+      assert.equal(response.status, 503, `${method} ${url} as ${headers === adminHeaders ? 'admin' : 'member'}`);
+      assert.equal(JSON.parse(response.text).code, 'RUST_DIARY_OWNED');
+    }
+  }
 });

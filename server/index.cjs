@@ -1159,12 +1159,9 @@ const modelRoutes = require('./routes/models.cjs').createModelRoutes({
 // The connector credentials and the connector endpoint are the Rust front's (#2206, rust-diary-routes.cjs);
 // the table is still created here, at boot, in the shape a rollback reads.
 require('./diary-connectors.cjs').ensureTable(authService.db);
-// The Diary routes that stay: the local exchange (the model throttle and the inference gate), the
-// files, the trash, the history, the operator import folders and the entry edit (routes/diary.cjs).
-const diaryRoutes = require('./routes/diary.cjs').createDiaryRoutes({
-  json, readBody, fetchJson, DIARY_BASE, authService, currentWorkspace, diary,
-  storageLatch,
-});
+// No Diary route stays in this process: the Diary proxies (files, file, the trash, the history, the operator
+// import folders and the entry edit) and the backup loop are the front's (rust-diary.cjs), as is the local
+// exchange (rust-diary-local-exchange.cjs), which takes this process's throttle and gate by lease.
 // #2287: the Rust front owns settings policy; the live tune script retains the state-file writer.
 const autotuneSettingsBridge = require('./rust-autotune-settings-bridge.cjs').createAutotuneSettingsBridge({
   secret: FRONT_SECRET, json, readJson, tuner: () => modelManager.autotune,
@@ -1501,8 +1498,6 @@ async function handleRequestScoped(req, res) {
 
     if (await modelRoutes(req, res, { path: p, authn, url })) return;
 
-    if (await diaryRoutes.diary(req, res, { path: p, authn, url })) return;
-
     if (await chatRoutes(req, res, { path: p, authn })) return;
 
     // Static files with SPA fallback (spa-routes.cjs).
@@ -1649,29 +1644,7 @@ if (require.main === module) {
     internalServer.headersTimeout = 15000;
   }
 
-  const readStorage = (userId) => authService.getStorage(userId, true);
-  require('./diary-backup-worker.cjs').startDiaryBackupWorker({
-    users: () => authService.listUsers(),
-    enabled: id => authService.diaryEnabled(id),
-    // #1429: an account whose saved login was refused (or is throttled) gets no automatic backup
-    // until its credentials change or the backoff passes; it is not counted as a failure either.
-    suspended: user => storageLatch.suspendedFor(user.id, readStorage),
-    // Default 30 s so an idle tenant does not build a new ManagedCorpusBackend every
-    // 3 s; DIARY_BACKUP_WORKER_INTERVAL_MS keeps the old cadence available for tests.
-    interval: Number(process.env.DIARY_BACKUP_WORKER_INTERVAL_MS) > 0 ? Number(process.env.DIARY_BACKUP_WORKER_INTERVAL_MS) : 30000,
-    run: user => requestScope.run({ workspace: workspaceStore.get(user.id), authn: { user, legacy: false } }, async () => {
-      // The backup copies to the remote destination on every run, so it is the one call that
-      // always carries the storage secret (#292); every other call sends only its ref.
-      const target = `${DIARY_BASE}/api/storage-backup`;
-      const r = await fetchJson(target, { method: 'POST', headers: diaryHeaders('POST', target, { secret: true }) }, 300000);
-      // #1429: the Diary tags a refused login (424 storageLoginRejected) and a throttle (503 storageThrottled);
-      // either one holds this account's automatic calls (storage-latch.cjs) until the credentials change.
-      storageLatch.noteDiaryReply(user.id, readStorage, r.body, r.ok);
-      if (!r.ok) throw new Error(`storage-backup failed: ${r.status}`);
-      return r.body;
-    }),
-    onError: userId => console.warn(`[diary-backup] ${userId ? `backup failed for ${userId}` : 'backup tick failed'}, backing off`),
-  });
+  // Diary backup is owned by the paired front build (rust-diary.cjs marker).
   server.requestTimeout = 20 * 60 * 1000;
   // A stray rejected promise in one request or task must not take the whole web process (and
   // every other tenant's session) down with it. Logged loudly with its stack, never silent.

@@ -6,13 +6,22 @@
 // ever reached by the front's signed requests and a stale route table cannot make two processes answer.
 //
 // The rest of the Diary routes the web client names moved with #2206 (rust-diary-routes.cjs) and the
-// local exchange after them (rust-diary-local-exchange.cjs). What stays here is the paths the web client
-// does not name (/api/diary/history, files, file, workspace-trash, external-sources, entries/edit), which
-// the front's route table does not list.
+// local exchange after them (rust-diary-local-exchange.cjs). The remaining proxies (/api/diary/history,
+// files, file, workspace-trash, external-sources, entries/edit) and the Diary backup loop move here as a
+// pair, so no Diary route stays in Node. Top compares this immutable export with the front's compiled
+// feature before either process starts; an environment value cannot activate a second worker.
+// Import/edit retain their unmatched-method fallthrough.
 //
 // The list is exactly noevia-rs contracts/http/routes.toml's owner = "rust" entries under /api/diary/
 // (every method: each route answers its own 405 after the add-on gate, as Node did).
 const OWNED_PATHS = Object.freeze([
+  '/api/diary/files',
+  '/api/diary/file',
+  '/api/diary/workspace-trash',
+  '/api/diary/history',
+  '/api/diary/external-sources',
+  '/api/diary/external-sources/import',
+  '/api/diary/entries/edit',
   '/api/diary/source',
   '/api/diary/today',
   '/api/diary/storage-import',
@@ -22,7 +31,7 @@ const OWNED_PATHS = Object.freeze([
 const ROUTE_REFUSAL = Object.freeze({ error: 'Diary corpus reads, storage import and workspace transfer are owned by the Rust front.', code: 'RUST_DIARY_OWNED' });
 
 /** True for the exact pathnames the front owns (core compared `p === '/api/diary/...'`, so no trailing slash). */
-const owned = (pathname) => OWNED_PATHS.includes(pathname);
+const owned = (pathname, method) => OWNED_PATHS.includes(pathname) && (method === undefined || !['/api/diary/external-sources/import', '/api/diary/entries/edit'].includes(pathname) || method === 'POST');
 
 /**
  * Runs before authentication, the maintenance gate and the workspace load (index.cjs
@@ -31,9 +40,10 @@ const owned = (pathname) => OWNED_PATHS.includes(pathname);
  */
 function refuseOwned(req, res, { parseRequestUrl, json }) {
   const url = parseRequestUrl(req, `http://${req.headers.host || 'localhost'}`) || parseRequestUrl(req);
-  if (!url || !owned(url.pathname)) return false;
+  if (!url || !owned(url.pathname, req.method)) return false;
   json(res, 503, ROUTE_REFUSAL);
   return true;
 }
 
-module.exports = { OWNED_PATHS, ROUTE_REFUSAL, owned, refuseOwned };
+const DIARY_BACKUP_WORKER_OWNER = 'noevia-diary-backup-worker-rust/1';
+module.exports = { DIARY_BACKUP_WORKER_OWNER, OWNED_PATHS, ROUTE_REFUSAL, owned, refuseOwned };
