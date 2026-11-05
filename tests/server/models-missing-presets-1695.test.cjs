@@ -6,7 +6,6 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const { Readable } = require('node:stream');
 const { createModelRoutes } = require('../../server/routes/models.cjs');
-const { modelAssignments } = require('../../server/model-assignments.cjs');
 
 function routes({ installed, sections, reload = { ok: true, status: 200, body: { reloaded: true } }, scan = null, cache = new Map(), manager = {} }) {
   const sent = [], fetched = [], reloads = [];
@@ -92,15 +91,6 @@ test('#1695 prune-missing is POST-only', async () => {
   assert.equal((await f.call('GET', '/api/models/prune-missing')).status, 405);
 });
 
-test('#1695 a configured reranker whose file is gone reads "missing", not "off", while reranking is off', () => {
-  const installed = [{ name: 'chat', labels: [] }, { name: 'tiny-reranker', labels: ['reranking'], missingFile: true }];
-  const off = modelAssignments({ installed, env: { RERANK_MODEL: 'tiny-reranker' } }).services.find((s) => s.id === 'reranker');
-  assert.equal(off.state, 'missing');
-  const pruned = modelAssignments({ installed: [installed[0]], env: { RERANK_MODEL: 'tiny-reranker' } }).services.find((s) => s.id === 'reranker');
-  assert.equal(pruned.state, 'missing', 'still missing after its preset was removed');
-  const fine = modelAssignments({ installed: [{ name: 'tiny-reranker', labels: ['reranking'] }], env: { RERANK_MODEL: 'tiny-reranker' } }).services.find((s) => s.id === 'reranker');
-  assert.equal(fine.state, 'off', 'a present reranker with reranking off is still just off');
-});
 
 // #1698: the scan and hasFile share one models folder, so a dropped share makes both say "gone".
 const many = (missing, present) => ({

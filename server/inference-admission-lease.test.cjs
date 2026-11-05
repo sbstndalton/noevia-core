@@ -130,3 +130,71 @@ test('a machine turn granted after the caller left is given straight back', asyn
   assert.equal(routes.leases.size(), 0);
   assert.equal(ended, 1);
 });
+
+// The front's Diary local exchange (rust-diary-local-exchange.cjs): the gate waited for briefly, the throttle chat
+// shares counted once, the backfill paused; all held until the lease ends.
+test('a Diary exchange lease holds the gate, counts the throttle once and pauses the backfill until it ends', async (t) => {
+  const log = [];
+  const modelManager = {
+    enterInferenceWithin: async (waitMs, signal) => { log.push(`enter ${waitMs} ${signal instanceof AbortSignal}`); return () => log.push('leave'); },
+    enterInference: () => { throw new Error('the exchange waits like chat, it does not use the immediate enter'); },
+    acquireLease: async () => { throw new Error('an exchange does not take a model lease'); },
+  };
+  const diaryExchange = { rateLimited: (user) => { log.push(`throttle ${user}`); return false; }, foreground: () => { log.push('pause'); return () => log.push('resume'); } };
+  const { base, routes } = await serve(t, { modelManager, diaryExchange });
+  const r = await ask(base, { diaryExchange: { user: 'u-synthetic' } });
+  assert.equal(r.status, 201);
+  const grant = await r.json();
+  assert.match(grant.lease, /^[0-9a-f]{32}$/);
+  assert.equal('headers' in grant, false);
+  assert.deepEqual(log, ['enter 3000 true', 'throttle u-synthetic', 'pause']);
+  assert.equal((await ask(base, null, undefined, `${PREFIX}/${grant.lease}/renew`)).status, 200);
+  assert.equal((await ask(base, null, undefined, `${PREFIX}/${grant.lease}`, 'DELETE')).status, 204);
+  assert.deepEqual(log.slice(3), ['resume', 'leave']);
+  assert.equal(routes.leases.size(), 0);
+});
+
+test('a Diary exchange refusal: the gate\'s 503 in its words, the throttle\'s 429 (gate given back), a bad ask 400', async (t) => {
+  let entered = 0, left = 0, paused = 0;
+  const held = Object.assign(new Error('Model configuration is being applied. Try again shortly.'), { status: 503 });
+  let gateHeld = false, limited = false;
+  const modelManager = { enterInferenceWithin: async () => { if (gateHeld) throw Object.assign(held, { code: 'inferenceMaintenance' }); entered++; return () => left++; } };
+  const diaryExchange = { rateLimited: () => limited, foreground: () => { paused++; return () => {}; } };
+  const { base, routes } = await serve(t, { modelManager, diaryExchange });
+  gateHeld = true;
+  let r = await ask(base, { diaryExchange: { user: 'u1' } });
+  assert.equal(r.status, 503);
+  assert.deepEqual(await r.json(), { error: 'Model configuration is being applied. Try again shortly.', code: 'inferenceMaintenance' });
+  gateHeld = false; limited = true;
+  r = await ask(base, { diaryExchange: { user: 'u1' } });
+  assert.equal(r.status, 429);
+  assert.deepEqual(await r.json(), { error: 'Please wait before sending another message' });
+  assert.deepEqual([entered, left, paused], [1, 1, 0], 'the throttled exchange gave the gate back and never paused the backfill');
+  for (const body of [{ diaryExchange: {} }, { diaryExchange: { user: '' } }, { diaryExchange: { user: 7 } }, { diaryExchange: { user: 'u1' }, model: 'm' }, { diaryExchange: null }]) {
+    r = await ask(base, body);
+    assert.equal(r.status, 400, JSON.stringify(body));
+  }
+  assert.equal(routes.leases.size(), 0);
+  // A Core wired without the exchange's throttle refuses rather than admit an uncounted exchange.
+  const bare = await serve(t, { modelManager });
+  assert.equal((await ask(bare.base, { diaryExchange: { user: 'u1' } })).status, 400);
+});
+
+test('a Diary exchange whose caller went away while the gate was waited for holds nothing', async (t) => {
+  let release;
+  const waiting = new Promise((r) => { release = r; });
+  let left = 0, counted = 0;
+  const modelManager = { enterInferenceWithin: async () => { await waiting; return () => left++; } };
+  const diaryExchange = { rateLimited: () => { counted++; return false; }, foreground: () => () => {} };
+  const { base, routes } = await serve(t, { modelManager, diaryExchange });
+  const controller = new AbortController();
+  const pending = ask(base, { diaryExchange: { user: 'u1' } }, undefined, PREFIX, 'POST', controller.signal).catch(() => null);
+  await settled();
+  controller.abort();
+  await pending;
+  await settled();
+  release();
+  await settled();
+  assert.equal(routes.leases.size(), 0);
+  assert.equal(left, counted, 'whatever was entered was given back');
+});

@@ -66,8 +66,8 @@ const ALL = null;
 const OWNED_ROUTES = Object.freeze([
   [/^\/api\/chat-framing\/preferences$/, ALL],
   [/^\/api\/account\/(?:instructions|memory|preferences)$/, ALL],
-  // Settings -> Data -> Delete old chats: its preview (sbstndalton/noevia#1071). PUT stays Node's.
-  [/^\/api\/account\/retention$/, ['GET']],
+  // Settings -> Data -> Delete old chats: the native preview and retention writer.
+  [/^\/api\/account\/retention$/, ['GET', 'PUT']],
   [/^\/api\/admin\/invitations$/, ['POST']],
   [/^\/api\/admin\/users$/, ['GET']],
   [/^\/api\/admin\/users\/[^/]+\/disabled$/, ['PUT']],

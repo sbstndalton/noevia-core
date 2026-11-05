@@ -8,7 +8,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const { Readable } = require('node:stream');
 const http = require('./http.cjs');
-const { OWNED_ROUTES, ROUTE_REFUSAL, BRIDGE_PATH, MESSAGE_CAP, owned, refuseOwned, createSuggestBridge } = require('./rust-chat-framing-suggest.cjs');
+const { OWNED_ROUTES, ROUTE_REFUSAL, BRIDGE_PATH, MESSAGE_CAP, USER_CAP, PUBLIC_BODY_LIMIT, BRIDGE_BODY_LIMIT, owned, refuseOwned, createSuggestBridge } = require('./rust-chat-framing-suggest.cjs');
 
 const SECRET = 'synthetic-front-secret-0123456789abcdef';
 const USER = 'aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa';
@@ -146,4 +146,43 @@ test('index.cjs no longer counts the suggestion budget or reaches the decision f
   assert.equal(source.includes('chat-frame:'), false, 'the chat-frame: budget is the front\'s');
   assert.match(source, /createChatFramingRoutes\(\{ json, readJson, settings: framingSettings \}\)/);
   assert.match(source, /createSuggestBridge\(\{\n  secret: FRONT_SECRET, json, readJson, framing: chatFraming,/);
+});
+
+test('a public request at the 1 MiB limit still fits the bridge after the front adds the user (review P2)', async () => {
+  assert.equal(PUBLIC_BODY_LIMIT, 1024 * 1024);
+  assert.equal(BRIDGE_BODY_LIMIT, 3 * 1024 * 1024 + 64 * 1024);
+  const prefix = '{"message":"m","chatId":"', suffix = '"}';
+  const fill = PUBLIC_BODY_LIMIT - prefix.length - suffix.length;
+  // A valid chat id, and one of invalid bytes that UTF-8 replacement triples: both are exactly 1 MiB in public.
+  for (const [label, byte] of [['valid', 0x63], ['invalid UTF-8', 0xff]]) {
+    const publicBody = Buffer.concat([Buffer.from(prefix), Buffer.alloc(fill, byte), Buffer.from(suffix)]);
+    assert.equal(publicBody.length, PUBLIC_BODY_LIMIT, label);
+    const parsed = JSON.parse(publicBody.toString('utf8'));
+    // What the front sends: the user, the message cut to MESSAGE_CAP and the chat id, re-encoded.
+    const sent = JSON.stringify({ user: USER, message: parsed.message.slice(0, MESSAGE_CAP), chatId: parsed.chatId });
+    assert.ok(Buffer.byteLength(sent) > PUBLIC_BODY_LIMIT, label);
+    const { bridge, calls } = harness({ suggest: async ({ chatId }) => ({ frame: null, reason: 'disabled', chatIdLength: chatId.length }) });
+    const res = response();
+    await bridge(request({ body: sent }), res);
+    assert.equal(res.statusCode, 200, `${label}: ${res.text().slice(0, 80)}`);
+    assert.deepEqual(JSON.parse(res.text()), { frame: null, reason: 'disabled', chatIdLength: fill });
+    assert.equal(calls.length, 1, label);
+  }
+  // The worst the front can send still fits: the longest user and an all-escape message beside it.
+  const worst = JSON.stringify({ user: '\u0001'.repeat(USER_CAP), message: '\u0001'.repeat(MESSAGE_CAP), chatId: '\ufffd'.repeat(PUBLIC_BODY_LIMIT) });
+  assert.ok(Buffer.byteLength(worst) <= BRIDGE_BODY_LIMIT, String(Buffer.byteLength(worst)));
+  // And the bridge stays bounded: one byte over its limit, or a longer user, is refused unsuggested.
+  const { bridge, calls } = harness();
+  const over = `{"user":"${USER}","message":"m","chatId":"${'c'.repeat(BRIDGE_BODY_LIMIT)}"}`.slice(0, BRIDGE_BODY_LIMIT - 2) + '"}';
+  assert.equal(Buffer.byteLength(over), BRIDGE_BODY_LIMIT);
+  let res = response();
+  await bridge(request({ body: over }), res);
+  assert.equal(res.statusCode, 200);
+  res = response();
+  await bridge(request({ body: over.slice(0, -2) + 'c"}' }), res);
+  assert.deepEqual([res.statusCode, res.text()], [400, '{"error":"invalid JSON"}']);
+  res = response();
+  await bridge(request({ body: JSON.stringify({ user: 'u'.repeat(USER_CAP + 1), message: 'm', chatId: null }) }), res);
+  assert.equal(res.statusCode, 400);
+  assert.equal(calls.length, 1);
 });

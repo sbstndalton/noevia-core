@@ -16,7 +16,8 @@ async function main() {
   const port = Number(process.env.UI_PORT);
   if (!dataDir || !port) throw new Error('serve.cjs needs UI_DATA_DIR and UI_PORT');
   const mocks = await startMocks();
-  const env = serverEnv({ port, dataDir, origin: process.env.PUBLIC_ORIGIN || `http://127.0.0.1:${port}`, mocks });
+  // The launcher's real front binary pairs Core when it passes one (NOEVIA_SERVER_BIN); otherwise a synthetic stand-in.
+  const env = serverEnv({ port, dataDir, origin: process.env.PUBLIC_ORIGIN || `http://127.0.0.1:${port}`, mocks, front: process.env.NOEVIA_SERVER_BIN });
   // Sign-in and the account are the Rust front's (sbstndalton/noevia#1071): Node always runs
   // read-only for those tables and refuses their routes, so there is no switch to pass through.
   // Node saves projects.json and free-chats.json only through the Rust front's project store and

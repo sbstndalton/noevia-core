@@ -6,7 +6,8 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
-const { createReloadGuard, engineView } = require('./preset-reload.cjs');
+const { createReloadGuard, createBridgeReloadGuard, engineView } = require('./preset-reload.cjs');
+const { createFakePresetBaseline } = require('./preset-baseline-fixture.cjs');
 const { createLlamaCppManager } = require('./llamacpp-manager.cjs');
 const davParseWasm = require('./dav-parse-wasm.cjs');
 
@@ -77,7 +78,18 @@ test('#1012 engineView is order-independent and sees preset changes and new or r
   assert.notEqual(engineView(r), engineView(r.slice(1)));
 });
 
-function managerFixture(t) {
+// Every manager-level test runs with the legacy local guard and with the front's baseline (bridge
+// mode, against a fake front whose calls land in the same call log as the router's).
+const MODES = ['legacy', 'bridge'];
+function guardFor(t, mode, { stateFile, log }) {
+  if (mode === 'legacy') return createReloadGuard({ check: fakeCheck, stateFile });
+  const front = createFakePresetBaseline({ check: fakeCheck, log });
+  // Bridge mode never opens the state file, and never falls back to the local guard.
+  t.after(() => assert.equal(fs.existsSync(stateFile), false, 'bridge mode wrote no state file'));
+  return createBridgeReloadGuard({ client: front, legacy: () => { throw new Error('bridge mode used the local guard'); } });
+}
+
+function managerFixture(t, { mode = 'legacy' } = {}) {
   const dir = tmp(t);
   const file = path.join(dir, 'models.ini');
   fs.writeFileSync(file, BASE);
@@ -90,13 +102,13 @@ function managerFixture(t) {
     const data = rows(state.loaded, state.presets, state.sleeping);
     return { ok: true, status: 200, body: { data: state.bare ? data.map((r) => ({ ...r, status: { value: r.status.value } })) : data } };
   };
-  const reloadGuard = createReloadGuard({ check: fakeCheck, stateFile: path.join(dir, 'reload.json') });
+  const reloadGuard = guardFor(t, mode, { stateFile: path.join(dir, 'reload.json'), log: state.calls });
   const manager = createLlamaCppManager({ baseUrl: 'http://synthetic', presetPath: file, fetchJson, reloadGuard });
   return { file, state, manager, reloads: () => state.calls.filter((c) => c === 'GET /models?reload=1').length };
 }
 
-test('#1012 a new section is served without unloading the loaded model', async (t) => {
-  const f = managerFixture(t);
+for (const mode of MODES) test(`#1012 a new section is served without unloading the loaded model [${mode}]`, async (t) => {
+  const f = managerFixture(t, { mode });
   assert.equal((await f.manager.reloadPresets()).status, 200, 'nothing loaded: reload and record');
   f.state.loaded = ['loaded-model'];
   fs.appendFileSync(f.file, '[gemma-synthetic]\nmodel = /models/g.gguf\nctx-size = 8192\n');
@@ -108,8 +120,8 @@ test('#1012 a new section is served without unloading the loaded model', async (
   assert.deepEqual(f.state.loaded, ['loaded-model']);
 });
 
-test('#1012 an edit to the loaded model, an unknown baseline or a moved router still refuses', async (t) => {
-  const f = managerFixture(t);
+for (const mode of MODES) test(`#1012 an edit to the loaded model, an unknown baseline or a moved router still refuses [${mode}]`, async (t) => {
+  const f = managerFixture(t, { mode });
   f.state.loaded = ['loaded-model'];
   assert.equal((await f.manager.reloadPresets()).body.reason, 'unknown', 'no baseline yet');
   f.state.loaded = [];
@@ -127,8 +139,8 @@ test('#1012 an edit to the loaded model, an unknown baseline or a moved router s
   assert.deepEqual(forced.body, { reloaded: true, unloaded: ['loaded-model'] });
 });
 
-test('#1012 never during a chat or a held gate (auto-tune, calibration)', async (t) => {
-  const f = managerFixture(t);
+for (const mode of MODES) test(`#1012 never during a chat or a held gate (auto-tune, calibration) [${mode}]`, async (t) => {
+  const f = managerFixture(t, { mode });
   await f.manager.reloadPresets();
   f.state.loaded = ['loaded-model'];
   const leave = f.manager.enterInference();
@@ -140,20 +152,20 @@ test('#1012 never during a chat or a held gate (auto-tune, calibration)', async 
   assert.equal(f.reloads(), 1);
 });
 
-test('#2276 writePresets: a 502 from the remote hold is not holdRefused and writes nothing', async (t) => {
+for (const mode of MODES) test(`#2276 writePresets: a 502 from the remote hold is not holdRefused and writes nothing [${mode}]`, async (t) => {
   const dir = tmp(t);
   const file = path.join(dir, 'models.ini');
   fs.writeFileSync(file, BASE);
   const down = Object.assign(new Error('The local model engine is not answering.'), { status: 502, code: 'engine_unavailable', retryable: true });
   const gate = { holdMaintenance: async () => { throw down; }, hasAdmin: () => true, waiting: () => 0, adminHeaders: () => ({}) };
-  const manager = createLlamaCppManager({ baseUrl: 'http://synthetic', presetPath: file, gate });
+  const manager = createLlamaCppManager({ baseUrl: 'http://synthetic', presetPath: file, gate, ...(mode === 'bridge' ? { presetBaselineClient: createFakePresetBaseline({ check: fakeCheck }) } : {}) });
   let writes = 0;
   await assert.rejects(manager.writePresets(async () => { writes += 1; }), (e) => e.status === 502 && e.code === 'engine_unavailable' && e.holdRefused !== true);
   assert.equal(writes, 0);
 });
 
-test('#2219 writePresets: a held gate means no write; a write and its reload share one hold', async (t) => {
-  const f = managerFixture(t);
+for (const mode of MODES) test(`#2219 writePresets: a held gate means no write; a write and its reload share one hold [${mode}]`, async (t) => {
+  const f = managerFixture(t, { mode });
   let writes = 0;
   const release = f.manager.holdMaintenance('synthetic tune');
   await assert.rejects(f.manager.writePresets(async () => { writes += 1; }), { status: 409, holdRefused: true });
@@ -182,8 +194,8 @@ test('#2219 writePresets: a held gate means no write; a write and its reload sha
   assert.equal((await f.manager.reloadPresets()).status, 200);
 });
 
-test('#1040 the file is re-read right before the reload and must be the text that was judged', async (t) => {
-  const f = managerFixture(t);
+for (const mode of MODES) test(`#1040 the file is re-read right before the reload and must be the text that was judged [${mode}]`, async (t) => {
+  const f = managerFixture(t, { mode });
   await f.manager.reloadPresets();
   f.state.loaded = ['loaded-model'];
   const lists = f.state.calls.filter((c) => c === 'GET /models').length;
@@ -194,8 +206,8 @@ test('#1040 the file is re-read right before the reload and must be the text tha
   assert.equal(f.reloads(), 1);
 });
 
-test('#1040 a model that starts loading between the check and the call refuses the reload', async (t) => {
-  const f = managerFixture(t);
+for (const mode of MODES) test(`#1040 a model that starts loading between the check and the call refuses the reload [${mode}]`, async (t) => {
+  const f = managerFixture(t, { mode });
   await f.manager.reloadPresets();
   f.state.loaded = ['loaded-model'];
   const lists = f.state.calls.filter((c) => c === 'GET /models').length;
@@ -205,12 +217,12 @@ test('#1040 a model that starts loading between the check and the call refuses t
   assert.equal(f.reloads(), 1);
 });
 
-test('#1038 a sleeping model counts as loaded', async (t) => {
-  const off = managerFixture(t);
+for (const mode of MODES) test(`#1038 a sleeping model counts as loaded [${mode}]`, async (t) => {
+  const off = managerFixture(t, { mode });
   off.state.sleeping = ['loaded-model'];
   const r = await off.manager.reloadPresets();
   assert.equal(r.status, 409); assert.deepEqual(r.body.loaded, ['loaded-model']);
-  const on = managerFixture(t);
+  const on = managerFixture(t, { mode });
   await on.manager.reloadPresets();
   on.state.sleeping = ['loaded-model'];
   fs.writeFileSync(on.file, BASE.replace('ctx-size = 8192', 'ctx-size = 2'));
@@ -219,18 +231,18 @@ test('#1038 a sleeping model counts as loaded', async (t) => {
   assert.deepEqual((await on.manager.reloadPresets()).body.kept, ['loaded-model']);
 });
 
-test('#1037 a router listing without presets never yields a baseline, so loaded models refuse', async (t) => {
-  const f = managerFixture(t);
+for (const mode of MODES) test(`#1037 a router listing without presets never yields a baseline, so loaded models refuse [${mode}]`, async (t) => {
+  const f = managerFixture(t, { mode });
   f.state.bare = true;
   await f.manager.reloadPresets();
   f.state.loaded = ['loaded-model'];
   assert.equal((await f.manager.reloadPresets()).body.reason, 'unknown');
 });
 
-test('#1012 a failed router reload forgets the baseline', async (t) => {
-  const f = managerFixture(t);
+for (const mode of MODES) test(`#1012 a failed router reload forgets the baseline [${mode}]`, async (t) => {
+  const f = managerFixture(t, { mode });
   await f.manager.reloadPresets();
-  const failing = createLlamaCppManager({ baseUrl: 'http://synthetic', presetPath: f.file, reloadGuard: createReloadGuard({ check: fakeCheck }),
+  const failing = createLlamaCppManager({ baseUrl: 'http://synthetic', presetPath: f.file, reloadGuard: guardFor(t, mode, { stateFile: path.join(tmp(t), 'reload.json'), log: [] }),
     fetchJson: async (url) => (url.includes('reload=1') ? { ok: false, status: 500, body: {} } : { ok: true, status: 200, body: { data: rows([]) } }) });
   assert.equal((await failing.reloadPresets()).status, 502);
 });

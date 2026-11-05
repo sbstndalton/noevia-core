@@ -1,8 +1,8 @@
 'use strict';
 // #2206: the rest of the Diary routes the web client names are the Rust front's (noevia-rs
 // crates/server-diary, bins/noevia-server diary_routes.rs; capability rust-diary-routes). Node refuses
-// them before authentication, for the methods it used to answer, and keeps the local exchange and the
-// paths the web client never names. The routes' behaviour itself is proven against a synthetic sidecar
+// them before authentication, for the methods it used to answer, and keeps the paths the web client never
+// names (the local exchange moved later and is refused by rust-diary-local-exchange.cjs). The routes' behaviour itself is proven against a synthetic sidecar
 // in noevia-rs crates/server-diary/tests (connector.rs, status_exchanges.rs) and bins/noevia-server/tests/diary.rs.
 //
 // The first block is the pure function; the second goes through the real router (handleRequest).
@@ -44,7 +44,7 @@ test('Node refuses exactly the paths and methods the front\'s route table gives 
   assert.equal(owned('GET', `/api/profile/diary-connectors/${ID}`), false, 'core mounted only DELETE there');
 });
 
-test('what stays Node\'s is not refused: the local exchange, the paths the web client never names, look-alikes', () => {
+test('what this module does not own is not refused here: the local exchange (its own module), the paths the web client never names, look-alikes', () => {
   for (const url of [
     '/api/diary/local-exchange', '/api/diary/history', '/api/diary/files', '/api/diary/file', '/api/diary/workspace-trash',
     '/api/diary/external-sources', '/api/diary/external-sources/import', '/api/diary/entries/edit',
@@ -74,7 +74,8 @@ test('every owned request is refused with a 503 and its code before the body is 
 
 test('the Node duplicates are gone', () => {
   const read = (...p) => fs.readFileSync(path.join(__dirname, ...p), 'utf8');
-  const routes = read('routes', 'diary.cjs');
+  // routes/diary.cjs is retired once the Diary proxies and the local exchange are both the front's.
+  const routes = fs.existsSync(path.join(__dirname, 'routes', 'diary.cjs')) ? read('routes', 'diary.cjs') : '';
   for (const gone of ['connector(', 'connectors(', "'/api/diary/exchanges'", "'/api/diary/storage-status'", 'diaryConnectors', 'connectorRate', 'readObject', 'automaticStorage', 'diary-jobs.cjs']) {
     assert.equal(routes.includes(gone), false, gone);
   }
@@ -145,7 +146,7 @@ async function request(url, { method = 'GET', headers = {}, body } = {}) {
   return { status: res.statusCode, headers: out, text, json: parsed };
 }
 
-test('through the router: owned routes are refused signed out and signed in; the local exchange and the unnamed paths still answer here', async () => {
+test('through the router: owned routes are refused signed out and signed in; the unnamed paths still answer here', async () => {
   const member = seedAccount(dataDir, { username: 'routes-off', displayName: 'Synthetic', role: 'member', publicOrigin: 'http://localhost', diaryEnabled: false });
   const withDiary = seedAccount(dataDir, { username: 'routes-on', displayName: 'Synthetic', role: 'member', diaryEnabled: true });
   const as = (a) => ({ cookie: a.cookie, origin: 'http://localhost', 'x-csrf-token': a.csrf });
@@ -168,14 +169,14 @@ test('through the router: owned routes are refused signed out and signed in; the
     }
   }
   // Positive controls: what Node keeps still runs the ordinary chain (auth, then the add-on gate).
-  for (const url of ['/api/diary/history', '/api/diary/workspace-trash', '/api/diary/files']) {
-    assert.equal((await request(url)).status, 401, `${url} signed out`);
-    const off = await request(url, { headers: as(member) });
-    assert.equal(off.status, 404, `${url} without the add-on`);
-    assert.deepEqual(off.json, { error: 'Diary add-on is disabled' });
-  }
+  // Joined with the local exchange's move, no Diary route stays in Node: signed out, the local exchange is
+  // refused by its own module before authentication, and a path no one routes still runs the ordinary chain.
+  const lx = await request('/api/diary/local-exchange');
+  assert.deepEqual([lx.status, lx.json], [503, require('./rust-diary-local-exchange.cjs').ROUTE_REFUSAL]);
+  assert.equal((await request('/api/diary/not-a-route')).status, 401, 'an unrouted Diary path signed out');
+  assert.equal((await request('/api/diary/not-a-route', { headers: as(withDiary) })).status, 404, 'an unrouted Diary path signed in');
   const local = await request('/api/diary/local-exchange', { method: 'POST', headers: as(member), body: '{}' });
-  assert.deepEqual([local.status, local.json], [404, { error: 'Diary add-on is disabled' }]);
+  assert.deepEqual([local.status, local.json], [503, require('./rust-diary-local-exchange.cjs').ROUTE_REFUSAL]);
   // An owned path with another method is Node's old unknown-path answer, as before.
   const put = await request('/api/diary/exchanges', { method: 'PUT', headers: as(withDiary), body: '{}' });
   assert.equal(put.status, 404);
