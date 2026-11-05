@@ -42,3 +42,9 @@ test('late recovery barrier acknowledgement cannot resurrect a completed inciden
  l.requireRecovery('new');assert.throws(()=>gate.enter(),e=>e.status===503);
  l.completeRecovery('new');gate.enter()();
 });
+
+test('recovery cancellation retention is bounded and fails closed at capacity',()=>{
+ const gate=createMaintenanceGate();const l=createLeases({hold:()=>gate.holdLocal(),barrier:()=>gate.barrier('repair',{recovery:true}),ticketTombstones:2});
+ for(const t of ['a','b','c']){l.requireRecovery(t);l.completeRecovery(t);}
+ assert.throws(()=>gate.enter(),e=>e.status===503);
+});

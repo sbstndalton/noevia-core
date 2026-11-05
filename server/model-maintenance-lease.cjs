@@ -72,12 +72,17 @@ function createLeases({ hold, ttlMs = TTL_MS, hardMs = HARD_MS, maxMs = MAX_MS, 
   // At capacity refuse new admissions rather than resurrecting delayed requests.
   let saturated = false, unbar = null;
   const recoveryKeys = new Set(), completedRecoveries = new Set();
+  let recoveryOverflow=false;
   function requireRecovery(ticket='legacy') {
     if(completedRecoveries.has(ticket))return;
-    recoveryKeys.add(ticket);
+    if(!recoveryKeys.has(ticket) && recoveryKeys.size >= ticketTombstones) { recoveryOverflow=true;saturated=true; }
+    else recoveryKeys.add(ticket);
     if (!unbar && barrier) unbar = barrier();
   }
   function completeRecovery(ticket='legacy') {
+    if(recoveryOverflow || new Set([...completedRecoveries,...recoveryKeys,ticket]).size > ticketTombstones) {
+      recoveryOverflow=true;saturated=true;if(!unbar&&barrier)unbar=barrier();return;
+    }
     // One exclusive repair settles every earlier latch. Retire its ticket too, so a delayed
     // barrier POST from a released hold cannot re-arm an already completed incident.
     completedRecoveries.add(ticket);
