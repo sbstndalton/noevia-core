@@ -28,6 +28,8 @@
 //          [HARD_MS, MAX_MS]; absent, HARD_MS. A maxMs that is not an integer is a 400 and holds nothing.
 //   POST   /internal/model-maintenance/lease/<id>/renew  200 {ttlMs}; 404 when it has ended
 //   DELETE /internal/model-maintenance/lease/<id>        204, also when it has already ended
+//   DELETE /internal/model-maintenance/lease/ticket/<t>  204: ends the latch asked for with body {ticket: t}
+//          (the front's lease id), also when the grant's answer never reached the front
 //
 // Only the front may ask: the connection must come from loopback, carry the per-start secret and not be a
 // request the front is proxying. Anything else is the same 404 as an unknown path.
@@ -71,11 +73,11 @@ function createLeases({ hold, ttlMs = TTL_MS, hardMs = HARD_MS, maxMs = MAX_MS, 
   }
   return {
     /** Takes the hold, or rejects as hold() does (409 while busy). */
-    async acquire(requested) {
+    async acquire(requested, ticket) {
       const cap = capFor(requested, hardMs, maxMs);
       const release = await hold();
       const id = crypto.randomBytes(16).toString('hex');
-      leases.set(id, { release, timer: null, hardAt: now() + cap });
+      leases.set(id, { release, timer: null, hardAt: now() + cap, ticket: ticket || null });
       arm(id);
       return { lease: id, ttlMs, renewMs: Math.min(RENEW_MS, Math.max(1, Math.floor(ttlMs / 3))), hardMs: cap };
     },
@@ -86,6 +88,11 @@ function createLeases({ hold, ttlMs = TTL_MS, hardMs = HARD_MS, maxMs = MAX_MS, 
       return true;
     },
     release: (id) => end(id, null),
+    /** Row J review: ends the latch the front asked for under `ticket`, whether or not its grant reached it. */
+    releaseTicket(ticket) {
+      for (const [id, lease] of leases) if (ticket && lease.ticket === ticket) return end(id, null);
+      return false;
+    },
     size: () => leases.size,
   };
 }
@@ -95,9 +102,16 @@ function unavailable(cause) {
 }
 
 /** The maintenance gate's `remote` over the front's authority (see the header). Never answers null: a
- *  hold it cannot take is a 409 (busy) or a 503 (no answer), so the gate never falls back to a local hold. */
-function createNativeLeaseClient({ port, token, fetchImpl = globalThis.fetch, boot = crypto.randomBytes(16).toString('hex'), timeoutMs = CALL_TIMEOUT_MS }) {
+ *  hold it cannot take is a 409 (busy) or a 503 (no answer), so the gate never falls back to a local hold.
+ *
+ *  Row J review: this process start registers first (`session {boot, startedAt}`); the authority issues an
+ *  ordered incarnation that every later call carries, and answers 410 once a newer start has registered.
+ *  ready() resolves once the start is registered and no lease the front holds remains (the gate keeps chat
+ *  closed until then). Grants are `native`: the gate gives them their own fail-closed lifecycle. Holds of
+ *  this process ask for the longest cap (MAX_MS) unless the caller asks less; liveness is the TTL. */
+function createNativeLeaseClient({ port, token, fetchImpl = globalThis.fetch, boot = crypto.randomBytes(16).toString('hex'), startedAt = Date.now(), timeoutMs = CALL_TIMEOUT_MS, retryMs = 1000, now = () => Date.now() }) {
   const ok = Number.isInteger(port) && port > 0 && port < 65536 && String(token || '').length > 0;
+  let incarnation = null, retired = false;
   async function call(op, body, wait = timeoutMs, signal = null) {
     if (!ok) throw unavailable();
     const deadline = AbortSignal.timeout(wait);
@@ -106,7 +120,7 @@ function createNativeLeaseClient({ port, token, fetchImpl = globalThis.fetch, bo
       res = await fetchImpl(`http://127.0.0.1:${port}${NATIVE_PREFIX}/${op}`, {
         method: 'POST',
         headers: { 'content-type': 'application/json', 'x-noevia-store-token': token },
-        body: JSON.stringify({ boot, ...body }),
+        body: JSON.stringify(body),
         signal: signal ? AbortSignal.any([deadline, signal]) : deadline,
       });
     } catch (err) {
@@ -115,39 +129,75 @@ function createNativeLeaseClient({ port, token, fetchImpl = globalThis.fetch, bo
     }
     let parsed = null;
     try { const text = await res.text(); parsed = text ? JSON.parse(text) : null; } catch { parsed = null; }
+    if (res.status === 410) { retired = true; incarnation = null; }
     return { status: res.status, body: parsed };
   }
-  const session = () => call('session', {}).catch(() => null);
-  // This start's boot, so the authority drops any lease a previous (crashed) start of this process held.
-  void session();
+  /** Registers this start; {incarnation, frontHeld}. Throws 503 when it cannot (also once retired). */
+  async function session() {
+    if (retired) throw unavailable();
+    const { status, body } = await call('session', { boot, startedAt });
+    if (status === 200 && Number.isSafeInteger(body?.incarnation)) {
+      incarnation = body.incarnation;
+      return { incarnation, frontHeld: body.frontHeld === true };
+    }
+    throw unavailable();
+  }
+  async function registered() { if (incarnation === null) await session(); return incarnation; }
+  const pause = (ms) => new Promise((r) => { const t = setTimeout(r, ms); t.unref?.(); });
+  let readiness = null;
+  /** Resolves once this start is registered and the front holds no lease (retrying every retryMs). */
+  function ready() {
+    if (!readiness) readiness = (async () => {
+      for (;;) {
+        try {
+          const { frontHeld } = await session();
+          if (!frontHeld) return;
+          const { status, body } = await call('held', { incarnation });
+          if (status === 200 && body?.front === false) return;
+        } catch { /* not answering yet: chat stays closed */ }
+        if (retired) return new Promise(() => {}); // a newer start of this process exists: stay closed
+        await pause(retryMs);
+      }
+    })();
+    return readiness;
+  }
   return {
     marker: LEASE_CLIENT_MARKER,
     hasAdmin: () => true,
-    /** {token, idleTtlMs, generation, header: false} | throws 409 (held) | throws 503 (no answer). */
-    async holdMaintenance(reason, { waitMs = 0, signal, maxMs } = {}) {
+    ready,
+    /** A native grant {token, native, askedAt, ttlMs, renewMs, hardMs, generation, header: false} | throws
+     *  409 (held) | throws 503 (no answer, or this start was retired). */
+    async holdMaintenance(reason, { waitMs = 0, signal, maxMs = MAX_MS } = {}) {
       const wait = Math.max(0, Math.min(MAX_WAIT_MS, Number(waitMs) || 0));
-      const ask = { reason: String(reason || '').slice(0, 300), waitMs: wait, ...(maxMs === undefined ? {} : { maxMs }) };
+      const inc = await registered();
+      const askedAt = now();
+      const ask = { incarnation: inc, reason: String(reason || '').slice(0, 300), waitMs: wait, maxMs };
       const { status, body } = await call('acquire', ask, wait + timeoutMs, signal);
-      if (status === 201 && body && typeof body.lease === 'string' && /^[0-9a-f]{32}$/.test(body.lease)) {
-        const renewMs = Number.isSafeInteger(body.renewMs) && body.renewMs > 0 ? body.renewMs : 10000;
-        // The gate renews every third of idleTtlMs: the authority's own cadence (renewMs).
-        return { token: body.lease, idleTtlMs: renewMs * 3, generation: body.generation, epoch: body.epoch, ttlMs: body.ttlMs, hardMs: body.hardMs, header: false };
+      if (status === 201 && body && typeof body.lease === 'string' && /^[0-9a-f]{32}$/.test(body.lease)
+        && [body.ttlMs, body.renewMs, body.hardMs].every((v) => Number.isSafeInteger(v) && v > 0)) {
+        return { token: body.lease, native: true, askedAt, ttlMs: body.ttlMs, renewMs: body.renewMs, hardMs: body.hardMs, generation: body.generation, epoch: body.epoch, idleTtlMs: body.renewMs * 3, header: false };
       }
       if (status === 409) throw Object.assign(new Error(body?.error || 'Inference is busy.'), { status: 409, code: 'maintenance_held', chatActive: false });
       throw unavailable();
     },
-    /** true: renewed; false: the lease has ended; null: no answer. */
+    /** true: renewed; false: the lease has ended (or this start was retired); null: no answer. */
     async renewMaintenance(lease, reason) {
+      if (retired || incarnation === null) return false;
       try {
-        const { status } = await call('renew', { lease, ...(reason ? { reason: String(reason).slice(0, 300) } : {}) });
-        return status === 200 ? true : status === 404 ? false : null;
+        const { status } = await call('renew', { incarnation, lease, ...(reason ? { reason: String(reason).slice(0, 300) } : {}) });
+        return status === 200 ? true : status === 404 || status === 410 ? false : null;
       } catch { return null; }
     },
     async releaseMaintenance(lease) {
-      try { await call('release', { lease }); } catch { /* an unreleased lease ends by itself */ }
+      if (retired || incarnation === null) return;
+      try { await call('release', { incarnation, lease }); } catch { /* an unreleased lease ends by itself */ }
     },
     async maintenanceHeld() {
-      try { const { status, body } = await call('held', {}); return status === 200 && typeof body?.held === 'boolean' ? body.held : null; } catch { return null; }
+      try {
+        const inc = await registered();
+        const { status, body } = await call('held', { incarnation: inc });
+        return status === 200 && typeof body?.held === 'boolean' ? body.held : null;
+      } catch { return null; }
     },
     session,
   };
@@ -159,6 +209,7 @@ function chainRemotes(gate, native) {
   const fromNative = new Set();
   return {
     hasAdmin: () => true,
+    ...(typeof native.ready === 'function' ? { ready: () => native.ready() } : {}),
     async holdMaintenance(reason, options) {
       const granted = await gate.holdMaintenance(reason, options);
       if (granted !== null) return granted;
@@ -193,7 +244,8 @@ function readAsk(req) {
       let ask;
       try { ask = JSON.parse(text); } catch { return finish(null); }
       if (!ask || typeof ask !== 'object' || Array.isArray(ask)) return finish(null);
-      if (Object.keys(ask).some((k) => k !== 'maxMs')) return finish(null);
+      if (Object.keys(ask).some((k) => k !== 'maxMs' && k !== 'ticket')) return finish(null);
+      if (Object.hasOwn(ask, 'ticket') && !(typeof ask.ticket === 'string' && /^[0-9a-f]{32}$/.test(ask.ticket))) return finish(null);
       if (Object.hasOwn(ask, 'maxMs') && !Number.isSafeInteger(ask.maxMs)) return finish(null);
       finish(ask);
     });
@@ -213,11 +265,19 @@ function createLeaseRoutes({ secret, hold, json, ...options }) {
       if (req.method !== 'POST') return notFound();
       const ask = await readAsk(req);
       if (!ask) { json(res, 400, { error: 'maxMs must be a whole number of milliseconds.' }); return true; }
-      try { json(res, 201, await leases.acquire(ask.maxMs)); }
+      try { json(res, 201, await leases.acquire(ask.maxMs, ask.ticket)); }
       catch (e) {
         if (e?.status === 409) json(res, 409, { error: e.message, chatActive: e.chatActive === true });
         else json(res, 503, { error: 'The maintenance hold could not be taken.' });
       }
+      return true;
+    }
+    const ticket = /^\/ticket\/([0-9a-f]{32})$/.exec(target.slice(PREFIX.length));
+    if (ticket) {
+      if (req.method !== 'DELETE') return notFound();
+      leases.releaseTicket(ticket[1]);
+      res.statusCode = 204;
+      res.end();
       return true;
     }
     const match = /^\/([0-9a-f]{32})(\/renew)?$/.exec(target.slice(PREFIX.length));

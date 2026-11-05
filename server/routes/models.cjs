@@ -78,6 +78,7 @@ function createModelRoutes({ servedEmbeddingModels = (target) => require('../rag
   // #873: the throughput sweep holds the inference maintenance gate for as long as it runs.
   const sweepGuard = typeof modelManager.holdMaintenance === 'function' ? require('../benchmark-sweep-guard.cjs').createSweepGuard({
     hold: reason => modelManager.holdMaintenance(reason),
+    barrier: typeof modelManager.chatBarrier === 'function' ? reason => modelManager.chatBarrier(reason) : null,
     progress: () => fetchJson(`${String(env.MODEL_LOADER_URL || '').replace(/\/+$/, '')}/api/v1/benchmark/progress`, { method: 'GET', headers: loaderHeaders() }, 15000),
     log: message => console.log(message),
     ...sweepGuardOptions,
@@ -349,7 +350,7 @@ function createModelRoutes({ servedEmbeddingModels = (target) => require('../rag
           if(refusal)return json(res,409,refusal);
         }
         if(sweepGuard&&aliases.length){
-          try{sweepRelease=await sweepGuard.acquire();}catch(e){return json(res,409,{error:e.publicMessage||'The sweep could not start.'});}
+          try{sweepRelease=await sweepGuard.acquire();}catch(e){return json(res,e?.status===503?503:409,{error:e.publicMessage||'The sweep could not start.',...(e?.status===503?{code:e.code,retryable:true}:{})});}
           sweepModels=aliases.length;
         }
       }

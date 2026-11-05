@@ -15,8 +15,11 @@
 
 const SWEEP_PAUSE_REASON = 'Chat is paused while noevia runs a throughput sweep. It will be available again when the sweep finishes or is cancelled.';
 const SWEEP_BUSY_ERROR = 'Requests are in progress, or a calibration, auto-tune or settings change is running. Wait for it to finish, then start the sweep.';
+// Row J review: the maintenance lease authority (the Rust front) not answering is an outage, not a busy engine.
+const SWEEP_UNAVAILABLE_ERROR = 'The maintenance lease authority is not answering, so the sweep was not started. Try again shortly.';
+const authorityUnavailable = (e) => e?.status === 503 && e?.code === 'maintenanceAuthorityUnavailable';
 
-function createSweepGuard({ hold, progress, log = () => {}, pollMs = 5000, perModelMs = 30 * 60 * 1000, slackMs = 5 * 60 * 1000,
+function createSweepGuard({ hold, progress, barrier = null, log = () => {}, pollMs = 5000, perModelMs = 30 * 60 * 1000, slackMs = 5 * 60 * 1000,
   unreachableMs = 2 * 60 * 1000, now = () => Date.now(), setTimer = setTimeout, clearTimer = clearTimeout,
   adoptRetryMs = 2000, adoptMaxDelayMs = 60 * 1000, adoptAttempts = 10 }) {
   let watching = null, adoptTimer = null, adoptWake = null, adoptCancelled = false;
@@ -30,8 +33,12 @@ function createSweepGuard({ hold, progress, log = () => {}, pollMs = 5000, perMo
     // waitable: a refusal that ends on its own (the inference gate's, this process's chat running, or
     // the gate not answering), unlike a hold of this process (a calibration), which is not fought over.
     const waitable = (e) => e?.fromGate === true || e?.chatActive === true || e?.status === 502;
-    try { held = hold(SWEEP_PAUSE_REASON); } catch (e) { throw Object.assign(refusal(), { waitable: waitable(e) }); }
-    if (typeof held?.then === 'function') return held.catch((e) => { throw Object.assign(refusal(), { waitable: waitable(e) }); });
+    // An unavailable authority keeps its 503 (and is transient: adopt() waits it out behind a chat barrier).
+    const failure = (e) => (authorityUnavailable(e)
+      ? Object.assign(Error(SWEEP_UNAVAILABLE_ERROR), { status: 503, code: 'maintenanceAuthorityUnavailable', publicMessage: SWEEP_UNAVAILABLE_ERROR, waitable: true, unavailable: true })
+      : Object.assign(refusal(), { waitable: waitable(e) }));
+    try { held = hold(SWEEP_PAUSE_REASON); } catch (e) { throw failure(e); }
+    if (typeof held?.then === 'function') return held.catch((e) => { throw failure(e); });
     return held;
   }
 
@@ -95,13 +102,32 @@ function createSweepGuard({ hold, progress, log = () => {}, pollMs = 5000, perMo
     // limit), and a chat may be finishing: the hold is asked for again with the same doubling delay, at most
     // adoptAttempts times (the delays add up to well past the gate's 60 s idle limit).
     let release;
+    // Row J review: while the lease authority does not answer, chat stays closed behind a barrier (the sweep
+    // is known to be running), and the hold is asked for again for as long as the sweep runs, within its bound.
+    let unbar = null;
+    const lift = () => { if (unbar) { unbar(); unbar = null; } };
+    const bound = now() + Math.max(1, Number(job.total) || 1) * perModelMs + slackMs;
     for (let attempt = 1, delay = adoptRetryMs; ; attempt += 1, delay = Math.min(delay * 2, adoptMaxDelayMs)) {
-      if (adoptCancelled || watching) return false;
+      if (adoptCancelled || watching) { lift(); return false; }
       // Only a refusal that ends on its own is waited out; a hold of this process (a calibration) is not fought over.
-      try { release = await acquire(); break; } catch (e) { if (!e?.waitable) return false; }
-      if (attempt >= adoptAttempts) { log('[models] throughput sweep still running after a restart, but chat could not be paused for it.'); return false; }
+      let outage = false;
+      try { release = await acquire(); break; } catch (e) {
+        if (!e?.waitable) { lift(); return false; }
+        outage = e?.unavailable === true;
+      }
+      if (outage) {
+        if (!unbar && typeof barrier === 'function') {
+          unbar = barrier(SWEEP_PAUSE_REASON);
+          log('[models] throughput sweep still running after a restart and the lease authority is not answering: chat paused while the hold is retried.');
+        }
+        let still = null;
+        try { const r = await progress(); still = r?.ok && r.body && typeof r.body === 'object' ? r.body.job || null : undefined; } catch { still = undefined; }
+        if (still === null || (still && still.active !== true)) { lift(); log('[models] throughput sweep: finished while chat was paused for it.'); return false; }
+        if (now() >= bound) { lift(); log('[models] throughput sweep ran past its time limit while the lease authority was not answering; chat resumed.'); return false; }
+      } else if (attempt >= adoptAttempts) { lift(); log('[models] throughput sweep still running after a restart, but chat could not be paused for it.'); return false; }
       await pause(delay);
     }
+    lift();
     if (adoptCancelled || watching) { release(); return false; }
     log('[models] throughput sweep still running after a restart: chat paused until it finishes.');
     watch(release, Math.max(1, Number(job.total) || 1));
@@ -118,4 +144,4 @@ function createSweepGuard({ hold, progress, log = () => {}, pollMs = 5000, perMo
   return { acquire, watch, adopt, cancelAdopt, active: () => !!watching };
 }
 
-module.exports = { createSweepGuard, SWEEP_PAUSE_REASON, SWEEP_BUSY_ERROR };
+module.exports = { createSweepGuard, SWEEP_PAUSE_REASON, SWEEP_BUSY_ERROR, SWEEP_UNAVAILABLE_ERROR };

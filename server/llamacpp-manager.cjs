@@ -40,7 +40,7 @@ const AVAILABLE_STATES = new Set(['loaded', 'sleeping']);
 const isAvailable = model => AVAILABLE_STATES.has(model.status?.value);
 const alreadyRunning = result => result?.status === 400 && /already running/i.test(JSON.stringify(result?.body ?? ''));
 
-function createLlamaCppManager({ budgetWatchDir = null, baseUrl, apiKey, fetchJson, presetPath, downloadStatePath, fetchStream, autoconfig = {}, calibrationStatePath, calibrationOptions = {}, publicCalibrator = false, evidenceDir, autotuneStatePath, autotuneOptions = {}, presetWriter = null, inferenceBudget = null, reloadStatePath = null, reloadGuard: reloadGuardOption = null, presetBaselineClient = null, gate = null, gateAdminToken = null, maintenanceAuthority = null }) {
+function createLlamaCppManager({ budgetWatchDir = null, baseUrl, apiKey, fetchJson, presetPath, downloadStatePath, fetchStream, autoconfig = {}, calibrationStatePath, calibrationOptions = {}, publicCalibrator = false, evidenceDir, autotuneStatePath, autotuneOptions = {}, presetWriter = null, inferenceBudget = null, reloadStatePath = null, reloadGuard: reloadGuardOption = null, presetBaselineClient = null, gate = null, gateAdminToken = null, maintenanceAuthority = null, maintenanceGateOptions = {} }) {
   const base = String(baseUrl || '').replace(/\/+$/, '').replace(/\/v1$/, '');
   const url = new URL(base);
   if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password || url.search || url.hash) throw Error('Invalid llama.cpp router URL');
@@ -85,7 +85,9 @@ function createLlamaCppManager({ budgetWatchDir = null, baseUrl, apiKey, fetchJs
   // Row J: without one, the Rust front's lease authority (model-maintenance-lease.cjs createNativeLeaseClient).
   const gateRemote=typeof gateClient.holdMaintenance==='function'&&gateClient.hasAdmin?.()===true?gateClient:null;
   const maintenanceRemote=gateRemote&&maintenanceAuthority?require('./model-maintenance-lease.cjs').chainRemotes(gateRemote,maintenanceAuthority):(gateRemote||maintenanceAuthority||null);
-  const maintenance=require('./inference-maintenance.cjs').createMaintenanceGate({remote:maintenanceRemote,observeMs:gate?0:3000});
+  // Row J review P1: the longest preset step (a write and its 120 s router reload) a lease must cover.
+  const PRESET_STEP_MS=Number.isFinite(maintenanceGateOptions.presetStepMs)?maintenanceGateOptions.presetStepMs:150000;
+  const maintenance=require('./inference-maintenance.cjs').createMaintenanceGate({remote:maintenanceRemote,observeMs:gate?0:3000,...maintenanceGateOptions});
   holdHeaders=maintenance.holdHeaders;
   // #1012: what the router last read, so a reload can keep loaded models (preset-reload.cjs, #1071: always on).
   // With the front's store client the baseline is the front's (bridge mode, preset-reload.cjs
@@ -290,6 +292,9 @@ function createLlamaCppManager({ budgetWatchDir = null, baseUrl, apiKey, fetchJs
     if(!models.some(m=>m.id===body.model))return {ok:false,status:404,body:{error:'Choose an installed model'}};
     if(models.some(m=>!['unloaded'].includes(m.status?.value)))return {ok:false,status:409,body:{error:'Unload all router models and finish downloads before applying a profile. Other clients must remain stopped.'}};
     const candidate=presets.prepare(body);
+    // Row J review P1: the write and its reload are one step; it starts only while this process's lease
+    // of the front's authority (if that is what it holds) covers it. The restore below settles that step.
+    maintenance.assertCovered(PRESET_STEP_MS);
     // #1003: auto-tune asks for one recovery copy per run (backup:false on its later writes).
     try {await presets.commit(candidate,writeOptions.backup===false?{backup:false}:undefined);}
     catch(e) {
@@ -327,16 +332,19 @@ function createLlamaCppManager({ budgetWatchDir = null, baseUrl, apiKey, fetchJs
     let release;
     try{release=await maintenance.hold();}catch(e){throw e?.status===409?Object.assign(e,{holdRefused:true}):e;}
     try{
+      // Row J review P1: no write once the lease cannot cover it (delete, prune, manager section writes).
+      maintenance.assertCovered(PRESET_STEP_MS);
       const written=await write();
       if(!reloadIf(written))return{written,reload:null};
       // The write stands whatever the reload does; its failure is the same "not applied yet".
       let reload;
-      try{reload=await reloadHeld({unload:false});}catch{reload={ok:false};}
+      try{reload=await reloadHeld({unload:false});}catch(e){if(e?.coverageLost)throw e;reload={ok:false};}
       return{written,reload};
     }finally{release();}
   }
   // The body of a reload; the caller holds the gate.
   async function reloadHeld({unload=false}={}) {
+    maintenance.assertCovered(PRESET_STEP_MS);
     const {liveIds}=require('./preset-reload.cjs');
     const refuse=(ids,reason)=>({ok:false,status:409,body:{error:'A model is loaded. Unload it to apply the new settings.',loaded:ids,...(reason?{reason}:{})}});
     const listing=await rawModels();
@@ -674,12 +682,15 @@ function createLlamaCppManager({ budgetWatchDir = null, baseUrl, apiKey, fetchJs
   // observeMs (3 s) when the front holds the inference gate itself. Inside that window #872's presetWriter.busy()
   // can still read false; chat and inference are excluded by the gate regardless, and a preset write that lands
   // then only fails the run's revision check, which is safe.
-  const calibrator=presets&&publicCalibrator?require('./llamacpp-calibration.cjs').createCalibrator({request,rawModels,presets,maintenance,applyUnlocked,invalidateBaseline,conservativeFor,identityFor:tuneIdentity,onResult:({model,status,entry})=>recordEvidence(model,status==='passed'?{category:'context_capacity',result:'passed',value:{ctx:entry.verifiedCtx,appliedCtx:entry.appliedCtx,slots:entry.slots},suite:{name:'native-calibration',version:1},source:'calibration',limitations:[`prompt budget ${entry.promptBudgetSeconds} s`]}:{category:'context_capacity',result:'failed',value:null,suite:{name:'native-calibration',version:1},source:'calibration',limitations:[String(entry.error||'').slice(0,200)]}),stream:(path,opts={})=>(fetchStream||fetch)(base+path,{...opts,headers:headers(opts.headers),redirect:'error'}),stateFile:calibrationStatePath,memoryFloorGib:autoconfig.memoryFloorGib||2,...calibrationOptions}):null;
+  // Row J review P1: every router step of a calibration or tune first checks this process's lease coverage,
+  // so a job whose lease of the front's authority ended stops before its next step.
+  const coveredRequest=(path,options,timeout)=>{try{maintenance.assertCovered(Number(timeout)||0);}catch(e){return Promise.reject(e);}return request(path,options,timeout);};
+  const calibrator=presets&&publicCalibrator?require('./llamacpp-calibration.cjs').createCalibrator({request:coveredRequest,rawModels,presets,maintenance,applyUnlocked,invalidateBaseline,conservativeFor,identityFor:tuneIdentity,onResult:({model,status,entry})=>recordEvidence(model,status==='passed'?{category:'context_capacity',result:'passed',value:{ctx:entry.verifiedCtx,appliedCtx:entry.appliedCtx,slots:entry.slots},suite:{name:'native-calibration',version:1},source:'calibration',limitations:[`prompt budget ${entry.promptBudgetSeconds} s`]}:{category:'context_capacity',result:'failed',value:null,suite:{name:'native-calibration',version:1},source:'calibration',limitations:[String(entry.error||'').slice(0,200)]}),stream:(path,opts={})=>(fetchStream||fetch)(base+path,{...opts,headers:headers(opts.headers),redirect:'error'}),stateFile:calibrationStatePath,memoryFloorGib:autoconfig.memoryFloorGib||2,...calibrationOptions}):null;
   const tuneDeps={identityFor:tuneIdentity,stateFile:autotuneStatePath,memoryFloorGib:autoconfig.memoryFloorGib||2,...(calibrationOptions.readMemory?{readMemory:calibrationOptions.readMemory}:{}),...autotuneOptions};
   // Internal context checks run under the full tuner's per-model lease; standalone
   // calibration still acquires the real gate.
   const managedGate={hold:()=>()=>{}};
-  const autotuner=presets&&autotuneStatePath?require('./llamacpp-full-autotune.cjs').createFullAutotuner({fileMissing:presetFileMissing,request,rawModels,presets,maintenance,applyUnlocked,invalidateBaseline,identityFor:tuneDeps.identityFor,stateFile:autotuneStatePath,
+  const autotuner=presets&&autotuneStatePath?require('./llamacpp-full-autotune.cjs').createFullAutotuner({fileMissing:presetFileMissing,request:coveredRequest,rawModels,presets,maintenance,applyUnlocked,invalidateBaseline,identityFor:tuneDeps.identityFor,stateFile:autotuneStatePath,
       samplingFor,
       // #1079: a Long tune adds its `<model>-long` section, then the router re-reads models.ini the
       // way every other noevia write does (recorded for the preset reload guard).
@@ -761,6 +772,10 @@ function createLlamaCppManager({ budgetWatchDir = null, baseUrl, apiKey, fetchJs
     holdMaintenance: reason => maintenance.hold(reason),
     // Row J: the latch the Rust front's lease takes (model-maintenance-lease.cjs createLeaseRoutes).
     holdMaintenanceLocal: reason => maintenance.holdLocal(reason),
+    // Row J review: the coverage check of this process's lease, and a chat barrier (sweep recovery).
+    assertMaintenanceCovered: stepMs => maintenance.assertCovered(stepMs),
+    maintenanceCoverageSignal: () => maintenance.coverageSignal(),
+    chatBarrier: reason => maintenance.barrier(reason),
     tuningActive: () => maintenance.held() || calibrator?.stateFacts().job?.status === 'running' || autotuner?.statusFacts().job?.status === 'running',
     presetFacts: model => presets?.get(model) ?? null,
     applyPreset,
