@@ -4,7 +4,7 @@ const { Readable } = require('node:stream');
 const { createModelRoutes } = require('./models.cjs');
 const { createIdleUnloadSetting } = require('./idle-unload-setting.cjs');
 const fs = require('node:fs');
-function routes({ installed, sections, reload = { ok: true, status: 200, body: { reloaded: true } }, scan = null, cache = new Map(), manager = {} }) {
+function routes({ installed, sections, reload = { ok: true, status: 200, body: { reloaded: true } }, scan = null, cache = new Map(), manager = {}, unreachable = false, scanFailure = false }) {
   const sent = [], fetched = [], reloads = [];
   let presets = sections.map((s) => ({ ...s }));
   // The router lists a preset until it re-reads models.ini (the #1695 regression).
@@ -22,6 +22,7 @@ function routes({ installed, sections, reload = { ok: true, status: 200, body: {
     readJson: async (req) => { let s = ''; for await (const c of req) s += c; return s ? JSON.parse(s) : {}; },
     fetchJson: async (url, init) => {
       fetched.push(`${init.method} ${url.replace('http://loader.invalid/api/v1/', '')}`);
+      if (url.endsWith('/api/v1/models') && init.method === 'GET' && scanFailure) return {ok:false,status:500,body:{}};
       if (url.endsWith('/api/v1/models') && init.method === 'GET') return { ok: true, status: 200, body: { models: scanFiles() } };
       if (url.endsWith('/sections') && init.method === 'GET') return { ok: true, status: 200, body: { revision: `r${presets.length}`, sections: presets } };
       const m = /sections\/([^?]+)\?baseRevision=r(\d+)$/.exec(url);
@@ -34,7 +35,7 @@ function routes({ installed, sections, reload = { ok: true, status: 200, body: {
     createVisionProbe: () => async () => ({ supported: true }),
     missingRoles: () => null, currentWorkspace: () => ({ userId: 'u1' }),
     service: { modelScanCache: cache, refreshModelScan: () => {}, autoRoles: () => null, setAutoRoles: () => {}, ensureRolesLoaded: () => {},
-      servedCatalogue: async () => [], modelsInstalled: async () => { listedAt.push(cache.has('models')); return routerRows; }, deriveUserModelName: (c) => c,
+      servedCatalogue: async () => [], modelsInstalled: async () => { listedAt.push(cache.has('models')); if(unreachable)throw Error('synthetic unavailable'); return routerRows; }, deriveUserModelName: (c) => c,
       lastLoadedModel: () => null, clearLastLoadedModel: () => {}, clearRoleReferences: () => [] },
   });
   const call = async (method, p, body, role = 'admin', rawText) => {
@@ -80,6 +81,8 @@ async function main() {
     output.idle.push({spec,status,body,calls});
   }
   const specs=[
+    {name:'engine-unreachable',unreachable:true,installed:[{name:'ok'}],sections:[]},
+    {name:'scan-failure',scanFailure:true,installed:[{name:'ok'}],sections:[]},
     {name:'none',installed:[{name:'ok'}],sections:[{name:'ok',hasFile:true}]},
     {name:'empty',installed:[{name:'gone',missingFile:true}],sections:[{name:'gone',hasFile:false}],scan:[]},
     {name:'majority',installed:[{name:'gone',missingFile:true},{name:'gone2',missingFile:true},{name:'ok'}],sections:[]},
