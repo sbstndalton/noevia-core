@@ -539,6 +539,57 @@
     }
   },
   {
+    "name": "shadowed-to-string",
+    "raw": "{\"checkpoint\":{\"toString\":null}}",
+    "enabled": true,
+    "ok": true,
+    "upstreamStatus": 202,
+    "upstream": {
+      "id": "ignored",
+      "modelName": "ignored"
+    },
+    "expected": {
+      "status": 500,
+      "body": {
+        "error": "Internal error"
+      }
+    }
+  },
+  {
+    "name": "shadowed-to-string-named",
+    "raw": "{\"checkpoint\":{\"toString\":null},\"modelName\":\"synthetic\"}",
+    "enabled": true,
+    "ok": true,
+    "upstreamStatus": 202,
+    "upstream": {
+      "id": "ignored",
+      "modelName": "ignored"
+    },
+    "expected": {
+      "status": 500,
+      "body": {
+        "error": "Internal error"
+      }
+    }
+  },
+  {
+    "name": "nested-shadowed-to-string",
+    "raw": "{\"checkpoint\":[{\"toString\":null}]}",
+    "enabled": true,
+    "ok": true,
+    "upstreamStatus": 202,
+    "upstream": {
+      "id": "ignored",
+      "modelName": "ignored"
+    },
+    "expected": {
+      "status": 500,
+      "body": {
+        "error": "Internal error"
+      }
+    }
+  },
+  {
     "name": "duplicate",
     "raw": "{\"checkpoint\":\"bad\",\"checkpoint\":\"synthetic/repo:Q4\"}",
     "enabled": true,
@@ -560,7 +611,7 @@
     }
   },
   {
-    "name": "upstream-30",
+    "name": "upstream-33",
     "raw": "{\"checkpoint\":\"synthetic/repo\"}",
     "enabled": true,
     "ok": false,
@@ -579,7 +630,7 @@
     }
   },
   {
-    "name": "upstream-31",
+    "name": "upstream-34",
     "raw": "{\"checkpoint\":\"synthetic/repo\"}",
     "enabled": true,
     "ok": false,
@@ -602,7 +653,7 @@
     }
   },
   {
-    "name": "upstream-32",
+    "name": "upstream-35",
     "raw": "{\"checkpoint\":\"synthetic/repo\"}",
     "enabled": true,
     "ok": false,
@@ -621,7 +672,7 @@
     }
   },
   {
-    "name": "upstream-33",
+    "name": "upstream-36",
     "raw": "{\"checkpoint\":\"synthetic/repo\"}",
     "enabled": true,
     "ok": false,
@@ -640,7 +691,7 @@
     }
   },
   {
-    "name": "upstream-34",
+    "name": "upstream-37",
     "raw": "{\"checkpoint\":\"synthetic/repo\"}",
     "enabled": true,
     "ok": false,
@@ -659,7 +710,7 @@
     }
   },
   {
-    "name": "upstream-35",
+    "name": "upstream-38",
     "raw": "{\"checkpoint\":\"synthetic/repo\"}",
     "enabled": true,
     "ok": false,
@@ -676,7 +727,7 @@
     }
   },
   {
-    "name": "upstream-36",
+    "name": "upstream-39",
     "raw": "{\"checkpoint\":\"synthetic/repo\"}",
     "enabled": true,
     "ok": false,
@@ -693,7 +744,7 @@
     }
   },
   {
-    "name": "disabled-37",
+    "name": "disabled-40",
     "raw": "{}",
     "enabled": false,
     "ok": true,
@@ -707,7 +758,7 @@
     }
   },
   {
-    "name": "disabled-38",
+    "name": "disabled-41",
     "raw": "{\"checkpoint\":\"bad\"}",
     "enabled": false,
     "ok": true,
@@ -721,7 +772,7 @@
     }
   },
   {
-    "name": "disabled-39",
+    "name": "disabled-42",
     "raw": "{\"checkpoint\":\"synthetic/repo\"}",
     "enabled": false,
     "ok": true,

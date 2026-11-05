@@ -74,9 +74,7 @@
       "body": {
         "ok": true,
         "unloaded": true,
-        "rolesCleared": [
-          "fast"
-        ],
+        "rolesCleared": [],
         "presetRemoved": false
       }
     }

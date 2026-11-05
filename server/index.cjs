@@ -1283,7 +1283,7 @@ const toolboxPickerFacts = require('./rust-toolbox-picker-facts.cjs').createTool
   mcp: () => ({ enabled: mcpWiring.enabled(), state: mcpState, servers: MCP_SERVERS, manifest: MCP_TOOLBOX_MANIFEST }),
 });
 
-const modelMutationsBridge = require('./rust-model-mutations-bridge.cjs').createModelMutationsBridge({ secret: FRONT_SECRET, json, readJson, manager: () => modelManager, service: modelService, asUser: diaryAsUser, env: process.env });
+const modelMutationsBridge = require('./rust-model-mutations-bridge.cjs').createModelMutationsBridge({ secret: FRONT_SECRET, json, readJson, manager: () => modelManager, service: modelService, env: process.env });
 
 // With no inference gate, the Rust front's reload holds this process's own maintenance gate (#2210).
 const maintenanceLeases = require('./model-maintenance-lease.cjs').createLeaseRoutes({

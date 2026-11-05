@@ -5,6 +5,7 @@ const baseline=process.env.NOEVIA_ORACLE_CORE;
 if(!baseline)throw Error('NOEVIA_ORACLE_CORE must name the pinned legacy Core source');
 const {createModelRoutes}=require(path.join(baseline,'server/routes/models.cjs'));
 const system=require(path.join(baseline,'server/model-system.cjs'));
+const {createModelService}=require(path.join(baseline,'server/models.cjs'));
 system.rememberSectionRoles('{"synthetic-system":"system-routing"}');
 const cases=[
  {name:'success',raw:'{"name":"synthetic"}',known:true,ok:true,status:200,unloaded:true},
@@ -17,7 +18,7 @@ const cases=[
  {name:'plain-failure',raw:'{"name":"synthetic"}',known:true,ok:false,status:500,unloaded:false},
  {name:'in-use',raw:'{"name":"synthetic"}',known:true,ok:false,status:409,unloaded:false,error:{error:{type:'gate_error',code:'model_in_use',message:'Busy',retryable:true}}},
 ];
-async function capture(c){let answer;const service={modelScanCache:{clear(){}},modelsInstalled:async()=>[{name:'synthetic'},{name:'synthetic-system'}],clearRoleReferences:()=>['fast'],lastLoadedModel:()=>null,clearLastLoadedModel(){}};
+async function capture(c){let answer;const workspace={autoRoles:{fast:'synthetic',smart:'other'},saveAutoRoles(){}};const shared=createModelService({fetchJson:async()=>({ok:false}),env:{},modelManager:{enabled:false},currentWorkspace:()=>workspace,listWorkspaces:()=>[workspace]});const service={modelScanCache:{clear(){}},modelsInstalled:async()=>[{name:'synthetic'},{name:'synthetic-system'}],clearRoleReferences:shared.clearRoleReferences,lastLoadedModel:()=>null,clearLastLoadedModel(){}};
  const manager={enabled:true,kind:'llamacpp',request:async()=>({ok:true,body:{data:[{id:'synthetic',status:{args:[]}}]}}),removeModel:async()=>({ok:c.ok,status:c.status,unloaded:c.unloaded,body:c.error||{}})};
  const route=createModelRoutes({json:(_r,status,body)=>{answer={status,body};},readBody:async()=>c.raw,env:{},modelManager:manager,service,currentWorkspace:()=>({})});
  try{await route({method:'POST'},{},{path:'/api/models/delete',authn:{user:{id:'admin',role:'admin'}},url:new URL('http://synthetic.invalid/api/models/delete')});}catch{answer={status:500,body:{error:'Internal error'}};}
