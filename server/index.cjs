@@ -1123,7 +1123,7 @@ const modelManagerScanCache = require('./rust-model-manager-scan-cache.cjs').cre
   secret: FRONT_SECRET, json, readJson, service: modelService,
 });
 const modelRoutes = require('./routes/models.cjs').createModelRoutes({
-  json, readBody, readJson, fetchJson, env: process.env, modelManager, currentWorkspace, service: modelService, inferenceBudget, idleUnload, decisionSettings, rerankSettings,
+  json, readBody, readJson, fetchJson, env: process.env, modelManager, currentWorkspace, service: modelService, inferenceBudget, idleUnload, decisionSettings,
 });
 // State only this process knows, published for the Rust front (published-snapshot.cjs): the retrieval
 // status behind GET /api/health (rust-health.cjs) and the served catalogue and machine models behind

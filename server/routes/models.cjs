@@ -68,7 +68,7 @@ function clientMessage(e, fallback) {
 const STATS_REFUSAL = Object.freeze({ error: 'Engine statistics are owned by the Rust front.' });
 const ROUTING_DEFAULT_REFUSAL = Object.freeze({ error: 'Routing default is owned by the Rust front.' });
 const AUTO_ROLES_REFUSAL = Object.freeze({ error: 'The auto-roles read is owned by the Rust front.', code: 'RUST_AUTO_ROLES_OWNED' });
-function createModelRoutes({ servedEmbeddingModels = (target) => require('../rag.cjs').servedModelsCached(target), json, readBody, readJson, fetchJson, env, modelManager, currentWorkspace, service, inferenceBudget = null, idleUnload = null, sweepGuardOptions = {}, decisionSettings = null, rerankSettings = null }) {
+function createModelRoutes({ servedEmbeddingModels = (target) => require('../rag.cjs').servedModelsCached(target), json, readBody, readJson, fetchJson, env, modelManager, currentWorkspace, service, inferenceBudget = null, idleUnload = null, sweepGuardOptions = {}, decisionSettings = null }) {
   const { modelScanCache, refreshModelScan, autoRoles, setAutoRoles, ensureRolesLoaded, servedCatalogue, modelsInstalled, deriveUserModelName, lastLoadedModel, clearLastLoadedModel, clearRoleReferences } = service;
   // #1461: the installed list is shared for a moment (service.modelsInstalled). A decision that must confirm
   // the engine's state right now (a delete that checks the model exists, a load that checks it is not missing)
