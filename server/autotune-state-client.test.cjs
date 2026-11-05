@@ -5,7 +5,7 @@ const { createAutotuneStateClient, Fenced } = require('./autotune-state-client.c
 const WRITER = 'a'.repeat(32);
 function rig(handler, opts = {}) {
   const sent = [];
-  const call = async (op, payload) => { sent.push({ op, payload: JSON.parse(JSON.stringify(payload)) }); return handler(op, payload, sent.length); };
+  const call = async (op, payload) => { sent.push({ op, payload: JSON.parse(JSON.stringify(payload)) }); if (op === 'attach' && payload.open) return { status: 200, body: { incarnation: 1 } }; return handler(op, payload, sent.length); };
   return { client: createAutotuneStateClient({ call, base: 'native-autotune-0123456789abcdef.json', ...opts }), sent };
 }
 const attached = { status: 200, body: { writer: WRITER, rev: 2, jobRev: 3, epoch: 4, state: { history: {}, settings: {} } } };
@@ -13,7 +13,9 @@ const attached = { status: 200, body: { writer: WRITER, rev: 2, jobRev: 3, epoch
 test('attach binds to the named state file and learns the writer, job revision and epoch', async () => {
   const { client, sent } = rig(() => attached);
   const r = await client.attach();
-  assert.deepEqual(sent, [{ op: 'attach', payload: { base: 'native-autotune-0123456789abcdef.json', available: true } }]);
+  assert.match(sent[0].payload.actor, /^[a-f0-9]{32}$/);
+  assert.deepEqual(sent[1].payload, { base: 'native-autotune-0123456789abcdef.json', available: true, actor: sent[0].payload.actor, incarnation: 1 });
+  sent.shift();
   assert.equal(client.writer, WRITER); assert.equal(client.jobRev, 3); assert.equal(client.epoch, 4);
   assert.deepEqual(r.state, { history: {}, settings: {} });
 });
@@ -31,14 +33,14 @@ test('commit sends the writer and job revision with the whole job and history, a
   const { client, sent } = rig((op) => op === 'attach' ? attached : { status: 200, body: { rev: 9, jobRev: 3, epoch: 5, settings: { m: { allowQ5Kv: true } } } });
   await client.attach();
   const reply = await client.commit({ job: { id: 'j' }, history: { m: [] } });
-  assert.deepEqual(sent[1], { op: 'commit', payload: { writer: WRITER, jobRev: 3, history: { m: [] }, job: { id: 'j' } } });
+  assert.deepEqual(sent[2], { op: 'commit', payload: { writer: WRITER, jobRev: 3, history: { m: [] }, job: { id: 'j' } } });
   assert.equal(client.epoch, 5);
   assert.deepEqual(reply.settings, { m: { allowQ5Kv: true } });
   // A state with no job leaves the key out (the owner removes the job).
   await client.commit({ history: {} });
-  assert.equal(Object.hasOwn(sent[2].payload, 'job'), false);
+  assert.equal(Object.hasOwn(sent[3].payload, 'job'), false);
   await client.commit({ job: { id: 'k' }, history: {}, register: true });
-  assert.equal(sent[3].payload.register, true);
+  assert.equal(sent[4].payload.register, true);
 });
 
 test('a refused commit carries the owner state and why; an unreachable owner is fenced too', async () => {
@@ -64,15 +66,30 @@ test('the start hold: busy is false, a refused writer is fenced, end never throw
   mode = 'down'; await client.end();
 });
 
-test('sync returns the owner state and adopts its revisions', async () => {
+test('sync observes state; only explicit replica adoption advances its fence', async () => {
   const { client } = rig((op) => op === 'attach' ? attached : { status: 200, body: { rev: 3, jobRev: 11, epoch: 12, state: { history: {}, settings: { m: {} } } } });
   await client.attach();
   const r = await client.sync();
   assert.deepEqual(r.state.settings, { m: {} });
+  assert.deepEqual([client.jobRev, client.epoch], [3, 4]);
+  client.setRun(r);
   assert.deepEqual([client.jobRev, client.epoch], [11, 12]);
 });
 
 test('constructing without its parts fails fast', () => {
   assert.throws(() => createAutotuneStateClient({ base: 'x' }));
   assert.throws(() => createAutotuneStateClient({ call: async () => null }));
+});
+
+
+test('settings reads and unadopted full reads cannot launder a stale replica fence', async () => {
+  const { client, sent } = rig(op => op === 'attach' ? attached : op === 'sync'
+    ? { status: 200, body: { jobRev: 99, epoch: 99, state: { settings: {}, job: { id: 'new' }, history: {} } } }
+    : { status: 409, body: { fenced: 'job' } });
+  await client.attach();
+  await client.sync({ settingsOnly: true });
+  await assert.rejects(client.commit({ job: { id: 'old' }, history: {} }));
+  assert.equal(sent.at(-1).payload.jobRev, 3);
+  await client.sync({ adopt: false });
+  assert.equal(client.jobRev, 3);
 });

@@ -259,12 +259,12 @@ function createFullAutotuner({ request: engineRequest, rawModels: engineRawModel
   // owner's, read here only. Every change reaches the owner through save() (ordered, coalesced, fenced)
   // and flush()/barrier() (before a step that cannot be undone). A refused write, an unreachable owner
   // or a job the owner changed under a running tune stops the run (fenceLost): it is never retried and
-  // never continued; the actor attaches again once the stopped run has settled, and recover() then
+  // never continued; only an explicitly unbound restarted owner permits reattachment after settlement; recover() then
   // finishes what a restart would.
   if (!stateClient) throw new Error('createFullAutotuner needs a stateClient');
   let state = { history: {}, settings: {} };
   let cancelled = false, child = null, completion = Promise.resolve(), starting = false, inflight = null, idleAbort = null;
-  let runActive = false, runEpoch = 0, attaching = null, fenced = null, dirty = false, pushing = null, healing = null;
+  let runActive = false, runEpoch = 0, attaching = null, fenced = null, dirty = false, pushing = null;
   const adoptState = doc => {
     state = doc && typeof doc === 'object' && !Array.isArray(doc) ? { ...doc } : {};
     state.history ||= {};
@@ -301,22 +301,15 @@ function createFullAutotuner({ request: engineRequest, rawModels: engineRawModel
     fenced = e || fencedError();
     console.warn('[autotune] state ownership lost (' + (e?.why || 'unknown') + '); stopping the run');
     try { abortControllers(); } catch { /* the run stops at its next check */ }
-    heal();
-  }
-  function heal() {
-    healing ||= (async () => {
-      try {
-        await completion.catch(() => {});
-        while (starting) await sleep(100);
-        cancelled = false; attaching = null;
-        for (;;) {
-          try { await attach(); break; } catch { await sleep(5000); }
-        }
-        await recoverState();
-        await flush().catch(() => {});
-      } finally { healing = null; }
-    })().catch(() => {});
-    return healing;
+    // Only an explicitly unbound front proves the authority restarted. A writer refusal from a
+    // live owner is permanent. Recovery waits for all old effects to settle and adopts a full replica.
+    if (e?.why === 'unbound') void (async () => {
+      await completion.catch(() => {});
+      while (starting) await sleep(100);
+      attaching = null;
+      try { await attach(); cancelled = false; await recoverState(); await flush(); } catch { /* remain fenced */ }
+    })();
+
   }
   async function drain() {
     try {
@@ -339,11 +332,11 @@ function createFullAutotuner({ request: engineRequest, rawModels: engineRawModel
   async function refresh({ adopt = !runActive && !starting } = {}) {
     if (adopt) await flush();
     let reply;
-    try { reply = await stateClient.sync(); } catch (e) { onFence(e); throw fencedError(); }
+    try { reply = await stateClient.sync({ adopt }); } catch (e) { onFence(e); throw fencedError(); }
     state.settings = reply.state?.settings && typeof reply.state.settings === 'object' ? reply.state.settings : {};
     if (adopt) {
       const keep = state.settings;
-      adoptState(reply.state); state.settings = keep; runEpoch = reply.epoch;
+      adoptState(reply.state); stateClient.setRun(reply); state.settings = keep; runEpoch = reply.epoch;
       if (state.job?._reloadPending) scheduleReload(state.job);
     }
   }
@@ -359,7 +352,12 @@ function createFullAutotuner({ request: engineRequest, rawModels: engineRawModel
     p.then(() => {}, () => {}).then(() => { if (completion === p) runActive = false; });
     return p;
   }
-  const check = () => { if (cancelled) throw cancelledError(); };
+  const authority = () => { if (fenced) throw fencedError(); };
+  const ownedCommit = (...args) => { authority(); return presets.commit(...args); };
+  const ownedApply = (...args) => { authority(); return applyUnlocked(...args); };
+  const ownedRequest = (...args) => { authority(); return request(...args); };
+  const ownedReload = () => { authority(); return routerReload ? routerReload() : request('/models?reload=1', {}, 120000); };
+  const check = () => { authority(); if (cancelled) throw cancelledError(); };
   const note = (j, text) => { (j.log ||= []).push({ at: now(), text }); if (j.log.length > 400) j.log.shift(); save(); };
   const phaseOf = (item, id) => item.phases.find(p => p.id === id);
   const settingsOf = model => ({ allowQ5Kv: state.settings[model]?.allowQ5Kv === true });
@@ -434,7 +432,7 @@ function createFullAutotuner({ request: engineRequest, rawModels: engineRawModel
           // #1069: read the count again right before stopping it; a request that just arrived wins.
           const now2 = await requestsProcessing(id);
           if (now2 > 0 || (now2 === null && d.reason === 'idle')) { raced = true; break; }
-          const u = await request('/models/unload', { method: 'POST', body: JSON.stringify({ model: id }) }, 60000);
+          const u = await ownedRequest('/models/unload', { method: 'POST', body: JSON.stringify({ model: id }) }, 60000);
           if (!u.ok) throw Error('Could not unload ' + id + ' before testing.');
         }
         if (!raced) {
@@ -555,7 +553,7 @@ function createFullAutotuner({ request: engineRequest, rawModels: engineRawModel
     for (const row of r.body.data) if (['loaded', 'loading', 'sleeping'].includes(row.status?.value)) {
       asked.add(row.id);
       if (!restoring) check();
-      const u = await request('/models/unload', { method: 'POST', body: JSON.stringify({ model: row.id }) }, 60000);
+      const u = await ownedRequest('/models/unload', { method: 'POST', body: JSON.stringify({ model: row.id }) }, 60000);
       if (!u.ok) throw Error('Could not unload ' + row.id + ' before testing.');
     }
     // The router acknowledges unload before its model state changes. Profile writes require
@@ -583,7 +581,7 @@ function createFullAutotuner({ request: engineRequest, rawModels: engineRawModel
     await barrier();
     if (presets.snapshot().revision !== j._revision) throw Object.assign(Error('Settings changed outside auto-tune.'), { fatal: true });
     await unloadAll();
-    const r = await applyUnlocked({ model: j.model, baseRevision: j._revision, options }, writeOptions(j));
+    const r = await ownedApply({ model: j.model, baseRevision: j._revision, options }, writeOptions(j));
     if (r.ok) wrote(j);
     if (!r.ok) throw Object.assign(Error(r.body?.error || 'Could not save settings; the profile may have changed.'), { fatal: r.status === 409 });
     j._revision = presets.snapshot().revision; save();
@@ -640,7 +638,7 @@ function createFullAutotuner({ request: engineRequest, rawModels: engineRawModel
     check();
     await barrier();
     const ask = async () => {
-      const response = await request('/models/load', { method: 'POST', body: JSON.stringify({ model: j.model }) }, 600000);
+      const response = await ownedRequest('/models/load', { method: 'POST', body: JSON.stringify({ model: j.model }) }, 600000);
       if (!response.ok) throw Error('The test profile could not be loaded.');
     };
     await ask();
@@ -705,7 +703,7 @@ function createFullAutotuner({ request: engineRequest, rawModels: engineRawModel
     if (body.baseRevision !== j._revision) throw Object.assign(Error('Settings changed outside auto-tune.'), { fatal: true });
     await barrier();
     await unloadAll();
-    const r = await applyUnlocked(body, writeOptions(j));
+    const r = await ownedApply(body, writeOptions(j));
     if (r?.ok) wrote(j);
     return r;
   };
@@ -975,7 +973,7 @@ function createFullAutotuner({ request: engineRequest, rawModels: engineRawModel
       // router's re-read waits while another client has a model live.
       await unloadOwn(j);
       await flush();
-      await presets.commit({ baseRevision: j._revision, text: p._beforeText }, j._backedUp ? { backup: false } : undefined);
+      await ownedCommit({ baseRevision: j._revision, text: p._beforeText }, j._backedUp ? { backup: false } : undefined);
       j._revision = presets.snapshot().revision; save();
       await reloadRouter(j);
       p.restored = true;
@@ -989,7 +987,7 @@ function createFullAutotuner({ request: engineRequest, rawModels: engineRawModel
     const first = await rawModels();
     if (!first.ok || !Array.isArray(first.body?.data)) throw Error('The model server stopped responding while unloading.');
     const own = first.body.data.find(m => m.id === j.model);
-    if (own && LIVE.includes(own.status?.value)) await request('/models/unload', { method: 'POST', body: JSON.stringify({ model: j.model }) }, 60000).catch(() => null);
+    if (own && LIVE.includes(own.status?.value)) await ownedRequest('/models/unload', { method: 'POST', body: JSON.stringify({ model: j.model }) }, 60000).catch(() => null);
     const deadline = now() + 60000;
     for (let poll = 0; poll < 120; poll++) {
       const listing = await rawModels();
@@ -1009,7 +1007,7 @@ function createFullAutotuner({ request: engineRequest, rawModels: engineRawModel
   async function reloadRouter(j) {
     if ((await othersLiveNow(j.model)) === false) {
       if (await invalidateBaseline('autotune')) {
-        const reload = await request('/models?reload=1', {}, 120000);
+        const reload = await ownedRequest('/models?reload=1', {}, 120000);
         if (!reload.ok) throw Error('The router did not confirm restored settings.');
         j._reloadPending = false; save();
         return;
@@ -1028,14 +1026,14 @@ function createFullAutotuner({ request: engineRequest, rawModels: engineRawModel
   let reloadTimer = null;
   function scheduleReload(j, tries = 0) {
     clearTimeout(reloadTimer);
-    if (!j._reloadPending) return;
+    if (fenced || !j._reloadPending) return;
     if (tries > 120) { note(j, 'The model server has not re-read the restored models.ini; it does so before this model next loads.'); return; }
     reloadTimer = setTimeout(async () => {
-      if (!j._reloadPending) return;
+      if (fenced || !j._reloadPending) return;
       if ((await othersLiveNow(j.model)) === false) {
         // #1072: a flush may have re-read the file while this check was in flight; no second re-read.
-        if (!j._reloadPending) return;
-        try { if (await invalidateBaseline('autotune')) { const r = await request('/models?reload=1', {}, 120000); if (r.ok) { j._reloadPending = false; note(j, 'The model server re-read the restored models.ini.'); return; } } } catch { /* retried below */ }
+        if (fenced || !j._reloadPending) return;
+        try { if (await invalidateBaseline('autotune')) { const r = await ownedRequest('/models?reload=1', {}, 120000); if (r.ok) { j._reloadPending = false; note(j, 'The model server re-read the restored models.ini.'); return; } } } catch { /* retried below */ }
       }
       scheduleReload(j, tries + 1);
     }, Math.max(foreignPollMs * 15, 1));
@@ -1053,7 +1051,7 @@ function createFullAutotuner({ request: engineRequest, rawModels: engineRawModel
     // #1072: a request that throws (the server unreachable) is the same refusal as a bad answer, and the
     // re-read is still owed, so it is re-armed rather than left for the next flush alone.
     // Not acknowledged: no re-read, the same refusal as a failed one (re-armed below).
-    const r = (await invalidateBaseline('autotune')) ? await request('/models?reload=1', {}, 120000).catch(() => null) : null;
+    const r = (await invalidateBaseline('autotune')) ? await ownedRequest('/models?reload=1', {}, 120000).catch(() => null) : null;
     guard?.();
     if (!r?.ok) {
       scheduleReload(j);
@@ -1465,7 +1463,7 @@ function createFullAutotuner({ request: engineRequest, rawModels: engineRawModel
   // restart before the re-read). Re-read once more; if it lists the pair, the tune goes on. Otherwise the
   // job stops with that said, and keeps the section for a Resume (it is not a different file).
   async function finishPendingLongSection(j, item) {
-    try { await (routerReload ? routerReload() : request('/models?reload=1', {}, 120000)); } catch { /* checked below */ }
+    try { await ownedReload(); } catch { /* checked below */ }
     if ((await routerPairs()).pairs.some(p => p.base === item.base && p.long === item.model)) {
       note(j, 'The long-context profile ' + item.model + ' is served; continuing.');
       return;
@@ -1499,21 +1497,21 @@ function createFullAutotuner({ request: engineRequest, rawModels: engineRawModel
     // between leaves a job that can tell its own write from a change made outside auto-tune.
     item.sectionCreated = true; j._pendingRevision = revisionOf(made.text); save();
     await barrier();
-    await presets.commit({ baseRevision: snap.revision, text: made.text }, writeOptions(j));
+    await ownedCommit({ baseRevision: snap.revision, text: made.text }, writeOptions(j));
     wrote(j);
     j._revision = j._pendingRevision; delete j._pendingRevision; save();
     let served = false;
     try {
-      const r = await (routerReload ? routerReload() : request('/models?reload=1', {}, 120000));
+      const r = await ownedReload();
       served = !!r?.ok && (await routerPairs()).pairs.some(p => p.base === item.base && p.long === item.model);
     } catch { served = false; }
     if (!served) {
       // Put the file back as it was, unless it moved on since (then it is left for the operator).
       try {
         if (presets.snapshot().revision === j._revision) {
-          await presets.commit({ baseRevision: j._revision, text: snap.text }, { backup: false });
+          await ownedCommit({ baseRevision: j._revision, text: snap.text }, { backup: false });
           j._revision = presets.snapshot().revision; item.sectionCreated = false; save();
-          await (routerReload ? routerReload() : request('/models?reload=1', {}, 120000)).catch(() => null);
+          await ownedReload().catch(() => null);
         }
       } catch { /* reported below */ }
       throw Object.assign(publicFail('The model server did not pick up the long-context profile ' + item.model + '. models.ini was put back; check the model server, then try again.'), { fatal: true });
@@ -1671,12 +1669,12 @@ function createFullAutotuner({ request: engineRequest, rawModels: engineRawModel
       try {
         if (!j.originalText || !j.lastRevision || presets.snapshot().revision !== j.lastRevision)
           throw Error('The profile changed after the run.');
-        const unloaded = await request('/models/unload', { method: 'POST', body: JSON.stringify({ model: j.model }) }, 60000);
+        const unloaded = await ownedRequest('/models/unload', { method: 'POST', body: JSON.stringify({ model: j.model }) }, 60000);
         if (!unloaded.ok) throw Error('Could not unload the test model.');
-        await presets.commit({ baseRevision: j.lastRevision, text: j.originalText });
+        await ownedCommit({ baseRevision: j.lastRevision, text: j.originalText });
         // Not acknowledged: no re-read now; it stays owed and is retried in the background.
         if (!(await invalidateBaseline('autotune'))) { j._reloadPending = true; throw Error('The router did not confirm restored settings.'); }
-        const reload = await request('/models?reload=1', {}, 120000);
+        const reload = await ownedRequest('/models?reload=1', {}, 120000);
         if (!reload.ok) throw Error('The router did not confirm restored settings.');
         j.restored = true;
       } catch { j.restored = false; }

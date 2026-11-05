@@ -13,8 +13,9 @@
 //
 // Fail closed: an unreachable owner, a refused writer token or a job revision this process has not
 // adopted is a `fenced` outcome, never a retry that continues old work. The actor stops its run on
-// one (llamacpp-full-autotune.cjs fenceLost) and attaches again only after that run has settled.
-// Everything is async and bounded; commits are ordered and coalesced: only the newest state is ever
+// one (llamacpp-full-autotune.cjs onFence). Only an explicitly unbound restarted front permits
+// recovery after the old run has settled; a live owner refusal permanently retires the actor.
+// A retired actor never reopens its session. Everything is async and bounded; commits are ordered and coalesced: only the newest state is ever
 // sent, one request at a time.
 
 // Release pairing (noevia deploy/tools/assemble-release.sh autotune_state_pairing): this core keeps no
@@ -36,6 +37,8 @@ class Fenced extends Error {
 /** `call(op, payload)` -> { status, body } (project-store-client autotuneState); `base`: the state file's name. */
 function createAutotuneStateClient({ call, base, available = true }) {
   if (typeof call !== 'function' || typeof base !== 'string' || !base) throw new Error('autotune state client needs call and base');
+  const actor = require('node:crypto').randomBytes(16).toString('hex');
+  let incarnation = null;
   let writer = null, jobRev = 0, epoch = 0;
   const unreachable = why => new Fenced(why);
   const exchange = async (op, payload) => {
@@ -52,7 +55,12 @@ function createAutotuneStateClient({ call, base, available = true }) {
     get jobRev() { return jobRev; },
     get epoch() { return epoch; },
     async attach() {
-      const r = await exchange('attach', { base, available });
+      {
+        const opened = await exchange('attach', { base, available, actor, open: true });
+        if (opened.status !== 200 || !Number.isSafeInteger(opened.body?.incarnation)) throw unreachable('session refused');
+        incarnation = opened.body.incarnation;
+      }
+      const r = await exchange('attach', { base, available, actor, incarnation });
       if (r.status !== 200 || !WRITER.test(r.body?.writer || '') || !r.body.state || typeof r.body.state !== 'object') throw unreachable('attach refused');
       writer = r.body.writer; adopt(r.body);
       return r.body;
@@ -87,7 +95,7 @@ function createAutotuneStateClient({ call, base, available = true }) {
       const r = await exchange('sync', { writer, ...(settingsOnly ? { settingsOnly: true } : {}) });
       if (r.status === 409 && r.body?.fenced) throw new Fenced(String(r.body.fenced));
       if (r.status !== 200 || !r.body?.state) throw unreachable('sync refused');
-      adopt(r.body);
+      // The caller adopts job/history and setRun together, synchronously.
       return r.body;
     },
     /** The job revision and epoch the owner reported last (for the actor's launch). */

@@ -47,7 +47,7 @@ function fixture(t, { badSampling = false, models = ['synthetic'], onChat, onUnl
     const u = new URL(url), b = opts.body ? JSON.parse(opts.body) : {};
     if (opts.signal?.aborted) throw Error('aborted');
     if (u.pathname === '/models' && u.searchParams.has('reload')) {
-      onReload?.({ status: { ...status } });
+      await onReload?.({ status: { ...status } });
       // #1079: like llama.cpp, a reload lists sections added to models.ini (unloaded) and drops removed ones.
       if (reloadAddsSections && !reloadFail) {
         const names = [...fs.readFileSync(ini, 'utf8').matchAll(/^\[([^\]]+)\]/gm)].map(m => m[1]).filter(n => n !== '*');
@@ -2360,7 +2360,7 @@ test('an abort of the current run ends it as cancelled and the owner holds the r
   assert.equal(fs.readFileSync(f.ini, 'utf8').includes('cache-type'), true, 'committed phases stay');
 });
 
-test('a write the owner refuses mid-run stops the run before any further step, then recovery interrupts it as a restart would', async t => {
+test('a refused writer stops permanently and cannot heal over its replacement', async t => {
   let armed = false, refused = 0, requestsAtFence = -1;
   const f = fixture(t, { onChat: ({ manager }) => {
     if (!armed && manager.autotune.statusFacts().job?.phase === 'Drafting') {
@@ -2369,11 +2369,11 @@ test('a write the owner refuses mid-run stops the run before any further step, t
     }
   } });
   await f.manager.autotune.start('synthetic', { confirmPause: true });
-  for (let i = 0; i < 600 && f.manager.testOwner.state.job?.status === 'running'; i++) await new Promise(r => setTimeout(r, 25));
+  await finished(f.manager);
   const owned = f.manager.testOwner.state.job;
   assert.equal(refused, 1);
-  assert.equal(owned.status, 'interrupted', JSON.stringify(owned.status));
-  assert.match(owned.error, /Restart interrupted tuning/);
+  assert.equal(owned.status, 'running', 'the retired writer leaves settlement to the new owner');
+  assert.equal(f.manager.testOwner.log.filter(([op]) => op === 'attach').length, 1);
   // Nothing measured after the refusal: at most the request in flight when the owner said no.
   assert.ok(f.requests.length - requestsAtFence <= 1, `${f.requests.length - requestsAtFence} engine requests after the fence`);
 });
@@ -2429,4 +2429,26 @@ test('the router listing for the owner\'s queue answers system, listed and base-
   const out = await f.manager.autotune.listingFacts([{ model: 'synthetic' }, { model: 'ghost', base: 'synthetic' }]);
   assert.deepEqual(out.models.map(r => [r.index, r.system, r.modelListed, r.baseListed]), [[0, false, true, false], [1, false, false, true]]);
   await assert.rejects(f.manager.autotune.listingFacts(new Array(513).fill({})));
+});
+
+
+test('refused save during long-profile reload prevents compensation and every later mutation', async t => {
+  let f, entered, release;
+  const blocked = new Promise(r => { entered = r; });
+  const gate = new Promise(r => { release = r; });
+  f = fixture(t, { reloadFail: true, onReload: async () => { entered(); await gate; } });
+  let refused = false;
+  f.manager.testOwner.refuse = (op, payload) => {
+    if (op === 'commit' && payload.job?.models?.[0]?.sectionCreated && !payload.job?._pendingRevision) { refused = true; return 'writer'; }
+    return null;
+  };
+  await f.manager.autotune.start('synthetic', { confirmPause: true, mode: 'long' });
+  await blocked;
+  for (let i = 0; i < 100 && !refused; i++) await new Promise(r => setImmediate(r));
+  assert.equal(refused, true);
+  const atFence = fs.readFileSync(f.ini, 'utf8'), requests = f.requests.length;
+  release();
+  await finished(f.manager);
+  assert.equal(fs.readFileSync(f.ini, 'utf8'), atFence, 'no compensating INI write after refusal');
+  assert.equal(f.requests.length, requests, 'no unload or load after refusal');
 });
