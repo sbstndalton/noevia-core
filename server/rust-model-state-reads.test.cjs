@@ -73,6 +73,16 @@ test('budget writes and installed reads go through native private store',async t
  assert.match(seen[0][0],/model-facts\/budget$/);assert.match(seen[1][0],/model-facts\/installed$/);
  assert.equal(native.budgetGib(),7,'Node never publishes a speculative saved value');
 });
+test('native budget saves audit only after a successful acknowledgement',async t=>{
+ const {root,state}=fixture(t);const audits=[];let status=503;
+ const client=createClient({port:12345,token:'s'.repeat(40),fetchImpl:async()=>new Response(JSON.stringify(status===200?{budgetGib:9}:{error:'unavailable'}),{status})});
+ const native=createNativeFacts({dataDir:root,start:state.start,now:()=>1000,storeClient:client,audit:(...args)=>audits.push(args)});
+ await assert.rejects(native.save({budgetGib:9},'synthetic-user'),{status:503});
+ assert.deepEqual(audits,[]);
+ assert.equal(native.budgetGib(),7);
+ status=200;await native.save({budgetGib:9},'synthetic-user');
+ assert.deepEqual(audits,[['inference.budget','synthetic-user',{budgetGib:9}]]);
+});
 test('runtime wiring retires the Node budget and facts bridge',()=>{
  const index=fs.readFileSync(path.join(__dirname,'index.cjs'),'utf8');
  assert.match(index,/createNativeFacts/);assert.doesNotMatch(index,/createInferenceBudget|modelFactsBridge/);
