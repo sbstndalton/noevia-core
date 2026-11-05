@@ -6,7 +6,7 @@ async function run(s) {
   const calls = [], headers = {};
   let answer;
   const routes = createModelRoutes({
-    json: (_, status, body) => { answer = { status, body, headers }; },
+    json: require('../../server/http.cjs').json,
     readBody: async () => s.raw || '{}', readJson: async () => ({}),
     fetchJson: async (url, init, timeout) => {
       calls.push({ url, method: init.method, timeout });
@@ -20,7 +20,7 @@ async function run(s) {
   });
   const url = new URL('http://synthetic.invalid' + s.path);
   const req = { method: s.method || 'GET', url: s.path };
-  await routes(req, { setHeader: (k, v) => { headers[k.toLowerCase()] = v; } }, { path: url.pathname, url, authn: { user: { id: 'synthetic', role: s.role || 'admin' } } });
+  await routes(req, { setHeader: (k, v) => { headers[k.toLowerCase()] = v; }, writeHead: (status, values) => { for (const [k,v] of Object.entries(values)) headers[k.toLowerCase()] = v; answer = { status, headers }; }, end: text => { answer.body = JSON.parse(text); } }, { path: url.pathname, url, authn: { user: { id: 'synthetic', role: s.role || 'admin' } } });
   return { ...answer, calls };
 }
 const scenarios = [
