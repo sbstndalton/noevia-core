@@ -9,7 +9,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
-const { createApprovalRegistry, OPS } = require('./rust-approval-registry.cjs');
+const { createApprovalRegistry, OPS, REGISTRY_PROTOCOL, DISPATCH_WINDOW_MS } = require('./rust-approval-registry.cjs');
 const { createClient } = require('./project-store-client.cjs');
 const { startFakeApprovalStore } = require('../tests/server/fake-approval-store.cjs');
 
@@ -25,7 +25,7 @@ const binding = { user: 'owner', canonicalChatId: 'chat', scope: 'project:p', co
 const until = async (fn) => { for (let i = 0; i < 200 && !fn(); i++) await new Promise((r) => setTimeout(r, 5)); };
 
 test('Node can only open, wait for, withdraw and check its own questions; it can never answer one', () => {
-  assert.deepEqual([...OPS].sort(), ['cancel', 'granted', 'open', 'redeem', 'revoke', 'wait']);
+  assert.deepEqual([...OPS].sort(), ['cancel', 'granted', 'open', 'redeem', 'revoke', 'started', 'wait']);
   assert.equal(fs.existsSync(path.join(__dirname, 'rust-tool-approval-bridge.cjs')), false, 'the #2282 facts/resolve bridge is gone');
   const index = fs.readFileSync(path.join(__dirname, 'index.cjs'), 'utf8');
   assert.match(index, /require\('\.\/rust-approval-registry\.cjs'\)\.createApprovalRegistry\(/);
@@ -269,14 +269,15 @@ test('a front-only revoke after a granted:true answer: the ticket is refused at 
   assert.match(grant.ticket, /^ticket-/);
   store.grants.delete('owner\nchat'); // the front's own move, delete or failed move; Node never hears of it
   assert.equal(await gate.redeemChatGrant('owner', 'chat', 'project:p', binding, grant), false);
-  assert.deepEqual(store.seen.at(-1), { op: 'redeem', body: { user: 'owner', chat: 'chat', scope: 'project:p', binding, ticket: grant.ticket } });
+  assert.deepEqual(store.seen.at(-1), { op: 'redeem', body: { user: 'owner', chat: 'chat', scope: 'project:p', binding, ticket: grant.ticket, protocol: REGISTRY_PROTOCOL } });
 });
 
 test('a ticket redeems once; a replay is refused', async (t) => {
   const { store, gate } = await fixture(t);
   store.grants.set('owner\nchat', 'project:p');
   const grant = await gate.chatWideApproved('owner', 'chat', 'project:p', binding);
-  assert.equal(await gate.redeemChatGrant('owner', 'chat', 'project:p', binding, grant), true);
+  const fence = await gate.redeemChatGrant('owner', 'chat', 'project:p', binding, grant);
+  assert.equal(fence.open(), true, 'a fresh redeem may be dispatched');
   assert.equal(await gate.redeemChatGrant('owner', 'chat', 'project:p', binding, grant), false);
   for (const bad of [null, true, {}, { ticket: '' }]) {
     assert.equal(await gate.redeemChatGrant('owner', 'chat', 'project:p', binding, bad), false, JSON.stringify(bad));
@@ -314,6 +315,114 @@ test("Node's own revoke still denies around a redeem, in either order (defence i
   const r2 = f.gate.revokeChatGrant('owner', 'chat');
   (await f.next('revoke')).ok({ revoked: true });
   await r2;
-  call.ok({ redeemed: true });
+  call.ok({ redeemed: true, protocol: REGISTRY_PROTOCOL, window_ms: 2000 });
   assert.equal(await redeem, false);
+  assert.ok(f.calls.some((c) => c.op === 'started' && c.payload.ticket === 't2'), 'the front is told it will not run');
+});
+
+// Re-review 689d17a P1-1: the front can consume a ticket (redeemed:true) and then complete a
+// front-only revoke (a failed move) while that answer is still in flight. The front's revoke
+// completes only once the redeem is DISPATCH_WINDOW old (it drains); Node dispatches only within
+// DISPATCH_WINDOW of SENDING the redeem, by its monotonic clock. Astra's schedule, deterministic:
+function fenced(options = {}) {
+  let clock = 1000;
+  const calls = [];
+  const approvals = (op, payload) => new Promise((resolve) => {
+    calls.push({ op, payload, ok: (body) => resolve({ status: 200, body }) });
+  });
+  const gate = createApprovalRegistry({ approvals, log: () => {}, monotonic: () => clock, ...options });
+  const flush = () => new Promise((r) => setImmediate(r));
+  const next = async (op) => { await flush(); const c = calls.find((x) => x.op === op && !x.taken); assert.ok(c, `a ${op} request`); c.taken = true; return c; };
+  const grant = async () => {
+    const check = gate.chatWideApproved('owner', 'chat', 'project:p', binding);
+    const call = await next('granted');
+    assert.equal(call.payload.protocol, REGISTRY_PROTOCOL);
+    call.ok({ granted: true, ticket: 't1' });
+    return check;
+  };
+  return { gate, calls, next, grant, advance: (ms) => { clock += ms; } };
+}
+test("Astra's schedule: redeemed:true held while the front's revoke drains and completes: never dispatched", async () => {
+  const f = fenced();
+  const g = await f.grant();
+  const redeem = f.gate.redeemChatGrant('owner', 'chat', 'project:p', binding, g);
+  const call = await f.next('redeem');
+  // The front records the redeem (R >= S), the failed move's revoke drains until R + D and returns.
+  f.advance(DISPATCH_WINDOW_MS);
+  call.ok({ redeemed: true, protocol: REGISTRY_PROTOCOL, window_ms: 2000 });
+  const fence = await redeem;
+  assert.equal(fence.open(), false, 'past S + D: never dispatched');
+  fence.started();
+  fence.started();
+  await new Promise((r) => setImmediate(r));
+  assert.equal(f.calls.filter((c) => c.op === 'started').length, 1, 'reported once');
+  assert.deepEqual(f.calls.find((c) => c.op === 'started').payload, { user: 'owner', ticket: 't1' });
+});
+test('the fence: open strictly before S + min(D, window_ms), closed once started, at S + D, or on a Node revoke', async () => {
+  const f = fenced();
+  let g = await f.grant();
+  let redeem = f.gate.redeemChatGrant('owner', 'chat', 'project:p', binding, g);
+  let call = await f.next('redeem');
+  f.advance(DISPATCH_WINDOW_MS - 1);
+  call.ok({ redeemed: true, protocol: REGISTRY_PROTOCOL, window_ms: 5000 });
+  let fence = await redeem;
+  assert.equal(fence.open(), true, 'Node uses its own D when the front allows longer');
+  f.advance(1);
+  assert.equal(fence.open(), false, 'S + D exactly is too late');
+  // The front's shorter window wins.
+  g = await f.grant();
+  redeem = f.gate.redeemChatGrant('owner', 'chat', 'project:p', binding, g);
+  call = await f.next('redeem');
+  f.advance(500);
+  call.ok({ redeemed: true, protocol: REGISTRY_PROTOCOL, window_ms: 500 });
+  assert.equal((await redeem).open(), false);
+  // Started: closed (one dispatch per redeem).
+  g = await f.grant();
+  redeem = f.gate.redeemChatGrant('owner', 'chat', 'project:p', binding, g);
+  (await f.next('redeem')).ok({ redeemed: true, protocol: REGISTRY_PROTOCOL, window_ms: 2000 });
+  fence = await redeem;
+  assert.equal(fence.open(), true);
+  fence.started();
+  assert.equal(fence.open(), false);
+  // A revoke Node starts inside the window closes it too (defence in depth).
+  g = await f.grant();
+  redeem = f.gate.redeemChatGrant('owner', 'chat', 'project:p', binding, g);
+  (await f.next('redeem')).ok({ redeemed: true, protocol: REGISTRY_PROTOCOL, window_ms: 2000 });
+  fence = await redeem;
+  const revoke = f.gate.revokeChatGrant('owner', 'chat');
+  assert.equal(fence.open(), false);
+  (await f.next('revoke')).ok({ revoked: true });
+  await revoke;
+});
+test('P1-2: a front that does not answer in registry-redeem-v2 authorises nothing', async () => {
+  for (const body of [{ redeemed: true }, { redeemed: true, protocol: 'rust-approval-registry', window_ms: 2000 }, { redeemed: true, protocol: REGISTRY_PROTOCOL }, { redeemed: true, protocol: REGISTRY_PROTOCOL, window_ms: 0 }, { redeemed: true, protocol: REGISTRY_PROTOCOL, window_ms: 'x' }]) {
+    const f = fenced();
+    const g = await f.grant();
+    const redeem = f.gate.redeemChatGrant('owner', 'chat', 'project:p', binding, g);
+    (await f.next('redeem')).ok(body);
+    assert.equal(await redeem, 'unavailable', JSON.stringify(body));
+  }
+  // An old front answers a grant check without a ticket: no grant.
+  const f = fenced();
+  const check = f.gate.chatWideApproved('owner', 'chat', 'project:p', binding);
+  (await f.next('granted')).ok({ granted: true });
+  assert.equal(await check, false);
+});
+test('P1-2: the front gives a check without the protocol no grant (fake front mirrors approval_registry.rs)', async (t) => {
+  const { store } = await fixture(t);
+  store.grants.set('owner\nchat', 'project:p');
+  const client = createClient({ port: store.port, token: store.token });
+  const { body } = await client.approvals('granted', { user: 'owner', chat: 'chat', scope: 'project:p', binding });
+  assert.deepEqual(body, { granted: false, code: 'APPROVAL_PROTOCOL' });
+});
+test('a revoke counter that cannot advance fails closed', async () => {
+  const f = fenced({ maxGeneration: 1 });
+  const g = await f.grant();
+  for (let i = 0; i < 2; i++) {
+    const r = f.gate.revokeChatGrant('owner', 'other');
+    (await f.next('revoke')).ok({ revoked: false });
+    await r;
+  }
+  assert.equal(await f.gate.redeemChatGrant('owner', 'chat', 'project:p', binding, g), false);
+  assert.equal(await f.gate.chatWideApproved('owner', 'chat', 'project:p', binding), false);
 });

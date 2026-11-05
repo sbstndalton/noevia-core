@@ -2454,20 +2454,25 @@ function createChatHandler({
               }
             }
             let redeemUnavailable = false;
+            // Re-review 689d17a P1-1: the redeemed grant's dispatch fence, checked in the same
+            // synchronous step as the dispatch below.
+            let dispatchFence = null;
             if (permission === 'ask') {
               try {
                 const finalBinding = await permissionContext();
                 if ((chatId && !grantContexts.matches(permissionBinding, finalBinding)) ||
                     approvalTarget() !== shownTarget || currentWorkspace().userId !== userId || currentWorkspace().revoked) throw grantContexts.invalid();
                 if (usedGrant && !askedPerCall) {
-                  // Port contract S9 (re-review 1ed3a14): the chat-wide grant is redeemed at the front,
-                  // ordered there against every revocation; this is the LAST await before dispatch.
+                  // Port contract S9 (re-reviews 1ed3a14, 689d17a): the chat-wide grant is redeemed at
+                  // the front, ordered there against every revocation; this is the LAST await before
+                  // dispatch, and its answer is a fence checked synchronously with the dispatch.
                   // (In-process gates without redeem check the grant again instead.)
-                  const redeemed = redeemChatGrant
-                    ? await redeemChatGrant(userId, grantChat, writeGrantScope, finalBinding, usedGrant)
-                    : await chatWideApproved(userId, grantChat, writeGrantScope, finalBinding);
-                  if (redeemed === 'unavailable') redeemUnavailable = true;
-                  else if (redeemed !== true) throw grantContexts.invalid();
+                  if (redeemChatGrant) {
+                    const redeemed = await redeemChatGrant(userId, grantChat, writeGrantScope, finalBinding, usedGrant);
+                    if (redeemed === 'unavailable') redeemUnavailable = true;
+                    else if (redeemed && typeof redeemed.open === 'function' && typeof redeemed.started === 'function') dispatchFence = redeemed;
+                    else throw grantContexts.invalid();
+                  } else if ((await chatWideApproved(userId, grantChat, writeGrantScope, finalBinding)) !== true) throw grantContexts.invalid();
                 }
               } catch {
                 // Even Allow once refuses a move-away-and-back, restart, deletion or failed read.
@@ -2475,28 +2480,36 @@ function createChatHandler({
                 return 'ERROR: the chat or permission target changed after approval; the tool was not run. Nothing was changed. Ask again.';
               }
             }
-            if (redeemUnavailable) {
-              // The grant could not be checked at the front: not run, and not a decline.
+            const notChecked = () => {
+              // The grant could not be checked at the front (or its answer came too late to act on):
+              // not run, and not a decline.
+              dispatchFence?.started();
               result = `ERROR: the permission for ${tc.name} could not be checked, so it was not run. Nothing was changed. Ask again.`;
               authService.audit('tool.denied', userId, userId, { tool: tc.name, reason: 'unavailable' });
               notRunResults.add(result);
               return result;
-            }
+            };
+            if (redeemUnavailable) return notChecked();
             // Synchronous targets may change during the final store await too.
             if (editTarget !== null) {
               const nowTarget = editTargets.resolveEditTarget(project ? getProject(project.id) : null, tc.args, { storageAccount: editStorageAccount(userId) });
               if (nowTarget.path !== editTarget || (nowTarget.account || null) !== editAccount) {
+                dispatchFence?.started();
                 await revokeChatGrant(userId, grantChat);
                 return 'ERROR: the project target changed before dispatch; tool was not run. Ask again.';
               }
             }
-            if (chatSignal.signal.aborted) return 'ERROR: exchange cancelled; tool was not run.';
-            if (toolPolicy.mode(userId, tc.name, isWriteTool(tc.name)) === 'block' || (permission !== 'ask' && toolPolicy.mode(userId, tc.name, isWriteTool(tc.name)) === 'ask') || revokedSkills()) return 'ERROR: permission changed before dispatch; tool was not run.';
+            if (chatSignal.signal.aborted) { dispatchFence?.started(); return 'ERROR: exchange cancelled; tool was not run.'; }
+            if (toolPolicy.mode(userId, tc.name, isWriteTool(tc.name)) === 'block' || (permission !== 'ask' && toolPolicy.mode(userId, tc.name, isWriteTool(tc.name)) === 'ask') || revokedSkills()) { dispatchFence?.started(); return 'ERROR: permission changed before dispatch; tool was not run.'; }
+            const options = { chatKey, exchangeKey, routes: toolRoutes, ...(editTarget !== null ? { editTarget: editTargets.targetDigest(editTarget, editAccount) } : {}) };
+            // From here to the dispatch is one synchronous step: no await between the fence and the call.
+            if (dispatchFence && !dispatchFence.open()) return notChecked();
             markWriteAttempt();
             // Set before the call, so a write that throws still counts as a round that wrote (#1456).
             if (isWriteTool(tc.name)) roundWrote = true;
-            const options = { chatKey, exchangeKey, routes: toolRoutes, ...(editTarget !== null ? { editTarget: editTargets.targetDigest(editTarget, editAccount) } : {}) };
-            result = await executeToolCall(project, tc.name, tc.args, allowedToolNames, chatSignal.signal, outcome, options);
+            const running = executeToolCall(project, tc.name, tc.args, allowedToolNames, chatSignal.signal, outcome, options);
+            dispatchFence?.started();
+            result = await running;
             ran = true;
             recordToolUse(chatWorkspace, tc.name);
             // Audit AFTER the fact and only for writes: "what did the model

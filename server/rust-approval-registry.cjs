@@ -12,6 +12,9 @@
 // also checks a grant against the chat's live grant context, so a move, a delete or a restart
 // revokes it there.
 //
+// Grant use (registry-redeem-v2): a grant check answers with a single-use ticket, redeemed at the
+// front just before dispatch, and the redeem's answer is a dispatch fence (redeemChatGrant below).
+//
 // The interface is approvals.cjs's (the in-process reference the chat tests still use), made async,
 // plus openApproval/openRouteChoice and one more outcome: 'unavailable' when the front could not be
 // asked. It fails closed: an unanswered or unreachable question never approves a write, and a grant
@@ -23,7 +26,16 @@
 // end as 'unavailable' (the tool is not run).
 const { safeId } = require('./chat-grant-context.cjs');
 
-const OPS = new Set(['open', 'wait', 'cancel', 'granted', 'redeem', 'revoke']);
+// The grant protocol (front capability registry-redeem-v2; the release and startup pairing guards
+// look for this line). Named on every grant check and redeem: a front that does not answer in it is
+// not asked to authorise anything.
+const REGISTRY_PROTOCOL = 'registry-redeem-v2';
+const OPS = new Set(['open', 'wait', 'cancel', 'granted', 'redeem', 'started', 'revoke']);
+// Re-review 689d17a P1-1: a redeemed write may be dispatched only within this long of SENDING its
+// redeem, by the monotonic clock (or the front's window_ms if shorter). The front records the redeem
+// later than Node sent it and drains every revocation until that record plus its window, so a revoke
+// that has completed can never be followed by a dispatch for a ticket issued before it.
+const DISPATCH_WINDOW_MS = 2000;
 // The front times a question out itself; Node's own deadline is only a backstop past that.
 const WAIT_SLACK_MS = 30000;
 // The front's grant lifetime (approval_registry.rs GRANT_TTL): no grant outlives it.
@@ -35,6 +47,10 @@ const REVOKE_RETRY = Object.freeze({ firstMs: 1000, maxMs: 60000 });
  *  `signal` aborts, and another error when the front cannot be reached (project-store-client.cjs). */
 function createApprovalRegistry({ approvals, timeoutMs = 5 * 60 * 1000, log = () => {},
   grantTtlMs = GRANT_TTL_MS, revokeRetry = REVOKE_RETRY, now = Date.now,
+  // The dispatch fence's clock: monotonic, never the wall clock.
+  monotonic = () => performance.now(), dispatchWindowMs = DISPATCH_WINDOW_MS,
+  // The largest revocation generation (tests lower it to reach the limit).
+  maxGeneration = Number.MAX_SAFE_INTEGER,
   // How a retry is scheduled: (fn, ms) -> handle with clear(). Injected by the tests to run retries
   // deterministically.
   schedule = (fn, ms) => { const t = setTimeout(fn, ms); t.unref?.(); return { clear: () => clearTimeout(t) }; } } = {}) {
@@ -119,12 +135,15 @@ function createApprovalRegistry({ approvals, timeoutMs = 5 * 60 * 1000, log = ()
   // front and Node together under a new start id, and a grant names the start id it was made in, so
   // after a restart no earlier grant applies anyway.
   let generations = 0;
+  // The counter can no longer advance: no grant is honoured again (fail closed).
+  let exhausted = false;
   const epochs = new Map(); // JSON [user, canonical chat] -> { epoch, at }
   const pendingRevokes = new Map(); // same key -> { user, chat, latest, since, delay, timer, trying }
   const revokeKey = (userId, chatId) => JSON.stringify([userId, safeId(chatId)]);
   const epochOf = (key) => epochs.get(key)?.epoch ?? 0;
 
   function bump(key) {
+    if (generations >= maxGeneration) { exhausted = true; return generations; }
     const epoch = ++generations;
     epochs.set(key, { epoch, at: now() });
     // Bounded: an epoch only matters to a grant check in flight, far shorter than a grant's life.
@@ -183,12 +202,12 @@ function createApprovalRegistry({ approvals, timeoutMs = 5 * 60 * 1000, log = ()
    *  neither does one the front cannot answer, one whose revoke the front has not yet confirmed, or
    *  one a revoke Node started while it was asked. */
   async function chatWideApproved(userId, chatId, scope, binding) {
-    if (!text(userId) || !safeId(chatId) || !text(scope) || !binding) return false;
+    if (exhausted || !text(userId) || !safeId(chatId) || !text(scope) || !binding) return false;
     const key = revokeKey(userId, chatId);
     if (revokePending(userId, chatId)) return false;
     const epoch = epochOf(key);
     try {
-      const { status, body } = await ask('granted', { user: userId, chat: chatId, scope, binding });
+      const { status, body } = await ask('granted', { user: userId, chat: chatId, scope, binding, protocol: REGISTRY_PROTOCOL });
       if (status !== 200 || body?.granted !== true || !text(body.ticket)) return false;
       if (epochOf(key) !== epoch || revokePending(userId, chatId)) return false;
       return Object.freeze({ ticket: body.ticket, epoch });
@@ -198,21 +217,43 @@ function createApprovalRegistry({ approvals, timeoutMs = 5 * 60 * 1000, log = ()
     }
   }
 
-  /** Re-review 1ed3a14: uses the grant `grant` (chatWideApproved's answer) for one write, just
-   *  before it is dispatched. The front's registry lock is the one point where this and every
-   *  revocation of the chat (Node's, a move, a delete, a failed move, a restart) are ordered: the
-   *  redeem succeeds only if none came before it. The caller must dispatch at once, with no further
-   *  await. true | false | 'unavailable' (the front could not be asked: the tool is not run, and it
-   *  is not a decline). Node's own epoch and pending records still deny first, as defence in depth;
-   *  the front is the authority. */
+  /** Re-reviews 1ed3a14 and 689d17a: uses the grant `grant` (chatWideApproved's answer) for one
+   *  write, just before it is dispatched. The front's registry lock orders this redeem against every
+   *  revocation of the chat (Node's, a move, a delete, a failed move, a restart): it succeeds only if
+   *  none came before it. A revocation after it completes only once this write was reported started
+   *  or the dispatch window has passed, so the answer is a fence the caller must check in the SAME
+   *  synchronous step as the dispatch:
+   *    const fence = await redeemChatGrant(...);           // false | 'unavailable' | fence
+   *    ... synchronous checks only ...
+   *    if (!fence.open()) { fence.started(); not run }      // too late: 'unavailable', not a decline
+   *    const running = executeToolCall(...); fence.started(); await running;
+   *  open() is true only while the monotonic clock reads less than the redeem's send time plus the
+   *  window, and Node's own epoch and pending records (defence in depth) still allow it. started()
+   *  tells the front, fire-and-forget, so revocations need not wait out the window; call it also
+   *  when the write will not be dispatched. 'unavailable': the front could not be asked or did not
+   *  answer in this protocol (the tool is not run, and it is not a decline). */
   async function redeemChatGrant(userId, chatId, scope, binding, grant) {
-    if (!text(userId) || !safeId(chatId) || !text(scope) || !binding || !text(grant?.ticket)) return false;
+    if (exhausted || !text(userId) || !safeId(chatId) || !text(scope) || !binding || !text(grant?.ticket)) return false;
     const key = revokeKey(userId, chatId);
-    if (revokePending(userId, chatId) || epochOf(key) !== grant.epoch) return false;
+    const allowed = () => !exhausted && epochOf(key) === grant.epoch && !revokePending(userId, chatId);
+    if (!allowed()) return false;
     try {
-      const { status, body } = await ask('redeem', { user: userId, chat: chatId, scope, binding, ticket: grant.ticket });
-      if (status !== 200 || typeof body?.redeemed !== 'boolean') { log(`[tool-approvals] redeem refused: ${status}`); return 'unavailable'; }
-      return body.redeemed === true && epochOf(key) === grant.epoch && !revokePending(userId, chatId);
+      const sentAt = monotonic();
+      const { status, body } = await ask('redeem', { user: userId, chat: chatId, scope, binding, ticket: grant.ticket, protocol: REGISTRY_PROTOCOL });
+      const windowMs = Math.min(dispatchWindowMs, Number(body?.window_ms));
+      if (status !== 200 || typeof body?.redeemed !== 'boolean' || body.protocol !== REGISTRY_PROTOCOL || !(windowMs > 0)) {
+        log(`[tool-approvals] redeem refused: ${status}`);
+        return 'unavailable';
+      }
+      if (body.redeemed !== true) return false;
+      let reported = false;
+      const started = () => {
+        if (reported) return;
+        reported = true;
+        Promise.resolve().then(() => ask('started', { user: userId, ticket: grant.ticket })).catch(() => {});
+      };
+      if (!allowed()) { started(); return false; }
+      return Object.freeze({ open: () => !reported && monotonic() < sentAt + windowMs && allowed(), started });
     } catch (e) {
       log(`[tool-approvals] redeem failed: ${why(e)}`);
       return 'unavailable';
@@ -242,4 +283,4 @@ function createApprovalRegistry({ approvals, timeoutMs = 5 * 60 * 1000, log = ()
   return { openApproval, openRouteChoice, awaitApproval, awaitRouteChoice, chatWideApproved, redeemChatGrant, revokeChatGrant, revokePending };
 }
 
-module.exports = { createApprovalRegistry, OPS, WAIT_SLACK_MS, GRANT_TTL_MS, REVOKE_RETRY };
+module.exports = { createApprovalRegistry, OPS, WAIT_SLACK_MS, GRANT_TTL_MS, REVOKE_RETRY, REGISTRY_PROTOCOL, DISPATCH_WINDOW_MS };

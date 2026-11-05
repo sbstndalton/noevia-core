@@ -247,12 +247,71 @@ test('S9: a front unreachable at redeem: not run, and not a decline', async (t) 
 });
 test('S9: a redeemed grant runs the write once, with its ticket, right after the redeem', async (t) => {
   let seen = null;
-  const { h, log } = grantTurn(t, async (user, chat, scope, binding, grant) => { seen = { user, chat, scope, ticket: grant.ticket, binding: !!binding }; return true; });
+  const { h, log } = grantTurn(t, async (user, chat, scope, binding, grant) => {
+    seen = { user, chat, scope, ticket: grant.ticket, binding: !!binding };
+    return { open: () => { log.push('open'); return true; }, started: () => log.push(`started after ${h.state.executed.length}`) };
+  });
   const execute = h.state.executed;
   await h.send({ message: 'Append it.' });
   assert.equal(execute.length, 1);
   assert.deepEqual(seen, { user: 'synthetic-user-a', chat: 'chat-679', scope: seen.scope, ticket: 'synthetic-ticket', binding: true });
-  assert.deepEqual(log, ['check', 'redeem']);
+  assert.deepEqual(log, ['check', 'redeem', 'open', 'started after 1']);
+});
+test('S9: a bare true from the redeem (no dispatch fence) is not an approval', async (t) => {
+  const { h, log } = grantTurn(t, async () => true);
+  await h.send({ message: 'Append it.' });
+  assert.equal(h.state.executed.length, 0);
+  assert.deepEqual(log, ['check', 'redeem', 'revoke']);
+});
+
+// Re-review 689d17a P1-1, Astra's schedule through the real chat loop and the real registry client:
+// the front consumes the ticket (redeemed:true) and then completes a front-only failed-move revoke
+// while that answer is in flight. The front's revoke completes only once the redeem is D old, so the
+// answer arrives at Node later than its send time + D: Node must not dispatch.
+function fencedTurn(t, { lateBy }) {
+  const { createApprovalRegistry, REGISTRY_PROTOCOL } = require('./rust-approval-registry.cjs');
+  let clock = 5000;
+  const calls = [];
+  const h = { current: null };
+  const approvals = (op, payload) => new Promise((resolve) => {
+    if (op === 'started') { calls.push({ op, payload, executed: h.current.state.executed.length }); return resolve({ status: 200, body: { settled: true } }); }
+    if (op === 'granted') return resolve({ status: 200, body: { granted: true, ticket: 'synthetic-ticket' } });
+    if (op === 'revoke') { calls.push({ op }); return resolve({ status: 200, body: { revoked: true } }); }
+    calls.push({ op, payload, ok: (body) => resolve({ status: 200, body }) });
+  });
+  const gate = createApprovalRegistry({ approvals, log: () => {}, monotonic: () => clock });
+  const grants = { check: gate.chatWideApproved, redeem: gate.redeemChatGrant, revoke: gate.revokeChatGrant };
+  h.current = harness(t, { grants, onPending: () => assert.fail('a granted write shows no card') });
+  store(h.current.a, 'chat-679', [{ role: 'user', content: 'Append it.' }]);
+  h.current.state.turns.push([toolCall('synthetic_append', APPEND, 'call-1')], [say('Done.')]);
+  async function run() {
+    const sending = h.current.send({ message: 'Append it.' });
+    let redeem;
+    for (let i = 0; i < 400 && !(redeem = calls.find((c) => c.op === 'redeem')); i++) await new Promise((r) => setTimeout(r, 5));
+    assert.ok(redeem, 'the write was redeemed');
+    clock += lateBy; // meanwhile the front drained and completed its revoke (lateBy >= D)
+    redeem.ok({ redeemed: true, protocol: REGISTRY_PROTOCOL, window_ms: 2000 });
+    const events = await sending;
+    await new Promise((r) => setImmediate(r));
+    return events;
+  }
+  return { h: h.current, calls, run };
+}
+test("S9 (Astra's schedule): redeemed:true arriving after the front's drained revoke completed is never dispatched", async (t) => {
+  const { h, calls, run } = fencedTurn(t, { lateBy: 2000 });
+  const events = await run();
+  assert.equal(h.state.executed.length, 0, 'the write never ran');
+  const result = events.find((e) => e.type === 'tool_result');
+  assert.equal(result.notRun, true);
+  assert.equal(result.declined, undefined, 'not a decline');
+  assert.match(result.text, /permission for synthetic_append could not be checked, so it was not run/);
+  assert.deepEqual(calls.filter((c) => c.op === 'started').map((c) => c.payload), [{ user: 'synthetic-user-a', ticket: 'synthetic-ticket' }], 'the front is told at once');
+});
+test('S9: redeemed:true in time is dispatched once, then reported started', async (t) => {
+  const { h, calls, run } = fencedTurn(t, { lateBy: 1999 });
+  await run();
+  assert.equal(h.state.executed.length, 1);
+  assert.deepEqual(calls.filter((c) => c.op === 'started').map((c) => c.executed), [1], 'reported after the dispatch, once');
 });
 
 test('nothing is written when the reply finishes, when someone already saved past the turn, or for a deleted chat', async (t) => {

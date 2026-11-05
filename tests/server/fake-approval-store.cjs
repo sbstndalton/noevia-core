@@ -1,6 +1,6 @@
 'use strict';
 // A synthetic stand-in for the Rust front's approval registry ops (noevia-rs approval_registry.rs,
-// POST /v1/approvals/{open,wait,cancel,granted,revoke}) on a real loopback HTTP server, for the
+// POST /v1/approvals/{open,wait,cancel,granted,redeem,started,revoke}, protocol registry-redeem-v2) on a real loopback HTTP server, for the
 // Node side's tests. It keeps the front's rules that Node's client relies on: a question belongs to
 // one user, a wait is a long-poll, dropping the wait withdraws the question (#679), and an answer is
 // consumed once. The front's own tests (noevia-rs tests/tool_approvals.rs) pin the rest.
@@ -13,6 +13,7 @@ async function startFakeApprovalStore({ token = 'synthetic-store-token-012345678
   const dropped = []; // ids whose wait Node dropped
   const tickets = Object.assign(new Map(), { count: 0 });
   const down = new Set(); // ops answered by dropping the connection, as a front that is down
+  const settled = []; // tickets Node reported started
   const server = http.createServer((req, res) => {
     let raw = '';
     req.on('data', (c) => { raw += c; });
@@ -48,7 +49,11 @@ async function startFakeApprovalStore({ token = 'synthetic-store-token-012345678
         case 'cancel':
           if (mine && !q.waiter) questions.delete(body.id);
           return reply(200, { cancelled: !!mine });
+        case 'started':
+          settled.push(body.ticket);
+          return reply(200, { settled: true });
         case 'granted': {
+          if (body.protocol !== 'registry-redeem-v2') return reply(200, { granted: false, code: 'APPROVAL_PROTOCOL' });
           const granted = grants.get(`${body.user}\n${body.chat}`) === body.scope && !!body.binding;
           if (!granted) return reply(200, { granted: false });
           const ticket = `ticket-${++tickets.count}`;
@@ -57,9 +62,10 @@ async function startFakeApprovalStore({ token = 'synthetic-store-token-012345678
         }
         case 'redeem': {
           // Single use; refused once the grant is gone (a revoke ordered before the redeem).
+          if (body.protocol !== 'registry-redeem-v2') return reply(200, { granted: false, redeemed: false, code: 'APPROVAL_PROTOCOL' });
           const want = tickets.get(body.ticket);
           tickets.delete(body.ticket);
-          return reply(200, { redeemed: want === `${body.user}\n${body.chat}\n${body.scope}` && grants.get(`${body.user}\n${body.chat}`) === body.scope });
+          return reply(200, { redeemed: want === `${body.user}\n${body.chat}\n${body.scope}` && grants.get(`${body.user}\n${body.chat}`) === body.scope, protocol: 'registry-redeem-v2', window_ms: 2000 });
         }
         case 'revoke':
           return reply(200, { revoked: grants.delete(`${body.user}\n${body.chat}`) });
@@ -78,7 +84,7 @@ async function startFakeApprovalStore({ token = 'synthetic-store-token-012345678
     return true;
   }
   const close = () => new Promise((resolve) => { server.closeAllConnections?.(); server.close(() => resolve()); });
-  return { port, token, seen, dropped, down, questions, grants, answer, close };
+  return { port, token, seen, dropped, down, settled, questions, grants, answer, close };
 }
 
 module.exports = { startFakeApprovalStore };
