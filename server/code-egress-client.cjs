@@ -87,9 +87,13 @@ function createEgressClient({ port, token, endpoint, fetchImpl = globalThis.fetc
         const reply = await post('revoke', { handle: r.id, budgetMs }, Math.max(1000, Math.min(budgetMs, 10000)) + 5000);
         const v = reply.value;
         if (reply.status !== 200 || !v || v.confirmed !== true || !v.report || v.report.final !== true) return unavailableReport();
-        active.delete(r);
         return Object.freeze({ confirmed: true, report: Object.freeze(v.report) });
       } catch { return unavailableReport(); }
+      // One-shot flight: once it has settled (confirmed or not) Node drops its strong reference. A handle
+      // still held keeps its answer through the WeakMap (confirmed:false stays confirmed:false, no second
+      // request, nothing re-acquired); an abandoned one is collectable instead of growing `active` across
+      // recoveries.
+      finally { active.delete(r); }
     })();
     return r.cleanup;
   }
@@ -112,7 +116,9 @@ function createEgressClient({ port, token, endpoint, fetchImpl = globalThis.fetc
     }
     return results;
   }
-  return Object.freeze({ impl: 'rust-controlled', capability: CAPABILITY, endpoint, start, available, ready: () => poll().then(() => ({ capability: CAPABILITY, available: available() })), grant, activity, revoke, forget, close, sweep: () => 0 });
+  // Diagnostics only: how many grants Node still holds a strong reference to (held or cleanup in flight).
+  const retained = () => active.size;
+  return Object.freeze({ impl: 'rust-controlled', retained, capability: CAPABILITY, endpoint, start, available, ready: () => poll().then(() => ({ capability: CAPABILITY, available: available() })), grant, activity, revoke, forget, close, sweep: () => 0 });
 }
 
 module.exports = { CAPABILITY, CODE_EGRESS_CLIENT_MARKER, EgressUnavailableError, createEgressClient };

@@ -107,3 +107,26 @@ test('close revokes what is still held', async (t) => {
 test('the client config refuses a missing or weak store secret and port', () => {
   for (const o of [{ port: 0, token: TOKEN }, { port: 70000, token: TOKEN }, { port: 1, token: 'short' }, { port: 1 }]) assert.throws(() => createEgressClient({ ...o, endpoint: 'x:1' }), (e) => e.code === 'EGRESS_UNAVAILABLE');
 });
+
+test('unconfirmed cleanups do not accumulate across recoveries: Node drops its reference once the flight settles', async (t) => {
+  let revokeStatus = 503;
+  const f = await front((op, body) => (op === 'revoke' ? [revokeStatus, { code: 'EGRESS_UNAVAILABLE', reason: 'handle' }] : normal(op, body))); t.after(f.close);
+  const c = createEgressClient({ port: f.port, token: TOKEN, endpoint: 'x:1' });
+  let kept = null;
+  for (let i = 0; i < 300; i++) {
+    const h = await c.grant({ taskId: `task:${i}`, domains: ['example.com'] });
+    const r = await c.revoke(h); assert.equal(r.confirmed, false);
+    if (i === 0) kept = { h, r };
+    if (i % 50 === 0) await c.ready(); // a successful native recovery poll must not be what clears them either
+  }
+  assert.equal(c.retained(), 0, 'no strong reference survives a settled cleanup');
+  // A still-held handle keeps its (unconfirmed) answer: same result, no second revoke request, no re-acquire.
+  const before = f.calls.length;
+  assert.equal(await c.revoke(kept.h), kept.r); assert.equal(f.calls.length, before);
+  assert.equal(f.calls.filter((x) => x.op === 'revoke').length, 300);
+  assert.equal(f.calls.filter((x) => x.op === 'grant').length, 300);
+  // A live handle is still tracked until its flight settles, and close() revokes only what remains.
+  const live = await c.grant({ taskId: 'task:live', domains: ['example.com'] }); assert.equal(c.retained(), 1);
+  revokeStatus = 200;
+  const results = await c.close(); assert.equal(results.length, 1); assert.equal(c.retained(), 0); void live;
+});
