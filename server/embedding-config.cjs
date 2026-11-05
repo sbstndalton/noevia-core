@@ -72,10 +72,10 @@ function seedFromEnv(env = process.env, fallbackModel = 'default', log = () => {
   return { active, next: next && !sameTarget(next, active) ? next : null, previous: null };
 }
 
-function readState(stateFile) {
+function readState(stateFile, suppliedRaw = null) {
   if (!stateFile) return null;
   let raw;
-  try { raw = fs.readFileSync(stateFile, 'utf8'); } catch { return null; }
+  try { raw = suppliedRaw ?? fs.readFileSync(stateFile, 'utf8'); } catch { return null; }
   try {
     const s = JSON.parse(raw);
     if (s?.version !== 1) throw Error('unknown version');
@@ -106,16 +106,39 @@ function createEmbeddingConfig({ env = process.env, stateFile = null, fallbackMo
   const held = {}; // 'active' | 'next' -> { reason, transient, target }: seeded values refused at start-up
   const source = saved ? 'saved' : 'environment';
   let version = 0;
+  let observed = saved && stateFile ? fs.readFileSync(stateFile, 'utf8') : null;
+  let refreshing = false;
   let savedChange = false; // a change was written to stateFile (a refusal at startup is not)
   const listeners = new Set();
   const copy = (t) => (t ? { ...t } : null);
 
+  // Native publication uses the same atomic file and flock. Check before every
+  // read, including synchronous retrieval consumers; a timer leaves a stale window.
+  function refresh() {
+    if (!nativeOwner || !stateFile || refreshing) return;
+    refreshing = true;
+    try {
+      let raw;
+      try { raw = fs.readFileSync(stateFile, 'utf8'); } catch (err) {
+        if (err.code === 'ENOENT' && observed === null) return;
+        throw Object.assign(Error('The saved embedding configuration is unavailable.'), { code: 'badState' });
+      }
+      if (raw === observed) return;
+      const next = readState(stateFile, raw); // validates before changing any state
+      observed = raw;
+      state = next;
+      savedChange = true;
+      version += 1;
+      for (const fn of listeners) { try { fn(get()); } catch { /* cache observers cannot block publication */ } }
+    } finally { refreshing = false; }
+  }
   function persist() {
     if (!stateFile) return;
     fs.mkdirSync(path.dirname(stateFile), { recursive: true });
     const tmp = `${stateFile}.${process.pid}.tmp`;
     fs.writeFileSync(tmp, JSON.stringify({ version: 1, ...state }, null, 2), { mode: 0o600 });
     fs.renameSync(tmp, stateFile);
+    observed = fs.readFileSync(stateFile, 'utf8');
   }
   function change(next) {
     if (nativeOwner && stateFile && !inHold) throw Error('Embedding configuration requires the publication lock');
@@ -134,6 +157,7 @@ function createEmbeddingConfig({ env = process.env, stateFile = null, fallbackMo
     return get();
   }
   function get() {
+    refresh();
     return { active: copy(state.active), next: copy(state.next), previous: copy(state.previous), source: savedChange || saved ? 'saved' : source, version };
   }
   const api = {
@@ -142,17 +166,17 @@ function createEmbeddingConfig({ env = process.env, stateFile = null, fallbackMo
       fs.mkdirSync(path.dirname(stateFile), { recursive: true });
       return require('./embedding-config-lock.cjs').withFlock(`${stateFile}.lock`, () => {
         inHold = true;
-        try { return action(); } finally { inHold = false; }
+        try { refresh(); return action(); } finally { inHold = false; }
       });
     },
     get,
-    active: () => copy(state.active),
-    next: () => copy(state.next),
-    previous: () => copy(state.previous),
-    version: () => version,
+    active: () => { refresh(); return copy(state.active); },
+    next: () => { refresh(); return copy(state.next); },
+    previous: () => { refresh(); return copy(state.previous); },
+    version: () => { refresh(); return version; },
     onChange(fn) { listeners.add(fn); return () => listeners.delete(fn); },
     /** Every model name this process may embed with now or after a switch or rollback. */
-    modelNames() { return [state.active, state.next, state.previous].filter(Boolean).map((t) => t.model); },
+    modelNames() { refresh(); return [state.active, state.next, state.previous].filter(Boolean).map((t) => t.model); },
     setNext(target) {
       const t = normalizeTarget(target);
       if (sameTarget(t, state.active)) throw Object.assign(Error('That model, profile and address are already active.'), { status: 409, code: 'alreadyActive' });
