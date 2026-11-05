@@ -24,6 +24,7 @@ test('private native request carries only the supplied synthetic catalogue and t
  let seen;const client=createClient({env,fetchImpl:async(url,options)=>{seen={url,options};return new Response(JSON.stringify(snapshot('synthetic')));}});
  await client.get([{name:'synthetic'}]);
  assert.equal(seen.url,'http://127.0.0.1:19091/v1/reranker/settings');
+ assert.equal(seen.options.redirect,'error');
  assert.deepEqual(JSON.parse(seen.options.body),{installed:[{name:'synthetic'}]});
  assert.equal(seen.options.headers['x-noevia-store-token'],env.NOEVIA_PROJECT_STORE_TOKEN);
 });

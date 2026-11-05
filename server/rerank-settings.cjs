@@ -17,7 +17,7 @@ function createClient({ env = process.env, fetchImpl = globalThis.fetch, onChang
     if (!Number.isInteger(port) || port < 1 || port > 65535 || typeof token !== 'string' || token.length < 32) throw unavailable();
     try {
       const response = await fetchImpl(`http://127.0.0.1:${port}/v1/reranker/settings`, {
-        method: 'POST',
+        method: 'POST', redirect: 'error',
         headers: { 'content-type': 'application/json', 'x-noevia-store-token': token },
         body: JSON.stringify({ installed }), signal: AbortSignal.timeout(10000),
       });
