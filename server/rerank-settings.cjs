@@ -24,9 +24,11 @@ function createClient({ env = process.env, fetchImpl = globalThis.fetch, onChang
       if (!response.ok) throw unavailable();
       const value = await require('./http.cjs').readCappedJson(response, 8 * 1024 * 1024);
       if (!value || !value.env || typeof value.env !== 'object' || Array.isArray(value.env)
-        || Object.values(value.env).some(v => typeof v !== 'string') || !value.view
+        || !Object.hasOwn(value.env, 'RERANK_API_KEY') || Object.values(value.env).some(v => typeof v !== 'string') || !value.view
         || typeof value.revision !== 'string' || !/^[a-f0-9]{32}:\d+$/.test(value.revision)
-        || typeof value.view.enabled !== 'boolean' || !Array.isArray(value.view.options)) throw unavailable();
+        || typeof value.view.enabled !== 'boolean' || !['admin', 'deployment'].includes(value.view.source)
+        || (value.view.choice !== null && typeof value.view.choice !== 'string') || !Array.isArray(value.view.options)
+        || value.view.options.some(option => !option || typeof option.id !== 'string' || typeof option.model !== 'string' || !['tei', 'llamacpp'].includes(option.backend))) throw unavailable();
       const next = require('node:crypto').createHash('sha256')
         .update(JSON.stringify([value.revision, value.env, value.view.choice, value.view.source])).digest('hex');
       if (next !== fingerprint) { onChange(); fingerprint = next; }

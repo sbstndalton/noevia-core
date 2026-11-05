@@ -2,7 +2,7 @@
 const test=require('node:test');const assert=require('node:assert/strict');
 const {createClient,install,current,withSettings}=require('./rerank-settings.cjs');
 const env={NOEVIA_PROJECT_STORE_PORT:'19091',NOEVIA_PROJECT_STORE_TOKEN:'x'.repeat(32)};
-const snapshot=(model)=>({revision:'0'.repeat(32)+':0',env:{RERANK_MODEL:model,NOEVIA_FEATURE_RAG_RERANK:'true'},view:{enabled:true,choice:'tei',source:'admin',options:[]}});
+const snapshot=(model)=>({revision:'0'.repeat(32)+':0',env:{RERANK_API_KEY:'',RERANK_MODEL:model,NOEVIA_FEATURE_RAG_RERANK:'true'},view:{enabled:true,choice:'tei',source:'admin',options:[]}});
 test('native owner unavailable never falls back to deployment',async()=>{
  const client=createClient({env,fetchImpl:async()=>{throw Error('synthetic outage');}});
  await assert.rejects(client.run(()=>assert.fail('must not execute')),e=>e.status===503);
@@ -16,7 +16,7 @@ test('concurrent operations retain their own native snapshot and the next use re
  assert.equal(await client.run(()=>client.effectiveEnv().RERANK_MODEL),'3');
 });
 test('bad or oversized authority responses refuse before executing work',async()=>{
- for(const response of [new Response('{}'),new Response('no',{status:503}),new Response('x'.repeat(1024*1024+1))]){
+ for(const response of [new Response('{}'),new Response('no',{status:503}),new Response('x'.repeat(1024*1024+1)),new Response(JSON.stringify({...snapshot('synthetic'),env:{}}))]){
   const client=createClient({env,fetchImpl:async()=>response});await assert.rejects(client.run(()=>assert.fail()),e=>e.status===503);
  }
 });
