@@ -5,6 +5,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const { Readable, Writable } = require('node:stream');
+const { frontTurn } = require('../tests/server/front-chat-turn.cjs');
 const test = require('node:test');
 // #2191 round 2: POST /api/projects is the Rust front's; fixtures are written as its create leaves them.
 const { createProjectAs } = require('../tests/server/front-projects.cjs');
@@ -23,11 +24,12 @@ test.after(() => {
   fs.rmSync(testDataDir, { recursive: true, force: true });
 });
 
-async function request(url, { method = 'GET', headers = {}, body = '' } = {}) {
+async function request(url, { method = 'GET', headers = {}, body = '', peer } = {}) {
   const req = Readable.from(body ? [body] : []);
   req.url = url;
   req.method = method;
   req.headers = { host: 'localhost', ...headers };
+  if (peer) req.socket = { remoteAddress: peer };
 
   const chunks = [];
   const responseHeaders = {};
@@ -84,7 +86,7 @@ test('projects are Chat projects; an old client sending modes is accepted, norma
 
 test('a project once saved without Chat no longer refuses chat turns (#1576)', async () => {
   const code = createProjectAs(testDataDir, frontUserId, { name: 'Synthetic code only', modes: ['code'] });
-  const reply = await post('/api/chat', { spaceId: 'project', projectId: code.id, message: 'hello', history: [] });
+  const reply = await request(...frontTurn({ method: 'POST', headers: mutationHeaders(), body: JSON.stringify({ spaceId: 'project', projectId: code.id, message: 'hello', history: [] }) }, frontUserId));
   assert.notEqual(reply.status, 409, reply.text);
   assert.doesNotMatch(reply.text, /not enabled for Chat/);
 });

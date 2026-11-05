@@ -21,8 +21,10 @@
 //   updatedAt ('current').
 // - Which users are read: those seen by an authenticated request in this process within
 //   ACTIVE_MS, on a short timer (INTERVAL_MS), plus the requesting user at every request start.
-//   A history save comes from a signed-in browser that keeps calling Node (chat turns, lists,
-//   framing). A user who goes quiet is caught up when they come back: the journal keeps the
+//   A user who only reaches routes the Rust front answers itself is active too: the front records
+//   every authenticated request in UI_DATA_DIR/chat-activity.json (chat-activity.cjs), and each tick
+//   first merges it (`activity`), so their last request counts as a request start here would have,
+//   with the same ACTIVE_MS. A user who goes quiet is caught up when they come back: the journal keeps the
 //   entries, and a rotation in between is detected and rescanned. Reading every account's
 //   journal every 2 s would cost a store call per account with nothing to gain. The timer calls the
 //   store only when the journal file's stamp (size, mtime, inode: `stamp`, a local stat) changed
@@ -51,7 +53,7 @@ const RECENT_CAP = 5000;
  * @param {(user:string, chatId:string) => void} deps.onChange  schedules the chat's mirror and brain
  * @param {(user:string) => string|null} [deps.stamp]  the journal file's stamp (null: unknown, read)
  */
-function createChangeJournalReader({ read, onChange, onRescan = () => {}, stamp = () => null, log = (...a) => console.warn(...a), intervalMs = INTERVAL_MS, activeMs = ACTIVE_MS,
+function createChangeJournalReader({ read, onChange, onRescan = () => {}, stamp = () => null, activity = () => null, log = (...a) => console.warn(...a), intervalMs = INTERVAL_MS, activeMs = ACTIVE_MS,
   now = Date.now, setTimer = setInterval, clearTimer = clearInterval }) {
   const moves = new Map(); // user -> bounded event identities + ordered live watermark
   const cursors = new Map(); // user -> { seq, start }
@@ -61,6 +63,7 @@ function createChangeJournalReader({ read, onChange, onRescan = () => {}, stamp 
   const failing = new Set(); // users whose last poll failed (logged once)
   const stamps = new Map(); // user -> the journal stamp at their last good timer read
   const recent = new Map(); // `${user}\n${chatId}` -> revision last scheduled
+  const merged = new Map(); // user -> the front's activity time last merged (kept past forget: only a newer one counts)
   let supported = null; // null: not known yet; true: the store journals; false: it has no op
   let timer = null;
 
@@ -193,7 +196,23 @@ function createChangeJournalReader({ read, onChange, onRescan = () => {}, stamp 
     poll(user);
   }
 
+  /** The front's record of authenticated requests (chat-activity.cjs): a time newer than the one
+   *  last merged for that user is a request start of theirs. Never throws. */
+  function absorb() {
+    let doc = null;
+    try { doc = activity(); } catch { doc = null; }
+    if (!doc || typeof doc !== 'object') return;
+    for (const user of merged.keys()) if (!Object.hasOwn(doc, user)) merged.delete(user);
+    for (const [user, at] of Object.entries(doc)) {
+      if (typeof user !== 'string' || !user || !Number.isFinite(at)) continue;
+      if (merged.has(user) && at <= merged.get(user)) continue;
+      merged.set(user, at);
+      if (!seen.has(user) || seen.get(user) < at) seen.set(user, at);
+    }
+  }
+
   function tick() {
+    absorb();
     // A store without the op (an older front): nothing to tail; request starts still probe it.
     if (supported === false) return Promise.resolve([]);
     const cutoff = now() - activeMs;

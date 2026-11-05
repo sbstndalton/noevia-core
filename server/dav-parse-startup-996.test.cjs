@@ -312,6 +312,8 @@ test('index.cjs starts with the pinned module and every retired switch left at j
   child = require('node:child_process').spawn(process.execPath, [path.join(__dirname, 'index.cjs')], {
     env: { ...process.env, UI_DATA_DIR: dataDir, UI_PORT: '0', PORT: '0', HOST: '127.0.0.1', PUBLIC_ORIGIN: 'http://localhost', DIARY_AUTH_TOKEN: 'test-cowork-token', DAV_PARSE_WASM: wasmFile,
       // The project store is required (sbstndalton/noevia#1071); nothing is saved in this test.
+      // The paired front Core probes at boot (rust-embedding-background.cjs); without it Core exits right after this check.
+      NOEVIA_SERVER_BIN: require('../tests/server/project-store-server.cjs').syntheticFrontBin(dataDir),
       NOEVIA_PROJECT_STORE_PORT: '9', NOEVIA_PROJECT_STORE_TOKEN: 'synthetic-store-token-'.padEnd(64, 'x'), NOEVIA_RUST_PROJECTS: '0', NOEVIA_START_ID: '0123456789abcdef0123456789abcdef',
       LLAMACPP_PRESETS_IMPL: 'js', STREAM_GUARD_IMPL: 'js', ROLE_CONTEXT_IMPL: 'js', DAV_PARSE_IMPL: 'js', S3_PARSE_IMPL: 'js', CHAT_TEMPLATE_CAPS_IMPL: 'off', AUTOTUNE_PLAN_IMPL: 'js', PRESET_RELOAD_IMPL: 'off', LAYA_LOAD_ADVISOR: 'off',
       MCP_FRAME_IMPL: 'js', UPLOAD_SNIFF_IMPL: 'js', S3_SIGN_IMPL: 'js', PROMPT_FRAMING_IMPL: 'js', SSRF_IMPL: 'js',

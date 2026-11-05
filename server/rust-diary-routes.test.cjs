@@ -74,7 +74,8 @@ test('every owned request is refused with a 503 and its code before the body is 
 
 test('the Node duplicates are gone', () => {
   const read = (...p) => fs.readFileSync(path.join(__dirname, ...p), 'utf8');
-  const routes = read('routes', 'diary.cjs');
+  // routes/diary.cjs is retired once the Diary proxies and the local exchange are both the front's.
+  const routes = fs.existsSync(path.join(__dirname, 'routes', 'diary.cjs')) ? read('routes', 'diary.cjs') : '';
   for (const gone of ['connector(', 'connectors(', "'/api/diary/exchanges'", "'/api/diary/storage-status'", 'diaryConnectors', 'connectorRate', 'readObject', 'automaticStorage', 'diary-jobs.cjs']) {
     assert.equal(routes.includes(gone), false, gone);
   }
@@ -168,12 +169,12 @@ test('through the router: owned routes are refused signed out and signed in; the
     }
   }
   // Positive controls: what Node keeps still runs the ordinary chain (auth, then the add-on gate).
-  for (const url of ['/api/diary/history', '/api/diary/workspace-trash', '/api/diary/files']) {
-    assert.equal((await request(url)).status, 401, `${url} signed out`);
-    const off = await request(url, { headers: as(member) });
-    assert.equal(off.status, 404, `${url} without the add-on`);
-    assert.deepEqual(off.json, { error: 'Diary add-on is disabled' });
-  }
+  // Joined with the local exchange's move, no Diary route stays in Node: signed out, the local exchange is
+  // refused by its own module before authentication, and a path no one routes still runs the ordinary chain.
+  const lx = await request('/api/diary/local-exchange');
+  assert.deepEqual([lx.status, lx.json], [503, require('./rust-diary-local-exchange.cjs').ROUTE_REFUSAL]);
+  assert.equal((await request('/api/diary/not-a-route')).status, 401, 'an unrouted Diary path signed out');
+  assert.equal((await request('/api/diary/not-a-route', { headers: as(withDiary) })).status, 404, 'an unrouted Diary path signed in');
   const local = await request('/api/diary/local-exchange', { method: 'POST', headers: as(member), body: '{}' });
   assert.deepEqual([local.status, local.json], [503, require('./rust-diary-local-exchange.cjs').ROUTE_REFUSAL]);
   // An owned path with another method is Node's old unknown-path answer, as before.

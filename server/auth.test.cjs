@@ -5,6 +5,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const { Readable, Writable } = require('node:stream');
+const { frontTurn } = require('../tests/server/front-chat-turn.cjs');
 const test = require('node:test');
 // #2191 round 2: POST /api/projects is the Rust front's; fixtures are written as its create leaves them.
 const { createProjectAs } = require('../tests/server/front-projects.cjs');
@@ -26,11 +27,12 @@ test.after(() => {
   fs.rmSync(testDataDir, { recursive: true, force: true });
 });
 
-async function request(url, { method = 'GET', headers = {}, body = '' } = {}) {
+async function request(url, { method = 'GET', headers = {}, body = '', peer } = {}) {
   const req = Readable.from(body ? [body] : []);
   req.url = url;
   req.method = method;
   req.headers = { host: 'localhost', ...headers };
+  if (peer) req.socket = { remoteAddress: peer };
 
   const chunks = [];
   const responseHeaders = {};
@@ -119,11 +121,34 @@ test('the provider registry\'s other methods are refused too (the Rust front rem
   }
 });
 
+test('chat port S5: only the front\'s relay runs a turn; the relay is bound to its user; the gate probe', async () => {
+  const body = JSON.stringify({ chatId: 'test', message: 'hello' });
+  // Straight at the public path, signed in or not: refused before the gate and authentication.
+  for (const headers of [adminHeaders, {}]) {
+    const direct = await request('/api/chat', { method: 'POST', headers, body });
+    assert.equal(direct.status, 503);
+    assert.deepEqual(JSON.parse(direct.text), require('./rust-chat-turn.cjs').ROUTE_REFUSAL);
+    assert.equal(direct.headers['X-Noevia-API'], '1');
+  }
+  // A relay naming another user than the credentials authenticate is signed out: Node's own 401 bytes.
+  const [url, init] = frontTurn({ method: 'POST', headers: adminHeaders, body }, 'synthetic-someone-else');
+  const wrong = await request(url, init);
+  assert.equal(wrong.status, 401);
+  assert.equal(wrong.text, JSON.stringify({ error: 'unauthorized' }));
+  // Not from the front (no loopback peer): the 404 of an unknown path, nothing run.
+  const stranger = await request(url, { ...init, peer: undefined });
+  assert.equal(stranger.status, 404);
+  // Chat port S8: the front's gate is an admission lease (rust-chat-admission.cjs); the old probe path is gone.
+  const [, probeInit] = frontTurn({ method: 'POST', headers: {} }, '');
+  const probe = await request('/internal/chat/gate', probeInit);
+  assert.notEqual(probe.status, 204);
+});
+
 test('chat reports upstream errors in SSE without writing headers twice', async (t) => {
   const projectId = createProjectAs(testDataDir, adminId, {name:'Failure test', model:'model'}).id;
   for (const fetchStub of [async () => { throw new Error('offline'); }, async () => new Response('unavailable', {status:503})]) {
     t.mock.method(global, 'fetch', fetchStub);
-    const result = await request('/api/chat', {method:'POST', headers:adminHeaders, body:JSON.stringify({projectId, chatId:'test', message:'hello'})});
+    const result = await request(...frontTurn({method:'POST', headers:adminHeaders, body:JSON.stringify({projectId, chatId:'test', message:'hello'})}, adminId));
     assert.equal(result.status, 200);
     assert.match(result.text, /"type":"error"/);
     assert.match(result.text, /"type":"done"/);
@@ -141,7 +166,7 @@ test('empty SSE fallback refuses redirects and reconstructs split SSE lines', as
     calls++;
     return calls === 1 ? new Response('') : Response.json({choices:[{message:{content:'fallback answer'}}]});
   });
-  const result = await request('/api/chat', {method:'POST', headers:adminHeaders, body:JSON.stringify({projectId, chatId:'test', message:'hello'})});
+  const result = await request(...frontTurn({method:'POST', headers:adminHeaders, body:JSON.stringify({projectId, chatId:'test', message:'hello'})}, adminId));
   assert.equal(calls, 2);
   assert.match(result.text, /fallback answer/);
   t.mock.restoreAll();
@@ -150,7 +175,7 @@ test('empty SSE fallback refuses redirects and reconstructs split SSE lines', as
     controller.enqueue(new TextEncoder().encode(line.slice(0, 17)));
     controller.enqueue(new TextEncoder().encode(line.slice(17))); controller.close();
   }})));
-  const split = await request('/api/chat', {method:'POST', headers:adminHeaders, body:JSON.stringify({projectId, chatId:'test', message:'hello'})});
+  const split = await request(...frontTurn({method:'POST', headers:adminHeaders, body:JSON.stringify({projectId, chatId:'test', message:'hello'})}, adminId));
   assert.match(split.text, /split answer/);
 });
 
@@ -162,18 +187,18 @@ test('a large authenticated request to a route the front owns is refused before 
   assert.equal(JSON.parse(result.text).code, 'RUST_PROJECT_CONFIG_OWNED');
 });
 
-test('diary file routes require auth and forward conflicts without losing the error', async (t) => {
-  assert.equal((await request('/api/diary/files')).status, 401);
-  // The Diary preference is written by the Rust front (#1071).
+test('the diary file routes are the Rust front\'s: Node refuses them before auth and never reaches the sidecar', async (t) => {
+  // The files/file proxies (their auth, add-on gate and 409 relay) moved to the front with the Diary proxy
+  // port: noevia-rs crates/server-diary/tests/proxy_parity.rs:25 and bins/noevia-server/tests/diary.rs:1028.
+  // The Diary preference is written by the Rust front (#1071); the chat test below needs it on.
   require('../tests/server/seed-account.cjs').setUserFeatures(testDataDir, adminId, { diaryEnabled: true });
-  t.mock.method(globalThis, 'fetch', async (url, opts) => {
-    assert.match(String(url), /\/api\/file$/);
-    assert.ok(opts.headers['X-Cowork-User-ID']);
-    assert.equal(opts.redirect, 'error');
-    return Response.json({ detail: 'File changed elsewhere' }, { status: 409 });
-  });
-  const r = await request('/api/diary/file', { method: 'PUT', headers: adminHeaders, body: JSON.stringify({path:'MEMORY.md',content:'edited',version:'old'}) });
-  assert.equal(r.status,409);assert.match(r.text,/changed elsewhere/);
+  t.mock.method(globalThis, 'fetch', async () => { throw new Error('the sidecar must not be called'); });
+  for (const [path, init] of [['/api/diary/files', {}], ['/api/diary/files', { headers: adminHeaders }],
+    ['/api/diary/file', { method: 'PUT', headers: adminHeaders, body: JSON.stringify({path:'MEMORY.md',content:'edited',version:'old'}) }]]) {
+    const r = await request(path, init);
+    assert.equal(r.status, 503, path);
+    assert.equal(JSON.parse(r.text).code, 'RUST_DIARY_OWNED', path);
+  }
 });
 test('diary forwards browser date and selected day to the pipeline', async (t) => {
   let sent;
@@ -181,7 +206,7 @@ test('diary forwards browser date and selected day to the pipeline', async (t) =
     sent = JSON.parse(opts.body);
     return Response.json({ choices:[{message:{content:'Reply',reasoning_content:'Synthetic provider reasoning'}}], diary:{decision:'logged'} });
   });
-  const r = await request('/api/chat', { method:'POST',headers:adminHeaders,body:JSON.stringify({spaceId:'diary',message:'Past day note',history:[],entryTime:'2026-09-07T10:00:00-04:00',entryDay:'2026-07-08'}) });
+  const r = await request(...frontTurn({ method:'POST',headers:adminHeaders,body:JSON.stringify({spaceId:'diary',message:'Past day note',history:[],entryTime:'2026-09-07T10:00:00-04:00',entryDay:'2026-07-08'}) }, adminId));
   assert.equal(r.status,200);assert.equal(sent.entryDay,'2026-07-08');assert.equal(sent.entryTime,'2026-09-07T10:00:00-04:00');
   assert.match(r.text, /"type":"reasoning","text":"Synthetic provider reasoning"/);
 });

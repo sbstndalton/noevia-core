@@ -1,4 +1,8 @@
 'use strict';
+function embeddingProtectionUnknown(env) {
+  const service = require('../embedding-service.cjs').current();
+  return !!env.MODEL_LOADER_URL && !!service?.protectionKnown && !service.protectionKnown();
+}
 // The model routes (models.cjs holds what they compute):
 //   /api/stats                  engine and system statistics
 //   /api/auto-roles             the Fast/Smart/Vision/Code/Creative role→model config
@@ -357,6 +361,7 @@ function createModelRoutes({ servedEmbeddingModels = (target) => require('../rag
       // every models.ini section it backed) using the SAME scan this guard already reads.
       let deleteKeys=null, deleteScanned=null;
       if(method==='POST'&&rest==='models/delete'){
+        if (embeddingProtectionUnknown(env)) return json(res, 409, { error: 'Embedding model protection is not current.', errorId: 'modelInUse' });
         let payload; try{payload=JSON.parse(body||'{}');}catch{payload={};}
         const keys=Array.isArray(payload.models)?payload.models:[];
         let scanned=modelScanCache.get('models')?.body?.models;
@@ -393,8 +398,8 @@ function createModelRoutes({ servedEmbeddingModels = (target) => require('../rag
         }
         // Delete-only guard (#336): removing the section for a model a live sidecar depends on
         // leaves that sidecar pointed at nothing. Rename is left alone — out of scope here.
-        if (method === 'DELETE' && (isSidecarModel(name, env) || (cachedEntry && isSidecarModel(cachedEntry.modelId, env)))) {
-          return json(res, 409, { error: SIDECAR_MODEL_DELETE_REASON, errorId: 'modelInUse', service: sidecarServiceOf(isSidecarModel(name, env) ? name : cachedEntry.modelId) });
+        if (method === 'DELETE' && (embeddingProtectionUnknown(env) || isSidecarModel(name, env) || (cachedEntry && isSidecarModel(cachedEntry.modelId, env)))) {
+          return json(res, 409, { error: SIDECAR_MODEL_DELETE_REASON, errorId: 'modelInUse', service: sidecarServiceOf(isSidecarModel(name, env) ? name : cachedEntry?.modelId) });
         }
         // #697: a section saved through the model manager replaces the whole section; refuse it when
         // the settings would not fit the inference memory budget, as the preset editor does.
@@ -649,7 +654,7 @@ function createModelRoutes({ servedEmbeddingModels = (target) => require('../rag
       // still pointed at it, which crash-loops that sidecar with nothing to fall back to.
       // 409 (not 400): the name is a perfectly valid model, just not deletable right now.
       // #1660: the refusal names the service, so the client can offer "switch it first".
-      if (isSidecarModel(body.name, env)) return json(res, 409, { error: SIDECAR_MODEL_DELETE_REASON, errorId: 'modelInUse', service: sidecarServiceOf(body.name) });
+      if (embeddingProtectionUnknown(env) || isSidecarModel(body.name, env)) return json(res, 409, { error: SIDECAR_MODEL_DELETE_REASON, errorId: 'modelInUse', service: sidecarServiceOf(body.name) });
       if (!modelManager.enabled) return json(res, 404, { error: 'model management is disabled' });
       // A neutral id can still point at Laya's weights: check the router's --model path as well.
       if (modelManager.kind === 'llamacpp' && typeof modelManager.request === 'function') {
