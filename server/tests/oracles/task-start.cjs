@@ -25,7 +25,7 @@ async function capture(input) {
   try {
     const result = await service.start({ dir: '/synthetic/account', userId: 'synthetic-user' }, { id: 'project' }, input.body);
     return JSON.parse(JSON.stringify({ status: 202, result, execution }));
-  } catch (error) { return { status: error.status || 500, error: error.publicMessage || 'Internal server error' }; }
+  } catch (error) { return { status: error.status || 500, error: error.publicMessage || (error.status ? error.message : 'Code request failed') }; }
 }
 async function fixture() {
   const cases = [];
