@@ -160,8 +160,11 @@ featureRuntime = require('./feature-runtime.cjs').createFeatureRuntime({
 });
 // One initial barrier, shared by real startup and the existing imported request API.
 // Ordinary enabled/flags/describe never initiate an RPC or bypass the live lease.
-let featureStartup=null;
-const readyFeatures=()=>featureStartup ||= Promise.all([featureRuntime.ready(), PROJECT_STORE.autoRolesReady()]);
+let featureStartup=null, autoRolesProof=null;
+// The native auto-roles write pairing proof is remembered once established or definitively
+// refused; a busy or unreachable store is not, so the next request asks again.
+const autoRolesReady=()=>autoRolesProof ||= PROJECT_STORE.autoRolesReady().catch((err)=>{ if (err && err.code==='PROJECTS_BUSY') autoRolesProof=null; throw err; });
+const readyFeatures=()=>Promise.all([featureStartup ||= featureRuntime.ready(), autoRolesReady()]);
 
 const featureRoutes = require('./routes/features.cjs').createFeatureRoutes({ json });
 // Settings → Data: the signed-in user's conversations as a ZIP (routes/export.cjs).
