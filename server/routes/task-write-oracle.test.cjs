@@ -46,3 +46,25 @@ for (const surface of ['code', 'browser']) {
     });
   }
 }
+for (const surface of ['code', 'browser']) {
+  const factory = surface === 'code' ? createCodeRoutes : createBrowserRoutes;
+  test(`${surface} action without task id retains the existing start alias`, async () => {
+    let response, started = 0;
+    const route = factory({ service: { start: async () => { started++; return { taskId: ID }; } },
+      features: { enabled: () => true }, getProject: () => ({ id: 'p' }), workspace: () => ({}),
+      json: (_, status, value) => { response = { status, value }; }, readJson: async () => ({}) });
+    assert.equal(await route({ method: 'POST' }, {}, { path: `/api/projects/p/${surface}/cancel`, authn: { user: { role: 'admin' } } }), true);
+    assert.equal(started, 1);
+    assert.deepEqual(response, { status: 202, value: { taskId: ID } });
+  });
+  test(`${surface} project and method rejection precede JSON reads`, async () => {
+    let status, reads = 0;
+    for (const exists of [false, true]) {
+      const route = factory({ service: {}, features: { enabled: () => true }, getProject: () => exists ? { id: 'p' } : null,
+        workspace: () => ({}), json: (_, code) => { status = code; }, readJson: async () => { reads++; throw SyntaxError(); } });
+      await route({ method: 'HEAD' }, {}, { path: `/api/projects/p/${surface}`, authn: { user: { role: 'admin' } } });
+      assert.equal(status, exists ? 405 : 404);
+    }
+    assert.equal(reads, 0);
+  });
+}
