@@ -587,7 +587,11 @@ function createModelRoutes({ servedEmbeddingModels = (target) => require('../rag
         if (isJsonObject(body) && body.reset === true) return json(res, 200, rerankSettings.reset(authn.user.id, installed));
         return json(res, 200, rerankSettings.save(body, authn.user.id, installed));
       } catch (error) {
-        return json(res, error.status || 400, { error: error.status ? error.message : 'Invalid reranker settings', ...(error.messageId ? { errorId: error.messageId } : {}) });
+        // Only the settings module's own refusals (they carry a messageId) are words meant for the admin. Anything else,
+        // a single-writer guard refusal included, is logged here and answered with the generic error (#2396).
+        if (error?.messageId) return json(res, error.status || 400, { error: error.message, errorId: error.messageId });
+        console.error('[rerank] settings', String(error?.code || error?.message || error).slice(0, 200));
+        return json(res, 500, { error: 'The reranker settings could not be changed.' });
       }
     }
 

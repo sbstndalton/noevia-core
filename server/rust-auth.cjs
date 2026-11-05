@@ -152,8 +152,15 @@ function singleSettingKey(sql, args) {
     const value = Array.isArray(args[0]) ? args[0][0] : args[0];
     return typeof value === 'string' ? value : null;
   }
-  const del = /^DELETE FROM settings WHERE key='([^']*)'(?: AND value=\?)?$/i.exec(source);
-  return del ? del[1] : null;
+  // A DELETE names its key literally or as the first bound value (#2396: the reranker reset's
+  // `DELETE FROM settings WHERE key=?`), exactly like an INSERT; the same ownership rule then applies.
+  const del = /^DELETE FROM settings WHERE key=(\?|'[^']*')(?: AND value=\?)?$/i.exec(source);
+  if (del) {
+    if (del[1] !== '?') return del[1].slice(1, -1);
+    const value = Array.isArray(args[0]) ? args[0][0] : args[0];
+    return typeof value === 'string' ? value : null;
+  }
+  return null;
 }
 // sbstndalton/noevia#1071: the routing allowed list, the reasoning default and the sampling-presets
 // switch are written only by the Rust front (their routes left Node). This connection refuses those
