@@ -21,6 +21,7 @@ test('workspace oracle captures clone saving, pinned cleanup and interrupted rec
     const options = { dir: storeDir, treeRoot, owner: { uid: process.getuid(), gid: process.getgid() }, epoch: 'first', now: () => 1234 };
     const store = createCodeWorkspaces(options);
     const claim = store.claim({ taskId, repoPath: repo, capabilities: ['read_repository', 'edit_file'], domains: ['example.com'], pinned: ['engine-config.json'] });
+    const snapshot = store.projectSnapshot(taskId);
     const created = { taskId: claim.taskId, branch: claim.branch, status: claim.status, mode: claim.mode, baseBranch: claim.baseBranch, capabilities: claim.capabilities, domains: claim.domains, pinned: claim.pinned, epoch: claim.epoch, claimedAt: claim.claimedAt, hasBase: /^[0-9a-f]{40}$/.test(claim.baseSha) };
     fs.writeFileSync(path.join(claim.path, 'file.txt'), 'changed');
     fs.writeFileSync(path.join(claim.path, 'engine-config.json'), 'synthetic credential placeholder');
@@ -28,12 +29,21 @@ test('workspace oracle captures clone saving, pinned cleanup and interrupted rec
     const saved = { status: released.status, error: released.error, releasedAt: released.releasedAt, changedHead: released.headSha !== released.baseSha, saved: run(['show', `${claim.branch}:file.txt`], repo), original: fs.readFileSync(path.join(repo, 'file.txt'), 'utf8'), treeRemoved: !fs.existsSync(claim.path), homeRemoved: !fs.existsSync(claim.home) };
     assert.equal(saved.status, 'released');assert.equal(saved.saved, 'changed');assert.equal(saved.original, 'original');
     assert.equal(saved.treeRemoved, true);assert.equal(saved.homeRemoved, true);
+    const change = store.change(taskId);
+    const normalize = value => JSON.parse(JSON.stringify(value).replaceAll(dir, '<ROOT>').replaceAll(released.baseSha, '<base>').replaceAll(released.headSha, '<head>'));
+    const pipeline = { snapshot, change: normalize(change), verified: normalize(store.verifyCheckout(taskId, released.headSha)), checkedOut: normalize(store.mergePreflight(taskId, { headSha: released.headSha })) };
+    assert.equal(pipeline.checkedOut.code, 'checked_out');
+    run(['checkout', '--detach', '--quiet'], repo);
+    pipeline.preflight = store.mergePreflight(taskId, { headSha: released.headSha });
+    pipeline.merged = normalize(store.mergeVerified(taskId, { headSha: released.headSha }));
+    assert.equal(pipeline.merged.ok, true);
+    assert.equal(pipeline.merged.to, '<head>');
     const next = store.claim({ taskId: otherId, repoPath: repo, pinned: ['engine-config.json'] });
     fs.writeFileSync(path.join(next.path, 'engine-config.json'), 'synthetic credential placeholder');
     const restarted = createCodeWorkspaces({ ...options, epoch: 'second', now: () => 5678 });
     const [recovered] = restarted.recover();
     const recovery = { status: recovered.status, interruptedAt: recovered.interruptedAt, pinnedDropped: recovered.pinnedDropped, treeKept: fs.existsSync(next.path), pinRemoved: !fs.existsSync(path.join(next.path, 'engine-config.json')) };
     assert.deepEqual(recovery, { status: 'interrupted', interruptedAt: 5678, pinnedDropped: true, treeKept: true, pinRemoved: true });
-    if (process.env.TASK_WORKSPACE_EVIDENCE) fs.writeFileSync(path.join(process.env.TASK_WORKSPACE_EVIDENCE, 'task-workspace-node.json'), JSON.stringify({ created, saved, recovery }, null, 2) + '\n');
+    if (process.env.TASK_WORKSPACE_EVIDENCE) fs.writeFileSync(path.join(process.env.TASK_WORKSPACE_EVIDENCE, 'task-workspace-node.json'), JSON.stringify({ created, saved, recovery, pipeline }, null, 2) + '\n');
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
