@@ -5,7 +5,7 @@ const {ladder}=require('./llamacpp-calibration.cjs');
 
 // Synthetic llama.cpp router: a model loads only while its preset context is at or below
 // `loadCap`, and recalls the start marker only at or below `longCap`.
-function fixture(t,{loadCap=40960,longCap=Infinity,native=131072,memory=()=>20,other=false,onLoad,speed=100000,presetWriter,extra={},bridge=null,reloadStatePath=null}={}){
+function fixture(t,{loadCap=40960,longCap=Infinity,native=131072,memory=()=>20,other=false,onLoad,speed=100000,presetWriter,extra={},bridge=null,reloadStatePath=null,managerExtra={},onStream=null}={}){
   const dir=fs.mkdtempSync(path.join(os.tmpdir(),'calibration-'));t.after(()=>fs.rmSync(dir,{recursive:true,force:true}));
   const ini=path.join(dir,'models.ini'),stateFile=path.join(dir,'state.json');
   const original='version = 1\n[*]\ncache-type-k = q8_0\n[synthetic]\n; operator note stays\nmodel = /models/s.gguf\nc = 8192\nparallel = 1\n[other]\nc = 4096\n';
@@ -39,6 +39,7 @@ function fixture(t,{loadCap=40960,longCap=Infinity,native=131072,memory=()=>20,o
       yield enc.encode(`data: ${JSON.stringify({prompt_progress:{total,cache:0,processed:0,time_ms:0}})}\n\n`);
       yield enc.encode(`data: ${JSON.stringify({prompt_progress:{total,cache:0,processed:1,time_ms:23}})}\n\n`);
       for(let processed=Math.min(1024,total);;processed=Math.min(total,processed+1024)){
+        await onStream?.(opts.signal);
         if(opts.signal?.aborted)throw Object.assign(Error('aborted'),{name:'AbortError'});
         clock.t+=1024/speed*1000;
         yield enc.encode(`data: ${JSON.stringify({prompt_progress:{total,cache:0,processed,time_ms:processed/speed*1000}})}\n\n`);
@@ -57,7 +58,7 @@ function fixture(t,{loadCap=40960,longCap=Infinity,native=131072,memory=()=>20,o
     return new Response(readable,{status:200});
   };
   const presetBaselineClient=bridge?bridge(router.calls):null;
-  const manager=createModelManager({kind:'llamacpp',baseUrl:'http://synthetic',presetPath:ini,fetchJson,fetchStream,publicCalibrator:true,calibrationStatePath:stateFile,autoconfig:{},presetWriter,presetBaselineClient,reloadStatePath,calibrationOptions:{identityFor:async()=>({arch:null,quant:null,artifact:'synthetic-artifact',build:null,profile:require('node:crypto').createHash('sha256').update(fs.readFileSync(ini)).digest('hex'),hardware:null}),sleep:async()=>{},readMemory:memory,now:()=>clock.t,timeouts:{memoryPoll:5},...extra}});
+  const manager=createModelManager({...managerExtra,kind:'llamacpp',baseUrl:'http://synthetic',presetPath:ini,fetchJson,fetchStream,publicCalibrator:true,calibrationStatePath:stateFile,autoconfig:{},presetWriter,presetBaselineClient,reloadStatePath,calibrationOptions:{identityFor:async()=>({arch:null,quant:null,artifact:'synthetic-artifact',build:null,profile:require('node:crypto').createHash('sha256').update(fs.readFileSync(ini)).digest('hex'),hardware:null}),sleep:async()=>{},readMemory:memory,now:()=>clock.t,timeouts:{memoryPoll:5},...extra}});
   return {manager,ini,stateFile,original,router,ctxOf};
 }
 // Existing worker tests launch an explicit synthetic plan. Public confirmation, numeric
@@ -393,4 +394,51 @@ test('legacy guard: a tombstone that cannot be written is treated the same (no r
   assert.equal(router.calls.filter(c=>c==='RELOAD').length,0);
   assert.match(manager.calibration.stateFacts().job.error,UNCONFIRMED);
   assert.equal(fs.existsSync(reloadStatePath),false,'the old state was not replaced');
+});
+
+// ---- Row J delta review: calibration under a lease of the Rust front's authority (synthetic). ----
+const {createNativeLeaseClient}=require('./model-maintenance-lease.cjs');
+const {authority,SECRET}=require('./synthetic-lease-authority.test-helper.cjs');
+const pause=ms=>new Promise(r=>setTimeout(r,ms));
+async function settled(manager,ms=20000){for(let i=0;i<ms/10;i++){const job=manager.calibration.stateFacts().job;if(job&&job.status!=='running')return job;await pause(10);}throw Error('calibration did not finish');}
+async function nativeFixture(t,options={},gateOptions={},authorityOptions={}){
+  const a=await authority(t,authorityOptions);
+  const client=createNativeLeaseClient({port:a.port,token:SECRET,boot:'cal',startedAt:1});
+  const f=fixture(t,{...options,managerExtra:{maintenanceAuthority:client,maintenanceGateOptions:gateOptions}});
+  await client.ready();await pause(5);
+  return {...f,a,client};
+}
+
+test('P2 a calibration on a fresh native lease with the production TTL and default step timeouts passes',async t=>{
+  const {manager,a}=await nativeFixture(t,{loadCap:131072,longCap:32768});
+  assert.equal((await launch(manager.calibration,'synthetic',{promptBudgetSeconds:120})).status,202);
+  const job=await settled(manager);
+  assert.equal(job.status,'passed',job.error);
+  assert.equal(job.result.verifiedCtx,32768);
+  assert.equal(a.acquires(),1,'one lease for the whole run');
+  manager.enterInference()();
+});
+
+test('P1 a calibration stream in flight when the lease is lost is aborted; chat stays closed until recovery confirms the engine idle',async t=>{
+  let tripped=false,abortedInFlight=false;
+  let a;
+  const f=await nativeFixture(t,{loadCap:131072,onStream:async signal=>{
+    if(tripped)return;
+    tripped=true;a.setRenew('ended');
+    await new Promise(resolve=>{if(signal?.aborted)resolve();signal?.addEventListener('abort',resolve,{once:true});setTimeout(resolve,5000);});
+    abortedInFlight=signal?.aborted===true;
+  }},{coverageMarginMs:50,recoveryRetryMs:20,recoveryPollMs:5},{ttlMs:600,renewMs:100});
+  a=f.a;
+  const {manager,router}=f;
+  assert.equal((await launch(manager.calibration,'synthetic',{promptBudgetSeconds:120})).status,202);
+  const job=await settled(manager);
+  assert.equal(abortedInFlight,true,'the stream carried the loss signal');
+  assert.notEqual(job.status,'passed');
+  const after=router.calls.length;
+  a.setRenew('ok');
+  assert.ok(await (async()=>{for(let i=0;i<500;i++){if(!manager.maintenanceHeld())return true;await pause(10);}return false;})(),'recovered');
+  assert.ok(router.calls.slice(after).includes('/models')||router.calls.length>after,'the recovery checked the engine');
+  assert.equal(router.status.synthetic,'unloaded','the engine is idle before chat resumes');
+  assert.equal(fs.readFileSync(f.ini,'utf8'),f.original,'the recovery restored the original profile');
+  manager.enterInference()();
 });

@@ -934,20 +934,63 @@ function createFullAutotuner({ request: engineRequest, rawModels: engineRawModel
   }
   const planOf = j => j.models?.find(m => m.model === j.model)?.plan || null;
   const phaseRuns = { sampling: runSampling, kv: runKv, context: runContext, drafting: runDrafting, batch: runBatch };
+  // Delta review P1: a phase whose lease of the front's authority was lost is not restored on that lease
+  // (nothing more runs on it). Its original text is kept in the job (durable) and the gate keeps chat and
+  // new maintenance closed until a recovery under a fresh lease has confirmed the engine idle, restored
+  // the text and had the router re-read it (recoverTrial); after a restart, recover() asks for it again.
+  const coverageLost = () => maintenance?.coverageSignal?.()?.aborted === true;
+  const recoverable = () => typeof maintenance?.requireRecovery === 'function';
+  function requireTrialRecovery(j) {
+    if (!j._recovery || !recoverable()) return;
+    maintenance.requireRecovery('autotune:' + j.id, () => recoverTrial(j),
+      'Chat is paused while noevia restores the settings an interrupted tune left behind.');
+  }
+  async function recoverTrial(j) {
+    const rec = j._recovery;
+    if (!rec) return;
+    // The engine is idle here (the recovery's settle step). Restore only our own version; an operator's
+    // later edit stands, and the router re-reads whatever models.ini holds now.
+    if (presets.snapshot().revision === rec.revision) {
+      await presets.commit({ baseRevision: rec.revision, text: rec.text }, rec.backedUp ? { backup: false } : undefined);
+      j._revision = presets.snapshot().revision;
+    }
+    if (!(await invalidateBaseline('autotune'))) throw Error('The preset reload baseline did not acknowledge the restore.');
+    const reload = await request('/models?reload=1', {}, 120000);
+    if (!reload.ok) throw Error('The router did not confirm restored settings.');
+    delete j._recovery; j._reloadPending = false; j._unsafe = false; j.restored = true;
+    note(j, 'Settings an interrupted tune left behind were restored, and the model server re-read them.');
+    save();
+  }
   async function restorePhase(j, p) {
     if (p._beforeText == null) return true;
     if (presets.snapshot().revision !== j._revision) { p.restored = false; return false; }
+    if (recoverable() && coverageLost()) {
+      j._recovery ||= { revision: j._revision, text: p._beforeText, backedUp: !!j._backedUp };
+      p.restored = false; save();
+      requireTrialRecovery(j);
+      return false;
+    }
     try {
       // #1068: restoring the file needs only the compact model stopped, never another client's; the
       // router's re-read waits while another client has a model live.
       await unloadOwn(j);
+      maintenance?.assertCovered?.();
       await presets.commit({ baseRevision: j._revision, text: p._beforeText }, j._backedUp ? { backup: false } : undefined);
       j._revision = presets.snapshot().revision; save();
       await reloadRouter(j);
       p.restored = true;
       delete p._beforeText; save();
       return true;
-    } catch { p.restored = false; save(); return false; }
+    } catch (e) {
+      // Lost during the restore itself: the recovery finishes it.
+      if (recoverable() && (e?.coverageLost || coverageLost())) {
+        j._recovery ||= { revision: j._revision, text: p._beforeText, backedUp: !!j._backedUp };
+        p.restored = false; save();
+        requireTrialRecovery(j);
+        return false;
+      }
+      p.restored = false; save(); return false;
+    }
   }
   async function unloadOwn(j) {
     // The compact model is often gone already (evicted by another client): ask only when it runs, and
@@ -1618,13 +1661,17 @@ function createFullAutotuner({ request: engineRequest, rawModels: engineRawModel
   function compareAndClear(token) {
     if (typeof token !== 'string' || clearFacts().token !== token) return { applied: false };
     const job = state.job;
-    if (starting || !job || !['failed', 'cancelled', 'interrupted', 'passed'].includes(job.status) || job._reloadPending) return { applied: false };
+    if (starting || !job || !['failed', 'cancelled', 'interrupted', 'passed'].includes(job.status) || job._reloadPending || job._recovery) return { applied: false };
     delete state.job;
     try { save(); } catch (error) { state.job = job; throw error; }
     return { applied: true };
   }
+  // A trial left unrestored by an earlier process keeps chat closed from the start.
+  if (state.job?._recovery) queueMicrotask(() => requireTrialRecovery(state.job));
   async function recover() {
     const j = state.job;
+    // A trial an earlier run could not restore after losing its lease: chat stays closed until it is.
+    if (j?._recovery) requireTrialRecovery(j);
     if (j?._reloadPending) scheduleReload(j);
     if (j) adoptPendingRevision(j);
     if (j?.status !== 'running') return;

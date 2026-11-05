@@ -12,63 +12,9 @@ const { spawn } = require('node:child_process');
 const { createNativeLeaseClient, chainRemotes, createLeaseRoutes, LEASE_CLIENT_MARKER, PREFIX } = require('./model-maintenance-lease.cjs');
 const { createLlamaCppManager } = require('./llamacpp-manager.cjs');
 
-const SECRET = 'synthetic-store-token-0123456789abcdef';
+const { authority, SECRET } = require('./synthetic-lease-authority.test-helper.cjs');
 const delay = (ms) => new Promise((r) => setTimeout(r, ms));
-
-/** A synthetic authority with the front's semantics (lease.rs): one lease, generation fence, ordered
- *  server-issued incarnations (410 for retired ones), front leases bound to the incarnation they latched. */
-async function authority(t, { ttlMs = 180000, renewMs = 10000, hardMs = 3600000 } = {}) {
-  const calls = [];
-  let holder = null, generation = 0, node = null, incarnations = 0, renew = 'ok';
-  const now = () => Date.now();
-  const expire = () => { if (holder && (now() >= holder.until || now() >= holder.hardAt)) holder = null; };
-  const server = http.createServer((req, res) => {
-    let raw = '';
-    req.on('data', (c) => { raw += c; });
-    req.on('end', () => {
-      const send = (status, body) => { res.writeHead(status, { 'content-type': 'application/json' }); res.end(body === undefined ? '' : JSON.stringify(body)); };
-      if (req.headers['x-noevia-store-token'] !== SECRET) return send(401, { error: 'unauthorised' });
-      const op = req.url.replace('/v1/maintenance-lease/', '');
-      const body = JSON.parse(raw || '{}');
-      calls.push({ op, body });
-      expire();
-      if (op === 'session') {
-        if (node && node.boot === body.boot) return send(200, { incarnation: node.inc, frontHeld: holder?.origin === 'front' });
-        if (node && body.startedAt <= node.started) return send(410, { code: 'incarnation_retired' });
-        node = { inc: ++incarnations, boot: body.boot, started: body.startedAt };
-        if (holder?.origin === 'node') holder = null;
-        if (holder?.origin === 'front' && holder.bound !== node.inc) holder.fenced = true;
-        return send(200, { incarnation: node.inc, frontHeld: holder?.origin === 'front' });
-      }
-      if (!node || body.incarnation !== node.inc) return send(410, { code: 'incarnation_retired' });
-      if (op === 'acquire') {
-        if (holder) return send(409, { error: 'Inference is busy. Wait for requests to finish before changing native presets.', code: 'maintenance_held', chatActive: false });
-        holder = { origin: 'node', lease: crypto.randomBytes(16).toString('hex'), generation: ++generation, until: now() + ttlMs, hardAt: now() + hardMs };
-        return send(201, { lease: holder.lease, generation: holder.generation, epoch: 'e', ttlMs, renewMs, hardMs });
-      }
-      if (op === 'renew') {
-        if (renew === 'hang') return; // never answers: the client's call times out (no answer)
-        if (renew === 'error') return send(500, {});
-        if (holder && holder.lease === body.lease && renew === 'ok') { holder.until = now() + ttlMs; return send(200, {}); }
-        return send(404, { error: 'Not found' });
-      }
-      if (op === 'release') { if (holder && holder.lease === body.lease) holder = null; return send(204); }
-      if (op === 'held') return send(200, { held: !!holder, front: holder?.origin === 'front' });
-      return send(404, { error: 'Not found' });
-    });
-  });
-  await new Promise((r) => server.listen(0, '127.0.0.1', r));
-  t.after(() => new Promise((r) => { server.closeAllConnections(); server.close(r); }));
-  return {
-    port: server.address().port, calls,
-    acquires: () => calls.filter((c) => c.op === 'acquire').length,
-    takeAsFront: () => { holder = { origin: 'front', lease: 'f'.repeat(32), generation: ++generation, until: Infinity, hardAt: Infinity, bound: node?.inc ?? null }; },
-    releaseFront: () => { if (holder?.origin === 'front') holder = null; },
-    forget: () => { holder = null; },
-    setRenew: (v) => { renew = v; },
-    held: () => holder,
-  };
-}
+const until = async (f, ms = 5000) => { for (let i = 0; i < ms / 20; i++) { if (f()) return true; await delay(20); } return false; };
 
 function manager(client, { gateOptions = {}, router = [] } = {}) {
   return createLlamaCppManager({
@@ -145,7 +91,7 @@ for (const [name, setup] of [
     const a = await authority(t, { ttlMs: 600, renewMs: 100 });
     const client = createNativeLeaseClient({ port: a.port, token: SECRET, boot: 'b', startedAt: 1 });
     const router = [];
-    const m = await ready(manager(client, { gateOptions: { coverageMarginMs: 50, presetStepMs: 0 }, router }), client);
+    const m = await ready(manager(client, { gateOptions: { coverageMarginMs: 50, presetStepMs: 0, recoveryRetryMs: 20 }, router }), client);
     let lost = null, chatDuringLoss = null, routerAtLoss = -1;
     // The write is the job's in-flight step: coverage ends while it runs.
     const done = m.writePresets(async () => {
@@ -160,8 +106,12 @@ for (const [name, setup] of [
     assert.equal(lost?.code, 'maintenanceCoverageLost');
     assert.equal(chatDuringLoss, 503, 'chat stays paused while the in-flight step settles');
     assert.equal(router.length, routerAtLoss, 'no router call after coverage ended');
-    assert.equal(a.acquires(), 1, 'the lease is never taken again for the same work');
-    assert.equal(m.maintenanceHeld(), false, 'released once the work settled');
+    assert.equal(a.calls.filter((c) => c.op === 'acquire' && !/recovers/.test(c.body.reason)).length, 1, 'the lease is never taken again for the same work');
+    // Delta review P1: chat opens only after a recovery under a fresh lease confirmed the engine idle.
+    assert.ok(await until(() => !m.maintenanceHeld()), 'recovered');
+    const recovery = a.calls.filter((c) => c.op === 'acquire' && /recovers/.test(c.body.reason));
+    assert.equal(recovery.length >= 1, true, 'the recovery took its own lease');
+    assert.ok(router.length > routerAtLoss, 'the recovery checked the engine (under its own lease)');
     m.enterInference()();
   });
 }
@@ -185,7 +135,10 @@ test('a step the lease cannot cover does not start (writePresets refuses before 
   let wrote = false;
   await assert.rejects(m.writePresets(async () => { wrote = true; }, () => false), (e) => e.code === 'maintenanceCoverageLost');
   assert.equal(wrote, false);
-  assert.equal(m.maintenanceHeld(), false);
+  // A lease that can never cover a step: it is treated as lost, and chat stays closed (fail closed),
+  // since no recovery lease can cover the check either.
+  assert.equal(m.maintenanceHeld(), true);
+  assert.throws(() => m.enterInference(), (e) => e.status === 503);
 });
 
 // ---- Review P1: a Node restart while a front lease is held keeps chat closed (two real processes). ----
@@ -205,7 +158,6 @@ function child(t, a, boot, startedAt) {
   p.stdout.on('data', (d) => lines.push(...String(d).split('\n').filter(Boolean)));
   return { p, lines, last: () => lines[lines.length - 1] };
 }
-const until = async (f, ms = 5000) => { for (let i = 0; i < ms / 20; i++) { if (f()) return true; await delay(20); } return false; };
 
 test('restart: a new Node process keeps chat closed while the front still holds a lease the old one latched', async (t) => {
   const a = await authority(t);
@@ -368,4 +320,85 @@ test('chainRemotes: the inference gate when it grants, the authority when it has
   const granted = chainRemotes({ ...gate, holdMaintenance: async () => ({ token: 'a'.repeat(32), idleTtlMs: 60000 }) }, native);
   assert.equal((await granted.holdMaintenance('x', {})).token, 'a'.repeat(32));
   assert.equal(a.held(), null, 'the authority is not asked when the gate grants');
+});
+
+// ---- Delta review P1: every engine dispatch is covered, and the loss aborts work in flight. ----
+
+/** A real manager over a synthetic router whose replies the test scripts per path. */
+function routed(client, handler, gateOptions = {}) {
+  const calls = [];
+  const m = createLlamaCppManager({
+    baseUrl: 'http://127.0.0.1:9/v1', gateAdminToken: null, fetchStream: async () => ({ ok: false }),
+    gate: { hasAdmin: () => false, waiting: () => 0, adminHeaders: () => ({}) },
+    fetchJson: async (url, opts = {}) => {
+      const u = new URL(url), name = (opts.method || 'GET') + ' ' + u.pathname + (u.searchParams.has('reload') ? '?reload' : '');
+      calls.push(name);
+      return handler(name, opts, calls);
+    },
+    maintenanceAuthority: client, maintenanceGateOptions: { coverageMarginMs: 50, recoveryRetryMs: 20, recoveryPollMs: 5, ...gateOptions },
+  });
+  return { m, calls };
+}
+const listing = (rows) => ({ ok: true, status: 200, body: { data: rows.map(([id, value]) => ({ id, status: { value } })) } });
+
+test('P1 loss during an await of a reload: no unload or router reload is dispatched after it', async (t) => {
+  const a = await authority(t, { ttlMs: 600, renewMs: 100 });
+  const client = createNativeLeaseClient({ port: a.port, token: SECRET, boot: 'b', startedAt: 1 });
+  let lossDone = false, rows = [['synthetic', 'loaded']];
+  const { m, calls } = routed(client, async (name) => {
+    if (name === 'GET /models' && !lossDone) {
+      // Coverage ends while the listing is awaited.
+      a.setRenew('ended');
+      for (let i = 0; i < 300; i++) { try { m.assertMaintenanceCovered(0); } catch { break; } await delay(10); }
+      lossDone = true;
+      return listing(rows);
+    }
+    if (name === 'POST /models/unload') { rows = [['synthetic', 'unloaded']]; return { ok: true, status: 200, body: {} }; }
+    if (name === 'GET /models') return listing(rows);
+    return { ok: true, status: 200, body: {} };
+  });
+  await ready(m, client);
+  const before = calls.length;
+  const result = m.reloadPresets({ unload: true });
+  await assert.rejects(result, (e) => e.code === 'maintenanceCoverageLost');
+  const job = calls.slice(before, before + 1);
+  assert.deepEqual(job, ['GET /models']);
+  assert.equal(calls.slice(before).includes('GET /models?reload'), false, 'no router reload on the lost lease');
+  // The recovery (its own lease) is what unloads; chat opens only after it confirmed the engine idle.
+  assert.throws(() => m.enterInference(), (e) => e.status === 503);
+  a.setRenew('ok');
+  assert.ok(await until(() => !m.maintenanceHeld()), 'recovered');
+  assert.deepEqual(rows, [['synthetic', 'unloaded']]);
+  m.enterInference()();
+});
+
+test('P1 a router call in flight when the lease is lost is aborted, and chat stays closed until the engine is confirmed idle', async (t) => {
+  const a = await authority(t, { ttlMs: 600, renewMs: 100 });
+  const client = createNativeLeaseClient({ port: a.port, token: SECRET, boot: 'b', startedAt: 1 });
+  let aborted = false, engineBusy = true, idleChecks = 0;
+  const { m } = routed(client, async (name, opts) => {
+    if (name === 'GET /models?reload') {
+      a.setRenew('ended');
+      await new Promise((resolve) => { if (opts.signal?.aborted) resolve(); opts.signal?.addEventListener('abort', resolve, { once: true }); });
+      aborted = true;
+      throw Object.assign(Error('aborted'), { name: 'AbortError' });
+    }
+    if (name === 'GET /models') {
+      // The engine is still reloading for a while after our call was cancelled.
+      if (aborted) idleChecks++;
+      if (aborted && idleChecks > 3) engineBusy = false;
+      return listing([['synthetic', aborted && engineBusy ? 'loading' : 'unloaded']]);
+    }
+    return { ok: true, status: 200, body: {} };
+  });
+  await ready(m, client);
+  await assert.rejects(m.reloadPresets({ unload: false }), (e) => e.code === 'maintenanceCoverageLost');
+  assert.equal(aborted, true, 'the in-flight call carried the loss signal');
+  a.setRenew('ok');
+  for (let i = 0; i < 300 && engineBusy; i++) {
+    assert.throws(() => m.enterInference(), (e) => e.status === 503, 'closed while the engine still works');
+    await delay(5);
+  }
+  assert.ok(await until(() => !m.maintenanceHeld()), 'recovered');
+  m.enterInference()();
 });

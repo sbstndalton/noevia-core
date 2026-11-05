@@ -68,7 +68,14 @@ function createSweepGuard({ hold, progress, barrier = null, log = () => {}, poll
       timer = setTimer(tick, pollMs);
       if (timer?.unref) timer.unref();
     };
-    const entry = { stop: () => finish('') };
+    // Delta review P1: a lease of the front's authority lost while the sweep runs does not end the
+    // watch: the sweep is still running in its container, so chat stays closed (this hold is kept
+    // locally) until the model manager reports it over or a bound passes; the gate then recovers under
+    // a fresh lease before chat resumes.
+    const lost = release?.signal;
+    const onLost = () => log('[models] throughput sweep: the maintenance lease was lost; chat stays paused until the sweep is over and the model server is checked.');
+    if (lost?.aborted) onLost(); else lost?.addEventListener?.('abort', onLost, { once: true });
+    const entry = { stop: () => finish(''), lost: () => lost?.aborted === true };
     watching = entry;
     timer = setTimer(tick, pollMs);
     if (timer?.unref) timer.unref();

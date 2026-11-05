@@ -50,7 +50,19 @@ function createLlamaCppManager({ budgetWatchDir = null, baseUrl, apiKey, fetchJs
   function headers(extra) {
     return { 'Content-Type': 'application/json', ...(apiKey && apiKey !== 'local' ? { Authorization: `Bearer ${apiKey}` } : {}), ...holdHeaders(), ...(extra || {}) };
   }
-  const rawRequest = (path, options = {}, timeout = 8000) => fetchJson(base + path, { ...options, headers: headers(options.headers) }, timeout);
+  // Delta review P1: every engine dispatch of this process, while it holds a lease of the front's
+  // authority, starts only while that lease covers it and carries the lease's loss signal, so work in
+  // flight is aborted when it is lost (set once the maintenance gate exists, below).
+  let dispatchSignal = (signal) => signal;
+  let lostReason = () => null;
+  const covered = (send) => async (path, options = {}, timeout) => {
+    const signal = dispatchSignal(options.signal);
+    try { return await send(path, signal === options.signal ? options : { ...options, signal }, timeout); }
+    catch (e) { throw lostReason(signal) || e; }
+  };
+  const rawRequest = covered((path, options = {}, timeout = 8000) => fetchJson(base + path, { ...options, headers: headers(options.headers) }, timeout));
+  // The same for a streamed engine call: the stream is aborted with the lease.
+  const stream = covered((path, opts = {}) => (fetchStream || fetch)(base + path, { ...opts, headers: headers(opts.headers), redirect: 'error' }));
   // #697: every load this process asks for (the Models page, calibration, auto-tune) passes the
   // inference memory budget first. Chat turns pass it in prepareLoad, before they ask for a lease.
   async function request(path, options = {}, timeout = 8000) {
@@ -89,6 +101,25 @@ function createLlamaCppManager({ budgetWatchDir = null, baseUrl, apiKey, fetchJs
   const PRESET_STEP_MS=Number.isFinite(maintenanceGateOptions.presetStepMs)?maintenanceGateOptions.presetStepMs:150000;
   const maintenance=require('./inference-maintenance.cjs').createMaintenanceGate({remote:maintenanceRemote,observeMs:gate?0:3000,...maintenanceGateOptions});
   holdHeaders=maintenance.holdHeaders;
+  dispatchSignal=signal=>maintenance.dispatchSignal(signal);
+  // Delta review P1: the settle step of every recovery from lost coverage, under the fresh lease: the
+  // engine confirmed idle (every model unloaded, as the router itself reports), not just our HTTP call
+  // cancelled. A load or unload still running is waited for, bounded; then the recovery is retried.
+  const RECOVERY_SETTLE_MS=Number.isFinite(maintenanceGateOptions.recoverySettleMs)?maintenanceGateOptions.recoverySettleMs:120000;
+  const RECOVERY_POLL_MS=Number.isFinite(maintenanceGateOptions.recoveryPollMs)?maintenanceGateOptions.recoveryPollMs:500;
+  maintenance.setRecoverySettle(async()=>{
+    const deadline=Date.now()+RECOVERY_SETTLE_MS;
+    for(;;){
+      const listing=await rawModels();
+      if(!listing.ok||!Array.isArray(listing.body?.data))throw Error('The model server did not answer.');
+      const live=listing.body.data.filter(m=>['loaded','loading','sleeping','unloading'].includes(m.status?.value));
+      if(!live.length)return;
+      for(const m of live)if(['loaded','sleeping'].includes(m.status.value))await forcedUnload(m.id,60000).catch(e=>{if(e?.coverageLost)throw e;});
+      if(Date.now()>=deadline)throw Error('The model server did not confirm every model stopped.');
+      await new Promise(r=>setTimeout(r,RECOVERY_POLL_MS));
+    }
+  });
+  lostReason=signal=>{const lost=maintenance.coverageSignal();return lost?.aborted&&signal?.aborted&&lost.reason?.coverageLost?lost.reason:null;};
   // #1012: what the router last read, so a reload can keep loaded models (preset-reload.cjs, #1071: always on).
   // With the front's store client the baseline is the front's (bridge mode, preset-reload.cjs
   // createBridgeReloadGuard); an older front keeps this process's own guard on the same file.
@@ -307,7 +338,17 @@ function createLlamaCppManager({ budgetWatchDir = null, baseUrl, apiKey, fetchJs
       const result=await routerReload(120000);
       if(!result.ok)throw Error('Native reload failed');
       return {ok:true,status:200,body:{...presets.get(body.model),applied:true,qualification:'unqualified; load and test this profile before relying on its capacity'}};
-    } catch {
+    } catch (e) {
+      // Delta review P1: the lease was lost after the write: nothing more runs on it. The restore below
+      // becomes a recovery under a fresh lease (chat stays closed until it has run).
+      if (e?.coverageLost || maintenance.coverageSignal()?.aborted) {
+        maintenance.requireRecovery(`apply:${candidate.revision}`, async () => {
+          if (presets.snapshot().revision === candidate.revision) await presets.commit({baseRevision:candidate.revision,text:candidate.before});
+          const again=await routerReload(120000);
+          if(!again.ok)throw Error('The router did not re-read the restored presets.');
+        }, 'Chat is paused while noevia restores the presets an interrupted change left behind.');
+        throw e?.coverageLost ? e : Object.assign(Error('The maintenance lease was lost, so this change stopped.'), {status:503,code:'maintenanceCoverageLost',coverageLost:true});
+      }
       // Restore only our own version; never overwrite an operator's later edit.
       try {await presets.commit({baseRevision:candidate.revision,text:candidate.before});}
       catch(e) {
@@ -684,8 +725,10 @@ function createLlamaCppManager({ budgetWatchDir = null, baseUrl, apiKey, fetchJs
   // then only fails the run's revision check, which is safe.
   // Row J review P1: every router step of a calibration or tune first checks this process's lease coverage,
   // so a job whose lease of the front's authority ended stops before its next step.
+  // Delta review P2: the dispatch itself is covered (rawRequest); the step's whole timeout is not
+  // required to fit one renewal window, only the lease's hard cap.
   const coveredRequest=(path,options,timeout)=>{try{maintenance.assertCovered(Number(timeout)||0);}catch(e){return Promise.reject(e);}return request(path,options,timeout);};
-  const calibrator=presets&&publicCalibrator?require('./llamacpp-calibration.cjs').createCalibrator({request:coveredRequest,rawModels,presets,maintenance,applyUnlocked,invalidateBaseline,conservativeFor,identityFor:tuneIdentity,onResult:({model,status,entry})=>recordEvidence(model,status==='passed'?{category:'context_capacity',result:'passed',value:{ctx:entry.verifiedCtx,appliedCtx:entry.appliedCtx,slots:entry.slots},suite:{name:'native-calibration',version:1},source:'calibration',limitations:[`prompt budget ${entry.promptBudgetSeconds} s`]}:{category:'context_capacity',result:'failed',value:null,suite:{name:'native-calibration',version:1},source:'calibration',limitations:[String(entry.error||'').slice(0,200)]}),stream:(path,opts={})=>(fetchStream||fetch)(base+path,{...opts,headers:headers(opts.headers),redirect:'error'}),stateFile:calibrationStatePath,memoryFloorGib:autoconfig.memoryFloorGib||2,...calibrationOptions}):null;
+  const calibrator=presets&&publicCalibrator?require('./llamacpp-calibration.cjs').createCalibrator({request:coveredRequest,rawModels,presets,maintenance,applyUnlocked,invalidateBaseline,conservativeFor,identityFor:tuneIdentity,onResult:({model,status,entry})=>recordEvidence(model,status==='passed'?{category:'context_capacity',result:'passed',value:{ctx:entry.verifiedCtx,appliedCtx:entry.appliedCtx,slots:entry.slots},suite:{name:'native-calibration',version:1},source:'calibration',limitations:[`prompt budget ${entry.promptBudgetSeconds} s`]}:{category:'context_capacity',result:'failed',value:null,suite:{name:'native-calibration',version:1},source:'calibration',limitations:[String(entry.error||'').slice(0,200)]}),stream,stateFile:calibrationStatePath,memoryFloorGib:autoconfig.memoryFloorGib||2,...calibrationOptions}):null;
   const tuneDeps={identityFor:tuneIdentity,stateFile:autotuneStatePath,memoryFloorGib:autoconfig.memoryFloorGib||2,...(calibrationOptions.readMemory?{readMemory:calibrationOptions.readMemory}:{}),...autotuneOptions};
   // Internal context checks run under the full tuner's per-model lease; standalone
   // calibration still acquires the real gate.
@@ -715,8 +758,8 @@ function createLlamaCppManager({ budgetWatchDir = null, baseUrl, apiKey, fetchJs
         // Private configured-profile worker client; no public confirmation/auth/HTTP policy.
         const revision=presets.snapshot().revision;
         const current=()=>hooks.contextCurrent?.() === true && maintenance.held() && presets.snapshot().revision === revision;
-        const worker=require('./llamacpp-calibration.cjs').createCalibrator({request,rawModels,presets,applyUnlocked,invalidateBaseline,conservativeFor,identityFor:tuneIdentity,maintenance:managedGate,
-          stream:(path,opts={})=>(fetchStream||fetch)(base+path,{...opts,headers:headers(opts.headers),redirect:'error'}),
+        const worker=require('./llamacpp-calibration.cjs').createCalibrator({request:coveredRequest,rawModels,presets,applyUnlocked,invalidateBaseline,conservativeFor,identityFor:tuneIdentity,maintenance:managedGate,
+          stream,
           memoryFloorGib:autoconfig.memoryFloorGib||2,...calibrationOptions,stateFile:undefined,...hooks});
         const controller=new AbortController();
         const failed=()=>({ok:false,body:{error:'The context worker state changed or is unavailable.'}});
@@ -776,6 +819,8 @@ function createLlamaCppManager({ budgetWatchDir = null, baseUrl, apiKey, fetchJs
     assertMaintenanceCovered: stepMs => maintenance.assertCovered(stepMs),
     maintenanceCoverageSignal: () => maintenance.coverageSignal(),
     chatBarrier: reason => maintenance.barrier(reason),
+    requireMaintenanceRecovery: (key, repair, message) => maintenance.requireRecovery(key, repair, message),
+    maintenanceRecoveryPending: () => maintenance.recoveryPending(),
     tuningActive: () => maintenance.held() || calibrator?.stateFacts().job?.status === 'running' || autotuner?.statusFacts().job?.status === 'running',
     presetFacts: model => presets?.get(model) ?? null,
     applyPreset,

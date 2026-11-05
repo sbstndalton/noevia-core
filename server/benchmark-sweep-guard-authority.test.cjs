@@ -70,3 +70,19 @@ test('recovery: an outage past the sweep\'s own time bound lifts the barrier', a
   assert.equal(await guard.adopt(), false);
   gate.enter()();
 });
+
+test('delta P1: a lease lost while a sweep runs keeps chat closed until the sweep reports it is over', async () => {
+  let active = true, released = 0;
+  const lost = new AbortController();
+  const { guard, logs } = harness({ progress: async () => ({ ok: true, body: { job: { active, unit: 'models', total: 1 } } }), pollMs: 5 });
+  const release = Object.assign(() => { released++; }, { signal: lost.signal });
+  const entry = guard.watch(release, 1);
+  lost.abort();
+  await new Promise((r) => setTimeout(r, 40));
+  assert.equal(entry.lost(), true);
+  assert.equal(released, 0, 'not released while the sweep still runs in its container');
+  assert.ok(logs.some((l) => /maintenance lease was lost/.test(l)), logs.join('\n'));
+  active = false;
+  for (let i = 0; i < 100 && !released; i++) await new Promise((r) => setTimeout(r, 5));
+  assert.equal(released, 1, 'released once the sweep is over (the gate then recovers)');
+});
