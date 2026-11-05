@@ -5,7 +5,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const { Readable } = require('node:stream');
-const { createModelRoutes } = require('../../server/routes/models.cjs');
+const { createModelRoutes } = require('../oracles/models.cjs');
 
 function routes({ installed, sections, reload = { ok: true, status: 200, body: { reloaded: true } }, scan = null, cache = new Map(), manager = {} }) {
   const sent = [], fetched = [], reloads = [];

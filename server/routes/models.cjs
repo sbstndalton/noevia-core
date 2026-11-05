@@ -145,54 +145,6 @@ function createModelRoutes({ servedEmbeddingModels = (target) => require('../rag
     }
   }
 
-  // #1695: remove the preset of every model whose file is gone. Idempotent: a second run finds
-  // nothing to do. A section is removed only when both noevia's folder scan (missingFile) and the
-  // model management service (hasFile: false) say its file is gone; Laya, sidecar models and
-  // presets served elsewhere are never touched.
-  // #1698: the folder scan and the service's hasFile both come from the same models folder, so they
-  // agree even when that folder is unavailable (a dropped share, a briefly empty mount). The prune
-  // therefore refuses, changing nothing, when the scan lists no model file at all or when more than
-  // half of the ordinary presets would go: that is the folder missing, not models deleted.
-  const SCAN_UNTRUSTED = 'The model folder looks unavailable, so nothing was removed.';
-  async function freshFolderScan() {
-    if (!env.MODEL_LOADER_URL) return null;
-    const headers = { 'Content-Type': 'application/json', ...(env.MODEL_LOADER_TOKEN ? { 'X-Model-Loader-Token': env.MODEL_LOADER_TOKEN } : {}) };
-    try {
-      const r = await fetchJson(`${env.MODEL_LOADER_URL.replace(/\/+$/, '')}/api/v1/models`, { method: 'GET', headers }, 15000);
-      return r?.ok && Array.isArray(r.body?.models) ? r.body.models : null;
-    } catch { return null; }
-  }
-  async function pruneMissingPresets() {
-    // A cached scan (possibly the glitch itself) must not drive a delete: drop it and the shared list.
-    modelScanCache.clear();
-    if (service.invalidateModelReads) service.invalidateModelReads();
-    const scan = await freshFolderScan();
-    if (!scan || scan.length === 0) return { ok: false, status: 409, code: 'scanUntrusted', error: SCAN_UNTRUSTED };
-    let installed;
-    try { installed = await modelsInstalledNow(); } catch { return { ok: false, status: 502, error: 'Could not list installed models.' }; }
-    const ordinary = (Array.isArray(installed) ? installed : [])
-      .filter((m) => m && m.system !== true && m.servedElsewhere !== true && !isSystemModel(m.name) && !isSidecarModel(m.name, env) && (m.source == null || m.source === 'preset'));
-    const candidates = ordinary.filter((m) => m.missingFile === true).map((m) => m.name);
-    if (candidates.length && candidates.length * 2 > ordinary.length) return { ok: false, status: 409, code: 'scanUntrusted', error: SCAN_UNTRUSTED, missing: candidates.length, presets: ordinary.length };
-    const removed = [], kept = [];
-    if (!candidates.length) return { ok: true, status: 200, removed, kept, reloaded: false };
-    const held = await writePresetsHeld(async () => {
-      for (const name of candidates) {
-        const r = await removePresetSection(name, { onlyWithoutFile: true });
-        (r.removed ? removed : kept).push(name);
-      }
-    }, () => removed.length > 0);
-    if (held.refused) return { ok: false, status: 409, code: 'maintenance_held', error: PRESETS_BUSY, retryable: true };
-    for (const name of removed) {
-      clearRoleReferences(name);
-      if (lastLoadedModel() === name) clearLastLoadedModel(name);
-      if (typeof modelManager.forgetIdentity === 'function') modelManager.forgetIdentity(name);
-    }
-    const { reloaded } = held;
-    if (removed.length) { modelScanCache.clear(); if (service.invalidateModelReads) service.invalidateModelReads(); }
-    return { ok: true, status: 200, removed, kept, reloaded };
-  }
-
   async function handle(req, res, { path: p, authn, url }) {
     // #1461: a write that can change what the shared reads report drops them first, so the next read is not older than the write.
     if (!['GET', 'HEAD'].includes(req.method || 'GET') && /^\/api\/(models|model-manager|auto-roles)(\/|$)/.test(p)) {
@@ -549,11 +501,7 @@ function createModelRoutes({ servedEmbeddingModels = (target) => require('../rag
       if(authn.user.role!=='admin')return json(res,403,{error:'Administrator required for shared model profiles'});
       if(!idleUnload)return json(res,404,{error:'The idle unload setting is unavailable',errorId:'idleUnloadUnavailable'});
       res.setHeader('Cache-Control','no-store');
-      const fail=(e)=>json(res,e.status||500,{error:e.status?e.message:'Could not change the idle unload time',...(e.errorId?{errorId:e.errorId}:{}),...(e.minSeconds?{minSeconds:e.minSeconds,maxSeconds:e.maxSeconds}:{})});
-      if(req.method==='PUT'){
-        let body;try{body=await readJson(req);}catch{return json(res,400,{error:'invalid JSON'});}
-        try{return json(res,200,await idleUnload.save(body,authn.user.id));}catch(e){return fail(e);}
-      }
+      if(req.method==='PUT') return json(res,503,{error:'Model writes are owned by the Rust front.'});
       return json(res,405,{error:'Method not allowed'});
     }
 
@@ -601,8 +549,7 @@ function createModelRoutes({ servedEmbeddingModels = (target) => require('../rag
     if (p === '/api/models/prune-missing') {
       if (req.method !== 'POST') return json(res, 405, { error: 'method not allowed' });
       if (!modelManager.enabled) return json(res, 404, { error: 'model management is disabled' });
-      const r = await pruneMissingPresets();
-      return json(res, r.status, r.ok ? { removed: r.removed, kept: r.kept, reloaded: r.reloaded } : { error: r.error, ...(r.code ? { code: r.code } : {}), ...(r.retryable ? { retryable: true } : {}) });
+      return json(res,503,{error:'Model writes are owned by the Rust front.'});
     }
 
     // The GET is the Rust front's (#2262). Another method used to get the list too; it is refused like any other unknown method.

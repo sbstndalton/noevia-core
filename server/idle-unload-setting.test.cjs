@@ -2,7 +2,7 @@
 // noevia#1863: the chat-model idle unload time as an admin setting. A fake model manager that
 // keeps the same contract as noevia-rs GET/PUT /api/v1/idle-unload; no engine, no model.
 const test = require('node:test'), assert = require('node:assert/strict');
-const { createIdleUnloadSetting, validSeconds, globalIdleSeconds, DEFAULT_SECONDS } = require('./idle-unload-setting.cjs');
+const { createIdleUnloadSetting, validSeconds, globalIdleSeconds, DEFAULT_SECONDS } = require('../tests/oracles/idle-unload-setting.cjs');
 
 const ENV = { MODEL_LOADER_URL: 'http://loader:8090/', MODEL_LOADER_TOKEN: 'synthetic-token' };
 
@@ -194,5 +194,6 @@ test('idle timer facts expose only the trusted live value and refuse forwarded t
   const parseRequestUrl = (req) => new URL(req.url, 'http://synthetic');
   assert.equal(refuseOwned({ method: 'GET', url: '/api/models/idle-unload' }, {}, { parseRequestUrl, json }), true);
   assert.equal(sent.pop().status, 503);
-  assert.equal(refuseOwned({ method: 'PUT', url: '/api/models/idle-unload' }, {}, { parseRequestUrl, json }), false);
+  assert.equal(refuseOwned({ method: 'PUT', url: '/api/models/idle-unload' }, {}, { parseRequestUrl, json }), true);
+  assert.equal(sent.pop().status, 503);
 });

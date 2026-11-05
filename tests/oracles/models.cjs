@@ -1,0 +1,812 @@
+'use strict';
+function embeddingProtectionUnknown(env) {
+  const service = require('../../server/embedding-service.cjs').current();
+  return !!env.MODEL_LOADER_URL && !!service?.protectionKnown && !service.protectionKnown();
+}
+// The model routes (models.cjs holds what they compute):
+//   /api/stats                  engine and system statistics
+//   /api/auto-roles             the Fast/Smart/Vision/Code/Creative role→model config
+//   /api/model-manager/*        proxy to the model management service, administrators only,
+//                               with the folder scan served from the last result
+//   /api/models/*               presets, evidence, autotune, calibration, hardware, the
+//                               installed list, pull/delete/load/unload, downloads
+//
+// Returns true when it handled the request. Auth and CSRF run before routes are mounted.
+// Every write under /api/models/ is administrator-only (the gate at the top), and any
+// write there also drops the cached folder scan. Blocks keep their original order; an
+// unmatched method falls through as it did inline. /api/auto-roles is not under
+// /api/models/, so its own PUT handler carries the narrower member-vs-admin split: any
+// member may save their workspace's roles, but only an admin's save also warms models
+// up on the shared engine (ensureRolesLoaded).
+
+const PASS = Symbol('unhandled');
+const { isJsonObject } = require('../../server/http.cjs');
+// File-path options of a models.ini section and every spelling llama-server accepts for them (#1235).
+const PATH_OPTION_ALIASES = Object.fromEntries([
+  ['model', ['model', 'm', 'LLAMA_ARG_MODEL']],
+  ['mmproj', ['mmproj', 'mm', 'LLAMA_ARG_MMPROJ']],
+  ['model-draft', ['model-draft', 'md', 'LLAMA_ARG_MODEL_DRAFT']],
+].flatMap(([canonical, names]) => names.map(n => [n, canonical])));
+const { isSystemModel, modelPathFromArgs, SYSTEM_MODEL_DELETE_REASON, SYSTEM_MODEL_LOAD_REASON, SIDECAR_MODEL_LOAD_REASON, MISSING_MODEL_FILE_REASON, rerankModelNames, isSidecarModel, SIDECAR_MODEL_DELETE_REASON } = require('../../server/model-system.cjs');
+
+// noevia#2115: a refusal from the inference gate, as { status, code, error, retryable }, or null. The gate answers in
+// the router's error shape; the model manager passes on a refusal it got while asking for a lease in its own shape.
+// Other failures (the memory budget, for one) keep their answers.
+const GATE_CODES = new Set(['inference_queue_full', 'inference_queue_timeout', 'engine_unavailable', 'engine_switch_stuck', 'lease_unknown',
+  'model_in_use', 'engine_busy', 'gate_busy', 'model_not_found', 'admin_required', 'maintenance_held']);
+function refusalOf(r) {
+  const b = r?.body, e = b?.error;
+  if (!Number.isInteger(r?.status) || r.status < 400 || r.status > 599) return null;
+  if (e && typeof e === 'object' && e.type === 'gate_error' && GATE_CODES.has(e.code)) return { status: r.status, code: e.code, error: String(e.message || 'The model engine refused the request.').slice(0, 300), retryable: e.retryable === true };
+  if (GATE_CODES.has(b?.code) && typeof e === 'string') return { status: r.status, code: b.code, error: e.slice(0, 300), retryable: b.retryable === true };
+  return null;
+}
+
+// A client sees e.message only when it was written for people (publicMessage, or a 4xx status).
+// Everything else is logged here and replaced by a fixed sentence.
+function clientMessage(e, fallback) {
+  if (e?.publicMessage) return String(e.publicMessage);
+  if (Number.isInteger(e?.status) && e.status < 500 && e.message) return e.message;
+  console.error('[models]', e?.stack || e);
+  return fallback;
+}
+
+/**
+ * @param {object} deps
+ * @param {(res, status, body) => any} deps.json
+ * @param {(req, limit?:number) => Promise<string>} deps.readBody
+ * @param {(req) => Promise<any>} deps.readJson
+ * @param {(url:string, init:object, timeoutMs?:number) => Promise<{ok:boolean,status:number,body:any}>} deps.fetchJson
+ * @param {object} deps.env                       process.env, read at call time
+ * @param {object} deps.modelManager
+ * @param {() => object} deps.currentWorkspace
+ * @param {object} deps.service   models.cjs
+ */
+// sbstndalton/noevia#1071: GET /api/stats and GET /api/routing-default belong to the Rust front
+// (noevia-rs crates/server-stats, crates/server-routing-default). A GET that reaches Node is a
+// bypass of the front, refused before any engine or workspace read.
+const STATS_REFUSAL = Object.freeze({ error: 'Engine statistics are owned by the Rust front.' });
+const ROUTING_DEFAULT_REFUSAL = Object.freeze({ error: 'Routing default is owned by the Rust front.' });
+const AUTO_ROLES_REFUSAL = Object.freeze({ error: 'The auto-roles read is owned by the Rust front.', code: 'RUST_AUTO_ROLES_OWNED' });
+function createModelRoutes({ servedEmbeddingModels = (target) => require('../../server/rag.cjs').servedModelsCached(target), json, readBody, readJson, fetchJson, env, modelManager, currentWorkspace, service, inferenceBudget = null, idleUnload = null, sweepGuardOptions = {}, decisionSettings = null, rerankSettings = null }) {
+  const { modelScanCache, refreshModelScan, autoRoles, setAutoRoles, ensureRolesLoaded, servedCatalogue, modelsInstalled, deriveUserModelName, lastLoadedModel, clearLastLoadedModel, clearRoleReferences } = service;
+  // #1461: the installed list is shared for a moment (service.modelsInstalled). A decision that must confirm
+  // the engine's state right now (a delete that checks the model exists, a load that checks it is not missing)
+  // asks for a fresh read instead.
+  const modelsInstalledNow = () => (service.modelsInstalledFresh || modelsInstalled)();
+  const loaderHeaders = () => ({ 'Content-Type': 'application/json', ...(env.MODEL_LOADER_TOKEN ? { 'X-Model-Loader-Token': env.MODEL_LOADER_TOKEN } : {}) });
+  // #873: the throughput sweep holds the inference maintenance gate for as long as it runs.
+  const sweepGuard = typeof modelManager.holdMaintenance === 'function' ? require('../../server/benchmark-sweep-guard.cjs').createSweepGuard({
+    hold: reason => modelManager.holdMaintenance(reason),
+    progress: () => fetchJson(`${String(env.MODEL_LOADER_URL || '').replace(/\/+$/, '')}/api/v1/benchmark/progress`, { method: 'GET', headers: loaderHeaders() }, 15000),
+    log: message => console.log(message),
+    ...sweepGuardOptions,
+  }) : null;
+  // A sweep that outlived a web restart gets the gate back (#873 follow-up).
+  const sweepAdopted = sweepGuard && env.MODEL_LOADER_URL ? sweepGuard.adopt().catch(() => false) : Promise.resolve(false);
+
+  /** Which sidecar holds `name`: the embedding service (any of its active/next/previous models) or the reranker. */
+  function sidecarServiceOf(name) {
+    const n = String(name || '').trim();
+    return n && rerankModelNames(env).has(n) ? 'reranker' : 'embedding';
+  }
+
+  // #1661: drop the models.ini section named `name` through the model management service. Never
+  // throws; `removed` is true when a section was deleted, false when there was none or no service.
+  // #1695: with `onlyWithoutFile`, a section the service reports as having a file (hasFile not
+  // exactly false) is kept, so an automatic cleanup can never drop the settings of a file on disk.
+  async function presetSections() {
+    if (!env.MODEL_LOADER_URL) return null;
+    const base = `${env.MODEL_LOADER_URL.replace(/\/+$/, '')}/api/v1/`;
+    const headers = { 'Content-Type': 'application/json', ...(env.MODEL_LOADER_TOKEN ? { 'X-Model-Loader-Token': env.MODEL_LOADER_TOKEN } : {}) };
+    const listing = await fetchJson(`${base}sections`, { method: 'GET', headers }, 15000);
+    if (!listing?.ok || !Array.isArray(listing.body?.sections)) return null;
+    const sections = listing.body.sections.map((x) => (typeof x === 'string' ? { name: x } : { name: x?.name, hasFile: x?.hasFile }));
+    return { base, headers, sections, revision: listing.body?.revision };
+  }
+  async function removePresetSection(name, { onlyWithoutFile = false } = {}) {
+    if (!env.MODEL_LOADER_URL || !name) return { removed: false };
+    try {
+      const listing = await presetSections();
+      if (!listing) return { removed: false };
+      // Only a section the service lists: the name is never sent anywhere it does not name.
+      const section = listing.sections.find((x) => x.name === name);
+      if (!section) return { removed: false };
+      if (onlyWithoutFile && section.hasFile !== false) return { removed: false, hasFile: true };
+      const q = listing.revision ? `?baseRevision=${encodeURIComponent(listing.revision)}` : '';
+      const del = await fetchJson(`${listing.base}sections/${encodeURIComponent(name)}${q}`, { method: 'DELETE', headers: listing.headers }, 15000);
+      return { removed: !!del?.ok };
+    } catch { return { removed: false }; }
+  }
+  // #1695: the router reads models.ini only at start or on a reload, so a removed section stayed in
+  // its model list (and the card came back as "File missing") until the next restart. Ask it to
+  // re-read the file. A reload that would disturb a loaded model is refused by reloadPresets
+  // (it never unloads here); the list hides missing-file presets either way.
+  async function reloadRouterPresets() {
+    if (typeof modelManager.reloadPresets !== 'function') return false;
+    try { return !!(await modelManager.reloadPresets({ unload: false }))?.ok; } catch { return false; }
+  }
+
+  // #2219: a models.ini write and its reload under one hold. { written, reload }, or { refused: true }
+  // with nothing written when the hold is refused (a tune, a load, a chat turn, another reload). A
+  // manager without a gate (not llama.cpp) writes, then reloads, as it always did.
+  const PRESETS_BUSY = 'Models are busy, so nothing was changed. Try again shortly.';
+  async function writePresetsHeld(write, reloadIf) {
+    if (typeof modelManager.writePresets !== 'function') {
+      const written = await write();
+      return { written, reloaded: reloadIf(written) ? await reloadRouterPresets() : false };
+    }
+    try {
+      const { written, reload } = await modelManager.writePresets(write, reloadIf);
+      return { written, reloaded: !!reload?.ok };
+    } catch (e) {
+      if (e?.holdRefused) return { refused: true };
+      throw e;
+    }
+  }
+
+  // #1695: remove the preset of every model whose file is gone. Idempotent: a second run finds
+  // nothing to do. A section is removed only when both noevia's folder scan (missingFile) and the
+  // model management service (hasFile: false) say its file is gone; Laya, sidecar models and
+  // presets served elsewhere are never touched.
+  // #1698: the folder scan and the service's hasFile both come from the same models folder, so they
+  // agree even when that folder is unavailable (a dropped share, a briefly empty mount). The prune
+  // therefore refuses, changing nothing, when the scan lists no model file at all or when more than
+  // half of the ordinary presets would go: that is the folder missing, not models deleted.
+  const SCAN_UNTRUSTED = 'The model folder looks unavailable, so nothing was removed.';
+  async function freshFolderScan() {
+    if (!env.MODEL_LOADER_URL) return null;
+    const headers = { 'Content-Type': 'application/json', ...(env.MODEL_LOADER_TOKEN ? { 'X-Model-Loader-Token': env.MODEL_LOADER_TOKEN } : {}) };
+    try {
+      const r = await fetchJson(`${env.MODEL_LOADER_URL.replace(/\/+$/, '')}/api/v1/models`, { method: 'GET', headers }, 15000);
+      return r?.ok && Array.isArray(r.body?.models) ? r.body.models : null;
+    } catch { return null; }
+  }
+  async function pruneMissingPresets() {
+    // A cached scan (possibly the glitch itself) must not drive a delete: drop it and the shared list.
+    modelScanCache.clear();
+    if (service.invalidateModelReads) service.invalidateModelReads();
+    const scan = await freshFolderScan();
+    if (!scan || scan.length === 0) return { ok: false, status: 409, code: 'scanUntrusted', error: SCAN_UNTRUSTED };
+    let installed;
+    try { installed = await modelsInstalledNow(); } catch { return { ok: false, status: 502, error: 'Could not list installed models.' }; }
+    const ordinary = (Array.isArray(installed) ? installed : [])
+      .filter((m) => m && m.system !== true && m.servedElsewhere !== true && !isSystemModel(m.name) && !isSidecarModel(m.name, env) && (m.source == null || m.source === 'preset'));
+    const candidates = ordinary.filter((m) => m.missingFile === true).map((m) => m.name);
+    if (candidates.length && candidates.length * 2 > ordinary.length) return { ok: false, status: 409, code: 'scanUntrusted', error: SCAN_UNTRUSTED, missing: candidates.length, presets: ordinary.length };
+    const removed = [], kept = [];
+    if (!candidates.length) return { ok: true, status: 200, removed, kept, reloaded: false };
+    const held = await writePresetsHeld(async () => {
+      for (const name of candidates) {
+        const r = await removePresetSection(name, { onlyWithoutFile: true });
+        (r.removed ? removed : kept).push(name);
+      }
+    }, () => removed.length > 0);
+    if (held.refused) return { ok: false, status: 409, code: 'maintenance_held', error: PRESETS_BUSY, retryable: true };
+    for (const name of removed) {
+      clearRoleReferences(name);
+      if (lastLoadedModel() === name) clearLastLoadedModel(name);
+      if (typeof modelManager.forgetIdentity === 'function') modelManager.forgetIdentity(name);
+    }
+    const { reloaded } = held;
+    if (removed.length) { modelScanCache.clear(); if (service.invalidateModelReads) service.invalidateModelReads(); }
+    return { ok: true, status: 200, removed, kept, reloaded };
+  }
+
+  async function handle(req, res, { path: p, authn, url }) {
+    // #1461: a write that can change what the shared reads report drops them first, so the next read is not older than the write.
+    if (!['GET', 'HEAD'].includes(req.method || 'GET') && /^\/api\/(models|model-manager|auto-roles)(\/|$)/.test(p)) {
+      if (service.invalidateModelReads) {
+        service.invalidateModelReads();
+        // The write lands after this. A read in between can cache the old state, and the snapshot the Rust front
+        // reads is rebuilt from those same reads (rust-auto-roles.cjs watches this call to republish at once), so
+        // the reads are dropped again, and the snapshot republished, when the answer is out. Once, whichever of
+        // 'finish' (answered) and 'close' (the client left first) comes first.
+        if (typeof res.once === 'function') {
+          let again = false;
+          const afterWrite = () => { if (again) return; again = true; service.invalidateModelReads(); };
+          res.once('finish', afterWrite);
+          res.once('close', afterWrite);
+        }
+      }
+    }
+    if (p.startsWith('/api/models/') && !['GET', 'HEAD'].includes(req.method || 'GET') && authn.user.role !== 'admin') {
+      return json(res, 403, { error: 'administrator required' });
+    }
+
+    // ── Engine statistics: the Rust front's (#1650, #1071). Its GET is refused; Node answers no
+    // other method on it either.
+    if (p === '/api/stats') {
+      if (req.method === 'GET') return json(res, 503, STATS_REFUSAL);
+      return json(res, 405, { error: 'Method not allowed' });
+    }
+
+    // The default mode new projects start in, and (on request) a one-off switch of every existing
+    // project of this user to it. Per workspace, so tenants never touch each other's projects.
+    if (p === '/api/routing-default') {
+      // M6 (#1305, #1071): the Rust front answers GET. Node refuses that GET before any workspace
+      // work, so the front is the only reader; PUT stays Node's.
+      if (req.method === 'GET') return json(res, 503, ROUTING_DEFAULT_REFUSAL);
+      const ws = currentWorkspace();
+      if (req.method === 'PUT') {
+        let body;
+        try { body = JSON.parse(await readBody(req)); } catch { return json(res, 400, { error: 'invalid JSON' }); }
+        if (body?.routing !== 'auto' && body?.routing !== 'manual') return json(res, 400, { error: "routing must be 'auto' or 'manual'" });
+        ws.preferences = { ...(ws.preferences || {}), defaultRouting: body.routing };
+        ws.savePreferences();
+        let updated = 0;
+        if (body.applyToExisting === true) {
+          for (const project of ws.projects) if (project.routing !== body.routing) { project.routing = body.routing; project.updatedAt = Date.now(); updated++; }
+          if (updated) ws.saveProjects();
+        }
+        return json(res, 200, { routing: body.routing, updated });
+      }
+      return json(res, 405, { error: 'method not allowed' });
+    }
+
+    if (p === '/api/auto-roles') {
+      // The GET is the Rust front's (sbstndalton/noevia#2190 close-out, rust-auto-roles.cjs): index.cjs refuses it
+      // before authentication; this is the same refusal for a mount that is reached some other way.
+      if (req.method === 'GET') return json(res, 503, AUTO_ROLES_REFUSAL);
+      if (req.method === 'PUT') {
+        const raw = await readBody(req);
+        let body;
+        try {
+          body = JSON.parse(raw);
+        } catch {
+          return json(res, 400, { error: 'invalid JSON' });
+        }
+        if (!isJsonObject(body)) return json(res, 400, { error: 'request body must be a JSON object' });
+        const fast = typeof body.fast === 'string' ? body.fast.trim() : '';
+        const smart = typeof body.smart === 'string' ? body.smart.trim() : '';
+        const vision = typeof body.vision === 'string' ? body.vision.trim() : '';
+        const code = typeof body.code === 'string' ? body.code.trim() : '';
+        // #1667: optional, like code and vision. An older client that omits the field keeps the saved one.
+        const creative = typeof body.creative === 'string' ? body.creative.trim() : body.creative === undefined ? (autoRoles()?.creative || '') : '';
+        if (!fast || !smart) return json(res, 400, { error: 'both fast and smart model names are required' });
+        // Names must resolve to installed models, or a bad id would keep producing repeated
+        // load-warning log lines forever (ensureRolesLoaded retries every save/warm-up). Skip
+        // the check only when the catalogue itself cannot be read (engine unreachable): saving
+        // is still allowed, since the alternative is a member/admin locked out of the page.
+        const catalogue = await servedCatalogue();
+        const named = { fast, smart, ...(vision ? { vision } : {}), ...(code ? { code } : {}), ...(creative ? { creative } : {}) };
+        if (Array.isArray(catalogue)) {
+          const known = new Set(catalogue.map((m) => m.name));
+          const bad = Object.entries(named).filter(([, name]) => !known.has(name)).map(([, name]) => name);
+          if (bad.length) return json(res, 400, { error: `unknown model(s): ${bad.join(', ')}` });
+        }
+        // #343/#442: fast/smart/vision/code all route chat-generation prompts — an embedding,
+        // reranking or routing model there fails every request through it (auto-router.cjs
+        // classifyFastOrSmart fails open to fast, so a bad `fast` breaks Auto entirely; a Laya or
+        // embedding `vision` role would send image-description duty to a model that cannot see).
+        // Same helper the sibling benchmark/start handler above already uses. This does not
+        // additionally require a `vision`/`multimodal` label: unlike Laya (name-flagged as a
+        // system model) or an embedding/reranking model (label-flagged), an ordinary chat model
+        // with no vision label is not known to be incapable of the image-description role, only
+        // unconfirmed — the client's picker narrows further to models the server actually
+        // reported as vision-capable (ModelsSettings.tsx), but the server accepts any chat model
+        // here so a hand-written /api/auto-roles call from a working setup never breaks.
+        const { nonChatAliases } = require('../../server/chat-model-kind.cjs');
+        const textRoles = { fast, smart, ...(vision ? { vision } : {}), ...(code ? { code } : {}), ...(creative ? { creative } : {}) };
+        const nonChat = new Set(nonChatAliases(Object.values(textRoles), catalogue));
+        const badRole = Object.entries(textRoles).find(([, name]) => nonChat.has(name));
+        if (badRole) {
+          const [role, model] = badRole;
+          return json(res, 400, { error: `The ${role} role needs a chat model; ${model} is an embedding, reranking or routing model.` });
+        }
+        setAutoRoles({ fast, smart, vision, code, ...(creative ? { creative } : {}) });
+        // Loading models for the shared engine is an administrative action: a member's save is
+        // stored per workspace like anyone else's, but only an admin's save may warm models up
+        // (native routing stays on demand either way; see ensureRolesLoaded above it).
+        if (authn.user.role === 'admin') ensureRolesLoaded();
+        return json(res, 200, { configured: true, roles: autoRoles() });
+      }
+    }
+
+    // A change to the models anywhere else (load, unload, download, delete) also invalidates the scan.
+    if (p.startsWith('/api/models/') && !['GET','HEAD','OPTIONS'].includes(req.method || 'GET')) modelScanCache.clear();
+    // Model manager (folded-in Model Loader) JSON API, administrators only.
+    if (p.startsWith('/api/model-manager/')) {
+      if(authn.user.role!=='admin')return json(res,403,{error:'Administrator required for model management'});
+      if(!env.MODEL_LOADER_URL)return json(res,404,{error:'Model management service is not configured'});
+      const rawRest=p.slice('/api/model-manager/'.length);
+      if(!/^[\w./%:+@-]*$/.test(rawRest)||rawRest.includes('..'))return json(res,400,{error:'Invalid path'});
+      // URL normalization must not turn an unchecked path into a section writer. Encoded
+      // separators also bypass the section's existing identity and budget checks.
+      let managerPath;
+      try {
+        const segments=rawRest.split('/').map(s=>decodeURIComponent(s));
+        if(segments.some(s=>s==='.'||s==='..'||s.includes('/')||s.includes('\\')))return json(res,400,{error:'Invalid path'});
+        managerPath=segments.join('/');
+      } catch { return json(res,400,{error:'Invalid path'}); }
+      const rest=managerPath;
+      const method=req.method||'GET';
+      const body=['GET','HEAD','DELETE'].includes(method)?undefined:await readBody(req,1024*1024);
+      // The file scan reads every model header from disk (~2 s on daserver). Serve the last scan at
+      // once and refresh it behind the response; any change through this API drops it.
+      // The prompt suite is chat generation: refuse embedding, reranking and routing models here too,
+      // so the picker is not the only gate (#206). An unreadable catalogue falls back to names.
+      if(method==='POST'&&rest==='benchmark/start'){
+        let payload; try{payload=JSON.parse(body||'{}');}catch{payload={};}
+        const bad=require('../../server/chat-model-kind.cjs').nonChatAliases(Array.isArray(payload.aliases)?payload.aliases:[],await servedCatalogue());
+        if(bad.length)return json(res,400,{error:`The prompt suite needs chat models; ${bad.join(', ')} ${bad.length===1?'is':'are'} an embedding, reranking or routing model.`});
+        // #697: the benchmark loads each model through the router itself, so the budget is checked here.
+        if(modelManager.loadRefusal)for(const alias of (Array.isArray(payload.aliases)?payload.aliases:[]).filter(a=>typeof a==='string').slice(0,64)){
+          const refusal=await modelManager.loadRefusal(alias).catch(()=>null);
+          if(refusal)return json(res,409,refusal);
+        }
+      }
+      // #873: a throughput sweep loads every chosen model into its own llama-bench container, so
+      // each must fit the inference budget like any load; and it holds the maintenance gate while
+      // it runs, so Chat or Diary cannot load a second model beside it.
+      let sweepRelease=null, sweepModels=0;
+      if(method==='POST'&&rest==='benchmark/sweep'){
+        let payload; try{payload=JSON.parse(body||'{}');}catch{payload={};}
+        const aliases=(Array.isArray(payload.aliases)?payload.aliases:[]).filter(a=>typeof a==='string'&&a);
+        if(aliases.length>64)return json(res,400,{error:'Choose at most 64 models for one sweep.'});
+        if(modelManager.loadRefusal)for(const alias of aliases){
+          const refusal=await modelManager.loadRefusal(alias).catch(()=>null);
+          if(refusal)return json(res,409,refusal);
+        }
+        if(sweepGuard&&aliases.length){
+          try{sweepRelease=await sweepGuard.acquire();}catch(e){return json(res,409,{error:e.publicMessage||'The sweep could not start.'});}
+          sweepModels=aliases.length;
+        }
+      }
+      // Set only for POST models/delete, and read again once the forwarded delete has
+      // succeeded (below): the folder-scan proxy deletes files directly through the model
+      // management service, bypassing modelManager entirely — the only way to unload a model
+      // deleted this way, and to clear the roles/last-loaded default that named it, is to
+      // resolve the deleted keys back to the engine model id(s) (a scanned entry's modelId and
+      // every models.ini section it backed) using the SAME scan this guard already reads.
+      let deleteKeys=null, deleteScanned=null;
+      if(method==='POST'&&rest==='models/delete'){
+        if (embeddingProtectionUnknown(env)) return json(res, 409, { error: 'Embedding model protection is not current.', errorId: 'modelInUse' });
+        let payload; try{payload=JSON.parse(body||'{}');}catch{payload={};}
+        const keys=Array.isArray(payload.models)?payload.models:[];
+        let scanned=modelScanCache.get('models')?.body?.models;
+        // An empty cache (cold start, or any write just cleared it) must not skip the guard: scan first.
+        if(keys.length&&!Array.isArray(scanned)){
+          const fresh=await fetchJson(`${env.MODEL_LOADER_URL.replace(/\/+$/,'')}/api/v1/models`,{method:'GET',headers:{'Content-Type':'application/json',...(env.MODEL_LOADER_TOKEN?{'X-Model-Loader-Token':env.MODEL_LOADER_TOKEN}:{})}},60*1000).catch(()=>null);
+          scanned=fresh?.ok&&fresh.body&&typeof fresh.body==='object'?fresh.body.models:undefined;
+          if(!Array.isArray(scanned))return json(res,409,{error:'Could not confirm these files are not system models. Refresh the model list and try again.'});
+          modelScanCache.set('models',{at:Date.now(),body:fresh.body});
+        }
+        if(keys.length){
+          const blocked=keys.some(key=>{const entry=scanned.find(f=>f.key===key);return entry&&(isSystemModel(entry.modelId)||(entry.sections||[]).some(s=>isSystemModel(s)));});
+          if(blocked)return json(res,400,{error:SYSTEM_MODEL_DELETE_REASON,errorId:'systemModel',service:'decision'});
+          // #336: the folder-scan delete removes files directly, bypassing the /api/models/delete
+          // guard below entirely — without this, canDelete:false on the installed list (models.cjs)
+          // is cosmetic, since the client falls back to this very endpoint whenever canDelete is false.
+          const sidecarBlocked=keys.some(key=>{const entry=scanned.find(f=>f.key===key);return entry&&(isSidecarModel(entry.modelId,env)||(entry.sections||[]).some(s=>isSidecarModel(s,env)));});
+          if(sidecarBlocked){
+            const held=keys.map(key=>scanned.find(f=>f.key===key)).filter(Boolean).flatMap(e=>[e.modelId,...(e.sections||[])]).find(n=>isSidecarModel(n,env));
+            return json(res,409,{error:SIDECAR_MODEL_DELETE_REASON,errorId:'modelInUse',service:sidecarServiceOf(held)});
+          }
+        }
+        deleteKeys=keys; deleteScanned=scanned;
+      }
+      // sections/<name> (and its /rename variant) can delete or rename a models.ini section directly;
+      // block that for Laya's section the same way models/delete is blocked above.
+      const sectionMatch = /^sections\/([^/]+)(?:\/rename)?$/.exec(rest);
+      if (sectionMatch && ['DELETE','POST','PUT'].includes(method)) {
+        const name = sectionMatch[1];
+        const scanned = modelScanCache.get('models')?.body?.models;
+        const cachedEntry = Array.isArray(scanned) ? scanned.find(f => (f.sections||[]).includes(name)) : null;
+        if (isSystemModel(name) || (cachedEntry && isSystemModel(cachedEntry.modelId))) {
+          return json(res,400,{error:SYSTEM_MODEL_DELETE_REASON,errorId:'systemModel',service:'decision'});
+        }
+        // Delete-only guard (#336): removing the section for a model a live sidecar depends on
+        // leaves that sidecar pointed at nothing. Rename is left alone — out of scope here.
+        if (method === 'DELETE' && (embeddingProtectionUnknown(env) || isSidecarModel(name, env) || (cachedEntry && isSidecarModel(cachedEntry.modelId, env)))) {
+          return json(res, 409, { error: SIDECAR_MODEL_DELETE_REASON, errorId: 'modelInUse', service: sidecarServiceOf(isSidecarModel(name, env) ? name : cachedEntry?.modelId) });
+        }
+        // #697: a section saved through the model manager replaces the whole section; refuse it when
+        // the settings would not fit the inference memory budget, as the preset editor does.
+        // #1233: file paths are strings. A number or object is refused, not coerced into models.ini.
+        if (method === 'PUT' && !rest.endsWith('/rename')) {
+          let sent; try { sent = JSON.parse(body || '{}'); } catch { sent = {}; }
+          const vals = sent && typeof sent.values === 'object' && sent.values ? sent.values : {};
+          // #1235: fold the llama-server aliases first (-m, LLAMA_ARG_MODEL, mm, md, ...), same key
+          // normalisation as llamacpp-presets canonicalOptions, so an alias cannot dodge the check.
+          for (const [rawKey, value] of Object.entries(vals)) {
+            const key = PATH_OPTION_ALIASES[String(rawKey).trim().replace(/^-+/, '')];
+            // #1249: the model path cannot be removed (null or blank); mmproj and model-draft can (the UI sends '' to clear).
+            if (key === 'model' && (value === null || (typeof value === 'string' && value.trim() === ''))) return json(res, 400, { error: 'Not saved: model must be a text path', code: 'invalid_path' });
+            if (key && value !== undefined && value !== null && typeof value !== 'string') return json(res, 400, { error: `Not saved: ${key} must be a text path`, code: 'invalid_path' });
+          }
+        }
+        if (method === 'PUT' && !rest.endsWith('/rename') && modelManager.presetRefusal) {
+          let payload; try { payload = JSON.parse(body || '{}'); } catch { payload = {}; }
+          const options = { ...(payload.values && typeof payload.values === 'object' ? payload.values : {}) };
+          for (const line of String(payload.extras || '').split('\n')) {
+            const m = /^\s*([^#;=\s][^=]*?)\s*=\s*(.*?)\s*$/.exec(line);
+            if (m) options[m[1]] = m[2];
+          }
+          const refusal = await modelManager.presetRefusal(name, Object.fromEntries(Object.entries(options).filter(([, v]) => typeof v === 'string' && v !== '')));
+          // #1158: an invalid size is a bad request, not a revision conflict. The client reads 409 as
+          // "the settings file changed" and tells the person to reload, which hid the real reason.
+          if (refusal) return json(res, refusal.code === 'invalid_size' ? 400 : 409, refusal);
+        }
+      }
+      if(method!=='GET')modelScanCache.clear();
+      // #2304: exact GET /api/model-manager/models is refused before this legacy proxy;
+      // native policy reads/publishes the same cache through its raw conditional operations.
+      // #697: the model manager's autoconfig sizes against the inference budget, set here rather
+      // than by the browser (any budget_gib the client sent is replaced).
+      let search=url.search;
+      if(method==='GET'&&/^sections\/[^/]+\/autoconfig$/.test(rest)&&modelManager.sizingBudgetGib){
+        const q=new URLSearchParams(url.search);q.delete('budget_gib');
+        const budget=modelManager.sizingBudgetGib();
+        if(budget>0)q.set('budget_gib',String(budget));
+        search=q.toString()?'?'+q.toString():'';
+      }
+      const forward=()=>fetchJson(`${env.MODEL_LOADER_URL.replace(/\/+$/,'')}/api/v1/${rawRest}${search}`,{method,headers:{'Content-Type':'application/json',...(env.MODEL_LOADER_TOKEN?{'X-Model-Loader-Token':env.MODEL_LOADER_TOKEN}:{})},body},10*60*1000).catch(()=>null);
+      // #2276: these manager routes write models.ini too. Use the same hold as the preset
+      // editor, retaining it through the reload; read-only section helpers need no hold.
+      const presetWrite=(method==='PUT'&&['models-ini','idle-unload'].includes(managerPath))
+        || (['PUT','DELETE'].includes(method)&&/^sections\/[^/]+$/.test(managerPath))
+        || (method==='POST'&&/^sections\/[^/]+\/(safe-defaults|rename)$/.test(managerPath));
+      const held=presetWrite?await writePresetsHeld(forward,r=>!!r?.ok&&r.body?.preset!=='failed'):null;
+      if(held?.refused)return json(res,409,{error:PRESETS_BUSY,errorId:'modelsBusy',code:'modelsBusy'});
+      const result=presetWrite?held.written:await forward();
+      // #873: a refused start releases the gate at once. An accepted one keeps it until the model
+      // manager reports the sweep over; so does a lost reply, since the sweep may have started.
+      if(sweepRelease){ if(result&&!result.ok)sweepRelease(); else sweepGuard.watch(sweepRelease,sweepModels); }
+      res.setHeader('Cache-Control','no-store');
+      if(!result)return json(res,502,{error:'The model management service is not responding.'});
+      const detail=result.body&&typeof result.body==='object'?result.body:{error:String(result.body||'')};
+      // A finished benchmark run viewed in the manager becomes throughput evidence (best-effort, throttled).
+      if(result.ok&&method==='GET'&&/^benchmark\/runs\/\d+$/.test(rest)&&modelManager.recordEvidence){
+        for(const {model,record} of require('../../server/benchmark-evidence.cjs').throughputRecords(detail))modelManager.recordEvidence(model,record).catch(()=>undefined);
+      }
+      // #302: the folder-scan delete above only removed files through the model management
+      // service — it never touched the live engine or the auto-router roles. Run the same
+      // cleanup /api/models/delete runs, for every engine id the deleted files backed.
+      if(result.ok&&deleteKeys&&deleteKeys.length){
+        const ids=new Set();
+        for(const key of deleteKeys){
+          const entry=Array.isArray(deleteScanned)?deleteScanned.find(f=>f.key===key):null;
+          if(!entry)continue;
+          if(entry.modelId)ids.add(entry.modelId);
+          for(const section of entry.sections||[])ids.add(section);
+        }
+        let unloaded=false; const rolesCleared=new Set();
+        for(const id of ids){
+          if(typeof modelManager.unload==='function'){
+            const u=await modelManager.unload(id).catch(()=>null);
+            if(u?.ok)unloaded=true;
+          }
+          for(const role of clearRoleReferences(id))rolesCleared.add(role);
+          if(lastLoadedModel()===id)clearLastLoadedModel(id);
+          if(typeof modelManager.forgetIdentity==='function')modelManager.forgetIdentity(id);
+        }
+        modelScanCache.clear();
+        return json(res,result.status,{...detail,unloaded,rolesCleared:[...rolesCleared]});
+      }
+      return json(res,result.status,result.ok?detail:{error:detail.detail||detail.error||'Model management request failed.'});
+    }
+
+    // POST /api/models/presets/reload is the Rust front's (#2210, noevia-rs model_maint/reload.rs;
+    // rust-model-maintenance.cjs refuses it before authentication). Node keeps the other methods' answers:
+    // the administrator check, then 405. (reloadPresets stays in the manager for this process's own
+    // reloads: the folder sync, delete, prune, idle-unload.)
+    if (p === '/api/models/presets/reload') {
+      if(authn.user.role!=='admin')return json(res,403,{error:'Administrator required for shared model profiles'});
+      return json(res,405,{error:'Method not allowed'});
+    }
+
+    // GET /api/models/evidence is the Rust front's (#2210, noevia-rs model_maint/evidence_live.rs;
+    // rust-model-maintenance.cjs refuses it before authentication).
+
+    // POST recheck is Rust's (#2286); Node keeps the other methods' role check and 405.
+    if (p === '/api/models/evidence/recheck') {
+      if(authn.user.role!=='admin')return json(res,403,{error:'Administrator required for shared model evidence'});
+      return json(res,405,{error:'Method not allowed'});
+    }
+
+    // POST /api/models/evidence/import is the Rust front's (#2210, noevia-rs model_maint/evidence_live.rs;
+    // rust-model-maintenance.cjs refuses it before authentication). Node keeps the other methods' answers.
+    if (p === '/api/models/evidence/import') {
+      if(authn.user.role!=='admin')return json(res,403,{error:'Administrator required for shared model evidence'});
+      return json(res,405,{error:'Method not allowed'});
+    }
+
+    if (p === '/api/models/autotune') {
+      if(authn.user.role!=='admin')return json(res,403,{error:'Administrator required for shared model profiles'});
+      if(!modelManager.autotune)return json(res,404,{error:'Auto-tune is unavailable'});
+      let result;
+      if(req.method==='POST'){const body=await readJson(req);result=await modelManager.autotune.start(String(body?.model||''),{confirmPause:body?.confirmPause,promptBudgetSeconds:body?.promptBudgetSeconds,untuned:body?.untuned===true,...(body?.mode!==undefined?{mode:body.mode}:{})});}
+      else return json(res,405,{error:'Method not allowed'});
+      res.setHeader('Cache-Control','no-store');
+      return json(res,result.status,result.body);
+    }
+    // #2303: every method of /api/models/calibration is owned by the Rust front.
+
+    // GET /api/models/preset/suggest and GET /api/models/estimate are the Rust front's (#2189,
+    // noevia-rs model_sizing.rs; rust-model-sizing.cjs refuses them before authentication). Their
+    // other methods keep Node's answers: the administrator check, then 405.
+    if (p === '/api/models/preset/suggest' || p === '/api/models/estimate') {
+      if(authn.user.role!=='admin')return json(res,403,{error:'Administrator required for shared model profiles'});
+      return json(res,405,{error:'Method not allowed'});
+    }
+
+    // #697: the inference memory budget (admin setting). The GET is the Rust front's (#2262, rust-model-state-reads.cjs); the
+    // PUT stays here with the figure this process enforces and the audit.
+    if (p === '/api/models/inference-budget') {
+      if(authn.user.role!=='admin')return json(res,403,{error:'Administrator required for shared model profiles'});
+      if(!inferenceBudget)return json(res,404,{error:'The inference memory budget is unavailable'});
+      res.setHeader('Cache-Control','no-store');
+      if(req.method!=='PUT')return json(res,405,{error:'Method not allowed'});
+      let body;try{body=await readJson(req);}catch{return json(res,400,{error:'invalid JSON'});}
+      try{return json(res,200,inferenceBudget.save(body,authn.user.id));}
+      catch(e){return json(res,e.status||500,{error:e.status?e.message:'Could not save the budget',...(e.messageId?{errorId:e.messageId,minGib:e.minGib,maxGib:e.maxGib}:{})});}
+    }
+
+    // noevia#1863: how long an idle chat model stays loaded (admin setting; the model manager
+    // stores it and rewrites the preset; a change reloads the router when nothing is running).
+    if (p === '/api/models/idle-unload') {
+      if(authn.user.role!=='admin')return json(res,403,{error:'Administrator required for shared model profiles'});
+      if(!idleUnload)return json(res,404,{error:'The idle unload setting is unavailable',errorId:'idleUnloadUnavailable'});
+      res.setHeader('Cache-Control','no-store');
+      const fail=(e)=>json(res,e.status||500,{error:e.status?e.message:'Could not change the idle unload time',...(e.errorId?{errorId:e.errorId}:{}),...(e.minSeconds?{minSeconds:e.minSeconds,maxSeconds:e.maxSeconds}:{})});
+      if(req.method==='PUT'){
+        let body;try{body=await readJson(req);}catch{return json(res,400,{error:'invalid JSON'});}
+        try{return json(res,200,await idleUnload.save(body,authn.user.id));}catch(e){return fail(e);}
+      }
+      return json(res,405,{error:'Method not allowed'});
+    }
+
+    if (p === '/api/models/preset') {
+      if(authn.user.role!=='admin')return json(res,403,{error:'Administrator required for shared model profiles'});
+      if(!modelManager.applyPreset)return json(res,404,{error:'Native presets are unavailable'});
+      if(req.method!=='PUT')return json(res,405,{error:'Method not allowed'});
+      const result=await modelManager.applyPreset(await readJson(req));
+      return json(res,result.status,result.body);
+    }
+
+    // #2187: GET /api/models/capabilities and GET /api/models/hardware are the Rust front's
+    // (rust-models.cjs refuses them before authentication). The hardware path's other methods keep
+    // their 405 here; the capabilities path never had other methods (they fall through).
+    if (p === '/api/models/hardware' && req.method !== 'GET') return json(res,405,{error:'Method not allowed'});
+
+    // #1662: what each model-backed service uses, for every signed-in user (read-only for members).
+    if (p === '/api/models/assignments') return json(res, 405, { error: 'method not allowed' });
+
+    // #1665: the reranker's runtime switch. Administrators only, for reading too (the options name what this
+    // server can rerank with); CSRF/origin run before routes. GET -> { enabled, choice, source, options };
+    // PUT { enabled, choice? } saves (audited, applies at once); DELETE or PUT { reset: true } returns to the
+    // deployment's configuration. No address is ever sent: a choice is an id the server maps to its address.
+    if (p === '/api/models/reranker') {
+      if (authn.user.role !== 'admin') return json(res, 403, { error: 'administrator required' });
+      if (!rerankSettings) return json(res, 503, { error: 'Reranker settings are unavailable.' });
+      if (!['GET', 'PUT', 'DELETE'].includes(req.method || 'GET')) return json(res, 405, { error: 'method not allowed' });
+      let installed = null;
+      try { installed = await modelsInstalled(); } catch { installed = null; }
+      if (!Array.isArray(installed)) installed = null;
+      try {
+        if (req.method === 'GET') return json(res, 200, rerankSettings.get(installed));
+        if (req.method === 'DELETE') return json(res, 200, rerankSettings.reset(authn.user.id, installed));
+        let body;
+        try { body = await readJson(req); } catch { return json(res, 400, { error: 'invalid JSON', errorId: 'invalidInput' }); }
+        if (isJsonObject(body) && body.reset === true) return json(res, 200, rerankSettings.reset(authn.user.id, installed));
+        return json(res, 200, rerankSettings.save(body, authn.user.id, installed));
+      } catch (error) {
+        return json(res, error.status || 400, { error: error.status ? error.message : 'Invalid reranker settings', ...(error.messageId ? { errorId: error.messageId } : {}) });
+      }
+    }
+
+    // #1695: idempotent cleanup of presets whose model file is gone (the web runs it when the
+    // admin's list has any; a release may call it too). POST only, admin only (guarded above).
+    if (p === '/api/models/prune-missing') {
+      if (req.method !== 'POST') return json(res, 405, { error: 'method not allowed' });
+      if (!modelManager.enabled) return json(res, 404, { error: 'model management is disabled' });
+      const r = await pruneMissingPresets();
+      return json(res, r.status, r.ok ? { removed: r.removed, kept: r.kept, reloaded: r.reloaded } : { error: r.error, ...(r.code ? { code: r.code } : {}), ...(r.retryable ? { retryable: true } : {}) });
+    }
+
+    // The GET is the Rust front's (#2262). Another method used to get the list too; it is refused like any other unknown method.
+    if (p === '/api/models/installed') return json(res, 405, { error: 'Method not allowed' });
+
+    if (p === '/api/models/mtp-artifact' && req.method === 'GET') {
+      const repo = url.searchParams.get('repo') || '';
+      if (!/^[\w.-]+\/[\w.-]+$/.test(repo)) return json(res,400,{error:'Invalid repository'});
+      const result = await modelManager.variants(repo);
+      if (!result.ok) return json(res,502,{error:'Could not resolve selected files'});
+      const variant = (result.body?.variants || []).find(v=>v.name === url.searchParams.get('variant'));
+      if (!variant) return json(res,404,{error:'Variant no longer available'});
+      return json(res,200,await require('../../server/mtp-artifact.cjs').check(repo,variant.files || [variant.primary_file]));
+    }
+
+    if (p === '/api/models/pull' && req.method === 'POST') {
+      const raw = await readBody(req);
+      let body;
+      try {
+        body = JSON.parse(raw);
+      } catch {
+        return json(res, 400, { error: 'invalid JSON' });
+      }
+      if (!body.checkpoint) return json(res, 400, { error: 'checkpoint required' });
+      if (!modelManager.enabled) return json(res, 404, { error: 'model management is disabled' });
+      const modelName = body.modelName || deriveUserModelName(body.checkpoint);
+      const r = await modelManager.pull({ modelName, checkpoint: body.checkpoint, recipe: body.recipe || 'llamacpp' });
+      return json(
+        res,
+        r.ok ? 200 : 502,
+        r.ok ? { jobId: r.body?.id || r.body?.job_id || 'pull', modelName: r.body?.modelName || modelName } : { error: r.body?.error || `pull failed: ${r.status}` },
+      );
+    }
+
+    if (p === '/api/models/delete' && req.method === 'POST') {
+      const raw = await readBody(req);
+      let body;
+      try {
+        body = JSON.parse(raw);
+      } catch {
+        return json(res, 400, { error: 'invalid JSON' });
+      }
+      if (!body.name) return json(res, 400, { error: 'name required' });
+      // #1660: Laya can be deleted too, but only when the request says so explicitly (the
+      // client's confirm names the Decision service); without it the old refusal stands.
+      const confirmSystem = body.confirmSystem === true;
+      if (isSystemModel(body.name) && !confirmSystem) return json(res, 400, { error: SYSTEM_MODEL_DELETE_REASON, errorId: 'systemModel', service: 'decision' });
+      // #336: the embedding model was deleted through this route while the embed sidecar was
+      // still pointed at it, which crash-loops that sidecar with nothing to fall back to.
+      // 409 (not 400): the name is a perfectly valid model, just not deletable right now.
+      // #1660: the refusal names the service, so the client can offer "switch it first".
+      if (embeddingProtectionUnknown(env) || isSidecarModel(body.name, env)) return json(res, 409, { error: SIDECAR_MODEL_DELETE_REASON, errorId: 'modelInUse', service: sidecarServiceOf(body.name) });
+      if (!modelManager.enabled) return json(res, 404, { error: 'model management is disabled' });
+      // A neutral id can still point at Laya's weights: check the router's --model path as well.
+      if (modelManager.kind === 'llamacpp' && typeof modelManager.request === 'function') {
+        const listing = await modelManager.request('/models').catch(() => null);
+        if (!listing?.ok || !Array.isArray(listing.body?.data)) return json(res, 409, { error: 'Could not confirm this is not a system model. Try again.' });
+        const row = listing.body.data.find(m => m.id === body.name);
+        if (row && !confirmSystem && isSystemModel(row.id, modelPathFromArgs(row.status?.args || []))) return json(res, 400, { error: SYSTEM_MODEL_DELETE_REASON, errorId: 'systemModel', service: 'decision' });
+        if (row && isSidecarModel(row.id, env)) return json(res, 409, { error: SIDECAR_MODEL_DELETE_REASON, errorId: 'modelInUse', service: sidecarServiceOf(row.id) });
+      }
+      // Confirm the model is known before touching it: an unknown name 404s instead of
+      // forwarding a delete the manager might silently accept for anything. When the
+      // installed list cannot be read (engine unreachable) this check is skipped and the
+      // delete below is attempted anyway, same as before this existence check existed.
+      let installed = null;
+      try { installed = await modelsInstalledNow(); } catch { installed = null; }
+      const entry = Array.isArray(installed) ? installed.find((m) => m.name === body.name) : null;
+      if (Array.isArray(installed) && !entry) return json(res, 404, { error: `model not found: ${body.name}` });
+      // Unload first: a loaded model can refuse deletion or leave its file locked. Tolerate
+      // the manager reporting "not loaded" (or being momentarily unreachable) — the delete
+      // below still goes ahead either way. removeModel (llama.cpp) holds a single mutate()
+      // gate across both calls and retries the unload once if the delete is refused, so an
+      // on-demand load cannot slip in between; other manager kinds fall back to the two calls.
+      let unloaded = false, r;
+      if (typeof modelManager.removeModel === 'function') {
+        r = await modelManager.removeModel(body.name);
+        unloaded = !!r.unloaded;
+      } else {
+        if (!entry || entry.loaded) {
+          const u = await modelManager.unload(body.name).catch(() => null);
+          unloaded = !!u?.ok;
+        }
+        r = await modelManager.deleteModel(body.name);
+      }
+      // #1661: the engine's delete removes the file, but the models.ini preset stayed behind and
+      // the card came back as "File missing". Remove the preset section through the model
+      // management service as well. A preset whose file is already gone has nothing for the
+      // engine to delete, so removing its section alone is a successful delete.
+      // Only once the file is gone (or was already missing): a refused engine delete must keep the
+      // section, or the file stays on disk with its settings lost and no card to retry from.
+      const fileGone = r.ok || entry?.missingFile === true;
+      // #2219: the file is already gone when a refused hold keeps the section: the card shows "File
+      // missing" and this delete or the list's prune finishes the job.
+      const held = fileGone && env.MODEL_LOADER_URL ? await writePresetsHeld(() => removePresetSection(body.name), (w) => w.removed) : null;
+      if (held?.refused && !r.ok) return json(res, 409, { error: PRESETS_BUSY, code: 'maintenance_held', retryable: true, unloaded });
+      const preset = held?.written || { removed: false };
+      const engineOk = r.ok || (entry?.missingFile === true && preset.removed);
+      if (!engineOk) {
+        // noevia#2115: the gate does not unload or delete a model that is answering a request.
+        const refusal = refusalOf(r);
+        if (refusal) return json(res, refusal.status, { error: refusal.error, code: refusal.code, retryable: refusal.retryable, unloaded });
+        return json(res, 502, { error: `delete failed: ${r.status}`, unloaded });
+      }
+      // The model is gone: drop every auto-role that pointed at it, the shared "last loaded
+      // model" default if it was this one, and the cached folder scan, so nothing still
+      // served by this route can hand the deleted name back out.
+      const rolesCleared = clearRoleReferences(body.name);
+      if (lastLoadedModel() === body.name) clearLastLoadedModel(body.name);
+      if (typeof modelManager.forgetIdentity === 'function') modelManager.forgetIdentity(body.name);
+      // #1695: the router still lists a removed section until it re-reads models.ini.
+      const reloaded = !!held?.reloaded;
+      modelScanCache.clear();
+      if (service.invalidateModelReads) service.invalidateModelReads();
+      return json(res, 200, { ok: true, unloaded, rolesCleared, presetRemoved: preset.removed, ...(held?.refused ? { presetBusy: true } : {}), ...(preset.removed ? { presetsReloaded: reloaded } : {}) });
+    }
+
+    for (const verb of ['load', 'unload']) {
+      if (p === `/api/models/${verb}` && req.method === 'POST') {
+        const raw = await readBody(req);
+        let body;
+        try {
+          body = JSON.parse(raw);
+        } catch {
+          return json(res, 400, { error: 'invalid JSON' });
+        }
+        if (!body.name) return json(res, 400, { error: 'name required' });
+        if (!modelManager.enabled) return json(res, 404, { error: 'model management is disabled' });
+        // #548: Laya and the in-use embedding/reranker models are run by their own sidecars; a
+        // load would duplicate them in the router and an unload would silently break RAG. 409, not
+        // 400: a valid model, just not one this route may touch.
+        if (isSystemModel(body.name)) return json(res, 409, { error: SYSTEM_MODEL_LOAD_REASON });
+        if (isSidecarModel(body.name, env)) return json(res, 409, { error: SIDECAR_MODEL_LOAD_REASON });
+        // #545: a preset whose GGUF is gone can only fail to load. Unloading it stays allowed.
+        if (verb === 'load') {
+          let installed = null;
+          try { installed = await modelsInstalledNow(); } catch { installed = null; }
+          if (Array.isArray(installed) && installed.find((m) => m.name === body.name)?.missingFile) return json(res, 409, { error: MISSING_MODEL_FILE_REASON });
+        }
+        if (verb === 'load' && body.mtp !== undefined && modelManager.kind === 'llamacpp') return json(res,400,{error:'Use the native preset editor to configure speculative decoding.'});
+        if (verb === 'load' && body.mtp !== undefined) {
+          const listing = await modelManager.listModels();
+          if (!listing.ok) return json(res,502,{error:'Could not verify MTP support'});
+          const model = (listing.body.data || []).find(m=>(m.id || m.model_name)===body.name);
+          if (!model) return json(res,404,{error:'Model not installed'});
+          let options;
+          try { options = require('../../server/mtp.cjs').loadOptions(model,body.mtp); }
+          catch(error) { return json(res,400,{error:error.message}); }
+          const loaded = await modelManager.load(body.name,options);
+          if (!loaded.ok) return json(res,502,{error:'Model could not load with that MTP setting. Previous saved settings were kept.'});
+          const saved = await modelManager.load(body.name,{...options,save_options:true});
+          return json(res,saved.ok?200:502,saved.ok?{ok:true}:{error:'Model loaded, but its MTP preference could not be saved. Check before reloading.'});
+        }
+        // noevia#2115: the inference gate refuses to unload a model that is answering a request (409 model_in_use).
+        // The admin may then unload it anyway (`force: true`), which ends what it is answering; the gate logs it.
+        if (verb === 'unload' && body.force === true) {
+          if (typeof modelManager.unloadAnyway !== 'function') return json(res, 400, { error: 'This model engine cannot unload a model in use.' });
+          const forced = await modelManager.unloadAnyway(body.name);
+          if (forced.ok) return json(res, 200, { ok: true, forced: true });
+          const refusal = refusalOf(forced);
+          return refusal ? json(res, refusal.status, { error: refusal.error, code: refusal.code, retryable: refusal.retryable }) : json(res, 502, { error: `unload failed: ${forced.status}` });
+        }
+        // noevia#2115: a load waits in the gate's queue, up to the gate's limit. An admin who closes the page or
+        // cancels leaves that queue and starts no switch: the request's abort signal goes to the load.
+        const gone = new AbortController();
+        const onClose = () => { if (!res.writableEnded) gone.abort(); };
+        res.once?.('close', onClose);
+        let r;
+        try { r = verb === 'load' ? await modelManager.load(body.name, {}, gone.signal) : await modelManager[verb](body.name); }
+        catch (error) { if (gone.signal.aborted) return true; throw error; }
+        finally { res.off?.('close', onClose); }
+        if (r.ok) return json(res, 200, { ok: true });
+        const refusal = refusalOf(r);
+        if (refusal) return json(res, refusal.status, { error: refusal.error, code: refusal.code, retryable: refusal.retryable,
+          ...(verb === 'unload' && refusal.code === 'model_in_use' ? { canForce: modelManager.gateAdmin?.() === true } : {}) });
+        return json(res, 502, { error: `${verb} failed: ${r.status}` });
+      }
+    }
+
+    // Exact GET is native; retain the historical behavior for other methods.
+    if (p === '/api/models/downloads' && req.method !== 'GET') {
+      if (!modelManager.enabled) return json(res, 200, []);
+      const r = await modelManager.downloads();
+      if (!r.ok) return json(res, 502, {error:'Download status unavailable'});
+      const arr = Array.isArray(r.body) ? r.body : r.body?.jobs || r.body?.downloads || [];
+      // Lemonade reports `percent` as 0-100; the UI expects a 0-1 fraction.
+      return json(res, 200, arr.map((j) => ({
+        id: j.id || j.job_id || '',
+        model: j.model_name || j.model || j.checkpoint || '',
+        progress: typeof j.percent === 'number' ? j.percent / 100 : typeof j.progress === 'number' ? j.progress : null,
+        status: j.status || j.state || '',
+      })));
+    }
+
+    return PASS;
+  }
+
+  const modelRoutes = async function modelRoutes(req, res, ctx) {
+    return (await handle(req, res, ctx)) !== PASS;
+  };
+  // Settles once the startup check for a still-running sweep is done (tests await it).
+  modelRoutes.sweepAdopted = sweepAdopted;
+  modelRoutes.cancelSweepAdopt = () => sweepGuard?.cancelAdopt();
+  return modelRoutes;
+}
+
+module.exports = { createModelRoutes, STATS_REFUSAL, ROUTING_DEFAULT_REFUSAL, AUTO_ROLES_REFUSAL };

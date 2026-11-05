@@ -396,11 +396,9 @@ if (typeof modelManager.releaseMaintenanceHold === 'function') shutdownHooks.add
   if (warning) console.warn(warning);
 }
 // noevia#1863: the chat-model idle unload time (admin setting, stored by the model manager).
-const idleUnload = process.env.MODEL_LOADER_URL ? require('./idle-unload-setting.cjs').createIdleUnloadSetting({ env: process.env, fetchJson,
-  reloadPresets: (o) => modelManager.reloadPresets ? modelManager.reloadPresets(o) : { ok: false },
-  writePresets: modelManager.writePresets || null,
+const idleUnload = process.env.MODEL_LOADER_URL ? require('./idle-unload-setting.cjs').createIdleUnloadSetting({
   presetsInRouter: () => modelManager.presetsInRouter ? modelManager.presetsInRouter() : null,
-  audit: (action, actor, detail) => authService.audit(action, actor, actor, detail) }) : null;
+}) : null;
 // #697 runtime safety net (the memory watchdog) is the Rust front's (rust-budget-watch.cjs
 // BUDGET_WATCH_OWNER, --features rust-budget-watch): it samples, unloads through the inference gate and
 // asks this process only for the maintenance state and the quarantine (budgetWatchBridge below). It is
@@ -1200,6 +1198,9 @@ const authRoutes = require('./routes/auth.cjs').createAuthRoutes({
 // only refuses a request that bypassed it.
 const storageRoutes = require('./routes/storage.cjs').createStorageRoutes({ json });
 // Public approval policy is Rust's; only pending chat Promise resolution remains here (#2282).
+const modelWriteEffects = require('./rust-model-write-effects.cjs').createModelWriteEffects({
+  secret: FRONT_SECRET, json, readJson, service: modelService, manager: modelManager, asUser: diaryAsUser,
+});
 const idleUnloadFacts = require('./rust-idle-unload-read-facts.cjs').createIdleUnloadFacts({
   secret: FRONT_SECRET, json, effectiveSeconds: () => idleUnload?.effectiveSeconds(),
 });
@@ -1310,6 +1311,7 @@ async function handleRequestInner(req, res) {
   publicHeaders(res);
   if (require('./rust-tool-approvals.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   if (require('./rust-idle-unload-read.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
+  if (await modelWriteEffects(req, res)) return;
   if (await idleUnloadFacts(req, res)) return;
   if (require('./rust-model-downloads-read.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   if (await modelDownloadsFacts(req, res)) return;
