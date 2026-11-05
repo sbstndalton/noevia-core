@@ -52,8 +52,24 @@ const MAX_MS = 24 * 60 * 60 * 1000;
 const BODY_LIMIT = 4096;
 /** The cap a lease gets for `requested` (undefined: the default). */
 const capFor = (requested, hardMs, maxMs) => (requested === undefined ? hardMs : Math.min(Math.max(requested, hardMs), Math.max(hardMs, maxMs)));
-function createLeases({ hold, ttlMs = TTL_MS, hardMs = HARD_MS, maxMs = MAX_MS, log = (m) => console.warn(m), now = () => Date.now() }) {
+/** Delta review P2: how long, and how many, given-back tickets are remembered so a POST that arrives (or is
+ *  granted) after its DELETE is refused rather than latched. Longer than any front call to this route. */
+const TICKET_TOMBSTONE_MS = 10 * 60 * 1000;
+const TICKET_TOMBSTONES = 1024;
+
+function cancelledTicket() {
+  return Object.assign(new Error('That maintenance hold was given back before it was granted.'), { status: 410 });
+}
+
+function createLeases({ hold, ttlMs = TTL_MS, hardMs = HARD_MS, maxMs = MAX_MS, log = (m) => console.warn(m), now = () => Date.now(),
+  ticketTombstoneMs = TICKET_TOMBSTONE_MS, ticketTombstones = TICKET_TOMBSTONES }) {
   const leases = new Map();
+  const tombstones = new Map(); // ticket -> expiry, oldest first
+  const pending = new Map(); // ticket -> the grant being taken under it
+  function tombstoned(ticket) {
+    for (const [k, until] of tombstones) { if (until > now()) break; tombstones.delete(k); }
+    return !!ticket && tombstones.has(ticket);
+  }
   function end(id, why) {
     const lease = leases.get(id);
     if (!lease) return false;
@@ -71,15 +87,31 @@ function createLeases({ hold, ttlMs = TTL_MS, hardMs = HARD_MS, maxMs = MAX_MS, 
     lease.timer = setTimeout(() => end(id, lease.hardAt <= now() ? 'passed its limit' : 'was not renewed'), Math.max(0, left));
     lease.timer.unref?.();
   }
+  const grantOf = (id, lease) => ({ lease: id, ttlMs, renewMs: Math.min(RENEW_MS, Math.max(1, Math.floor(ttlMs / 3))), hardMs: lease.cap });
+  async function take(requested, ticket) {
+    const cap = capFor(requested, hardMs, maxMs);
+    const release = await hold();
+    // A DELETE that came while the hold was being taken: give it back at once.
+    if (tombstoned(ticket)) { release(); throw cancelledTicket(); }
+    const id = crypto.randomBytes(16).toString('hex');
+    const lease = { release, timer: null, hardAt: now() + cap, cap, ticket: ticket || null };
+    leases.set(id, lease);
+    arm(id);
+    return grantOf(id, lease);
+  }
   return {
-    /** Takes the hold, or rejects as hold() does (409 while busy). */
+    /** Takes the hold, or rejects as hold() does (409 while busy); 410 for a ticket already given back.
+     *  One ticket is one latch: a repeated ask returns the grant taken (or being taken) under it. */
     async acquire(requested, ticket) {
-      const cap = capFor(requested, hardMs, maxMs);
-      const release = await hold();
-      const id = crypto.randomBytes(16).toString('hex');
-      leases.set(id, { release, timer: null, hardAt: now() + cap, ticket: ticket || null });
-      arm(id);
-      return { lease: id, ttlMs, renewMs: Math.min(RENEW_MS, Math.max(1, Math.floor(ttlMs / 3))), hardMs: cap };
+      if (tombstoned(ticket)) throw cancelledTicket();
+      if (ticket) {
+        for (const [id, lease] of leases) if (lease.ticket === ticket) return grantOf(id, lease);
+        if (pending.has(ticket)) return pending.get(ticket);
+        const taking = take(requested, ticket).finally(() => pending.delete(ticket));
+        pending.set(ticket, taking);
+        return taking;
+      }
+      return take(requested, null);
     },
     renew(id) {
       const lease = leases.get(id);
@@ -88,9 +120,15 @@ function createLeases({ hold, ttlMs = TTL_MS, hardMs = HARD_MS, maxMs = MAX_MS, 
       return true;
     },
     release: (id) => end(id, null),
-    /** Row J review: ends the latch the front asked for under `ticket`, whether or not its grant reached it. */
+    /** Row J review: ends the latch the front asked for under `ticket`, whether or not its grant reached it,
+     *  and remembers the ticket (bounded) so a grant that lands later is refused or given back. */
     releaseTicket(ticket) {
-      for (const [id, lease] of leases) if (ticket && lease.ticket === ticket) return end(id, null);
+      if (!ticket) return false;
+      tombstoned(null); // prune expired
+      tombstones.delete(ticket);
+      tombstones.set(ticket, now() + ticketTombstoneMs);
+      while (tombstones.size > ticketTombstones) tombstones.delete(tombstones.keys().next().value);
+      for (const [id, lease] of leases) if (lease.ticket === ticket) return end(id, null);
       return false;
     },
     size: () => leases.size,
@@ -268,6 +306,7 @@ function createLeaseRoutes({ secret, hold, json, ...options }) {
       try { json(res, 201, await leases.acquire(ask.maxMs, ask.ticket)); }
       catch (e) {
         if (e?.status === 409) json(res, 409, { error: e.message, chatActive: e.chatActive === true });
+        else if (e?.status === 410) json(res, 410, { error: e.message, code: 'ticketCancelled' });
         else json(res, 503, { error: 'The maintenance hold could not be taken.' });
       }
       return true;

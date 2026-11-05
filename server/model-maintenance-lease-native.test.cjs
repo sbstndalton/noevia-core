@@ -267,6 +267,79 @@ test('the latch is a local-only hold: no second trip to the authority, and a tic
   leave();
 });
 
+// Delta review P2: the ticket give-back is cancellation-safe. A DELETE that reaches Node before (or while)
+// the POST is granted leaves a bounded tombstone, so the late grant is refused or given back at once; a
+// repeated POST with one ticket is idempotent; another ticket's latch is untouched.
+async function latchRoutes(t, { hold, ...options }) {
+  const { createMaintenanceGate } = require('./inference-maintenance.cjs');
+  const gate = createMaintenanceGate();
+  const routes = createLeaseRoutes({ secret: SECRET, hold: hold || (() => gate.holdLocal('front latch')), json: (res, s, b) => { res.writeHead(s, { 'content-type': 'application/json' }); res.end(JSON.stringify(b)); }, ...options });
+  const server = http.createServer(async (req, res) => { if (!(await routes.handle(req, res))) { res.writeHead(418); res.end(); } });
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  t.after(() => new Promise((r) => { server.closeAllConnections(); server.close(r); }));
+  const url = `http://127.0.0.1:${server.address().port}${PREFIX}`;
+  const h = { 'x-noevia-store-token': SECRET, 'content-type': 'application/json' };
+  const post = (ticket) => fetch(url, { method: 'POST', headers: h, body: JSON.stringify(ticket ? { ticket } : {}) });
+  const del = (ticket) => fetch(`${url}/ticket/${ticket}`, { method: 'DELETE', headers: h });
+  return { gate, post, del };
+}
+
+test('ticket: a DELETE before the POST arrives refuses the late grant, and nothing stays held', async (t) => {
+  const { gate, post, del } = await latchRoutes(t, {});
+  const ticket = 'b'.repeat(32);
+  assert.equal((await del(ticket)).status, 204);
+  const late = await post(ticket);
+  assert.equal(late.status, 410, 'a cancelled ticket is not granted');
+  assert.equal(gate.held(), false, 'the late POST holds nothing');
+  gate.enter()();
+});
+
+test('ticket: a DELETE while the grant is being taken gives it back the moment it is taken', async (t) => {
+  let open; const taken = new Promise((r) => { open = r; });
+  let released = 0;
+  const { post, del } = await latchRoutes(t, { hold: async () => { await taken; return () => { released++; }; } });
+  const ticket = 'c'.repeat(32);
+  const pending = post(ticket);
+  await delay(30);
+  assert.equal((await del(ticket)).status, 204);
+  open();
+  const answer = await pending;
+  assert.equal(answer.status, 410);
+  assert.equal(released, 1, 'the hold taken after the DELETE is released at once');
+});
+
+test('ticket: one ticket is one latch (idempotent POST), and another ticket\'s latch is isolated', async (t) => {
+  const { gate, post, del } = await latchRoutes(t, {});
+  const one = 'd'.repeat(32), two = 'e'.repeat(32);
+  const first = await post(one);
+  assert.equal(first.status, 201);
+  const again = await post(one);
+  assert.equal(again.status, 201, 'a retried POST of the same ticket is the same latch, not a busy 409');
+  assert.equal((await again.json()).lease, (await first.json()).lease);
+  assert.equal((await del(one)).status, 204);
+  assert.equal(gate.held(), false);
+  // An old ticket's tombstone does not touch a new ticket's latch.
+  assert.equal((await post(two)).status, 201);
+  assert.equal((await del(one)).status, 204);
+  assert.equal(gate.held(), true, 'the new latch is untouched');
+  assert.equal((await del(two)).status, 204);
+  assert.equal(gate.held(), false);
+});
+
+test('ticket: tombstones are bounded in count and lifetime', async (t) => {
+  let clock = 0;
+  const { post, del } = await latchRoutes(t, { now: () => clock, ticketTombstoneMs: 1000, ticketTombstones: 4 });
+  const tk = (i) => i.toString(16).padStart(32, '0');
+  for (let i = 1; i <= 6; i++) assert.equal((await del(tk(i))).status, 204);
+  // The two oldest were dropped (count bound): a POST with them is granted; the newest is still refused.
+  assert.equal((await post(tk(6))).status, 410);
+  const old = await post(tk(1));
+  assert.equal(old.status, 201);
+  assert.equal((await del(tk(1))).status, 204);
+  clock += 1001; // lifetime bound
+  assert.equal((await post(tk(6))).status, 201);
+});
+
 test('a cancelled wait for the authority takes nothing and rejects as cancelled', async (t) => {
   const a = await authority(t);
   const client = createNativeLeaseClient({ port: a.port, token: SECRET, boot: 'b', startedAt: 1 });
