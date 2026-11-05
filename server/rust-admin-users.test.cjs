@@ -69,7 +69,7 @@ test('a workspace held for an account whose folder the front removed is revoked,
   sleepSync(300);
   assert.equal(held.revoked, true, 'seen within the folder check\'s 250 ms');
   assert.throws(() => held.assertActive(), (e) => e.status === 410 && /no longer exists/.test(e.message));
-  assert.throws(() => held.saveAutoRoles(), (e) => e.status === 410);
+  assert.throws(() => held.saveProjects(), (e) => e.status === 410);
   assert.equal(fs.existsSync(path.join(root, 'users', USER)), false, 'nothing made the folder again');
   // An account the front did not delete is untouched.
   assert.equal(ws.get(OTHER).revoked, false);
