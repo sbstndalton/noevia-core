@@ -1,7 +1,7 @@
 'use strict';
 // Synthetic oracle. Run against the pre-port Core tree with Node 22.
-const backfill = require('../document-backfill.cjs');
-const figures = require('../figure-sweep.cjs');
+const backfill = require('../../tests/oracles/media-u2/document-backfill.cjs');
+const figures = require('../../tests/oracles/media-u2/figure-sweep.cjs');
 const rag = require('../rag.cjs');
 const hash = 'a'.repeat(64);
 const base = { name: 'sample.pdf', content: 'head', document: { version: hash, byteHash: hash, availableVersion: hash, extractor: 'old', indexing: 'ready', state: 'ready' } };
@@ -30,4 +30,4 @@ const windows = [
   ['all', head, {}], ['resume', head, { fromPage: 3 }], ['limited', head, { textLimit: 30 }],
   ['one-window', head, { maxChars: 1 }], ['mismatch', 'unrelated', {}], ['empty-head', '', {}],
 ].map(([name, content, options]) => ({ name, content, record: pages, options, result: backfill.tailWindow(content, pages, { chunkText: rag.chunkText, ...options }) }));
-process.stdout.write(JSON.stringify({ candidates, windows, settings: [{ env: {}, result: backfill.settings({}) }, { env: { PROJECT_BACKFILL_DUTY: '0', PROJECT_TAIL_EMBED_BATCH: '100', PROJECT_UPLOAD_COMPLETION_PER_PASS: '0' }, result: backfill.settings({ PROJECT_BACKFILL_DUTY: '0', PROJECT_TAIL_EMBED_BATCH: '100', PROJECT_UPLOAD_COMPLETION_PER_PASS: '0' }) }] }, null, 2) + '\n');
+process.stdout.write(JSON.stringify({ candidates, windows, settings: [{ env: { PROJECT_TAIL_EMBED_BATCH: '0x10', PROJECT_TAIL_EMBED_PER_PASS: '0b100', PROJECT_UPLOAD_COMPLETION_PER_PASS: '0o3' }, result: backfill.settings({ PROJECT_TAIL_EMBED_BATCH: '0x10', PROJECT_TAIL_EMBED_PER_PASS: '0b100', PROJECT_UPLOAD_COMPLETION_PER_PASS: '0o3' }) }, { env: {}, result: backfill.settings({}) }, { env: { PROJECT_BACKFILL_DUTY: '0', PROJECT_TAIL_EMBED_BATCH: '100', PROJECT_UPLOAD_COMPLETION_PER_PASS: '0' }, result: backfill.settings({ PROJECT_BACKFILL_DUTY: '0', PROJECT_TAIL_EMBED_BATCH: '100', PROJECT_UPLOAD_COMPLETION_PER_PASS: '0' }) }] }, null, 2) + '\n');

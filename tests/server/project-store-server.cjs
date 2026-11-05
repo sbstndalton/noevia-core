@@ -361,7 +361,7 @@ function createHandler(dataDir, token, writes = [], failures = [], { changes = f
  *  (server/rust-embedding-background.cjs), so a real boot pairs; pass its path as NOEVIA_SERVER_BIN. */
 function syntheticFrontBin(dir) {
   const file = path.join(dir, 'synthetic-noevia-server');
-  fs.writeFileSync(file, `#!/bin/sh\n[ "$1" = --features ] && echo ${require('../../server/rust-embedding-background.cjs').RUST_EMBEDDING_OWNED} ${require('../../server/rust-index-outbox.cjs').RUST_INDEX_OUTBOX_OWNED}\n`, { mode: 0o755 });
+  fs.writeFileSync(file, `#!/bin/sh\n[ "$1" = --features ] && echo ${require('../../server/rust-embedding-background.cjs').RUST_EMBEDDING_OWNED} ${require('../../server/rust-index-outbox.cjs').RUST_INDEX_OUTBOX_OWNED} ${require('../../server/rust-media-background.cjs').RUST_MEDIA_BACKGROUND_OWNED}\n`, { mode: 0o755 });
   return file;
 }
 
