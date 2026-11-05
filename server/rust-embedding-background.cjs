@@ -7,8 +7,21 @@ const { trustedFront } = require('./trusted-front.cjs');
 const RUST_EMBEDDING_OWNED = 'rust-embedding-background-v1';
 const RUST_INDEX_OUTBOX_OWNED = require('./rust-index-outbox.cjs').RUST_INDEX_OUTBOX_OWNED;
 const PROTOCOL = 'rust-embedding-worker-v1';
+// All checks and scheduling run synchronously after the notification body is read.
+function createSourceMembershipGuard({ userExists, workspaceFor }) {
+  return (user, project, file) => {
+    try {
+      if (!userExists(user)) return false;
+      const workspace = workspaceFor(user);
+      workspace.assertActive();
+      workspace.projectsFile?.refresh(workspace.projects);
+      const current = workspace.projects.find(p => p && p.id === project);
+      return !!current && Array.isArray(current.files) && current.files.some(f => f && f.name === file);
+    } catch { return false; }
+  };
+}
 // frontSecret: the per-start store secret, captured before project-store-client deletes it from process.env (#1916).
-function createOwner({ sourceChanged = (user, project) => require('./multimodal-rag.cjs').sourceChanged(user, project), foregroundBusy = () => require('./rag.cjs').foregroundBusy(), env = process.env, frontSecret = '', dataDir, now = Date.now, verifyPair = true, features = () => execFileSync(env.NOEVIA_SERVER_BIN || '/usr/local/bin/noevia-server', ['--features'], { encoding: 'utf8', timeout: 5000 }) }) {
+function createOwner({ sourceMember = () => false, sourceChanged = (user, project) => require('./multimodal-rag.cjs').sourceChanged(user, project), foregroundBusy = () => require('./rag.cjs').foregroundBusy(), env = process.env, frontSecret = '', dataDir, now = Date.now, verifyPair = true, features = () => execFileSync(env.NOEVIA_SERVER_BIN || '/usr/local/bin/noevia-server', ['--features'], { encoding: 'utf8', timeout: 5000 }) }) {
   const start = String(env.NOEVIA_START_ID || '');
   if (verifyPair && (!start || !frontSecret || ![RUST_EMBEDDING_OWNED, RUST_INDEX_OUTBOX_OWNED].every(f => features().split(/\s+/).includes(f)))) throw Error('Embedding background requires a coherent paired front and current start');
   let stopped = false, sequence = 0;
@@ -41,9 +54,15 @@ function createOwner({ sourceChanged = (user, project) => require('./multimodal-
       if (req.method !== 'POST' || !verifyPair || stopped || !trustedFront(req, frontSecret)) { json(res, 404, { error: 'Not found' }); return true; }
       let body;
       try { body = await require('./http.cjs').readJson(req, 4096); } catch { json(res, 400, { error: 'Invalid notification' }); return true; }
-      if (body?.start !== start || typeof body.user !== 'string' || !/^[a-f0-9-]{36}$/i.test(body.user) || typeof body.project !== 'string' || !body.project || body.project.length > 256 || body.project.startsWith('.') || /[/\\\x00]/.test(body.project)) { json(res, 400, { error: 'Invalid notification' }); return true; }
-      try { sourceChanged(body.user, body.project); }
-      catch { json(res, 503, { error: 'Media notification unavailable' }); return true; }
+      if (typeof body?.file !== 'string' || body?.start !== start || typeof body.user !== 'string' || !/^[a-f0-9-]{36}$/i.test(body.user) || typeof body.project !== 'string' || !body.project || body.project.length > 256 || body.project.startsWith('.') || /[/\\\x00]/.test(body.project)) { json(res, 400, { error: 'Invalid notification' }); return true; }
+      // No await between this fresh check and scheduling: a delayed body may
+      // refer to an account/source removed after the native preflight.
+      let member = false;
+      try { member = sourceMember(body.user, body.project, body.file) === true; } catch { /* fail closed */ }
+      if (member) {
+        try { sourceChanged(body.user, body.project); }
+        catch { json(res, 503, { error: 'Media notification unavailable' }); return true; }
+      }
       json(res, 200, { protocol: PROTOCOL, start, notified: true });
       return true;
     },
@@ -62,4 +81,4 @@ function scheduleLegacy({ owner, env, config, service, migration, afterReady, in
   });
   return () => { stopped = true; timers.forEach(clear); owner?.stop(); return migration.stop(); };
 }
-module.exports = { RUST_EMBEDDING_OWNED, PROTOCOL, createOwner, scheduleLegacy };
+module.exports = { RUST_EMBEDDING_OWNED, PROTOCOL, createOwner, createSourceMembershipGuard, scheduleLegacy };

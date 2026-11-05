@@ -12,15 +12,15 @@ function fixture(t) {
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
   const env = { NOEVIA_START_ID: 'synthetic-start', NOEVIA_PROJECT_STORE_TOKEN: 'synthetic-token', MODEL_LOADER_URL: 'http://127.0.0.1:9999' };
   let clock = 100000;
-  const owner = createOwner({ dataDir: dir, env, frontSecret: 'synthetic-token', now: () => clock, features: () => 'rust-embedding-background-v1 rust-index-outbox-v2' });
+  const owner = createOwner({ dataDir: dir, env, frontSecret: 'synthetic-token', now: () => clock, features: () => 'rust-embedding-background-v1 rust-index-outbox-v3' });
   return { dir, env, owner, now: () => clock, advance: ms => { clock += ms; } };
 }
 test('compiled owner refuses missing start, secret or capability', () => {
   assert.throws(() => createOwner({ env: {}, features: () => '' }));
   assert.throws(() => createOwner({ env: { NOEVIA_START_ID: 'a' }, frontSecret: 'b', features: () => 'old' }));
   // #1916: the secret is gone from the environment by the time index.cjs builds the owner; only the captured one counts.
-  assert.throws(() => createOwner({ env: { NOEVIA_START_ID: 'a', NOEVIA_PROJECT_STORE_TOKEN: 'b' }, features: () => 'rust-embedding-background-v1 rust-index-outbox-v2' }));
-  assert.doesNotThrow(() => createOwner({ env: { NOEVIA_START_ID: 'a' }, frontSecret: 'b', features: () => 'rust-embedding-background-v1 rust-index-outbox-v2' }));
+  assert.throws(() => createOwner({ env: { NOEVIA_START_ID: 'a', NOEVIA_PROJECT_STORE_TOKEN: 'b' }, features: () => 'rust-embedding-background-v1 rust-index-outbox-v3' }));
+  assert.doesNotThrow(() => createOwner({ env: { NOEVIA_START_ID: 'a' }, frontSecret: 'b', features: () => 'rust-embedding-background-v1 rust-index-outbox-v3' }));
 });
 test('paired boot never registers Node timers; shutdown cannot activate fallback', async t => {
   const { owner, env } = fixture(t);
@@ -112,7 +112,7 @@ test('unconfirmed native embedding ownership cannot publish healthy retrieval', 
 
 test('no-loader host still requires a native migration owner and sends start-bound kicks', t => {
   const f = fixture(t), env = { ...f.env }; delete env.MODEL_LOADER_URL;
-  const owner = createOwner({ env, frontSecret: 'synthetic-token', dataDir: f.dir, now: f.now, features: () => 'rust-embedding-background-v1 rust-index-outbox-v2' });
+  const owner = createOwner({ env, frontSecret: 'synthetic-token', dataDir: f.dir, now: f.now, features: () => 'rust-embedding-background-v1 rust-index-outbox-v3' });
   const config = createEmbeddingConfig({ env: { EMBEDDING_NEXT_MODEL: 'next' }, log() {} });
   const migration = createEmbeddingMigration({ config, nativeOwner: owner, rag: { listIndexes: () => [] } });
   assert.equal(owner.healthy(), false, 'absence of loader is not proof of a migration owner');
@@ -202,8 +202,8 @@ for (const scenario of ['damaged config', 'unknown profile', 'long pass']) {
 test('native source notifications schedule the Node media owner without a second drainer', async () => {
   const { Readable } = require('node:stream');
   const calls = [], replies = [];
-  const owner = createOwner({ env: { NOEVIA_START_ID: 'synthetic-start' }, frontSecret: 'synthetic-token', features: () => 'rust-embedding-background-v1 rust-index-outbox-v2', sourceChanged: (u,p) => calls.push([u,p]) });
-  const body = { start: 'synthetic-start', user: '11111111-1111-4111-8111-111111111111', project: 'synthetic-project' };
+  const owner = createOwner({ env: { NOEVIA_START_ID: 'synthetic-start' }, frontSecret: 'synthetic-token', features: () => 'rust-embedding-background-v1 rust-index-outbox-v3', sourceMember: () => true, sourceChanged: (u,p) => calls.push([u,p]) });
+  const body = { start: 'synthetic-start', user: '11111111-1111-4111-8111-111111111111', project: 'synthetic-project', file: 'source.md' };
   const req = (value, headers = { 'x-noevia-store-token': 'synthetic-token' }) => Object.assign(Readable.from([JSON.stringify(value)]), { method: 'POST', url: '/internal/embedding-worker-owner/source-changed', headers, socket: { remoteAddress: '127.0.0.1' } });
   const json = (_,status,value) => replies.push({status,value});
   await owner.handleSourceChanged(req(body), {}, json);
@@ -221,4 +221,18 @@ test('Node skill oracle excludes a tracked source after its front matter is remo
   const {inspect} = require('./instruction-skills.cjs');
   assert.equal(inspect(file, {}), null);
   assert.ok(inspect(file, {instructionSkills:{'source.md':{enabled:false}}}));
+});
+
+test('consumer membership guard refreshes the tenant workspace and fails closed', () => {
+  const {createSourceMembershipGuard}=require('./rust-embedding-background.cjs');
+  let active=true, revoked=false, lookups=0;
+  let saved=[{id:'p',files:[{name:'source.md'}]}];
+  const workspace={projects:[],assertActive(){if(revoked)throw Error('inactive');},projectsFile:{refresh(items){items.splice(0,items.length,...saved);}}};
+  const guard=createSourceMembershipGuard({userExists:u=>active && u==='tenant',workspaceFor:u=>{assert.equal(u,'tenant');lookups++;return workspace;}});
+  assert.equal(guard('tenant','p','source.md'),true);
+  saved=[{id:'p',files:[]}];assert.equal(guard('tenant','p','source.md'),false);
+  saved=[];assert.equal(guard('tenant','p','source.md'),false);
+  saved=[{id:'p',files:[{name:'source.md'}]}];revoked=true;assert.equal(guard('tenant','p','source.md'),false);
+  revoked=false;active=false;const before=lookups;assert.equal(guard('tenant','p','source.md'),false);assert.equal(lookups,before);
+  active=true;assert.equal(guard('other','p','source.md'),false);
 });
