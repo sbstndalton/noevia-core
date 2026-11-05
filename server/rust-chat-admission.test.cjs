@@ -134,16 +134,22 @@ test('one gate count per call: a live gate lease covers one call of its route, t
   assert.equal(routes.covers(req(engine), 'chat'), false, 'a model lease is not a gate lease');
   assert.equal(routes.covers(req(chat), ''), false, 'no route, no cover');
   const first = req(chat);
-  assert.equal(routes.covers(first, 'chat'), true);
+  const settleChat = routes.covers(first, 'chat');
+  assert.equal(typeof settleChat, 'function', "covered: the call's settle()");
   assert.deepEqual(first.headers, { cookie: 'c' });
   assert.equal(routes.covers(req(chat), 'chat'), false, 'single use');
-  assert.equal(routes.covers(req(diary), 'diary'), true);
+  const settleDiary = routes.covers(req(diary), 'diary');
+  assert.equal(typeof settleDiary, 'function');
   assert.equal(routes.covers({ headers: {} }, 'chat'), false);
   assert.equal(routes.covers({ headers: { [front.LEASE_HEADER]: ['x'] } }, 'chat'), false);
   assert.equal(routes.covers(null, 'chat'), false);
-  // The covered call holds no count of its own: the leases are the counts, and deleting them gives them back.
+  // The covered call holds no count of its own: the leases are the counts. Deleting them gives them back, a covered
+  // one only once its call has settled (exclusion-settle rule).
   assert.equal(gate.active(), 3);
   for (const id of [chat, diary, engine]) await ask(base, null, { path: `${PREFIX}/${id}`, method: 'DELETE' });
+  assert.equal(gate.active(), 2, 'the covered calls still run');
+  settleChat();
+  settleDiary();
   assert.equal(gate.active(), 0);
   const ended = req(chat);
   assert.equal(routes.covers(ended, 'chat'), false, 'an ended lease covers nothing');

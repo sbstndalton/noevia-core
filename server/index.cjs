@@ -1567,7 +1567,8 @@ async function handleRequest(req,res) {
   if(leave){res.once('finish',leave);res.once('close',leave);}
   // #1881: while a chat or Diary turn runs, the long-document backfill makes no embed request (rag.cjs foreground).
   if(inference){const fg=rag.foreground();res.once('finish',fg);res.once('close',fg);}
-  try {return await handleRequestInner(req,res);}finally{if(leave && (res.writableEnded||res.destroyed))leave();}
+  // Exclusion-settle rule: the front's lease gives its count back only after the covered call has settled.
+  try {return await handleRequestInner(req,res);}finally{if(leave && (res.writableEnded||res.destroyed))leave();if(typeof frontAdmitted==='function')frontAdmitted();}
 }
 
 // #2191 round 2: the catalogue is on disk as soon as this module is loaded (the front's project create
