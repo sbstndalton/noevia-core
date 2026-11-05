@@ -126,6 +126,7 @@ async function run(scenario, fake) {
     mcpOAuth: {
       connected: () => true,
       async session(userId, serverId, rejected) {
+        if (!userId) return null; // rust-mcp-credentials.cjs: no account, no sign-in
         brokerLog.push(['session', userId, serverId, rejected]);
         const next = oauthQueue.length > 1 ? oauthQueue.shift() : oauthQueue[0];
         if (next && next.transient) throw transient();
@@ -137,6 +138,7 @@ async function run(scenario, fake) {
     mcpKeys: {
       hasKey: () => true,
       async headers(userId, serverId) {
+        if (!userId) return null; // rust-mcp-credentials.cjs: no account, no key
         brokerLog.push(['key', userId, serverId]);
         const next = keysQueue.length > 1 ? keysQueue.shift() : keysQueue[0];
         if (next === 'transient') throw transient();
@@ -271,7 +273,7 @@ const SCENARIOS = [
   { id: 'result-long-prose-is-cut', servers: [srv('s', 'none')], steps: [step(call('t1'), text('p '.repeat(6000)))] },
   { id: 'result-uniform-records-are-tabulated', servers: [srv('s', 'none')], steps: [step(call('t1'), text(records(400)))] },
   { id: 'result-nested-json-is-compacted', servers: [srv('s', 'none')], steps: [step(call('t1'), text(nested))] },
-  { id: 'result-multibyte-text-measured-in-utf16', servers: [srv('s', 'none')], steps: [step(call('t1'), text('é😀'.repeat(4500)))] },
+  { id: 'result-multibyte-text-measured-in-utf16', servers: [srv('s', 'none')], steps: [step(call('t1'), text('😀'.repeat(6000)))] },
   // ── arguments
   { id: 'arguments-null-become-an-empty-object', servers: [srv('s', 'none')], steps: [step(call('t1', { args: null }), OK), step(call('t1', { args: undefined }), OK)] },
   { id: 'arguments-pass-through-unchanged', servers: [srv('s', 'none')], steps: [step(call('t1', { args: { n: 1.5, s: 'é', nested: { a: [1, null, 'x'] }, big: 12345678901234567890 } }), OK)] },
