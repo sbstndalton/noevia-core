@@ -30,9 +30,9 @@ const cases = [
   { name: 'legacy-external-edit', text: 'external edit', state: { job: { id: 'old', model: 'synthetic', status: 'running', originalText: before, lastRevision: revision(after) } } },
 ];
 test('recorded recovery behavior of the original actor with fake files and engine', async () => {
-  const filename = path.join(__dirname, 'llamacpp-full-autotune.cjs');
+  const filename = path.join(__dirname, '../llamacpp-full-autotune.cjs');
   const mod = new Module(filename, module);
-  mod.filename = filename; mod.paths = Module._nodeModulePaths(__dirname);
+  mod.filename = filename; mod.paths = Module._nodeModulePaths(path.dirname(filename));
   mod._compile(execFileSync('git', ['show', SOURCE + ':server/llamacpp-full-autotune.cjs'], { encoding: 'utf8' }), filename);
   const evidence = process.env.K5_EVIDENCE;
   assert.ok(evidence, 'K5_EVIDENCE must name the private evidence folder');
@@ -62,7 +62,7 @@ test('recorded recovery behavior of the original actor with fake files and engin
       records.push({ input: JSON.parse(JSON.stringify(input)), expected: { state: JSON.parse(fs.readFileSync(file)), text, effects } });
     } finally { fs.rmSync(dir, { recursive: true, force: true }); }
   }
-  const target = path.join(__dirname, 'fixtures/autotune-recovery-node.json');
+  const target = path.join(__dirname, 'autotune-recovery-node.json');
   if (process.env.K5_RECORD === '1') fs.writeFileSync(target, JSON.stringify({ source: SOURCE, now: 123456, records }, null, 2) + '\n');
   else assert.deepEqual(records, JSON.parse(fs.readFileSync(target)).records);
 });
