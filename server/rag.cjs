@@ -116,18 +116,22 @@ let rerank = null; // { decisions, pool, keep, deadlineMs }
 // #1665: the environment the reranker is configured from. The deployment's by default; index.cjs points it at
 // rerank-settings.cjs (the admin's saved switch over the deployment's) and calls reloadRerank() after a change.
 let rerankEnv = () => process.env;
+let rerankConfiguration = null;
 function configureRerank(envFn) {
   rerankEnv = typeof envFn === 'function' ? envFn : () => process.env;
+  rerankConfiguration = null;
   if (!require('./rerank-settings.cjs').current()?.run) initRerank();
 }
-function reloadRerank() { if (require('./rerank-settings.cjs').current()?.run) { rerank=null; return; } initRerank(); }
+function reloadRerank() { rerankConfiguration = null; if (require('./rerank-settings.cjs').current()?.run) { rerank=null; return; } initRerank(); }
 function initRerank() {
   // #697: never on the shared inference engine unless the operator allows it (rerank-target.cjs).
   let env;
   env = rerankEnv();
+  const configuration = crypto.createHash('sha256').update(JSON.stringify([env, process.env.RAG_RERANK_POOL, process.env.RAG_RERANK_KEEP, process.env.RAG_RERANK_DEADLINE_MS])).digest('hex');
+  if (configuration === rerankConfiguration) return;
   const target = require('./rerank-target.cjs').rerankTarget(env);
   if (target.reason) console.warn('[rag] rerank off:', target.reason);
-  if (!target.enabled) { rerank = null; return; }
+  if (!target.enabled) { rerank = null; rerankConfiguration = configuration; return; }
   const baseUrl = target.baseUrl;
   const { createDecisions } = require('./decision/index.cjs');
   const backend = rerankBackend(baseUrl, target.backend, target.model, Object.prototype.hasOwnProperty.call(env, 'RERANK_API_KEY') ? env.RERANK_API_KEY || null : process.env.RERANK_API_KEY || null);
@@ -137,6 +141,7 @@ function initRerank() {
     log: (e) => { if (e.failed || e.fellBack) console.warn('[rag] rerank', JSON.stringify(e)); },
   });
   rerank = { backend: target.backend, decisions, pool: clampInt(process.env.RAG_RERANK_POOL, 12, TOP_K, RERANK_POOL_MAX), keep: clampInt(process.env.RAG_RERANK_KEEP, 6, 1, RERANK_POOL_MAX), deadlineMs: clampInt(process.env.RAG_RERANK_DEADLINE_MS, 3000, 100, 30000) };
+  rerankConfiguration = configuration;
 }
 function clampInt(v, dflt, lo, hi) { const n = parseInt(v, 10); return Number.isFinite(n) ? Math.min(hi, Math.max(lo, n)) : dflt; }
 

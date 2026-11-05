@@ -25,9 +25,10 @@ function createClient({ env = process.env, fetchImpl = globalThis.fetch, onChang
       const value = await require('./http.cjs').readCappedJson(response, 8 * 1024 * 1024);
       if (!value || !value.env || typeof value.env !== 'object' || Array.isArray(value.env)
         || Object.values(value.env).some(v => typeof v !== 'string') || !value.view
+        || typeof value.revision !== 'string' || !/^[a-f0-9]{32}:\d+$/.test(value.revision)
         || typeof value.view.enabled !== 'boolean' || !Array.isArray(value.view.options)) throw unavailable();
       const next = require('node:crypto').createHash('sha256')
-        .update(JSON.stringify([value.env, value.view.choice, value.view.source])).digest('hex');
+        .update(JSON.stringify([value.revision, value.env, value.view.choice, value.view.source])).digest('hex');
       if (next !== fingerprint) { onChange(); fingerprint = next; }
       return value;
     } catch { throw unavailable(); }

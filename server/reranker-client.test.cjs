@@ -2,7 +2,7 @@
 const test=require('node:test');const assert=require('node:assert/strict');
 const {createClient,install,current,withSettings}=require('./rerank-settings.cjs');
 const env={NOEVIA_PROJECT_STORE_PORT:'19091',NOEVIA_PROJECT_STORE_TOKEN:'x'.repeat(32)};
-const snapshot=(model)=>({env:{RERANK_MODEL:model,NOEVIA_FEATURE_RAG_RERANK:'true'},view:{enabled:true,choice:'tei',source:'admin',options:[]}});
+const snapshot=(model)=>({revision:'0'.repeat(32)+':0',env:{RERANK_MODEL:model,NOEVIA_FEATURE_RAG_RERANK:'true'},view:{enabled:true,choice:'tei',source:'admin',options:[]}});
 test('native owner unavailable never falls back to deployment',async()=>{
  const client=createClient({env,fetchImpl:async()=>{throw Error('synthetic outage');}});
  await assert.rejects(client.run(()=>assert.fail('must not execute')),e=>e.status===503);
@@ -48,4 +48,10 @@ test('a changed native selection invalidates existing model reads before work st
  await client.run(()=>assert.equal(changes,1));
  await client.run(()=>assert.equal(changes,1));
  model='synthetic-b';await client.run(()=>assert.equal(changes,2));
+});
+
+test('an identical native save still invalidates consumers through its mutation sequence',async()=>{
+ let revision=0,changes=0;
+ const client=createClient({env,fetchImpl:async()=>new Response(JSON.stringify({...snapshot('synthetic'),revision:'0'.repeat(32)+':'+revision})),onChange:()=>changes++});
+ await client.run(()=>{});revision++;await client.run(()=>{});assert.equal(changes,2);
 });
