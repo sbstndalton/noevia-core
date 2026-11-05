@@ -1378,6 +1378,8 @@ async function handleRequestInner(req, res) {
   if (require('./rust-admin-users.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   // And the two read-only sizing reads (#2189): GET /api/models/estimate and /api/models/preset/suggest.
   if (require('./rust-model-sizing.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
+  // And the MTP/NextN artifact check of a download choice: GET /api/models/mtp-artifact.
+  if (require('./rust-mtp-artifact.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   // And the model maintenance authorities (#2210): POST /api/models/presets/reload.
   if (require('./rust-model-maintenance.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   if (require('./rust-model-evidence-recheck.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;

@@ -34,12 +34,6 @@ test('native cache downloads and deletes use router identities',async()=>{
  const count=calls.length;assert.equal((await manager.pull({checkpoint:'https://untrusted.invalid/file'})).status,400);assert.equal(calls.length,count);
 });
 
-test('public variant discovery excludes projectors, ambiguous quants and incomplete splits',async()=>{
- const {variants}=require('./llamacpp-variants.cjs');let options;
- const files=[['model-Q8_0.gguf',100],['mmproj-F16.gguf',20],['a-Q4_K_M.gguf',30],['b-Q4_K_M.gguf',40],['model-Q5_K_M-00001-of-00002.gguf',50],['model-IQ4_XS-00001-of-00002.gguf',70],['model-IQ4_XS-00002-of-00002.gguf',80]];
- const r=await variants('synthetic/model',async(url,opts)=>{options=opts;assert.ok(url.startsWith('https://huggingface.co/api/models/'));return {ok:true,body:{siblings:files.map(([rfilename,size])=>({rfilename,lfs:{size}}))}};});
- assert.deepEqual(r.body.variants.map(v=>v.name),['IQ4_XS','Q8_0']);assert.equal(r.body.variants[0].size_bytes,150);assert.deepEqual(options,{});
-});
 test('native metrics preserve unknown values and use actual speculative counters',()=>{
  const {parseMetrics,summarize}=require('./llamacpp-metrics.cjs');
  const values=parseMetrics('llamacpp:tokens_predicted_total 20\nllamacpp:spec_decode_num_draft_tokens_total 10\nllamacpp:spec_decode_num_accepted_tokens_total 6\nllamacpp:predicted_tokens_seconds NaN');

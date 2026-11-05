@@ -608,15 +608,8 @@ function createModelRoutes({ servedEmbeddingModels = (target) => require('../rag
     // The GET is the Rust front's (#2262). Another method used to get the list too; it is refused like any other unknown method.
     if (p === '/api/models/installed') return json(res, 405, { error: 'Method not allowed' });
 
-    if (p === '/api/models/mtp-artifact' && req.method === 'GET') {
-      const repo = url.searchParams.get('repo') || '';
-      if (!/^[\w.-]+\/[\w.-]+$/.test(repo)) return json(res,400,{error:'Invalid repository'});
-      const result = await modelManager.variants(repo);
-      if (!result.ok) return json(res,502,{error:'Could not resolve selected files'});
-      const variant = (result.body?.variants || []).find(v=>v.name === url.searchParams.get('variant'));
-      if (!variant) return json(res,404,{error:'Variant no longer available'});
-      return json(res,200,await require('../mtp-artifact.cjs').check(repo,variant.files || [variant.primary_file]));
-    }
+    // GET /api/models/mtp-artifact is the Rust front's (noevia-rs model_maint/mtp_artifact.rs);
+    // rust-mtp-artifact.cjs refuses it before authentication. Other methods fall through as before.
 
     if (p === '/api/models/pull' && req.method === 'POST') {
       const raw = await readBody(req);

@@ -343,8 +343,11 @@ test('engine-specific routes say what is unavailable and guard the method', asyn
   assert.deepEqual(f.sent.pop(), { status: 404, body: { error: 'Auto-tune is unavailable' } });
   await f.call('GET', '/api/models/preset', undefined, 'member');
   assert.deepEqual(f.sent.pop(), { status: 403, body: { error: 'Administrator required for shared model profiles' } });
+  // GET /api/models/mtp-artifact is the Rust front's (rust-mtp-artifact.cjs refuses it before authentication);
+  // a GET that reaches this route anyway is not answered by an artifact check here.
+  const before = f.sent.length;
   await f.call('GET', '/api/models/mtp-artifact', undefined, 'member', '?repo=bad');
-  assert.deepEqual(f.sent.pop(), { status: 400, body: { error: 'Invalid repository' } });
+  assert.ok(f.sent.length === before || f.sent.pop().body?.error !== 'Invalid repository');
   await f.call('POST', '/api/models/installed', undefined, 'admin');
   assert.equal(f.sent.pop().status, 405, 'only the front lists, and it lists on GET');
   const native = fixture({ manager: { autotune: { statusFacts: () => assert.fail('Node must not compose public GET status') } } });

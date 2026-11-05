@@ -808,7 +808,6 @@ function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloa
     metrics: model => model ? request('/metrics' + modelQuery(model), {}, 6000) : unsupported('Aggregate metrics'),
     stats,
     systemStats: () => unsupported('Host telemetry'),
-    variants: repo => require('./llamacpp-variants.cjs').variants(repo, fetchJson),
   };
 }
 module.exports = { createLlamaCppManager, keepAlongside };
