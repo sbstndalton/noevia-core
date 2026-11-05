@@ -943,12 +943,15 @@ const framingReasoner = require('./framing-reasoner.cjs').createFramingReasoner(
 });
 const reasoningTraces = { enabled: (dir) => require('./chat-framing.cjs').readPreferences(dir).keepReasoningTraces === true,
   append: (dir, entry) => require('./framing-reasoner.cjs').appendTrace(dir, entry) };
-// #760: about ten suggests a minute per user (one embed + three decisions each), on the LLM limiter.
-const FRAMING_RATE_LIMIT = 10;
-const chatFramingRoutes = require('./routes/chat-framing.cjs').createChatFramingRoutes({ json, readJson, framing: chatFraming, settings: framingSettings,
-  rateLimited: (userId) => llmRateLimiter.rateLimited(`chat-frame:${userId}`, FRAMING_RATE_LIMIT, LLM_RATE_WINDOW_MS),
+const chatFramingRoutes = require('./routes/chat-framing.cjs').createChatFramingRoutes({ json, readJson, settings: framingSettings });
+// Chat port S4: POST /api/chat-framing/suggest is the Rust front's (its 10-a-minute budget too); this is
+// the front's loopback call for what only this process has: the user's lists and the decision service.
+const chatFramingSuggestBridge = require('./rust-chat-framing-suggest.cjs').createSuggestBridge({
+  secret: FRONT_SECRET, json, readJson, framing: chatFraming,
+  asUser: (userId, fn) => diaryAsUser(userId, fn),
   // #810: only Chat-mode, unarchived projects are offered as a destination; every own chat still counts for links and tags.
-  workspace: () => { const projects = PROJECTS.filter((proj) => !diaryExtras.internalProject(proj)); return { projects: projects.filter(require('./project-modes.cjs').chatDestination).map((proj) => ({ id: proj.id, name: proj.name })), chats: [...Array.from(FREE_CHATS), ...projects.flatMap((proj) => proj.chats || [])] }; } });
+  workspace: () => { const projects = PROJECTS.filter((proj) => !diaryExtras.internalProject(proj)); return { projects: projects.filter(require('./project-modes.cjs').chatDestination).map((proj) => ({ id: proj.id, name: proj.name })), chats: [...Array.from(FREE_CHATS), ...projects.flatMap((proj) => proj.chats || [])] }; },
+});
 // #741: "Mirror chats to Diary", per user and off by default. One-way, debounced, through the Diary
 // files client above, as the chat's own user. Runs only with chatFraming on and the Diary add-on on.
 const vaultMirrorLib = require('./chat-vault-mirror.cjs');
@@ -996,6 +999,8 @@ const changeJournal = require('./chat-change-journal.cjs').createChangeJournalRe
   onChange: require('./chat-change-journal.cjs').scheduleMirrorAndBrain({ chatVaultMirror, chatBrains }),
   onRescan: (userId) => chatVaultMirror.schedule(userId),
   stamp: (userId) => require('./chat-change-journal.cjs').fileStamp(DATA_DIR, userId),
+  // Chat port S3: the users the Rust front saw, so one who only uses its routes is still read.
+  activity: require('./chat-activity.cjs').createActivitySource({ dataDir: DATA_DIR }),
 });
 afterNativeReady(() => changeJournal.start());
 // #2190: the Rust front owns the mirror preferences; a save that turns the mirror on nudges it here.
@@ -1332,6 +1337,9 @@ async function handleRequestInner(req, res) {
   // GET /api/integrations/storage is the Rust front's (#1071): refused before authentication.
   if (require('./features.cjs').refuseRustStorageRead(req, res, { parseRequestUrl, badRequestUrl, json })) return;
   if (require('./routes/chat-framing.cjs').refuseOwnedPreferences(req, res, { parseRequestUrl, json })) return;
+  // And the framing suggestion's POST (chat port S4), with the front's loopback call for the lists and the decision.
+  if (require('./rust-chat-framing-suggest.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
+  if (await chatFramingSuggestBridge(req, res)) return;
   if (require('./routes/features.cjs').refuseOwnedFeatures(req, res, { parseRequestUrl, json })) return;
   // The Diary routes that are only a proxy and a policy are the Rust front's (#2185).
   if (require('./rust-diary.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
