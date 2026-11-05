@@ -157,6 +157,31 @@ test('worst-case escaped files at the 1 MiB boundary read as the old Node parser
   assert.ok(JSON.stringify('\u0000'.repeat(MIB)).length > 6 * MIB, 'the case really is the worst case on the wire');
 });
 
+// A read's model or section name is bounded by nothing but the file: the old parser answers a name of
+// any length, so the transport must carry the widest file AND the widest name at once.
+test('a long section name read by that name agrees with the old Node parser', (t) => {
+  const MIB = 1024 * 1024;
+  const { file } = fixture(t, '');
+  const ours = runtime.createPresetStore(file, { cacheRam: LIMITS }), theirs = reference.createPresetStore(file, { cacheRam: LIMITS });
+  const outcome = (fn) => { try { return { value: JSON.stringify(fn()) }; } catch (e) { return { status: e.status, message: e.message }; } };
+  const cases = {
+    'the review case: a 650,000-NUL section name (a 7.8 MB request)': (() => { const name = '\u0000'.repeat(650000); return ['[' + name + ']\nc=4096\n', name]; })(),
+    'the worst case: a 1 MiB file and a near-1 MiB name (about 12 MiB on the wire)': (() => { const name = '\u0000'.repeat(MIB - 16); return ['[' + name + ']\nc=4096\n', name]; })(),
+    'a long name that is not in a file at the limit': ['[m]\nc=1\n', '\u0000'.repeat(MIB)],
+  };
+  for (const [name, [text, model]] of Object.entries(cases)) {
+    fs.writeFileSync(file, text);
+    assert.ok(Buffer.byteLength(text) <= MIB, name);
+    const want = outcome(() => theirs.get(model));
+    assert.deepEqual(outcome(() => ours.get(model)), want, name);
+    assert.equal(want.status, undefined, name);
+  }
+  fs.writeFileSync(file, cases['the review case: a 650,000-NUL section name (a 7.8 MB request)'][0]);
+  const facts = ours.get(cases['the review case: a 650,000-NUL section name (a 7.8 MB request)'][1]);
+  assert.deepEqual([facts.exists, facts.options], [true, { 'ctx-size': '4096' }]);
+  assert.ok(JSON.stringify(['\u0000'.repeat(MIB - 16), '\u0000'.repeat(MIB - 16)]).length > 12 * MIB - 1024, 'the case really is the worst case on the wire');
+});
+
 test('a native fault is an unavailable parser, never a silent JS parse', (t) => {
   const { store } = fixture(t, TEXT);
   const warn = console.warn, seen = [];

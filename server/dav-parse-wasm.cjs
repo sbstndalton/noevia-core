@@ -2339,9 +2339,10 @@ function toolboxesPermitted(input) {
 // already String()-ed where the JS would), the cache-ram hard maximum (a number or null) and the
 // effective micro-batch and batch values (a string or null each). Every reply is checked for shape;
 // a refusal or bad reply throws a DavParseError, which llamacpp-presets.cjs answers by refusing.
-// Sized for the worst case of models.ini (#2387): a file inside the 1 MiB editor limit is up to 6 MiB as
-// JSON (a NUL is \u0000), plus a model name and the envelope. The limit itself is the parser's alone.
-const MAX_LLAMACPP_PRESETS_BYTES = 7 * 1024 * 1024 + 1;
+// Sized for the worst case of a read (#2387): a models.ini inside the 1 MiB editor limit is up to 6 MiB as
+// JSON (a NUL is \u0000), and the model or section name read from it, bounded by nothing but the file,
+// is up to 6 MiB more, plus the envelope. The limit itself is the parser's alone.
+const MAX_LLAMACPP_PRESETS_BYTES = 12 * 1024 * 1024 + 64 * 1024 + 1;
 const presetsCall = (op, args) => jsonOpCall(op, args, MAX_LLAMACPP_PRESETS_BYTES, (e) => e.llamacpp_presets(), 'llamacpp presets').reply;
 const stringPairs = (pairs, nullable) => Array.isArray(pairs) && pairs.every((p) => Array.isArray(p) && p.length === 2 && typeof p[0] === 'string'
   && (typeof p[1] === 'string' || (nullable && p[1] === null)));
