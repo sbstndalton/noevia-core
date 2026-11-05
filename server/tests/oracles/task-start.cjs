@@ -38,6 +38,7 @@ async function fixture() {
     { repository: 'repo', prompt: 'task', capabilities: ['network', 'install_dependency', 'edit_file', 'edit_file', 'other'], domains: [' Example.COM ', 'bad', '.com', 'a..com', 'a.x', 'a.co', 42, null] },
     { repository: 'repo', prompt: ['task', 'data'], capabilities: [], model: 42 },
     { repository: 'repo', prompt: { toString: 42 } },
+    null, false, 42, 'task', [],
   ];
   for (const network of ['unconfigured', 'ready']) for (const pipeline of [false, true]) for (const body of bodies) {
     const input = { network, pipeline, body }; cases.push({ input, expected: await capture(input) });
