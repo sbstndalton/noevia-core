@@ -162,66 +162,36 @@ async function boot(t, mode) {
     const res = await request(base, 'POST', path, { ...options, body: JSON.stringify(body) });
     return { status: res.status, json: JSON.parse(res.text), text: res.text };
   };
-  const facts = async (op, body) => {
-    const reply = await calibrationCall('/internal/calibration-routes/' + op, body);
-    assert.equal(reply.status, 200, reply.text);
-    assert.equal(reply.json.available, true);
-    return reply.json;
-  };
-  const startCalibration = async () => {
-    const { token } = await facts('facts');
-    const ask = { model: 'small', token };
-    const listing = await facts('listing', ask);
-    assert.equal(listing.backend, true);
-    assert.equal(listing.row?.id, 'small');
-    assert.equal(listing.system, false);
-    const request = { ...ask, rowToken: listing.rowToken };
-    const prepared = await facts('prepare', request);
-    assert.equal(prepared.identityReady, true);
-    const result = await facts('launch', {
-      ...request,
-      preparedToken: prepared.preparedToken,
-      // Same known-valid configured model and budget used by this fixture before the port.
-      plan: { native: 8192, base: {}, promptBudgetSeconds: 30 },
-    });
-    return { prepared, result };
-  };
-  const cancelCalibration = async jobId => {
-    let generation;
-    for (let attempt = 0; attempt < 10; attempt++) {
-      const facts = await calibrationCall('/internal/calibration-cancel/facts');
-      assert.equal(facts.status, 200, facts.text);
-      const state = facts.json;
-      assert.equal(state.job?.id, jobId, 'the same synthetic job must be cancelled');
-      if (state.job.status !== 'running') return;
-      if (generation && state.generation !== generation) throw Error('synthetic calibration was replaced');
-      generation = state.generation;
-      const aborted = await calibrationCall('/internal/calibration-cancel/abort', { token: state.token });
-      if (aborted.status === 200) return;
-      assert.equal(aborted.status, 409, aborted.text);
+  // #2303: the calibration job is the Rust front's (bins/noevia-server calibration_worker.rs, its readiness and
+  // fault handling tested there). Node keeps no calibrator: every raw-facts and cancellation step a front can ask
+  // answers exactly { available: false } (an older front then reports calibration unavailable), nothing else leaks,
+  // and no step reaches the router.
+  const calibrationClosed = async () => {
+    const hex = (c) => c.repeat(64);
+    const ask = { model: 'small', token: hex('a') }, row = { ...ask, rowToken: hex('b') };
+    const steps = [
+      ['/internal/calibration-routes/facts', {}],
+      ['/internal/calibration-routes/listing', ask],
+      ['/internal/calibration-routes/prepare', row],
+      ['/internal/calibration-routes/launch', { ...row, preparedToken: hex('c'), plan: { native: 8192, base: {}, promptBudgetSeconds: 30 } }],
+      ['/internal/calibration-cancel/facts', {}],
+      ['/internal/calibration-cancel/abort', { token: hex('d') }],
+    ];
+    for (const [p, body] of steps) {
+      const reply = await calibrationCall(p, body);
+      assert.equal(reply.status, 200, `${p}: ${reply.text}`);
+      assert.deepEqual(reply.json, { available: false }, p);
     }
-    assert.fail('synthetic calibration changed too often to cancel');
   };
-  return { call, startCalibration, cancelCalibration, calibrationFacts: () => facts('facts'), router, log: () => log.join(''), bootFaults: () => log.join('').split('\n').filter((l) => BOOT_FAULT.test(l)).length, running: () => child.exitCode === null };
-}
-
-async function stopCalibration(s, jobId) {
-  await s.cancelCalibration(jobId);
-  for (let i = 0; i < 200; i++) {
-    const { job } = await s.calibrationFacts();
-    assert.equal(job?.id, jobId);
-    if (job.status !== 'running') return;
-    await new Promise((resolve) => setTimeout(resolve, 50));
-  }
-  assert.fail('the cancelled calibration did not stop');
+  return { call, calibrationClosed, router, log: () => log.join(''), bootFaults: () => log.join('').split('\n').filter((l) => BOOT_FAULT.test(l)).length, running: () => child.exitCode === null };
 }
 
 // What each fault path must do to each request. `refused` means the evaluator-backed answer is withheld.
 const EXPECT = {
-  none: { bootFaults: 0, calibrationReady: true, load: 200 },
-  'memory-limit': { bootFaults: 1, calibrationReady: true, load: 200 },
-  'ctx-candidates': { bootFaults: 0, calibrationReady: false, load: 200 },
-  evaluator: { bootFaults: 1, calibrationReady: false, load: 502 },
+  none: { bootFaults: 0, load: 200 },
+  'memory-limit': { bootFaults: 1, load: 200 },
+  'ctx-candidates': { bootFaults: 0, load: 200 },
+  evaluator: { bootFaults: 1, load: 502 },
 };
 
 for (const mode of Object.keys(EXPECT)) {
@@ -259,26 +229,15 @@ for (const mode of Object.keys(EXPECT)) {
       assert.equal(owned.json.code, 'RUST_MODEL_SIZING_OWNED');
     }
 
-    // Node refuses the public path. Exercise the real worker through its authenticated bridge.
+    // Node refuses the public path, and the facts bridge fails closed under every fault: the job is native.
     s.router.calls.length = 0;
     const refusal = await s.call('POST', '/api/models/calibration', { model: 'small', confirmPause: true, promptBudgetSeconds: 30 });
     ran++;
     assert.equal(refusal.status, 503, refusal.text);
     assert.equal(refusal.json.code, 'RUST_CALIBRATION_OWNED');
-    assert.ok(!s.router.calls.some((c) => c === 'POST /models/load'));
-
-    const { prepared, result } = await s.startCalibration();
+    await s.calibrationClosed();
     ran++;
-    assert.equal(prepared.ladderReady, want.calibrationReady);
-    assert.equal(result.applied, want.calibrationReady);
-    if (want.calibrationReady) {
-      assert.equal(result.job?.status, 'running');
-      assert.equal(typeof result.job?.id, 'string');
-      await stopCalibration(s, result.job.id);
-    } else {
-      assert.equal(result.reason, 'unavailable');
-      assert.ok(!s.router.calls.some((c) => c === 'POST /models/load'), 'a refused calibration never asks the router to load');
-    }
+    assert.ok(!s.router.calls.some((c) => c === 'POST /models/load'), 'no calibration step asks the router to load');
 
     // A load: permitted by the normal evaluator, refused (and never sent to the router) when it faults.
     s.router.calls.length = 0;
