@@ -858,10 +858,15 @@ const { state: mcpState, oauthServerIds, accountReady, discoverMcpTools, execute
 // Port contract S9: the approval gate's state (pending write approvals, routing questions and chat-wide
 // grants) is the Rust front's approval registry (rust-approval-registry.cjs); the chat loop below asks
 // it through the private store. Node holds none of it.
-const { openApproval, openRouteChoice, chatWideApproved, redeemChatGrant, revokeChatGrant, awaitApproval, awaitRouteChoice } = require('./rust-approval-registry.cjs').createApprovalRegistry({
+const approvalRegistry = require('./rust-approval-registry.cjs').createApprovalRegistry({
   approvals: (op, payload, options) => PROJECT_STORE.approvals(op, payload, options),
   log: (message) => console.warn(message),
 });
+const { openApproval, openRouteChoice, chatWideApproved, redeemChatGrant, revokeChatGrant, awaitApproval, awaitRouteChoice } = approvalRegistry;
+const approvalRevocation = require('./approval-revocation.cjs').createRevocationRoute({
+  secret: FRONT_SECRET, registry: approvalRegistry, json, readJson,
+});
+
 // #917: which of the signed-in workspace's lists holds a chat id ('free', a project id, or null).
 // Outside an authenticated request it throws, which the chat gate treats as "no chat-wide grant".
 const chatListHolder = (chatId) => require('./chat-lists.cjs').listHolding(chatId, Array.from(FREE_CHATS), Array.from(PROJECTS));
@@ -1364,6 +1369,7 @@ async function handleRequestInner(req, res) {
   if (require('./rust-project-source-work.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   // And deep research, every method, and the front's loopback calls for its jobs (#2218).
   if (require('./rust-research.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
+  if (await approvalRevocation(req, res)) return;
   if (await inferenceAdmission.handle(req, res)) return;
   if (await researchBridge(req, res)) return;
   // And the Code and Browser task reads, and the front's loopback call for what only this process knows (#2257).

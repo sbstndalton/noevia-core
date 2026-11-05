@@ -2454,8 +2454,7 @@ function createChatHandler({
               }
             }
             let redeemUnavailable = false;
-            // Re-review 689d17a P1-1: the redeemed grant's dispatch fence, checked in the same
-            // synchronous step as the dispatch below.
+            // Redeemed grant fence: carried through every executor await to its outbound boundary.
             let dispatchFence = null;
             if (permission === 'ask') {
               try {
@@ -2464,8 +2463,8 @@ function createChatHandler({
                     approvalTarget() !== shownTarget || currentWorkspace().userId !== userId || currentWorkspace().revoked) throw grantContexts.invalid();
                 if (usedGrant && !askedPerCall) {
                   // Port contract S9 (re-reviews 1ed3a14, 689d17a): the chat-wide grant is redeemed at
-                  // the front, ordered there against every revocation; this is the LAST await before
-                  // dispatch, and its answer is a fence checked synchronously with the dispatch.
+                  // the front, ordered there against every revocation. The executor checks the fence
+                  // after its own awaits, immediately before the outbound write.
                   // (In-process gates without redeem check the grant again instead.)
                   if (redeemChatGrant) {
                     const redeemed = await redeemChatGrant(userId, grantChat, writeGrantScope, finalBinding, usedGrant);
@@ -2501,15 +2500,19 @@ function createChatHandler({
             }
             if (chatSignal.signal.aborted) { dispatchFence?.started(); return 'ERROR: exchange cancelled; tool was not run.'; }
             if (toolPolicy.mode(userId, tc.name, isWriteTool(tc.name)) === 'block' || (permission !== 'ask' && toolPolicy.mode(userId, tc.name, isWriteTool(tc.name)) === 'ask') || revokedSkills()) { dispatchFence?.started(); return 'ERROR: permission changed before dispatch; tool was not run.'; }
-            const options = { chatKey, exchangeKey, routes: toolRoutes, ...(editTarget !== null ? { editTarget: editTargets.targetDigest(editTarget, editAccount) } : {}) };
-            // From here to the dispatch is one synchronous step: no await between the fence and the call.
+            const options = { chatKey, exchangeKey, routes: toolRoutes, writeFence: dispatchFence, ...(editTarget !== null ? { editTarget: editTargets.targetDigest(editTarget, editAccount) } : {}) };
+            // Early refusal only. The executor rechecks at its actual outbound write after all awaits.
             if (dispatchFence && !dispatchFence.open()) return notChecked();
             markWriteAttempt();
             // Set before the call, so a write that throws still counts as a round that wrote (#1456).
             if (isWriteTool(tc.name)) roundWrote = true;
-            const running = executeToolCall(project, tc.name, tc.args, allowedToolNames, chatSignal.signal, outcome, options);
-            dispatchFence?.started();
-            result = await running;
+            try { result = await executeToolCall(project, tc.name, tc.args, allowedToolNames, chatSignal.signal, outcome, options); }
+            finally { dispatchFence?.started(); }
+            if (outcome.notRun) {
+              notRunResults.add(result);
+              authService.audit('tool.denied', userId, userId, { tool: tc.name, reason: 'unavailable' });
+              return result;
+            }
             ran = true;
             recordToolUse(chatWorkspace, tc.name);
             // Audit AFTER the fact and only for writes: "what did the model

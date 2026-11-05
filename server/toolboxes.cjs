@@ -427,7 +427,14 @@ function createToolboxes({
   async function executeToolCall(project, name, rawArgs, allowed, signal, outcome = {}, options = {}) {
     let flagged = false;
     const fail = (text) => { flagged = true; return text; };
-    const text = await runToolCall(project, name, rawArgs, allowed, signal, fail, options || {});
+    let text;
+    try {
+      text = await require('./tool-write-fence.cjs').run(options?.writeFence, () => runToolCall(project, name, rawArgs, allowed, signal, fail, options || {}));
+    } catch (e) {
+      if (e?.code !== require('./tool-write-fence.cjs').CODE) throw e;
+      outcome.notRun = true;
+      text = fail(`ERROR: ${e.message}`);
+    }
     outcome.failed = flagged || (typeof text === 'string' && DELEGATED_FAILURE.test(text));
     return text;
   }

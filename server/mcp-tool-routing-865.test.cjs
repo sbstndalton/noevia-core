@@ -36,7 +36,7 @@ function fakeMcp(catalogues) {
 
 const SELF_URL = 'http://127.0.0.1:9/mcp';
 
-async function setup({ withDirectory = true, withInternal = false } = {}) {
+async function setup({ withDirectory = true, withInternal = false, auth = 'nextcloud', mcpKeys = undefined } = {}) {
   const catalogues = {
     [NC_URL]: [rawTool('search_files', 'operator search'), rawTool('nc_only')],
     ...(withDirectory ? { [DIR_URL]: [rawTool('search_files', 'directory search'), rawTool('project_append_file', 'directory append'), rawTool('dir_only')] } : {}),
@@ -45,8 +45,10 @@ async function setup({ withDirectory = true, withInternal = false } = {}) {
   const mcp = fakeMcp(catalogues);
   const scope = new AsyncLocalStorage();
   const directoryServers = withDirectory ? [{ id: 'dir', title: 'Synthetic directory', url: DIR_URL, auth: 'directory', directory: true }] : [];
+  const oauth = { connected: () => false, tokenFor: async () => 'discovery-token' };
   const wiring = createMcpWiring({
-    servers: [{ id: 'nc', url: NC_URL, auth: 'nextcloud' }, ...(withInternal ? [{ id: 'self', url: SELF_URL, auth: 'internal' }] : [])],
+    mcpKeys,
+    servers: [{ id: 'nc', url: NC_URL, auth }, ...(withInternal ? [{ id: 'self', url: SELF_URL, auth: 'internal' }] : [])],
     manifest: [{ id: 'nc-files', label: 'Files', server: 'nc', tools: ['search_files', 'nc_only'], reads: ['search_files', 'nc_only'] }],
     mcp, bindBoxes,
     directoryMcp: {
@@ -54,7 +56,7 @@ async function setup({ withDirectory = true, withInternal = false } = {}) {
       boxFor: (server, names) => ({ id: server.id, server: server.id, label: server.title, directory: true, description: 'synthetic', tools: [...names] }),
       headersFor: () => ({ 'X-Key': 'directory-key' }), userHeadersFor: () => ({}), hasUserKey: () => false,
     },
-    mcpOAuth: { connected: () => false, tokenFor: async () => null },
+    mcpOAuth: oauth,
     directoryUrlAllowed: async () => true,
     credentialOriginAllowed: createCredentialOriginCheck('http://cloud.invalid'),
     scope,
@@ -78,7 +80,7 @@ async function setup({ withDirectory = true, withInternal = false } = {}) {
     const text = await asUser(() => toolboxes.executeToolCall({ id: 'p1' }, name, '{}', allowed, undefined, {}, { routes: resolved.routes }));
     return { resolved, text };
   };
-  return { wiring, toolboxes, mcp, asUser, callAs };
+  return { wiring, toolboxes, mcp, oauth, asUser, callAs };
 }
 
 test('enabling only the directory box routes a shared tool name to the directory server, with its own credential', { skip: skipWasm }, async () => {
@@ -249,4 +251,42 @@ test('#891: a fixed caller never falls back to a directory server when no operat
   assert.equal(await s.asUser(() => s.wiring.executeMcpToolCall('dir_only', {})), `${DIR_URL}:dir_only`);
 });
 
-test.after(() => { if (!skipWasm) assert.equal(ran, 3, 'a wasm-guarded test body did not run'); });
+test.after(() => { if (!skipWasm) assert.equal(ran, 7, 'a wasm-guarded test body did not run'); });
+
+for (const pause of ['after-early-check', 'credentials', 'connection', 'credential-retry']) {
+  test(`revocation at ${pause} prevents the executor outbound write`, { skip: skipWasm }, async () => {
+    ran++;
+    let epoch = 0, release, arrived;
+    const parked = new Promise(resolve => { release = resolve; });
+    const entered = new Promise(resolve => { arrived = resolve; });
+    let loads = 0;
+    const s = await setup({ withDirectory: false, auth: 'oauth' });
+    // Use the production OAuth path, including its refresh-and-retry branch.
+    const originalConnect = s.mcp.connect;
+    s.mcp.connect = async (...args) => {
+      if (pause === 'connection') { arrived(); await parked; }
+      return originalConnect(...args);
+    };
+    // This setup's injected broker is read dynamically by the production wiring.
+    s.oauth.session = async () => {
+      loads++;
+      if ((pause === 'credentials' && loads === 1) || (pause === 'credential-retry' && loads === 2)) { arrived(); await parked; }
+      return { accessToken: `token-${loads}`, generation: '1' };
+    };
+    if (pause === 'credential-retry') {
+      s.mcp.callTool = async () => { s.mcp.calls.push({ sent: true }); throw Object.assign(Error('refused'), { httpStatus: 401 }); };
+    }
+    const captured = epoch;
+    const fence = { open: () => epoch === captured };
+    assert.equal(fence.open(), true, 'early chat check passed');
+    if (pause === 'after-early-check') epoch++;
+    const outcome = {};
+    const result = s.asUser(() => s.toolboxes.executeToolCall(null, 'nc_only', '{}', new Set(['nc_only']), undefined, outcome,
+      { routes: new Map([['nc_only','nc']]), writeFence: fence }));
+    if (pause !== 'after-early-check') { await entered; epoch++; release(); }
+    const text = await result;
+    assert.equal(s.mcp.calls.length, pause === 'credential-retry' ? 1 : 0, 'no outbound call after revocation acknowledgement');
+    assert.equal(outcome.notRun, true);
+    assert.match(text, /permission changed before the write was sent/);
+  });
+}

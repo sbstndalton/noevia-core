@@ -545,7 +545,7 @@ function createMcpWiring({
       const callOnce = async (headers) => {
         const { session } = await transport.connect(server.url, headers, undefined, signal);
         try {
-          return await transport.callTool(server.url, session, name, args, headers, undefined, signal);
+          return await require('./tool-write-fence.cjs').send(() => transport.callTool(server.url, session, name, args, headers, undefined, signal));
         } finally {
           // Close it whatever happened. Nothing used to, so every tool call left a
           // session behind on the server for the life of the process.
@@ -600,6 +600,7 @@ function createMcpWiring({
       if (reduced.reduced) logger.log(`[tool-result] ${name}: ${text.length} → ${reduced.text.length} chars`);
       return reduced.text;
     } catch (err) {
+      if (err?.code === require('./tool-write-fence.cjs').CODE) throw err;
       // Returned, not thrown: a failed tool call is information the model can
       // act on or relay, and throwing would strand the chip with no result.
       // An HTTP failure carries the server's response body in its message; that

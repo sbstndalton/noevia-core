@@ -12,7 +12,7 @@
 // also checks a grant against the chat's live grant context, so a move, a delete or a restart
 // revokes it there.
 //
-// Grant use (registry-redeem-v2): a grant check answers with a single-use ticket, redeemed at the
+// Grant use (registry-executor-v3): a grant check answers with a single-use ticket, redeemed at the
 // front just before dispatch, and the redeem's answer is a dispatch fence (redeemChatGrant below).
 //
 // The interface is approvals.cjs's (the in-process reference the chat tests still use), made async,
@@ -26,15 +26,13 @@
 // end as 'unavailable' (the tool is not run).
 const { safeId } = require('./chat-grant-context.cjs');
 
-// The grant protocol (front capability registry-redeem-v2; the release and startup pairing guards
+// The grant protocol (front capability registry-executor-v3; the release and startup pairing guards
 // look for this line). Named on every grant check and redeem: a front that does not answer in it is
 // not asked to authorise anything.
-const REGISTRY_PROTOCOL = 'registry-redeem-v2';
-const OPS = new Set(['open', 'wait', 'cancel', 'granted', 'redeem', 'started', 'revoke']);
-// Re-review 689d17a P1-1: a redeemed write may be dispatched only within this long of SENDING its
-// redeem, by the monotonic clock (or the front's window_ms if shorter). The front records the redeem
-// later than Node sent it and drains every revocation until that record plus its window, so a revoke
-// that has completed can never be followed by a dispatch for a ticket issued before it.
+const REGISTRY_PROTOCOL = 'registry-executor-v3';
+const OPS = new Set(['open', 'wait', 'cancel', 'granted', 'redeem', 'revoke']);
+// Additional local expiry for a redeemed fence. Revocation safety comes from the executor epoch
+// check plus the authenticated Node acknowledgement, independently of elapsed time.
 const DISPATCH_WINDOW_MS = 2000;
 // The front times a question out itself; Node's own deadline is only a backstop past that.
 const WAIT_SLACK_MS = 30000;
@@ -120,8 +118,8 @@ function createApprovalRegistry({ approvals, timeoutMs = 5 * 60 * 1000, log = ()
   // generation becomes the chat's revocation epoch. The epoch outlives the revoke's confirmation. A
   // grant check reads the epoch before it asks the front and refuses the answer if the epoch moved
   // meanwhile: a granted:true produced before a revoke can never be accepted after it, whether that
-  // revoke was confirmed at once, failed, or was retried. (Revokes the front makes itself, on a move or
-  // a delete, change the chat's live context, and the front's own check is atomic with them.)
+  // revoke was confirmed at once, failed, or was retried. Front-originated revokes also bump this
+  // epoch through the authenticated private route before they may return success.
   //
   // Pending records. A revoke follows a refusal such as "the write target changed after approval";
   // if the front could not be told, its grant would still auto-approve the next write in that chat for
@@ -137,10 +135,23 @@ function createApprovalRegistry({ approvals, timeoutMs = 5 * 60 * 1000, log = ()
   let generations = 0;
   // The counter can no longer advance: no grant is honoured again (fail closed).
   let exhausted = false;
+  const userEpochs = new Map(); // one entry per account, retained for this process lifetime
   const epochs = new Map(); // JSON [user, canonical chat] -> { epoch, at }
   const pendingRevokes = new Map(); // same key -> { user, chat, latest, since, delay, timer, trying }
   const revokeKey = (userId, chatId) => JSON.stringify([userId, safeId(chatId)]);
-  const epochOf = (key) => epochs.get(key)?.epoch ?? 0;
+  // Missing/pruned entries use the current global generation, never zero (no epoch ABA).
+  const epochOf = (key) => Math.max(epochs.get(key)?.epoch ?? generations,
+    userEpochs.get(JSON.parse(key)[0]) ?? 0);
+
+  // Authenticated front acknowledgement: synchronous epoch advance before the HTTP answer.
+  // Project deletion invalidates this user's in-flight tickets as well, including grants already
+  // removed from the front. A conservative user-wide invalidation avoids a stale holder snapshot.
+  function frontRevoked(userId, chatId = null) {
+    if (!text(userId) || (chatId !== null && !safeId(chatId))) return false;
+    const epoch = bump(revokeKey(userId, chatId || '_all'));
+    if (chatId === null) userEpochs.set(userId, epoch);
+    return true;
+  }
 
   function bump(key) {
     if (generations >= maxGeneration) { exhausted = true; return generations; }
@@ -217,21 +228,11 @@ function createApprovalRegistry({ approvals, timeoutMs = 5 * 60 * 1000, log = ()
     }
   }
 
-  /** Re-reviews 1ed3a14 and 689d17a: uses the grant `grant` (chatWideApproved's answer) for one
-   *  write, just before it is dispatched. The front's registry lock orders this redeem against every
-   *  revocation of the chat (Node's, a move, a delete, a failed move, a restart): it succeeds only if
-   *  none came before it. A revocation after it completes only once this write was reported started
-   *  or the dispatch window has passed, so the answer is a fence the caller must check in the SAME
-   *  synchronous step as the dispatch:
-   *    const fence = await redeemChatGrant(...);           // false | 'unavailable' | fence
-   *    ... synchronous checks only ...
-   *    if (!fence.open()) { fence.started(); not run }      // too late: 'unavailable', not a decline
-   *    const running = executeToolCall(...); fence.started(); await running;
-   *  open() is true only while the monotonic clock reads less than the redeem's send time plus the
-   *  window, and Node's own epoch and pending records (defence in depth) still allow it. started()
-   *  tells the front, fire-and-forget, so revocations need not wait out the window; call it also
-   *  when the write will not be dispatched. 'unavailable': the front could not be asked or did not
-   *  answer in this protocol (the tool is not run, and it is not a decline). */
+  /** Single-use redemption. The executor must recheck open() immediately before EACH outbound
+   * write (including credential retries), in the same synchronous block as its transport call.
+   * Every front revocation records the revoke, then awaits frontRevoked's authenticated ack before
+   * returning success. The clock is only an additional expiry check, never a revoke barrier.
+   * started() retires this local fence once execution has finished or been abandoned. */
   async function redeemChatGrant(userId, chatId, scope, binding, grant) {
     if (exhausted || !text(userId) || !safeId(chatId) || !text(scope) || !binding || !text(grant?.ticket)) return false;
     const key = revokeKey(userId, chatId);
@@ -250,7 +251,6 @@ function createApprovalRegistry({ approvals, timeoutMs = 5 * 60 * 1000, log = ()
       const started = () => {
         if (reported) return;
         reported = true;
-        Promise.resolve().then(() => ask('started', { user: userId, ticket: grant.ticket })).catch(() => {});
       };
       if (!allowed()) { started(); return false; }
       return Object.freeze({ open: () => !reported && monotonic() < sentAt + windowMs && allowed(), started });
@@ -280,7 +280,7 @@ function createApprovalRegistry({ approvals, timeoutMs = 5 * 60 * 1000, log = ()
     return false;
   }
 
-  return { openApproval, openRouteChoice, awaitApproval, awaitRouteChoice, chatWideApproved, redeemChatGrant, revokeChatGrant, revokePending };
+  return { frontRevoked, openApproval, openRouteChoice, awaitApproval, awaitRouteChoice, chatWideApproved, redeemChatGrant, revokeChatGrant, revokePending };
 }
 
 module.exports = { createApprovalRegistry, OPS, WAIT_SLACK_MS, GRANT_TTL_MS, REVOKE_RETRY, REGISTRY_PROTOCOL, DISPATCH_WINDOW_MS };

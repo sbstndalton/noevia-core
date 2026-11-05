@@ -38,7 +38,7 @@ const store = (ws, id, history) => fs.writeFileSync(ws.historyPath(id), JSON.str
 
 /** One handler. Each scripted model turn is a list of chunks; DISCONNECT in it closes the client
  *  connection at that point (the stream then ends the way an aborted fetch does). */
-function harness(t, { approvals = createApprovals(), onPending = null, workspaces = null, openApproval = undefined, grants = null } = {}) {
+function harness(t, { approvals = createApprovals(), onPending = null, workspaces = null, openApproval = undefined, grants = null, execute = null } = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'noevia-679-'));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
   fs.mkdirSync(path.join(root, 'a')); fs.mkdirSync(path.join(root, 'b'));
@@ -80,7 +80,7 @@ function harness(t, { approvals = createApprovals(), onPending = null, workspace
     DIARY_BASE: 'http://fixture.invalid', TOOL_RESULT_CAP: 8000, json: () => {}, saveChats() {}, endpointApproved: () => true, diaryHeaders: () => ({}),
     lastLoadedModel: () => null, classifyFastOrSmart: async () => 'fast', servedCatalogue: async () => [], modelsInstalled: async () => [], missingRoles: () => [], staleRolesError: () => null,
     allToolboxes: () => [],
-    executeToolCall: async (_p, name, args) => { state.executed.push({ name, args: JSON.parse(args) }); return name === 'synthetic_read' ? 'Zahl: 1' : `Appended 10 chars to "${TARGET}".`; },
+    executeToolCall: execute || (async (_p, name, args) => { state.executed.push({ name, args: JSON.parse(args) }); return name === 'synthetic_read' ? 'Zahl: 1' : `Appended 10 chars to "${TARGET}".`; }),
     grantContext: async raw => require('../tests/server/chat-grant-fixture.cjs').context(raw, { holder: { kind: 'absent' } }), chatWideApproved: () => false,
     awaitApproval: (card) => { const p = approvals.awaitApproval(card); if (onPending) onPending(card, state, disconnect); return p; },
     ...(openApproval ? { openApproval } : {}),
@@ -264,17 +264,16 @@ test('S9: a bare true from the redeem (no dispatch fence) is not an approval', a
   assert.deepEqual(log, ['check', 'redeem', 'revoke']);
 });
 
-// Re-review 689d17a P1-1, Astra's schedule through the real chat loop and the real registry client:
+// Re-review 689d17a P1-1, delayed redeem response through the real chat loop and the real registry client:
 // the front consumes the ticket (redeemed:true) and then completes a front-only failed-move revoke
-// while that answer is in flight. The front's revoke completes only once the redeem is D old, so the
-// answer arrives at Node later than its send time + D: Node must not dispatch.
+// while that answer is in flight. Additional local expiry also refuses an answer delivered after D.
+// Revocation completion itself now depends on the authenticated epoch acknowledgement.
 function fencedTurn(t, { lateBy }) {
   const { createApprovalRegistry, REGISTRY_PROTOCOL } = require('./rust-approval-registry.cjs');
   let clock = 5000;
   const calls = [];
   const h = { current: null };
   const approvals = (op, payload) => new Promise((resolve) => {
-    if (op === 'started') { calls.push({ op, payload, executed: h.current.state.executed.length }); return resolve({ status: 200, body: { settled: true } }); }
     if (op === 'granted') return resolve({ status: 200, body: { granted: true, ticket: 'synthetic-ticket' } });
     if (op === 'revoke') { calls.push({ op }); return resolve({ status: 200, body: { revoked: true } }); }
     calls.push({ op, payload, ok: (body) => resolve({ status: 200, body }) });
@@ -289,7 +288,7 @@ function fencedTurn(t, { lateBy }) {
     let redeem;
     for (let i = 0; i < 400 && !(redeem = calls.find((c) => c.op === 'redeem')); i++) await new Promise((r) => setTimeout(r, 5));
     assert.ok(redeem, 'the write was redeemed');
-    clock += lateBy; // meanwhile the front drained and completed its revoke (lateBy >= D)
+    clock += lateBy; // extra local expiry, independent of the epoch acknowledgement
     redeem.ok({ redeemed: true, protocol: REGISTRY_PROTOCOL, window_ms: 2000 });
     const events = await sending;
     await new Promise((r) => setImmediate(r));
@@ -297,7 +296,7 @@ function fencedTurn(t, { lateBy }) {
   }
   return { h: h.current, calls, run };
 }
-test("S9 (Astra's schedule): redeemed:true arriving after the front's drained revoke completed is never dispatched", async (t) => {
+test("S9: a redeemed response arriving after its local expiry is never dispatched", async (t) => {
   const { h, calls, run } = fencedTurn(t, { lateBy: 2000 });
   const events = await run();
   assert.equal(h.state.executed.length, 0, 'the write never ran');
@@ -305,13 +304,13 @@ test("S9 (Astra's schedule): redeemed:true arriving after the front's drained re
   assert.equal(result.notRun, true);
   assert.equal(result.declined, undefined, 'not a decline');
   assert.match(result.text, /permission for synthetic_append could not be checked, so it was not run/);
-  assert.deepEqual(calls.filter((c) => c.op === 'started').map((c) => c.payload), [{ user: 'synthetic-user-a', ticket: 'synthetic-ticket' }], 'the front is told at once');
+  assert.equal(calls.filter((c) => c.op === 'started').length, 0);
 });
-test('S9: redeemed:true in time is dispatched once, then reported started', async (t) => {
+test('S9: redeemed:true in time is dispatched once, then its local fence closes', async (t) => {
   const { h, calls, run } = fencedTurn(t, { lateBy: 1999 });
   await run();
   assert.equal(h.state.executed.length, 1);
-  assert.deepEqual(calls.filter((c) => c.op === 'started').map((c) => c.executed), [1], 'reported after the dispatch, once');
+  assert.equal(calls.filter((c) => c.op === 'started').length, 0);
 });
 
 test('nothing is written when the reply finishes, when someone already saved past the turn, or for a deleted chat', async (t) => {
@@ -477,4 +476,32 @@ test('the interrupted reply goes through the transcript store and fails closed w
   assert.equal(await saveInterruptedTurn({ workspace: recorded, chatId: 'c1!', message: USER.content, entry: { role: 'assistant', content: 'qa kept' } }), 'saved');
   assert.deepEqual(calls.map((c) => [c.url, c.body.chat]), [['/v1/history/append-if-last', 'c1']], 'the reduced id, one store op');
   assert.equal(await saveInterruptedTurn({ workspace: recorded, chatId: 'c1', message: USER.content, entry: { role: 'assistant', content: 'qa again' } }), 'not-last', 'a retry finds its reply already kept');
+});
+
+test('S9: a revoke during executor setup is stopped, never declined or audited as a completed write', async t => {
+  const { createApprovalRegistry, REGISTRY_PROTOCOL } = require('./rust-approval-registry.cjs');
+  let sends = 0;
+  const gate = createApprovalRegistry({ approvals: async op => ({ status:200, body: op === 'granted'
+    ? { granted:true, ticket:'synthetic-ticket' }
+    : { redeemed:true, protocol:REGISTRY_PROTOCOL, window_ms:2000 } }) });
+  const tools = require('./toolboxes.cjs').createToolboxes({
+    scope: new (require('node:async_hooks').AsyncLocalStorage)(),
+    mcpTools: () => new Map([['synthetic_append', {}]]),
+    executeMcp: async () => {
+      await tick();
+      gate.frontRevoked('synthetic-user-a', 'chat-679');
+      return require('./tool-write-fence.cjs').send(() => { sends++; return 'written'; });
+    },
+  });
+  const h = harness(t, { execute:tools.executeToolCall,
+    grants:{ check:gate.chatWideApproved, redeem:gate.redeemChatGrant, revoke:gate.revokeChatGrant },
+    onPending:() => assert.fail('grant already present') });
+  store(h.a, 'chat-679', [{ role:'user', content:'Append it.' }]);
+  h.state.turns.push([toolCall('synthetic_append', APPEND, 'call-1')], [say('Stopped.')]);
+  const events = await h.send({ message:'Append it.' });
+  assert.equal(sends, 0);
+  const result = events.find(e => e.type === 'tool_result');
+  assert.equal(result.notRun, true);
+  assert.equal(result.declined, undefined);
+  assert.match(result.text, /permission changed before the write was sent/);
 });

@@ -25,7 +25,7 @@ const binding = { user: 'owner', canonicalChatId: 'chat', scope: 'project:p', co
 const until = async (fn) => { for (let i = 0; i < 200 && !fn(); i++) await new Promise((r) => setTimeout(r, 5)); };
 
 test('Node can only open, wait for, withdraw and check its own questions; it can never answer one', () => {
-  assert.deepEqual([...OPS].sort(), ['cancel', 'granted', 'open', 'redeem', 'revoke', 'started', 'wait']);
+  assert.deepEqual([...OPS].sort(), ['cancel', 'granted', 'open', 'redeem', 'revoke', 'wait']);
   assert.equal(fs.existsSync(path.join(__dirname, 'rust-tool-approval-bridge.cjs')), false, 'the #2282 facts/resolve bridge is gone');
   const index = fs.readFileSync(path.join(__dirname, 'index.cjs'), 'utf8');
   assert.match(index, /require\('\.\/rust-approval-registry\.cjs'\)\.createApprovalRegistry\(/);
@@ -317,13 +317,13 @@ test("Node's own revoke still denies around a redeem, in either order (defence i
   await r2;
   call.ok({ redeemed: true, protocol: REGISTRY_PROTOCOL, window_ms: 2000 });
   assert.equal(await redeem, false);
-  assert.ok(f.calls.some((c) => c.op === 'started' && c.payload.ticket === 't2'), 'the front is told it will not run');
+
 });
 
 // Re-review 689d17a P1-1: the front can consume a ticket (redeemed:true) and then complete a
 // front-only revoke (a failed move) while that answer is still in flight. The front's revoke
 // completes only once the redeem is DISPATCH_WINDOW old (it drains); Node dispatches only within
-// DISPATCH_WINDOW of SENDING the redeem, by its monotonic clock. Astra's schedule, deterministic:
+// DISPATCH_WINDOW of SENDING the redeem, by its monotonic clock. delayed redeem response, deterministic:
 function fenced(options = {}) {
   let clock = 1000;
   const calls = [];
@@ -342,7 +342,7 @@ function fenced(options = {}) {
   };
   return { gate, calls, next, grant, advance: (ms) => { clock += ms; } };
 }
-test("Astra's schedule: redeemed:true held while the front's revoke drains and completes: never dispatched", async () => {
+test("delayed redeem response: redeemed:true held while the front's revoke drains and completes: never dispatched", async () => {
   const f = fenced();
   const g = await f.grant();
   const redeem = f.gate.redeemChatGrant('owner', 'chat', 'project:p', binding, g);
@@ -355,8 +355,8 @@ test("Astra's schedule: redeemed:true held while the front's revoke drains and c
   fence.started();
   fence.started();
   await new Promise((r) => setImmediate(r));
-  assert.equal(f.calls.filter((c) => c.op === 'started').length, 1, 'reported once');
-  assert.deepEqual(f.calls.find((c) => c.op === 'started').payload, { user: 'owner', ticket: 't1' });
+  assert.equal(f.calls.filter((c) => c.op === 'started').length, 0, 'no wrapper-entry acknowledgement');
+
 });
 test('the fence: open strictly before S + min(D, window_ms), closed once started, at S + D, or on a Node revoke', async () => {
   const f = fenced();
@@ -394,7 +394,7 @@ test('the fence: open strictly before S + min(D, window_ms), closed once started
   (await f.next('revoke')).ok({ revoked: true });
   await revoke;
 });
-test('P1-2: a front that does not answer in registry-redeem-v2 authorises nothing', async () => {
+test('P1-2: a front that does not answer in registry-executor-v3 authorises nothing', async () => {
   for (const body of [{ redeemed: true }, { redeemed: true, protocol: 'rust-approval-registry', window_ms: 2000 }, { redeemed: true, protocol: REGISTRY_PROTOCOL }, { redeemed: true, protocol: REGISTRY_PROTOCOL, window_ms: 0 }, { redeemed: true, protocol: REGISTRY_PROTOCOL, window_ms: 'x' }]) {
     const f = fenced();
     const g = await f.grant();
@@ -425,4 +425,26 @@ test('a revoke counter that cannot advance fails closed', async () => {
   }
   assert.equal(await f.gate.redeemChatGrant('owner', 'chat', 'project:p', binding, g), false);
   assert.equal(await f.gate.chatWideApproved('owner', 'chat', 'project:p', binding), false);
+});
+
+test('front acknowledgement invalidates a redeemed fence in either revoke/redeem order', async () => {
+  for (const first of ['revoke', 'redeem']) {
+    const f = fenced();
+    const g = await f.grant();
+    const redeem = f.gate.redeemChatGrant('owner', 'chat', 'project:p', binding, g);
+    const request = await f.next('redeem');
+    if (first === 'revoke') f.gate.frontRevoked('owner', 'chat');
+    request.ok({ redeemed: true, protocol: REGISTRY_PROTOCOL, window_ms: 2000 });
+    const fence = await redeem;
+    if (first === 'redeem') { assert.equal(fence.open(), true); f.gate.frontRevoked('owner', 'chat'); }
+    assert.ok(fence === false || !fence.open(), 'no pre-revoke ticket may send afterwards');
+  }
+});
+test('project revocation acknowledgement invalidates user tickets even with a missing front grant', async () => {
+  const f = fenced(); const g = await f.grant();
+  const redeem = f.gate.redeemChatGrant('owner', 'chat', 'project:p', binding, g);
+  (await f.next('redeem')).ok({ redeemed: true, protocol: REGISTRY_PROTOCOL, window_ms: 2000 });
+  const fence = await redeem;
+  f.gate.frontRevoked('owner');
+  assert.equal(fence.open(), false);
 });
