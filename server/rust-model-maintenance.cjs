@@ -24,10 +24,10 @@
 // assignments, idle-unload, prune-missing (all chat-bound), inference-budget PUT (the boot-time cache of the saved budget).
 //
 // The Rust front is the single writer of the reload guard state file (native-preset-reload-<hash>.json) for
-// the reloads it makes. This process still makes reloads (the folder sync, delete, prune, idle-unload, the
+// the reloads it makes. This process still makes reloads (delete, prune, idle-unload, the
 // preset editor, auto-tune) and records their baselines in the same file under the same lock file
 // (preset-reload.cjs), re-reading it on every use. It also asks the inference gate whether a hold it did
-// not take is held (inference-maintenance.cjs), so the folder sync, the optional chat work and the code
+// not take is held (inference-maintenance.cjs), so the optional chat work and the code
 // machine wait for a hold the front took.
 //
 // With no inference gate (no admin token, or nothing at the engine address knows the hold), the front's reload takes a

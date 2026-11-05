@@ -60,13 +60,6 @@ test('a held lease holds chat, tune, calibration and every other hold back, unti
   assert.equal(manager.maintenanceHeld(), true);
   assert.equal(manager.tuningActive(), true, 'tune and calibration read this');
   assert.equal(manager.inferenceBusy(), true, 'the Rust lease is visible to optional inference');
-  let scanned = false;
-  const folders = require('./model-folder-sync.cjs').createFolderSync({
-    busy: () => manager.tuningActive(), listUnregistered: async () => { scanned = true; return ['synthetic']; },
-    register: async () => assert.fail('a held Rust lease must prevent registration'), reloadPresets: async () => assert.fail('a held Rust lease must prevent reload'),
-  });
-  assert.equal((await folders.run()).deferred, true, 'folderSync sees the Rust lease');
-  assert.equal(scanned, false);
   assert.throws(() => manager.holdMaintenance('calibration'), (e) => e.status === 409, 'a tune or calibration start is refused');
   assert.equal((await ask('POST')).status, 409, 'a second reload is refused');
   // A chat that waits within its allowance gets in as soon as the lease ends.
@@ -211,7 +204,7 @@ test('a lease ends at its requested cap, and an unrenewed one still ends after t
 
 // #2286 group E precondition: the configured-gate path observes a foreign Rust hold too,
 // rather than relying only on Node's in-process maintenance counter.
-test('a foreign gate hold is visible to real-manager tuningActive, inferenceBusy and folderSync', {timeout:8000}, async t => {
+test('a foreign gate hold is visible to real-manager tuningActive and inferenceBusy', {timeout:8000}, async t => {
   let held=false; const paths=[];
   const gate=http.createServer((req,res)=>{
     paths.push(req.method+' '+req.url);
@@ -232,11 +225,6 @@ test('a foreign gate hold is visible to real-manager tuningActive, inferenceBusy
   const until=async(predicate,ms)=>{const end=Date.now()+ms;while(!predicate()&&Date.now()<end)await delay(10);assert.equal(predicate(),true);};
   await until(()=>manager.tuningActive(),1000);
   assert.equal(manager.inferenceBusy(),true);
-  let scanned=false;
-  const folders=require('./model-folder-sync.cjs').createFolderSync({busy:()=>manager.tuningActive(),
-    listUnregistered:async()=>{scanned=true;return ['synthetic'];},register:async()=>assert.fail('foreign Rust hold must prevent registration'),reloadPresets:async()=>assert.fail('foreign Rust hold must prevent reload')});
-  assert.equal((await folders.run()).deferred,true);
-  assert.equal(scanned,false);
   assert.equal((await fetch(base+'/gate/v1/maintenance/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',{method:'DELETE'})).status,204);
   await until(()=>!manager.tuningActive(),4500);
   assert.equal(manager.inferenceBusy(),false);
