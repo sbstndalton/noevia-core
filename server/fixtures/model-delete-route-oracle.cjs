@@ -16,6 +16,7 @@ const cases=[
  {name:'system-confirm-string',raw:'{"name":"synthetic-system","confirmSystem":"true"}',known:true,ok:true,status:200,unloaded:true},
  ...['','{','null','false','[]','{}','{"name":""}','{"name":false}','{"name":[]}','{"name":{}}','{"name":"\\ud800"}'].map((raw,i)=>({name:'invalid-'+i,raw,known:true,ok:true,status:200,unloaded:true})),
  {name:'plain-failure',raw:'{"name":"synthetic"}',known:true,ok:false,status:500,unloaded:false},
+ ...[true,{reason:'busy'},'x'.repeat(299)+'😀tail','\ud800'].map((message,i)=>({name:'gate-message-'+i,raw:'{"name":"synthetic"}',known:true,ok:false,status:409,unloaded:false,error:{error:{type:'gate_error',code:'model_in_use',message,retryable:true}}})),
  {name:'in-use',raw:'{"name":"synthetic"}',known:true,ok:false,status:409,unloaded:false,error:{error:{type:'gate_error',code:'model_in_use',message:'Busy',retryable:true}}},
 ];
 async function capture(c){let answer;const workspace={autoRoles:{fast:'synthetic',smart:'other'},saveAutoRoles(){}};const shared=createModelService({fetchJson:async()=>({ok:false}),env:{},modelManager:{enabled:false},currentWorkspace:()=>workspace,listWorkspaces:()=>[workspace]});const service={modelScanCache:{clear(){}},modelsInstalled:async()=>[{name:'synthetic'},{name:'synthetic-system'}],clearRoleReferences:shared.clearRoleReferences,lastLoadedModel:()=>null,clearLastLoadedModel(){}};
