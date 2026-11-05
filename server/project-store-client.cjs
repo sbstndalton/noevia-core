@@ -38,6 +38,7 @@ const REPLY_CAP = 2 * 32 * 1024 * 1024 + 64 * 1024;
 // providers.json (sbstndalton/noevia#2190 round 6) is the account's private provider rows: the Rust
 // front's routes are its writer; Node saves only its seal-on-load migration here.
 const FILES = new Set(['projects.json', 'free-chats.json', 'providers.json']);
+const PRESET_BASELINE_OPS = new Set(['session', 'begin', 'settle', 'invalidate', 'verdict', 'router-text']);
 
 /** Whether the environment hands over the Rust store (see the header): its port and secret. */
 function enabledFrom(env = process.env, warn = console.warn) {
@@ -125,8 +126,15 @@ function createClient({ port, token, fetchImpl = globalThis.fetch, timeoutMs = T
       if (reader) { reader.cancel().catch(() => {}); reader.releaseLock(); }
     }
   }
+  // noevia-rs model_maint/reload.rs: the front's preset reload baseline (preset-reload.cjs
+  // createBridgeReloadGuard). { status, body }; throws when the front does not answer in time.
+  async function presetBaseline(op, payload, { timeoutMs: wait = 5000 } = {}) {
+    if (!PRESET_BASELINE_OPS.has(op)) throw new Error(`not a preset baseline op: ${op}`);
+    return call(`preset-baseline/${op}`, payload, wait);
+  }
   return {
     featureContext,
+    presetBaseline,
     async grantContext(user, chat) {
       const { status, body } = await call('chat/grant-context', { user, chat });
       if (status !== 200) throw moveFailure(status, body);

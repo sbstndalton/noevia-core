@@ -92,8 +92,9 @@ test('the removed Insights reflection route is unavailable', async () => {
 
 test('other routes are unaffected by the LLM throttle', async () => {
   // GET /api/integrations/storage is the Rust front's (#1071); the workspace view is still Node's.
-  const response = await request('/api/chats/search', { headers: { cookie } });
-  assert.equal(response.status, 200);
+  // (GET /api/chats/search is the Rust front's; the framing suggestion's GET is Node's 405.)
+  const response = await request('/api/chat-framing/suggest', { headers: { cookie } });
+  assert.equal(response.status, 405);
 });
 
 test('the throttle bucket is per user, not global', async () => {
