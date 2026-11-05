@@ -159,6 +159,8 @@ function singleSettingKey(sql, args) {
 // switch are written only by the Rust front (their routes left Node). This connection refuses those
 // keys too, even inside exempt(), with their own codes.
 const FRONT_SETTING_KEYS = Object.freeze({
+  'inference:machines': ['Inference machines are owned by the Rust front.', 'RUST_INFERENCE_MACHINES_OWNED'],
+  'inference:machineTune': ['Machine tuning is owned by the Rust front.', 'RUST_INFERENCE_MACHINES_OWNED'],
   ...Object.fromEntries(require('./feature-catalog.cjs').loadCatalog().features.flatMap(row => [row.id,...(row.legacy?[row.legacy]:[])].map(name => [`feature:${name}`,['Feature settings are owned by the Rust front.','RUST_FEATURES_OWNED']]))),
   'native:feature-runtime:incarnation': ['Feature runtime state is owned by the Rust front.', 'RUST_FEATURE_RUNTIME_OWNED'],
   public_origin_admin: ['Web address changes are owned by the Rust front.', 'RUST_WEB_ADDRESS_WRITE_OWNED'],

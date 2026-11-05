@@ -39,7 +39,7 @@ const hostOf = (value) => { try { return new URL(String(value || '').trim()).hos
 // what that machine can serve), and RERANK_API_KEY, which belongs to the deployment's reranker, is only sent when the
 // machine is the same host as RERANK_BASE_URL (the #1753 rule of decision-settings.cjs).
 function createRerankSettings({ store, env = process.env, audit = () => {}, onChange = () => {}, machine = () => null }) {
-  const onMachine = () => { try { const m = machine(); return m && typeof m.url === 'string' && m.url ? { url: m.url, protocol: m.protocol === 'llamacpp' ? 'llamacpp' : 'tei' } : null; } catch { return null; } };
+  const onMachine = () => { try { const m = machine(); return m && typeof m.url === 'string' && m.url ? { url: m.url, protocol: m.protocol === 'llamacpp' ? 'llamacpp' : 'tei' } : null; } catch (err) { if (err?.code === 'machinesUnavailable') throw err; return null; } };
   /** The deployment's endpoints, with an assigned machine's address over them. */
   function endpointsNow() {
     const ep = endpoints(env);

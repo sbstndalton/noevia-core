@@ -116,7 +116,9 @@ let rerank = null; // { decisions, pool, keep, deadlineMs }
 // #1665: the environment the reranker is configured from. The deployment's by default; index.cjs points it at
 // rerank-settings.cjs (the admin's saved switch over the deployment's) and calls reloadRerank() after a change.
 let rerankEnv = () => process.env;
+let liveRerank = false;
 function configureRerank(envFn) {
+  liveRerank = typeof envFn === 'function';
   rerankEnv = typeof envFn === 'function' ? envFn : () => process.env;
   initRerank();
 }
@@ -124,7 +126,10 @@ function reloadRerank() { initRerank(); }
 function initRerank() {
   // #697: never on the shared inference engine unless the operator allows it (rerank-target.cjs).
   let env;
-  try { env = rerankEnv() || process.env; } catch { env = process.env; }
+  try { env = rerankEnv() || process.env; } catch (err) {
+    if (err?.code === 'machinesUnavailable') { rerank = null; throw err; }
+    env = process.env;
+  }
   const target = require('./rerank-target.cjs').rerankTarget(env);
   if (target.reason) console.warn('[rag] rerank off:', target.reason);
   if (!target.enabled) { rerank = null; return; }
@@ -895,6 +900,9 @@ async function searchProjectNow(projectId, query, userId) {
 // The text side of a search: cosine pool, version filter, then the optional reranker. Unchanged by #1726
 // apart from the kind filter, which matches every row of an index that holds no image rows.
 async function textHits(index, qbuf, projectId, query, userId) {
+  // Re-read the native placement before using an adapter: a committed mutation may
+  // outlive its best-effort invalidation callback to this process.
+  if (liveRerank) initRerank();
   const rows = index.db
     .prepare(
       `SELECT c.file, c.chunk_no, c.body, c.version, 1.0 - vec_distance_cosine(v.embedding, ?) AS score

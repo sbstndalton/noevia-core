@@ -286,6 +286,33 @@ function valid(file, text) {
 }
 
 /** The request handler over `<dataDir>/users/<user>/<file>`; `writes` lists the files written. */
+function createMachineReply(dataDir) {
+  let machineEpoch = 0;
+  return body => {
+    if(body.op === 'session') return {epoch:++machineEpoch};
+    if(['turnBegin','turnEnd'].includes(body.op)) return {ok:true};
+    if(['tuneStatus','tuneResult'].includes(body.op)) return null;
+    // Test-only historical projection of the synthetic database. Production has no Node owner.
+    const db=new (require(require.resolve('better-sqlite3',{paths:[path.join(__dirname,'..','..','server')]})))(path.join(dataDir,'cowork.db'),{fileMustExist:true});
+    try {
+      const owner=require('../reference/inference-machines.node.cjs').createInferenceMachines({store:require('../../server/feature-setting-source.cjs').createStore(db),log:()=>{}});
+      switch(body.op) {
+        case 'view': return owner.view();
+        case 'runtimeSource': return owner.runtimeContextSource();
+        case 'machine': return owner.machine(body.id);
+        case 'chatTarget': return owner.chatTarget(body.role);
+        case 'urlFor': return owner.urlFor(body.service);
+        case 'assignmentOf': return owner.assignmentOf(body.service);
+        case 'embeddingMachine': return owner.embeddingMachine();
+        case 'rerankProtocol': return owner.rerankProtocol();
+        case 'rerankTarget': {const url=owner.urlFor('reranker');return url?{url,protocol:owner.rerankProtocol()}:null;}
+        default: throw Error('unsupported synthetic machine operation');
+      }
+    } finally {db.close();}
+  };
+
+}
+
 function createHandler(dataDir, token, writes = [], failures = [], { changes = false } = {}) {
   // Reuse the existing test-only source journal stand-in across HTTP calls. Production
   // clients still have no Node journal fallback; Rust tests cover the actual store.
@@ -305,18 +332,21 @@ function createHandler(dataDir, token, writes = [], failures = [], { changes = f
     } finally {db.close();}
   };
 
+  const machineReply = createMachineReply(dataDir);
+
   return (req, res) => {
     const chunks = [];
     req.on('data', (c) => chunks.push(c));
     req.on('end', async () => {
       try {
-        if (req.method !== 'POST' || !(['/v1/read', '/v1/write','/v1/features/context','/v1/storage/legacy-webdav'].includes(req.url) || HISTORY_OPS.has(req.url))) return send(res, 404, { error: 'not found' });
+        if (req.method !== 'POST' || !(['/v1/read', '/v1/write','/v1/features/context','/v1/inference-machines','/v1/storage/legacy-webdav'].includes(req.url) || HISTORY_OPS.has(req.url))) return send(res, 404, { error: 'not found' });
         if (req.url === '/v1/changes/read' && !changes) return send(res, 404, { error: 'not found' });
         if (req.headers['x-noevia-store-token'] !== token) return send(res, 401, { error: 'unauthorised' });
         const planned = failures.find((f) => f.url === req.url && f.times > 0);
         if (planned) { planned.times -= 1; return send(res, planned.status, planned.body); }
         let body;
         try { body = JSON.parse(Buffer.concat(chunks).toString('utf8')); } catch { return send(res, 400, { error: 'invalid JSON' }); }
+        if(req.url==='/v1/inference-machines')return send(res,200,machineReply(body));
         if(req.url==='/v1/features/context')return send(res,200,contextReply(body));
         // sbstndalton/noevia#2190 round 4: the legacy WebDAV setup, saved as the front saves it (only
         // while the account has no row or a local one; noevia-rs project_store.rs legacy_webdav).
@@ -361,7 +391,7 @@ function createHandler(dataDir, token, writes = [], failures = [], { changes = f
  *  (server/rust-embedding-background.cjs), so a real boot pairs; pass its path as NOEVIA_SERVER_BIN. */
 function syntheticFrontBin(dir) {
   const file = path.join(dir, 'synthetic-noevia-server');
-  fs.writeFileSync(file, `#!/bin/sh\n[ "$1" = --features ] && echo ${require('../../server/rust-embedding-background.cjs').RUST_EMBEDDING_OWNED}\n`, { mode: 0o755 });
+  fs.writeFileSync(file, `#!/bin/sh\n[ "$1" = --features ] && echo ${require('../../server/rust-embedding-background.cjs').RUST_EMBEDDING_OWNED} rust-inference-machines\n`, { mode: 0o755 });
   return file;
 }
 
@@ -389,6 +419,11 @@ function freePortSync() {
  *  secret out of the environment) and starts the store on that port, unref'd so it never keeps
  *  the test process alive. Call it before requiring index.cjs. */
 function installProjectStore(dataDir, env = process.env) {
+  // These tests load Core on the same event loop as their HTTP stand-in. Supply the
+  // native projection double directly; real cross-process RPC is covered separately.
+  const nativePath = require.resolve('../../server/native-machines-client.cjs');
+  const native = require(nativePath), machineReply = createMachineReply(dataDir);
+  require.cache[nativePath].exports = {...native, configure() {}, call: machineReply, callAsync: async body => machineReply(body)};
   if(!/^[0-9a-f]{32}$/.test(env.NOEVIA_START_ID||''))env.NOEVIA_START_ID=crypto.randomBytes(16).toString('hex');
   const port = freePortSync();
   const token = crypto.randomBytes(32).toString('hex');

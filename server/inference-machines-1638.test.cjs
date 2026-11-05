@@ -1,14 +1,15 @@
+// Historical Node registry fixture; runtime clients are covered by native-machines-client tests.
 'use strict';
 // #1638: Settings → Inference machines. The registry (inference-machines.cjs), the consumers that read
 // their address from it (decision-settings.cjs, rerank-settings.cjs, llamacpp-manager.cjs keepAlongside),
 // the bounded health probe (machine-health.cjs) and the admin-only route. Synthetic addresses only.
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { createInferenceMachines, normalizeAddress, KEY } = require('./inference-machines.cjs');
+const { createInferenceMachines, normalizeAddress, KEY } = require('../tests/reference/inference-machines.node.cjs');
 const { createDecisionSettings } = require('./decision-settings.cjs');
 const { createRerankSettings } = require('./rerank-settings.cjs');
 const { createMachineHealth, machineState } = require('./machine-health.cjs');
-const { createInferenceMachineRoutes } = require('./routes/inference-machines.cjs');
+const { createInferenceMachineRoutes } = require('../tests/reference/inference-machines-route.node.cjs');
 
 function memoryStore(seed = {}) {
   const map = new Map(Object.entries(seed));

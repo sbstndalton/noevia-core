@@ -42,7 +42,7 @@ async function autoRolesState({ servedCatalogue, remoteRoles, machineModels }) {
     ? rows.filter((m) => m && typeof m.name === 'string').map((m) => ({ name: m.name, missingFile: !!m.missingFile }))
     : null;
   let machineRoles = [];
-  try { machineRoles = Object.keys(remoteRoles() || {}); } catch { machineRoles = []; }
+  try { machineRoles = Object.keys(remoteRoles() || {}); } catch (err) { if (err?.code === 'machinesUnavailable') throw err; machineRoles = []; }
   let onMachines = [];
   try { onMachines = machineModels() || []; } catch { onMachines = []; }
   if (onMachines.length) {

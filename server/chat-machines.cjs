@@ -113,12 +113,14 @@ function createChatMachines({ machines, health = null, fetchImpl = defaultServic
   /** A turn (or classification) starts on `machineId`: counted until the returned release is called (idempotent). */
   function beginTurn(machineId) {
     const id = String(machineId || '');
+    const nativeRelease = machines?.native ? machines.beginTurn(id) : null;
     turns.set(id, (turns.get(id) || 0) + 1);
     for (const fn of [...turnListeners]) { try { fn(id); } catch { /* a listener never fails a turn */ } }
     let done = false;
     return () => {
       if (done) return;
       done = true;
+      nativeRelease?.();
       const n = (turns.get(id) || 1) - 1;
       if (n > 0) turns.set(id, n); else turns.delete(id);
     };
@@ -133,10 +135,10 @@ function createChatMachines({ machines, health = null, fetchImpl = defaultServic
   /** Called with the machine id whenever a turn starts there; returns the unsubscribe. */
   function onTurn(fn) { turnListeners.add(fn); return () => turnListeners.delete(fn); }
 
-  /** The role's machine, or null when it runs here. Never throws. */
+  /** The role's machine, or null when it runs here; native authority failures refuse routing. */
   function target(role) {
     if (!machines || !ROLE_LABEL[role]) return null;
-    try { return machines.chatTarget(role) || null; } catch { return null; }
+    try { return machines.chatTarget(role) || null; } catch (err) { if (machines.native || err?.code === 'machinesUnavailable') throw err; return null; }
   }
 
   /** The roles on another machine: { fast: target, ... } (empty: all here). */

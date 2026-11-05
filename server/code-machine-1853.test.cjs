@@ -1,3 +1,4 @@
+// Historical Node registry fixture; runtime clients are covered by native-machines-client tests.
 'use strict';
 // sbstndalton/noevia#1853: the Code pipeline (role engine) and the Code sandbox follow the Code role to its
 // Inference machine. A fake llama-server on loopback is the machine. A full pipeline task runs its Planner,
@@ -8,7 +9,7 @@
 const test = require('node:test'), assert = require('node:assert/strict');
 const fs = require('node:fs'), os = require('node:os'), path = require('node:path'), http = require('node:http');
 const { execFileSync } = require('node:child_process');
-const { createInferenceMachines } = require('./inference-machines.cjs');
+const { createInferenceMachines } = require('../tests/reference/inference-machines.node.cjs');
 const { createChatMachines } = require('./chat-machines.cjs');
 const { createMachineHealth } = require('./machine-health.cjs');
 const { createRoleEngine } = require('./role-engine.cjs');
