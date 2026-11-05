@@ -8,7 +8,7 @@ const RUST_EMBEDDING_OWNED = 'rust-embedding-background-v1';
 const RUST_INDEX_OUTBOX_OWNED = require('./rust-index-outbox.cjs').RUST_INDEX_OUTBOX_OWNED;
 const PROTOCOL = 'rust-embedding-worker-v1';
 // frontSecret: the per-start store secret, captured before project-store-client deletes it from process.env (#1916).
-function createOwner({ foregroundBusy = () => require('./rag.cjs').foregroundBusy(), env = process.env, frontSecret = '', dataDir, now = Date.now, verifyPair = true, features = () => execFileSync(env.NOEVIA_SERVER_BIN || '/usr/local/bin/noevia-server', ['--features'], { encoding: 'utf8', timeout: 5000 }) }) {
+function createOwner({ sourceChanged = (user, project) => require('./multimodal-rag.cjs').sourceChanged(user, project), foregroundBusy = () => require('./rag.cjs').foregroundBusy(), env = process.env, frontSecret = '', dataDir, now = Date.now, verifyPair = true, features = () => execFileSync(env.NOEVIA_SERVER_BIN || '/usr/local/bin/noevia-server', ['--features'], { encoding: 'utf8', timeout: 5000 }) }) {
   const start = String(env.NOEVIA_START_ID || '');
   if (verifyPair && (!start || !frontSecret || ![RUST_EMBEDDING_OWNED, RUST_INDEX_OUTBOX_OWNED].every(f => features().split(/\s+/).includes(f)))) throw Error('Embedding background requires a coherent paired front and current start');
   let stopped = false, sequence = 0;
@@ -32,6 +32,19 @@ function createOwner({ foregroundBusy = () => require('./rag.cjs').foregroundBus
       if (req.url !== '/internal/embedding-worker-owner') return false;
       if (req.method !== 'GET' || !verifyPair || stopped || !trustedFront(req, frontSecret)) json(res, 404, { error: 'Not found' });
       else json(res, 200, { protocol: PROTOCOL, start, nodeWorkersStopped: true, indexOutboxStopped: true, foregroundBusy: !!foregroundBusy() });
+      return true;
+    },
+    // Media remains Node-owned. This delegate only schedules its existing
+    // media pass; native remains the sole index/unindex outbox executor.
+    async handleSourceChanged(req, res, json) {
+      if (req.url !== '/internal/embedding-worker-owner/source-changed') return false;
+      if (req.method !== 'POST' || !verifyPair || stopped || !trustedFront(req, frontSecret)) { json(res, 404, { error: 'Not found' }); return true; }
+      let body;
+      try { body = await require('./http.cjs').readJson(req, 4096); } catch { json(res, 400, { error: 'Invalid notification' }); return true; }
+      if (body?.start !== start || typeof body.user !== 'string' || !/^[a-f0-9-]{36}$/i.test(body.user) || typeof body.project !== 'string' || !body.project || body.project.length > 256 || body.project.startsWith('.') || /[/\\\x00]/.test(body.project)) { json(res, 400, { error: 'Invalid notification' }); return true; }
+      try { sourceChanged(body.user, body.project); }
+      catch { json(res, 503, { error: 'Media notification unavailable' }); return true; }
+      json(res, 200, { protocol: PROTOCOL, start, notified: true });
       return true;
     },
     stop() { stopped = true; },

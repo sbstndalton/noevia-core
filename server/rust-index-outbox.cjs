@@ -72,5 +72,5 @@ function createIndexOutbox({ userDir, open = defaultOpen, kinds = CORE_KINDS }) 
   return { generation, deletedSince, file: (userId) => stateFor(userId).file };
 }
 
-const RUST_INDEX_OUTBOX_OWNED = 'rust-index-outbox-v1';
+const RUST_INDEX_OUTBOX_OWNED = 'rust-index-outbox-v2';
 module.exports = { OUTBOX_FILE, MAX_ATTEMPTS, createIndexOutbox, RUST_INDEX_OUTBOX_OWNED };

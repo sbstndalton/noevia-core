@@ -1281,6 +1281,7 @@ async function handleRequestInner(req, res) {
   if (require('./rust-model-downloads-read.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   if (await modelDownloadsFacts(req, res)) return;
   if (require('./rust-autotune-read.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
+  if (await embeddingOwner.handleSourceChanged(req, res, json)) return;
   if (embeddingOwner.handle(req, res, json)) return;
   if (require('./rust-preset-read.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   if (await presetReadBridge(req, res)) return;
