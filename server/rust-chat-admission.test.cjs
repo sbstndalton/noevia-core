@@ -7,7 +7,7 @@
 const assert = require('node:assert/strict');
 const http = require('node:http');
 const test = require('node:test');
-const { createAdmissionRoutes, PREFIX } = require('./inference-admission-lease.cjs');
+const { createAdmissionRoutes, createAdmission, PREFIX } = require('./inference-admission-lease.cjs');
 const { createMaintenanceGate } = require('./inference-maintenance.cjs');
 const front = require('./rust-chat-admission.cjs');
 const { json, readJson } = require('./http.cjs');
@@ -157,4 +157,17 @@ test('a gate lease the front stops renewing ends by itself and gives the count b
   await settled(150);
   assert.equal(gate.active(), 0);
   assert.equal(routes.leases.size(), 0);
+});
+
+test('review P2-2: the gate opening as the front goes away gives the count back, whatever comes first', async () => {
+  // Deterministic: the gate lets the call in and the abort lands before the admission's continuation resumes.
+  const gate = createMaintenanceGate();
+  const abort = new AbortController();
+  const modelManager = {
+    enterInference: gate.enter,
+    enterInferenceWithin: async () => { const leave = gate.enter(); abort.abort(); return leave; },
+  };
+  const admit = createAdmission({ modelManager, admitEngineModel: async () => {} });
+  await assert.rejects(admit({ gate: 'chat' }, abort.signal));
+  assert.equal(gate.active(), 0, 'no gate count is left behind');
 });

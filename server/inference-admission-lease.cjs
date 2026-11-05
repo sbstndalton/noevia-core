@@ -77,8 +77,10 @@ function createAdmission({ modelManager, admitEngineModel, chatMachines = null, 
     let leave;
     try { leave = await chatAdmission.enterChatInference(modelManager, { waitMs: Math.min(gateWaitMs, chatAdmission.CHAT_GATE_WAIT_MS), signal }); }
     catch (e) { throw Object.assign(e, { status: e.status || 503, publicMessage: e.message }); }
-    signal?.throwIfAborted?.();
-    return { headers: null, gate: route, release: typeof leave === 'function' ? leave : () => {} };
+    const release = typeof leave === 'function' ? leave : () => {};
+    // The front went away as the gate let it in (review P2-2): give the count back before refusing.
+    if (signal?.aborted) { release(); signal.throwIfAborted(); }
+    return { headers: null, gate: route, release };
   }
   return (ask, signal) => {
     const text = (v) => typeof v === 'string' && v.length > 0 && v.length <= 1024;
