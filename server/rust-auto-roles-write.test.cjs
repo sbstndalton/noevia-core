@@ -5,17 +5,18 @@ const { createModelRoutes } = require('./routes/models.cjs');
 const { createBridge } = require('./rust-auto-roles-write.cjs');
 
 test('#2408 a disconnect before commit cannot consume the final invalidation', async () => {
-  let release, started, invalidations = 0;
+  let release, started, value = 'old';
+  const cache = require('./short-read.cjs').createSharedRead(async () => value, 60000);
   const pending = new Promise(r => { release = r; }), entered = new Promise(r => { started = r; });
   const route = createModelRoutes({ json() {}, env: { MODEL_LOADER_URL: 'http://synthetic.invalid' }, modelManager: {},
-    readBody: async () => '{}', fetchJson: async () => { started(); await pending; return { ok: true, status: 200, body: {} }; },
-    service: { modelScanCache: { clear() {} }, invalidateModelReads() { invalidations++; } } });
+    readBody: async () => '{}', fetchJson: async () => { started(); await pending; value = 'new'; return { ok: true, status: 200, body: {} }; },
+    service: { modelScanCache: { clear() {} }, invalidateModelReads() { cache.clear(); } } });
   const res = new EventEmitter(); res.setHeader = () => {};
   const done = route({ method: 'POST' }, res, { path: '/api/model-manager/noop', authn: { user: { role: 'admin' } }, url: new URL('http://localhost/api/model-manager/noop') });
   await entered; res.emit('close');
-  const beforeCommit = invalidations;
+  assert.equal(await cache.get(), 'old', 'the read in the gap sees the pre-commit state');
   release(); await done;
-  assert.ok(invalidations > beforeCommit, 'must invalidate after the mutation actually commits');
+  assert.equal(await cache.get(), 'new', 'the read in the gap must not remain cached after commit');
 });
 
 test('native warm bridge authenticates, rechecks admin and invokes the existing trigger in user scope', async () => {
