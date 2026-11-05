@@ -28,7 +28,7 @@ jobs:
           # Immutable acceptance input for the native embedding/outbox/media owner.
           # Its compiled features include rust-media-background-v1, required by Core boot.
           # Acceptance input only; release ancestry and checksum gates are unchanged.
-          ref: 76c9f705876593e021bc7392fefb1b209130456d
+          ref: d30fb58a09073f6dc081654fd2771c77df9e9380
           path: rs
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
