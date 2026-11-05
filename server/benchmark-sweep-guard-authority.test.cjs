@@ -42,7 +42,7 @@ test('recovery: chat is closed behind a barrier through the outage, and the hold
   assert.deepEqual(seen.slice(1), ['closed', 'closed', 'closed', 'closed', 'closed'], 'chat closed after the first outage answer');
   assert.throws(() => gate.enter(), (e) => e.message === SWEEP_PAUSE_REASON, 'now held by the adopted sweep');
   assert.equal(guard.active(), true, 'the sweep is watched');
-  assert.equal(seen[0], 'open', 'before the outage was known, chat was not yet closed');
+  assert.equal(seen[0], 'closed', 'restart barrier precedes the first await');
 });
 
 test('recovery: a sweep that finishes during the outage lifts the barrier and adopts nothing', async () => {
@@ -59,16 +59,18 @@ test('recovery: a sweep that finishes during the outage lifts the barrier and ad
   assert.ok(logs.some((l) => /finished while chat was paused/.test(l)), logs.join('\n'));
 });
 
-test('recovery: an outage past the sweep\'s own time bound lifts the barrier', async () => {
-  let t = 0;
+test('recovery: outage past a local bound retains the barrier until terminal acknowledgement', async () => {
+  let t = 0, calls = 0;
   const gate = createMaintenanceGate();
   const { guard } = harness({
     hold: () => { t += 1000; throw outage(); },
-    progress: async () => ({ ok: true, body: { job: { active: true, unit: 'models', total: 1 } } }),
-    barrier: (r) => gate.barrier(r), now: () => t, perModelMs: 2000, slackMs: 0,
+    progress: async () => { calls++; if (calls > 6) return {ok:true,body:{job:{active:false}}};
+      if(calls > 3) assert.throws(()=>gate.enter(), e=>e.status===503);
+      return {ok:true,body:{job:{active:true,unit:'models',total:1}}}; },
+    barrier:r=>gate.barrier(r),now:()=>t,perModelMs:2000,slackMs:0,
   });
-  assert.equal(await guard.adopt(), false);
-  gate.enter()();
+  assert.equal(await guard.adopt(),false);
+  assert.ok(t>2000);gate.enter()();
 });
 
 test('delta P1: a lease lost while a sweep runs keeps chat closed until the sweep reports it is over', async () => {

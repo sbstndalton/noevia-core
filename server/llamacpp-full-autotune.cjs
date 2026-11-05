@@ -951,12 +951,18 @@ function createFullAutotuner({ request: engineRequest, rawModels: engineRawModel
     // The engine is idle here (the recovery's settle step). Restore only our own version; an operator's
     // later edit stands, and the router re-reads whatever models.ini holds now.
     if (presets.snapshot().revision === rec.revision) {
+      maintenance?.assertCovered?.();
       await presets.commit({ baseRevision: rec.revision, text: rec.text }, rec.backedUp ? { backup: false } : undefined);
       j._revision = presets.snapshot().revision;
     }
+    j._reloadPending = true; save();
+    maintenance?.assertCovered?.();
     if (!(await invalidateBaseline('autotune'))) throw Error('The preset reload baseline did not acknowledge the restore.');
     const reload = await request('/models?reload=1', {}, 120000);
     if (!reload.ok) throw Error('The router did not confirm restored settings.');
+    maintenance?.assertCovered?.();
+    for (const item of j.models || []) for (const phase of item.phases || []) if (phase._beforeText != null) { delete phase._beforeText; phase.restored = true; }
+    delete j.originalText;
     delete j._recovery; j._reloadPending = false; j._unsafe = false; j.restored = true;
     note(j, 'Settings an interrupted tune left behind were restored, and the model server re-read them.');
     save();
@@ -1038,7 +1044,7 @@ function createFullAutotuner({ request: engineRequest, rawModels: engineRawModel
   function scheduleReload(j, tries = 0) {
     clearTimeout(reloadTimer);
     if (!j._reloadPending) return;
-    if (tries > 120) { note(j, 'The model server has not re-read the restored models.ini; it does so before this model next loads.'); return; }
+    if (tries > 120) { try { note(j, 'The model server has not re-read the restored models.ini; it does so before this model next loads.'); } catch { /* The durable job may be unavailable during shutdown; the re-read remains owed. */ } return; }
     reloadTimer = setTimeout(async () => {
       if (!j._reloadPending) return;
       if ((await othersLiveNow(j.model)) === false) {
@@ -1667,11 +1673,44 @@ function createFullAutotuner({ request: engineRequest, rawModels: engineRawModel
     return { applied: true };
   }
   // A trial left unrestored by an earlier process keeps chat closed from the start.
-  if (state.job?._recovery) queueMicrotask(() => requireTrialRecovery(state.job));
+  // Register synchronously during construction, before the listener can admit chat.
+  function armStartupRecovery(j) {
+    if (!j || !recoverable()) return false;
+    if (!j._recovery) {
+      const phase = j.models?.flatMap(m => m.phases || []).find(p => p._beforeText != null);
+      const text = phase?._beforeText ?? j.originalText;
+      if (text != null || j._reloadPending) {
+        j._recovery = { revision: j._pendingRevision || j._revision || j.lastRevision,
+          text: text ?? presets.snapshot().text, backedUp: !!j._backedUp };
+        save();
+      }
+    }
+    if (!j._recovery) return false;
+    requireTrialRecovery(j);
+    return true;
+  }
+  armStartupRecovery(state.job);
   async function recover() {
     const j = state.job;
-    // A trial an earlier run could not restore after losing its lease: chat stays closed until it is.
-    if (j?._recovery) requireTrialRecovery(j);
+    if (armStartupRecovery(j)) {
+      if (j.status === 'running') {
+        for (const item of j.models || []) if(item.status === 'running') {
+          item.status = 'interrupted';
+          for (const phase of item.phases || []) if(phase.status === 'running') {
+            phase.status = 'interrupted'; phase.reason = 'Restart interrupted this phase.';
+            for(const step of phase.steps || []) if(step.status === 'running') step.status = 'interrupted';
+          }
+        }
+        stoppedAt(j);
+        j.status = 'interrupted'; j.phase = 'Interrupted'; j.finishedAt = now(); j.restored = false;
+        j.error = 'Restart interrupted tuning. Completed settings remain saved.'; save();
+      }
+      await maintenance.recoverNow?.();
+      if(j._recovery && j.restored === false) {
+        j.error = 'Restart interrupted tuning; settings could not safely be restored. Inspect models.ini before resuming.'; save();
+      }
+      return;
+    }
     if (j?._reloadPending) scheduleReload(j);
     if (j) adoptPendingRevision(j);
     if (j?.status !== 'running') return;

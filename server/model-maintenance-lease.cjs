@@ -62,19 +62,23 @@ function cancelledTicket() {
 }
 
 function createLeases({ hold, ttlMs = TTL_MS, hardMs = HARD_MS, maxMs = MAX_MS, log = (m) => console.warn(m), now = () => Date.now(),
-  ticketTombstoneMs = TICKET_TOMBSTONE_MS, ticketTombstones = TICKET_TOMBSTONES }) {
+  ticketTombstoneMs = TICKET_TOMBSTONE_MS, ticketTombstones = TICKET_TOMBSTONES, barrier = null }) {
   const leases = new Map();
   const tombstones = new Map(); // ticket -> expiry, oldest first
+  let inflight = 0;
   const pending = new Map(); // ticket -> the grant being taken under it
-  function tombstoned(ticket) {
-    for (const [k, until] of tombstones) { if (until > now()) break; tombstones.delete(k); }
-    return !!ticket && tombstones.has(ticket);
-  }
+  // Tickets have no enforced arrival lifetime. Never forget a cancellation within this process.
+  // At capacity refuse new admissions rather than resurrecting delayed requests.
+  let saturated = false, unbar = null;
+  function requireRecovery() { if (!unbar && barrier) unbar = barrier(); }
+  function completeRecovery() { const lift = unbar; unbar = null; lift?.(); }
+  function tombstoned(ticket) { return !!ticket && tombstones.has(ticket); }
   function end(id, why) {
     const lease = leases.get(id);
     if (!lease) return false;
     leases.delete(id);
     clearTimeout(lease.timer);
+    if (why) requireRecovery();
     lease.release();
     if (why) log(`[models] the front's maintenance lease ${why}; chat and tuning may run again`);
     return true;
@@ -88,11 +92,13 @@ function createLeases({ hold, ttlMs = TTL_MS, hardMs = HARD_MS, maxMs = MAX_MS, 
     lease.timer.unref?.();
   }
   const grantOf = (id, lease) => ({ lease: id, ttlMs, renewMs: Math.min(RENEW_MS, Math.max(1, Math.floor(ttlMs / 3))), hardMs: lease.cap });
-  async function take(requested, ticket) {
+  async function take(requested, ticket, state, recovery=false) {
     const cap = capFor(requested, hardMs, maxMs);
-    const release = await hold();
+    inflight++;
+    let release;
+    try { release = await hold({recovery}); } finally { inflight--; }
     // A DELETE that came while the hold was being taken: give it back at once.
-    if (tombstoned(ticket)) { release(); throw cancelledTicket(); }
+    if (state?.cancelled || tombstoned(ticket)) { release(); throw cancelledTicket(); }
     const id = crypto.randomBytes(16).toString('hex');
     const lease = { release, timer: null, hardAt: now() + cap, cap, ticket: ticket || null };
     leases.set(id, lease);
@@ -102,16 +108,20 @@ function createLeases({ hold, ttlMs = TTL_MS, hardMs = HARD_MS, maxMs = MAX_MS, 
   return {
     /** Takes the hold, or rejects as hold() does (409 while busy); 410 for a ticket already given back.
      *  One ticket is one latch: a repeated ask returns the grant taken (or being taken) under it. */
-    async acquire(requested, ticket) {
+    async acquire(requested, ticket, recovery=false) {
       if (tombstoned(ticket)) throw cancelledTicket();
       if (ticket) {
         for (const [id, lease] of leases) if (lease.ticket === ticket) return grantOf(id, lease);
-        if (pending.has(ticket)) return pending.get(ticket);
-        const taking = take(requested, ticket).finally(() => pending.delete(ticket));
-        pending.set(ticket, taking);
+        if (pending.has(ticket)) return pending.get(ticket).promise;
+        if (saturated || inflight >= ticketTombstones) throw unavailable();
+        const state = { cancelled: false, promise: null };
+        const taking = take(requested, ticket, state, recovery).finally(() => pending.delete(ticket));
+        state.promise = taking;
+        pending.set(ticket, state);
         return taking;
       }
-      return take(requested, null);
+      if (saturated || inflight >= ticketTombstones) throw unavailable();
+      return take(requested, null, null, recovery);
     },
     renew(id) {
       const lease = leases.get(id);
@@ -124,13 +134,14 @@ function createLeases({ hold, ttlMs = TTL_MS, hardMs = HARD_MS, maxMs = MAX_MS, 
      *  and remembers the ticket (bounded) so a grant that lands later is refused or given back. */
     releaseTicket(ticket) {
       if (!ticket) return false;
-      tombstoned(null); // prune expired
-      tombstones.delete(ticket);
-      tombstones.set(ticket, now() + ticketTombstoneMs);
-      while (tombstones.size > ticketTombstones) tombstones.delete(tombstones.keys().next().value);
+      const state = pending.get(ticket);
+      if (state) state.cancelled = true;
+      if (tombstones.has(ticket) || tombstones.size < ticketTombstones) tombstones.set(ticket, true);
+      else saturated = true;
       for (const [id, lease] of leases) if (lease.ticket === ticket) return end(id, null);
       return false;
     },
+    requireRecovery, completeRecovery,
     size: () => leases.size,
   };
 }
@@ -282,7 +293,8 @@ function readAsk(req) {
       let ask;
       try { ask = JSON.parse(text); } catch { return finish(null); }
       if (!ask || typeof ask !== 'object' || Array.isArray(ask)) return finish(null);
-      if (Object.keys(ask).some((k) => k !== 'maxMs' && k !== 'ticket')) return finish(null);
+      if (Object.keys(ask).some((k) => k !== 'maxMs' && k !== 'ticket' && k !== 'recovery')) return finish(null);
+      if (Object.hasOwn(ask, 'recovery') && typeof ask.recovery !== 'boolean') return finish(null);
       if (Object.hasOwn(ask, 'ticket') && !(typeof ask.ticket === 'string' && /^[0-9a-f]{32}$/.test(ask.ticket))) return finish(null);
       if (Object.hasOwn(ask, 'maxMs') && !Number.isSafeInteger(ask.maxMs)) return finish(null);
       finish(ask);
@@ -299,11 +311,16 @@ function createLeaseRoutes({ secret, hold, json, ...options }) {
     if (target !== PREFIX && !target.startsWith(`${PREFIX}/`)) return false;
     const notFound = () => { json(res, 404, { error: 'Not found' }); return true; };
     if (!trusted(req) || !leases) return notFound();
+    if (target === `${PREFIX}/recovery`) {
+      if (req.method === 'POST') { leases.requireRecovery(); json(res, 204, null); return true; }
+      if (req.method === 'DELETE') { leases.completeRecovery(); json(res, 204, null); return true; }
+      return notFound();
+    }
     if (target === PREFIX) {
       if (req.method !== 'POST') return notFound();
       const ask = await readAsk(req);
       if (!ask) { json(res, 400, { error: 'maxMs must be a whole number of milliseconds.' }); return true; }
-      try { json(res, 201, await leases.acquire(ask.maxMs, ask.ticket)); }
+      try { json(res, 201, await leases.acquire(ask.maxMs, ask.ticket, ask.recovery===true)); }
       catch (e) {
         if (e?.status === 409) json(res, 409, { error: e.message, chatActive: e.chatActive === true });
         else if (e?.status === 410) json(res, 410, { error: e.message, code: 'ticketCancelled' });

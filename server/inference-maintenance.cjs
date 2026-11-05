@@ -32,13 +32,14 @@ function createMaintenanceGate({ remote = null, log = (line) => console.log(line
     Promise.resolve(remote.ready()).then(()=>{bootFenced=false;wake();},()=>{});
   }
   // Review P2 (sweep recovery): chat barriers that close admission without being a hold (hold() ignores them).
-  let barriers=0,barrierReason='';
+  let barriers=0,recoveryBarriers=0,barrierReason='';
   // The coverage of a lease of the front's authority while one is held (nativeHolding).
   let coverage=null;
   // Delta review P1: work whose lease was lost may have left the engine mid-step (a load or unload the
   // router may still be running, a trial preset). Until a recovery has run under a fresh, valid lease
   // (the settle step: the engine confirmed idle; then each registered repair), chat and new maintenance
   // stay closed. Recovery is driven here, with backoff, without a restart.
+  const recoveryWaiters=new Set();
   const recoveries=new Map(); // key -> repair(ctx) or null (settle only)
   let settle=null,recovering=false,recoveryTimer=null,recoveryDelay=0,recoveryReason='';
   // sbstndalton/noevia#2210: a hold another client took at the gate (the Rust front's reload, calibration or
@@ -173,7 +174,7 @@ function createMaintenanceGate({ remote = null, log = (line) => console.log(line
   // Holds the gate until release() for work that outlives one request (calibration jobs).
   // Throws (rejects, with a gate) a 409 while requests are in flight or the gate is held.
   function hold(message,{recovery=false}={}) {
-    if(maintenance||(recoveries.size&&!recovery))throw busy();
+    if(maintenance||((recoveries.size||recoveryBarriers)&&!recovery))throw busy();
     // chatActive: only this process's own requests are running (they end on their own).
     if(active)throw Object.assign(busy(),{chatActive:true});
     if(absent())return holding(message,null);
@@ -187,8 +188,8 @@ function createMaintenanceGate({ remote = null, log = (line) => console.log(line
   }
   // Row J: a hold of this process's own admission only (the latch a lease of the Rust front's authority
   // takes: that lease is already the authority's, so it is not asked again). Same 409s as hold().
-  function holdLocal(message) {
-    if(maintenance||recoveries.size)throw busy();
+  function holdLocal(message,{recovery=false}={}) {
+    if(maintenance||recoveries.size||(recoveryBarriers&&!recovery))throw busy();
     if(active)throw Object.assign(busy(),{chatActive:true});
     return holding(message,null);
   }
@@ -197,7 +198,7 @@ function createMaintenanceGate({ remote = null, log = (line) => console.log(line
     const deadline=Date.now()+timeoutMs;
     for(;;) {
       if(signal?.aborted)throw Object.assign(Error('Cancelled'),{cancelled:true});
-      if(!maintenance&&!active&&!recoveries.size){
+      if(!maintenance&&!active&&!recoveries.size&&!recoveryBarriers){
         if(absent())return holding(message,null);
         // The gate waits for other clients' work to end (bounded, in slices so a cancel is prompt);
         // this process's own chat may still start meanwhile, as without a gate.
@@ -211,13 +212,13 @@ function createMaintenanceGate({ remote = null, log = (line) => console.log(line
         if(granted!==undefined){
           // A chat turn of this process (or another hold) started while the gate was asked: give
           // the gate's hold back and wait again.
-          if(!maintenance&&!active&&!recoveries.size)return grantedHold(message,granted);
+          if(!maintenance&&!active&&!recoveries.size&&!recoveryBarriers)return grantedHold(message,granted);
           if(granted)void remote.releaseMaintenance(granted.token);
         }
       }
       const remaining=deadline-Date.now();
       if(remaining<=0)throw Object.assign(Error('Timed out waiting for chat to become idle.'),{idleTimeout:true});
-      if(!maintenance&&!active&&!recoveries.size&&!absent())continue;
+      if(!maintenance&&!active&&!recoveries.size&&!recoveryBarriers&&!absent())continue;
       await new Promise((resolve,reject)=>{
         let timer;
         const done=()=>{clearTimeout(timer);waiting.delete(done);signal?.removeEventListener('abort',abort);resolve();};
@@ -226,7 +227,7 @@ function createMaintenanceGate({ remote = null, log = (line) => console.log(line
         timer=setTimeout(done,remaining);
         if(signal?.aborted){abort();return;}
         // Recheck after registering, so a release between hold() and registration cannot strand us.
-        if(!maintenance&&!active&&!recoveries.size)done();
+        if(!maintenance&&!active&&!recoveries.size&&!recoveryBarriers)done();
       });
     }
   }
@@ -263,6 +264,7 @@ function createMaintenanceGate({ remote = null, log = (line) => console.log(line
       log(`[models] recovery from interrupted model maintenance did not finish (${e?.message||e}); chat stays paused and it is tried again`);
     }finally{
       recovering=false;
+      for(const done of recoveryWaiters)done();recoveryWaiters.clear();
       // A recovery lease that was itself lost re-adds the settle step (release above).
       try{release?.();}catch{}
       if(ok&&!recoveries.size){recoveryDelay=0;recoveryReason='';log('[models] recovery from interrupted model maintenance finished; chat may run again');wake();}
@@ -333,10 +335,15 @@ function createMaintenanceGate({ remote = null, log = (line) => console.log(line
     // The settle step every recovery runs first (the manager: the engine confirmed idle).
     setRecoverySettle(fn) { settle=typeof fn==='function'?fn:null; },
     recoveryPending: () => recoveries.size>0,
+    async recoverNow() {
+      if(recovering)await new Promise(resolve=>recoveryWaiters.add(resolve));
+      else await runRecovery();
+    },
     // Review P2: closes chat admission without holding (a sweep recovering its hold). Release once.
-    barrier(message) {
+    barrier(message,{recovery=false}={}) {
+      if(recovery)recoveryBarriers++;
       barriers++;barrierReason=message||barrierReason;let done=false;
-      return ()=>{if(done)return;done=true;barriers--;if(!barriers)barrierReason='';wake();};
+      return ()=>{if(done)return;done=true;barriers--;if(recovery)recoveryBarriers--;if(!barriers)barrierReason='';wake();};
     },
     // Read-only: inference requests in flight (#1785: the chat title skips a busy engine).
     active: () => active,

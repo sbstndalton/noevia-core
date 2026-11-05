@@ -420,11 +420,11 @@ test('P2 a calibration on a fresh native lease with the production TTL and defau
 });
 
 test('P1 a calibration stream in flight when the lease is lost is aborted; chat stays closed until recovery confirms the engine idle',async t=>{
-  let tripped=false,abortedInFlight=false;
+  let tripped=false,abortedInFlight=false,atLoss=0;
   let a;
   const f=await nativeFixture(t,{loadCap:131072,onStream:async signal=>{
     if(tripped)return;
-    tripped=true;a.setRenew('ended');
+    tripped=true;atLoss=f.router.calls.length;a.setRenew('ended');
     await new Promise(resolve=>{if(signal?.aborted)resolve();signal?.addEventListener('abort',resolve,{once:true});setTimeout(resolve,5000);});
     abortedInFlight=signal?.aborted===true;
   }},{coverageMarginMs:50,recoveryRetryMs:20,recoveryPollMs:5},{ttlMs:600,renewMs:100});
@@ -434,7 +434,7 @@ test('P1 a calibration stream in flight when the lease is lost is aborted; chat 
   const job=await settled(manager);
   assert.equal(abortedInFlight,true,'the stream carried the loss signal');
   assert.notEqual(job.status,'passed');
-  const after=router.calls.length;
+  const after=atLoss;
   a.setRenew('ok');
   assert.ok(await (async()=>{for(let i=0;i<500;i++){if(!manager.maintenanceHeld())return true;await pause(10);}return false;})(),'recovered');
   assert.ok(router.calls.slice(after).includes('/models')||router.calls.length>after,'the recovery checked the engine');

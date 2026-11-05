@@ -278,18 +278,16 @@ test('ticket: one ticket is one latch (idempotent POST), and another ticket\'s l
   assert.equal(gate.held(), false);
 });
 
-test('ticket: tombstones are bounded in count and lifetime', async (t) => {
+test('ticket: bounded retention fails closed rather than forgetting admissible cancellations', async (t) => {
   let clock = 0;
   const { post, del } = await latchRoutes(t, { now: () => clock, ticketTombstoneMs: 1000, ticketTombstones: 4 });
-  const tk = (i) => i.toString(16).padStart(32, '0');
-  for (let i = 1; i <= 6; i++) assert.equal((await del(tk(i))).status, 204);
-  // The two oldest were dropped (count bound): a POST with them is granted; the newest is still refused.
-  assert.equal((await post(tk(6))).status, 410);
-  const old = await post(tk(1));
-  assert.equal(old.status, 201);
-  assert.equal((await del(tk(1))).status, 204);
-  clock += 1001; // lifetime bound
-  assert.equal((await post(tk(6))).status, 201);
+  const tk = i => i.toString(16).padStart(32,'0');
+  for(let i=1;i<=6;i++)assert.equal((await del(tk(i))).status,204);
+  assert.equal((await post(tk(1))).status,410);
+  assert.equal((await post(tk(6))).status,503);
+  clock+=1001;
+  assert.equal((await post(tk(1))).status,410);
+  assert.equal((await post(tk(7))).status,503);
 });
 
 test('a cancelled wait for the authority takes nothing and rejects as cancelled', async (t) => {

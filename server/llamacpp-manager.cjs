@@ -812,9 +812,10 @@ function createLlamaCppManager({ budgetWatchDir = null, baseUrl, apiKey, fetchJs
     // #873: the throughput sweep runs outside this process; the proxy holds the gate while it runs.
     // Throws a 409 when requests are in flight or the gate is already held; with the inference
     // gate as the authority (#2187) it returns a promise of the release instead (callers await it).
-    holdMaintenance: reason => maintenance.hold(reason),
+    holdMaintenance: (reason, options) => maintenance.hold(reason, options),
     // Row J: the latch the Rust front's lease takes (model-maintenance-lease.cjs createLeaseRoutes).
-    holdMaintenanceLocal: reason => maintenance.holdLocal(reason),
+    maintenanceBarrier: reason => maintenance.barrier(reason,{recovery:true}),
+    holdMaintenanceLocal: (reason, options) => maintenance.holdLocal(reason, options),
     // Row J review: the coverage check of this process's lease, and a chat barrier (sweep recovery).
     assertMaintenanceCovered: stepMs => maintenance.assertCovered(stepMs),
     maintenanceCoverageSignal: () => maintenance.coverageSignal(),

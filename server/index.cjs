@@ -1288,7 +1288,8 @@ const toolboxPickerFacts = require('./rust-toolbox-picker-facts.cjs').createTool
 
 // Row J: a lease of the front's authority pauses this process's chat through this latch (a local-only hold).
 const maintenanceLeases = require('./model-maintenance-lease.cjs').createLeaseRoutes({
-  secret: FRONT_SECRET, json, hold: typeof modelManager.holdMaintenanceLocal === 'function' ? () => modelManager.holdMaintenanceLocal() : null,
+  barrier: () => modelManager.maintenanceBarrier('Interrupted maintenance is being recovered.'),
+  secret: FRONT_SECRET, json, hold: typeof modelManager.holdMaintenanceLocal === 'function' ? options => modelManager.holdMaintenanceLocal(undefined, options) : null,
 });
 
 // #2303: the front's calibration loads ask this process's load decision (overBudget) first.
