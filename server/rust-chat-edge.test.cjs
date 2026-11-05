@@ -66,7 +66,8 @@ test('index.cjs: a call the front\'s admission lease covers enters no gate; no l
   assert.equal(/chatEdge\.leases|relay==='gate'/.test(top), false);
   assert.match(source, /^const chatEdge = require\('\.\/rust-chat-edge\.cjs'\);$/m);
   assert.equal(/llmRateLimit|createRateLimiter|rateLimited:|markGateRefused/.test(source), false);
-  for (const route of ['routes/chat.cjs', 'routes/diary.cjs']) {
+  // routes/diary.cjs left this process with the local exchange (rust-diary-local-exchange.cjs).
+  for (const route of ['routes/chat.cjs', 'routes/diary.cjs'].filter((r) => fs.existsSync(path.join(__dirname, r)))) {
     assert.equal(/rateLimited|429/.test(fs.readFileSync(path.join(__dirname, route), 'utf8')), false, route);
   }
 });
