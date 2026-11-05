@@ -87,6 +87,7 @@ function createDiaryRoutes({ json, readBody, readJson, fetchJson, DIARY_BASE, au
       const gone = new AbortController();
       const onClose = () => { if (!res.writableEnded) gone.abort(); };
       res.once?.('close', onClose);
+      if (res.destroyed || req.socket?.destroyed) gone.abort();
       let r;
       try { r = await reach(res, () => diaryFetchJson(`${DIARY_BASE}/api${suffix}`, { method: req.method, body, storageRetry, signal: gone.signal }, local ? 600000 : 60000), gone.signal); }
       finally { res.removeListener?.('close', onClose); }
