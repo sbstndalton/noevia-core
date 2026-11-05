@@ -41,7 +41,7 @@ const documentSources = require('./document-sources.cjs');
 const { TOOL_RESULT_CAP, TOOL_PREFILL_TARGET_MS, estimateToolTokens, toolCapFor, createToolboxes } = require('./toolboxes.cjs');
 const { createVisionProbe } = require('./vision.cjs');
 const { createModelManager } = require('./model-manager.cjs');
-const { createAuth, createRateLimiter } = require('./auth.cjs');
+const { createAuth } = require('./auth.cjs');
 const { createWorkspaceStore } = require('./workspace.cjs');
 const { createSecretStore } = require('./secrets.cjs');
 const { isPublicUrl, createEndpointApproved } = require('./ssrf.cjs');
@@ -200,17 +200,9 @@ const workspaceStore = createWorkspaceStore(DATA_DIR, { id: DEFAULT_PROVIDER_ID,
   // The Rust front deletes accounts (rust-admin-users.cjs): a workspace is never made for a user the database no longer has.
   userExists: (userId) => !!authService.db.prepare('SELECT 1 FROM users WHERE id=?').get(userId) });
 
-// Per-user throttle for LLM-backed routes. Every hit is a full model call
-// against the shared inference endpoint, so one member (or a runaway client)
-// must not be able to hog it. Fixed window, shared bucket across chat and
-// diary conversations. Admins are throttled like everyone else. Raise
-// LLM_RATE_LIMIT for a beefier inference host.
-const LLM_RATE_LIMIT = Math.max(1, Number(process.env.LLM_RATE_LIMIT || 60));
-const LLM_RATE_WINDOW_MS = 60 * 1000;
-const llmRateLimiter = createRateLimiter();
-function llmRateLimited(userId) {
-  return llmRateLimiter.rateLimited(`llm:${userId}`, LLM_RATE_LIMIT, LLM_RATE_WINDOW_MS);
-}
+// Chat port S6: the per-user `llm:` budget that chat and the Diary local exchange share (LLM_RATE_LIMIT a minute) is
+// the Rust front's (rust-chat-edge.cjs); this process keeps no limiter for it.
+const chatEdge = require('./rust-chat-edge.cjs');
 const requestScope = new AsyncLocalStorage();
 function currentWorkspace() {
   const workspace = requestScope.getStore()?.workspace;
@@ -769,8 +761,9 @@ const budgetWatchBridge = require('./rust-budget-watch.cjs').createBudgetWatchBr
 // ── Deep research (#2218): the Rust front's (rust-research.cjs); what its jobs still need from this process ──
 const inferenceAdmission = require('./inference-admission-lease.cjs').createAdmissionRoutes({
   secret: FRONT_SECRET, modelManager, admitEngineModel, chatMachines, json, readJson,
-  // The front's Diary local exchange (rust-diary-local-exchange.cjs): the chat throttle and the backfill's pause.
-  diaryExchange: { rateLimited: (userId) => llmRateLimited(userId), foreground: () => rag.foreground() },
+  // The front's Diary local exchange (rust-diary-local-exchange.cjs): the backfill's pause. Its share of the `llm:`
+  // budget is counted by the front (chat port S6, rust-chat-edge.cjs), so the lease charges nothing here.
+  diaryExchange: { foreground: () => rag.foreground() },
 });
 const researchBridge = require('./rust-research-bridge.cjs').createResearchBridge({
   secret: FRONT_SECRET, json, readJson,
@@ -1094,9 +1087,9 @@ const { handleChat } = require('./chat.cjs').createChatHandler({
   // #659: the Google Drive writes name the Drive file they change on the approval card.
   writeTargetFor: (name, rawArgs, { user }) => (driveTools.names.has(name) ? driveTools.describeTarget(user, name, rawArgs) : null),
 });
-// POST /api/chat: rate limit, body cap and the Diary gate, then the loop (routes/chat.cjs).
+// POST /api/chat: body cap and the Diary gate, then the loop (routes/chat.cjs); the front answered them first (S6).
 const chatRoutes = require('./routes/chat.cjs').createChatRoutes({
-  json, readBody, bodyCap: STORED_HISTORY_BYTES, rateLimited: (userId) => llmRateLimited(userId),
+  json, readBody, bodyCap: STORED_HISTORY_BYTES,
   diaryEnabled: (userId) => authService.diaryEnabled(userId), handleChat,
   // Cowork sessions (#236) start a task on the existing code path; the route guards admin and the flag.
   harnessEnabled: () => features.enabled('codeHarness'),
@@ -1554,14 +1547,16 @@ async function handleRequest(req,res) {
   // #1896: a chat turn waits a moment (<= 3 s) for a briefly held gate, then answers a retryable 503 and logs its reason.
   const chatAdmission=require('./chat-admission.cjs');
   const aborted=new AbortController();res.once('close',()=>aborted.abort());
-  try {if(inference)leave=await chatAdmission.enterChatInference(modelManager,{signal:aborted.signal});}
+  // Chat port S6: a call the front already took the gate for adopts that hold (rust-chat-edge.cjs leases).
+  const adopted=inference&&relay!=='gate'?chatEdge.leases.adopt(req,relay==='turn'?'chat':pathname===chatEdge.LOCAL_EXCHANGE?'diary':''):null;
+  try {if(adopted)leave=adopted;else if(inference)leave=await chatAdmission.enterChatInference(modelManager,{signal:aborted.signal});}
   catch(error){
     const status=error.status||503;
     if(pathname==='/api/chat'&&status===503){chatAdmission.log503('maintenance');res.setHeader('Retry-After','3');return json(res,503,chatAdmission.refusalBody(error));}
     return json(res,status,{error:error.message});
   }
   // The front's probe of the gate alone, for a request it refuses (401/403): Node's gate answers first.
-  if(relay==='gate'){if(leave)leave();res.statusCode=204;res.end();return;}
+  if(relay==='gate'){const ask=require('./rust-chat-turn.cjs').relayedGate(req);if(ask&&ask.hold)return chatEdge.leases.hold(res,ask.route,leave);if(leave)leave();res.statusCode=204;res.end();return;}
   if(leave){res.once('finish',leave);res.once('close',leave);}
   // #1881: while a chat or Diary turn runs, the long-document backfill makes no embed request (rag.cjs foreground).
   if(inference){const fg=rag.foreground();res.once('finish',fg);res.once('close',fg);}

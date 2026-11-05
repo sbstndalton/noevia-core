@@ -14,7 +14,8 @@
 //   /api/profile/diary-connectors/{id}  DELETE
 //
 // The local exchange moved after these (rust-diary-local-exchange.cjs): the front relays it and holds this
-// process's model throttle and inference gate through its admission lease. The paths the web client does not
+// process's inference gate through its admission lease; its share of the `llm:` budget is the front's (chat port S6,
+// rust-chat-edge.cjs). The paths the web client does not
 // name (history, files, file, workspace-trash, external-sources, entries/edit) are not in the front's route
 // table and stay here.
 //
