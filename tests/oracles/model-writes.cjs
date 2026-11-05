@@ -106,8 +106,10 @@ async function main() {
       output.gates.push({method,path,spec,...result});
     }
     const f=routes({installed:[{name:'ok'}],sections:[{name:'ok',hasFile:true}]});
-    const result=await f.call(method,path,{},'admin','{');
-    output.malformed.push({method,path,...result});
+    for(const rawText of ['{','',' ']){
+      const result=await f.call(method,path,{},'admin',rawText);
+      output.malformed.push({method,path,rawText,...result});
+    }
   }
   fs.writeFileSync(process.argv[2],JSON.stringify(output,null,2)+'\n');
 }
