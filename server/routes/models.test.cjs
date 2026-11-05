@@ -77,8 +77,7 @@ test('every write under /api/models/ is refused for members before anything else
   const f = fixture();
   assert.equal(await f.call('POST', '/api/models/anything-at-all'), true);
   assert.deepEqual(f.sent.pop(), { status: 403, body: { error: 'administrator required' } });
-  assert.equal(await f.call('HEAD', '/api/models/downloads'), true, 'the legacy HEAD stays open to members');
-  assert.deepEqual(f.sent.pop(), { status: 200, body: [{ id: 'j1', model: 'm', progress: 0.4, status: 'running' }] });
+  assert.equal(await f.call('HEAD', '/api/models/downloads'), false, 'the front owns the residual HEAD');
   assert.equal(await f.call('GET', '/api/model'), false);
   assert.equal(await f.call('DELETE', '/api/auto-roles'), false, 'an unhandled method keeps falling through');
 });
@@ -89,8 +88,7 @@ test('the roles round-trip and warm up; the front\'s model reads are not answere
   // before this module); nothing here answers them.
   assert.equal(await f.call('GET', '/api/models/capabilities', undefined, 'admin'), false);
   assert.equal(await f.call('GET', '/api/models/hardware', undefined, 'admin'), false);
-  await f.call('PUT', '/api/models/hardware', {}, 'admin');
-  assert.deepEqual(f.sent.pop(), { status: 405, body: { error: 'Method not allowed' } }, 'the hardware path\'s other methods keep their 405');
+  assert.equal(await f.call('PUT', '/api/models/hardware', {}, 'admin'), false);
   // The GET is the Rust front's (#2190 close-out, rust-auto-roles.cjs); the PUT is still this module's.
   await f.call('GET', '/api/auto-roles');
   assert.deepEqual(f.sent.pop(), { status: 503, body: AUTO_ROLES_REFUSAL });
@@ -252,8 +250,7 @@ test('any write under /api/models/ drops the scan, and pull/delete/load keep the
   const off = fixture({ enabled: false });
   await off.call('POST', '/api/models/load', { name: 'm' }, 'admin');
   assert.deepEqual(off.sent.pop(), { status: 404, body: { error: 'model management is disabled' } });
-  await off.call('HEAD', '/api/models/downloads');
-  assert.deepEqual(off.sent.pop(), { status: 200, body: [] });
+  assert.equal(await off.call('HEAD', '/api/models/downloads'), false);
 });
 
 test('engine-specific routes say what is unavailable and guard the method', async () => {
@@ -274,8 +271,7 @@ test('engine-specific routes say what is unavailable and guard the method', asyn
   assert.deepEqual(f.sent.pop(), { status: 403, body: { error: 'Administrator required for shared model profiles' } });
   await f.call('GET', '/api/models/mtp-artifact', undefined, 'member', '?repo=bad');
   assert.deepEqual(f.sent.pop(), { status: 400, body: { error: 'Invalid repository' } });
-  await f.call('POST', '/api/models/installed', undefined, 'admin');
-  assert.equal(f.sent.pop().status, 405, 'only the front lists, and it lists on GET');
+  assert.equal(await f.call('POST', '/api/models/installed', undefined, 'admin'), false, 'the residual method is no longer composed here');
   const native = fixture({ manager: { autotune: { statusFacts: () => assert.fail('Node must not compose public GET status') } } });
   await native.call('GET', '/api/models/autotune', undefined, 'admin', '?model=m');
   assert.deepEqual(native.sent.pop(), { status: 405, body: { error: 'Method not allowed' } });
@@ -512,13 +508,11 @@ test('GET of the estimate and the suggestion is the Rust front\'s; their other m
   const seen = [];
   const f = fixture({ manager: { estimateMemory: async (m) => { seen.push(m); return { ok: true, status: 200, body: {} }; }, suggestPreset: async (m) => { seen.push(m); return { ok: true, status: 200, body: {} }; } } });
   for (const p of ['/api/models/estimate', '/api/models/preset/suggest']) {
-    await f.call('HEAD', p, undefined, 'member', '?model=m');
-    assert.deepEqual(f.sent.pop(), { status: 403, body: { error: 'Administrator required for shared model profiles' } }, p);
+    assert.equal(await f.call('HEAD', p, undefined, 'member', '?model=m'), false);
     await f.call('POST', p, {}, 'member', '?model=m');
     assert.deepEqual(f.sent.pop(), { status: 403, body: { error: 'administrator required' } }, p);
     for (const m of ['POST', 'PUT', 'HEAD']) {
-      await f.call(m, p, {}, 'admin', '?model=m');
-      assert.deepEqual(f.sent.pop(), { status: 405, body: { error: 'Method not allowed' } }, `${m} ${p}`);
+      assert.equal(await f.call(m, p, {}, 'admin', '?model=m'), false, `${m} ${p}`);
     }
   }
   assert.deepEqual(seen, [], 'no manager sizing call is left in the route');
@@ -1067,18 +1061,16 @@ test('download GET pairs an exact refusal with bounded trusted adapter facts', a
   assert.deepEqual(ignored.body, { kind: 'listing', rows: [{ fields: { id: 'small', model_name: 'm', status: 'done', percent: 25 } }] });
   assert.doesNotThrow(() => JSON.stringify(ignored.body));
   const legacy = fixture({ manager: { downloads: async () => ({ ok: true, body: ignoredBody }) } });
-  await legacy.call('HEAD', '/api/models/downloads');
-  assert.equal(JSON.stringify(legacy.sent.pop().body),
-    '[{"id":"small","model":"m","progress":0.25,"status":"done"}]');
+  assert.equal(await legacy.call('HEAD', '/api/models/downloads'), false);
+  assert.equal(legacy.sent.length, 0);
   const unicode = String.fromCodePoint(0x10f800, 0x10ffff);
   assert.equal((await facts([{ id: unicode }])).body.rows[0].fields.id, unicode);
   const selectedDeep = JSON.parse('['.repeat(200) + '0' + ']'.repeat(200));
   assert.equal((await facts([{ id: selectedDeep }])).body.rows[0].fields.id, selectedDeep);
   const selectedBody = [{ id: unicode, model: selectedDeep }];
   const legacySelected = fixture({ manager: { downloads: async () => ({ ok: true, body: selectedBody }) } });
-  await legacySelected.call('HEAD', '/api/models/downloads');
-  assert.equal(JSON.stringify(legacySelected.sent.pop().body),
-    JSON.stringify([{ id: unicode, model: selectedDeep, progress: null, status: '' }]));
+  assert.equal(await legacySelected.call('HEAD', '/api/models/downloads'), false);
+  assert.equal(legacySelected.sent.length, 0);
   assert.equal(JSON.stringify((await facts(selectedBody)).body.rows[0].fields),
     JSON.stringify({ id: unicode, model: selectedDeep }));
   const polled = polls;

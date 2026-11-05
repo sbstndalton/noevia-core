@@ -462,13 +462,7 @@ function createModelRoutes({ servedEmbeddingModels = (target) => require('../rag
     }
     // #2303: every method of /api/models/calibration is owned by the Rust front.
 
-    // GET /api/models/preset/suggest and GET /api/models/estimate are the Rust front's (#2189,
-    // noevia-rs model_sizing.rs; rust-model-sizing.cjs refuses them before authentication). Their
-    // other methods keep Node's answers: the administrator check, then 405.
-    if (p === '/api/models/preset/suggest' || p === '/api/models/estimate') {
-      if(authn.user.role!=='admin')return json(res,403,{error:'Administrator required for shared model profiles'});
-      return json(res,405,{error:'Method not allowed'});
-    }
+    // Sizing-method residuals are refused at the front ownership boundary.
 
     // #697: the inference memory budget (admin setting). The GET is the Rust front's (#2262, rust-model-state-reads.cjs); the
     // PUT stays here with the figure this process enforces and the audit.
@@ -504,22 +498,15 @@ function createModelRoutes({ servedEmbeddingModels = (target) => require('../rag
       return json(res,result.status,result.body);
     }
 
-    // #2187: GET /api/models/capabilities and GET /api/models/hardware are the Rust front's
-    // (rust-models.cjs refuses them before authentication). The hardware path's other methods keep
-    // their 405 here; the capabilities path never had other methods (they fall through).
-    if (p === '/api/models/hardware' && req.method !== 'GET') return json(res,405,{error:'Method not allowed'});
-
-    // #1662: what each model-backed service uses, for every signed-in user (read-only for members).
-    if (p === '/api/models/assignments') return json(res, 405, { error: 'method not allowed' });
+    // Configuration-read and assignment residuals are refused at the front ownership boundary.
 
     // #1665: the reranker's runtime switch. Administrators only, for reading too (the options name what this
     // server can rerank with); CSRF/origin run before routes. GET -> { enabled, choice, source, options };
     // PUT { enabled, choice? } saves (audited, applies at once); DELETE or PUT { reset: true } returns to the
     // deployment's configuration. No address is ever sent: a choice is an id the server maps to its address.
-    if (p === '/api/models/reranker') {
+    if (p === '/api/models/reranker' && ['GET', 'PUT', 'DELETE'].includes(req.method || 'GET')) {
       if (authn.user.role !== 'admin') return json(res, 403, { error: 'administrator required' });
       if (!rerankSettings) return json(res, 503, { error: 'Reranker settings are unavailable.' });
-      if (!['GET', 'PUT', 'DELETE'].includes(req.method || 'GET')) return json(res, 405, { error: 'method not allowed' });
       let installed = null;
       try { installed = await modelsInstalled(); } catch { installed = null; }
       if (!Array.isArray(installed)) installed = null;
@@ -537,15 +524,13 @@ function createModelRoutes({ servedEmbeddingModels = (target) => require('../rag
 
     // #1695: idempotent cleanup of presets whose model file is gone (the web runs it when the
     // admin's list has any; a release may call it too). POST only, admin only (guarded above).
-    if (p === '/api/models/prune-missing') {
-      if (req.method !== 'POST') return json(res, 405, { error: 'method not allowed' });
+    if (p === '/api/models/prune-missing' && req.method === 'POST') {
       if (!modelManager.enabled) return json(res, 404, { error: 'model management is disabled' });
       const r = await pruneMissingPresets();
       return json(res, r.status, r.ok ? { removed: r.removed, kept: r.kept, reloaded: r.reloaded } : { error: r.error, ...(r.code ? { code: r.code } : {}), ...(r.retryable ? { retryable: true } : {}) });
     }
 
-    // The GET is the Rust front's (#2262). Another method used to get the list too; it is refused like any other unknown method.
-    if (p === '/api/models/installed') return json(res, 405, { error: 'Method not allowed' });
+    // Installed-list residual methods are refused at the front ownership boundary.
 
     if (p === '/api/models/mtp-artifact' && req.method === 'GET') {
       const repo = url.searchParams.get('repo') || '';
@@ -719,21 +704,6 @@ function createModelRoutes({ servedEmbeddingModels = (target) => require('../rag
           ...(verb === 'unload' && refusal.code === 'model_in_use' ? { canForce: modelManager.gateAdmin?.() === true } : {}) });
         return json(res, 502, { error: `${verb} failed: ${r.status}` });
       }
-    }
-
-    // Exact GET is native; retain the historical behavior for other methods.
-    if (p === '/api/models/downloads' && req.method !== 'GET') {
-      if (!modelManager.enabled) return json(res, 200, []);
-      const r = await modelManager.downloads();
-      if (!r.ok) return json(res, 502, {error:'Download status unavailable'});
-      const arr = Array.isArray(r.body) ? r.body : r.body?.jobs || r.body?.downloads || [];
-      // Lemonade reports `percent` as 0-100; the UI expects a 0-1 fraction.
-      return json(res, 200, arr.map((j) => ({
-        id: j.id || j.job_id || '',
-        model: j.model_name || j.model || j.checkpoint || '',
-        progress: typeof j.percent === 'number' ? j.percent / 100 : typeof j.progress === 'number' ? j.progress : null,
-        status: j.status || j.state || '',
-      })));
     }
 
     return PASS;

@@ -31,13 +31,5 @@ test('index.cjs refuses the route before authentication; the Node list and its c
   const index = fs.readFileSync(path.join(__dirname, 'index.cjs'), 'utf8');
   const at = index.indexOf("require('./rust-provider-models.cjs').refuseOwned(req, res, { parseRequestUrl, json })");
   assert.ok(at > 0 && at < index.indexOf('const preAuth = requestAuth.authenticate(req);'));
-  const routes = fs.readFileSync(path.join(__dirname, 'routes', 'providers.cjs'), 'utf8');
-  assert.doesNotMatch(routes, /modelLists|lastRefresh|providerModels|modelIdsFrom|\/v1\/models/);
-  const { createProviderRoutes } = require('./routes/providers.cjs');
-  const sent = [];
-  const routesFn = createProviderRoutes({ json: (_res, status, body) => { sent.push({ status, body }); } });
-  return routesFn({ method: 'GET' }, {}, { path: '/api/providers/mine/models', authn: { user: { id: 'u', role: 'admin' } } }).then((handled) => {
-    assert.equal(handled, true);
-    assert.deepEqual(sent.pop(), { status: 503, body: owned.ROUTE_REFUSAL }, 'a bypass is refused, never fetched');
-  });
+  assert.equal(fs.existsSync(path.join(__dirname, 'routes', 'providers.cjs')), false, 'the fallback mount is retired');
 });
