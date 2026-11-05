@@ -1,0 +1,39 @@
+'use strict';
+const { test } = require('node:test');
+const assert = require('node:assert/strict');
+const fs = require('node:fs'), path = require('node:path'), os = require('node:os');
+const { execFileSync } = require('node:child_process');
+const { createCodeWorkspaces } = require('../../code-workspace.cjs');
+const taskId = '11111111-1111-4111-8111-111111111111';
+const otherId = '22222222-2222-4222-8222-222222222222';
+test('workspace oracle captures clone saving, pinned cleanup and interrupted recovery', () => {
+  const dir = fs.mkdtempSync(path.join(process.env.TASK_WORKSPACE_EVIDENCE || os.tmpdir(), 'workspace-oracle-'));
+  const environment = { PATH: process.env.PATH, HOME: dir, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_SYSTEM: '/dev/null' };
+  const run = (args, cwd) => execFileSync('git', args, { cwd, env: environment, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 10000 }).trim();
+  try {
+    const repo = path.join(dir, 'repo');fs.mkdirSync(repo);
+    run(['init', '--quiet', '--initial-branch=main'], repo);
+    fs.writeFileSync(path.join(repo, 'file.txt'), 'original');
+    run(['add', '--all'], repo);
+    run(['-c', 'user.name=synthetic', '-c', 'user.email=synthetic@invalid', 'commit', '--quiet', '-m', 'base'], repo);
+    const storeDir = path.join(dir, 'account');fs.mkdirSync(storeDir);
+    const treeRoot = path.join(dir, 'trees');
+    const options = { dir: storeDir, treeRoot, owner: { uid: process.getuid(), gid: process.getgid() }, epoch: 'first', now: () => 1234 };
+    const store = createCodeWorkspaces(options);
+    const claim = store.claim({ taskId, repoPath: repo, capabilities: ['read_repository', 'edit_file'], domains: ['example.com'], pinned: ['engine-config.json'] });
+    const created = { taskId: claim.taskId, branch: claim.branch, status: claim.status, mode: claim.mode, baseBranch: claim.baseBranch, capabilities: claim.capabilities, domains: claim.domains, pinned: claim.pinned, epoch: claim.epoch, claimedAt: claim.claimedAt, hasBase: /^[0-9a-f]{40}$/.test(claim.baseSha) };
+    fs.writeFileSync(path.join(claim.path, 'file.txt'), 'changed');
+    fs.writeFileSync(path.join(claim.path, 'engine-config.json'), 'synthetic credential placeholder');
+    const released = store.release({ taskId });
+    const saved = { status: released.status, error: released.error, releasedAt: released.releasedAt, changedHead: released.headSha !== released.baseSha, saved: run(['show', `${claim.branch}:file.txt`], repo), original: fs.readFileSync(path.join(repo, 'file.txt'), 'utf8'), treeRemoved: !fs.existsSync(claim.path), homeRemoved: !fs.existsSync(claim.home) };
+    assert.equal(saved.status, 'released');assert.equal(saved.saved, 'changed');assert.equal(saved.original, 'original');
+    assert.equal(saved.treeRemoved, true);assert.equal(saved.homeRemoved, true);
+    const next = store.claim({ taskId: otherId, repoPath: repo, pinned: ['engine-config.json'] });
+    fs.writeFileSync(path.join(next.path, 'engine-config.json'), 'synthetic credential placeholder');
+    const restarted = createCodeWorkspaces({ ...options, epoch: 'second', now: () => 5678 });
+    const [recovered] = restarted.recover();
+    const recovery = { status: recovered.status, interruptedAt: recovered.interruptedAt, pinnedDropped: recovered.pinnedDropped, treeKept: fs.existsSync(next.path), pinRemoved: !fs.existsSync(path.join(next.path, 'engine-config.json')) };
+    assert.deepEqual(recovery, { status: 'interrupted', interruptedAt: 5678, pinnedDropped: true, treeKept: true, pinRemoved: true });
+    if (process.env.TASK_WORKSPACE_EVIDENCE) fs.writeFileSync(path.join(process.env.TASK_WORKSPACE_EVIDENCE, 'task-workspace-node.json'), JSON.stringify({ created, saved, recovery }, null, 2) + '\n');
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
