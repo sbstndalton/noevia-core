@@ -2,7 +2,8 @@
 const assert = require('node:assert/strict');
 const test = require('node:test');
 const { OWNED_ROUTES, ROUTE_REFUSAL, refuseOwned } = require('./rust-preset-write.cjs');
-const { createPresetWriteEffects, PATH } = require('./rust-preset-write-effects.cjs');
+const { createPresetWriteEffects, PATH, MAX_BODY } = require('./rust-preset-write-effects.cjs');
+const { EventEmitter } = require('node:events');
 const parseRequestUrl = req => new URL(req.url, 'http://localhost');
 
 test('exactly PUT /api/models/preset is refused before authentication; every other method and path stays Node\'s', () => {
@@ -60,4 +61,26 @@ test('the cache drop is for the trusted front only and drops both model caches',
   assert.equal(await handle(request(), {}), true);
   assert.deepEqual(sent, { status: 200, body: { ok: true } });
   assert.deepEqual(calls, ['scan', 'reads']);
+});
+
+test('a trusted caller that streams too much or never ends cannot hold the handler: it answers at once and the connection is cut', async () => {
+  const calls = [];
+  let sent;
+  const handle = createPresetWriteEffects({
+    secret: 'secret',
+    json: (_res, status, body) => { sent = { status, body }; },
+    service: { modelScanCache: { clear: () => calls.push('scan') }, invalidateModelReads: () => calls.push('reads') },
+  });
+  const stream = Object.assign(new EventEmitter(), { url: PATH, method: 'POST', socket: { remoteAddress: '127.0.0.1' }, headers: { 'x-noevia-store-token': 'secret' }, destroyed: 0 });
+  stream.destroy = () => { stream.destroyed += 1; };
+  const res = Object.assign(new EventEmitter(), { setHeader() {} });
+  // The handler returns without waiting for the body, which has not ended.
+  assert.equal(await handle(stream, res), true);
+  assert.deepEqual(sent, { status: 200, body: { ok: true } });
+  assert.deepEqual(calls, ['scan', 'reads']);
+  stream.emit('data', Buffer.alloc(MAX_BODY));
+  assert.equal(stream.destroyed, 0, 'up to the cap is tolerated');
+  stream.emit('data', Buffer.alloc(1));
+  assert.equal(stream.destroyed, 1, 'past the cap the connection is cut');
+  res.emit('close');
 });
