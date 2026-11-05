@@ -133,6 +133,10 @@ test('enabled egress is a fail-closed client of the native issuer: it publishes 
     // No front to ask: refused at boot like any bad profile (index.cjs needs the store anyway).
     assert.throws(() => startEgressFromEnv({ ...env, NOEVIA_PROJECT_STORE_PORT: '' }), /unavailable/);
     assert.throws(() => startEgressFromEnv({ ...env, NOEVIA_PROJECT_STORE_TOKEN: 'short' }), /unavailable/);
+    // index.cjs removes the secret from process.env at start and hands it over explicitly.
+    const { NOEVIA_PROJECT_STORE_PORT: _p, NOEVIA_PROJECT_STORE_TOKEN: _t, ...bare } = env;
+    assert.equal(startEgressFromEnv(bare, { store: { port: 19021, token: store.NOEVIA_PROJECT_STORE_TOKEN } }).impl, 'rust-controlled');
+    assert.throws(() => startEgressFromEnv(bare), /unavailable/);
     assert.equal(JSON.stringify(logs).includes('synthetic-store-token'), false);
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });

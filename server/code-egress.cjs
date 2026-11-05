@@ -15,7 +15,7 @@ const DEFAULT_GRANT_LIFETIME_MS = 2 * 60 * 60 * 1000; // near a real task; a los
  * outage); the front validates the same profile and does the issuing. `store` is the internal store
  * the front serves on loopback (port and secret from the web supervisor).
  */
-function startEgressFromEnv(env = process.env, { log = () => {}, fetchImpl } = {}) {
+function startEgressFromEnv(env = process.env, { log = () => {}, fetchImpl, store = null } = {}) {
   const rawPort = String(env.CODE_EGRESS_PORT || '').trim();
   if (!rawPort || rawPort === '0') return null;
   const unavailable = () => Object.assign(Error('Native egress configuration is unavailable.'), { code: 'EGRESS_UNAVAILABLE', status: 503 });
@@ -33,7 +33,8 @@ function startEgressFromEnv(env = process.env, { log = () => {}, fetchImpl } = {
   const file = String(env.CODE_EGRESS_CONTROL_KEY_FILE || '');
   const path = require('node:path');
   if (!path.isAbsolute(file) || path.resolve(file) !== file || file.includes('\0')) throw unavailable();
-  const port = Number(env.NOEVIA_PROJECT_STORE_PORT), token = String(env.NOEVIA_PROJECT_STORE_TOKEN || '');
+  // index.cjs takes the secret out of process.env at start (#1916) and hands it over here; tests pass it in env.
+  const port = Number(store ? store.port : env.NOEVIA_PROJECT_STORE_PORT), token = String(store ? store.token : env.NOEVIA_PROJECT_STORE_TOKEN || '');
   const client = (() => {
     try { return require('./code-egress-client.cjs').createEgressClient({ port, token, endpoint: `${host}:${rawPort}`, log, ...(fetchImpl ? { fetchImpl } : {}) }); }
     catch { throw unavailable(); }
