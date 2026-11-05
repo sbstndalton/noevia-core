@@ -3,8 +3,14 @@ const test=require('node:test'),assert=require('node:assert/strict'),fs=require(
 const {spawn}=require('node:child_process');
 const {startProjectStore,syntheticFrontBin}=require('./project-store-server.cjs');
 const SERVER=path.resolve(__dirname,'../../server/index.cjs');
+// A real boot needs the server's better-sqlite3 and dav-parse.wasm; skipped without them unless
+// DAV_PARSE_WASM_REQUIRED=1 (CI sets it), as in embedding-owner-boot.test.cjs.
+const davParseWasm=require('../../server/dav-parse-wasm.cjs');
+const serverRequire=require('node:module').createRequire(path.join(__dirname,'..','..','server','package.json'));
+const noSqlite=(()=>{try{serverRequire.resolve('better-sqlite3');return false;}catch{return 'better-sqlite3 not installed here';}})();
+const skipBoot=noSqlite||(!fs.existsSync(process.env.DAV_PARSE_WASM||davParseWasm.DEFAULT_WASM)&&process.env.DAV_PARSE_WASM_REQUIRED!=='1'&&'dav-parse.wasm not built');
 for(const entry of ['main','ready','handler']) for(const paired of [false,true]) {
-  test(`auto-roles real boot ${entry}: ${paired?'paired':'half-pair refused'}`,{timeout:30000},async t=>{
+  test(`auto-roles real boot ${entry}: ${paired?'paired':'half-pair refused'}`,{timeout:30000,skip:skipBoot},async t=>{
     const root=fs.mkdtempSync(path.join(os.tmpdir(),'roles-boot-')),data=path.join(root,'data');fs.mkdirSync(data);
     const store=await startProjectStore(data); if(!paired) store.failNext(404,{error:'not found'},{url:'/v1/auto-roles/proof',times:100});
     const ini=path.join(root,'models.ini');fs.writeFileSync(ini,'version = 1\n');
