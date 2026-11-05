@@ -81,10 +81,11 @@ test('the admission lease refusal now carries the gate\'s retryable flag the pub
   const { GateError } = require('./inference-gate-client.cjs');
   const x = exchange();
   const routes = createAdmissionRoutes({
+    authority: { current: () => ({ epoch: "e".repeat(32), incarnation: 1 }) },
     secret: SECRET, json: x.json, readJson: async () => ({ model: 'm' }),
     modelManager: { enterInference: () => () => {}, acquireLease: async () => { throw new GateError({ code: 'inference_queue_full', status: 503, retryable: true, message: 'Synthetic queue full.' }); } },
   });
   const res = new EventEmitter(); res.writableEnded = false; res.destroy = () => {};
-  await routes.handle(request('POST', '/internal/inference-admission/lease', { 'x-noevia-store-token': SECRET }), res);
+  await routes.handle(request('PUT', '/internal/inference-admission/lease/' + 'a'.repeat(32), { 'x-noevia-store-token': SECRET, 'x-noevia-admission-epoch': 'e'.repeat(32), 'x-noevia-admission-incarnation': '1' }), res);
   assert.deepEqual(x.sent, [{ status: 503, body: { error: 'Synthetic queue full.', code: 'inference_queue_full', retryable: true } }]);
 });
