@@ -100,8 +100,10 @@ function createDiary({ fs, path, fetchJson, DIARY_BASE, DIARY_TOKEN, DIARY_TENAN
   }
 
   /** fetchJson against the sidecar with tenant headers and the 428 retry. */
-  function diaryFetchJson(url, { method = 'GET', body, storageRetry = false } = {}, timeoutMs) {
-    return withStorageCredential((secret) => fetchJson(url, { method, headers: diaryHeaders(method, url, { secret, body, storageRetry }), body }, timeoutMs));
+  function diaryFetchJson(url, { method = 'GET', body, storageRetry = false, signal } = {}, timeoutMs) {
+    // `signal`: the caller's request going away (chat port S8 review: the front closes the call when its admission lease
+    // is lost), which ends the sidecar call instead of letting it run to its timeout.
+    return withStorageCredential((secret) => fetchJson(url, { method, headers: diaryHeaders(method, url, { secret, body, storageRetry }), body, ...(signal ? { signal } : {}) }, timeoutMs));
   }
 
   // ── Corpus-source adapter (Diary tab reads) ────────────────────────────────

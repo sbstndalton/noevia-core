@@ -28,7 +28,7 @@ function createDiaryRoutes({ json, readBody, readJson, fetchJson, DIARY_BASE, au
   const { diaryHeaders, corpusSource } = diary;
   const log = diary.log || ((line) => console.info(line));
   // Older fakes pass only diaryHeaders; fall back to a single send without the 428 retry.
-  const diaryFetchJson = diary.diaryFetchJson || ((url, { method = 'GET', body, storageRetry = false } = {}, timeoutMs) => fetchJson(url, { method, headers: diaryHeaders(method, url, { body, storageRetry }), body }, timeoutMs));
+  const diaryFetchJson = diary.diaryFetchJson || ((url, { method = 'GET', body, storageRetry = false, signal } = {}, timeoutMs) => fetchJson(url, { method, headers: diaryHeaders(method, url, { body, storageRetry }), body, ...(signal ? { signal } : {}) }, timeoutMs));
 
   // #2232: a Diary that cannot be reached is a status the page can word, not a bare 500. The call
   // throws (connection refused, a stalled reply); nothing of the error is passed on.
@@ -39,8 +39,10 @@ function createDiaryRoutes({ json, readBody, readJson, fetchJson, DIARY_BASE, au
   // ERR_SOCKET_CONNECTION_TIMEOUT: Node documents it as no address answering within the family auto-selection timeout, a connect timeout (#2255).
   const NETWORK = /^(E[A-Z0-9]+|EAI_[A-Z]+|UND_ERR_[A-Z_]+|ERR_SOCKET_CONNECTION_TIMEOUT)$/;
   const isUnreachable = (e) => e?.name === 'AbortError' || e?.name === 'TimeoutError' || (e instanceof TypeError && NETWORK.test(String(e.cause?.code || '')));
-  const reach = async (res, call) => {
+  const reach = async (res, call, gone) => {
     try { return await call(); } catch (e) {
+      // The caller went away: nobody is left to answer.
+      if (gone?.aborted) return null;
       log(`[diary] sidecar call failed: ${e?.name || 'Error'}${e?.cause?.code ? ' ' + e.cause.code : ''}${isUnreachable(e) ? ' (unavailable)' : ' (internal)'}`);
       if (isUnreachable(e)) { unavailable(res); return null; }
       throw e;
@@ -80,7 +82,14 @@ function createDiaryRoutes({ json, readBody, readJson, fetchJson, DIARY_BASE, au
       // #1198: live QA could not tell whether a Retry press reached this point. Method, route and the
       // account's id only: no path, no storage address, no credential.
       if (storageRetry) log(`[diary] forwarding X-Cowork-Storage-Retry: 1 (${req.method} ${p}, user ${authn.user.id})`);
-      const r = await reach(res, () => diaryFetchJson(`${DIARY_BASE}/api${suffix}`, { method: req.method, body, storageRetry }, local ? 600000 : 60000));
+      // Chat port S8 review: the caller going away (for the local exchange: the front closing the call because its
+      // admission lease was lost, so the gate no longer counts it) ends the sidecar call at once, not after 600 s.
+      const gone = new AbortController();
+      const onClose = () => { if (!res.writableEnded) gone.abort(); };
+      res.once?.('close', onClose);
+      let r;
+      try { r = await reach(res, () => diaryFetchJson(`${DIARY_BASE}/api${suffix}`, { method: req.method, body, storageRetry, signal: gone.signal }, local ? 600000 : 60000), gone.signal); }
+      finally { res.removeListener?.('close', onClose); }
       if (!r) return;
       if (r.ok) {
         // #1589: an explicit Retry that works proves the saved login is good, so automatic calls resume.
