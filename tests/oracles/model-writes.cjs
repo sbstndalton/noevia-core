@@ -60,6 +60,10 @@ async function main() {
     {name:'preset-failed',body:{seconds:900},preset:'failed'},
     {name:'pending',body:{seconds:900},pending:true},
     {name:'applied-mismatch',body:{seconds:900},mismatch:true},
+    {name:'ignored-deep',rawBody:'{"seconds":900,"ignored":'+ '['.repeat(512)+'0'+']'.repeat(512)+'}'},
+    {name:'ignored-overflow',rawBody:'{"seconds":900,"ignored":1e400}'},
+    {name:'ignored-surrogate',rawBody:'{"seconds":900,"ignored":"\\ud800"}'},
+    {name:'ignored-private-use',rawBody:JSON.stringify({seconds:900,ignored:String.fromCodePoint(0x100000)})},
   ];
   for (const spec of idleCases) {
     let chosen=1800;
@@ -76,7 +80,7 @@ async function main() {
       presetsInRouter:async()=>`[*]\nsleep-idle-seconds = ${spec.mismatch?300:chosen}\n`,
     });
     let status=200,body;
-    try{body=await setting.save(spec.body,'synthetic');}
+    try{body=await setting.save(spec.rawBody===undefined?spec.body:JSON.parse(spec.rawBody),'synthetic');}
     catch(e){status=e.status||500;body={error:e.status?e.message:'Could not change the idle unload time',...(e.errorId?{errorId:e.errorId}:{}),...(e.minSeconds?{minSeconds:e.minSeconds,maxSeconds:e.maxSeconds}:{})};}
     output.idle.push({spec,status,body,calls});
   }
