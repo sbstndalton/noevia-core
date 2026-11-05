@@ -160,8 +160,11 @@ featureRuntime = require('./feature-runtime.cjs').createFeatureRuntime({
 });
 // One initial barrier, shared by real startup and the existing imported request API.
 // Ordinary enabled/flags/describe never initiate an RPC or bypass the live lease.
-let featureStartup=null;
-const readyFeatures=()=>featureStartup ||= featureRuntime.ready();
+let featureStartup=null, autoRolesProof=null;
+// The native auto-roles write pairing proof is remembered once established or definitively
+// refused; a busy or unreachable store is not, so the next request asks again.
+const autoRolesReady=()=>autoRolesProof ||= PROJECT_STORE.autoRolesReady().catch((err)=>{ if (err && err.code==='PROJECTS_BUSY') autoRolesProof=null; throw err; });
+const readyFeatures=()=>Promise.all([featureStartup ||= featureRuntime.ready(), autoRolesReady()]);
 
 const featureRoutes = require('./routes/features.cjs').createFeatureRoutes({ json });
 // Settings → Data: the signed-in user's conversations as a ZIP (routes/export.cjs).
@@ -436,10 +439,8 @@ require('./models-ini-writer.cjs').reportModelsIniWriter({ mode: process.env.MOD
 // default, the auto-router roles, the manager service call and the cached folder scan (models.cjs).
 const modelService = require('./models.cjs').createModelService({
   fetchJson, env: process.env, modelManager, currentWorkspace,
-  // Auto-roles are per workspace: a deleted model's role reference must be cleared out of
-  // every workspace's config, not just whichever one happened to make the delete request.
-  listWorkspaces: () => authService.listUsers().map((u) => workspaceStore.get(u.id)),
   roleOnMachine: (role) => !!chatMachines.target(role),
+  autoRolesWriter: (user, name) => PROJECT_STORE.clearAutoRoles(user, name),
 });
 const { autoRoles, ensureRolesLoaded, servedCatalogue, modelsInstalled, lastLoadedModel } = modelService;
 
@@ -1277,9 +1278,15 @@ function publicHeaders(res) {
   res.setHeader('Permissions-Policy', 'camera=(), microphone=(), geolocation=(), payment=(), usb=(), serial=(), bluetooth=(), hid=(), midi=(), magnetometer=(), gyroscope=(), accelerometer=()');
 }
 
+const autoRolesWriteBridge = require('./rust-auto-roles-write.cjs').createBridge({
+  secret: FRONT_SECRET, json, readJson, service: modelService,
+  asUser: diaryAsUser, user: id => authService.db.prepare('SELECT role FROM users WHERE id=?').get(id),
+});
 async function handleRequestInner(req, res) {
   // The ownership refusals below answer before handleRequestScoped; they carry the same headers.
   publicHeaders(res);
+  if (require('./rust-auto-roles-write.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
+  if (await autoRolesWriteBridge(req, res)) return;
   if (require('./rust-tool-approvals.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   if (require('./rust-idle-unload-read.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   if (await idleUnloadFacts(req, res)) return;
