@@ -28,6 +28,7 @@ function routes({ installed, sections, reload = { ok: true, status: 200, body: {
       if (m && init.method === 'DELETE' && Number(m[2]) === presets.length) { presets = presets.filter((x) => x.name !== decodeURIComponent(m[1])); return { ok: true, status: 200, body: {} }; }
       return { ok: false, status: 409, body: {} };
     },
+    idleUnload: {save: async()=>({})},
     env: { MODEL_LOADER_URL: 'http://loader.invalid', RERANK_MODEL: 'tiny-reranker' }, modelManager,
     getProvider: () => ({}), providerHeaders: () => ({}), DEFAULT_PROVIDER_ID: 'default',
     createVisionProbe: () => async () => ({ supported: true }),
@@ -36,17 +37,17 @@ function routes({ installed, sections, reload = { ok: true, status: 200, body: {
       servedCatalogue: async () => [], modelsInstalled: async () => { listedAt.push(cache.has('models')); return routerRows; }, deriveUserModelName: (c) => c,
       lastLoadedModel: () => null, clearLastLoadedModel: () => {}, clearRoleReferences: () => [] },
   });
-  const call = async (method, p, body) => {
-    const req = Readable.from(body === undefined ? [] : [Buffer.from(JSON.stringify(body))]);
+  const call = async (method, p, body, role = 'admin', rawText) => {
+    const req = Readable.from(rawText !== undefined ? [Buffer.from(rawText)] : body === undefined ? [] : [Buffer.from(JSON.stringify(body))]);
     req.method = method;
-    await handle(req, { setHeader() {} }, { path: p, authn: { user: { id: 'u1', role: 'admin' } }, url: new URL('http://localhost' + p) });
+    await handle(req, { setHeader() {} }, { path: p, authn: { user: { id: 'u1', role } }, url: new URL('http://localhost' + p) });
     return sent.pop();
   };
   return { call, fetched, reloads, listedAt, presets: () => presets.map((p) => p.name), rows: () => routerRows.map((m) => m.name) };
 }
 
 async function main() {
-  const output = { idle: [], prune: [] };
+  const output = { idle: [], prune: [], gates: [], malformed: [] };
   const defaults = { seconds:1800,source:'default',fallbackSeconds:1800,fallbackSource:'default',preset:'written' };
   const idleCases = [
     ...[{},null,[],{seconds:true},{seconds:'300'},{seconds:299},{seconds:86401},{seconds:1.5}].map((body,i)=>({name:`invalid-${i}`,body})),
@@ -91,6 +92,22 @@ async function main() {
   for(const spec of specs){
     const f=routes({...spec,reload:{ok:!spec.pending},manager:spec.busy?{writePresets:async()=>{throw Object.assign(Error('busy'),{holdRefused:true});}}:{}});
     output.prune.push({spec,...await f.call('POST','/api/models/prune-missing')});
+  }
+  const {gate,csrfValid,digest}=require('./model-write-auth-gate.cjs');
+  const {unauthorized}=require('../../server/http.cjs');
+  for(const [method,path] of [['PUT','/api/models/idle-unload'],['POST','/api/models/prune-missing']]){
+    for(const spec of [{role:'none',csrf:true},{role:'member',csrf:true},{role:'admin',csrf:false},{role:'admin',csrf:true,origin:'http://wrong.invalid'}]){
+      let result=null;
+      const req={method,headers:{cookie:'cowork_csrf=csrf',...(spec.csrf?{'x-csrf-token':'csrf'}:{})}};
+      const res={writeHead(status){result={status};},end(body){result.body=JSON.parse(body);}};
+      const authn=spec.role==='none'?null:{legacy:false,user:{id:'u1',role:spec.role},session:{csrf_hash:digest('csrf')}};
+      gate(req,res,path,{authenticate:()=>authn,csrfValid},{originValid:()=>!spec.origin},new Set(),unauthorized,(_res,status,body)=>{result={status,body};});
+      if(!result){const f=routes({installed:[],sections:[]});result=await f.call(method,path,{},spec.role);}
+      output.gates.push({method,path,spec,...result});
+    }
+    const f=routes({installed:[{name:'ok'}],sections:[{name:'ok',hasFile:true}]});
+    const result=await f.call(method,path,{},'admin','{');
+    output.malformed.push({method,path,...result});
   }
   fs.writeFileSync(process.argv[2],JSON.stringify(output,null,2)+'\n');
 }
