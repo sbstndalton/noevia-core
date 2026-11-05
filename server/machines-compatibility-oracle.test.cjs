@@ -25,3 +25,33 @@ test('model identifiers fall through null and missing fields only', () => {
     assert.deepEqual(modelIds({ data: [{ id, model: 'synthetic-model' }] }), []);
   }
 });
+
+test('replacement coercion: String() of the name/address value, ToPrimitive failures and V8 depth', async () => {
+  const { build } = require('./machines-coerce-cases.cjs');
+  const { cases } = await build();
+  const byRaw = raw => cases.find(c => c.input.raw === raw);
+  const byNest = (n, leaf) => cases.find(c => c.input.nest && c.input.nest[0] === n && c.input.nest[1] === leaf);
+  // An own toString that is not callable has no primitive form: a TypeError before anything is saved,
+  // directly, inside arrays and under an escaped key. Own valueOf and nested objects do not matter.
+  for (const raw of ['{"toString":1}', '[{"toString":null}]', '{"toStrin\\u0067":"x"}', '["a",["b",{"toString":1}]]', '[[{"toString":1}]]']) {
+    assert.deepEqual(byRaw(raw).add, { throws: 'TypeError', writes: 0 }, raw);
+  }
+  assert.deepEqual(byRaw('{"valueOf":1}').add, { ok: '[object Object]' });
+  assert.deepEqual(byRaw('{"a":{"toString":1}}').add, { ok: '[object Object]' });
+  assert.deepEqual(byRaw('[1,[2,[null,{"x":{"toString":1}}]]]').add, { ok: '1,2,,[object Object]' });
+  // Deep arrays: String() recurses and V8 throws RangeError far below the 1 MiB body cap.
+  assert.deepEqual(byNest(2500, '"x"').add, { ok: 'x' });
+  assert.deepEqual(byNest(5000, '"x"').add, { throws: 'RangeError', writes: 0 });
+  assert.deepEqual(byNest(100000, '{"toString":1}').coerce, { throws: 'RangeError' });
+  assert.deepEqual(byNest(100, '{"toString":1}').coerce, { throws: 'TypeError' });
+  // A deep array inside an object is never walked.
+  assert.deepEqual(cases.find(c => c.input.inObject === 100000).coerce, { text: 'a,[object Object]' });
+});
+
+test('registry accepts a very deep ignored field in a request', async () => {
+  const rows = new Map();
+  const registry = createInferenceMachines({ store: { get: k => rows.get(k), set: (k, v) => rows.set(k, v) }, audit() {}, log() {} });
+  const body = JSON.parse(`{"action":"add","name":"deep","address":"192.168.1.2","ignored":${'['.repeat(400000)}0${']'.repeat(400000)}}`);
+  const { machine } = await registry.add(body, 'admin');
+  assert.equal(machine.name, 'deep');
+});
