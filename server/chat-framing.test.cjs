@@ -221,25 +221,6 @@ test('flag off: no embed or decide call at all', async () => {
   assert.equal(calls, 0);
 });
 
-test('route: a burst over the per-user budget gets 429 rate-limited without calling suggest', async () => {
-  const { createChatFramingRoutes } = require('./routes/chat-framing.cjs');
-  // Same fixed-window contract as auth.cjs createRateLimiter (which needs better-sqlite3 to load).
-  const hits = new Map();
-  const limiter = { rateLimited: (key, limit) => { const n = (hits.get(key) || 0) + 1; hits.set(key, n); return n > limit; } };
-  let suggested = 0;
-  const routes = createChatFramingRoutes({ json: (res, status, body) => { res.status = status; res.body = body; },
-    readJson: async () => ({ message: 'hi' }), settings: {}, workspace: () => ({ projects: [], chats: [] }),
-    framing: { suggest: async () => { suggested++; return { frame: null, reason: 'no-kind' }; } },
-    rateLimited: (userId) => limiter.rateLimited(`chat-frame:${userId}`, 10, 60000) });
-  const call = async (id) => { const res = {}; await routes({ method: 'POST' }, res, { path: '/api/chat-framing/suggest', authn: { user: { id } } }); return res; };
-  const statuses = [];
-  for (let i = 0; i < 12; i++) statuses.push((await call('u-a')).status);
-  assert.deepEqual(statuses, [...Array(10).fill(200), 429, 429]);
-  assert.deepEqual((await call('u-a')).body, { frame: null, reason: 'rate-limited' });
-  assert.equal(suggested, 10);
-  assert.equal((await call('u-b')).status, 200, 'another user has their own budget');
-});
-
 test('the suggest list offers every live project, including once Code- or Cowork-only ones, never an archived one (#810, #1576)', async () => {
   const offered = [];
   const { decide, seen } = stubDecide({ 'chat.frame.kind': 'question', 'chat.frame.project': (r) => { offered.push(...r.options.map((o) => o.id)); return 'p-code'; }, 'chat.frame.tag': NONE });

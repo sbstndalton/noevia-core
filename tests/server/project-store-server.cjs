@@ -310,13 +310,14 @@ function createHandler(dataDir, token, writes = [], failures = [], { changes = f
     req.on('data', (c) => chunks.push(c));
     req.on('end', async () => {
       try {
-        if (req.method !== 'POST' || !(['/v1/read', '/v1/write','/v1/features/context','/v1/storage/legacy-webdav'].includes(req.url) || HISTORY_OPS.has(req.url))) return send(res, 404, { error: 'not found' });
+        if (req.method !== 'POST' || !(['/v1/read', '/v1/write','/v1/features/context','/v1/storage/legacy-webdav','/v1/auto-roles/proof'].includes(req.url) || HISTORY_OPS.has(req.url))) return send(res, 404, { error: 'not found' });
         if (req.url === '/v1/changes/read' && !changes) return send(res, 404, { error: 'not found' });
         if (req.headers['x-noevia-store-token'] !== token) return send(res, 401, { error: 'unauthorised' });
         const planned = failures.find((f) => f.url === req.url && f.times > 0);
         if (planned) { planned.times -= 1; return send(res, planned.status, planned.body); }
         let body;
         try { body = JSON.parse(Buffer.concat(chunks).toString('utf8')); } catch { return send(res, 400, { error: 'invalid JSON' }); }
+        if(req.url==='/v1/auto-roles/proof')return send(res,200,{capability:'rust-auto-roles-write'});
         if(req.url==='/v1/features/context')return send(res,200,contextReply(body));
         // sbstndalton/noevia#2190 round 4: the legacy WebDAV setup, saved as the front saves it (only
         // while the account has no row or a local one; noevia-rs project_store.rs legacy_webdav).
@@ -354,6 +355,15 @@ function createHandler(dataDir, token, writes = [], failures = [], { changes = f
       }
     });
   };
+}
+
+/** The paired Rust front as the web supervisor installs it, for tests that spawn server/index.cjs: an executable in
+ *  `dir` that answers `noevia-server --features` with the embedding background capability
+ *  (server/rust-embedding-background.cjs), so a real boot pairs; pass its path as NOEVIA_SERVER_BIN. */
+function syntheticFrontBin(dir) {
+  const file = path.join(dir, 'synthetic-noevia-server');
+  fs.writeFileSync(file, `#!/bin/sh\n[ "$1" = --features ] && echo ${require('../../server/rust-embedding-background.cjs').RUST_EMBEDDING_OWNED}\n`, { mode: 0o755 });
+  return file;
 }
 
 /** Starts the store on 127.0.0.1 (port 0 by default); resolves { port, token, server, writes, close }. */
@@ -478,4 +488,4 @@ function rustChatMove(dataDir,user,encodedChat,body) {
   return answer(200,{ok:true,from:out.from.kind==='free'?null:out.from.id,projectId:out.to.kind==='free'?null:out.to.id});
 }
 
-module.exports = { rustChatMove, chatMoveOp, startProjectStore, installProjectStore, createHandler, freePortSync, localTranscripts, historyOp, rustHistorySave, rustChatDelete };
+module.exports = { syntheticFrontBin, rustChatMove, chatMoveOp, startProjectStore, installProjectStore, createHandler, freePortSync, localTranscripts, historyOp, rustHistorySave, rustChatDelete };

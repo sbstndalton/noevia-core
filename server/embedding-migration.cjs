@@ -54,7 +54,7 @@ function clamp(v, dflt, lo, hi) { const n = Number(v); return Number.isFinite(n)
  * @param {() => number} [deps.now]
  * @param {(line:string) => void} [deps.log]
  */
-function createEmbeddingMigration({ config, rag, env = process.env, sleep = (ms) => new Promise((r) => setTimeout(r, ms)), now = Date.now, log = (line) => console.info(line),
+function createEmbeddingMigration({ config, rag, nativeOwner = null, env = process.env, sleep = (ms) => new Promise((r) => setTimeout(r, ms)), now = Date.now, log = (line) => console.info(line),
   servedModels = typeof rag?.servedModels === 'function' ? (t) => rag.servedModels(t) : null }) {
   const duty = clamp(env.EMBEDDING_REINDEX_DUTY, 0.5, 0.05, 1);
   const batch = Math.round(clamp(env.EMBEDDING_REINDEX_BATCH, 4, 1, 16));
@@ -157,6 +157,7 @@ function createEmbeddingMigration({ config, rag, env = process.env, sleep = (ms)
   /** Starts a background pass (or queues one after the pass under way). Never throws. */
   function kick() {
     if (stopped) return running;
+    if (nativeOwner) { nativeOwner.kick(); return null; }
     if (running) { again = true; return running; }
     running = (async () => {
       do {
@@ -197,12 +198,14 @@ function createEmbeddingMigration({ config, rag, env = process.env, sleep = (ms)
 
   function status() {
     const c = config.get();
+    const snapshot = nativeOwner?.snapshot();
     return {
       active: c.active, next: c.next, previous: c.previous, source: c.source,
       coverage: { active: coverageOf(c.active), next: coverageOf(c.next) },
       ...(c.next ? { nextServed: verified.has(keyOf(c.next)) ? true : nextHeld?.key === keyOf(c.next) ? false : null } : {}),
       ...(c.next && nextHeld?.key === keyOf(c.next) ? { nextHeld: { code: nextHeld.code, error: nextHeld.error } } : {}),
-      running: !!running, lastPass, duty, batch, ...(config.damaged ? { damaged: config.damaged } : {}),
+      running: !!running, lastPass, duty, batch,
+      ...(nativeOwner ? { running: snapshot?.running ?? null, lastPass: snapshot?.lastPass ?? null, nextServed: snapshot?.nextServed ?? null, nextHeld: snapshot?.nextHeld ?? null, stale: !snapshot, configValid: snapshot?.configValid ?? null, configInvalid: snapshot?.configInvalid ?? null } : {}), ...(config.damaged ? { damaged: config.damaged } : {}),
     };
   }
 
@@ -213,6 +216,7 @@ function createEmbeddingMigration({ config, rag, env = process.env, sleep = (ms)
     return { ok: sims.every(Number.isFinite) && min >= PARITY_MIN_COSINE, minCosine: Number.isFinite(min) ? Math.round(min * 1e5) / 1e5 : null };
   }
 
+  const locked = (fn) => config.withLock ? config.withLock(fn) : fn();
   return {
     status,
     kick,
@@ -222,18 +226,23 @@ function createEmbeddingMigration({ config, rag, env = process.env, sleep = (ms)
       const r = await check(t);
       if (!r.ok) throw Object.assign(Error(r.error), { status: 409, code: r.code, ...(r.served ? { served: r.served } : {}) });
       verified.set(keyOf(t), now());
-      const before = config.get();
-      const c = config.setNext(t);
-      // A different next replaces an abandoned one: its partial vectors go.
-      if (before.next && !sameIdentity(before.next, c.next) && !sameIdentity(before.next, c.active) && !sameIdentity(before.next, c.previous)) dropEverywhere(before.next);
-      kick();
-      return status();
+      return locked(() => {
+        const before = config.get();
+        const c = config.setNext(t);
+        // A different next replaces an abandoned one: its partial vectors go.
+        if (before.next && !sameIdentity(before.next, c.next) && !sameIdentity(before.next, c.active) && !sameIdentity(before.next, c.previous)) dropEverywhere(before.next);
+        kick();
+        return status();
+      });
     },
     clearNext() {
-      const before = config.get();
-      config.clearNext();
-      if (before.next && !sameIdentity(before.next, before.active) && !sameIdentity(before.next, before.previous)) dropEverywhere(before.next);
-      return status();
+      return locked(() => {
+        const before = config.get();
+        config.clearNext();
+        if (nativeOwner) kick();
+        if (before.next && !sameIdentity(before.next, before.active) && !sameIdentity(before.next, before.previous)) dropEverywhere(before.next);
+        return status();
+      });
     },
     async switchToNext({ force = false } = {}) {
       const c = config.get();
@@ -251,31 +260,38 @@ function createEmbeddingMigration({ config, rag, env = process.env, sleep = (ms)
         const cov = coverageOf(c.next);
         if (!cov.ready) throw Object.assign(Error('The new model has not finished indexing every project yet.'), { status: 409, code: 'notReady', coverage: cov });
       }
-      const displaced = config.previous();
-      const after = config.switchToNext(checked);
-      // An older rollback target is displaced by the new one: its vectors would never be read again.
-      dropIfOrphaned(displaced, after);
-      log(`[embedding] switched to ${c.next.profile}/${c.next.model}${force ? ' (forced)' : ''}; previous ${c.active.profile}/${c.active.model} kept for rollback`);
-      kick();
-      return status();
+      return locked(() => {
+        const displaced = config.previous();
+        const after = config.switchToNext(checked);
+        // An older rollback target is displaced by the new one: its vectors would never be read again.
+        dropIfOrphaned(displaced, after);
+        log(`[embedding] switched to ${c.next.profile}/${c.next.model}${force ? ' (forced)' : ''}; previous ${c.active.profile}/${c.active.model} kept for rollback`);
+        kick();
+        return status();
+      });
     },
     rollback() {
-      const before = config.get();
-      const c = config.rollback();
-      // The re-index that was under way is abandoned by a rollback: no partly built slot stays behind.
-      dropIfOrphaned(before.next, c);
-      log(`[embedding] rolled back to ${c.active.profile}/${c.active.model}`);
-      kick();
-      return status();
+      return locked(() => {
+        const before = config.get();
+        const c = config.rollback();
+        // The re-index that was under way is abandoned by a rollback: no partly built slot stays behind.
+        dropIfOrphaned(before.next, c);
+        log(`[embedding] rolled back to ${c.active.profile}/${c.active.model}`);
+        kick();
+        return status();
+      });
     },
     finish() {
-      const c = config.get();
-      if (!c.previous) throw Object.assign(Error('There is no previous embedding model to remove.'), { status: 409, code: 'noPrevious' });
-      const old = c.previous;
-      config.finish();
-      if (!sameIdentity(old, c.active) && !sameIdentity(old, c.next)) dropEverywhere(old);
-      log(`[embedding] removed ${old.profile}/${old.model} and its vectors`);
-      return status();
+      return locked(() => {
+        const c = config.get();
+        if (!c.previous) throw Object.assign(Error('There is no previous embedding model to remove.'), { status: 409, code: 'noPrevious' });
+        const old = c.previous;
+        config.finish();
+        if (nativeOwner) kick();
+        if (!sameIdentity(old, c.active) && !sameIdentity(old, c.next)) dropEverywhere(old);
+        log(`[embedding] removed ${old.profile}/${old.model} and its vectors`);
+        return status();
+      });
     },
     stop() { stopped = true; if (retryTimer) clearTimeout(retryTimer); retryTimer = null; return running; },
   };

@@ -135,7 +135,8 @@ async function scenario(front, mode, workerBase, fixtures, root, calls, { doclin
   const doclingServer = docling ? await startDocling(path.join(dataDir, 'docling-stand-in')) : null;
   const nodePort = await port(); const frontPort = front ? await port() : nodePort;
   const base = `http://127.0.0.1:${frontPort}`;
-  const env = serverEnv({ port: nodePort, dataDir, origin: base, mocks });
+  // The real front binary's --features pairs Core's embedding owner, as in production (a stand-in only without one).
+  const env = serverEnv({ port: nodePort, dataDir, origin: base, mocks, front });
   env.OCR_BASE_URL = `http://127.0.0.1:${relay.address().port}`;
   env.NOEVIA_CORPUS_ALLOWED_PORTS += `,${relay.address().port}`;
   // Node saves projects.json only through the Rust front's project store and refuses to start
