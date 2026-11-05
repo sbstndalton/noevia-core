@@ -4080,18 +4080,18 @@
         "result": {
          "content": [],
          "structuredContent": {
+          "ok": true,
           "rows": [
            1,
            2
-          ],
-          "ok": true
+          ]
          }
         }
        }
       ]
      },
      "expect": {
-      "text": "{\"rows\":[1,2],\"ok\":true}"
+      "text": "{\"ok\":true,\"rows\":[1,2]}"
      },
      "requests": [
       {

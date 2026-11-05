@@ -267,7 +267,7 @@ const SCENARIOS = [
   { id: 'result-null', servers: [srv('s', 'none')], steps: [step(call('t1'), { call: [{ result: null }] })] },
   { id: 'result-tool-error', servers: [srv('s', 'none')], steps: [step(call('t1'), { call: [{ result: { isError: true, content: [{ type: 'text', text: 'bad input' }] } }] })] },
   { id: 'result-tool-error-without-detail', servers: [srv('s', 'none')], steps: [step(call('t1'), { call: [{ result: { isError: true, content: [] } }] })] },
-  { id: 'result-structured-content', servers: [srv('s', 'none')], steps: [step(call('t1'), { call: [{ result: { content: [], structuredContent: { rows: [1, 2], ok: true } } }] })] },
+  { id: 'result-structured-content', servers: [srv('s', 'none')], steps: [step(call('t1'), { call: [{ result: { content: [], structuredContent: { ok: true, rows: [1, 2] } } }] })] },
   { id: 'result-other-content-kinds', servers: [srv('s', 'none')], steps: [step(call('t1'), { call: [{ result: { content: [{ type: 'image', data: 'AAAA' }, { type: 'text', text: ' after ' }, null, { type: 'resource' }, { type: 'text' }] } }] })] },
   { id: 'result-content-not-iterable', servers: [srv('s', 'none')], steps: [step(call('t1'), { call: [{ result: { content: { type: 'text' } } }] })] },
   { id: 'result-long-prose-is-cut', servers: [srv('s', 'none')], steps: [step(call('t1'), text('p '.repeat(6000)))] },
