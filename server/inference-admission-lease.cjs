@@ -163,6 +163,11 @@ function createAdmissionRoutes({ secret, modelManager, admitEngineModel, chatMac
       } catch (e) {
         if (signal.aborted) { res.destroy?.(); return true; }
         const status = [400, 409, 503].includes(e?.status) ? e.status : 503;
+        // Bounded metadata survives a front declining to buffer an oversized refusal body.
+        if (status === 503 || status === 409) {
+          if (typeof e?.code === 'string' && /^[A-Za-z0-9_.:-]{1,128}$/.test(e.code)) res.setHeader('X-Noevia-Admission-Code', e.code);
+          if (status === 503) res.setHeader('Retry-After', '3');
+        }
         json(res, status, { error: e?.publicMessage || BUSY, ...(e?.code ? { code: e.code } : {}) });
       }
       return true;

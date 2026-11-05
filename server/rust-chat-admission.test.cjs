@@ -171,3 +171,43 @@ test('review P2-2: the gate opening as the front goes away gives the count back,
   await assert.rejects(admit({ gate: 'chat' }, abort.signal));
   assert.equal(gate.active(), 0, 'no gate count is left behind');
 });
+
+
+test('the real gate keeps a 70042-byte refusal complete and exposes bounded retry metadata', { timeout: 5000 }, async (t) => {
+  const gate = createMaintenanceGate();
+  const reason = 'r'.repeat(70000);
+  const release = gate.hold(reason);
+  t.after(release);
+  const { base } = await serve(t, { modelManager: manager(gate), gateWaitMs: 1 });
+  const r = await ask(base, { gate: 'chat' });
+  assert.equal(r.status, 503);
+  assert.equal(r.headers.get('retry-after'), '3');
+  assert.equal(r.headers.get('x-noevia-admission-code'), 'inferenceMaintenance');
+  const body = await r.text();
+  assert.equal(Buffer.byteLength(body), 70042);
+  assert.deepEqual(JSON.parse(body), { error: reason, code: 'inferenceMaintenance' });
+});
+
+test('oversized refusals keep a bounded code header without putting free text in a header', { timeout: 5000 }, async (t) => {
+  const { base } = await serve(t, { modelManager: { enterInference: () => {
+    throw Object.assign(Error('r'.repeat(1024 * 1024)), { status: 503, code: 'engineHeld' });
+  } } });
+  const r = await ask(base, { gate: 'chat' });
+  assert.equal(r.status, 503);
+  assert.equal(r.headers.get('retry-after'), '3');
+  assert.equal(r.headers.get('x-noevia-admission-code'), 'engineHeld');
+  assert.ok((await r.text()).length > 1024 * 1024);
+});
+
+
+test('refusal code headers exclude overlong values and header delimiters', { timeout: 5000 }, async (t) => {
+  for (const code of ['c'.repeat(129), 'bad\r\nheader']) {
+    const { base } = await serve(t, { modelManager: { enterInference: () => {
+      throw Object.assign(Error('synthetic refusal'), { status: 503, code });
+    } } });
+    const r = await ask(base, { gate: 'chat' });
+    assert.equal(r.status, 503);
+    assert.equal(r.headers.get('x-noevia-admission-code'), null);
+    assert.equal((await r.json()).code, code);
+  }
+});
