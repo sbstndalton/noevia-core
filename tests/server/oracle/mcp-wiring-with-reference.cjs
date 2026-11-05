@@ -17,7 +17,9 @@ function createMcpWiringWithReference(args) {
     ...(discoveryFailTtlMs !== undefined ? { discoveryFailTtlMs } : {}),
     ...(discoveryRetryMs !== undefined ? { discoveryRetryMs } : {}),
   });
-  return createMcpWiring({ ...wiringArgs, discovery: reference });
+  const wiring = createMcpWiring({ ...wiringArgs, discovery: reference });
+  // Tests that exercise one server's discovery (DNS rebinding, hostile schemas) reach the reference's.
+  return reference.discoverOneServer ? { ...wiring, discoverOneServer: reference.discoverOneServer } : wiring;
 }
 
 module.exports = { ...rest, createMcpWiring: createMcpWiringWithReference, bindBoxes };

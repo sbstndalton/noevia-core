@@ -141,6 +141,7 @@ function createReferenceDiscovery({
     };
   }
   return Object.freeze({
+    discoverOneServer,
     async discover({ force = false, generation = null } = {}) {
       await discoverMcpTools(force);
       const snap = snapshot();

@@ -5,7 +5,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const { buildFacts, createChatFactsPublisher, SNAPSHOT_FILE, SNAPSHOT_KIND, MAX_BYTES } = require('./toolbox-chat-facts.cjs');
-const { buildInAppBoxes } = require('./toolbox-inapp-fixture.cjs');
+const { buildInAppBoxes } = require('../tests/server/toolbox-inapp-fixture.cjs');
 
 const fn = (name, description = 'd') => ({ type: 'function', function: { name, description, parameters: { type: 'object' } } });
 const base = (over = {}) => ({

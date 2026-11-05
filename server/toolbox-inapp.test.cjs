@@ -6,7 +6,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const { isInAppBox } = require('./toolbox-flags.cjs');
-const { buildInAppBoxes } = require('./toolbox-inapp-fixture.cjs');
+const { buildInAppBoxes } = require('../tests/server/toolbox-inapp-fixture.cjs');
 
 const fixture = buildInAppBoxes();
 const IN_APP_IDS = fixture.allToolboxes().map((b) => b.id);

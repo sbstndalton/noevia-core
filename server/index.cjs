@@ -603,6 +603,9 @@ afterNativeReady(() => {
 });
 
 // ── MCP toolboxes (master step 15): curated, discovered and bound by the Rust front (mcp_manifest.rs) ─────────
+// The curation data stays here as the source the front's copy is differential-tested against (noevia-rs
+// tests/mcp-discovery-oracle.cjs) and the tests read; nothing in this process binds boxes from it any more.
+const MCP_TOOLBOX_MANIFEST = require('./mcp-toolbox-manifest.cjs').buildToolboxManifest({ diaryMcpWrite:featureConstruction.diaryMcpWrite });
 
 // MCP server list and curated-box filter: parsed in mcp-servers.cjs.
 const { parseMcpServers, parseEnabledToolboxes, createToolboxOffered } = require('./mcp-servers.cjs');
@@ -1666,4 +1669,4 @@ if (require.main === module) {
   })().catch(() => { console.error('[startup] readiness or initialisation failed'); process.exitCode = 1; });
 }
 
-module.exports = { readyFeatures, handleRequest, chatListHolder, sanitizeChats, MCP_SERVERS, toolboxOffered, ownsFile, projectFolderName, prefill, TOOL_PREFILL_TARGET_MS, isWriteTool, chatWideApproved, pendingApprovals, resolveTools, allToolboxes, mcpCredentialOriginAllowed, toolTokenBudgetFor, estimateToolTokens, toolCapFor, sanitizeToolboxes, executeToolCall, TOOLBOXES, classifierVerdict, heuristicWantsSmart, heuristicWantsCode, CLASSIFIER_MAX_TOKENS, recordUsage, recordToolUse, readUsage, usageDayKey, USAGE_RETENTION_DAYS };
+module.exports = { readyFeatures, handleRequest, chatListHolder, sanitizeChats, MCP_SERVERS, toolboxOffered, ownsFile, projectFolderName, prefill, TOOL_PREFILL_TARGET_MS, isWriteTool, chatWideApproved, pendingApprovals, resolveTools, allToolboxes, mcpCredentialOriginAllowed, toolTokenBudgetFor, MCP_TOOLBOX_MANIFEST, estimateToolTokens, toolCapFor, sanitizeToolboxes, executeToolCall, TOOLBOXES, classifierVerdict, heuristicWantsSmart, heuristicWantsCode, CLASSIFIER_MAX_TOKENS, recordUsage, recordToolUse, readUsage, usageDayKey, USAGE_RETENTION_DAYS };
