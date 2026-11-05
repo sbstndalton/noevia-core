@@ -212,3 +212,33 @@ test('chat port S6: a Diary exchange wired without a throttle (the front counts 
   assert.deepEqual([entered, left, paused], [3, 3, 3]);
   assert.equal(routes.leases.size(), 0);
 });
+
+test('exclusion-settle: a covered call keeps the gate count after its lease ends until the call has settled', () => {
+  const lease = require('./inference-admission-lease.cjs');
+  const ev = [];
+  for (const how of ['delete', 'expire']) {
+    let t = 0;
+    const leases = lease.createLeases({ ttlMs: 50, log: () => {}, now: () => t });
+    const id = leases.add({ gate: 'chat', release: () => ev.push(`${how}:released`) });
+    const settle = leases.cover(id, 'chat');
+    assert.equal(typeof settle, 'function');
+    if (how === 'delete') leases.release(id);
+    else { t = 10 ** 9; assert.equal(leases.renew(id), false); leases.release(id); }
+    assert.equal(leases.renew(id), false, 'an ended lease is not renewable');
+    assert.deepEqual(ev.filter((e) => e.startsWith(how)), [], `${how}: released while the covered call still ran`);
+    settle();
+    settle();
+    assert.deepEqual(ev.filter((e) => e.startsWith(how)), [`${how}:released`]);
+  }
+  // A call that settles first: the count is the front's until it deletes the lease.
+  const leases = lease.createLeases({ log: () => {} });
+  const id = leases.add({ gate: 'chat', release: () => ev.push('early:released') });
+  leases.cover(id, 'chat')();
+  assert.ok(!ev.includes('early:released'));
+  leases.release(id);
+  assert.deepEqual(ev.filter((e) => e.startsWith('early')), ['early:released']);
+  // An uncovered lease still gives its count back at once.
+  const id2 = leases.add({ gate: 'chat', release: () => ev.push('plain:released') });
+  leases.release(id2);
+  assert.ok(ev.includes('plain:released'));
+});

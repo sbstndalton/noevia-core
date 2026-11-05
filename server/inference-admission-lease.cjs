@@ -134,7 +134,10 @@ function createLeases({ ttlMs = TTL_MS, hardMs = HARD_MS, log = (m) => console.w
     if (!lease) return false;
     leases.delete(id);
     clearTimeout(lease.timer);
-    lease.release();
+    // Exclusion-settle rule: a lease covering a call that is still running (the front gave up, timed out or stopped
+    // renewing) keeps its gate count until that call has settled; the covered call's settle() releases it.
+    if (lease.covering && !lease.settled) lease.ended = true;
+    else lease.release();
     if (why) log(`[models] the front's inference lease ${why}; it no longer holds the engine`);
     return true;
   }
@@ -149,16 +152,23 @@ function createLeases({ ttlMs = TTL_MS, hardMs = HARD_MS, log = (m) => console.w
   return {
     add(held) {
       const id = crypto.randomBytes(16).toString('hex');
-      leases.set(id, { release: held.release, gate: held.gate || null, covering: false, timer: null, hardAt: now() + hardMs });
+      leases.set(id, { release: held.release, gate: held.gate || null, covering: false, settled: false, ended: false, timer: null, hardAt: now() + hardMs });
       arm(id);
       return id;
     },
-    /** Chat port S8: whether live gate lease `id` covers one call on `route`; each lease covers one call only. */
+    /**
+     * Chat port S8: whether live gate lease `id` covers one call on `route`; each lease covers one call only. Covered,
+     * the answer is that call's settle(): called once the call has settled, it lets an ended lease give its count back.
+     */
     cover(id, route) {
       const lease = typeof id === 'string' ? leases.get(id) : undefined;
       if (!lease || !lease.gate || lease.gate !== route || lease.covering || lease.hardAt <= now()) return false;
       lease.covering = true;
-      return true;
+      return () => {
+        if (lease.settled) return;
+        lease.settled = true;
+        if (lease.ended) lease.release();
+      };
     },
     renew(id) {
       const lease = leases.get(id);
@@ -224,11 +234,12 @@ function createAdmissionRoutes({ secret, modelManager, admitEngineModel, chatMac
   /**
    * Chat port S8: whether `req` is covered by the front's live gate lease for `route` ('chat' or 'diary'), in which case
    * it must not enter the gate again (one gate count per call, chat.cjs engineBusy). The header is always removed.
+   * Covered, the answer is the call's settle() (createLeases cover), which the caller runs once the call has ended.
    */
   function covers(req, route) {
     const id = req?.headers?.[frontAdmission.LEASE_HEADER];
     if (req?.headers) delete req.headers[frontAdmission.LEASE_HEADER];
-    return Boolean(route) && leases.cover(id, route);
+    return (Boolean(route) && leases.cover(id, route)) || false;
   }
   return { handle, leases, covers };
 }
