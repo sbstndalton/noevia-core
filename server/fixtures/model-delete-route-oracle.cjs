@@ -9,6 +9,8 @@ const {createModelService}=require(path.join(baseline,'server/models.cjs'));
 system.rememberSectionRoles('{"synthetic-system":"system-routing"}');
 const cases=[
  {name:'success',raw:'{"name":"synthetic"}',known:true,ok:true,status:200,unloaded:true},
+ {name:'matched-before-null',raw:'{"name":"synthetic"}',known:true,ok:true,status:200,unloaded:true,listing:[{id:'synthetic',status:{args:[]}},null]},
+ {name:'null-before-match',raw:'{"name":"synthetic"}',known:true,ok:true,status:200,unloaded:true,listing:[null,{id:'synthetic',status:{args:[]}}]},
  {name:'unknown',raw:'{"name":"unknown"}',known:true,ok:true,status:200,unloaded:true},
  {name:'traversal',raw:'{"name":"../../outside"}',known:true,ok:true,status:200,unloaded:true},
  {name:'system',raw:'{"name":"synthetic-system"}',known:true,ok:true,status:200,unloaded:true},
@@ -20,7 +22,7 @@ const cases=[
  {name:'in-use',raw:'{"name":"synthetic"}',known:true,ok:false,status:409,unloaded:false,error:{error:{type:'gate_error',code:'model_in_use',message:'Busy',retryable:true}}},
 ];
 async function capture(c){let answer;const workspace={autoRoles:{fast:'synthetic',smart:'other'},saveAutoRoles(){}};const shared=createModelService({fetchJson:async()=>({ok:false}),env:{},modelManager:{enabled:false},currentWorkspace:()=>workspace,listWorkspaces:()=>[workspace]});const service={modelScanCache:{clear(){}},modelsInstalled:async()=>[{name:'synthetic'},{name:'synthetic-system'}],clearRoleReferences:shared.clearRoleReferences,lastLoadedModel:()=>null,clearLastLoadedModel(){}};
- const manager={enabled:true,kind:'llamacpp',request:async()=>({ok:true,body:{data:[{id:'synthetic',status:{args:[]}}]}}),removeModel:async()=>({ok:c.ok,status:c.status,unloaded:c.unloaded,body:c.error||{}})};
+ const manager={enabled:true,kind:'llamacpp',request:async()=>({ok:true,body:{data:c.listing||[{id:'synthetic',status:{args:[]}}]}}),removeModel:async()=>({ok:c.ok,status:c.status,unloaded:c.unloaded,body:c.error||{}})};
  const route=createModelRoutes({json:(_r,status,body)=>{answer={status,body};},readBody:async()=>c.raw,env:{},modelManager:manager,service,currentWorkspace:()=>({})});
  try{await route({method:'POST'},{},{path:'/api/models/delete',authn:{user:{id:'admin',role:'admin'}},url:new URL('http://synthetic.invalid/api/models/delete')});}catch{answer={status:500,body:{error:'Internal error'}};}
  return answer;
