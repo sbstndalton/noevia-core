@@ -70,6 +70,8 @@ if (require.main === module) {
   davParseWasm.warnRetiredFlags();
   try {
     const wasmFlags = davParseWasm.verifyAtStartup();
+    // #2387: the preset facts are the module's (ops 5 and 6); one without them cannot serve any read.
+    require('./rust-preset-facts.cjs').verifyNative(davParseWasm);
     console.log(`[dav-parse] dav-parse.wasm verified${wasmFlags.length ? ` for ${wasmFlags.join(', ')}` : ''}`);
   } catch (err) {
     console.error(`FATAL: ${err.message}. Restore the pinned module (server/dav-parse.lock).`);
@@ -1204,9 +1206,6 @@ const idleUnloadFacts = require('./rust-idle-unload-read-facts.cjs').createIdleU
 const modelDownloadsFacts = require('./rust-model-downloads-read-facts.cjs').createModelDownloadsFacts({
   secret: FRONT_SECRET, json, manager: () => modelManager,
 });
-const presetReadBridge = require('./rust-preset-read-bridge.cjs').createPresetReadBridge({
-  secret: FRONT_SECRET, json, readJson, manager: () => modelManager,
-});
 const autotuneReadBridge = require('./rust-autotune-read-bridge.cjs').createAutotuneReadBridge({
   secret: FRONT_SECRET, json, readJson, autotune: () => modelManager.autotune,
 });
@@ -1314,7 +1313,6 @@ async function handleRequestInner(req, res) {
   if (require('./rust-autotune-read.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   if (embeddingOwner.handle(req, res, json)) return;
   if (require('./rust-preset-read.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
-  if (await presetReadBridge(req, res)) return;
   if (await autotuneReadBridge(req, res)) return;
   if (require('./rust-autotune-resume.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   if (await autotuneResumeBridge(req, res)) return;

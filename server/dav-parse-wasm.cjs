@@ -76,7 +76,8 @@
 //   - crates/toolboxes-permitted toolboxes* = toolboxes-permitted.cjs projectToolboxIds,
 //                          selectedToolboxIds and computePermittedTools over the host's
 //                          projections (TOOLBOXES_PERMITTED_IMPL, retired in #1071)
-//   - crates/llamacpp-presets llamacppPresets* = llamacpp-presets.cjs prepare's option check (with
+//   - crates/llamacpp-presets llamacppPresetsParse/Facts = llamacpp-presets.cjs read(), parse() and get(): the one models.ini
+//                          parser, revision and facts, shared with the Rust front (#2387), and llamacppPresets* = prepare's option check (with
 //                          inference-budget.cjs clampCacheRam), canonicalOptions, the micro-batch
 //                          check and the model name pattern (LLAMACPP_PRESETS_IMPL)
 //
@@ -2377,6 +2378,43 @@ function llamacppPresetsModel(model) {
   return r;
 }
 
+const PRESET_FAULTS = new Set(['oversized', 'duplicate']);
+const isHex64 = (v) => typeof v === 'string' && /^[0-9a-f]{64}$/.test(v);
+const optionPairs = (o, canonicalNames) => Array.isArray(o) && o.every((p) => Array.isArray(p) && p.length === 2
+  && typeof p[0] === 'string' && typeof p[1] === 'string' && (!canonicalNames || canonicalNames.has(p[0])));
+
+/**
+ * models.ini through the one parser (llamacpp_presets op 5): `{ revision, lines, sections: [{ name,
+ * start, end, options: [[field, value]], assignments: [[line, field]] }] }`, or `{ fault: 'oversized' | 'duplicate' }` for a text
+ * that is not a preset file (core's 413 and 409). `revision` is the sha256 of the text; the sections
+ * keep the file's order and each option list its insertion order.
+ */
+function llamacppPresetsParse(text) {
+  presetsInput(typeof text === 'string', 'parse');
+  const r = presetsCall(5, [text]);
+  if (exactKeys(r, ['fault']) && PRESET_FAULTS.has(r.fault)) return r;
+  if (!exactKeys(r, ['revision', 'lines', 'sections']) || !isHex64(r.revision) || !Number.isSafeInteger(r.lines) || r.lines < 1
+    || !Array.isArray(r.sections) || !r.sections.every((s) => exactKeys(s, ['name', 'start', 'end', 'options', 'assignments']) && typeof s.name === 'string'
+      && Number.isSafeInteger(s.start) && Number.isSafeInteger(s.end) && s.start >= 0 && s.start < s.end && s.end <= r.lines
+      && optionPairs(s.options, null) && Array.isArray(s.assignments)
+      && s.assignments.every((a) => Array.isArray(a) && a.length === 2 && Number.isSafeInteger(a[0]) && a[0] > s.start && a[0] < s.end && typeof a[1] === 'string'))) badReply('llamacpp presets parse');
+  return r;
+}
+
+/**
+ * `get(model)` over the same parse (op 6): `{ revision, exists, options, defaults, fields }` with the
+ * options as ordered [field, value] pairs and the field names in `fields` order, or a fault as above.
+ */
+function llamacppPresetsFacts(text, model) {
+  presetsInput(typeof text === 'string' && typeof model === 'string', 'facts');
+  const r = presetsCall(6, [text, model]);
+  if (exactKeys(r, ['fault']) && PRESET_FAULTS.has(r.fault)) return r;
+  if (!exactKeys(r, ['revision', 'exists', 'options', 'defaults', 'fields']) || !isHex64(r.revision) || typeof r.exists !== 'boolean'
+    || !Array.isArray(r.fields) || r.fields.length === 0 || !r.fields.every((f) => typeof f === 'string')
+    || !optionPairs(r.options, new Set(r.fields)) || !optionPairs(r.defaults, new Set(r.fields))) badReply('llamacpp presets facts');
+  return r;
+}
+
 // Every switch that selects this module (#996). None is left: the last two, STORAGE_PATH_IMPL and
 // SECRET_ENVELOPE_IMPL, were retired in #1071. Retired switches are not listed: the Rust path they
 // selected is always on, and verifyAtStartup() always loads this module for it. Kept (empty) for
@@ -2481,5 +2519,5 @@ function verifyAtStartup(env = process.env, { hostname } = {}) {
 /** Test hook: forget the cached module (and its failure). */
 function reset() { cached = null; }
 
-module.exports = { llamacppPresetsValues, llamacppPresetsCanonical, llamacppPresetsBatch, llamacppPresetsModel, MAX_LLAMACPP_PRESETS_BYTES, toolGateRule, toolGateOptions, toolGateAnswer, toolGateQueries, toolGateMonths, toolGatePublic, MAX_TOOL_GATE_BYTES,
+module.exports = { llamacppPresetsValues, llamacppPresetsCanonical, llamacppPresetsBatch, llamacppPresetsModel, llamacppPresetsParse, llamacppPresetsFacts, MAX_LLAMACPP_PRESETS_BYTES, toolGateRule, toolGateOptions, toolGateAnswer, toolGateQueries, toolGateMonths, toolGatePublic, MAX_TOOL_GATE_BYTES,
   toolboxesProjectIds, toolboxesSelectedIds, toolboxesPermitted, MAX_TOOLBOXES_BYTES, browserPolicyClassify, browserPolicyNavigation, browserPolicySubstitute, browserPolicyFold, MAX_BROWSER_POLICY_BYTES, providerEgressExternal, providerEgressRefusal, providerEgressStrip, providerEgressToolRefusal, providerEgressCanonical, providerEgressFolder, MAX_PROVIDER_EGRESS_BYTES, codeActionsClassify, codeActionsDecide, codeActionsPick, MAX_CODE_ACTIONS_BYTES, projectFileNames, MAX_PROJECT_FILE_NAMES_BYTES, llamacppAutoconfig, autoconfigReply, MAX_AUTOCONFIG_BYTES, taskLifecycleDiagnostic, taskLifecycleDiagnosticReply, taskLifecycleCanTransition, taskLifecycleTransition, taskLifecycleStageMove, taskLifecycleFold, taskLifecycleDerive, taskLifecycleReply, MAX_TASK_LIFECYCLE_BYTES, completenessReport, completenessReply, completenessPolicy, MAX_COMPLETENESS_BYTES, roleContextProject, roleContextDossier, roleContextReply, MAX_ROLE_CONTEXT_BYTES, codeNetSpec, codeNetResolved, codeNetRefuses, MAX_CODE_NET_BYTES, MAX_CODE_NET_ENTRIES, mcpServersParse, mcpToolboxes, mcpToolboxOffered, MAX_MCP_SERVERS_BYTES, decisionRequestTag, decisionResultTag, decisionInvalidRequest, decisionInvalidResult, decisionCauseOf, decisionErrorFacts, decisionRequest, MAX_DECISION_MESSAGE_UNITS, MAX_DECISION_BYTES, DECISION_ENTRIES, reviewTag, reviewVerdictRead, reviewEventBound, reviewVerdictReply, MAX_REVIEW_BYTES, toolExchangeCheck, toolExchangeError, MAX_EXCHANGE_ARGS_UNITS, MAX_EXCHANGE_NAME_UNITS, ggufSummary, ggufSummaryReply, MAX_GGUF_WINDOW_BYTES, MAX_GGUF_SEGMENTS, authTokens, toolPolicyMode, toolPolicySet, MAX_POLICY_UNITS, MAX_POLICY_TOOLS, streamGuardSchema, streamGuardOptions, streamGuardNew, streamGuardFeed, streamGuardEnd, streamGuardCheck, streamGuardCheckReply, streamGuardCorrection, streamGuardReply, plainJson, MAX_GUARD_BYTES, MAX_GUARD_DEPTH, MAX_GUARD_SCHEMA_BYTES, MAX_GUARD_STATE_BYTES, MAX_GUARD_INPUT_BYTES, MAX_CORRECTION_UNITS, s3Sign, s3Region, MAX_S3_FIELD_BYTES, MAX_S3_QUERY_PAIRS, MAX_S3_PAYLOAD_BYTES, wasmFlags, RETIRED_FLAGS, warnRetiredFlags, DEPRECATED_FLAG_ALIASES, resetDeprecatedFlagNotes, verifyAtStartup, framingRuntimeMatches, IMPL_FLAGS, ssrfUrl, ssrfAddressesPublic, ssrfUrlReply, ssrfAddressesReply, MAX_SSRF_BYTES, MAX_SSRF_ADDRESSES, frameUntrusted, escapeClosing, provenanceNew, provenanceIngest, provenanceAdd, provenanceSource, provenanceCheck, provenanceProbe, packetParse, packetValidate, packetRender, FRAME_TEXT_UNITS, FRAME_LABEL_UNITS, MAX_PROVENANCE_BYTES, MAX_PACKET_BYTES, listRecords, s3ListPage, storagePath, uploadValidate, uploadClassify, uploadDecode, secretOpen, secretSeal, mcpRpcBody, mcpSchemaRefs, templateCaps, providerErrorKind, servingVerdict, autotuneScan, MAX_AUTOTUNE_SCAN_BYTES, autotunePlan, autotunePlanText, MAX_PLAN_BYTES, presetReload, MAX_RELOAD_BYTES, loadVerdict, loadVerdictText, MAX_VERDICT_BYTES, tuneContention, tuneContentionText, MAX_CONTENTION_BYTES, longProfilePairs, longProfileSection, longProfilePick, longProfileText, MAX_LONG_PROFILE_BYTES, MAX_TEMPLATE_BYTES, MCP_BODY_UNITS, MCP_SCHEMA_UNITS, MAX_SECRET_PLAIN_BYTES, MAX_SECRET_UNITS, MAX_SECRET_USER_BYTES, load, readLock, reset, memoryBytes, DavParseError, DEFAULT_WASM, MAX_INPUT_BYTES, MAX_DECODE_BYTES, SNIFF_BYTES, RESET_AFTER_BYTES };

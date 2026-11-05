@@ -1,9 +1,11 @@
 'use strict';
 // #1071: Rust owns preset value, model-name and micro-batch policy.
-// File IO, revisions, cache-budget inputs and field metadata remain in this host.
+// #2387: Rust also owns the parse, the editor limit, the revision and the facts (field names,
+// aliases, defaults): the llamacpp-presets crate, run here through dav-parse.wasm and by the Rust
+// front for GET /api/models/preset and its conditional writes. This host keeps only file IO and the
+// cache-budget inputs, so a revision read here and a revision read there cannot disagree.
 const fs=require('node:fs'),path=require('node:path'),crypto=require('node:crypto');
-const fields={"ctx-size":{"aliases":["c","LLAMA_ARG_CTX_SIZE"]},"parallel":{"aliases":["np","LLAMA_ARG_N_PARALLEL"]},"n-gpu-layers":{"aliases":["ngl","gpu-layers","LLAMA_ARG_N_GPU_LAYERS"]},"cache-type-k":{"aliases":["ctk","LLAMA_ARG_CACHE_TYPE_K"]},"cache-type-v":{"aliases":["ctv","LLAMA_ARG_CACHE_TYPE_V"]},"flash-attn":{"aliases":["fa","LLAMA_ARG_FLASH_ATTN"]},"batch-size":{"aliases":["b","LLAMA_ARG_BATCH"]},"ubatch-size":{"aliases":["ub","LLAMA_ARG_UBATCH"]},"cache-ram":{"aliases":["cram","LLAMA_ARG_CACHE_RAM"]},"image-max-tokens":{"aliases":["LLAMA_ARG_IMAGE_MAX_TOKENS"]},"spec-type":{"aliases":["LLAMA_ARG_SPEC_TYPE"]},"spec-draft-n-max":{"aliases":["LLAMA_ARG_SPEC_DRAFT_N_MAX"]},"spec-draft-p-min":{"aliases":["LLAMA_ARG_SPEC_DRAFT_P_MIN"]},"temp":{"aliases":[]},"top-p":{"aliases":[]},"top-k":{"aliases":["LLAMA_ARG_TOP_K"]},"min-p":{"aliases":[]},"repeat-penalty":{"aliases":[]}};
-const canonical=key=>Object.keys(fields).find(k=>k===key||fields[k].aliases.includes(key));
+const {PROTOCOL}=require('./rust-preset-facts.cjs');
 const modelNameOk=model=>typeof model==='string'&&ask(defaultLoader,w=>w.llamacppPresetsModel(model))?.ok===true;
 function optionValue(key,value,limits,wasmLoader=defaultLoader){
   if(typeof key!=='string'||typeof value!=='string')return undefined;
@@ -24,7 +26,6 @@ function microBatchExceeds(ubatch,batch){
 const DEFAULT_BATCH_SIZE='2048';
 const microBatchExceedsEffective=(ubatch,batch)=>microBatchExceeds(ubatch,batch===undefined||batch===null||batch===''?DEFAULT_BATCH_SIZE:batch);
 const error=(status,message)=>Object.assign(Error(message),{status});
-const revision=text=>crypto.createHash('sha256').update(text).digest('hex');
 // #874: recovery copies `<file>.noevia-backup-<revision>` are whole-file snapshots taken before each
 // web write; calibration and auto-tune write many. Keep the newest BACKUP_KEEP of this file.
 const BACKUP_KEEP=20;
@@ -42,24 +43,43 @@ function pruneBackups(file,keep){
   for(const {name} of rows.slice(keep)){try{fs.unlinkSync(path.join(dir,name));removed.push(name);}catch{}}
   return removed;
 }
-function parse(text) {
-  if (Buffer.byteLength(text)>1024*1024) throw error(413,'Preset file exceeds the editor limit');
-  const sections=new Map();let current=null;
-  const lines=text.split('\n');
-  lines.forEach((line,index)=>{
-    const header=/^\s*\[([^\]\r\n]+)\]\s*(?:[;#].*)?$/.exec(line);
-    if (header) {
-      if (sections.has(header[1])) throw error(409,'Duplicate preset sections require operator repair');
-      current={start:index,end:lines.length,options:{}};
-      const previous=[...sections.values()].at(-1);if(previous)previous.end=index;
-      sections.set(header[1],current);
-    } else if(current) {
-      const match=/^\s*([^=\s]+)\s*=\s*(.*?)\s*$/.exec(line),key=match&&canonical(match[1]);
-      if(key)current.options[key]=match[2];
-    }
-  });
-  return {lines,sections};
+const FAULTS={oversized:()=>error(413,'Preset file exceeds the editor limit'),duplicate:()=>error(409,'Duplicate preset sections require operator repair')};
+const warnedRead=new Set();
+function readWarn(reason){
+  if(warnedRead.has(reason))return;
+  warnedRead.add(reason);
+  console.warn(`[llamacpp-presets] ${PROTOCOL} read fault (${reason}); preset state is unavailable`);
 }
+/** Asks the native reader; a refusal of the module itself is an unavailable parser, not a bad file. */
+function native(wasmLoader,fn){
+  let r;
+  try{r=fn(wasmLoader());}
+  catch(err){
+    readWarn(String(err?.reason||'unexpected').slice(0,40));
+    throw err?.reason==='too_large'?FAULTS.oversized():error(503,'Preset state is unavailable. Try again shortly.');
+  }
+  if(r?.fault!==undefined){
+    if(!Object.hasOwn(FAULTS,r.fault))throw error(503,'Preset state is unavailable. Try again shortly.');
+    throw FAULTS[r.fault]();
+  }
+  return r;
+}
+let knownFields=null;
+/** `Object.keys(fields)`: the editable option names, in the native reader's order. */
+function fieldNames(){
+  if(!knownFields)knownFields=Object.freeze(native(defaultLoader,w=>w.llamacppPresetsFacts('','')).fields);
+  return knownFields;
+}
+const objectOf=pairs=>{const out={};for(const [k,v] of pairs)out[k]=v;return out;};
+/** `text.split('\n')` lines and the sections of the native parse: Map name -> {start,end,options}. */
+function parse(text,wasmLoader=defaultLoader) {
+  const r=native(wasmLoader,w=>w.llamacppPresetsParse(text));
+  const sections=new Map();
+  for(const s of r.sections)sections.set(s.name,{start:s.start,end:s.end,options:objectOf(s.options),assignments:s.assignments});
+  return {lines:text.split('\n'),sections,revision:r.revision};
+}
+/** The revision of `text` as the native reader (and so the Rust front) computes it. */
+const revision=(text,wasmLoader=defaultLoader)=>native(wasmLoader,w=>w.llamacppPresetsParse(text)).revision;
 // ── LLAMACPP_PRESETS_IMPL ───────────────────────────────────────────────────
 function llamacppPresetsImpl(){return 'wasm';}
 const defaultLoader=()=>require('./dav-parse-wasm.cjs');
@@ -82,15 +102,21 @@ function createPresetStore(file,{writer=null,cacheRam=null,backupKeep=BACKUP_KEE
   if(!file || !path.isAbsolute(file))throw error(500,'LLAMACPP_PRESET_PATH must be an absolute path');
   // #1596: the Laya marker is models.roles.json beside models.ini, never a key in models.ini.
   require('./model-system.cjs').useRolesBeside(file);
-  function read() {
+  function readText() {
     const stat=fs.lstatSync(file);
     if(!stat.isFile()||stat.isSymbolicLink())throw error(409,'Preset path must be a regular file');
-    const text=fs.readFileSync(file,'utf8');
-    return {text,revision:revision(text),...parse(text)};
+    return fs.readFileSync(file,'utf8');
   }
+  function read() {
+    const text=readText();
+    return {text,...parse(text)};
+  }
+  // #2387: the facts of one snapshot, from the native reader: the same parse, revision, defaults and
+  // field names the Rust front answers GET /api/models/preset with and checks its writes against.
   function get(model) {
-    const data=read(),section=data.sections.get(model);
-    return {model,revision:data.revision,exists:!!section,options:section?.options || {},defaults:data.sections.get('*')?.options || {},fields:Object.keys(fields)};
+    const text=readText();
+    const r=native(defaultLoader,w=>w.llamacppPresetsFacts(text,typeof model==='string'?model:''));
+    return {model,revision:r.revision,exists:r.exists,options:objectOf(r.options),defaults:objectOf(r.defaults),fields:r.fields};
   }
   function prepare({model,baseRevision,options}) {
     if(typeof model!=='string'||ask(wasmLoader,w=>w.llamacppPresetsModel(model))?.ok!==true)throw error(400,'Invalid preset model name');
@@ -126,9 +152,9 @@ function createPresetStore(file,{writer=null,cacheRam=null,backupKeep=BACKUP_KEE
       else {const checked=checkedCache(effective);if(checked!==String(effective).trim())updates['cache-ram']=checked;}
     }
     if(section) {
-      const content=lines.slice(section.start+1,section.end).filter(line=>{
-        const match=/^\s*([^=\s]+)\s*=/.exec(line);return !match||!Object.hasOwn(updates,canonical(match[1]));
-      });
+      // The lines that assign a field being written are the native reader's (assignments).
+      const replaced=new Set(section.assignments.filter(([,field])=>Object.hasOwn(updates,field)).map(([line])=>line));
+      const content=lines.slice(section.start+1,section.end).filter((line,i)=>!replaced.has(section.start+1+i));
       const additions=Object.entries(updates).filter(([,v])=>v!=='').map(([k,v])=>`${k} = ${v}`);
       lines.splice(section.start+1,section.end-section.start-1,...content,...additions);
     } else lines.push('',`[${model}]`,...Object.entries(updates).filter(([,v])=>v!=='').map(([k,v])=>`${k} = ${v}`));
@@ -210,9 +236,9 @@ function checkedCanonicalOptions(options,{wasmLoader=defaultLoader}={}){
   const out={};
   for(let i=0;i<pairs.length;i++){
     const pair=r.options[i];
-    if(!Array.isArray(pair)||pair.length!==2||!(pair[0]===null||typeof pair[0]==='string'&&Object.hasOwn(fields,pair[0]))||!(pair[1]===null||typeof pair[1]==='string'))return {options:{},refused:pairs[i][0]};
+    if(!Array.isArray(pair)||pair.length!==2||!(pair[0]===null||typeof pair[0]==='string'&&fieldNames().includes(pair[0]))||!(pair[1]===null||typeof pair[1]==='string'))return {options:{},refused:pairs[i][0]};
     if(pair[0]!==null&&pair[1]!==null)out[pair[0]]=pair[1];
   }
   return {options:out,refused:null};
 }
-module.exports={createPresetStore,parse,fields,canonical,canonicalOptions,checkedCanonicalOptions,llamacppPresetsImpl,modelNameOk,optionValue,canonicalEntry,microBatchExceeds,microBatchExceedsEffective,pruneBackups,BACKUP_KEEP};
+module.exports={createPresetStore,parse,revision,fieldNames,canonicalOptions,checkedCanonicalOptions,llamacppPresetsImpl,modelNameOk,optionValue,canonicalEntry,microBatchExceeds,microBatchExceedsEffective,pruneBackups,BACKUP_KEEP};

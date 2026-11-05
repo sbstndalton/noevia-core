@@ -16,6 +16,10 @@
 // list (the differential test checks every UTF-16 code unit against the runtime's own), and every
 // other pattern is ASCII. All values are synthetic; random combinations use a seeded mulberry32.
 
+const crypto = require('node:crypto');
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
 const p = require('../tests/reference/llamacpp-presets-js.cjs');
 
 function mulberry32(seed) {
@@ -131,6 +135,90 @@ for (let i = 0; i < 500; i++) op3(rand() < 0.1 ? null : pick(NUMBERS), rand() < 
 const MODELS = ['m', 'gemma-3-12b', 'org/model.gguf', 'org/model:Q4_K_M', 'a'.repeat(200), 'a'.repeat(201), '', ' ', 'a b', 'a\nb', 'a\n', '\na', 'ü', 'model ',
   '../x', 'x]', '[x', '*', 'a;b', 'a=b', 'a#b', 'm\u0000', '\ud800', 'm ', 'MODEL_1.2-3/4:5', '٣', 'ｍ'];
 for (const m of MODELS) push(4, [m], { ok: p.modelNameOk(m) });
+
+// ── models.ini parse and facts (ops 5-6, #2387) ───────────────
+// The oracle is the frozen JS: parse() and a store's get() over a real file, the very reads the
+// native reader replaces. Faults are { fault } (core's 413 and 409); a text that cannot be written
+// to a file and read back unchanged (a lone surrogate) is an op 5 row only.
+const sha = (t) => crypto.createHash('sha256').update(t).digest('hex');
+const pairsOf = (o) => Object.entries(o);
+const faultOf = (e) => (e.status === 413 ? 'oversized' : e.status === 409 && /Duplicate/.test(e.message) ? 'duplicate' : null);
+// prepare()'s own line filter in the JS: a line `key =` whose key names a field.
+function assignmentsOf(lines, section) {
+  const out = [];
+  for (let i = section.start + 1; i < section.end; i++) {
+    const match = /^\s*([^=\s]+)\s*=/.exec(lines[i]);
+    const field = match && p.canonical(match[1]);
+    if (field) out.push([i, field]);
+  }
+  return out;
+}
+function op5(text) {
+  let want;
+  try {
+    const { lines, sections } = p.parse(text);
+    want = { revision: sha(text), lines: lines.length,
+      sections: [...sections].map(([name, s]) => ({ name, start: s.start, end: s.end, options: pairsOf(s.options), assignments: assignmentsOf(lines, s) })) };
+  } catch (e) {
+    const fault = faultOf(e);
+    if (!fault) throw e;
+    want = { fault };
+  }
+  push(5, [text], want);
+}
+const scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'preset-facts-'));
+const scratchFile = path.join(scratch, 'models.ini');
+const scratchStore = p.createPresetStore(scratchFile, { cacheRam: { capMib: 1024, hardMaxMib: 2048 } });
+function op6(text, model) {
+  fs.writeFileSync(scratchFile, text);
+  let want;
+  try {
+    const g = scratchStore.get(model);
+    want = { revision: g.revision, exists: g.exists, options: pairsOf(g.options), defaults: pairsOf(g.defaults), fields: g.fields };
+  } catch (e) {
+    const fault = faultOf(e);
+    if (!fault) throw e;
+    want = { fault };
+  }
+  push(6, [text, model], want);
+}
+const SECTION_NAMES = ['*', 'm', 'a b', 'org/model:Q4', 'x', ' m', 'm ', '[x', 'ü', 'n', 'org/other', 'z-1', 'q', 'w'];
+const HEADERS = (n) => [`[${n}]`, `  [${n}]  `, `[${n}] ; note`, `[${n}]# note`, `[${n}]\r`, `[${n}] ;c\r`, `\ufeff[${n}]`, `[${n}] x`, `\t[${n}]\u2028`, `[${n}]\u00a0`];
+const OPTION_KEYS = [...Object.keys(p.fields), ...Object.values(p.fields).flatMap((f) => f.aliases), 'model', 'm', 'mmproj', 'spec-draft-model',
+  'unknown', '--ctx-size', 'CTX-SIZE', 'ctx_size', '__proto__', 'toString'];
+const OPTION_VALUES = ['4096', ' 8192 ', '2', '', 'q8_0', '/models/x.gguf', '0.7', 'on', '１２', 'a = b', 'v ; c', '\u2028x', 'x\u2028y', 'x\r', '\r', '\u00a07\u00a0', '\ufeff9'];
+const OPTION_LINES = (k, v) => [`${k}=${v}`, `${k} = ${v}`, `  ${k}\t=\t${v}  `, `${k} =`, `${k}${v}`, `=${v}`, `${k} x = ${v}`];
+const FIXED = ['', '\n', '\n\n', '; comment only\n', '[*]\n', '[m]\n[m]\n', '[m]\nc=1\n[m]\n', '[*]\nparallel=2\n[m]\nc=4096\nmodel=/private/synthetic.gguf\n',
+  '[m]\r\nc=1\r\nnp=2\r\n', '[m]\nc=1\nctx-size=2\nLLAMA_ARG_CTX_SIZE=3\n', 'c=1\n[m]\nc=2\n', '\ufeff[m]\nc=1', '[m]\nc=1', '[ m]\n[m]\n[m ]\n',
+  '[a]\nc=1\n\n[b]\nnp=2\n', '[*]\nb=1\n[m]\nb=2\ncram=0\n', '[__proto__]\nc=1\n', '[constructor]\nc=1\n[toString]\nc=2\n', 'x'.repeat(1000),
+  '€'.repeat(5000), '\ud800[m]\n', 'lone \ud800 surrogate\n[m]\nc=\udc00\n'];
+const texts = [...FIXED];
+for (let i = 0; i < 700; i++) {
+  // Mostly distinct section names, so most texts parse; one in ten may repeat a name (a fault).
+  const lines = [], n = 1 + Math.floor(rand() * 12), repeat = rand() < 0.1, used = new Set();
+  const name = () => {
+    let pickName = pick(SECTION_NAMES);
+    for (let tries = 0; !repeat && used.has(pickName) && tries < 20; tries++) pickName = pick(SECTION_NAMES);
+    used.add(pickName);
+    return pickName;
+  };
+  for (let j = 0; j < n; j++) {
+    const r = rand();
+    if (r < 0.3) lines.push(pick(HEADERS(name())));
+    else if (r < 0.85) lines.push(pick(OPTION_LINES(pick(OPTION_KEYS), pick(OPTION_VALUES))));
+    else lines.push(pick(['', '; c', '# c', '   ']));
+  }
+  texts.push(lines.join(rand() < 0.2 ? '\r\n' : '\n') + (rand() < 0.5 ? '\n' : ''));
+}
+for (const t of texts) {
+  op5(t);
+  if (/[\ud800-\udfff]/.test(t.replace(/[\ud800-\udbff][\udc00-\udfff]/g, ''))) continue;
+  let names = [];
+  try { names = [...p.parse(t).sections.keys()]; } catch { /* a fault: asked for one model */ }
+  for (const m of ['*', 'absent', '', ...names.slice(0, 4)]) op6(t, m);
+}
+for (const m of MODELS.filter((x) => !/[\ud800-\udfff]/.test(x))) op6('[*]\nparallel=2\n[' + m + ']\nc=1\n', m);
+fs.rmSync(scratch, { recursive: true, force: true });
 
 process.stdout.write(JSON.stringify({
   note: 'Generated by noevia-core tools/gen-llamacpp-presets-fixtures.cjs from llamacpp-presets.cjs itself; byte-identical in noevia-rs.',

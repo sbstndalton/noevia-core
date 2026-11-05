@@ -47,6 +47,9 @@ const CALLS = {
   2: ([pairs]) => davParseWasm.llamacppPresetsCanonical(pairs),
   3: ([u, b]) => davParseWasm.llamacppPresetsBatch(u, b),
   4: ([m]) => davParseWasm.llamacppPresetsModel(m),
+  // #2387: the one models.ini parser (read(), parse(), get()).
+  5: ([text]) => davParseWasm.llamacppPresetsParse(text),
+  6: ([text, model]) => davParseWasm.llamacppPresetsFacts(text, model),
 };
 
 test('the fixture file is what the generator prints', { skip: !fs.existsSync(GENERATOR) && 'no generator here' }, () => {
