@@ -11,7 +11,10 @@ const outage = () => Object.assign(Error('The maintenance lease authority is not
 function harness({ hold, progress, ...options }) {
   const gate = createMaintenanceGate(), logs = [];
   const guard = createSweepGuard({ hold: hold || ((r) => gate.hold(r)), progress, barrier: (r) => gate.barrier(r), log: (m) => logs.push(m),
-    adoptRetryMs: 1, adoptMaxDelayMs: 2, adoptAttempts: 3, pollMs: 60000, setTimer: (fn, ms) => setTimeout(fn, ms), clearTimer: clearTimeout, ...options });
+    adoptRetryMs: 1, adoptMaxDelayMs: 2, adoptAttempts: 3, pollMs: 60000,
+    // Timers the guard cannot unref: the event loop must stay alive while adopt() retries in a test.
+    // The adopted sweep's long watch poll may still be unref'd, so the test can end.
+    setTimer: (fn, ms) => { const t = setTimeout(fn, ms); return { t, unref() { if (ms >= 60000) t.unref(); } }; }, clearTimer: (h) => clearTimeout(h?.t), ...options });
   return { gate, guard, logs };
 }
 
