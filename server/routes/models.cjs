@@ -561,6 +561,8 @@ function createModelRoutes({ servedEmbeddingModels = (target) => require('../rag
     // rust-preset-write.cjs); both are refused before authentication. Other methods keep this answer.
     if (p === '/api/models/preset') {
       if(authn.user.role!=='admin')return json(res,403,{error:'Administrator required for shared model profiles'});
+      // Only the llama.cpp adapter has native presets (presetFacts); another engine says so, as it always did.
+      if(!modelManager.presetFacts)return json(res,404,{error:'Native presets are unavailable'});
       return json(res,405,{error:'Method not allowed'});
     }
 

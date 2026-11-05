@@ -348,7 +348,10 @@ test('engine-specific routes say what is unavailable and guard the method', asyn
   await f.call('PUT', '/api/models/preset', { model: 'm' }, 'member');
   assert.deepEqual(f.sent.pop(), { status: 403, body: { error: 'administrator required' } });
   await f.call('PUT', '/api/models/preset', { model: 'm' }, 'admin');
-  assert.deepEqual(f.sent.pop(), { status: 405, body: { error: 'Method not allowed' } });
+  assert.deepEqual(f.sent.pop(), { status: 404, body: { error: 'Native presets are unavailable' } }, 'an engine without native presets');
+  const withPresets = fixture({ manager: { presetFacts: () => null } });
+  await withPresets.call('PUT', '/api/models/preset', { model: 'm' }, 'admin');
+  assert.deepEqual(withPresets.sent.pop(), { status: 405, body: { error: 'Method not allowed' } });
   await f.call('GET', '/api/models/mtp-artifact', undefined, 'member', '?repo=bad');
   assert.deepEqual(f.sent.pop(), { status: 400, body: { error: 'Invalid repository' } });
   await f.call('POST', '/api/models/installed', undefined, 'admin');
