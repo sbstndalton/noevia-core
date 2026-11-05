@@ -77,8 +77,8 @@ function createModelRoutes({ servedEmbeddingModels = (target) => require('../rag
   const loaderHeaders = () => ({ 'Content-Type': 'application/json', ...(env.MODEL_LOADER_TOKEN ? { 'X-Model-Loader-Token': env.MODEL_LOADER_TOKEN } : {}) });
   // #873: the throughput sweep holds the inference maintenance gate for as long as it runs.
   const sweepGuard = typeof modelManager.holdMaintenance === 'function' ? require('../benchmark-sweep-guard.cjs').createSweepGuard({
-    hold: reason => modelManager.holdMaintenance(reason),
-    barrier: typeof modelManager.chatBarrier === 'function' ? reason => modelManager.chatBarrier(reason) : null,
+    hold: (reason, options) => modelManager.holdMaintenance(reason, options),
+    barrier: typeof modelManager.maintenanceBarrier === 'function' ? reason => modelManager.maintenanceBarrier(reason) : null,
     progress: () => fetchJson(`${String(env.MODEL_LOADER_URL || '').replace(/\/+$/, '')}/api/v1/benchmark/progress`, { method: 'GET', headers: loaderHeaders() }, 15000),
     log: message => console.log(message),
     ...sweepGuardOptions,
