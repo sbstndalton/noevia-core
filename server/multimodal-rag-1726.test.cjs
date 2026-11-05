@@ -1,3 +1,4 @@
+// Historical Node oracle tests; native worker coverage lives in embedding-worker.
 'use strict';
 // #1726: multimodal RAG — image vectors in the project index, scanned pages skipped, a text query that
 // finds an image by content, the rate-limited backfill, and flag-off behaviour. Synthetic bytes and a fake
@@ -14,7 +15,7 @@ delete process.env.RAG_DIR;
 for (const k of ['EMBEDDING_BASE_URL', 'EMBEDDING_MODEL', 'EMBED_MODEL', 'EMBEDDING_PROFILE', 'EMBEDDING_NEXT_MODEL', 'EMBEDDING_NEXT_BASE_URL', 'EMBEDDING_NEXT_PROFILE', 'EMBEDDING_IMAGE_MODEL', 'NOEVIA_MULTIMODAL_RAG']) delete process.env[k];
 
 const { createEmbeddingConfig } = require('./embedding-config.cjs');
-const multimodal = require('./multimodal-rag.cjs');
+const multimodal = require('../tests/oracles/media-u2/multimodal-rag.cjs');
 
 let depsOk = true;
 try { require('better-sqlite3'); require('sqlite-vec'); } catch { depsOk = false; }

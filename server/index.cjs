@@ -233,7 +233,13 @@ function arrayProxy(field) {
 }
 // #1636/#1638: the one embedding configuration (endpoint, model, profile), seeded from the environment
 // and saved beside the data once changed through /api/embedding (embedding-migration.cjs).
-const embeddingOwner = require('./rust-embedding-background.cjs').createOwner({ env: process.env, frontSecret: FRONT_SECRET, dataDir: DATA_DIR, verifyPair: require.main === module });
+const embeddingBackground = require('./rust-embedding-background.cjs');
+const embeddingOwner = embeddingBackground.createOwner({ env: process.env, frontSecret: FRONT_SECRET, dataDir: DATA_DIR, verifyPair: require.main === module,
+  sourceMember: embeddingBackground.createSourceMembershipGuard({
+    userExists: user => !!authService.db.prepare('SELECT 1 FROM users WHERE id=?').get(user) && !workspaceStore.isRemoved(user),
+    workspaceFor: user => workspaceStore.get(user),
+  }),
+});
 const embeddingConfig = require('./embedding-config.cjs').install(require('./embedding-config.cjs').loadEmbeddingConfig({
   env: process.env, nativeOwner: embeddingOwner, stateFile: path.join(DATA_DIR, 'embedding-config.json') }));
 rag.init({ dataDir: DATA_DIR, inferenceUrl: INFERENCE_BASE, headersFn: () => inferenceHeaders(), userDataDirFn: workspaceStore.userDir,
@@ -258,63 +264,10 @@ const shutdownHooks = require('./shutdown-hooks.cjs').createShutdownHooks();
 shutdownHooks.add(require('./rust-embedding-background.cjs').scheduleLegacy({ owner: embeddingOwner, env: process.env, config: embeddingConfig, service: embeddingService, migration: embeddingMigration, afterReady: afterNativeReady }));
 shutdownHooks.install();
 
-// #1726: multimodal RAG (NOEVIA_MULTIMODAL_RAG, off by default). On, the rate-limited media pass embeds
-// every project's images into its own index, starting shortly after boot (the backfill) and again after
-// each source change (projects.cjs) and every half hour (a model switch leaves the new slot without image
-// vectors). Off, it never runs and stored image vectors are left alone.
-{
-  const multimodal = require('./multimodal-rag.cjs');
-  const mediaBackfill = multimodal.install(multimodal.createMediaBackfill({
-    userIds: () => authService.db.prepare('SELECT id FROM users').all().map((r) => r.id).filter((id) => !workspaceStore.isRemoved(id)),
-    workspaceFor: (userId) => workspaceStore.get(userId),
-    documentDir: (workspace, projectId) => require('./document-sources.cjs').directory(workspace, projectId),
-    rag,
-    // The embeddings router serves at most two models: during a re-index both slots are text models.
-    paused: () => (embeddingConfig.next() ? 'a re-index is under way' : null),
-    release: () => rag.releaseMediaModel(),
-  }));
-  // #1770: documents read before the flag was on are read again once for figures (figure-sweep.cjs), paced
-  // like the re-index and held while one runs; each re-read schedules that project's media pass.
-  const figureSweep = require('./figure-sweep.cjs').createFigureSweep({
-    extractorVersion: () => require('./documents.cjs').EXTRACTOR_VERSION,
-    userIds: () => authService.db.prepare('SELECT id FROM users').all().map((r) => r.id).filter((id) => !workspaceStore.isRemoved(id)),
-    workspaceFor: (userId) => workspaceStore.get(userId),
-    documentDir: (workspace, projectId) => require('./document-sources.cjs').directory(workspace, projectId),
-    runAs: (userId, fn) => {
-      const user = authService.publicUser(authService.db.prepare('SELECT * FROM users WHERE id=?').get(userId));
-      return requestScope.run({ workspace: workspaceStore.get(userId), authn: { user, legacy: false } }, fn);
-    },
-    refresh: (project, file) => projectStore.refreshDocumentFigures(project, file),
-    paused: () => (embeddingConfig.next() ? 'a re-index is under way' : null),
-  });
-  if (multimodal.enabled()) afterNativeReady(() => {
-    setTimeout(() => mediaBackfill.kick(), 45000).unref();
-    setInterval(() => mediaBackfill.kick(), 30 * 60 * 1000).unref();
-    setTimeout(() => figureSweep.kick(), 60000).unref();
-    setInterval(() => figureSweep.kick(), 30 * 60 * 1000).unref();
-  });
-  // #1770 review: on shutdown no new document or image is started.
-  shutdownHooks.add(() => { figureSweep.stop(); mediaBackfill.stop(); });
-}
-
-// #1868/#1869: long documents gain their text past the 200,000-character head in the search index, and
-// uploads made with no storage connection get the completion pass, both paced in the background
-// (document-backfill.cjs) and held while a re-index is under way.
-{
-  const documentBackfill = require('./document-backfill.cjs').createDocumentBackfill({
-    rag,
-    userIds: () => authService.db.prepare('SELECT id FROM users').all().map((r) => r.id).filter((id) => !workspaceStore.isRemoved(id)),
-    workspaceFor: (userId) => workspaceStore.get(userId),
-    documentDir: (workspace, projectId) => require('./document-sources.cjs').directory(workspace, projectId),
-    runAs: (userId, fn) => {
-      const user = authService.publicUser(authService.db.prepare('SELECT * FROM users WHERE id=?').get(userId));
-      return requestScope.run({ workspace: workspaceStore.get(userId), authn: { user, legacy: false } }, fn);
-    },
-    completeUpload: (project, file, options) => projectStore.completeUploadedDocument(project, file, options),
-    paused: () => (embeddingConfig.next() ? 'a re-index is under way' : null),
-  });
-  afterNativeReady(() => documentBackfill.start()); // unref'd timers
-}
+// Native media/figure/document workers share the embedding background owner.
+// Node only posts source-change hints; it owns no timer, batch or retry loop.
+require('./multimodal-rag.cjs').install(require('./rust-media-background.cjs').createClient({ dataDir: DATA_DIR, start: process.env.NOEVIA_START_ID || '' }));
+shutdownHooks.add(() => require('./multimodal-rag.cjs').current()?.stop());
 
 // User-created projects; the earlier fixed demo spaces were removed.
 // spaces were deleted per user request — projects are user-created only.
@@ -550,11 +503,8 @@ const {
   saveProjects, getProject, sanitizeChats, loadChats, saveChats, deleteChat, saveFreeChats, deleteFreeChat, createProject,
   readHistory, ownsFile, ensureProjectFolder, withSourceLock, pruneDocuments, writeProjectTextFile, sweepDeletedProject, indexSource,
 } = projectStore;
-// #2191 round 2: the Rust front creates and deletes projects (rust-project-lifecycle.cjs). It reads the
-// toolbox catalogue published here (MCP discovery is this process's), and leaves the RAG index of
-// create-time files in the user's index outbox, which this executor drains (round 3: the storage folder
-// sweep and #687's create-time storage step are the front's own, rust-project-storage.cjs);
-// a delete's tombstone stops an index run of that project still in flight (rag.cjs lifecycle guard).
+// The front owns durable RAG outbox execution. Core keeps a read-only lifecycle
+// guard for its remaining request-time RAG calls and publishes the toolbox catalogue.
 const projectCatalogue = require('./project-catalogue.cjs').createCataloguePublisher({
   dataDir: DATA_DIR,
   current: () => ({
@@ -565,42 +515,11 @@ const projectCatalogue = require('./project-catalogue.cjs').createCataloguePubli
   }),
 });
 const indexOutbox = require('./rust-index-outbox.cjs').createIndexOutbox({
-  // #2191 round 3: only this process's job kinds; the front runs its own (the storage sweep).
-  kinds: require('./rust-project-storage.cjs').CORE_KINDS,
   userDir: (userId) => workspaceStore.userDir(userId),
-  userIds: () => authService.db.prepare('SELECT id FROM users').all().map((r) => r.id).filter((id) => !workspaceStore.isRemoved(id)),
-  runAs: (userId, fn) => {
-    const user = authService.publicUser(authService.db.prepare('SELECT * FROM users WHERE id=?').get(userId));
-    return requestScope.run({ workspace: workspaceStore.get(userId), authn: { user, legacy: false } }, fn);
-  },
-  runJob: async (job, userId) => {
-    const workspace = currentWorkspace();
-    if (job.kind === 'index') {
-      // The project as the front saved it (re-read when projects.json changed), the file's text as it is now.
-      if (workspace.projectsFile) workspace.projectsFile.refresh(workspace.projects);
-      const project = getProject(job.project);
-      const file = (project?.files || []).find((f) => f && f.name === job.file);
-      if (!project || !file) return; // removed or replaced since: nothing left to index
-      await indexSource(project, file);
-      return;
-    }
-    if (job.kind === 'unindex') {
-      // #2191 round 3 (rust-project-files.cjs): a source file the front removed. Its rows go unless a
-      // file of that name is listed again by now (#1919: a re-upload's fresh rows stay), or the project
-      // is gone (its delete removed the whole index; opening it here would make it again).
-      if (workspace.projectsFile) workspace.projectsFile.refresh(workspace.projects);
-      const project = getProject(job.project);
-      if (!project || (project.files || []).some((f) => f && f.name === job.file)) return;
-      rag.deleteProjectFile(job.project, job.file, userId);
-      return;
-    }
-    throw new Error(`unknown outbox job kind ${job.kind}`);
-  },
 });
 rag.setLifecycleGuard(indexOutbox);
 afterNativeReady(() => {
   projectCatalogue.publish();
-  setInterval(() => { indexOutbox.tick().catch((err) => console.warn('[index-outbox] pass failed:', err.message)); }, 2000).unref();
 });
 
 // ── MCP toolboxes (master step 15): curated in mcp-toolbox-manifest.cjs ─────────
@@ -1321,6 +1240,7 @@ async function handleRequestInner(req, res) {
   if (require('./rust-model-downloads-read.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   if (await modelDownloadsFacts(req, res)) return;
   if (require('./rust-autotune-read.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
+  if (await embeddingOwner.handleSourceChanged(req, res, json)) return;
   if (embeddingOwner.handle(req, res, json)) return;
   if (require('./rust-preset-read.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   if (await presetReadBridge(req, res)) return;
@@ -1340,7 +1260,6 @@ async function handleRequestInner(req, res) {
   // (project-catalogue.cjs; written only when it changed).
   projectCatalogue.publish();
   // ... and index or sweep work the front queued in an outbox starts now, not only on the 2 s interval.
-  indexOutbox.kick();
   // GET /api/integrations/storage is the Rust front's (#1071): refused before authentication.
   if (require('./features.cjs').refuseRustStorageRead(req, res, { parseRequestUrl, badRequestUrl, json })) return;
   if (require('./routes/chat-framing.cjs').refuseOwnedPreferences(req, res, { parseRequestUrl, json })) return;

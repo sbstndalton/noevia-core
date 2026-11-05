@@ -1,3 +1,4 @@
+// Historical Node oracle tests; native worker coverage lives in embedding-worker.
 'use strict';
 // #1868: the text of a long document past its 200,000-character head is appended to the search index in
 // budgeted, paced batches (document-backfill.cjs + rag.cjs appendFileTail), without re-indexing anything.
@@ -12,7 +13,7 @@ const path = require('node:path');
 delete process.env.RAG_DIR;
 for (const k of ['EMBEDDING_BASE_URL', 'EMBEDDING_MODEL', 'EMBED_MODEL', 'EMBEDDING_PROFILE', 'EMBEDDING_NEXT_MODEL', 'EMBEDDING_NEXT_BASE_URL', 'EMBEDDING_NEXT_PROFILE']) delete process.env[k];
 
-const backfill = require('./document-backfill.cjs');
+const backfill = require('../tests/oracles/media-u2/document-backfill.cjs');
 const documents = require('./documents.cjs');
 const { createEmbeddingConfig } = require('./embedding-config.cjs');
 
@@ -349,7 +350,7 @@ test('#1869: completeUploadedDocument runs the stored record\'s completion once,
   const project = { id: 'proj-up', files: [] };
   const workspace = { assetDir: (id) => path.join(dir, 'assets', id), dir: path.join(dir, 'ws'), userId: USER, projects: [project], saveProjects: () => {} };
   const indexed = [];
-  const store = require('./projects.cjs').createProjectStore({ fs, path, documentSources, storageClient: {},
+  const store = require('../tests/oracles/media-u2/projects.cjs').createProjectStore({ fs, path, documentSources, storageClient: {},
     rag: { indexProjectFile: async (...a) => { indexed.push(a[1]); return { ok: true, stored: 1, embedded: 1 }; }, deleteProjectFile: () => {} },
     authService: { getStorage: () => ({}) }, currentWorkspace: () => workspace, PROJECTS: [project],
     reasoningEffort: {}, projectAppearance: () => ({}), FREE_CHATS: [], sanitizeToolboxes: () => null, defaultToolboxes: () => [], PROJECT_ROOT_FOLDER: 'fixture-root',
@@ -502,7 +503,7 @@ test('#1881: default budgets are the lowered ones, with their own duty', () => {
 function uploadStore(dir, project) {
   const documentSources = require('./document-sources.cjs');
   const workspace = { assetDir: (id) => path.join(dir, 'assets', id), dir: path.join(dir, 'ws'), userId: USER, projects: [project], saveProjects: () => {} };
-  const store = require('./projects.cjs').createProjectStore({ fs, path, documentSources, storageClient: {},
+  const store = require('../tests/oracles/media-u2/projects.cjs').createProjectStore({ fs, path, documentSources, storageClient: {},
     rag: { indexProjectFile: async () => ({ ok: true, stored: 1, embedded: 1 }), deleteProjectFile: () => {} },
     authService: { getStorage: () => ({}) }, currentWorkspace: () => workspace, PROJECTS: [project],
     reasoningEffort: {}, projectAppearance: () => ({}), FREE_CHATS: [], sanitizeToolboxes: () => null, defaultToolboxes: () => [], PROJECT_ROOT_FOLDER: 'fixture-root',

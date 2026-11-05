@@ -25,10 +25,10 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           repository: sbstndalton/noevia-rs
-          # The front owns the embedding background and its --features advertises rust-embedding-background-v1, which this
-          # Core's boot pairs with (server/rust-embedding-background.cjs); acceptance input only. The head of the noevia-rs
-          # embeddings PR (sbstndalton/noevia-rs#403, move/embedding-input-framing), which contains the research round head.
-          ref: 5fdee7b42e9b014377e675c4e88290f143752fde
+          # Immutable acceptance input for the native embedding/outbox/media owner.
+          # Its compiled features include rust-media-background-v1, required by Core boot.
+          # Acceptance input only; release ancestry and checksum gates are unchanged.
+          ref: d30fb58a09073f6dc081654fd2771c77df9e9380
           path: rs
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
