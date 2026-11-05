@@ -5,7 +5,10 @@
 // process's own counts, which its synchronous chat and workers read: the maintenance gate's inference count, the
 // inference budget (#697) and the gate's one-model queue, a machine's turn (#1849, #1880), the Diary exchange's
 // throttle and the backfill's pause. This module takes them for a ticket the front issued and holds them until the
-// front gives the ticket back; it never issues a lease of its own.
+// front gives the ticket back; it never issues a lease of its own. Partial port: the admission decisions themselves
+// (maintenance permit, budget/quarantine, machine assignment and readiness, the Diary throttle) are still made here
+// (createAdmission) and trusted by the front, until their owners (maintenance lease, model budget, machines, chat)
+// move them.
 //
 //   PUT    /internal/inference-admission/lease/<id>        {model} | {role, machine, model} | {diaryExchange: {user}}
 //          201 {lease: <id>, ttlMs, headers?}; 400/409/429/503 {error, code?}; 410 when the epoch or incarnation
