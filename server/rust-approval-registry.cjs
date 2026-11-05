@@ -140,8 +140,11 @@ function createApprovalRegistry({ approvals, timeoutMs = 5 * 60 * 1000, log = ()
   const pendingRevokes = new Map(); // same key -> { user, chat, latest, since, delay, timer, trying }
   const revokeKey = (userId, chatId) => JSON.stringify([userId, safeId(chatId)]);
   // Missing/pruned entries use the current global generation, never zero (no epoch ABA).
-  const epochOf = (key) => Math.max(epochs.get(key)?.epoch ?? generations,
-    userEpochs.get(JSON.parse(key)[0]) ?? 0);
+  function epochOf(key) {
+    let seen = epochs.get(key);
+    if (!seen) { seen = { epoch: generations, at: now() }; epochs.set(key, seen); }
+    return Math.max(seen.epoch, userEpochs.get(JSON.parse(key)[0]) ?? 0);
+  }
 
   // Authenticated front acknowledgement: synchronous epoch advance before the HTTP answer.
   // Project deletion invalidates this user's in-flight tickets as well, including grants already

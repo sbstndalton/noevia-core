@@ -448,3 +448,15 @@ test('project revocation acknowledgement invalidates user tickets even with a mi
   f.gate.frontRevoked('owner');
   assert.equal(fence.open(), false);
 });
+
+test('another chat or account revoke does not close an unexpired executor fence', async () => {
+  const f = fenced(); const g = await f.grant();
+  const redeem = f.gate.redeemChatGrant('owner', 'chat', 'project:p', binding, g);
+  (await f.next('redeem')).ok({ redeemed:true, protocol:REGISTRY_PROTOCOL, window_ms:2000 });
+  const fence = await redeem;
+  f.gate.frontRevoked('other-owner', 'chat');
+  f.gate.frontRevoked('owner', 'other-chat');
+  assert.equal(fence.open(), true);
+  f.gate.frontRevoked('owner', 'chat');
+  assert.equal(fence.open(), false);
+});
