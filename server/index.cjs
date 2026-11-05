@@ -1283,6 +1283,8 @@ const toolboxPickerFacts = require('./rust-toolbox-picker-facts.cjs').createTool
   mcp: () => ({ enabled: mcpWiring.enabled(), state: mcpState, servers: MCP_SERVERS, manifest: MCP_TOOLBOX_MANIFEST }),
 });
 
+const modelMutationsBridge = require('./rust-model-mutations-bridge.cjs').createModelMutationsBridge({ secret: FRONT_SECRET, json, readJson, manager: () => modelManager, service: modelService, asUser: diaryAsUser, env: process.env });
+
 // With no inference gate, the Rust front's reload holds this process's own maintenance gate (#2210).
 const maintenanceLeases = require('./model-maintenance-lease.cjs').createLeaseRoutes({
   secret: FRONT_SECRET, json, hold: typeof modelManager.holdMaintenance === 'function' ? () => modelManager.holdMaintenance() : null,
@@ -1308,6 +1310,8 @@ function publicHeaders(res) {
 async function handleRequestInner(req, res) {
   // The ownership refusals below answer before handleRequestScoped; they carry the same headers.
   publicHeaders(res);
+  if (require('./rust-model-mutations.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
+  if (await modelMutationsBridge(req, res)) return;
   if (require('./rust-tool-approvals.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   if (require('./rust-idle-unload-read.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   if (await idleUnloadFacts(req, res)) return;

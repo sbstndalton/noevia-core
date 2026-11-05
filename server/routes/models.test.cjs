@@ -302,18 +302,12 @@ test('#336: the sections proxy refuses to delete the configured embedding model\
   assert.equal(f.sent.pop().status, 200, 'renaming the embedding model section is unaffected by the delete guard');
 });
 
-test('any write under /api/models/ drops the scan, and pull/delete/load keep their answers', async () => {
+test('any write under /api/models/ drops the scan, and migrated writes refuse while load keeps its answer', async () => {
   const f = fixture();
   f.scan.set('models', { at: Date.now(), body: {} });
-  await f.call('POST', '/api/models/pull', { checkpoint: 'org/m:q4' }, 'admin');
-  assert.deepEqual(f.sent.pop(), { status: 200, body: { jobId: 'pull-1', modelName: 'user.org/m:q4' } });
+  await f.call('POST', '/api/models/pull', { checkpoint: 'synthetic/repo:Q4' }, 'admin');
+  assert.deepEqual(f.sent.pop(), { status: 503, body: { error: 'The Rust front owns model pull and delete.' } });
   assert.equal(f.scan.has('models'), false);
-  await f.call('POST', '/api/models/pull', {}, 'admin');
-  assert.deepEqual(f.sent.pop(), { status: 400, body: { error: 'checkpoint required' } });
-  await f.call('POST', '/api/models/delete', { name: 'm' }, 'admin');
-  assert.deepEqual(f.sent.pop(), { status: 502, body: { error: 'delete failed: 500', unloaded: true } }, 'a failed delete still reports whether the unload before it succeeded (#302 follow-up)');
-  await f.call('POST', '/api/models/delete', { name: 'laya_multilingual_f16' }, 'admin');
-  assert.deepEqual(f.sent.pop(), { status: 400, body: { error: 'System routing model — not deleted', errorId: 'systemModel', service: 'decision' } });
   await f.call('POST', '/api/models/load', { name: 'm', mtp: true }, 'admin');
   assert.deepEqual(f.sent.pop(), { status: 400, body: { error: 'Use the native preset editor to configure speculative decoding.' } });
   await f.call('POST', '/api/models/unload', { name: 'm' }, 'admin');
@@ -407,163 +401,7 @@ test('#1071: GET /api/routing-default is the Rust front\'s, so Node always refus
   assert.equal(f.sent.pop().status, 200, 'PUT keeps answering in Node');
 });
 
-test('deleting a loaded model unloads first, clears its auto-role and the last-loaded default, and reports what changed', async () => {
-  const calls = [];
-  const f = fixture({
-    manager: {
-      unload: async (name) => { calls.push(['unload', name]); return { ok: true }; },
-      deleteModel: async (name) => { calls.push(['delete', name]); return { ok: true, status: 200 }; },
-    },
-    modelsInstalled: async () => [{ name: 'm', loaded: true }, { name: 'other', loaded: false }],
-    initialRoles: { fast: 'm', smart: 'other' },
-    initialLastLoaded: 'm',
-  });
-  await f.call('POST', '/api/models/delete', { name: 'm' }, 'admin');
-  assert.deepEqual(f.sent.pop(), { status: 200, body: { ok: true, unloaded: true, rolesCleared: ['fast'], presetRemoved: false } });
-  assert.deepEqual(calls, [['unload', 'm'], ['delete', 'm']], 'unload happens before delete, in that order');
-  assert.deepEqual(f.roles.current, { fast: 'other', smart: 'other' }, 'the fast role falls back to the still-configured smart model');
-  assert.equal(f.lastLoaded.current, null, 'the deleted model is no longer the no-model-selected default');
-});
-
-test('deleting a model that is not loaded skips unload but still deletes and clears roles', async () => {
-  const calls = [];
-  const f = fixture({
-    manager: {
-      unload: async (name) => { calls.push(['unload', name]); return { ok: true }; },
-      deleteModel: async (name) => { calls.push(['delete', name]); return { ok: true, status: 200 }; },
-    },
-    modelsInstalled: async () => [{ name: 'm', loaded: false }],
-    initialRoles: { fast: 'f', smart: 'm', vision: 'm' },
-  });
-  await f.call('POST', '/api/models/delete', { name: 'm' }, 'admin');
-  assert.deepEqual(f.sent.pop(), { status: 200, body: { ok: true, unloaded: false, rolesCleared: ['smart', 'vision'], presetRemoved: false } });
-  assert.deepEqual(calls, [['delete', 'm']], 'an already-unloaded model is never sent an unload call');
-  assert.deepEqual(f.roles.current, { fast: 'f', smart: 'f' }, 'smart falls back to fast, and the optional vision role is dropped rather than left dangling');
-});
-
-test('deleting a model prefers manager.removeModel (one mutate gate) over separate unload+deleteModel calls, when the manager offers it', async () => {
-  const calls = [];
-  const f = fixture({
-    manager: {
-      removeModel: async (name) => { calls.push(['removeModel', name]); return { ok: true, status: 200, unloaded: true }; },
-      unload: async (name) => { calls.push(['unload', name]); return { ok: true }; },
-      deleteModel: async (name) => { calls.push(['delete', name]); return { ok: true, status: 200 }; },
-    },
-    modelsInstalled: async () => [{ name: 'm', loaded: true }],
-  });
-  await f.call('POST', '/api/models/delete', { name: 'm' }, 'admin');
-  assert.deepEqual(f.sent.pop(), { status: 200, body: { ok: true, unloaded: true, rolesCleared: [], presetRemoved: false } });
-  assert.deepEqual(calls, [['removeModel', 'm']], 'removeModel is called instead of separate unload/deleteModel calls');
-});
-
-test('a failed delete through removeModel reports its own unloaded value in the 502 body', async () => {
-  const f = fixture({
-    manager: { removeModel: async () => ({ ok: false, status: 409, unloaded: true }) },
-    modelsInstalled: async () => [{ name: 'm', loaded: true }],
-  });
-  await f.call('POST', '/api/models/delete', { name: 'm' }, 'admin');
-  assert.deepEqual(f.sent.pop(), { status: 502, body: { error: 'delete failed: 409', unloaded: true } });
-});
-
-test('deleting a model tolerates the manager reporting "not loaded" on unload and still deletes', async () => {
-  const f = fixture({
-    manager: {
-      unload: async () => ({ ok: false, status: 404 }),
-      deleteModel: async () => ({ ok: true, status: 200 }),
-    },
-    modelsInstalled: async () => [{ name: 'm', loaded: true }],
-  });
-  await f.call('POST', '/api/models/delete', { name: 'm' }, 'admin');
-  assert.deepEqual(f.sent.pop(), { status: 200, body: { ok: true, unloaded: false, rolesCleared: [], presetRemoved: false } });
-});
-
-test('deleting an unknown model 404s and never reaches unload or delete', async () => {
-  const calls = [];
-  const f = fixture({
-    manager: {
-      unload: async () => { calls.push('unload'); return { ok: true }; },
-      deleteModel: async () => { calls.push('delete'); return { ok: true, status: 200 }; },
-    },
-    modelsInstalled: async () => [{ name: 'other', loaded: false }],
-  });
-  await f.call('POST', '/api/models/delete', { name: 'gone' }, 'admin');
-  assert.deepEqual(f.sent.pop(), { status: 404, body: { error: 'model not found: gone' } });
-  assert.deepEqual(calls, []);
-});
-
-test('a system model is still refused before any unload or delete call, on both engine kinds', async () => {
-  const llama = fixture({ manager: { unload: async () => ({ ok: true }), deleteModel: async () => ({ ok: true, status: 200 }) } });
-  await llama.call('POST', '/api/models/delete', { name: 'laya_multilingual_f16' }, 'admin');
-  assert.deepEqual(llama.sent.pop(), { status: 400, body: { error: 'System routing model — not deleted', errorId: 'systemModel', service: 'decision' } });
-
-  const python = fixture({ kind: 'lemonade', manager: { unload: async () => ({ ok: true }), deleteModel: async () => ({ ok: true, status: 200 }) } });
-  await python.call('POST', '/api/models/delete', { name: 'laya_multilingual_f16' }, 'admin');
-  assert.deepEqual(python.sent.pop(), { status: 400, body: { error: 'System routing model — not deleted', errorId: 'systemModel', service: 'decision' } });
-});
-
-test('#336: deleting the configured embedding model (or reranker) 409s before any unload/delete call, on both engine kinds', async () => {
-  const calls = [];
-  const manager = {
-    unload: async () => { calls.push('unload'); return { ok: true }; },
-    deleteModel: async () => { calls.push('delete'); return { ok: true, status: 200 }; },
-  };
-  const llama = fixture({ env: { EMBEDDING_MODEL: 'nomic-embed-text-v1' }, manager, modelsInstalled: async () => [{ name: 'nomic-embed-text-v1', loaded: true }] });
-  await llama.call('POST', '/api/models/delete', { name: 'nomic-embed-text-v1' }, 'admin');
-  assert.deepEqual(llama.sent.pop(), { status: 409, body: { error: 'A running sidecar (embedding or reranking) depends on this model — not deleted', errorId: 'modelInUse', service: 'embedding' } });
-  assert.deepEqual(calls, [], 'never unloaded or deleted');
-
-  // EMBED_MODEL is the fallback name (rag.cjs's own precedence), and a reranker only counts
-  // once the feature is actually on.
-  const rerank = fixture({
-    env: { EMBED_MODEL: 'nomic-embed-text-v1', NOEVIA_FEATURE_RAG_RERANK: '1', RERANK_MODEL: 'qwen3-reranker-0.6b-q8_0' },
-    modelsInstalled: async () => [{ name: 'qwen3-reranker-0.6b-q8_0', loaded: false }],
-  });
-  await rerank.call('POST', '/api/models/delete', { name: 'qwen3-reranker-0.6b-q8_0' }, 'admin');
-  assert.deepEqual(rerank.sent.pop(), { status: 409, body: { error: 'A running sidecar (embedding or reranking) depends on this model — not deleted', errorId: 'modelInUse', service: 'reranker' } });
-
-  const rerankOff = fixture({
-    env: { RERANK_MODEL: 'qwen3-reranker-0.6b-q8_0' },
-    manager: { unload: async () => ({ ok: true }), deleteModel: async () => ({ ok: true, status: 200 }) },
-    modelsInstalled: async () => [{ name: 'qwen3-reranker-0.6b-q8_0', loaded: false }],
-  });
-  await rerankOff.call('POST', '/api/models/delete', { name: 'qwen3-reranker-0.6b-q8_0' }, 'admin');
-  assert.equal(rerankOff.sent.pop().status, 200, 'RERANK_MODEL alone (feature off) does not protect it');
-
-  // A neutral id resolving to the embedding model through the llama.cpp router listing is caught too.
-  const python = fixture({
-    kind: 'lemonade',
-    env: { EMBEDDING_MODEL: 'nomic-embed-text-v1' },
-    manager,
-    modelsInstalled: async () => [{ name: 'nomic-embed-text-v1', loaded: true }],
-  });
-  await python.call('POST', '/api/models/delete', { name: 'nomic-embed-text-v1' }, 'admin');
-  assert.deepEqual(python.sent.pop(), { status: 409, body: { error: 'A running sidecar (embedding or reranking) depends on this model — not deleted', errorId: 'modelInUse', service: 'embedding' } });
-
-  // EMBEDDING_MODEL=default (the .env.example placeholder) protects nothing.
-  const placeholder = fixture({
-    env: { EMBEDDING_MODEL: 'default' },
-    manager: { unload: async () => ({ ok: true }), deleteModel: async () => ({ ok: true, status: 200 }) },
-    modelsInstalled: async () => [{ name: 'default', loaded: false }],
-  });
-  await placeholder.call('POST', '/api/models/delete', { name: 'default' }, 'admin');
-  assert.equal(placeholder.sent.pop().status, 200);
-});
-
-test('the python model-manager branch (no /models listing check) still unloads, deletes and clears roles', async () => {
-  const calls = [];
-  const f = fixture({
-    kind: 'lemonade',
-    manager: {
-      unload: async (name) => { calls.push(['unload', name]); return { ok: true }; },
-      deleteModel: async (name) => { calls.push(['delete', name]); return { ok: true, status: 200 }; },
-    },
-    modelsInstalled: async () => [{ name: 'm', loaded: true }],
-    initialRoles: { fast: 'm', smart: 'other' },
-  });
-  await f.call('POST', '/api/models/delete', { name: 'm' }, 'admin');
-  assert.deepEqual(f.sent.pop(), { status: 200, body: { ok: true, unloaded: true, rolesCleared: ['fast'], presetRemoved: false } });
-  assert.deepEqual(calls, [['unload', 'm'], ['delete', 'm']]);
-});
+test('migrated pull and delete refuse direct Node calls without invoking adapters',async()=>{const f=fixture({manager:{pull:()=>assert.fail(),removeModel:()=>assert.fail(),deleteModel:()=>assert.fail()}});for(const path of ['/api/models/pull','/api/models/delete']){await f.call('POST',path,'malformed','admin');assert.deepEqual(f.sent.pop(),{status:503,body:{error:'The Rust front owns model pull and delete.'}});}});
 
 test('the benchmark start proxy refuses non-chat models with 400 and forwards chat-only suites (#206)', async () => {
   const f = fixture({ env: { MODEL_LOADER_URL: 'http://loader' }, catalogue: [{ name: 'chat-syn', labels: [] }, { name: 'vec-syn', labels: ['embeddings'] }] });
@@ -991,7 +829,6 @@ test('native embedding protection missing or stale refuses all delete entrypoint
   mod.install({ protectionKnown: () => false, managed: () => false });
   const f = fixture({ env: { MODEL_LOADER_URL: 'http://loader' } });
   for (const [method, route, body] of [
-    ['POST', '/api/models/delete', { name: 'synthetic' }],
     ['POST', '/api/model-manager/models/delete', { models: ['synthetic'] }],
     ['DELETE', '/api/model-manager/sections/synthetic'],
   ]) {
@@ -1012,7 +849,7 @@ test('#2298 stable saved reranker is protected beside the deployment seed in pub
   try {
     for (const name of ['rerank-seed-a', 'rerank-current-b']) {
       const f = fixture({ env, manager: { load: forbidden, unload: forbidden, deleteModel: forbidden, request: forbidden } });
-      for (const action of ['load', 'unload', 'delete']) {
+      for (const action of ['load', 'unload']) {
         await f.call('POST', `/api/models/${action}`, { name }, 'admin');
         assert.equal(f.sent.at(-1)?.status, 409, `${action} must protect ${name}`);
         if (action === 'delete') assert.equal(f.sent.at(-1).body.service, 'reranker');
@@ -1049,7 +886,6 @@ test('#2298 unreadable current reranker state refuses unsafe public actions befo
       for (const [method, path, body] of [
         ['POST', '/api/models/load', { name: 'm' }],
         ['POST', '/api/models/unload', { name: 'm' }],
-        ['POST', '/api/models/delete', { name: 'm' }],
         ['DELETE', '/api/model-manager/sections/m'],
         ['POST', '/api/model-manager/models/delete', { models: ['synthetic.gguf'] }],
       ]) {

@@ -27,13 +27,6 @@ test('model polling does not load cold models or invent unsupported telemetry',a
  const {manager,calls}=fixture();await manager.listModels();const health=await manager.health();assert.deepEqual(health.body.all_models_loaded,[]);
  assert.ok(calls.every(c=>c.url.endsWith('/models')));assert.equal((await manager.systemStats()).ok,false);assert.equal((await manager.stats()).body.output_tokens_total,null);
 });
-test('native cache downloads and deletes use router identities',async()=>{
- const {manager,calls}=fixture();await manager.pull({checkpoint:'fixture/model:Q8_0'});await manager.deleteModel('fixture/model:Q8_0');
- assert.equal(calls[0].url,'http://synthetic-router/models');assert.equal(calls[0].options.method,'POST');
- assert.equal(new URL(calls[1].url).searchParams.get('model'),'fixture/model:Q8_0');assert.equal(calls[1].options.method,'DELETE');
- const count=calls.length;assert.equal((await manager.pull({checkpoint:'https://untrusted.invalid/file'})).status,400);assert.equal(calls.length,count);
-});
-
 test('public variant discovery excludes projectors, ambiguous quants and incomplete splits',async()=>{
  const {variants}=require('./llamacpp-variants.cjs');let options;
  const files=[['model-Q8_0.gguf',100],['mmproj-F16.gguf',20],['a-Q4_K_M.gguf',30],['b-Q4_K_M.gguf',40],['model-Q5_K_M-00001-of-00002.gguf',50],['model-IQ4_XS-00001-of-00002.gguf',70],['model-IQ4_XS-00002-of-00002.gguf',80]];
@@ -163,43 +156,6 @@ test('qualification evidence is tied to the live configuration and goes stale wh
 
 // removeModel (#302 follow-up): unload and delete inside a single mutate() gate, with the
 // delete retried once (after one more unload attempt) if the router refuses it the first time.
-test('removeModel unloads then deletes as one call, and reports unloaded:true on success',async()=>{
- const calls=[];
- const manager=createModelManager({gate:fakeGate(),fetchStream:async()=>({ok:false}),kind:'llamacpp',baseUrl:'http://synthetic',fetchJson:async(url,options)=>{
-  const path=new URL(url).pathname;calls.push(`${options?.method||'GET'} ${path}`);
-  if(path==='/models/unload')return {ok:true,status:200,body:{success:true}};
-  if(path==='/models'&&options?.method==='DELETE')return {ok:true,status:200,body:{deleted:true}};
-  return {ok:true,status:200,body:{}};
- }});
- const r=await manager.removeModel('gone');
- assert.equal(r.ok,true);assert.equal(r.unloaded,true);
- assert.deepEqual(calls,['POST /models/unload','DELETE /models'],'unload happens before delete, exactly once each on the happy path');
-});
-
-test('removeModel retries the unload once, then retries the delete, if the first delete is refused',async()=>{
- const calls=[];let deleteAttempts=0;
- const manager=createModelManager({gate:fakeGate(),fetchStream:async()=>({ok:false}),kind:'llamacpp',baseUrl:'http://synthetic',fetchJson:async(url,options)=>{
-  const path=new URL(url).pathname;calls.push(`${options?.method||'GET'} ${path}`);
-  if(path==='/models/unload')return {ok:true,status:200,body:{success:true}};
-  if(path==='/models'&&options?.method==='DELETE'){deleteAttempts+=1;return deleteAttempts===1?{ok:false,status:409,body:{error:'busy'}}:{ok:true,status:200,body:{deleted:true}};}
-  return {ok:true,status:200,body:{}};
- }});
- const r=await manager.removeModel('busy-model');
- assert.equal(r.ok,true);assert.equal(deleteAttempts,2);
- assert.deepEqual(calls,['POST /models/unload','DELETE /models','POST /models/unload','DELETE /models'],'a refused delete gets one more unload+delete attempt, inside the same mutate() gate');
-});
-
-test('removeModel gives up after the retry and still reports whether anything actually unloaded',async()=>{
- const manager=createModelManager({gate:fakeGate(),fetchStream:async()=>({ok:false}),kind:'llamacpp',baseUrl:'http://synthetic',fetchJson:async(url,options)=>{
-  const path=new URL(url).pathname;
-  if(path==='/models/unload')return {ok:false,status:404,body:{error:'not loaded'}};
-  if(path==='/models'&&options?.method==='DELETE')return {ok:false,status:409,body:{error:'still busy'}};
-  return {ok:true,status:200,body:{}};
- }});
- const r=await manager.removeModel('stuck-model');
- assert.equal(r.ok,false);assert.equal(r.status,409);assert.equal(r.unloaded,false,'the manager never reported a successful unload, on either attempt');
-});
-
 test('forgetIdentity drops a cached identity without needing a live request',async()=>{
  const manager=createModelManager({gate:fakeGate(),fetchStream:async()=>({ok:false}),kind:'llamacpp',baseUrl:'http://synthetic',fetchJson:async()=>({ok:true,status:200,body:{}})});
  assert.doesNotThrow(()=>manager.forgetIdentity('whatever-not-cached'));
@@ -366,3 +322,5 @@ test('#2215: Node\'s identity for a preset with a draft model is the hash noevia
   assert.equal((await manager.evidence('fx')).body.identityHash,'020672eed05cd79afff0a83eb80abfcfb682271e57a2a7585caf35736c02a9d7');
  }finally{fs.rmSync(root,{recursive:true,force:true});}
 });
+
+test('pull and delete have no remaining Node engine executor',()=>{const {manager}=fixture();for(const method of ['pull','deleteModel','removeModel'])assert.equal(manager[method],undefined);});

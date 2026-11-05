@@ -1,9 +1,9 @@
 'use strict';
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { createModelManager } = require('./model-manager.cjs');
-const { fakeGate } = require('./fixtures/fake-inference-gate.cjs');
-const cases = require('./fixtures/model-delete-manager.json');
+const { createModelManager } = require(require('node:path').join(process.env.NOEVIA_ORACLE_CORE,'server/model-manager.cjs'));
+const { fakeGate } = require('./fake-inference-gate.cjs');
+const cases = require('./model-delete-manager.json');
 
 // Also consumed by noevia-server/tests/model_delete.rs. These cases use no model files or engines.
 for (const fixture of cases) test(`delete native oracle: ${fixture.name}`, async () => {

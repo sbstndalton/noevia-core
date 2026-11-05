@@ -354,25 +354,13 @@ function createModelService({ fetchJson, env, modelManager, currentWorkspace, li
     return installed;
   }
 
-  // Lemonade's /pull needs a namespaced model_name for any checkpoint it
-  // doesn't already know about; derive one from the repo/variant the user
-  // picked (variants() below always hands us `<repo>:<variant>` or a bare
-  // repo). Lemonade requires the `user.` prefix to avoid colliding with its
-  // built-in registry.
-  function deriveUserModelName(checkpoint) {
-    const [repo, variant] = String(checkpoint).split(':');
-    const base = (repo.split('/').pop() || repo).replace(/[^A-Za-z0-9._-]/g, '-');
-    const safeVariant = variant ? variant.replace(/[^A-Za-z0-9._-]/g, '-') : '';
-    return `user.${base}${safeVariant ? `-${safeVariant}` : ''}`;
-  }
-
   return {
     managerFetch, modelScanCache, refreshModelScan, lastLoadedModel, clearLastLoadedModel,
     modelScanSnapshot: () => modelScanCache.snapshot(),
     publishModelScan: (body,token) => modelScanCache.publish(body,token),
     requestModelScanRefresh: token => modelScanCache.refresh(token),
     autoRoles, setAutoRoles, clearRoleReferences, ensureModelLoaded, ensureRolesLoaded,
-    servedCatalogue, modelsInstalled, modelsInstalledFresh, invalidateModelReads, installedFacts, deriveUserModelName,
+    servedCatalogue, modelsInstalled, modelsInstalledFresh, invalidateModelReads, installedFacts,
   };
 }
 

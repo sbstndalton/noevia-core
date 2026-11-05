@@ -69,7 +69,7 @@ const STATS_REFUSAL = Object.freeze({ error: 'Engine statistics are owned by the
 const ROUTING_DEFAULT_REFUSAL = Object.freeze({ error: 'Routing default is owned by the Rust front.' });
 const AUTO_ROLES_REFUSAL = Object.freeze({ error: 'The auto-roles read is owned by the Rust front.', code: 'RUST_AUTO_ROLES_OWNED' });
 function createModelRoutes({ servedEmbeddingModels = (target) => require('../rag.cjs').servedModelsCached(target), json, readBody, readJson, fetchJson, env, modelManager, currentWorkspace, service, inferenceBudget = null, idleUnload = null, sweepGuardOptions = {}, decisionSettings = null, rerankSettings = null }) {
-  const { modelScanCache, refreshModelScan, autoRoles, setAutoRoles, ensureRolesLoaded, servedCatalogue, modelsInstalled, deriveUserModelName, lastLoadedModel, clearLastLoadedModel, clearRoleReferences } = service;
+  const { modelScanCache, refreshModelScan, autoRoles, setAutoRoles, ensureRolesLoaded, servedCatalogue, modelsInstalled, lastLoadedModel, clearLastLoadedModel, clearRoleReferences } = service;
   // #1461: the installed list is shared for a moment (service.modelsInstalled). A decision that must confirm
   // the engine's state right now (a delete that checks the model exists, a load that checks it is not missing)
   // asks for a fresh read instead.
@@ -618,107 +618,7 @@ function createModelRoutes({ servedEmbeddingModels = (target) => require('../rag
       return json(res,200,await require('../mtp-artifact.cjs').check(repo,variant.files || [variant.primary_file]));
     }
 
-    if (p === '/api/models/pull' && req.method === 'POST') {
-      const raw = await readBody(req);
-      let body;
-      try {
-        body = JSON.parse(raw);
-      } catch {
-        return json(res, 400, { error: 'invalid JSON' });
-      }
-      if (!body.checkpoint) return json(res, 400, { error: 'checkpoint required' });
-      if (!modelManager.enabled) return json(res, 404, { error: 'model management is disabled' });
-      const modelName = body.modelName || deriveUserModelName(body.checkpoint);
-      const r = await modelManager.pull({ modelName, checkpoint: body.checkpoint, recipe: body.recipe || 'llamacpp' });
-      return json(
-        res,
-        r.ok ? 200 : 502,
-        r.ok ? { jobId: r.body?.id || r.body?.job_id || 'pull', modelName: r.body?.modelName || modelName } : { error: r.body?.error || `pull failed: ${r.status}` },
-      );
-    }
-
-    if (p === '/api/models/delete' && req.method === 'POST') {
-      const raw = await readBody(req);
-      let body;
-      try {
-        body = JSON.parse(raw);
-      } catch {
-        return json(res, 400, { error: 'invalid JSON' });
-      }
-      if (!body.name) return json(res, 400, { error: 'name required' });
-      // #1660: Laya can be deleted too, but only when the request says so explicitly (the
-      // client's confirm names the Decision service); without it the old refusal stands.
-      const confirmSystem = body.confirmSystem === true;
-      if (isSystemModel(body.name) && !confirmSystem) return json(res, 400, { error: SYSTEM_MODEL_DELETE_REASON, errorId: 'systemModel', service: 'decision' });
-      // #336: the embedding model was deleted through this route while the embed sidecar was
-      // still pointed at it, which crash-loops that sidecar with nothing to fall back to.
-      // 409 (not 400): the name is a perfectly valid model, just not deletable right now.
-      // #1660: the refusal names the service, so the client can offer "switch it first".
-      if (embeddingProtectionUnknown(env) || isSidecarModel(body.name, env)) return json(res, 409, { error: SIDECAR_MODEL_DELETE_REASON, errorId: 'modelInUse', service: sidecarServiceOf(body.name) });
-      if (!modelManager.enabled) return json(res, 404, { error: 'model management is disabled' });
-      // A neutral id can still point at Laya's weights: check the router's --model path as well.
-      if (modelManager.kind === 'llamacpp' && typeof modelManager.request === 'function') {
-        const listing = await modelManager.request('/models').catch(() => null);
-        if (!listing?.ok || !Array.isArray(listing.body?.data)) return json(res, 409, { error: 'Could not confirm this is not a system model. Try again.' });
-        const row = listing.body.data.find(m => m.id === body.name);
-        if (row && !confirmSystem && isSystemModel(row.id, modelPathFromArgs(row.status?.args || []))) return json(res, 400, { error: SYSTEM_MODEL_DELETE_REASON, errorId: 'systemModel', service: 'decision' });
-        if (row && isSidecarModel(row.id, env)) return json(res, 409, { error: SIDECAR_MODEL_DELETE_REASON, errorId: 'modelInUse', service: sidecarServiceOf(row.id) });
-      }
-      // Confirm the model is known before touching it: an unknown name 404s instead of
-      // forwarding a delete the manager might silently accept for anything. When the
-      // installed list cannot be read (engine unreachable) this check is skipped and the
-      // delete below is attempted anyway, same as before this existence check existed.
-      let installed = null;
-      try { installed = await modelsInstalledNow(); } catch { installed = null; }
-      const entry = Array.isArray(installed) ? installed.find((m) => m.name === body.name) : null;
-      if (Array.isArray(installed) && !entry) return json(res, 404, { error: `model not found: ${body.name}` });
-      // Unload first: a loaded model can refuse deletion or leave its file locked. Tolerate
-      // the manager reporting "not loaded" (or being momentarily unreachable) — the delete
-      // below still goes ahead either way. removeModel (llama.cpp) holds a single mutate()
-      // gate across both calls and retries the unload once if the delete is refused, so an
-      // on-demand load cannot slip in between; other manager kinds fall back to the two calls.
-      let unloaded = false, r;
-      if (typeof modelManager.removeModel === 'function') {
-        r = await modelManager.removeModel(body.name);
-        unloaded = !!r.unloaded;
-      } else {
-        if (!entry || entry.loaded) {
-          const u = await modelManager.unload(body.name).catch(() => null);
-          unloaded = !!u?.ok;
-        }
-        r = await modelManager.deleteModel(body.name);
-      }
-      // #1661: the engine's delete removes the file, but the models.ini preset stayed behind and
-      // the card came back as "File missing". Remove the preset section through the model
-      // management service as well. A preset whose file is already gone has nothing for the
-      // engine to delete, so removing its section alone is a successful delete.
-      // Only once the file is gone (or was already missing): a refused engine delete must keep the
-      // section, or the file stays on disk with its settings lost and no card to retry from.
-      const fileGone = r.ok || entry?.missingFile === true;
-      // #2219: the file is already gone when a refused hold keeps the section: the card shows "File
-      // missing" and this delete or the list's prune finishes the job.
-      const held = fileGone && env.MODEL_LOADER_URL ? await writePresetsHeld(() => removePresetSection(body.name), (w) => w.removed) : null;
-      if (held?.refused && !r.ok) return json(res, 409, { error: PRESETS_BUSY, code: 'maintenance_held', retryable: true, unloaded });
-      const preset = held?.written || { removed: false };
-      const engineOk = r.ok || (entry?.missingFile === true && preset.removed);
-      if (!engineOk) {
-        // noevia#2115: the gate does not unload or delete a model that is answering a request.
-        const refusal = refusalOf(r);
-        if (refusal) return json(res, refusal.status, { error: refusal.error, code: refusal.code, retryable: refusal.retryable, unloaded });
-        return json(res, 502, { error: `delete failed: ${r.status}`, unloaded });
-      }
-      // The model is gone: drop every auto-role that pointed at it, the shared "last loaded
-      // model" default if it was this one, and the cached folder scan, so nothing still
-      // served by this route can hand the deleted name back out.
-      const rolesCleared = clearRoleReferences(body.name);
-      if (lastLoadedModel() === body.name) clearLastLoadedModel(body.name);
-      if (typeof modelManager.forgetIdentity === 'function') modelManager.forgetIdentity(body.name);
-      // #1695: the router still lists a removed section until it re-reads models.ini.
-      const reloaded = !!held?.reloaded;
-      modelScanCache.clear();
-      if (service.invalidateModelReads) service.invalidateModelReads();
-      return json(res, 200, { ok: true, unloaded, rolesCleared, presetRemoved: preset.removed, ...(held?.refused ? { presetBusy: true } : {}), ...(preset.removed ? { presetsReloaded: reloaded } : {}) });
-    }
+    if (['/api/models/pull', '/api/models/delete'].includes(p) && req.method === 'POST') return json(res, 503, { error: 'The Rust front owns model pull and delete.' });
 
     for (const verb of ['load', 'unload']) {
       if (p === `/api/models/${verb}` && req.method === 'POST') {

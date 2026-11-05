@@ -1,7 +1,10 @@
 'use strict';
 // Actual Core public handler + actual adapter; no network or model data.
-const { createModelRoutes } = require('../routes/models.cjs');
-const { createModelManager } = require('../model-manager.cjs');
+const path=require('node:path');
+const baseline=process.env.NOEVIA_ORACLE_CORE;
+if(!baseline)throw Error('Set NOEVIA_ORACLE_CORE to the pinned pre-migration Core source');
+const { createModelRoutes } = require(path.join(baseline,'server/routes/models.cjs'));
+const { createModelManager } = require(path.join(baseline,'server/model-manager.cjs'));
 const { fakeGate } = require('./fake-inference-gate.cjs');
 async function capture(c) {
   let request;

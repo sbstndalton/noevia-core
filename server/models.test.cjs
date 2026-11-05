@@ -227,13 +227,6 @@ test('clearLastLoadedModel only clears when the name still matches (a load in be
   assert.equal(f.service.lastLoadedModel(), null);
 });
 
-test('a checkpoint becomes a namespaced user model name', () => {
-  const { service } = fixture();
-  assert.equal(service.deriveUserModelName('org/Model-7B:Q4_K_M'), 'user.Model-7B-Q4_K_M');
-  assert.equal(service.deriveUserModelName('org/Model 7B'), 'user.Model-7B');
-  assert.equal(service.deriveUserModelName('bare'), 'user.bare');
-});
-
 test('#545: a models.ini preset whose file is not in the folder scan reads as missing and failed; cache-sourced models and other presets are untouched', async () => {
   const f = fixture({
     env: { MODEL_LOADER_URL: 'http://loader' },

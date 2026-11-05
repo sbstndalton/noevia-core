@@ -801,26 +801,8 @@ function createLlamaCppManager({ budgetWatchDir = null, baseUrl, apiKey, fetchJs
     // #697 watchdog: unload without waiting behind maintenance; memory is running out. With the admin
     // token it ends a model in use (the gate logs it); without one the gate unloads only an idle model.
     emergencyUnload: model => gateClient.hasAdmin() ? forcedUnload(model, 60000) : post('/models/unload', { model }, 60000),
-    pull: ({ checkpoint }) => mutate(async () => {
-      if (!/^[\w.-]+\/[\w.-]+(?::[\w.-]+)?$/.test(checkpoint || '')) return { ok: false, status: 400, body: { error: 'Choose a Hugging Face repository and quantization' } };
-      tracker.requested(checkpoint);
-      const response = await post('/models', { model: checkpoint });
-      if(!response.ok)tracker.rejected(checkpoint);
-      return response.ok ? { ...response, body: { ...response.body, id: checkpoint, modelName: checkpoint } } : response;
-    }),
-    deleteModel: model => mutate(async () => { const r = await request('/models?model=' + encodeURIComponent(model), { method: 'DELETE' }, 60000); if (r.ok) identityCache.delete(model); return r; }),
-    // Unload, then delete. A request from another client can load the model again in between, so
-    // retry once if deletion is refused. The gate refuses to unload a model in use.
-    removeModel: model => mutate(async () => {
-      let unloaded = !!(await post('/models/unload', { model }).catch(() => null))?.ok;
-      let del = await request('/models?model=' + encodeURIComponent(model), { method: 'DELETE' }, 60000);
-      if (!del.ok) {
-        if ((await post('/models/unload', { model }).catch(() => null))?.ok) unloaded = true;
-        del = await request('/models?model=' + encodeURIComponent(model), { method: 'DELETE' }, 60000);
-      }
-      if (del.ok) identityCache.delete(model);
-      return { ...del, unloaded };
-    }),
+    // Progress remains shared with Node download readers and the evidence-import consumer.
+    noteDownload: (checkpoint, state) => state === 'requested' ? tracker.requested(checkpoint) : tracker.rejected(checkpoint),
     // Exposed so callers that delete a model's files through a different path (the raw
     // model-manager folder-scan proxy, routes/models.cjs) can still drop its cached identity.
     forgetIdentity: model => identityCache.delete(model),

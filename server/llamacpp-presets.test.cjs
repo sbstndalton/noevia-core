@@ -37,7 +37,7 @@ test('preset reload excludes concurrent native lifecycle mutations',async t=>{
  const manager=createModelManager({kind:'llamacpp',baseUrl:'http://synthetic',presetPath:file,fetchJson:async url=>{if(url==='http://synthetic/models')await waiting;return {ok:true,status:200,body:{data:[{id:'synthetic',status:{value:'unloaded'}}]}};}});
  const applying=manager.applyPreset({model:'synthetic',baseRevision:store.get('synthetic').revision,options:{parallel:'1'},confirmReload:true});
  assert.throws(()=>manager.enterInference(),{status:503});
- for(const operation of [()=>manager.load('synthetic'),()=>manager.unload('synthetic'),()=>manager.deleteModel('synthetic'),()=>manager.pull({checkpoint:'synthetic/model:Q8_0'})])await assert.rejects(operation(),{status:503});
+ for(const operation of [()=>manager.load('synthetic'),()=>manager.unload('synthetic')])await assert.rejects(operation(),{status:503});
  release();assert.equal((await applying).ok,true);
  const leave=manager.enterInference();leave();
 });
