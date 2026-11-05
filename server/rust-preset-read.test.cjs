@@ -129,6 +129,34 @@ test('missing, malformed and valid-empty files are three different outcomes', (t
   assert.throws(() => dir.store().get('m'), { status: 409, message: 'Preset path must be a regular file' });
 });
 
+// The 1 MiB editor limit is the parser's alone. JSON writes a NUL as six bytes (\u0000), so a file
+// inside the limit is up to 6 MiB on the wire; the transport bound must never refuse it.
+test('worst-case escaped files at the 1 MiB boundary read as the old Node parser reads them', (t) => {
+  const MIB = 1024 * 1024;
+  const { file } = fixture(t, '');
+  const ours = runtime.createPresetStore(file, { cacheRam: LIMITS }), theirs = reference.createPresetStore(file, { cacheRam: LIMITS });
+  const outcome = (fn) => { try { return { value: JSON.stringify(fn()) }; } catch (e) { return { status: e.status, message: e.message }; } };
+  const cases = {
+    'a comment then 750000 NULs (750001 bytes, 4.5 MB on the wire)': ';' + '\u0000'.repeat(750000),
+    'exactly 1 MiB of NULs (6 MiB on the wire)': '\u0000'.repeat(MIB),
+    'a section and NULs up to exactly 1 MiB': '[m]\nc=4096\n' + '\u0000'.repeat(MIB - 13),
+    '1 MiB + 1 of NULs': '\u0000'.repeat(MIB + 1),
+    '1 MiB + 1 of plain text': 'x'.repeat(MIB + 1),
+    'a file far past the transport bound': 'x'.repeat(8 * MIB),
+  };
+  let accepted = 0, refused = 0;
+  for (const [name, text] of Object.entries(cases)) {
+    fs.writeFileSync(file, text);
+    const want = outcome(() => theirs.get('m'));
+    assert.deepEqual(outcome(() => ours.get('m')), want, name);
+    assert.deepEqual(outcome(() => ours.snapshot()), outcome(() => theirs.snapshot()), `${name} (snapshot)`);
+    if (want.status) { assert.equal(want.status, 413, name); refused++; } else { assert.equal(JSON.parse(want.value).revision, sha(text), name); accepted++; }
+  }
+  assert.equal(accepted, 3);
+  assert.equal(refused, 3);
+  assert.ok(JSON.stringify('\u0000'.repeat(MIB)).length > 6 * MIB, 'the case really is the worst case on the wire');
+});
+
 test('a native fault is an unavailable parser, never a silent JS parse', (t) => {
   const { store } = fixture(t, TEXT);
   const warn = console.warn, seen = [];

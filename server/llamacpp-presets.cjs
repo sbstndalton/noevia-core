@@ -56,6 +56,9 @@ function native(wasmLoader,fn){
   try{r=fn(wasmLoader());}
   catch(err){
     readWarn(String(err?.reason||'unexpected').slice(0,40));
+    // The transport bound covers every file inside the limit written at its widest, so a request past it
+    // is a text past the limit too: Node's own answer for that is the 413. (The limit is decided by the
+    // parser; this is only what a request too big to reach it means.)
     throw err?.reason==='too_large'?FAULTS.oversized():error(503,'Preset state is unavailable. Try again shortly.');
   }
   if(r?.fault!==undefined){
