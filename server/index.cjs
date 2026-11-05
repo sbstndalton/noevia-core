@@ -765,7 +765,7 @@ const inferenceAdmission = require('./inference-admission-lease.cjs').createAdmi
   secret: FRONT_SECRET, modelManager, admitEngineModel, chatMachines, json, readJson,
   // The front's Diary local exchange (rust-diary-local-exchange.cjs): the backfill's pause. Its share of the `llm:`
   // budget is counted by the front (chat port S6, rust-chat-edge.cjs), so the lease charges nothing here.
-  diaryExchange: { rateLimited: () => false, foreground: () => rag.foreground() },
+  diaryExchange: { foreground: () => rag.foreground() },
 });
 const researchBridge = require('./rust-research-bridge.cjs').createResearchBridge({
   secret: FRONT_SECRET, json, readJson,
