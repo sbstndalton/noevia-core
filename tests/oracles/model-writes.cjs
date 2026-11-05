@@ -29,7 +29,7 @@ function routes({ installed, sections, reload = { ok: true, status: 200, body: {
       if (m && init.method === 'DELETE' && Number(m[2]) === presets.length) { presets = presets.filter((x) => x.name !== decodeURIComponent(m[1])); return { ok: true, status: 200, body: {} }; }
       return { ok: false, status: 409, body: {} };
     },
-    idleUnload: {save: async()=>({})},
+    idleUnload: createIdleUnloadSetting({env:{}}),
     env: { MODEL_LOADER_URL: 'http://loader.invalid', RERANK_MODEL: 'tiny-reranker' }, modelManager,
     getProvider: () => ({}), providerHeaders: () => ({}), DEFAULT_PROVIDER_ID: 'default',
     createVisionProbe: () => async () => ({ supported: true }),
