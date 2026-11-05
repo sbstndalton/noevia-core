@@ -23,6 +23,9 @@ const MAX_ATTEMPTS = 8;
 const CHAT_DELETE_CLIENT_MARKER = 'noevia-chat-delete-client/1';
 // Release pairing requires foundation + generation-aware Node enforcement.
 const CHAT_MOVE_CLIENT_MARKER = 'noevia-chat-move-client/1';
+// sbstndalton/noevia#2218: this core runs no MCP tool call itself; mcpCall asks the front's executor (noevia-rs mcp_exec.rs). noevia
+// deploy/tools/assemble-release.sh pairs it with a front exporting "rust-mcp-exec" (and refuses the reverse pairing). Keep the quoted literal.
+const MCP_EXEC_CLIENT_MARKER = 'noevia-mcp-exec-client/1';
 const TIMEOUT_MS = 10000;
 // sbstndalton/noevia#2190 round 5: a ChatGPT session may refresh upstream and a model list may
 // fetch the catalogue after a refresh (the broker's 15 s each).
@@ -34,6 +37,9 @@ const RESEAL_WAIT_MS = 120000;
 // discover and register (up to five 8 s requests).
 const MCP_WAIT_MS = 45000;
 const MCP_START_WAIT_MS = 120000;
+// sbstndalton/noevia#2218: one MCP tool call is the front's (mcp_exec.rs): connect 30 s, call 60 s, close 5 s, one retry after a refused
+// sign-in, and the broker's own waits; this is the most a caller waits for its text.
+const MCP_CALL_WAIT_MS = 4 * 60 * 1000;
 const REPLY_CAP = 2 * 32 * 1024 * 1024 + 64 * 1024;
 // providers.json (sbstndalton/noevia#2190 round 6) is the account's private provider rows: the Rust
 // front's routes are its writer; Node saves only its seal-on-load migration here.
@@ -283,6 +289,15 @@ function createClient({ port, token, fetchImpl = globalThis.fetch, timeoutMs = T
       if (status === 200 && body && body.headers && typeof body.headers === 'object' && !Array.isArray(body.headers)) return { ok: true, headers: body.headers };
       return mcpRefusal(status, body);
     },
+    /** sbstndalton/noevia#2218: run one MCP tool call on the front's executor (mcp_exec.rs). `body` is
+     *  `{ name, args, server, offers, caller, workspace, editTarget, internalAuth }`; the answer is the text the model is
+     *  given (a failed call is text too, never a throw). `{ ok: false }` when the front cannot be asked or does not
+     *  answer: the caller refuses, it never runs the call itself. `signal` (the chat's Stop) abandons the call, which
+     *  closes the session the front opened. Throws AbortError on a Stop. */
+    async mcpCall(body, { signal = null } = {}) {
+      const { status, body: answer } = await call('mcp/call', body, MCP_CALL_WAIT_MS, signal);
+      return status === 200 && answer && typeof answer.text === 'string' ? { ok: true, text: answer.text } : { ok: false, status };
+    },
     async mcpReject(user, server, generation) {
       const { status, body } = await call('mcp/reject', { user, server, generation: String(generation || '') }, MCP_WAIT_MS);
       return status === 200 && body ? { ok: true, marked: body.marked === true } : mcpRefusal(status, body);
@@ -477,4 +492,4 @@ function holdForStoreSaves(res, saves) {
   };
 }
 
-module.exports = { CHAT_MOVE_CLIENT_MARKER, CHAT_DELETE_CLIENT_MARKER, HISTORY_ORIGINS, enabledFrom, createClient, clientFromEnv, createQueue, busy, failureReply, holdForStoreSaves, transcriptsFor, MAX_ATTEMPTS, TIMEOUT_MS };
+module.exports = { CHAT_MOVE_CLIENT_MARKER, CHAT_DELETE_CLIENT_MARKER, MCP_EXEC_CLIENT_MARKER, HISTORY_ORIGINS, enabledFrom, createClient, clientFromEnv, createQueue, busy, failureReply, holdForStoreSaves, transcriptsFor, MAX_ATTEMPTS, TIMEOUT_MS };

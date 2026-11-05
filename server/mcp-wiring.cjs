@@ -3,9 +3,10 @@
 // How noevia talks to MCP servers at runtime: the live server list (operator
 // entries plus directory entries an administrator added), lazy cached
 // discovery with per-server failure, which credential each server mode gets
-// (nextcloud pass-through, a static bearer, a per-account key or sign-in, or
-// a capability token for noevia's own internal server), and the executor
-// that runs one discovered tool. The MCP protocol itself is mcp.cjs; the
+// (a static bearer, a per-account key or sign-in, or a capability token for
+// noevia's own internal server), and the client of the Rust front's executor
+// that runs one discovered tool (sbstndalton/noevia#2218). The MCP protocol
+// itself is mcp.cjs; the
 // curated boxes are mcp-boxes.cjs; the directory and OAuth stores are
 // injected, so this module holds no database and tests need no server.
 
@@ -59,14 +60,11 @@ function createCredentialOriginCheck(origins) {
  * @param {object} [deps.mcpKeys]        the keys broker: hasKey (sync, from its published readiness) and headers (async,
  *   one call's worth; never cached here). Without it no account has a key (fails closed).
  * @param {(url) => Promise<boolean>} deps.directoryUrlAllowed
- * @param {(baseUrl) => boolean} deps.credentialOriginAllowed
  * @param {{ getStore() }} deps.scope    the request scope: { workspace:{userId}, authn:{user}, internalCallProject }
- * @param {(userId) => object} deps.storageFor    the account's storage connection (kind, baseUrl, username, secret)
  * @param {(name) => boolean} deps.isWriteTool
  * @param {{ mintToken(key, claims) }} deps.internal   mcp-internal.cjs
  * @param {string|Buffer} deps.internalKey
- * @param {(text, opts) => { text, reduced }} deps.reduceToolResult
- * @param {number} deps.resultCap
+ * @param {(request, { signal }) => Promise<{ ok, text?, status? }>} deps.mcpExec   the Rust front's tool executor (project-store-client.cjs mcpCall)
  * @param {NodeJS.ProcessEnv} [deps.env]   for a bearer server's tokenEnv
  * @param {(url, init) => Promise<Response>} [deps.fetch]
  * @param {(url, init) => Promise<Response>} [deps.publicFetch]   public-fetch.cjs: refuses a private
@@ -84,8 +82,10 @@ function createCredentialOriginCheck(origins) {
  * @param {{ log, warn }} [deps.logger]
  */
 function createMcpWiring({
-  servers, manifest = [], mcp, bindBoxes, directoryMcp, mcpOAuth, mcpKeys = { hasKey: () => false, headers: async () => null }, directoryUrlAllowed, credentialOriginAllowed,
-  scope, storageFor, isWriteTool, internal, internalKey, reduceToolResult, resultCap = 8000,
+  servers, manifest = [], mcp, bindBoxes, directoryMcp, mcpOAuth, mcpKeys = { hasKey: () => false, headers: async () => null }, directoryUrlAllowed,
+  scope, isWriteTool, internal, internalKey,
+  // Fails closed when nothing is wired: a call is refused, never run here.
+  mcpExec = async () => ({ ok: false, status: 0 }),
   env = process.env, fetch = globalThis.fetch, publicFetch = null, discoveryTtlMs = 10 * 60 * 1000,
   discoveryFailTtlMs = Number(process.env.MCP_DISCOVERY_FAIL_TTL_MS || 30 * 1000), logger = console,
   isUserDisabled = () => false,
@@ -93,27 +93,9 @@ function createMcpWiring({
   // it is retried after these steps, one per consecutive failed discovery, instead of after the whole
   // discoveryTtlMs. The last step holds. Capped at discoveryTtlMs.
   discoveryRetryMs = [5000, 15000, 45000, 120000],
-  toolRateLimit = require('./tool-rate-limit.cjs').createToolRateLimit(),
   // How often the Rust front's directory table is looked at on the hot paths (0: every time).
   directoryCheckMs = 250,
 }) {
-  const rateLimit = require('./tool-rate-limit.cjs');
-  const PER_USER_AUTH = new Set(['nextcloud', 'personal', 'oauth']);
-  /** An access token for one call: the broker's session ({ accessToken, generation }), or null. */
-  const oauthSessionFor = async (userId, serverId, rejected = null, signal = undefined) => {
-    if (typeof mcpOAuth.session === 'function') return mcpOAuth.session(userId, serverId, rejected, { signal });
-    const token = await mcpOAuth.tokenFor(userId, serverId, { signal });
-    return token ? { accessToken: token, generation: '' } : null;
-  };
-  /** What a tool call says when its credential could not be fetched for a reason that is NOT "the account has to
-   *  sign in": the broker is down or busy (`transient`) - nothing is wrong with the sign-in or key, so the
-   *  person is not sent to redo it - or the chat was stopped. */
-  const credentialTrouble = (name, server, err) => {
-    if (err && err.name === 'AbortError') return `ERROR calling ${name}: the request was stopped.`;
-    if (err && err.transient === true) return `ERROR: ${name} could not check your ${server.auth === 'oauth' ? 'sign-in' : 'key'} for ${server.title || 'this server'} right now. This is temporary: try again in a moment. Do not sign in again.`;
-    // Anything else is returned like any other failed call (a thrown error would strand the chip with no result).
-    return `ERROR calling ${name}: ${String((err && err.message) || err).slice(0, 300)}`;
-  };
   const MCP_SERVERS = servers;
   if (publicFetch && typeof mcp.withFetch !== 'function') throw new TypeError('publicFetch needs an MCP client with withFetch');
   const publicMcp = publicFetch ? mcp.withFetch(publicFetch) : null;
@@ -203,39 +185,12 @@ function createMcpWiring({
   };
 
   /** A server's own service token, if it was configured with one. Distinct from
-   *  mcpAuthHeaders, which forwards the USER's Nextcloud credential — this is a
+   *  the USER's Nextcloud credential (the front's, mcp_exec.rs) — this is a
    *  single key belonging to noevia's deployment, identical for everyone. */
   function mcpStaticAuth(server) {
     if (!server || server.auth !== 'bearer' || !server.tokenEnv) return null;
     const token = env[server.tokenEnv];
     return token ? { Authorization: `Bearer ${token}` } : null;
-  }
-
-  // Per-user credential pass-through, following the diaryHeaders() precedent.
-  //
-  // The MCP server runs in multi_user_basic mode: it stores no credential of its
-  // own and builds a Nextcloud client per request from the Authorization header.
-  // noevia already holds exactly the credential that wants — the per-user
-  // Nextcloud app password obtained for storage — so the consent the user has
-  // already given is reused rather than asked for a second time.
-  //
-  // Both 'nextcloud' and 'webdav' connections qualify: a Nextcloud app password
-  // is the same secret whichever way the user attached it, and in practice the
-  // generic WebDAV form is common. The origin allowlist, not the `kind` label,
-  // is what makes this safe.
-  function mcpAuthHeaders() {
-    const store = scope.getStore();
-    const workspace = store && store.workspace;
-    if (!workspace) return null;
-    const storage = storageFor(workspace.userId);
-    if (!['nextcloud', 'webdav'].includes(storage.kind)) return null;
-    if (!storage.username || !storage.secret) return null;
-    if (!credentialOriginAllowed(storage.baseUrl)) {
-      logger.warn(`[mcp] refusing to forward credentials for ${storage.baseUrl}: origin not in MCP_NEXTCLOUD_ORIGINS`);
-      return null;
-    }
-    const basic = Buffer.from(`${storage.username}:${storage.secret}`).toString('base64');
-    return { Authorization: `Basic ${basic}`, 'X-Cowork-User-ID': workspace.userId };
   }
 
   /** Which project the in-flight tool call belongs to. executeMcpToolCall is
@@ -293,7 +248,7 @@ function createMcpWiring({
 
   async function discoverOneServer(server) {
     // Discovery lists the catalogue only. A per-USER credential is attached at
-    // call time instead (see mcpAuthHeaders), but a static service token has to
+    // call time instead (the front's executor), but a static service token has to
     // be present here or the server has nothing to list.
     // A directory server is someone else's: re-check at every discovery that its name still points
     // at a public address, so a DNS change cannot turn it into a probe of the home network.
@@ -385,7 +340,7 @@ function createMcpWiring({
         // Flatten into one registry. A name offered by two servers keeps the
         // first in `tools` — declaration order in MCP_SERVERS is the tie-break, and the
         // collision is logged rather than silently resolved. `offers` keeps every server
-        // offering the name, which is what a call is routed by (routeMcpTool, below).
+        // offering the name, which is what a call is routed by (the front's executor, from the `offers` a call carries).
         const byName = new Map();
         const offers = new Map();
         for (const server of MCP_SERVERS) {
@@ -440,181 +395,42 @@ function createMcpWiring({
     return mcpState.inflight;
   }
 
-  /** Which server's tool a call means (#865). A call is routed by (server, name): `serverId` is
-   *  the server whose box offered the tool to the model. Without one, a name only one server
-   *  offers is unambiguous; a name two servers offer is refused rather than guessed, because
-   *  guessing sends the call — and that server's credential — somewhere the model was not shown. */
-  function routeMcpTool(name, serverId) {
-    const offered = mcpState.offers.get(name);
-    if (serverId !== undefined && serverId !== null) {
-      const entry = offered ? offered.get(serverId) : null;
-      return entry ? { known: entry } : { error: `ERROR: unknown tool "${name}" on MCP server "${serverId}"` };
-    }
-    if (offered && offered.size > 1) {
-      logger.warn(`[mcp] refused a call to "${name}" without a server: offered by ${[...offered.keys()].map((id) => `"${id}"`).join(', ')}`);
-      return { error: `ERROR: tool "${name}" is offered by more than one MCP server, so it was not run.` };
-    }
-    const known = mcpState.tools.get(name);
-    return known ? { known } : { error: `ERROR: unknown tool "${name}"` };
-  }
-
-  /** The one operator (non-directory) server offering a name, for noevia's own fixed callers
-   *  (deep research's tavily_search / tavily_extract). They name a tool the operator configured,
-   *  so a directory server offering the same name must neither take the call nor make it
-   *  ambiguous. `undefined` when no operator server, or more than one, offers it. */
-  function operatorServerFor(name) {
-    const offered = mcpState.offers.get(name);
-    if (!offered) return undefined;
-    const ids = [...offered.keys()].filter((id) => { const sv = MCP_SERVER_BY_ID.get(id); return sv && !sv.directory; });
-    return ids.length === 1 ? ids[0] : undefined;
-  }
-
-  /** Run a fixed caller's tool (deep research's tavily_search / tavily_extract) on the one
-   *  operator server offering it. With no such server the call fails and nothing is sent: falling
-   *  back to name routing would hand the query, with that server's credential, to a directory
-   *  server (#891). Chat tool calls keep using executeMcpToolCall. */
-  async function executeOperatorToolCall(name, args, signal) {
-    const serverId = operatorServerFor(name);
-    if (serverId === undefined) {
-      logger.warn(`[mcp] refused "${name}" for a fixed caller: no single operator MCP server offers it`);
-      const message = 'Web search is not configured on this server.';
-      throw Object.assign(Error(message), { publicMessage: message });
-    }
-    return executeMcpToolCall(name, args, signal, serverId);
-  }
-
+  /** Runs one discovered tool (sbstndalton/noevia#2218): the Rust front's executor does it (noevia-rs bins/noevia-server
+   *  mcp_exec.rs): routing by (server, name), the approved-edit binding, the account's own credential, the 429 wait, the
+   *  MCP session, the one retry after a refused sign-in and the reduction of the result. This is its client, and it fails
+   *  closed: a front that cannot be asked or does not answer is a refused call, never one this process runs itself.
+   *
+   *  Discovery stays here, so the call carries what only this process knows: which servers offer the name (`offers`),
+   *  whether the chat approved it as a project-file edit, the account (`caller`: its key and sign-in; `workspace`: its
+   *  Nextcloud connection) and, for noevia's own server, the capability token this process alone can mint.
+   *  Like the executor it replaced, it RETURNS a failure as text: a thrown error would strand the chip with no result. */
   async function executeMcpToolCall(name, args, signal, serverId) {
     refreshDirectory();
-    const route = routeMcpTool(name, serverId);
-    if (route.error) return route.error;
-    const known = route.known;
-    const server = MCP_SERVER_BY_ID.get(known.serverId);
-    if (!server) return `ERROR: tool "${name}" belongs to MCP server "${known.serverId}", which is no longer configured`;
-    // An approval for a project file edit names a stored project file, and only noevia's own
-    // server edits project files. A call carrying that approval that is routed anywhere else was
-    // approved for something it would not do: refused, nothing sent (#865 review).
-    if (scope.getStore()?.internalEditTarget && server.auth !== 'internal') {
-      logger.warn(`[mcp] refused "${name}": approved as a project file edit but routed to MCP server "${server.id}"`);
-      return `ERROR: ${name} was approved as a project file edit, but "${name}" was offered by MCP server "${server.id}"; it was not run.`;
+    const store = scope.getStore();
+    const offered = mcpState.offers.get(name);
+    const offers = offered ? [...offered.keys()] : [];
+    // The token is minted only when an internal server could take the call; the front uses it only if its own routing
+    // resolves to one. 30 seconds, bound to this user and project by the HMAC.
+    const internalAuth = offers.some((id) => MCP_SERVER_BY_ID.get(id)?.auth === 'internal') ? mcpInternalAuth(name)?.Authorization : undefined;
+    const request = {
+      name, args, offers,
+      ...(serverId !== undefined && serverId !== null ? { server: serverId } : {}),
+      ...(store?.authn?.user?.id ? { caller: store.authn.user.id } : {}),
+      ...(store?.workspace?.userId ? { workspace: store.workspace.userId } : {}),
+      ...(store?.internalEditTarget ? { editTarget: true } : {}),
+      ...(internalAuth ? { internalAuth } : {}),
+    };
+    let answer;
+    try { answer = await mcpExec(request, { signal }); } catch (err) {
+      if ((signal && signal.aborted) || (err && err.name === 'AbortError')) return `ERROR calling ${name}: This operation was aborted`;
+      logger.warn(`[mcp] ${name} not run: the tool executor could not be asked (${String((err && err.code) || (err && err.name) || 'error').slice(0, 60)})`);
+      return `ERROR calling ${name}: tool execution is unavailable right now. Try again in a moment.`;
     }
-
-    // Credentials are per server. Forwarding the user's Nextcloud password to a
-    // server that merely happens to be configured would hand their password to
-    // somebody else's service, so only a server the operator marked
-    // auth=nextcloud gets it — and then only if the origin allowlist agrees.
-    let auth = null;
-    // The signed-in account's sign-in session, kept to retry once if the server refuses its token.
-    let oauthSession = null;
-    const callerId = scope.getStore()?.authn?.user?.id;
-    if (server.auth === 'personal') {
-      // Each account's own key, never another's: asked of the broker for this call only.
-      // `signal` is the chat's: Stop cancels the broker call too.
-      try { auth = await mcpKeys.headers(callerId, server.id, { signal }); } catch (e) { return credentialTrouble(name, server, e); }
-      if (!auth || !Object.keys(auth).length) return `ERROR: ${name} needs your own key for ${server.title || 'this server'}: Plugins → Connected → Add key.`;
-    } else if (server.auth === 'oauth') {
-      // Each account's own sign-in, never another's: an access token for this call only. The refresh
-      // token stays with the broker. A broker that cannot say right now is "try again", not "sign in".
-      try { oauthSession = await oauthSessionFor(callerId, server.id, null, signal); } catch (e) { return credentialTrouble(name, server, e); }
-      if (!oauthSession) return `ERROR: ${name} needs you to sign in to ${server.title || 'this server'} first: Plugins → Connected → Sign in.`;
-      auth = { Authorization: `Bearer ${oauthSession.accessToken}` };
-    } else if (server.auth === 'directory') {
-      auth = directoryMcp.headersFor(server.id);
-    } else if (server.auth === 'bearer') {
-      auth = mcpStaticAuth(server);
-      if (!auth) return `ERROR: ${name} needs ${server.tokenEnv}, which is not configured on this deployment.`;
-    } else if (server.auth === 'internal') {
-      auth = mcpInternalAuth(name);
-      if (!auth) return `ERROR: ${name} needs a signed-in session and there is none.`;
-    } else if (server.auth === 'nextcloud') {
-      auth = mcpAuthHeaders();
-      if (!auth) {
-        // Actionable on purpose: the model relays this to the user, and the fix
-        // is something only the user can do.
-        return 'ERROR: this tool needs your Nextcloud account. Connect Nextcloud in Settings → Storage, then try again. (If it is already connected, the administrator has not listed its address in MCP_NEXTCLOUD_ORIGINS.)';
-      }
+    if (!answer || answer.ok !== true) {
+      logger.warn(`[mcp] ${name} not run: the tool executor answered ${answer && answer.status}`);
+      return `ERROR calling ${name}: tool execution is unavailable right now. Try again in a moment.`;
     }
-
-    if (server.directory && !(await directoryUrlAllowed(server.url))) return `ERROR: ${name} was not run: its server's address no longer resolves to a public host.`;
-    // #1693: a provider that answered 429 is not called again inside its wait. Per server, and per account for every
-    // server that sends the account's own credentials (#1701: nextcloud too), so one account never pauses another.
-    const rateKey = `${server.id}\u0000${PER_USER_AUTH.has(server.auth) ? String(scope.getStore()?.authn?.user?.id || '') : ''}`;
-    const coolingMs = toolRateLimit.remaining(rateKey);
-    if (coolingMs > 0) return rateLimit.coolingDownText(name, coolingMs);
-    try {
-      const transport = transportFor(server);
-      const callOnce = async (headers) => {
-        const { session } = await transport.connect(server.url, headers, undefined, signal);
-        try {
-          return await transport.callTool(server.url, session, name, args, headers, undefined, signal);
-        } finally {
-          // Close it whatever happened. Nothing used to, so every tool call left a
-          // session behind on the server for the life of the process.
-          await transport.disconnect(server.url, session, headers, undefined, signal);
-        }
-      };
-      let result;
-      try {
-        result = await callOnce(auth);
-      } catch (err) {
-        // A server that refuses the token it was just given: ask the broker for one past it (it
-        // refreshes only if that token is still the stored one) and try once more. A second refusal
-        // marks THAT sign-in as needing a new one, so the account is told to sign in again.
-        if (!(oauthSession && err && err.httpStatus === 401)) throw err;
-        let next;
-        try { next = await oauthSessionFor(callerId, server.id, oauthSession.accessToken, signal); }
-        catch (down) {
-          // The broker could not say (down, or its refresh at the service failed just now). The 401
-          // stands as the answer, and NOTHING is marked: the sign-in may be perfectly good, and
-          // marking it would cost the account a sign-in over a passing fault.
-          if (signal && signal.aborted) throw down;
-          throw err;
-        }
-        // No usable sign-in left: the broker has already marked the refused one (it does that itself when
-        // it cannot refresh past it), so there is nothing to mark here either.
-        if (!next) throw err;
-        if (next.accessToken === oauthSession.accessToken) {
-          // The broker's best is the very token that was refused: that sign-in is no good.
-          if (typeof mcpOAuth.reject === 'function') await mcpOAuth.reject(callerId, server.id, oauthSession.generation).catch(() => false);
-          throw err;
-        }
-        oauthSession = next;
-        try { result = await callOnce({ Authorization: `Bearer ${next.accessToken}` }); }
-        catch (again) {
-          if (again && again.httpStatus === 401 && typeof mcpOAuth.reject === 'function') await mcpOAuth.reject(callerId, server.id, next.generation).catch(() => false);
-          throw again;
-        }
-      }
-      const text = mcp.resultToText(result);
-      if (result && result.isError && rateLimit.isRateLimitedText(text)) {
-        logger.warn(`[mcp] ${name} rate limited (tool error)`);
-        return rateLimit.rateLimitedText(name, toolRateLimit.hit(rateKey));
-      }
-      if (!result || !result.isError) toolRateLimit.clear(rateKey);
-      if (!text) return '(the tool returned no output)';
-      // Was a blind `slice(0, cap)`. A listing from the Nextcloud box is an
-      // array of near-identical objects, so most of what that slice spent the
-      // budget on was the same keys over and over. Hoisting them to a header
-      // row buys roughly twice the records for the same characters, and the
-      // cap itself is unchanged. Nothing is dropped without saying so.
-      const reduced = reduceToolResult(text, { maxChars: resultCap });
-      if (reduced.reduced) logger.log(`[tool-result] ${name}: ${text.length} → ${reduced.text.length} chars`);
-      return reduced.text;
-    } catch (err) {
-      // Returned, not thrown: a failed tool call is information the model can
-      // act on or relay, and throwing would strand the chip with no result.
-      // An HTTP failure carries the server's response body in its message; that
-      // is third-party text, so it goes to the log and the model gets a
-      // neutral line with the status only.
-      if (err && err.httpStatus === 429) {
-        logger.warn(`[mcp] ${name} rate limited (HTTP 429)`);
-        return rateLimit.rateLimitedText(name, toolRateLimit.hit(rateKey, rateLimit.parseRetryAfter(err.retryAfter)));
-      }
-      if (err && Number.isInteger(err.httpStatus)) {
-        logger.warn(`[mcp] ${name} failed: ${String(err.message).slice(0, 300)}`);
-        return `ERROR calling ${name}: tool call failed (HTTP ${err.httpStatus})`;
-      }
-      return `ERROR calling ${name}: ${String((err && err.message) || err).slice(0, 300)}`;
-    }
+    return answer.text;
   }
 
   return {
@@ -623,8 +439,8 @@ function createMcpWiring({
     state: mcpState,
     oauthServerIds, accountReady, syncDirectoryServers, refreshDirectory,
     discoverOneServer, discoverMcpTools,
-    mcpStaticAuth, mcpAuthHeaders, mcpInternalAuth, internalCallProjectId, mcpDiscoveryAuth,
-    executeMcpToolCall, operatorServerFor, executeOperatorToolCall,
+    mcpStaticAuth, mcpInternalAuth, internalCallProjectId, mcpDiscoveryAuth,
+    executeMcpToolCall,
   };
 }
 

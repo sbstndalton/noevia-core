@@ -157,11 +157,9 @@ function wiring({ servers, publicFetch, directoryUrlAllowed = async () => true, 
   return createMcpWiring({
     servers, mcp, publicFetch, directoryUrlAllowed,
     bindBoxes: () => [], directoryMcp: { signal: () => 0, asServers: () => [], headersFor: () => ({}) }, mcpOAuth: {},
-    credentialOriginAllowed: () => false,
     scope: { getStore: () => ({ workspace: { userId: 'alice' }, authn: { user: { id: 'alice' } } }) },
-    storageFor: () => ({}), isWriteTool: () => false,
+    isWriteTool: () => false,
     internal: { mintToken: () => 'internal-token' }, internalKey: 'k',
-    reduceToolResult: (text) => ({ text, reduced: false }),
     logger: { log() {}, warn: (line) => warnings.push(line) },
   });
 }
@@ -179,17 +177,6 @@ test('DNS rebinding against a directory server: the check passes, the connection
   assert.equal(fx.hits.length, 0);
 });
 
-test('a directory server that rebinds is refused for tool calls too', async (t) => {
-  const fx = await mcpFixture(t);
-  const url = `http://localhost:${fx.port}/mcp`;
-  const server = { id: 'dir-x', url, auth: 'none', directory: true };
-  const w = wiring({ servers: [server], publicFetch: createPublicFetch({ resolve: fakeResolver(['169.254.169.254']).resolve }) });
-  w.state.tools.set('echo', { tool: {}, readOnly: true, serverId: 'dir-x' });
-  const out = await w.executeMcpToolCall('echo', { s: 'x' });
-  assert.match(out, /^ERROR calling echo: refused: localhost resolves to a private address/);
-  assert.equal(fx.hits.length, 0);
-});
-
 test("the operator's LAN server and the internal loopback server are unaffected", async (t) => {
   const fx = await mcpFixture(t);
   // A publicFetch that would refuse every connection: if either server went through it, it would fail.
@@ -199,21 +186,15 @@ test("the operator's LAN server and the internal loopback server are unaffected"
   const w = wiring({ servers: [lan, internalSv], publicFetch });
   assert.deepEqual([...(await w.discoverOneServer(lan)).keys()], ['echo']);
   assert.deepEqual([...(await w.discoverOneServer(internalSv)).keys()], ['echo']);
-  w.state.tools.set('echo', { tool: {}, readOnly: true, serverId: 'noevia' });
-  assert.equal(await w.executeMcpToolCall('echo', { s: 'in' }), 'echo:in');
-  assert.ok(fx.hits.some((h) => h.headers.authorization === 'Bearer internal-token'));
-  w.state.tools.set('echo', { tool: {}, readOnly: true, serverId: 'nextcloud' });
-  assert.equal(await w.executeMcpToolCall('echo', { s: 'lan' }), 'echo:lan');
+  assert.ok(fx.hits.some((h) => h.headers.authorization === 'Bearer internal-token'), 'the internal server is listed with its discovery token, over the ordinary fetch');
 });
 
-test('a directory server whose name stays public works end to end through the wiring', async (t) => {
+test('a directory server whose name stays public is discovered through the wiring', async (t) => {
   const fx = await mcpFixture(t);
   const publicFetch = createPublicFetch({ resolve: fakeResolver(['127.0.0.1']).resolve, isPublicAddress: (ip) => ip === '127.0.0.1' });
   const server = { id: 'dir-ok', url: `http://localhost:${fx.port}/mcp`, auth: 'none', directory: true };
   const w = wiring({ servers: [server], publicFetch });
   assert.deepEqual([...(await w.discoverOneServer(server)).keys()], ['echo']);
-  w.state.tools.set('echo', { tool: {}, readOnly: true, serverId: 'dir-ok' });
-  assert.equal(await w.executeMcpToolCall('echo', { s: 'ok' }), 'echo:ok');
 });
 
 test('wiring refuses a publicFetch it cannot use rather than silently skipping it', () => {

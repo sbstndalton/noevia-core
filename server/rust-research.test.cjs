@@ -1,13 +1,14 @@
 'use strict';
 // #2218: deep research is the Rust front's. Node refuses every method of its paths before authentication, the front's
-// loopback bridge offers only the two search tools as the asking user, and the old handlers are gone.
+// loopback bridge offers only the two facts only this process holds (the model it last loaded, a project's retrieval) as the
+// asking user, and the old handlers, the search-tool bridge and the Node tool executor are gone.
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const http = require('node:http');
 const path = require('node:path');
 const test = require('node:test');
 const { OWNED_ROUTES, ROUTE_REFUSAL, owned, refuseOwned } = require('./rust-research.cjs');
-const { createResearchBridge, validTool } = require('./rust-research-bridge.cjs');
+const { createResearchBridge } = require('./rust-research-bridge.cjs');
 const { stripBoilerplate } = require('./strip-boilerplate.cjs');
 const { json, readJson } = require('./http.cjs');
 
@@ -46,8 +47,7 @@ async function bridge(t, overrides = {}) {
   const handle = createResearchBridge({
     secret: SECRET, json, readJson, log: () => {},
     asUser: (user, fn) => { calls.push(['as', user]); return fn(); },
-    availability: () => ({ reason: null, lastLoaded: 'm' }),
-    executeOperatorToolCall: async (name, args, signal) => { calls.push(['tool', name, args, signal instanceof AbortSignal]); return 'tool text'; },
+    facts: () => ({ lastLoaded: 'm' }),
     retrieve: async (projectId, question, user) => { calls.push(['retrieve', projectId, question, user]); return [{ file: 'f', text: 't' }]; },
     ...overrides,
   });
@@ -61,46 +61,54 @@ async function bridge(t, overrides = {}) {
 test('the bridge answers only the front', async (t) => {
   const { post, calls } = await bridge(t);
   for (const headers of [{}, { 'x-noevia-store-token': 'no' }, { 'x-noevia-store-token': SECRET, 'x-forwarded-for': '203.0.113.1' }, { 'x-noevia-store-token': SECRET, 'x-noevia-client-ip': '203.0.113.1' }]) {
-    assert.equal((await post('tool', { user: 'u', name: 'tavily_search', args: { query: 'q' } }, headers)).status, 404);
+    assert.equal((await post('facts', { user: 'u' }, headers)).status, 404);
   }
   assert.equal((await post('other', { user: 'u' })).status, 404);
   assert.deepEqual(calls, []);
 });
 
-test('only the two search tools, in research\'s own shape, as the asking user', async (t) => {
+test('the search tools and the availability of them are not this process\'s any more: their paths are unknown', async (t) => {
   const { post, calls } = await bridge(t);
-  let r = await post('tool', { user: 'u1', name: 'tavily_search', args: { query: 'q', max_results: 500, extra: 1 } });
-  assert.deepEqual([r.status, await r.json()], [200, { text: 'tool text' }]);
-  assert.deepEqual(calls, [['as', 'u1'], ['tool', 'tavily_search', { query: 'q', max_results: 5 }, true]]);
-  calls.length = 0;
-  for (const [name, args] of [['execute_code', { query: 'q' }], ['tavily_search', {}], ['tavily_search', { query: 7 }], ['tavily_extract', { urls: ['a', 'b'] }], ['tavily_extract', { urls: [] }], ['tavily_search', null]]) {
-    assert.equal((await post('tool', { user: 'u1', name, args })).status, 400, name);
-  }
+  for (const op of ['tool', 'availability']) assert.equal((await post(op, { user: 'u', name: 'tavily_search', args: { query: 'q' } })).status, 404, op);
   assert.deepEqual(calls, []);
-  assert.deepEqual(validTool('tavily_extract', { urls: ['https://a.test/'] }), { urls: ['https://a.test/'] });
-  r = await post('tool', { name: 'tavily_search', args: { query: 'q' } });
+  const bridgeSource = fs.readFileSync(path.join(__dirname, 'rust-research-bridge.cjs'), 'utf8');
+  for (const gone of ['executeOperatorToolCall', 'tavily_search', 'validTool']) assert.equal(bridgeSource.includes(gone), false, gone);
+  const wiring = fs.readFileSync(path.join(__dirname, 'mcp-wiring.cjs'), 'utf8');
+  for (const gone of ['executeOperatorToolCall', 'operatorServerFor', 'routeMcpTool', 'mcpAuthHeaders', 'oauthSessionFor']) assert.equal(wiring.includes(gone), false, gone);
+  assert.equal(fs.existsSync(path.join(__dirname, 'tool-rate-limit.cjs')), false, 'the 429 wait is the front\'s');
+});
+
+test('the facts and a project\'s retrieval, as the asking user', async (t) => {
+  const { post, calls } = await bridge(t);
+  let r = await post('facts', { user: 'u1' });
+  assert.deepEqual([r.status, await r.json()], [200, { lastLoaded: 'm' }]);
+  assert.deepEqual(calls, [['as', 'u1']]);
+  calls.length = 0;
+  r = await post('facts', {});
   assert.equal(r.status, 400, 'a user is required');
   r = await post('retrieve', { user: 'u2', projectId: 'p', question: 'q' });
   assert.deepEqual(await r.json(), { hits: [{ file: 'f', text: 't' }] });
   assert.deepEqual(calls, [['as', 'u2'], ['retrieve', 'p', 'q', 'u2']]);
+  r = await post('retrieve', { user: 'u2', projectId: 7, question: 'q' });
+  assert.equal(r.status, 400);
 });
 
-test('a failing tool keeps its public words and hides the rest; a caller going away aborts the tool', async (t) => {
-  const { post } = await bridge(t, { executeOperatorToolCall: async () => { throw Object.assign(Error('x'), { publicMessage: 'Web search is not configured on this server.' }); } });
-  let r = await post('tool', { user: 'u', name: 'tavily_search', args: { query: 'q' } });
-  assert.deepEqual([r.status, await r.json()], [502, { error: 'Web search is not configured on this server.' }]);
-  const hidden = await bridge(t, { executeOperatorToolCall: async () => { throw Error('/secret/path'); } });
-  r = await hidden.post('tool', { user: 'u', name: 'tavily_search', args: { query: 'q' } });
+test('a failing read keeps its public words and hides the rest; a caller going away aborts the retrieval', async (t) => {
+  const { post } = await bridge(t, { retrieve: async () => { throw Object.assign(Error('x'), { publicMessage: 'The index is rebuilding.' }); } });
+  let r = await post('retrieve', { user: 'u', projectId: 'p', question: 'q' });
+  assert.deepEqual([r.status, await r.json()], [502, { error: 'The index is rebuilding.' }]);
+  const hidden = await bridge(t, { retrieve: async () => { throw Error('/secret/path'); } });
+  r = await hidden.post('retrieve', { user: 'u', projectId: 'p', question: 'q' });
   assert.deepEqual(await r.json(), { error: 'Research could not reach this tool.' });
-  let aborted = false;
-  const slow = await bridge(t, { executeOperatorToolCall: (_, __, signal) => new Promise((_res, rej) => { signal.addEventListener('abort', () => { aborted = true; rej(Error('aborted')); }); }) });
+  let closed = false;
+  const slow = await bridge(t, { retrieve: () => new Promise((resolve) => { setTimeout(() => { closed = true; resolve([]); }, 200); }) });
   const controller = new AbortController();
-  const pending = slow.post('tool', { user: 'u', name: 'tavily_search', args: { query: 'q' } }, undefined, controller.signal).catch(() => 'gone');
+  const pending = slow.post('retrieve', { user: 'u', projectId: 'p', question: 'q' }, undefined, controller.signal).catch(() => 'gone');
   await new Promise((res) => setTimeout(res, 30));
   controller.abort();
   assert.equal(await pending, 'gone');
-  await new Promise((res) => setTimeout(res, 30));
-  assert.equal(aborted, true);
+  await new Promise((res) => setTimeout(res, 250));
+  assert.equal(closed, true, 'the retrieval was left to finish, but no answer was written to a caller that left');
 });
 
 test('Kiwix keeps the page cleaner research used to lend it', () => {

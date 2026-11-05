@@ -448,3 +448,44 @@ test('slice7 real loopback authority double preserves latest metadata, CAS, tena
  await assert.rejects(bad.chatMove(USER,'qa raw!','qa-p'));
  await assert.rejects(client.chatMove('88888888-2222-4333-8444-555555555555','qa raw!',null),e=>e.status===410);
 });
+
+test('#2218: an MCP tool call is one store call with the account, the offers and the approval; its text is the answer; it fails closed', async () => {
+  const seen = [];
+  let behaviour = 'ok';
+  const server = http.createServer((req, res) => {
+    let raw = '';
+    req.on('data', (c) => { raw += c; });
+    req.on('end', () => {
+      seen.push({ url: req.url, token: req.headers['x-noevia-store-token'], body: JSON.parse(raw) });
+      if (req.headers['x-noevia-store-token'] !== TOKEN) { res.writeHead(401, { 'content-type': 'application/json' }); return res.end('{"error":"unauthorised"}'); }
+      if (behaviour === 'hang') return; // the tool never answers
+      if (behaviour === 'busy') { res.writeHead(503, { 'content-type': 'application/json' }); return res.end('{"error":"unavailable"}'); }
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify(behaviour === 'shape' ? { text: 5 } : { text: 'ERROR calling t: tool call failed (HTTP 500)' }));
+    });
+  });
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  try {
+    const client = psc.createClient({ port: server.address().port, token: TOKEN });
+    const request = { name: 't', args: { q: 1 }, offers: ['a'], server: 'a', caller: USER, workspace: USER, editTarget: true };
+    assert.deepEqual(await client.mcpCall(request), { ok: true, text: 'ERROR calling t: tool call failed (HTTP 500)' });
+    assert.deepEqual([seen[0].url, seen[0].token, seen[0].body], ['/v1/mcp/call', TOKEN, request]);
+    // Not the front's answer: refused, never run here.
+    behaviour = 'busy';
+    assert.deepEqual(await client.mcpCall(request), { ok: false, status: 503 });
+    behaviour = 'shape';
+    assert.deepEqual(await client.mcpCall(request), { ok: false, status: 200 });
+    const wrong = psc.createClient({ port: server.address().port, token: 'x'.repeat(40) });
+    assert.deepEqual(await wrong.mcpCall(request), { ok: false, status: 401 });
+    // A Stop abandons the call (the connection closes, which ends it at the front) and is an AbortError.
+    behaviour = 'hang';
+    const stop = new AbortController();
+    const pending = client.mcpCall(request, { signal: stop.signal });
+    await new Promise((r) => setTimeout(r, 50));
+    stop.abort();
+    await assert.rejects(pending, { name: 'AbortError' });
+  } finally { server.closeAllConnections(); server.close(); }
+  // An unreachable front is a refusal the caller handles, not a hang.
+  const dead = psc.createClient({ port: 9, token: TOKEN, timeoutMs: 200 });
+  await assert.rejects(dead.mcpCall({ name: 't', offers: [] }), { code: 'PROJECTS_BUSY' });
+});

@@ -41,6 +41,25 @@ const cut = (value, max) => String(value ?? '').slice(0, max).toWellFormed();
 // A tool the front can carry has a text name (discovery guarantees it for MCP tools; a built-in always has one).
 const named = (tool) => !!(tool && tool.function && typeof tool.function.name === 'string' && tool.function.name);
 
+/** The tools deep research asks for by name (the front's research_routes.rs). */
+const RESEARCH_TOOLS = ['tavily_search', 'tavily_extract'];
+
+/**
+ * Which servers offer each tool name, in declaration order (`mcpState.offers`): what the front's tool executor routes
+ * deep research's own calls by (sbstndalton/noevia#2218). Bounded by what the operator configured: a name only a directory
+ * server (a stranger's) offers is left out, except the two names research asks for, so that "discovered, but not by an
+ * operator server" stays distinguishable from "not discovered".
+ */
+function offersOf(state, servers) {
+  const directory = new Set(servers.filter((sv) => sv.directory).map((sv) => sv.id));
+  const out = {};
+  for (const [name, byServer] of (state && state.offers) || []) {
+    const ids = [...byServer.keys()].map(String);
+    if (ids.some((id) => !directory.has(id)) || RESEARCH_TOOLS.includes(name)) out[String(name)] = ids;
+  }
+  return out;
+}
+
 /**
  * The catalogue document (no header): pure, from the live objects.
  * @param {object} o
@@ -84,6 +103,7 @@ function buildWith({ allToolboxes, manifest, mcpEnabled, servers, state, isWrite
         name: cut(t.function.name, 128), description: cut(t.function.description, 240), write: !!isWriteTool(t.function.name),
       })),
     })),
+    offers: enabled ? offersOf(state, servers) : {},
     manifest: enabled ? manifest.map((e) => ({ id: e.id, label: cut(e.label || e.id, 200), description: cut(e.description || '', 1000), inApp: isManifestBoxInApp(e) })) : [],
     // Each server's last discovery, as the admin directory shows it: the tools actually bound to its own
     // box (not the global name registry, where collisions can hide a server's own tools).

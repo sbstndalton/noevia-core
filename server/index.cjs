@@ -775,16 +775,8 @@ const inferenceAdmission = require('./inference-admission-lease.cjs').createAdmi
 const researchBridge = require('./rust-research-bridge.cjs').createResearchBridge({
   secret: FRONT_SECRET, json, readJson,
   asUser: (userId, fn) => diaryAsUser(userId, fn),
-  // The tool half of core's old `available()`; the model half reads the roles and machines row on the front.
-  availability: () => {
-    let reason = null;
-    if (!toolboxOffered('web-search') || !mcpState.tools.has('tavily_search') || !mcpState.tools.has('tavily_extract')) reason = 'Deep research needs the web-search toolbox (tavily_search and tavily_extract) on this server.';
-    else if (operatorServerFor('tavily_search') === undefined || operatorServerFor('tavily_extract') === undefined) reason = 'Web search is not configured on this server.';
-    return { reason, lastLoaded: lastLoadedModel() || null };
-  },
-  // The operator's own search server, even if a directory server offers the same name (#865);
-  // with none, research fails rather than reaching a directory server (#891).
-  executeOperatorToolCall: (name, args, signal) => executeOperatorToolCall(name, args, signal),
+  // The search tools are the front's (mcp_exec.rs); what only this process knows is the model it last loaded.
+  facts: () => ({ lastLoaded: lastLoadedModel() || null }),
   retrieve: async (projectId, question, userId) => {
     const project = getProject(projectId);
     if (!project || !rag.ragAvailable()) return [];
@@ -836,14 +828,14 @@ const mcpCredentialOriginAllowed = createCredentialOriginCheck(process.env.MCP_N
 const mcpWiring = createMcpWiring({
   servers: MCP_SERVERS, manifest: MCP_TOOLBOX_MANIFEST, mcp, bindBoxes, directoryMcp, mcpOAuth, mcpKeys, directoryUrlAllowed,
   publicFetch: mcpPublicFetch,
-  credentialOriginAllowed: mcpCredentialOriginAllowed, scope: requestScope,
-  storageFor: (userId) => authService.getStorage(userId, true),
+  scope: requestScope,
   isWriteTool: (name) => isWriteTool(name),
   internal: mcpInternal, internalKey: MCP_INTERNAL_KEY,
-  reduceToolResult, resultCap: TOOL_RESULT_CAP,
+  // Running a tool is the Rust front's (sbstndalton/noevia#2218, mcp_exec.rs); this process discovers and asks.
+  mcpExec: (request, opts) => PROJECT_STORE.mcpCall(request, opts),
   isUserDisabled: (userId) => !!authService.listUsers().find((u) => u.id === userId)?.disabled,
 });
-const { state: mcpState, oauthServerIds, accountReady, discoverMcpTools, executeMcpToolCall, operatorServerFor, executeOperatorToolCall } = mcpWiring;
+const { state: mcpState, oauthServerIds, accountReady, discoverMcpTools, executeMcpToolCall } = mcpWiring;
 
 // The approval gate's state lives in approvals.cjs; the chat loop below and the
 // /api/tool-approvals route are its only callers.

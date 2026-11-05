@@ -45,6 +45,21 @@ test('the catalogue carries the offered boxes with their named tools, each tool\
     [true, true, false, true, ['https://cloud.example.test'], ['core'], ['gdrive']]);
 });
 
+test('#2218: the offers say which servers offer each name, for the operator\'s names and research\'s two, never a stranger\'s others', () => {
+  const entry = (serverId) => ({ tool: {}, readOnly: false, serverId });
+  const offers = new Map([
+    ['nc_notes_search_notes', new Map([['nextcloud', entry('nextcloud')]])],
+    ['tavily_search', new Map([['dir-x', entry('dir-x')], ['nextcloud', entry('nextcloud')]])],
+    ['tavily_extract', new Map([['dir-x', entry('dir-x')]])],
+    ['only_a_stranger_has_this', new Map([['dir-x', entry('dir-x')]])],
+  ]);
+  const base = input();
+  const c = buildCatalogue({ ...base, state: { ...base.state, offers } });
+  assert.deepEqual(c.offers, { nc_notes_search_notes: ['nextcloud'], tavily_search: ['dir-x', 'nextcloud'], tavily_extract: ['dir-x'] });
+  assert.deepEqual(buildCatalogue({ ...base, mcpEnabled: () => false, state: { ...base.state, offers } }).offers, {}, 'nothing is offered while MCP is off');
+  assert.deepEqual(buildCatalogue(base).offers, {}, 'a state with no offers publishes none');
+});
+
 test('the configured boxes are published only while MCP is enabled, and the servers carry their last discovery', () => {
   const c = buildCatalogue(input());
   assert.deepEqual(c.manifest, [{ id: 'nextcloud-calendar', label: 'Calendar', description: 'Cal', inApp: true }, { id: 'bare', label: 'bare', description: '', inApp: true }]);
