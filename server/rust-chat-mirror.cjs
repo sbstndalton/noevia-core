@@ -37,6 +37,15 @@ const TOUCH_EVERY_MS = 30000;
  * @param {{ run: (user: string, chatId: string) => Promise<string> }} deps.brains
  */
 function createExecutorBridge({ secret, mirror, brains, json, readJson, log = (m) => console.warn(m) }) {
+  // Retain the latest completion per front incarnation. Never evict an incarnation: if the
+  // bounded table fills, refuse new ones rather than permitting a stale replay to publish.
+  const operations = new Map();
+  let brainTail = Promise.resolve();
+  const execute = (user, chatId) => {
+    const pending = brainTail.then(() => brains.run(user, chatId)).catch(() => 'error');
+    brainTail = pending.then(() => {});
+    return pending;
+  };
   return async function handle(req, res) {
     const path = String(req.url || '').split('?')[0];
     if (path !== SYNC_PATH && path !== BRAIN_PATH) return false;
@@ -54,7 +63,33 @@ function createExecutorBridge({ secret, mirror, brains, json, readJson, log = (m
       } else {
         const chatId = body.chatId;
         if (typeof chatId !== 'string' || !chatId) { json(res, 400, { error: 'A chat id is required.' }); return true; }
-        json(res, 200, { reason: await brains.run(user, chatId) });
+        const { incarnation, sequence } = body;
+        let pending;
+        if (incarnation === undefined && sequence === undefined) {
+          pending = execute(user, chatId); // Compatibility: still shares actual execution serialization.
+        } else {
+          if (typeof incarnation !== 'string' || !/^[a-f0-9]{32}$/.test(incarnation) ||
+              !Number.isSafeInteger(sequence) || sequence < 1) {
+            json(res, 400, { error: 'invalid operation' }); return true;
+          }
+          const previous = operations.get(incarnation);
+          if (previous && (sequence < previous.sequence ||
+              (sequence === previous.sequence && (previous.user !== user || previous.chatId !== chatId)))) {
+            json(res, 409, { error: 'stale operation' }); return true;
+          }
+          if (previous && sequence === previous.sequence) pending = previous.pending;
+          else {
+            if ((!previous && operations.size >= 64) || (previous && !previous.done)) {
+              json(res, 409, { error: 'operation unsettled' }); return true;
+            }
+            const op = { sequence, user, chatId, done: false };
+            pending = op.pending = execute(user, chatId).then(reason => { op.done = true; return reason; });
+            operations.set(incarnation, op);
+          }
+        }
+        // A disconnected response is not a cancellation. The caller reconciles this exact
+        // promise before releasing its queue; in particular a lost 'built' remains 'built'.
+        json(res, 200, { reason: await pending });
       }
     } catch (error) {
       log(`[chat-mirror] executor failed: ${error?.code || error?.name || 'error'}`);

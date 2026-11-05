@@ -129,3 +129,48 @@ test('the replaced Node code is gone and index.cjs is wired to the front\'s sche
   const client = fs.readFileSync(path.join(__dirname, 'project-store-client.cjs'), 'utf8');
   assert.ok(!client.includes('changesRead'));
 });
+
+test('disconnect reconciliation holds actual execution, preserves built, and rejects stale publication replays', { timeout: 3000 }, async (t) => {
+  const http = require('node:http');
+  const { createBrainRunner } = require('./chat-brain.cjs');
+  const deferred = () => { let resolve; const promise = new Promise(r => { resolve = r; }); return { promise, resolve }; };
+  const entered = deferred(), release = deferred();
+  let active = 0, maximum = 0, builds = 0;
+  const writes = [];
+  const brains = createBrainRunner({ enabled: () => true, chat: () => ({ updatedAt: builds + 1 }),
+    readHistory: () => [], store: { read: () => null, write: (_u, _c, record) => writes.push(record) },
+    builder: { build: async () => { builds++; active++; maximum = Math.max(maximum, active); entered.resolve(); await release.promise; active--; return { ok: true, brain: { build: builds } }; } } });
+  const handle = createExecutorBridge({ secret: SECRET, mirror: {}, brains, readJson,
+    json: (res, status, body) => { res.writeHead(status); res.end(JSON.stringify(body)); } });
+  const server = http.createServer((req, res) => { void handle(req, res); });
+  await new Promise(r => server.listen(0, '127.0.0.1', r));
+  t.after(() => { release.resolve(); server.closeAllConnections(); server.close(); });
+  const body = { user: 'u1', chatId: 'c1', incarnation: 'a'.repeat(32), sequence: 1 };
+  const send = (payload) => {
+    let req;
+    const result = new Promise((resolve, reject) => {
+      req = http.request({ hostname: '127.0.0.1', port: server.address().port, path: BRAIN_PATH, method: 'POST', headers: { 'x-noevia-store-token': SECRET } }, res => {
+        let text = ''; res.on('data', chunk => { text += chunk; }); res.on('end', () => resolve({ status: res.statusCode, body: JSON.parse(text) }));
+      }); req.on('error', reject); req.end(JSON.stringify(payload));
+    });
+    return { req, result };
+  };
+  const first = send(body); first.result.catch(() => {});
+  await entered.promise;
+  first.req.destroy(); // Exact failure: Node builder has entered and is still running.
+  await assert.rejects(first.result);
+  const retry = send(body);
+  const newer = await send({ ...body, sequence: 2 }).result;
+  assert.equal(newer.status, 409, 'unconfirmed execution must keep the caller queue held');
+  const restartedFront = send({ ...body, incarnation: 'b'.repeat(32) });
+  await new Promise(r => setImmediate(r));
+  assert.equal(builds, 1, 'even a new front incarnation cannot overlap actual work');
+  release.resolve();
+  assert.deepEqual((await retry.result).body, { reason: 'built' }, 'lost built notification is reconciled');
+  await restartedFront.result;
+  assert.equal(maximum, 1);
+  await send({ ...body, sequence: 2 }).result;
+  const count = writes.length;
+  assert.equal((await send(body).result).status, 409, 'an older operation cannot publish again');
+  assert.equal(writes.length, count);
+});
