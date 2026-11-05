@@ -20,3 +20,22 @@ test('journal oracle captures Code plan normalization and assistant event limits
     if (process.env.TASK_JOURNAL_EVIDENCE) fs.writeFileSync(path.join(process.env.TASK_JOURNAL_EVIDENCE, 'task-journal-events-node.json'), JSON.stringify({ plan, output, eventLimit: 64 }, null, 2) + '\n');
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
+
+test('plain task journals do not fsync each event; durable journals do', () => {
+  const dir = fs.mkdtempSync(path.join(process.env.TASK_JOURNAL_EVIDENCE || os.tmpdir(), 'journal-sync-oracle-'));
+  const original = fs.fsyncSync;
+  let count = 0;
+  fs.fsyncSync = fd => { count++; return original(fd); };
+  try {
+    const result = {};
+    for (const durable of [false, true]) {
+      count = 0;
+      const jobs = createJobs({ dir: path.join(dir, String(durable)), kinds: ['code'], durable, now: () => 1234 });
+      const id = jobs.create({ kind: 'code', projectId: 'project' });
+      jobs.append(id, 'job.started', {});
+      result[durable ? 'durable' : 'plain'] = count;
+    }
+    assert.deepEqual(result, { plain: 0, durable: 4 });
+    if (process.env.TASK_JOURNAL_EVIDENCE) fs.writeFileSync(path.join(process.env.TASK_JOURNAL_EVIDENCE, 'task-journal-sync-node.json'), JSON.stringify(result, null, 2) + '\n');
+  } finally { fs.fsyncSync = original; fs.rmSync(dir, { recursive: true, force: true }); }
+});
