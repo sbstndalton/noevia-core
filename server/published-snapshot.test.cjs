@@ -269,7 +269,8 @@ test('the demand timers and the watcher never keep the process alive', () => {
 test('the process wires one demand source into both publishers and starts it with them (index.cjs)', () => {
   const source = fs.readFileSync(path.join(__dirname, 'index.cjs'), 'utf8');
   assert.match(source, /createDemand\(\{ dir: DATA_DIR/);
-  assert.match(source, /createRagStatusPublisher\(\{ dataDir: DATA_DIR, rag, demand \}\)/);
+  // The same demand source, and (core#329, the native embedding worker) the native owner's health gate on what it publishes.
+  assert.match(source, /createRagStatusPublisher\(\{ dataDir: DATA_DIR, rag, demand, ownerReady: \(\) => embeddingOwner\.healthy\(\) \}\)/);
   assert.match(source, /machineModels: \(\) => chatMachines\.machineModels\(\), demand,/);
   assert.match(source, /ragStatus\.start\(\); autoRolesSnapshot\.start\(\); demand\.start\(\);/);
 });
