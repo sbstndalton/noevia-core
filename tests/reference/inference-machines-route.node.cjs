@@ -41,6 +41,16 @@ const TUNE_ACTIONS = new Set(['tune', 'tuneAbort']);
  * @param {() => ({url:string, path:string, headers?:object}|null)} [deps.engine]  #1856: what to ask of this machine's own inference engine / model loader
  */
 function createInferenceMachineRoutes({ json, readJson, machines, health, effective = {}, chatMachines = null, authHeaders = {}, engine = null, machineTune = null }) {
+  /** The models a machine's server lists at `port` (its /v1/models), for the Settings picker and the assign check. */
+  async function historicalListModels(machineId, port) {
+    const fail = (status, code, message) => Object.assign(Error(message), {status, code});
+    const m = machines?.machine?.(String(machineId || ''));
+    if (!m) throw fail(404, 'unknownMachine', 'That machine is not on the list.');
+    const n = typeof port === 'string' && /^\d+$/.test(port.trim()) ? Number(port) : port;
+    if (!Number.isInteger(n) || n < 1 || n > 65535) throw fail(400, 'invalidPort', 'Enter the service’s port, a number from 1 to 65535.');
+    return chatMachines.modelsAt(m.address, n, m.name);
+  }
+
   // #1840: a chat role on a machine reaches that machine's server; on this machine it has no address of its own here.
   const chatUrl = (service) => { const role = SERVICES[service]?.mode === 'chat' ? SERVICES[service].role : null; const t = role && machines.chatTarget ? machines.chatTarget(role) : null; return t ? t.baseUrl : null; };
   const effectiveUrl = (service) => { if (SERVICES[service]?.mode === 'chat') return chatUrl(service); try { return effective[service] ? effective[service]() || null : null; } catch { return null; } };
@@ -98,7 +108,7 @@ function createInferenceMachineRoutes({ json, readJson, machines, health, effect
     if (SERVICES[service]?.mode === 'chat' && body.machine && body.machine !== 'local' && chatMachines) {
       const model = typeof body.model === 'string' ? body.model.trim() : '';
       if (!model) throw Object.assign(Error('Choose the model this machine serves for the role.'), { status: 400, code: 'invalidModel' });
-      const served = await chatMachines.listModels(body.machine, body.port);
+      const served = await (chatMachines.listModels || historicalListModels)(body.machine, body.port);
       if (!served.includes(model)) throw Object.assign(Error(`That machine does not serve ${model} on port ${body.port}.`), { status: 400, code: 'unknownModel', models: served });
     }
     return machines.assign(body, actor);
@@ -113,7 +123,7 @@ function createInferenceMachineRoutes({ json, readJson, machines, health, effect
       const modelsOf = url?.searchParams?.get?.('models');
       if (modelsOf !== null && modelsOf !== undefined) {
         if (!chatMachines) return json(res, 404, { error: 'Not available' });
-        try { return json(res, 200, { models: await chatMachines.listModels(modelsOf, url.searchParams.get('port')) }); }
+        try { return json(res, 200, { models: await (chatMachines.listModels || historicalListModels)(modelsOf, url.searchParams.get('port')) }); }
         catch (err) { return json(res, err?.status || 502, { error: err?.status ? err.message : 'The machine could not be asked for its models.', code: err?.code }); }
       }
       if (url?.searchParams?.get?.('tune') === '1') {

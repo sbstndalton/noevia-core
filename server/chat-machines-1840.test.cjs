@@ -206,7 +206,7 @@ test('#1840 a machine whose name now resolves to a public or link-local address 
     assert.equal(out.replied?.status, 503, answer);
     assert.match(out.replied.body.error, /Fast model’s machine \(Synthetic Pi\) is unreachable: its address is not on this network/);
     assert.equal(out.localRequests.length, 0);
-    await assert.rejects(chatMachines.listModels(machines.view().machines[1].id, fake.port), (e) => e.code === 'publicAddress');
+    await assert.rejects(chatMachines.modelsAt(machines.view().machines[1].address, fake.port), (e) => e.code === 'publicAddress');
   }
   assert.equal(fake.seen.length, 0, 'nothing reached any server');
 });
