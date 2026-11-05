@@ -557,12 +557,11 @@ function createModelRoutes({ servedEmbeddingModels = (target) => require('../rag
       return json(res,405,{error:'Method not allowed'});
     }
 
+    // The GET is the Rust front's (rust-preset-read.cjs) and so is the PUT, the preset editor (D2,
+    // rust-preset-write.cjs); both are refused before authentication. Other methods keep this answer.
     if (p === '/api/models/preset') {
       if(authn.user.role!=='admin')return json(res,403,{error:'Administrator required for shared model profiles'});
-      if(!modelManager.applyPreset)return json(res,404,{error:'Native presets are unavailable'});
-      if(req.method!=='PUT')return json(res,405,{error:'Method not allowed'});
-      const result=await modelManager.applyPreset(await readJson(req));
-      return json(res,result.status,result.body);
+      return json(res,405,{error:'Method not allowed'});
     }
 
     // #2187: GET /api/models/capabilities and GET /api/models/hardware are the Rust front's

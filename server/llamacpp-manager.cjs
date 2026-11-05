@@ -259,25 +259,8 @@ function createLlamaCppManager({ budgetWatchDir = null, baseUrl, apiKey, fetchJs
     }
     return {ok:true,status:200,body:require('./llamacpp-metrics.cjs').summarize(rows)};
   }
-  async function applyPreset(body) {
-    if(!presets)return unsupported('Native preset editing; configure LLAMACPP_PRESET_PATH');
-    if(body?.confirmReload!==true) return {ok:false,status:400,body:{error:'Confirm that other clients and Diary background inference are stopped before reloading.'}};
-    return maintenance.exclusive(async()=>{
-      const {isSystemModel,modelPathFromArgs,SYSTEM_MODEL_REASON}=require('./model-system.cjs');
-      const listing=await rawModels();
-      if(listing.ok){
-        const row=(listing.body?.data||[]).find(m=>m.id===body?.model);
-        if(row && isSystemModel(row.id, modelPathFromArgs(row.status?.args))) return {ok:false,status:400,body:{error:SYSTEM_MODEL_REASON}};
-      }
-      // #697: a dry run of the same write, estimated before anything is committed.
-      let section=null;
-      try {const candidate=presets.prepare(body);section=require('./llamacpp-presets.cjs').parse(candidate.text).sections.get(body.model)?.options||null;} catch {}
-      const refusal=section?await presetRefusal(body.model,section):null;
-      if(refusal)return {ok:false,status:409,body:refusal};
-      return applyUnlocked(body);
-    });
-  }
-  // Caller must hold the maintenance gate (applyPreset or a calibration job).
+  // Caller must hold the maintenance gate (a calibration or auto-tune job). The public preset editor (PUT
+  // /api/models/preset) is the Rust front's (rust-preset-write.cjs); this is the same write for the jobs that remain here.
   // writeOptions.backup:false is auto-tune's alone (#1003); request bodies cannot ask for it.
   async function applyUnlocked(body, writeOptions = {}) {
     const listing=await rawModels();
@@ -758,7 +741,6 @@ function createLlamaCppManager({ budgetWatchDir = null, baseUrl, apiKey, fetchJs
     holdMaintenance: reason => maintenance.hold(reason),
     tuningActive: () => maintenance.held() || calibrator?.stateFacts().job?.status === 'running' || autotuner?.statusFacts().job?.status === 'running',
     presetFacts: model => presets?.get(model) ?? null,
-    applyPreset,
     // #697: the load guard and the budget, for the proxied benchmark start and the watchdog.
     loadRefusal: model => overBudget(model).then(r => r ? r.body : null),
     // LLAMACPP_PRESETS_IMPL=wasm: an entry the Rust port folds differently is refused (400), never dropped.
