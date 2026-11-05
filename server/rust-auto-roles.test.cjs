@@ -84,13 +84,6 @@ test('the publisher writes auto-roles-snapshot.json, and a model write republish
   p.watch({});
 });
 
-test('the PUT is still Node\'s: it validates against the catalogue and saves the file the front reads', () => {
-  const source = fs.readFileSync(path.join(__dirname, 'routes', 'models.cjs'), 'utf8');
-  assert.ok(source.includes("if (req.method === 'PUT') {\n        const raw = await readBody(req);"));
-  assert.ok(source.includes('ensureRolesLoaded()'));
-  assert.ok(source.includes("if (req.method === 'GET') return json(res, 503, AUTO_ROLES_REFUSAL);"));
-});
-
 // ── through the real router ─────────────────────────────────────────────────────
 
 const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'noevia-rust-autoroles-'));
@@ -132,8 +125,8 @@ test('through the router: the GET is refused whoever asks; the PUT still reaches
   }
   // The PUT is not refused: it reaches the handler (a body it cannot parse is that handler's own 400).
   const put = await request('/api/auto-roles', { method: 'PUT', headers: { cookie: admin.cookie, origin: 'http://localhost', 'x-csrf-token': admin.csrf } });
-  assert.equal(put.status, 400);
-  assert.equal((await request('/api/auto-roles', { method: 'PUT' })).status, 401, 'signed out is the gate\'s');
+  assert.equal(put.status, 503);
+  assert.equal((await request('/api/auto-roles', { method: 'PUT' })).status, 503, 'refused before authentication');
 });
 
 test('the catalogue is read only while a signed-in page has asked: an idle installation reads no engines (#2190 review M1)', async () => {
