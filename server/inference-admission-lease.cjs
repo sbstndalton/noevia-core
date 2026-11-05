@@ -3,7 +3,7 @@
 // while chat, tuning and the engine manager live here, this process is the one arbiter of the one-model rule, the
 // inference budget (#697) and the maintenance gate. A lease IS a hold of what a local request holds here.
 //
-//   POST   /internal/inference-admission/lease             {model} | {role, machine, model} | {gate}
+//   POST   /internal/inference-admission/lease             {model} | {role, machine, model} | {gate} | {diaryExchange: {user}}
 //          201 {lease, ttlMs, headers?}; 409/503 {error, code?}
 //   POST   /internal/inference-admission/lease/<id>/renew  200 {ttlMs}; 404 when it has ended
 //   DELETE /internal/inference-admission/lease/<id>        204, also when it has already ended
@@ -11,13 +11,17 @@
 // Engine: maintenance enter, then the gate's lease when a gate is configured (which includes the budget check), else
 // the budget check alone. Machine: nothing is admitted here; the machine's health and served model are checked, and it
 // counts a turn while the lease lasts (#1849, #1880). Gate (chat port S8, rust-chat-admission.cjs): the inference gate
-// as POST /api/chat ({gate:'chat'}) or the Diary local exchange ({gate:'diary'}) meets it, waiting at most
-// CHAT_GATE_WAIT_MS; the call the front then sends with the lease is covered by it and enters nothing again. A lease not renewed within ttlMs ends by itself, so a front that
+// as POST /api/chat ({gate:'chat'}) meets it, waiting at most CHAT_GATE_WAIT_MS; the call the front then sends with the
+// lease is covered by it and enters nothing again. Diary exchange (the front's /api/diary/local-exchange): the
+// maintenance gate waited for briefly (chat-admission.cjs, a 503 in the gate's words) and the long-document backfill's
+// pause (rag.cjs foreground), held until the lease ends; the model throttle chat shares is the front's (chat port S6), so
+// `diaryExchange.rateLimited` answers false in index.cjs. A lease not renewed within ttlMs ends by itself, so a front that
 // dies frees chat and tune. Only the front may ask (the same check as its other loopback calls), and a caller that
 // goes away while waiting holds nothing.
 const crypto = require('node:crypto');
 const { trustedFront } = require('./trusted-front.cjs');
 const chatAdmission = require('./chat-admission.cjs');
+const { enterChatInference } = chatAdmission;
 const frontAdmission = require('./rust-chat-admission.cjs');
 
 const PREFIX = '/internal/inference-admission/lease';
@@ -25,6 +29,9 @@ const TTL_MS = 30000;
 const HARD_MS = 6 * 60 * 60 * 1000;
 const MAX_WAIT_MS = 120000;
 const BUSY = 'The model is busy. Try again shortly.';
+const THROTTLED = 'Please wait before sending another message';
+/** The statuses a refusal keeps; anything else is the 503 BUSY. */
+const KEPT = [400, 409, 429, 503];
 
 /** Aborts when the caller goes away before this answer has been sent. */
 function callerGone(req, res) {
@@ -39,7 +46,7 @@ function refusal(status, message, code) {
   return Object.assign(Error(message), { status, publicMessage: message, code });
 }
 
-function createAdmission({ modelManager, admitEngineModel, chatMachines = null, gateWaitMs = chatAdmission.CHAT_GATE_WAIT_MS }) {
+function createAdmission({ modelManager, admitEngineModel, chatMachines = null, gateWaitMs = chatAdmission.CHAT_GATE_WAIT_MS, diaryExchange = null }) {
   /** What one local step holds, or a refusal in that step's words. */
   async function holdEngine(model, signal) {
     let leave;
@@ -82,13 +89,37 @@ function createAdmission({ modelManager, admitEngineModel, chatMachines = null, 
     if (signal?.aborted) { release(); signal.throwIfAborted(); }
     return { headers: null, gate: route, release };
   }
+  async function holdExchange(user, signal) {
+    let leave;
+    try { leave = (await enterChatInference(modelManager, { signal })) || (() => {}); }
+    catch (e) { throw Object.assign(e, { status: e.status || 503, publicMessage: e.publicMessage || e.message || BUSY }); }
+    let throttled = true;
+    try { throttled = diaryExchange.rateLimited(user); }
+    finally { if (throttled) leave(); }
+    if (throttled) throw refusal(429, THROTTLED);
+    let resume = () => {};
+    try { resume = diaryExchange.foreground?.() || resume; } catch { /* the pause is advisory, the gate is not */ }
+    return { headers: null, release() { try { resume(); } finally { leave(); } } };
+  }
   return (ask, signal) => {
     const text = (v) => typeof v === 'string' && v.length > 0 && v.length <= 1024;
     if (ask && ask.gate !== undefined) {
       if (!frontAdmission.GATE_ROUTES.includes(ask.gate) || Object.keys(ask).length !== 1) throw refusal(400, 'Unknown gate.');
       return holdGate(ask.gate, signal);
     }
+    if (ask && typeof ask === 'object' && 'diaryExchange' in ask) {
+      if (typeof diaryExchange?.rateLimited !== 'function') throw refusal(400, 'Diary exchanges are not admitted here.');
+      if ('model' in ask || 'role' in ask || 'machine' in ask || !text(ask.diaryExchange?.user)) throw refusal(400, 'A user is required.');
+      return holdExchange(ask.diaryExchange.user, signal);
+    }
     if (!text(ask?.model)) throw refusal(400, 'A model is required.');
+    if (ask.embedding !== undefined) {
+      if (ask.embedding !== true || Object.keys(ask).some(k => !['embedding', 'model'].includes(k))) throw refusal(400, 'Invalid embedding lease.');
+      signal?.throwIfAborted();
+      const leave = modelManager.enterInference?.() || (() => {});
+      let released = false;
+      return Promise.resolve({ headers: null, release() { if (!released) { released = true; leave(); } } });
+    }
     if (ask.role === undefined && ask.machine === undefined) return holdEngine(ask.model, signal);
     if (ask.role !== 'smart' || !text(ask.machine)) throw refusal(400, 'Only the Smart role runs research.');
     return holdMachine(ask);
@@ -141,9 +172,9 @@ function createLeases({ ttlMs = TTL_MS, hardMs = HARD_MS, log = (m) => console.w
 }
 
 /** The route, answered before authentication and the request gate. True when it was this route's. */
-function createAdmissionRoutes({ secret, modelManager, admitEngineModel, chatMachines, json, readJson, gateWaitMs, ...options }) {
+function createAdmissionRoutes({ secret, modelManager, admitEngineModel, chatMachines, json, readJson, gateWaitMs, diaryExchange = null, ...options }) {
   const leases = createLeases(options);
-  const admit = createAdmission({ modelManager, admitEngineModel, chatMachines, ...(gateWaitMs === undefined ? {} : { gateWaitMs }) });
+  const admit = createAdmission({ modelManager, admitEngineModel, chatMachines, diaryExchange, ...(gateWaitMs === undefined ? {} : { gateWaitMs }) });
   async function handle(req, res) {
     const target = String(req.url || '').split('?')[0];
     if (target !== PREFIX && !target.startsWith(`${PREFIX}/`)) return false;
@@ -164,7 +195,7 @@ function createAdmissionRoutes({ secret, modelManager, admitEngineModel, chatMac
         json(res, 201, { lease: id, ttlMs: leases.ttlMs, ...(held.headers ? { headers: held.headers } : {}) });
       } catch (e) {
         if (signal.aborted) { res.destroy?.(); return true; }
-        const status = [400, 409, 503].includes(e?.status) ? e.status : 503;
+        const status = KEPT.includes(e?.status) ? e.status : 503;
         // Bounded metadata survives a front declining to buffer an oversized refusal body.
         if (status === 503 || status === 409) {
           if (typeof e?.code === 'string' && /^[A-Za-z0-9_.:-]{1,128}$/.test(e.code)) res.setHeader('X-Noevia-Admission-Code', e.code);
@@ -201,4 +232,4 @@ function createAdmissionRoutes({ secret, modelManager, admitEngineModel, chatMac
   return { handle, leases, covers };
 }
 
-module.exports = { createAdmissionRoutes, createAdmission, createLeases, callerGone, PREFIX, TTL_MS, MAX_WAIT_MS };
+module.exports = { createAdmissionRoutes, createAdmission, createLeases, callerGone, PREFIX, TTL_MS, MAX_WAIT_MS, THROTTLED };

@@ -356,6 +356,15 @@ function createHandler(dataDir, token, writes = [], failures = [], { changes = f
   };
 }
 
+/** The paired Rust front as the web supervisor installs it, for tests that spawn server/index.cjs: an executable in
+ *  `dir` that answers `noevia-server --features` with the embedding background capability
+ *  (server/rust-embedding-background.cjs), so a real boot pairs; pass its path as NOEVIA_SERVER_BIN. */
+function syntheticFrontBin(dir) {
+  const file = path.join(dir, 'synthetic-noevia-server');
+  fs.writeFileSync(file, `#!/bin/sh\n[ "$1" = --features ] && echo ${require('../../server/rust-embedding-background.cjs').RUST_EMBEDDING_OWNED}\n`, { mode: 0o755 });
+  return file;
+}
+
 /** Starts the store on 127.0.0.1 (port 0 by default); resolves { port, token, server, writes, close }. */
 async function startProjectStore(dataDir, { port = 0, token = crypto.randomBytes(32).toString('hex'), changes = false } = {}) {
   const writes = [];
@@ -482,4 +491,4 @@ function rustChatMove(dataDir,user,encodedChat,body) {
   return answer(200,{ok:true,from:out.from.kind==='free'?null:out.from.id,projectId:out.to.kind==='free'?null:out.to.id});
 }
 
-module.exports = { rustChatMove, chatMoveOp, startProjectStore, installProjectStore, installedToken, createHandler, freePortSync, localTranscripts, historyOp, rustHistorySave, rustChatDelete };
+module.exports = { syntheticFrontBin, rustChatMove, chatMoveOp, startProjectStore, installProjectStore, installedToken, createHandler, freePortSync, localTranscripts, historyOp, rustHistorySave, rustChatDelete };
