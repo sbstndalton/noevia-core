@@ -1256,7 +1256,7 @@ const inferenceMachineRoutes = require('./routes/inference-machines.cjs').create
     ocr: () => require('./document-workers.cjs').resolve('ocr').url || null,
     documents: () => require('./document-workers.cjs').resolve('documents').url || null,
     embedding: () => require('./embedding-config.cjs').current()?.active()?.baseUrl || null,
-    reranker: () => { const t = require('./rerank-target.cjs').rerankTarget(rerankSettings.effectiveEnv()); return t.enabled ? t.baseUrl : null; },
+    reranker: () => require('./rerank-settings.cjs').withSettings(() => { const t = require('./rerank-target.cjs').rerankTarget(rerankSettings.effectiveEnv()); return t.enabled ? t.baseUrl : null; }),
   } });
 // GET /api/ready (#297): unauthenticated, mounted before the session gate below alongside the
 // sign-in routes. isReady is set once startup wiring under require.main finishes (see below).

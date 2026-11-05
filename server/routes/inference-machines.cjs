@@ -43,14 +43,14 @@ const TUNE_ACTIONS = new Set(['tune', 'tuneAbort']);
 function createInferenceMachineRoutes({ json, readJson, machines, health, effective = {}, chatMachines = null, authHeaders = {}, engine = null, machineTune = null }) {
   // #1840: a chat role on a machine reaches that machine's server; on this machine it has no address of its own here.
   const chatUrl = (service) => { const role = SERVICES[service]?.mode === 'chat' ? SERVICES[service].role : null; const t = role && machines.chatTarget ? machines.chatTarget(role) : null; return t ? t.baseUrl : null; };
-  const effectiveUrl = (service) => { if (SERVICES[service]?.mode === 'chat') return chatUrl(service); try { return effective[service] ? effective[service]() || null : null; } catch { return null; } };
+  const effectiveUrl = async (service) => { if (SERVICES[service]?.mode === 'chat') return chatUrl(service); try { return effective[service] ? await effective[service]() || null : null; } catch (error) { if (error?.code === 'RERANKER_SETTINGS_UNAVAILABLE') throw error; return null; } };
 
   async function healthOf(view) {
     // #1841/#1844: OCR, Docling and the sensitivity check are probed the same way (GET /health at their origin); the sensitivity
     // check, like the workers, is reached with link-local refused, so it does not use the decision service's link-local probe.
     const chat = Object.keys(SERVICES).filter((id) => SERVICES[id].mode === 'chat' && chatUrl(id));
     const headersFor = (service, url) => { try { return url && authHeaders[service] ? authHeaders[service](url) || null : null; } catch { return null; } };
-    const targets = ['decision', 'sensitivity', 'embedding', 'reranker', 'ocr', 'documents', ...chat].map((service) => { const url = effectiveUrl(service); return { service, url, decision: service === 'decision', headers: headersFor(service, url), ...(service === 'decision' || service === 'sensitivity' ? { fallbackPath: '/v1/models' } : {}) }; });
+    const targets = await Promise.all(['decision', 'sensitivity', 'embedding', 'reranker', 'ocr', 'documents', ...chat].map(async (service) => { const url = await effectiveUrl(service); return { service, url, decision: service === 'decision', headers: headersFor(service, url), ...(service === 'decision' || service === 'sensitivity' ? { fallbackPath: '/v1/models' } : {}) }; }));
     // #1856: this machine's own engine is probed where the app really reaches it (the model loader, else the default provider), not at a guessed /health.
     let local = null;
     try { local = engine ? engine() : null; } catch { local = null; }
@@ -88,8 +88,8 @@ function createInferenceMachineRoutes({ json, readJson, machines, health, effect
     return { services, machines: out, reasons, failing, ...(Object.keys(measured).length ? { measured } : {}) };
   }
 
-  function withUrls(view) {
-    return { ...view, services: view.services.map((s) => (effective[s.id] || chatUrl(s.id) ? { ...s, url: effectiveUrl(s.id) } : s)) };
+  async function withUrls(view) {
+    return { ...view, services: await Promise.all(view.services.map(async (s) => (effective[s.id] || chatUrl(s.id) ? { ...s, url: await effectiveUrl(s.id) } : s))) };
   }
 
   /** #1840: a chat role moves to a machine only with a model that machine lists now. */
@@ -122,7 +122,7 @@ function createInferenceMachineRoutes({ json, readJson, machines, health, effect
       }
       const view = machines.view();
       const wantHealth = url?.searchParams?.get?.('health') === '1';
-      return json(res, 200, { ...withUrls(view), ...(wantHealth ? { health: await healthOf(view) } : {}) });
+      return json(res, 200, { ...await withUrls(view), ...(wantHealth ? { health: await healthOf(view) } : {}) });
     }
     if (req.method !== 'POST') return json(res, 405, { error: 'Method not allowed' });
     let body;
@@ -145,7 +145,7 @@ function createInferenceMachineRoutes({ json, readJson, machines, health, effect
         : action === 'update' ? await machines.update(body, actor)
           : action === 'remove' ? machines.remove(body, actor)
             : await assignChecked(body, actor);
-      return json(res, action === 'add' ? 201 : 200, withUrls(out));
+      return json(res, action === 'add' ? 201 : 200, await withUrls(out));
     } catch (err) {
       if (!err?.status) {
         console.error('[machines]', String(err?.message || err).slice(0, 200));
@@ -156,8 +156,7 @@ function createInferenceMachineRoutes({ json, readJson, machines, health, effect
   }
 
   return async function inferenceMachineRoutes(req, res, ctx) {
-    const run = async () => (await handle(req, res, ctx)) !== PASS;
-    return ctx.path === PATH || ctx.path.startsWith(PATH + '/') ? require('../rerank-settings.cjs').withSettings(run) : run();
+    return (await handle(req, res, ctx)) !== PASS;
   };
 }
 
