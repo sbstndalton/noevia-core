@@ -1317,6 +1317,7 @@ async function handleRequestInner(req, res) {
   publicHeaders(res);
   if (require('./rust-auto-roles-write.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   if (await autoRolesWriteBridge(req, res)) return;
+  if (require('./rust-model-manager-read.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   if (require('./rust-model-load.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   if (await modelLoadInvalidate(req, res)) return;
   if (require('./rust-tool-approvals.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;

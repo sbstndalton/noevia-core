@@ -1,0 +1,543 @@
+{
+  "version": 1,
+  "core": "99ebd9c951b16cb6beeeae8bd79722cf4f3368bb",
+  "node": "v22.23.3",
+  "scenarios": [
+    {
+      "name": "sections",
+      "path": "/api/model-manager/sections",
+      "body": {
+        "sections": [
+          "sample"
+        ]
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "sections": [
+            "sample"
+          ]
+        },
+        "headers": {
+          "cache-control": "no-store"
+        },
+        "calls": [
+          {
+            "url": "http://synthetic.invalid/api/v1/sections",
+            "method": "GET",
+            "timeout": 600000
+          }
+        ]
+      }
+    },
+    {
+      "name": "query-preserved",
+      "path": "/api/model-manager/status?x=1&x=2",
+      "expect": {
+        "status": 200,
+        "body": {
+          "ok": true
+        },
+        "headers": {
+          "cache-control": "no-store"
+        },
+        "calls": [
+          {
+            "url": "http://synthetic.invalid/api/v1/status?x=1&x=2",
+            "method": "GET",
+            "timeout": 600000
+          }
+        ]
+      }
+    },
+    {
+      "name": "escaped-name",
+      "path": "/api/model-manager/sections/sample%20name",
+      "expect": {
+        "status": 200,
+        "body": {
+          "ok": true
+        },
+        "headers": {
+          "cache-control": "no-store"
+        },
+        "calls": [
+          {
+            "url": "http://synthetic.invalid/api/v1/sections/sample%20name",
+            "method": "GET",
+            "timeout": 600000
+          }
+        ]
+      }
+    },
+    {
+      "name": "empty-rest",
+      "path": "/api/model-manager/",
+      "expect": {
+        "status": 200,
+        "body": {
+          "ok": true
+        },
+        "headers": {
+          "cache-control": "no-store"
+        },
+        "calls": [
+          {
+            "url": "http://synthetic.invalid/api/v1/",
+            "method": "GET",
+            "timeout": 600000
+          }
+        ]
+      }
+    },
+    {
+      "name": "member",
+      "path": "/api/model-manager/sections",
+      "role": "member",
+      "expect": {
+        "status": 403,
+        "body": {
+          "error": "Administrator required for model management"
+        },
+        "headers": {},
+        "calls": []
+      }
+    },
+    {
+      "name": "disabled",
+      "path": "/api/model-manager/sections",
+      "disabled": true,
+      "expect": {
+        "status": 404,
+        "body": {
+          "error": "Model management service is not configured"
+        },
+        "headers": {},
+        "calls": []
+      }
+    },
+    {
+      "name": "member-disabled",
+      "path": "/api/model-manager/sections",
+      "disabled": true,
+      "role": "member",
+      "expect": {
+        "status": 403,
+        "body": {
+          "error": "Administrator required for model management"
+        },
+        "headers": {},
+        "calls": []
+      }
+    },
+    {
+      "name": "invalid-0",
+      "path": "/api/model-manager/bad%2fname",
+      "expect": {
+        "status": 400,
+        "body": {
+          "error": "Invalid path"
+        },
+        "headers": {},
+        "calls": []
+      }
+    },
+    {
+      "name": "invalid-1",
+      "path": "/api/model-manager/bad%5cname",
+      "expect": {
+        "status": 400,
+        "body": {
+          "error": "Invalid path"
+        },
+        "headers": {},
+        "calls": []
+      }
+    },
+    {
+      "name": "invalid-2",
+      "path": "/api/model-manager/bad%",
+      "expect": {
+        "status": 400,
+        "body": {
+          "error": "Invalid path"
+        },
+        "headers": {},
+        "calls": []
+      }
+    },
+    {
+      "name": "invalid-3",
+      "path": "/api/model-manager/bad..name",
+      "expect": {
+        "status": 400,
+        "body": {
+          "error": "Invalid path"
+        },
+        "headers": {},
+        "calls": []
+      }
+    },
+    {
+      "name": "invalid-4",
+      "path": "/api/model-manager/bad!name",
+      "expect": {
+        "status": 400,
+        "body": {
+          "error": "Invalid path"
+        },
+        "headers": {},
+        "calls": []
+      }
+    },
+    {
+      "name": "invalid-5",
+      "path": "/api/model-manager/%2e%2e%2fname",
+      "expect": {
+        "status": 400,
+        "body": {
+          "error": "Invalid path"
+        },
+        "headers": {},
+        "calls": []
+      }
+    },
+    {
+      "name": "body-0",
+      "path": "/api/model-manager/status",
+      "body": null,
+      "expect": {
+        "status": 200,
+        "body": {
+          "error": ""
+        },
+        "headers": {
+          "cache-control": "no-store"
+        },
+        "calls": [
+          {
+            "url": "http://synthetic.invalid/api/v1/status",
+            "method": "GET",
+            "timeout": 600000
+          }
+        ]
+      }
+    },
+    {
+      "name": "body-1",
+      "path": "/api/model-manager/status",
+      "body": "",
+      "expect": {
+        "status": 200,
+        "body": {
+          "error": ""
+        },
+        "headers": {
+          "cache-control": "no-store"
+        },
+        "calls": [
+          {
+            "url": "http://synthetic.invalid/api/v1/status",
+            "method": "GET",
+            "timeout": 600000
+          }
+        ]
+      }
+    },
+    {
+      "name": "body-2",
+      "path": "/api/model-manager/status",
+      "body": "plain",
+      "expect": {
+        "status": 200,
+        "body": {
+          "error": "plain"
+        },
+        "headers": {
+          "cache-control": "no-store"
+        },
+        "calls": [
+          {
+            "url": "http://synthetic.invalid/api/v1/status",
+            "method": "GET",
+            "timeout": 600000
+          }
+        ]
+      }
+    },
+    {
+      "name": "body-3",
+      "path": "/api/model-manager/status",
+      "body": false,
+      "expect": {
+        "status": 200,
+        "body": {
+          "error": ""
+        },
+        "headers": {
+          "cache-control": "no-store"
+        },
+        "calls": [
+          {
+            "url": "http://synthetic.invalid/api/v1/status",
+            "method": "GET",
+            "timeout": 600000
+          }
+        ]
+      }
+    },
+    {
+      "name": "body-4",
+      "path": "/api/model-manager/status",
+      "body": 12,
+      "expect": {
+        "status": 200,
+        "body": {
+          "error": "12"
+        },
+        "headers": {
+          "cache-control": "no-store"
+        },
+        "calls": [
+          {
+            "url": "http://synthetic.invalid/api/v1/status",
+            "method": "GET",
+            "timeout": 600000
+          }
+        ]
+      }
+    },
+    {
+      "name": "body-5",
+      "path": "/api/model-manager/status",
+      "body": [
+        "sample"
+      ],
+      "expect": {
+        "status": 200,
+        "body": [
+          "sample"
+        ],
+        "headers": {
+          "cache-control": "no-store"
+        },
+        "calls": [
+          {
+            "url": "http://synthetic.invalid/api/v1/status",
+            "method": "GET",
+            "timeout": 600000
+          }
+        ]
+      }
+    },
+    {
+      "name": "detail-400",
+      "path": "/api/model-manager/status",
+      "status": 400,
+      "body": {
+        "detail": "synthetic refusal",
+        "error": "ignored"
+      },
+      "expect": {
+        "status": 400,
+        "body": {
+          "error": "synthetic refusal"
+        },
+        "headers": {
+          "cache-control": "no-store"
+        },
+        "calls": [
+          {
+            "url": "http://synthetic.invalid/api/v1/status",
+            "method": "GET",
+            "timeout": 600000
+          }
+        ]
+      }
+    },
+    {
+      "name": "fallback-400",
+      "path": "/api/model-manager/status",
+      "status": 400,
+      "body": {},
+      "expect": {
+        "status": 400,
+        "body": {
+          "error": "Model management request failed."
+        },
+        "headers": {
+          "cache-control": "no-store"
+        },
+        "calls": [
+          {
+            "url": "http://synthetic.invalid/api/v1/status",
+            "method": "GET",
+            "timeout": 600000
+          }
+        ]
+      }
+    },
+    {
+      "name": "detail-409",
+      "path": "/api/model-manager/status",
+      "status": 409,
+      "body": {
+        "detail": "synthetic refusal",
+        "error": "ignored"
+      },
+      "expect": {
+        "status": 409,
+        "body": {
+          "error": "synthetic refusal"
+        },
+        "headers": {
+          "cache-control": "no-store"
+        },
+        "calls": [
+          {
+            "url": "http://synthetic.invalid/api/v1/status",
+            "method": "GET",
+            "timeout": 600000
+          }
+        ]
+      }
+    },
+    {
+      "name": "fallback-409",
+      "path": "/api/model-manager/status",
+      "status": 409,
+      "body": {},
+      "expect": {
+        "status": 409,
+        "body": {
+          "error": "Model management request failed."
+        },
+        "headers": {
+          "cache-control": "no-store"
+        },
+        "calls": [
+          {
+            "url": "http://synthetic.invalid/api/v1/status",
+            "method": "GET",
+            "timeout": 600000
+          }
+        ]
+      }
+    },
+    {
+      "name": "detail-500",
+      "path": "/api/model-manager/status",
+      "status": 500,
+      "body": {
+        "detail": "synthetic refusal",
+        "error": "ignored"
+      },
+      "expect": {
+        "status": 500,
+        "body": {
+          "error": "synthetic refusal"
+        },
+        "headers": {
+          "cache-control": "no-store"
+        },
+        "calls": [
+          {
+            "url": "http://synthetic.invalid/api/v1/status",
+            "method": "GET",
+            "timeout": 600000
+          }
+        ]
+      }
+    },
+    {
+      "name": "fallback-500",
+      "path": "/api/model-manager/status",
+      "status": 500,
+      "body": {},
+      "expect": {
+        "status": 500,
+        "body": {
+          "error": "Model management request failed."
+        },
+        "headers": {
+          "cache-control": "no-store"
+        },
+        "calls": [
+          {
+            "url": "http://synthetic.invalid/api/v1/status",
+            "method": "GET",
+            "timeout": 600000
+          }
+        ]
+      }
+    },
+    {
+      "name": "detail-503",
+      "path": "/api/model-manager/status",
+      "status": 503,
+      "body": {
+        "detail": "synthetic refusal",
+        "error": "ignored"
+      },
+      "expect": {
+        "status": 503,
+        "body": {
+          "error": "synthetic refusal"
+        },
+        "headers": {
+          "cache-control": "no-store"
+        },
+        "calls": [
+          {
+            "url": "http://synthetic.invalid/api/v1/status",
+            "method": "GET",
+            "timeout": 600000
+          }
+        ]
+      }
+    },
+    {
+      "name": "fallback-503",
+      "path": "/api/model-manager/status",
+      "status": 503,
+      "body": {},
+      "expect": {
+        "status": 503,
+        "body": {
+          "error": "Model management request failed."
+        },
+        "headers": {
+          "cache-control": "no-store"
+        },
+        "calls": [
+          {
+            "url": "http://synthetic.invalid/api/v1/status",
+            "method": "GET",
+            "timeout": 600000
+          }
+        ]
+      }
+    },
+    {
+      "name": "transport",
+      "path": "/api/model-manager/status",
+      "drop": true,
+      "expect": {
+        "status": 502,
+        "body": {
+          "error": "The model management service is not responding."
+        },
+        "headers": {
+          "cache-control": "no-store"
+        },
+        "calls": [
+          {
+            "url": "http://synthetic.invalid/api/v1/status",
+            "method": "GET",
+            "timeout": 600000
+          }
+        ]
+      }
+    }
+  ]
+}

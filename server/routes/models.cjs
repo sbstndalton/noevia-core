@@ -245,6 +245,7 @@ function createModelRoutes({ servedEmbeddingModels = (target) => require('../rag
     // A change to the models anywhere else (load, unload, download, delete) also invalidates the scan.
     if (p.startsWith('/api/models/') && !['GET','HEAD','OPTIONS'].includes(req.method || 'GET')) modelScanCache.clear();
     // Model manager (folded-in Model Loader) JSON API, administrators only.
+    if (require('../rust-model-manager-read.cjs').owned(req.method, p)) return json(res,503,{error:'Model management reads are owned by the Rust front.',code:'RUST_MODEL_MANAGER_READ_OWNED'});
     if (p.startsWith('/api/model-manager/')) {
       if(authn.user.role!=='admin')return json(res,403,{error:'Administrator required for model management'});
       if(!env.MODEL_LOADER_URL)return json(res,404,{error:'Model management service is not configured'});
