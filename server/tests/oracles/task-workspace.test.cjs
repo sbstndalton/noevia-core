@@ -8,6 +8,9 @@ const taskId = '11111111-1111-4111-8111-111111111111';
 const otherId = '22222222-2222-4222-8222-222222222222';
 test('workspace oracle captures clone saving, pinned cleanup and interrupted recovery', () => {
   const dir = fs.mkdtempSync(path.join(process.env.TASK_WORKSPACE_EVIDENCE || os.tmpdir(), 'workspace-oracle-'));
+  const originalSync = fs.fsyncSync;
+  let applicationSyncs = 0;
+  fs.fsyncSync = fd => { applicationSyncs++; return originalSync(fd); };
   const environment = { PATH: process.env.PATH, HOME: dir, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_SYSTEM: '/dev/null' };
   const run = (args, cwd) => execFileSync('git', args, { cwd, env: environment, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 10000 }).trim();
   try {
@@ -48,6 +51,7 @@ test('workspace oracle captures clone saving, pinned cleanup and interrupted rec
     const [recovered] = restarted.recover();
     const recovery = { status: recovered.status, interruptedAt: recovered.interruptedAt, pinnedDropped: recovered.pinnedDropped, treeKept: fs.existsSync(next.path), pinRemoved: !fs.existsSync(path.join(next.path, 'engine-config.json')) };
     assert.deepEqual(recovery, { status: 'interrupted', interruptedAt: 5678, pinnedDropped: true, treeKept: true, pinRemoved: true });
+    assert.equal(applicationSyncs, 0, 'workspace records, trust and excludes follow write-only Node policy');
     if (process.env.TASK_WORKSPACE_EVIDENCE) fs.writeFileSync(path.join(process.env.TASK_WORKSPACE_EVIDENCE, 'task-workspace-node.json'), JSON.stringify({ created, saved, recovery, pipeline, reclaim }, null, 2) + '\n');
-  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+  } finally { fs.fsyncSync = originalSync; fs.rmSync(dir, { recursive: true, force: true }); }
 });
