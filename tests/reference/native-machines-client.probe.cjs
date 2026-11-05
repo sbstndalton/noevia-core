@@ -17,4 +17,4 @@ assert.throws(()=>require('../../server/llamacpp-manager.cjs').keepAlongside(),e
 const workers=require('../../server/document-workers.cjs');workers.useMachines(kind=>machines.urlFor(kind));
 assert.throws(()=>workers.resolve('ocr'),e=>e.status===503);
 assert.throws(()=>workers.assigned('documents'),e=>e.status===503);
-(async()=>{await assert.rejects(require('../../server/machine-tune.cjs').createMachineTune().start({service:'chatFast',confirm:true,actor:'synthetic-admin'}),e=>e.status===503);})().catch(e=>{console.error(e);process.exitCode=1;});
+(async()=>{await assert.rejects(require('../../server/rust-auto-roles.cjs').autoRolesState({servedCatalogue:async()=>[],remoteRoles:()=>({}),machineModels:()=>machines.chatTarget('fast')}),e=>e.status===503);await assert.rejects(require('../../server/machine-tune.cjs').createMachineTune().start({service:'chatFast',confirm:true,actor:'synthetic-admin'}),e=>e.status===503);})().catch(e=>{console.error(e);process.exitCode=1;});
