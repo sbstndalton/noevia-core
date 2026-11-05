@@ -211,3 +211,15 @@ test('refusal code headers exclude overlong values and header delimiters', { tim
     assert.equal((await r.json()).code, code);
   }
 });
+
+
+test('the Diary gate keeps its existing refusal headers', { timeout: 5000 }, async (t) => {
+  const gate = createMaintenanceGate();
+  const release = gate.hold('synthetic maintenance');
+  t.after(release);
+  const { base } = await serve(t, { modelManager: manager(gate), gateWaitMs: 1 });
+  const r = await ask(base, { gate: 'diary' });
+  assert.equal(r.status, 503);
+  assert.equal(r.headers.get('retry-after'), null);
+  assert.deepEqual(await r.json(), { error: 'synthetic maintenance', code: 'inferenceMaintenance' });
+});

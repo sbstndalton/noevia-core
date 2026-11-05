@@ -153,8 +153,10 @@ function createAdmissionRoutes({ secret, modelManager, admitEngineModel, chatMac
       if (req.method !== 'POST') return notFound();
       const signal = callerGone(req, res);
       let held = null;
+      let chatGate = false;
       try {
         const ask = await readJson(req);
+        chatGate = ask?.gate === 'chat';
         held = await admit(ask, signal);
         // A wait the caller gave up on must not leave the model held for the lease's whole life.
         if (signal.aborted) { held.release(); return true; }
@@ -166,7 +168,7 @@ function createAdmissionRoutes({ secret, modelManager, admitEngineModel, chatMac
         // Bounded metadata survives a front declining to buffer an oversized refusal body.
         if (status === 503 || status === 409) {
           if (typeof e?.code === 'string' && /^[A-Za-z0-9_.:-]{1,128}$/.test(e.code)) res.setHeader('X-Noevia-Admission-Code', e.code);
-          if (status === 503) res.setHeader('Retry-After', '3');
+          if (status === 503 && chatGate) res.setHeader('Retry-After', '3');
         }
         json(res, status, { error: e?.publicMessage || BUSY, ...(e?.code ? { code: e.code } : {}) });
       }
