@@ -672,11 +672,14 @@ function createLlamaCppManager({ budgetWatchDir = null, baseUrl, apiKey, fetchJs
   // can still read false; chat and inference are excluded by the gate regardless, and a preset write that lands
   // then only fails the run's revision check, which is safe.
   const calibrator=presets&&publicCalibrator?require('./llamacpp-calibration.cjs').createCalibrator({request,rawModels,presets,maintenance,applyUnlocked,invalidateBaseline,conservativeFor,identityFor:tuneIdentity,onResult:({model,status,entry})=>recordEvidence(model,status==='passed'?{category:'context_capacity',result:'passed',value:{ctx:entry.verifiedCtx,appliedCtx:entry.appliedCtx,slots:entry.slots},suite:{name:'native-calibration',version:1},source:'calibration',limitations:[`prompt budget ${entry.promptBudgetSeconds} s`]}:{category:'context_capacity',result:'failed',value:null,suite:{name:'native-calibration',version:1},source:'calibration',limitations:[String(entry.error||'').slice(0,200)]}),stream:(path,opts={})=>(fetchStream||fetch)(base+path,{...opts,headers:headers(opts.headers),redirect:'error'}),stateFile:calibrationStatePath,memoryFloorGib:autoconfig.memoryFloorGib||2,...calibrationOptions}):null;
-  const tuneDeps={identityFor:tuneIdentity,stateFile:autotuneStatePath,memoryFloorGib:autoconfig.memoryFloorGib||2,...(calibrationOptions.readMemory?{readMemory:calibrationOptions.readMemory}:{}),...autotuneOptions};
+  const tuneDeps={identityFor:tuneIdentity,memoryFloorGib:autoconfig.memoryFloorGib||2,...(calibrationOptions.readMemory?{readMemory:calibrationOptions.readMemory}:{}),...autotuneOptions};
   // Internal context checks run under the full tuner's per-model lease; standalone
   // calibration still acquires the real gate.
   const managedGate={hold:()=>()=>{}};
-  const autotuner=presets&&autotuneStatePath?require('./llamacpp-full-autotune.cjs').createFullAutotuner({fileMissing:presetFileMissing,request,rawModels,presets,maintenance,applyUnlocked,invalidateBaseline,identityFor:tuneDeps.identityFor,stateFile:autotuneStatePath,
+  // The Rust front owns auto-tune's state file (autotune-state-client.cjs): this process is its runner.
+  // Tests may hand over their own owner; without either there is no tuner.
+  const autotuneStateClient=autotuneOptions.stateClient||(autotuneStatePath&&presetBaselineClient?.autotuneState?require('./autotune-state-client.cjs').createAutotuneStateClient({call:presetBaselineClient.autotuneState,base:require('node:path').basename(autotuneStatePath)}):null);
+  const autotuner=presets&&autotuneStateClient?require('./llamacpp-full-autotune.cjs').createFullAutotuner({fileMissing:presetFileMissing,request,rawModels,presets,maintenance,applyUnlocked,invalidateBaseline,identityFor:tuneDeps.identityFor,stateClient:autotuneStateClient,
       samplingFor,
       // #1079: a Long tune adds its `<model>-long` section, then the router re-reads models.ini the
       // way every other noevia write does (recorded for the preset reload guard).
@@ -785,7 +788,7 @@ function createLlamaCppManager({ budgetWatchDir = null, baseUrl, apiKey, fetchJs
     // #2210: waits (bounded) until the front has applied a queued record (recordEvidence's handle).
     evidenceApplied: (handle,options)=>evidenceInbox?evidenceInbox.applied(handle,options):Promise.resolve(true),
     calibration: calibrator ? { stateFacts: calibrator.stateFacts, listingFacts: calibrator.listingFacts, preparationFacts: calibrator.preparationFacts, compareAndLaunch: calibrator.compareAndLaunch, cancellationFacts: calibrator.cancellationFacts, compareAndAbort: calibrator.compareAndAbort, recover: calibrator.recover } : null,
-    autotune: autotuner ? { start: (...args) => { const fault = budgetFaultReason(); return fault ? Promise.resolve({ ok: false, status: 503, body: budgetFaultBody('Auto-tune unavailable', fault) }) : autotuner.start(...args); }, resumeFacts: autotuner.resumeFacts, prepareResume: autotuner.prepareResume, compareAndResume: autotuner.compareAndResume, cancellationFacts: autotuner.cancellationFacts, compareAndAbort: autotuner.compareAndAbort, clearFacts: autotuner.clearFacts, compareAndClear: autotuner.compareAndClear, statusFacts: autotuner.statusFacts, settingsFacts: autotuner.settingsFacts, commitSettings: autotuner.commitSettings, recover: autotuner.recover, scanFacts: autotuner.scanFacts } : null,
+    autotune: autotuner ? { start: (...args) => { const fault = budgetFaultReason(); return fault ? Promise.resolve({ ok: false, status: 503, body: budgetFaultBody('Auto-tune unavailable', fault) }) : autotuner.start(...args); }, abort: autotuner.abort, launch: autotuner.launch, outsideFacts: autotuner.outsideFacts, listingFacts: autotuner.listingFacts, identityFacts: autotuner.identityFacts, statusFacts: autotuner.statusFacts, recover: autotuner.recover, attach: autotuner.attach, scanFacts: autotuner.scanFacts } : null,
     // noevia#2115: the gate refuses to unload a model in use (409 `model_in_use`); `unloadAnyway` is the
     // admin's choice to end what it is answering, and needs INFERENCE_GATE_ADMIN_TOKEN.
     unload: model => mutate(()=>post('/models/unload', { model })),

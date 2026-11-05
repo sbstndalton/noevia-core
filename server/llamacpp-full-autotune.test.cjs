@@ -4,37 +4,30 @@ const fs = require('node:fs'), os = require('node:os'), path = require('node:pat
 const { createModelManager } = require('./model-manager.cjs');
 const { createPresetStore } = require('./llamacpp-presets.cjs');
 const { QUALITY, qualityCheck, qualityFailure, newModel } = require('./llamacpp-full-autotune.cjs');
+const { createOwnerDouble } = require('./autotune-state-owner-double.cjs');
 
 const testIdentity = (model, build = 'fake-v1') => ({ arch: 'synthetic', quant: 'Q8_0', artifact: 'synthetic:' + model, build, profile: '0'.repeat(64), hardware: 'fake' });
 const scanUntuned = async tuner => ({ body: require('./dav-parse-wasm.cjs').autotuneScan({ op: 'scan', ...await tuner.scanFacts() }) });
-function cancelWorker(manager) { return manager.autotune.compareAndAbort(manager.autotune.cancellationFacts().token); }
-// Arrange a known-valid switch through the actor's conditional primitive. Public validation and
-// unfinished-job refusal moved to Rust; these tests only arrange the tune scripts' existing inputs.
+// The front (the state owner) records a cancellation, then fires the running actor's abort signal.
+function cancelWorker(manager) { const a = manager.autotune; return a.abort({ jobId: a.statusFacts().job.id, epoch: manager.testOwner.epoch }); }
+// Arrange a known-valid switch the way the front does: the owner changes its settings map, and the
+// actor sees it on its next read of the owner (start/scan). Public validation moved to Rust.
 function setTuneSettings(manager, model, body) {
-  const facts = manager.autotune.settingsFacts(model);
-  const changed = manager.autotune.commitSettings(model, body.allowQ5Kv, facts.token);
-  assert.equal(changed.applied, true);
-  return changed;
+  manager.testOwner.setSettings(model, body.allowQ5Kv);
+  return { applied: true };
 }
 
-
-// Arrange known-valid worker inputs through the actor's mechanical primitives. Public validation,
-// filtering and HTTP responses are tested in Rust, not reproduced by this worker fixture helper.
+// Arrange a resume the way the front does: the owner patches the unfinished items and persists the job as
+// running, then hands the actor the job to run. Public validation and the decisions are tested in Rust.
 async function resumeWorker(manager) {
-  const a = manager.autotune;
-  let facts = a.resumeFacts();
-  const listed = await a.prepareResume(facts.token, { stage: 'listing' });
-  assert.equal(listed.applied, true);
-  assert.ok(listed.models.every(row => !row.system), 'this worker fixture contains no protected item');
-  const selectors = listed.job.models.flatMap((item, index) => item.status === 'passed' ? [] : [{ index, field: item.base ? 'base' : 'model' }]);
-  facts = await a.prepareResume(listed.token, { stage: 'identities', selectors });
-  assert.equal(facts.applied, true);
-  const reset = facts.job.models.flatMap((item, index) => item.status === 'passed' ? [] : [{ index,
-    phases: item.phases.flatMap((p, index) => p.status === 'passed' ? [] : [{ index,
-      keepSteps: item.planned && ['context', 'verify'].includes(p.id) ? p.steps.flatMap((s, i) => ['passed', 'failed'].includes(s.status) ? [i] : []) : null,
+  const owner = manager.testOwner, job = owner.state.job;
+  const reset = job.models.flatMap((item, index) => item.status === 'passed' ? [] : [{ index,
+    phases: item.phases.flatMap((p, pi) => p.status === 'passed' ? [] : [{ index: pi,
+      keepSteps: item.plan && ['context', 'verify'].includes(p.id) ? p.steps.flatMap((s, i) => ['passed', 'failed'].includes(s.status) ? [i] : []) : null,
     }]),
   }]);
-  return a.compareAndResume(facts.token, { kind: 'launch', reset });
+  const launched = manager.autotune.launch(owner.launchPatch(reset));
+  return { applied: launched.launched, ...launched };
 }
 
 // #1057: the fake engine's f16 quirks (failLoadF16, badF16, the shorter recall) hold for both
@@ -105,10 +98,12 @@ function fixture(t, { badSampling = false, models = ['synthetic'], onChat, onUnl
     const content = Number(o['ctx-size']) <= (unq(o) ? 8192 : 16384) ? marker : 'forgot';
     return new Response(`data: ${JSON.stringify({ choices: [{ delta: { content } }], timings: { prompt_n: Math.floor(text.length / 5), prompt_ms: 100, prompt_per_second: 100000 } })}\n\ndata: [DONE]\n\n`);
   };
-  const makeManager = () => createModelManager({ kind: 'llamacpp', baseUrl: 'http://synthetic', presetPath: ini, fetchJson, fetchStream, presetBaselineClient,
+  let owner = null;
+  const makeManager = () => { owner = createOwnerDouble(stateFile); const m = makeManagerWith(owner); Object.defineProperty(m, 'testOwner', { value: owner }); return m; };
+  const makeManagerWith = owner => createModelManager({ kind: 'llamacpp', baseUrl: 'http://synthetic', presetPath: ini, fetchJson, fetchStream, presetBaselineClient,
     calibrationStatePath: path.join(dir, 'cal.json'), autotuneStatePath: stateFile,
     calibrationOptions: { identityFor: async()=>({arch:null,quant:null,artifact:'synthetic-artifact',build:null,profile:require('node:crypto').createHash('sha256').update(fs.readFileSync(ini)).digest('hex'),hardware:null}), sleep: async () => {}, readMemory: () => 20, ...calibrationExtra },
-    autotuneOptions: { ...autotuneExtra, ...(servingChecks ? { servingChecks } : {}), ...(unloadPolls || unloadStuck ? { sleep: async () => {} } : {}), betweenModelsMs: 25, idleTimeoutMs, readMemory: () => 20, identityFor: async m => (++identityReads > 1 && loseIdentityAfterStart ? null : testIdentity(m, build)) } });
+    autotuneOptions: { stateClient: owner, ...autotuneExtra, ...(servingChecks ? { servingChecks } : {}), ...(unloadPolls || unloadStuck ? { sleep: async () => {} } : {}), betweenModelsMs: 25, idleTimeoutMs, readMemory: () => 20, identityFor: async m => (++identityReads > 1 && loseIdentityAfterStart ? null : testIdentity(m, build)) } });
   let manager = makeManager();
   return { manager, ini, stateFile, dir, original, requests, servingRequests, options, status, restart: () => { manager = makeManager(); return manager; }, setBuild: b => { build = b; } };
 }
@@ -308,7 +303,7 @@ test('external preset edit stops rollback and Resume, preserving the operator te
   assert.equal(j.status, 'failed'); assert.match(j.error, /inspect models.ini/);
   assert.match(fs.readFileSync(f.ini, 'utf8'), /external operator edit/);
   assert.equal(j.models[0].phases[0].status, 'passed');
-  assert.equal(f.manager.autotune.resumeFacts().job.unsafe, true);
+  assert.equal(f.manager.testOwner.state.job._unsafe, true, 'the owner holds the unsafe mark a resume must refuse');
 });
 
 test('restart rolls back active phase only, then explicit Resume skips committed phases', async t => {
@@ -370,6 +365,7 @@ test('legacy running journal restores only after unloading and confirmed reload'
       queue: [{ model: 'synthetic', status: 'running' }], steps: [],
     } }));
     const manager = f.restart();
+    await manager.autotune.attach();
     assert.doesNotMatch(JSON.stringify(manager.autotune.statusFacts().job), /originalText|lastRevision|version = 1/);
     await manager.autotune.recover();
     const j = manager.autotune.statusFacts().job;
@@ -377,7 +373,7 @@ test('legacy running journal restores only after unloading and confirmed reload'
     assert.equal(j.restored, !reloadFail);
     assert.equal(f.status.synthetic, 'unloaded');
     assert.equal(fs.readFileSync(f.ini, 'utf8'), before);
-    assert.equal(manager.autotune.resumeFacts().job.models, null);
+    assert.equal(Array.isArray(manager.testOwner.state.job.models), false, 'a pre-v3 journal has no queue the owner could resume');
   }
 });
 
@@ -642,7 +638,7 @@ test('#545: the bulk untuned list skips presets whose model file is missing, and
   const rows = [{ id: 'present', source: 'preset', status: { args: [] } }, { id: 'ghost', source: 'preset', status: { args: [] } }];
   const presets = { get: () => ({ exists: true, options: {}, defaults: {} }), files: () => ({}) };
   const build = fileMissing => createFullAutotuner({ request: async () => ({ ok: true, body: {} }), rawModels: async () => ({ ok: true, body: { data: rows } }), presets,
-    maintenance: {}, applyUnlocked: async () => ({ ok: true }), identityFor: async m => testIdentity(m), stateFile: path.join(dir, 'tune.json'), ...(fileMissing ? { fileMissing } : {}) });
+    maintenance: {}, applyUnlocked: async () => ({ ok: true }), identityFor: async m => testIdentity(m), stateClient: createOwnerDouble(path.join(dir, 'tune.json')), ...(fileMissing ? { fileMissing } : {}) });
   assert.deepEqual((await scanUntuned(build())).body.models, ['present', 'ghost'], 'default: nothing is treated as missing');
   const scan = (await scanUntuned(build(row => row.id === 'ghost'))).body;
   assert.deepEqual(scan.models, ['present']);
@@ -769,44 +765,51 @@ test('#1978 a restart-interrupted run keeps the phase it was in', async t => {
   assert.equal(j.status, 'interrupted'); assert.equal(j.failedPhase, 'Drafting');
 });
 
-test('#1978 clear drops a finished job record only: measurements, settings and models.ini stay', async t => {
+test('#1978 the owner dropping a finished job record leaves measurements, settings and models.ini; the actor adopts it', async t => {
   const f = fixture(t, { rejectAll: true });
-  await setTuneSettings(f.manager, 'synthetic', { allowQ5Kv: true });
+  setTuneSettings(f.manager, 'synthetic', { allowQ5Kv: true });
   await f.manager.autotune.start('synthetic', { confirmPause: true });
   await finished(f.manager);
   const before = JSON.parse(fs.readFileSync(f.stateFile, 'utf8'));
   const ini = fs.readFileSync(f.ini, 'utf8');
-  const r = f.manager.autotune.compareAndClear(f.manager.autotune.clearFacts().token);
-  assert.deepEqual(r, { applied: true });
-  assert.equal(f.manager.autotune.statusFacts().job, undefined);
+  f.manager.testOwner.clearJob(); // the front's clear: its policy and token are tested in Rust
   const after = JSON.parse(fs.readFileSync(f.stateFile, 'utf8'));
   assert.equal(after.job, undefined);
   assert.deepEqual(after.history, before.history);
   assert.deepEqual(after.settings, before.settings);
-  assert.equal(f.manager.autotune.statusFacts(['synthetic']).entries[0].allowQ5Kv, true);
   assert.equal(fs.readFileSync(f.ini, 'utf8'), ini);
-  assert.equal(f.manager.autotune.compareAndClear(f.manager.autotune.clearFacts().token).applied, false, 'nothing left to clear');
-  assert.equal(f.manager.autotune.resumeFacts().job, null);
+  // The idle actor lagged behind the job revision: its next start adopts the owner's state instead of failing.
+  const again = await f.manager.autotune.start('synthetic', { confirmPause: true });
+  assert.equal(again.ok, true, JSON.stringify(again.body));
+  const j = await finished(f.manager);
+  assert.notEqual(j.id, before.job.id);
+  assert.deepEqual(JSON.parse(fs.readFileSync(f.stateFile, 'utf8')).settings, before.settings);
+  assert.equal(f.manager.autotune.statusFacts(['synthetic']).entries[0].allowQ5Kv, true);
 });
 
-test('#1978 clear keeps finished measurements in history after a passed run', async t => {
+test('#1978 finished measurements stay in history when the owner drops the job record after a passed run', async t => {
   const f = fixture(t);
   await f.manager.autotune.start('synthetic', { confirmPause: true });
   assert.equal((await finished(f.manager)).status, 'passed');
   const history = (f.manager.autotune.statusFacts(['synthetic']).entries[0].history || []);
   assert.ok(history.length > 0);
-  assert.equal(f.manager.autotune.compareAndClear(f.manager.autotune.clearFacts().token).applied, true);
-  assert.deepEqual((f.manager.autotune.statusFacts(['synthetic']).entries[0].history || []), history);
+  f.manager.testOwner.clearJob();
+  assert.deepEqual(JSON.parse(fs.readFileSync(f.stateFile, 'utf8')).history.synthetic.length, history.length);
 });
 
-test('#1978 clear is refused while a run is active, and the run carries on', async t => {
-  let result;
-  const f = fixture(t, { onChat: ({ manager }) => { result ||= manager.autotune.compareAndClear(manager.autotune.clearFacts().token); } });
+test('#1978 a start is refused while the owner holds another start or a run, and the running tune carries on', async t => {
+  const f = fixture(t, { onChat: async ({ manager }) => { refused ||= await manager.autotune.start('synthetic', { confirmPause: true }); } });
+  let refused;
   await f.manager.autotune.start('synthetic', { confirmPause: true });
-  assert.equal(f.manager.autotune.compareAndClear(f.manager.autotune.clearFacts().token).applied, false, 'refused while starting');
   const j = await finished(f.manager);
-  assert.equal(result.applied, false);
+  assert.equal(refused.ok, false); assert.equal(refused.status, 409);
   assert.equal(j.status, 'passed');
+  // Another holder (a preparation, a start elsewhere) refuses a start without touching the state.
+  const owner = f.manager.testOwner;
+  assert.equal(await owner.begin(), true);
+  const held = await f.manager.autotune.start('synthetic', { confirmPause: true });
+  assert.deepEqual([held.ok, held.status], [false, 409]);
+  await owner.end();
 });
 
 test('#328 with sampling to apply, the baseline is measured first at bf16 (#1078) and the KV and drafting keys are put back', async t => {
@@ -886,6 +889,7 @@ test('#328 status facts report only raw per-model KV switches', async t => {
   assert.equal(f.manager.autotune.statusFacts(['synthetic']).entries[0].allowQ5Kv, false);
   assert.equal(f.manager.autotune.statusFacts().allowBelowQ5Kv, false);
   setTuneSettings(f.manager, 'synthetic', { allowQ5Kv: true });
+  await f.manager.autotune.scanFacts(); // the actor reads the owner's settings when it scans or starts
   assert.equal(f.manager.autotune.statusFacts(['synthetic']).entries[0].allowQ5Kv, true);
   assert.equal(f.manager.autotune.statusFacts(['embed']).entries[0].allowQ5Kv, false);
   process.env.NOEVIA_AUTOTUNE_ALLOW_BELOW_Q5_KV = '1';
@@ -1793,7 +1797,7 @@ function owedReread(t, { request, rawModels, invalidateBaseline }) {
   fs.writeFileSync(stateFile, JSON.stringify({ job: { status: 'interrupted', model: 'synthetic', _reloadPending: true, models: [] } }));
   const presets = { get: () => ({ exists: true, options: {}, defaults: {} }), files: () => ({}), snapshot: () => ({ text: '', revision: '' }) };
   const autotune = createFullAutotuner({ request, rawModels, presets, maintenance: {}, applyUnlocked: async () => ({ ok: true }),
-    identityFor: async m => testIdentity(m), stateFile, foreignPollMs: 1, ...(invalidateBaseline ? { invalidateBaseline } : {}) });
+    identityFor: async m => testIdentity(m), stateClient: createOwnerDouble(stateFile), foreignPollMs: 1, ...(invalidateBaseline ? { invalidateBaseline } : {}) });
   const owed = () => JSON.parse(fs.readFileSync(stateFile, 'utf8')).job._reloadPending;
   return { autotune, owed };
 }
@@ -2024,9 +2028,10 @@ test('#1093 an unrelated change to models.ini still refuses the resume', async t
   job.status = 'interrupted';
   fs.writeFileSync(f.ini, crashed.ini + '# edited by hand\n'); fs.writeFileSync(f.stateFile, JSON.stringify(state));
   const manager = f.restart(); await manager.autotune.recover();
-  const facts = manager.autotune.resumeFacts();
-  assert.notEqual(facts.revision, facts.job.revision);
-  assert.notEqual(facts.revision, facts.job.pendingRevision);
+  const owned = manager.testOwner.state.job, revision = createPresetStore(f.ini).snapshot().revision;
+  assert.notEqual(revision, owned._revision);
+  assert.notEqual(revision, owned._pendingRevision);
+  assert.equal(owned._pendingRevision, undefined, 'the pending revision is dropped, not adopted, for a file changed by hand');
 });
 
 test('#1079 Long refuses up front when the section cannot be made (no model file to point at)', async t => {
@@ -2310,7 +2315,7 @@ test('an unacknowledged invalidation: the background re-read keeps retrying with
   for (let i = 0; i < 100 && log.filter(e => e === 'bridge invalidate:autotune').length < 2; i++) await new Promise(r => setTimeout(r, 10));
   assert.ok(log.filter(e => e === 'bridge invalidate:autotune').length >= 2, 'retried: ' + log.join(', '));
   assert.equal(log.filter(e => e === 'RELOAD').length, 0);
-  assert.equal(manager.autotune.clearFacts().reloadPending, true);
+  assert.equal(owedOnDisk(f), true);
 });
 
 test('an unacknowledged invalidation: the flush before a load refuses the load and keeps the re-read owed', async t => {
@@ -2323,5 +2328,105 @@ test('an unacknowledged invalidation: the flush before a load refuses the load a
   assert.equal(f.status.synthetic, 'unloaded', 'nothing was loaded');
   assert.ok(log.includes('bridge invalidate:autotune'));
   assert.equal(log.filter(e => e === 'RELOAD').length, 0);
-  assert.equal(manager.autotune.clearFacts().reloadPending, true);
+  assert.equal(owedOnDisk(f), true);
+});
+
+// ── the front owns the state: fencing, abort and launch (autotune-state-client.cjs, noevia-rs autotune_state.rs) ──
+test('abort matches the exact run: a wrong job, a stale epoch or an idle actor changes nothing', async t => {
+  const results = [];
+  const f = fixture(t, { onChat: ({ manager }) => {
+    if (results.length) return;
+    const a = manager.autotune, id = a.statusFacts().job.id, epoch = manager.testOwner.epoch;
+    results.push(a.abort({ jobId: 'other', epoch }), a.abort({ jobId: id, epoch: epoch - 1 }), a.abort({ jobId: id }), a.abort());
+  } });
+  assert.deepEqual(f.manager.autotune.abort({ jobId: 'j', epoch: 1 }), { aborted: false }, 'idle');
+  await f.manager.autotune.start('synthetic', { confirmPause: true });
+  const j = await finished(f.manager);
+  assert.deepEqual(results, [{ aborted: false }, { aborted: false }, { aborted: false }, { aborted: false }]);
+  assert.equal(j.status, 'passed', 'the run carried on');
+});
+
+test('an abort of the current run ends it as cancelled and the owner holds the restored result', async t => {
+  let aborted;
+  const f = fixture(t, { onChat: ({ manager }) => {
+    if (!aborted && manager.autotune.statusFacts().job?.phase === 'Drafting') aborted = manager.autotune.abort({ jobId: manager.autotune.statusFacts().job.id, epoch: manager.testOwner.epoch });
+  } });
+  await f.manager.autotune.start('synthetic', { confirmPause: true });
+  const j = await finished(f.manager);
+  assert.deepEqual(aborted, { aborted: true });
+  assert.equal(j.status, 'cancelled');
+  const owned = f.manager.testOwner.state.job;
+  assert.equal(owned.status, 'cancelled', 'the owner holds the final state, not a stale one');
+  assert.equal(fs.readFileSync(f.ini, 'utf8').includes('cache-type'), true, 'committed phases stay');
+});
+
+test('a write the owner refuses mid-run stops the run before any further step, then recovery interrupts it as a restart would', async t => {
+  let armed = false, refused = 0, requestsAtFence = -1;
+  const f = fixture(t, { onChat: ({ manager }) => {
+    if (!armed && manager.autotune.statusFacts().job?.phase === 'Drafting') {
+      armed = true;
+      manager.testOwner.refuse = (op) => { if (op === 'commit' && !refused) { refused++; requestsAtFence = f.requests.length; return 'writer'; } return null; };
+    }
+  } });
+  await f.manager.autotune.start('synthetic', { confirmPause: true });
+  for (let i = 0; i < 600 && f.manager.testOwner.state.job?.status === 'running'; i++) await new Promise(r => setTimeout(r, 25));
+  const owned = f.manager.testOwner.state.job;
+  assert.equal(refused, 1);
+  assert.equal(owned.status, 'interrupted', JSON.stringify(owned.status));
+  assert.match(owned.error, /Restart interrupted tuning/);
+  // Nothing measured after the refusal: at most the request in flight when the owner said no.
+  assert.ok(f.requests.length - requestsAtFence <= 1, `${f.requests.length - requestsAtFence} engine requests after the fence`);
+});
+
+test('an unreachable owner refuses a start without touching models.ini, and a refused registration starts nothing', async t => {
+  const f = fixture(t);
+  f.manager.testOwner.refuse = op => op === 'attach' ? 'unreachable' : null;
+  const down = await f.manager.autotune.start('synthetic', { confirmPause: true });
+  assert.deepEqual([down.ok, down.status], [false, 503]);
+  assert.equal(fs.readFileSync(f.ini, 'utf8'), f.original);
+  assert.equal(f.requests.length, 0);
+  f.manager.testOwner.refuse = (op, p) => op === 'commit' && p.register ? 'writer' : null;
+  const refused = await f.manager.autotune.start('synthetic', { confirmPause: true });
+  assert.deepEqual([refused.ok, refused.status], [false, 503]);
+  assert.equal(f.manager.autotune.statusFacts().job, undefined, 'the unregistered job is not kept');
+  assert.equal(f.requests.length, 0);
+  assert.equal(fs.readFileSync(f.ini, 'utf8'), f.original);
+  // The hold was released: with the owner back, a start works.
+  f.manager.testOwner.refuse = null;
+  const ok = await f.manager.autotune.start('synthetic', { confirmPause: true });
+  assert.equal(ok.ok, true, JSON.stringify(ok.body));
+  assert.equal((await finished(f.manager)).status, 'passed');
+});
+
+test('launch runs the job the owner persisted, adopting its job and history, and refuses a second launch while it runs', async t => {
+  let again;
+  const f = fixture(t, { badBatch: true, onChat: ({ manager }) => { again ||= manager.autotune.launch({ epoch: 99, jobRev: 99, job: { status: 'running', id: 'x' }, history: {} }); } });
+  await f.manager.autotune.start('synthetic', { confirmPause: true });
+  const failed = await finished(f.manager);
+  assert.equal(failed.status, 'failed');
+  assert.deepEqual(again, { launched: false }, 'a running actor takes no second job');
+  const launched = await resumeWorker(f.manager);
+  assert.equal(launched.applied, true);
+  assert.deepEqual(f.manager.autotune.launch({ epoch: 1, jobRev: 1, job: { status: 'passed' }, history: {} }), { launched: false });
+  assert.deepEqual(f.manager.autotune.launch({}), { launched: false });
+  const j = await finished(f.manager);
+  assert.equal(j.id, failed.id, 'the same job resumes under a new run');
+});
+
+test('outside facts name the revision, roles and profiles the owner cannot see, for any model name', t => {
+  const f = fixture(t);
+  const facts = f.manager.autotune.outsideFacts(['synthetic', '__proto__', 'Laya']);
+  assert.equal(typeof facts.revision, 'string');
+  assert.equal(facts.allowBelowQ5Kv, false);
+  assert.deepEqual(Object.keys(facts.models).sort(), ['Laya', '__proto__', 'synthetic']);
+  assert.deepEqual(facts.models.synthetic, { configured: true, system: false });
+  assert.equal(facts.models.__proto__.configured, false);
+  for (const bad of [null, 'x', [1], new Array(1025).fill('m')]) assert.throws(() => f.manager.autotune.outsideFacts(bad));
+});
+
+test('the router listing for the owner\'s queue answers system, listed and base-listed per item, or null when the router is silent', async t => {
+  const f = fixture(t);
+  const out = await f.manager.autotune.listingFacts([{ model: 'synthetic' }, { model: 'ghost', base: 'synthetic' }]);
+  assert.deepEqual(out.models.map(r => [r.index, r.system, r.modelListed, r.baseListed]), [[0, false, true, false], [1, false, false, true]]);
+  await assert.rejects(f.manager.autotune.listingFacts(new Array(513).fill({})));
 });

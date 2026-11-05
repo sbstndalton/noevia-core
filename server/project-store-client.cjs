@@ -39,6 +39,8 @@ const REPLY_CAP = 2 * 32 * 1024 * 1024 + 64 * 1024;
 // front's routes are its writer; Node saves only its seal-on-load migration here.
 const FILES = new Set(['projects.json', 'free-chats.json', 'providers.json']);
 const PRESET_BASELINE_OPS = new Set(['session', 'begin', 'settle', 'invalidate', 'verdict', 'router-text']);
+// The Rust front's auto-tune state owner (autotune-state-client.cjs): the tune actor's channel.
+const AUTOTUNE_STATE_OPS = new Set(['attach', 'commit', 'start', 'sync']);
 
 /** Whether the environment hands over the Rust store (see the header): its port and secret. */
 function enabledFrom(env = process.env, warn = console.warn) {
@@ -132,9 +134,15 @@ function createClient({ port, token, fetchImpl = globalThis.fetch, timeoutMs = T
     if (!PRESET_BASELINE_OPS.has(op)) throw new Error(`not a preset baseline op: ${op}`);
     return call(`preset-baseline/${op}`, payload, wait);
   }
+  // noevia-rs autotune_state.rs: the tune actor's calls to the state owner. { status, body }.
+  async function autotuneState(op, payload, { timeoutMs: wait = 15000 } = {}) {
+    if (!AUTOTUNE_STATE_OPS.has(op)) throw new Error(`not an autotune state op: ${op}`);
+    return call(`autotune-state/${op}`, payload, wait);
+  }
   return {
     featureContext,
     presetBaseline,
+    autotuneState,
     async grantContext(user, chat) {
       const { status, body } = await call('chat/grant-context', { user, chat });
       if (status !== 200) throw moveFailure(status, body);

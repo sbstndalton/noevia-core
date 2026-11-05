@@ -35,7 +35,7 @@ test('actual shared WASM policy makes Node collector read identities only for el
  const stateFile=path.join(dir,'state.json');fs.writeFileSync(stateFile,JSON.stringify({history:Object.fromEntries(rows.filter(r=>r.latest).map(r=>[r.id,[r.latest]])),settings:Object.fromEntries(rows.filter(r=>r.allowQ5Kv).map(r=>[r.id,{allowQ5Kv:true}]))}));
  const system=require('./model-system.cjs');system.rememberSectionRoles(JSON.stringify({system:'system-routing'}));t.after(()=>system.rememberSectionRoles(''));
  const {createFullAutotuner}=require('./llamacpp-full-autotune.cjs');
- const tuner=createFullAutotuner({stateFile,servingChecks:{},planner:{},loadAdvisor:{},longProfiles:{pairsOf:()=>rows.filter(r=>r.long).map(r=>({long:r.id}))},rawModels:async()=>({ok:true,body:{data:rows.map(r=>({id:r.id,status:{args:r.args}}))}}),presets:{get:id=>rows.find(r=>r.id===id).profile},fileMissing:r=>rows.find(x=>x.id===r.id).missing,identityFor:async id=>{reads.push(id);const identity=rows.find(r=>r.id===id).identity;assert.notEqual(identity,null,'skipped identity must not be read');return identity;}});
+ const tuner=createFullAutotuner({stateClient:require('./autotune-state-owner-double.cjs').createOwnerDouble(stateFile),servingChecks:{},planner:{},loadAdvisor:{},longProfiles:{pairsOf:()=>rows.filter(r=>r.long).map(r=>({long:r.id}))},rawModels:async()=>({ok:true,body:{data:rows.map(r=>({id:r.id,status:{args:r.args}}))}}),presets:{get:id=>rows.find(r=>r.id===id).profile},fileMissing:r=>rows.find(x=>x.id===r.id).missing,identityFor:async id=>{reads.push(id);const identity=rows.find(r=>r.id===id).identity;assert.notEqual(identity,null,'skipped identity must not be read');return identity;}});
  const facts=await tuner.scanFacts();assert.deepEqual(reads,fixture.identityReads);assert.deepEqual(wasm.autotuneScan({op:'scan',...facts}),fixture.expected);
  const controller=new AbortController();controller.abort();reads.length=0;await assert.rejects(tuner.scanFacts({signal:controller.signal}));assert.deepEqual(reads,[]);
 });
@@ -49,8 +49,9 @@ test('later rows reread live settings after an earlier async identity instead of
  const stateFile=path.join(dir,'state.json');fs.writeFileSync(stateFile,JSON.stringify({history:{second:[{version:3,signature:currentQ5}]},settings:{}}));
  const reads=[];let switched=false;
  const {createFullAutotuner}=require('./llamacpp-full-autotune.cjs');
- const tuner=createFullAutotuner({stateFile,servingChecks:{},planner:{},loadAdvisor:{},longProfiles:{pairsOf:()=>[]},rawModels:async()=>({ok:true,body:{data:[{id:'first',status:{args:[]}},{id:'second',status:{args:[]}}]}}),presets:{get:()=>profile},identityFor:async id=>{
-  reads.push(id);if(id==='first'&&!switched){switched=true;const snapshot=tuner.settingsFacts('second');assert.equal(tuner.commitSettings('second',true,snapshot.token).applied,true);await Promise.resolve();}return identity;
+ const owner=require('./autotune-state-owner-double.cjs').createOwnerDouble(stateFile);
+ const tuner=createFullAutotuner({stateClient:owner,servingChecks:{},planner:{},loadAdvisor:{},longProfiles:{pairsOf:()=>[]},rawModels:async()=>({ok:true,body:{data:[{id:'first',status:{args:[]}},{id:'second',status:{args:[]}}]}}),presets:{get:()=>profile},identityFor:async id=>{
+  reads.push(id);if(id==='first'&&!switched){switched=true;owner.setSettings('second',true);await Promise.resolve();}return identity;
  }});
  const facts=await tuner.scanFacts();assert.deepEqual(reads,['first','second']);assert.equal(facts.rows[1].allowQ5Kv,true);
  assert.deepEqual(wasm.autotuneScan({op:'scan',...facts}),{models:['first'],skipped:[{model:'second',reason:'Current tune already applied'}]});
@@ -64,7 +65,7 @@ test('stable current reranker is ineligible without reading its identity and unr
  const dir=fs.mkdtempSync(path.join(os.tmpdir(),'untuned-protection-'));t.after(()=>fs.rmSync(dir,{recursive:true,force:true}));
  const stateFile=path.join(dir,'state.json');fs.writeFileSync(stateFile,JSON.stringify({history:{},settings:{}}));const reads=[];
  const {createFullAutotuner}=require('./llamacpp-full-autotune.cjs');
- const tuner=createFullAutotuner({stateFile,servingChecks:{},planner:{},loadAdvisor:{},longProfiles:{pairsOf:()=>[]},rawModels:async()=>({ok:true,body:{data:[{id:'ordinary-synthetic',status:{args:[]}},{id:'untuned-current-b-synthetic',status:{args:[]}}]}}),presets:{get:()=>base.profile},identityFor:async id=>{reads.push(id);return base.identity;}});
+ const tuner=createFullAutotuner({stateClient:require('./autotune-state-owner-double.cjs').createOwnerDouble(stateFile),servingChecks:{},planner:{},loadAdvisor:{},longProfiles:{pairsOf:()=>[]},rawModels:async()=>({ok:true,body:{data:[{id:'ordinary-synthetic',status:{args:[]}},{id:'untuned-current-b-synthetic',status:{args:[]}}]}}),presets:{get:()=>base.profile},identityFor:async id=>{reads.push(id);return base.identity;}});
  const facts=await tuner.scanFacts();assert.deepEqual(reads,['ordinary-synthetic']);
  assert.deepEqual(wasm.autotuneScan({op:'scan',...facts}),{models:['ordinary-synthetic'],skipped:[{model:'untuned-current-b-synthetic',reason:'System routing model — not tuned'}]});
  reads.length=0;settings.install({effectiveEnv(){throw Error('synthetic private configuration');}});

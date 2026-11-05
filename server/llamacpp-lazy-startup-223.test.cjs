@@ -76,9 +76,10 @@ function synthetic(t, { autoconfig = {}, inferenceBudget, native, autotuneOption
   const ini = path.join(dir, 'models.ini');
   fs.writeFileSync(ini, INI);
   const calls = [], state = { small: 'unloaded' };
+  const owner = require('./autotune-state-owner-double.cjs').createOwnerDouble(path.join(dir, 'tune.json'));
   const m = createModelManager({ kind: 'llamacpp', baseUrl: 'http://synthetic', presetPath: ini, publicCalibrator: true, calibrationStatePath: path.join(dir, 'cal.json'), autotuneStatePath: path.join(dir, 'tune.json'), gate: require('./fixtures/fake-inference-gate.cjs').fakeGate(),
     autoconfig: { modelsPath: dir, cacheRamMaxMib: 1024, ...autoconfig }, ...(inferenceBudget ? { inferenceBudget } : {}),
-    calibrationOptions: { sleep: async () => {}, readMemory: () => 20 }, ...(autotuneOptions ? { autotuneOptions } : {}),
+    calibrationOptions: { sleep: async () => {}, readMemory: () => 20 }, autotuneOptions: { stateClient: owner, ...(autotuneOptions || {}) },
     fetchJson: async (url, options = {}) => {
       const p = new URL(url).pathname;
       calls.push(`${options.method || 'GET'} ${p}`);
@@ -86,7 +87,7 @@ function synthetic(t, { autoconfig = {}, inferenceBudget, native, autotuneOption
       if (p === '/models/unload') state.small = 'unloaded';
       return { ok: true, status: 200, body: p === '/models' ? { data: [{ id: 'small', status: { value: state.small }, ...(native ? { meta: { n_ctx_train: native } } : {}) }] } : { success: true } };
     } });
-  return { m, calls, ini };
+  return { m, calls, ini, owner };
 }
 const WRITES = (calls) => calls.filter(c => c.startsWith('POST') && c !== 'POST /models/unload');
 
@@ -239,10 +240,10 @@ test('auto-tune: an autoconfig_impl refusal while planning stops the job with it
 
 test('auto-tune: a planning failure that is not a refusal still falls back to the standard order (unchanged)', { skip: skipWasm }, async (t) => {
   freshModules(t);
-  const { m } = synthetic(t, { native: 32768, inferenceBudget: { budgetGib: () => 64 }, autotuneOptions: { planFacts: async () => { throw new Error('model file unreadable'); } } });
+  const { m, owner } = synthetic(t, { native: 32768, inferenceBudget: { budgetGib: () => 64 }, autotuneOptions: { planFacts: async () => { throw new Error('model file unreadable'); } } });
   const r = await m.autotune.start('small', TUNE);
   assert.equal(r.status, 202);
-  m.autotune.compareAndAbort(m.autotune.cancellationFacts().token);
+  m.autotune.abort({ jobId: m.autotune.statusFacts().job.id, epoch: owner.epoch });
   const job = await tuneSettled(m);
   ran++;
   assert.notEqual(job?.status, 'running');

@@ -333,6 +333,7 @@ const autoconfigBudget = (() => {
   }
 })();
 
+const AUTOTUNE_STATE_PATH = path.join(DATA_DIR,'native-autotune-'+require('node:crypto').createHash('sha256').update(MODEL_MANAGER_BASE).digest('hex').slice(0,16)+'.json');
 const modelManager = createModelManager({
   kind: MODEL_MANAGER_KIND,
   presetPath: process.env.LLAMACPP_PRESET_PATH,
@@ -354,7 +355,7 @@ const modelManager = createModelManager({
   budgetWatchDir: path.join(DATA_DIR,'budget-watch-'+require('node:crypto').createHash('sha256').update(MODEL_MANAGER_BASE).digest('hex').slice(0,16)),
   evidenceDir: path.join(DATA_DIR,'evidence-'+require('node:crypto').createHash('sha256').update(MODEL_MANAGER_BASE).digest('hex').slice(0,16)),
   calibrationStatePath: path.join(DATA_DIR,'native-calibration-'+require('node:crypto').createHash('sha256').update(MODEL_MANAGER_BASE).digest('hex').slice(0,16)+'.json'),
-  autotuneStatePath: path.join(DATA_DIR,'native-autotune-'+require('node:crypto').createHash('sha256').update(MODEL_MANAGER_BASE).digest('hex').slice(0,16)+'.json'),
+  autotuneStatePath: AUTOTUNE_STATE_PATH,
   // #1012: the models.ini text the router last read after a reload noevia made.
   // noevia-rs model_maint/reload.rs: the front holds that baseline when it serves it (preset-reload.cjs).
   presetBaselineClient: PROJECT_STORE,
@@ -1167,10 +1168,6 @@ require('./diary-connectors.cjs').ensureTable(authService.db);
 // No Diary route stays in this process: the Diary proxies (files, file, the trash, the history, the operator
 // import folders and the entry edit) and the backup loop are the front's (rust-diary.cjs), as is the local
 // exchange (rust-diary-local-exchange.cjs), which takes this process's throttle and gate by lease.
-// #2287: the Rust front owns settings policy; the live tune script retains the state-file writer.
-const autotuneSettingsBridge = require('./rust-autotune-settings-bridge.cjs').createAutotuneSettingsBridge({
-  secret: FRONT_SECRET, json, readJson, tuner: () => modelManager.autotune,
-});
 // The router's list of the paths a signed-out browser may call. Their sign-in methods are the Rust
 // front's (#1071, refused above by rust-auth.cjs); any other method passes the gate as before.
 const publicAuthRoutes = new Set([
@@ -1209,13 +1206,10 @@ const modelDownloadsFacts = require('./rust-model-downloads-read-facts.cjs').cre
 const presetReadBridge = require('./rust-preset-read-bridge.cjs').createPresetReadBridge({
   secret: FRONT_SECRET, json, readJson, manager: () => modelManager,
 });
-const autotuneReadBridge = require('./rust-autotune-read-bridge.cjs').createAutotuneReadBridge({
-  secret: FRONT_SECRET, json, readJson, autotune: () => modelManager.autotune,
-});
-const autotuneResumeBridge = require('./rust-autotune-resume-bridge.cjs').createAutotuneResumeBridge({
+// The Rust front owns auto-tune's state; this is its private way back to the tune actor (the runner).
+const autotuneActorBridge = require('./rust-autotune-actor-bridge.cjs').createAutotuneActorBridge({
   secret: FRONT_SECRET, json, readJson, autotune: () => modelManager.autotune, invalidate: () => modelService.modelScanCache.clear(),
 });
-const autotuneClearBridge = require('./rust-autotune-clear-bridge.cjs').createAutotuneClearBridge({ secret: FRONT_SECRET, json, readJson, autotune: () => modelManager.autotune });
 const autotuneUntunedFacts = require('./rust-autotune-untuned-facts.cjs').createAutotuneUntunedFacts({ secret: FRONT_SECRET, json, readJson, autotune: () => modelManager.autotune });
 const toolApprovals = require('./rust-tool-approval-bridge.cjs');
 const toolApprovalBridge = toolApprovals.createToolApprovalBridge({
@@ -1274,9 +1268,6 @@ const calibrationCancelBridge = require('./rust-calibration-cancel-bridge.cjs').
   secret: FRONT_SECRET, json, readJson, calibration: () => modelManager.calibration,
 });
 // #2281: the Rust front owns the picker response; only raw live discovery/prefill facts stay here.
-const autotuneCancelBridge = require('./rust-autotune-cancel-bridge.cjs').createAutotuneCancelBridge({
-  secret: FRONT_SECRET, json, readJson, autotune: () => modelManager.autotune,
-});
 const toolboxPickerFacts = require('./rust-toolbox-picker-facts.cjs').createToolboxPickerFacts({
   secret: FRONT_SECRET, discoverMcpTools: async () => { await readyFeatures(); await discoverMcpTools(); }, allToolboxes, connectorBoxes: CONNECTOR_BOXES, json, readJson,
   prefill: { targetMs: TOOL_PREFILL_TARGET_MS, stats: () => prefill.stats() },
@@ -1317,13 +1308,11 @@ async function handleRequestInner(req, res) {
   if (embeddingOwner.handle(req, res, json)) return;
   if (require('./rust-preset-read.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   if (await presetReadBridge(req, res)) return;
-  if (await autotuneReadBridge(req, res)) return;
   if (require('./rust-autotune-resume.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
-  if (await autotuneResumeBridge(req, res)) return;
   if (require('./rust-autotune-clear.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
-  if (await autotuneClearBridge(req, res)) return;
   if (require('./rust-autotune-untuned.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   if (await autotuneUntunedFacts(req, res)) return;
+  if (await autotuneActorBridge(req, res)) return;
   if (await toolApprovalBridge(req, res)) return;
   // The Rust front's maintenance lease on this process's gate (#2210): before everything, and only the front's.
   if (await maintenanceLeases.handle(req, res)) return;
@@ -1352,7 +1341,6 @@ async function handleRequestInner(req, res) {
   if (require('./rust-models.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   if (require('./rust-model-state-reads.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   if (require('./rust-autotune-settings.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
-  if (await autotuneSettingsBridge(req, res)) return;
   // And a project source's stored text and originals (#2191): GET sources/text, documents/original, uploads/original.
   if (require('./rust-project-reads.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   // And a project's create and delete (#2191 round 2): POST /api/projects, DELETE /api/projects/{id}.
@@ -1408,7 +1396,6 @@ async function handleRequestInner(req, res) {
   if (require('./rust-model-manager-scan.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   if (await modelManagerScanCache(req, res)) return;
   if (require('./rust-autotune-cancel.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
-  if (await autotuneCancelBridge(req, res)) return;
   if (require('./rust-calibration-cancel.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   if (await calibrationCancelBridge(req, res)) return;
   if (await toolboxPickerFacts(req, res)) return;
@@ -1671,7 +1658,13 @@ if (require.main === module) {
     discoverMcpTools().catch(() => undefined);
     // #2303: a calibration interrupted by a restart is the Rust front's to recover (it owns the job and
     // its state file); recovering it here too would interrupt a job the front is still running.
-    modelManager.autotune?.recover().catch(() => undefined);
+    // Auto-tune's state is the Rust front's: bind to it (retrying until it answers), then finish what
+    // a restart interrupted. Without a tuner the front is told so, and answers "unavailable".
+    require('./rust-autotune-actor-bridge.cjs').attachWhenReady({
+      actor: modelManager.autotune,
+      unavailableClient: require('./autotune-state-client.cjs').createAutotuneStateClient({
+        call: PROJECT_STORE.autotuneState, base: path.basename(AUTOTUNE_STATE_PATH), available: false }),
+    }).catch(() => undefined);
     // A GGUF that appears in the models folder becomes usable without anyone opening a page.
     folderSync?.start();
   });
