@@ -2341,7 +2341,11 @@ function toolboxesPermitted(input) {
 // a refusal or bad reply throws a DavParseError, which llamacpp-presets.cjs answers by refusing.
 // Sized for the worst case of a read (#2387): a models.ini inside the 1 MiB editor limit is up to 6 MiB as
 // JSON (a NUL is \u0000), and the model or section name read from it, bounded by nothing but the file,
-// is up to 6 MiB more, plus the envelope. The limit itself is the parser's alone.
+// is up to 6 MiB more, plus the envelope. Facts replaces provably absent longer names before
+// encoding. The extra byte is the op, outside the 12 MiB + 64 KiB JSON budget.
+// Near that bound, transport buffers alone can occupy about 60 MiB: up to 24 MiB for the JS
+// JSON string, 12 MiB encoded bytes, 12 MiB op-prefixed bytes, and 12 MiB in wasm. This excludes
+// the original strings, parser allocations, reply and retained wasm memory; it is not a process peak.
 const MAX_LLAMACPP_PRESETS_BYTES = 12 * 1024 * 1024 + 64 * 1024 + 1;
 const presetsCall = (op, args) => jsonOpCall(op, args, MAX_LLAMACPP_PRESETS_BYTES, (e) => e.llamacpp_presets(), 'llamacpp presets').reply;
 const stringPairs = (pairs, nullable) => Array.isArray(pairs) && pairs.every((p) => Array.isArray(p) && p.length === 2 && typeof p[0] === 'string'
@@ -2410,7 +2414,10 @@ function llamacppPresetsParse(text) {
  */
 function llamacppPresetsFacts(text, model) {
   presetsInput(typeof text === 'string' && typeof model === 'string', 'facts');
-  const r = presetsCall(6, [text, model]);
+  // A section name is a substring of the decoded file. Longer names are absent; never encode
+  // their unbounded contents. A newline cannot occur in a section name. Still ask the native
+  // reader for the file revision, defaults, fields and faults (including duplicate/oversized).
+  const r = presetsCall(6, [text, model.length > text.length ? '\n' : model]);
   if (exactKeys(r, ['fault']) && PRESET_FAULTS.has(r.fault)) return r;
   if (!exactKeys(r, ['revision', 'exists', 'options', 'defaults', 'fields']) || !isHex64(r.revision) || typeof r.exists !== 'boolean'
     || !Array.isArray(r.fields) || r.fields.length === 0 || !r.fields.every((f) => typeof f === 'string')

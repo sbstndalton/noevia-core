@@ -157,8 +157,7 @@ test('worst-case escaped files at the 1 MiB boundary read as the old Node parser
   assert.ok(JSON.stringify('\u0000'.repeat(MIB)).length > 6 * MIB, 'the case really is the worst case on the wire');
 });
 
-// A read's model or section name is bounded by nothing but the file: the old parser answers a name of
-// any length, so the transport must carry the widest file AND the widest name at once.
+// Present names fit in the file. Absent names are unbounded, so Core must avoid encoding them.
 test('a long section name read by that name agrees with the old Node parser', (t) => {
   const MIB = 1024 * 1024;
   const { file } = fixture(t, '');
@@ -180,6 +179,25 @@ test('a long section name read by that name agrees with the old Node parser', (t
   const facts = ours.get(cases['the review case: a 650,000-NUL section name (a 7.8 MB request)'][1]);
   assert.deepEqual([facts.exists, facts.options], [true, { 'ctx-size': '4096' }]);
   assert.ok(JSON.stringify(['\u0000'.repeat(MIB - 16), '\u0000'.repeat(MIB - 16)]).length > 12 * MIB - 1024, 'the case really is the worst case on the wire');
+});
+
+test('unbounded absent names preserve the frozen parser answer before encoding', (t) => {
+  const { file } = fixture(t, '');
+  const ours = runtime.createPresetStore(file, { cacheRam: LIMITS });
+  const theirs = reference.createPresetStore(file, { cacheRam: LIMITS });
+  const outcome = (fn) => { try { return { value: JSON.stringify(fn()) }; } catch (e) { return { status: e.status, message: e.message }; } };
+  const defaults = '[*]\nc=8192\n[m]\nparallel=2\n';
+  for (const [label, text, model] of [
+    ['empty file, review name', '', '\0'.repeat(2110000)],
+    ['short file, longer name with defaults', defaults, '\0'.repeat(2110000)],
+    ['name exactly as long as file', defaults, '\0'.repeat(defaults.length)],
+    ['UTF-16 lengths with astral characters', '[😀]\nc=1\n', '😀'.repeat(8)],
+    ['duplicate fault survives shortcut', '[m]\n[m]\n', '\0'.repeat(2110000)],
+    ['oversized fault survives shortcut', 'x'.repeat(1024 * 1024 + 1), '\0'.repeat(2110000)],
+  ]) {
+    fs.writeFileSync(file, text);
+    assert.deepEqual(outcome(() => ours.get(model)), outcome(() => theirs.get(model)), label);
+  }
 });
 
 test('a native fault is an unavailable parser, never a silent JS parse', (t) => {
