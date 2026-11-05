@@ -9,6 +9,6 @@
 # Read by server/dav-parse-wasm.cjs, noevia-core CI and noevia's build/web.Dockerfile. The ref must
 # be on noevia-rs main before a release pins this core commit (noevia CI checks it).
 NOEVIA_RS_REF=5c1057b40de4244df2f8b672fb59114a1fc752fc
-NOEVIA_RS_SHA256=4fe259e77f4621d193c71e2c9fe13aa4a495c5cea7fe60d770a23e8b2bc2b324
+NOEVIA_RS_SHA256=54f25c6b222543fda0ecd86cd212cc86c067b0aefcccd87feb6f38606ad8abef
 DAV_PARSE_WASM_SHA256=1e3d85457e90da706926ea6a6a8a5b42bab59b985352b402b346c08bff84bac5
 # #2295: shared untuned scan/signature source, verified GitHub archive and deterministic binary.
