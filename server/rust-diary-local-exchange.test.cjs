@@ -37,7 +37,9 @@ test('nothing else is refused here: siblings, look-alikes, an unparseable target
 });
 
 test('Node\'s own exchange handler is gone; the stream relay stays for chat\'s Diary turns', () => {
-  const routes = fs.readFileSync(path.join(__dirname, 'routes', 'diary.cjs'), 'utf8');
+  // Joined with the Diary proxy move, routes/diary.cjs is retired: no Diary route is left in this process.
+  const file = path.join(__dirname, 'routes', 'diary.cjs');
+  const routes = fs.existsSync(file) ? fs.readFileSync(file, 'utf8') : '';
   for (const gone of ["'/api/diary/local-exchange'", 'rateLimited', 'proxyDiaryStream', '16 * 1024 * 1024']) assert.equal(routes.includes(gone), false, gone);
   assert.equal(typeof require('./diary-stream.cjs').proxyDiaryStream, 'function');
 });

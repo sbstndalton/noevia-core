@@ -143,6 +143,15 @@ function createClient({ port, token, fetchImpl = globalThis.fetch, timeoutMs = T
       if(status!==200 || body?.ok!==true) throw Object.assign(Error('Model scan cache is unavailable.'),{status:503});
     },
     featureContext,
+    async autoRolesReady() {
+      const { status, body } = await call('auto-roles/proof', {});
+      if (status !== 200 || body?.capability !== 'rust-auto-roles-write') throw new Error('Native auto-roles write pairing is required');
+    },
+    async clearAutoRoles(user, name) {
+      const { status, body } = await call('auto-roles/clear', { user, name }, RESEAL_WAIT_MS);
+      if (status !== 200 || !Array.isArray(body?.cleared)) throw failure(status, body);
+      return body.cleared;
+    },
     presetBaseline,
     async modelBudget(value) {
       const {status,body}=await call('model-facts/budget',value);

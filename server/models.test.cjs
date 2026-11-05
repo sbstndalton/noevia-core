@@ -131,9 +131,9 @@ test('a disabled or unreachable manager reads as null from servedCatalogue and t
 test('roles are saved with vision and code optional, and the warm-up loads only what is not loaded', async () => {
   const f = fixture({ models: [{ id: 'fast' }, { id: 'smart' }, { id: 'broken' }], loaded: ['fast'] });
   assert.equal(f.service.autoRoles(), null);
-  f.service.setAutoRoles({ fast: 'fast', smart: 'smart', vision: '', code: 'broken' });
-  assert.deepEqual(f.service.autoRoles(), { fast: 'fast', smart: 'smart', code: 'broken' });
-  assert.equal(f.workspace.saves, 1);
+  f.workspace.autoRoles = ({ fast: 'fast', smart: 'smart', vision: '', code: 'broken' });
+  assert.deepEqual(f.service.autoRoles(), { fast: 'fast', smart: 'smart', vision: '', code: 'broken' });
+  assert.equal(f.workspace.saves, 0);
   const warned = [];
   const original = console.warn; console.warn = (...args) => warned.push(args.join(' '));
   try {
@@ -148,12 +148,12 @@ test('roles are saved with vision and code optional, and the warm-up loads only 
 
 test('#1816 the warm-up skips Creative unless it is also the Fast or Smart model', async () => {
   const f = fixture({ models: [{ id: 'fast' }, { id: 'smart' }, { id: 'poet' }], loaded: [] });
-  f.service.setAutoRoles({ fast: 'fast', smart: 'smart', creative: 'poet' });
+  f.workspace.autoRoles = ({ fast: 'fast', smart: 'smart', creative: 'poet' });
   f.service.ensureRolesLoaded();
   await new Promise((r) => setTimeout(r, 20));
   assert.deepEqual(f.calls.filter((c) => c[0] === 'load'), [['load', 'fast'], ['load', 'smart']], 'a separate Creative model is not warmed');
   const g = fixture({ models: [{ id: 'fast' }, { id: 'smart' }], loaded: ['smart'] });
-  g.service.setAutoRoles({ fast: 'fast', smart: 'smart', creative: 'smart' });
+  g.workspace.autoRoles = ({ fast: 'fast', smart: 'smart', creative: 'smart' });
   g.service.ensureRolesLoaded();
   await new Promise((r) => setTimeout(r, 20));
   assert.deepEqual(g.calls.filter((c) => c[0] === 'load'), [['load', 'fast']], 'a shared Creative model adds no extra load');
@@ -161,7 +161,7 @@ test('#1816 the warm-up skips Creative unless it is also the Fast or Smart model
 
 test('with native routing the warm-up is a no-op', async () => {
   const f = fixture({ routing: true, models: [{ id: 'smart' }] });
-  f.service.setAutoRoles({ fast: 'smart', smart: 'smart' });
+  f.workspace.autoRoles = ({ fast: 'smart', smart: 'smart' });
   f.service.ensureRolesLoaded();
   await new Promise((r) => setTimeout(r, 10));
   assert.deepEqual(f.calls.filter((c) => c[0] === 'load'), []);
@@ -179,40 +179,12 @@ test('the manager call carries the token and the folder scan is cached once', as
   assert.equal(f.service.publishModelScan, undefined, 'Node cannot publish cache entries');
 });
 
-test('clearRoleReferences drops the optional roles and falls the required ones back to each other', () => {
-  const f = fixture();
-  assert.deepEqual(f.service.clearRoleReferences('m'), [], 'no roles configured yet: nothing to clear');
-
-  f.service.setAutoRoles({ fast: 'm', smart: 'keep', vision: 'm', code: 'keep-code' });
-  assert.deepEqual(f.service.clearRoleReferences('m'), ['fast', 'vision']);
-  assert.deepEqual(f.service.autoRoles(), { fast: 'keep', smart: 'keep', code: 'keep-code' });
-
-  assert.deepEqual(f.service.clearRoleReferences('nope'), [], 'a model no role points at clears nothing and does not resave');
-});
-
-test('when both required roles would end up empty, the whole config is unset rather than saved as fast:\'\' smart:\'\'', () => {
-  const f = fixture();
-  f.service.setAutoRoles({ fast: 'm', smart: 'm' });
-  const savesBefore = f.workspace.saves;
-  assert.deepEqual(f.service.clearRoleReferences('m'), ['fast', 'smart'], 'both required roles pointed at the deleted model, with no candidate left');
-  assert.equal(f.service.autoRoles(), null, 'unset (null), not { fast: "", smart: "" } — chat.cjs reads this as "not configured yet"');
-  assert.equal(f.workspace.saves, savesBefore + 1);
-});
-
-test('clearRoleReferences fixes every workspace it can see, not just the current one, and reports only the current workspace\'s cleared roles', () => {
-  const other1 = makeWorkspace({ fast: 'm', smart: 'other-smart' });
-  const other2 = makeWorkspace({ fast: 'untouched', smart: 'also-untouched', vision: 'm' });
-  const f = fixture({ otherWorkspaces: [other1, other2] });
-  f.service.setAutoRoles({ fast: 'keep-fast', smart: 'm' });
-
-  const cleared = f.service.clearRoleReferences('m');
-
-  assert.deepEqual(cleared, ['smart'], 'the return value only describes the current (requesting) workspace');
-  assert.deepEqual(f.service.autoRoles(), { fast: 'keep-fast', smart: 'keep-fast' }, 'current workspace: smart falls back to fast');
-  assert.deepEqual(other1.autoRoles, { fast: 'other-smart', smart: 'other-smart' }, 'other workspace 1 is fixed silently: fast falls back to smart');
-  assert.equal(other1.saves, 1);
-  assert.deepEqual(other2.autoRoles, { fast: 'untouched', smart: 'also-untouched' }, 'other workspace 2: the optional vision role referencing it is dropped');
-  assert.equal(other2.saves, 1);
+test('deletion cleanup is awaited through the native writer and never persists a workspace snapshot', async () => {
+  const seen = []; const ws = {userId:'synthetic-user', autoRoles:{fast:'a',smart:'b'}};
+  const service = createModelService({modelManager:{},currentWorkspace:()=>ws,autoRolesWriter:async (user,name)=>{seen.push([user,name]);return ['fast'];}});
+  assert.deepEqual(await service.clearRoleReferences('a'), ['fast']);
+  assert.deepEqual(seen, [['synthetic-user','a']]);
+  assert.deepEqual(ws.autoRoles, {fast:'a',smart:'b'});
 });
 
 test('clearLastLoadedModel only clears when the name still matches (a load in between is left alone)', async () => {

@@ -1,11 +1,10 @@
 'use strict';
 // Chat framing, phase 1 (#737):
-//   POST /api/chat-framing/suggest        { message, chatId? } -> { frame|null, reason }  signed-in user
-//        rate limited per user (#760): over the budget, 429 { frame:null, reason:'rate-limited' }
+//   POST /api/chat-framing/suggest is the Rust front's (chat port S4): rust-chat-framing-suggest.cjs refuses
+//        it before authentication and serves the front's loopback call for the user's lists and the decision
+//        service. The other methods still get this mount's signed-in 405 (a cheap authenticated probe).
 //   GET/PUT /api/chat-framing/preferences is permanently Rust-owned; Node refuses (#1071).
 //   GET/PUT /api/admin/framing-settings   { framingRouterModel, framingReasonerModel }    admin
-// The suggestion is read-only: nothing is saved and nothing reaches the prompt. Only the signed-in
-// user's own projects and chats (the request-scoped workspace) are offered as options.
 // Returns true when it handled the request. Auth and CSRF run before routes are mounted.
 
 const PREFERENCES_PATH = '/api/chat-framing/preferences';
@@ -21,25 +20,15 @@ function refuseOwnedPreferences(req, res, { parseRequestUrl, json }) {
 
 /**
  * @param {object} deps
- * @param {{ suggest: Function }} deps.framing
  * @param {{ get: Function, save: Function }} deps.settings
- * @param {() => { projects: object[], chats: object[] }} deps.workspace  the current user's own lists
- * @param {(userId:string) => boolean} [deps.rateLimited]  true when this user is over the suggest budget (#760)
  */
-function createChatFramingRoutes({ json, readJson, framing, settings, workspace, rateLimited = () => false }) {
+function createChatFramingRoutes({ json, readJson, settings }) {
   return async function chatFramingRoutes(req, res, { path, authn }) {
     if (path === '/api/chat-framing/suggest') {
       if (!authn) return json(res, 401, { error: 'Sign in required' }), true;
-      if (req.method !== 'POST') return json(res, 405, { error: 'method not allowed' }), true;
-      if (rateLimited(authn.user.id)) return json(res, 429, { frame: null, reason: 'rate-limited' }), true;
-      let body;
-      try { body = await readJson(req); } catch { return json(res, 400, { error: 'Invalid request' }), true; }
-      if (typeof body?.message !== 'string') return json(res, 400, { error: 'message required' }), true;
-      let lists;
-      try { lists = workspace(); } catch { return json(res, 200, { frame: null, reason: 'error' }), true; }
-      const result = await framing.suggest({ message: body.message.slice(0, 4000), chatId: typeof body.chatId === 'string' ? body.chatId : null,
-        projects: lists.projects, chats: lists.chats });
-      return json(res, 200, result), true;
+      // The POST never gets here (refused before authentication); kept closed should the order change.
+      if (req.method === 'POST') return json(res, 503, require('../rust-chat-framing-suggest.cjs').ROUTE_REFUSAL), true;
+      return json(res, 405, { error: 'method not allowed' }), true;
     }
     // Permanent native ownership, including unsupported-method replies. No body,
     // workspace or old writer is reached when the front was bypassed.
