@@ -56,10 +56,10 @@ function createEmbeddingRoutes({ json, readJson, migration, authService, fetchJs
   async function projects(action, body) {
     try {
       if (action === 'set-next') return await migration.setNext(body.target);
-      if (action === 'clear-next') return migration.clearNext();
+      if (action === 'clear-next') return await migration.clearNext();
       if (action === 'switch') return await migration.switchToNext({ force: body.force === true });
-      if (action === 'rollback') return migration.rollback();
-      return migration.finish();
+      if (action === 'rollback') return await migration.rollback();
+      return await migration.finish();
     } catch (err) {
       return { error: String(err?.message || err).slice(0, 300), status: err?.status || 500, ...(err?.code ? { code: err.code } : {}), ...(err?.coverage ? { coverage: err.coverage } : {}), ...(err?.parity ? { parity: err.parity } : {}), ...(err?.served ? { served: err.served } : {}) };
     }

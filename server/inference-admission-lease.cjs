@@ -95,6 +95,13 @@ function createAdmission({ modelManager, admitEngineModel, chatMachines = null, 
       return holdExchange(ask.diaryExchange.user, signal);
     }
     if (!text(ask?.model)) throw refusal(400, 'A model is required.');
+    if (ask.embedding !== undefined) {
+      if (ask.embedding !== true || Object.keys(ask).some(k => !['embedding', 'model'].includes(k))) throw refusal(400, 'Invalid embedding lease.');
+      signal?.throwIfAborted();
+      const leave = modelManager.enterInference?.() || (() => {});
+      let released = false;
+      return Promise.resolve({ headers: null, release() { if (!released) { released = true; leave(); } } });
+    }
     if (ask.role === undefined && ask.machine === undefined) return holdEngine(ask.model, signal);
     if (ask.role !== 'smart' || !text(ask.machine)) throw refusal(400, 'Only the Smart role runs research.');
     return holdMachine(ask);
