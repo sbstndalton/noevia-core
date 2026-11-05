@@ -313,8 +313,8 @@ function createClient({ port, token, fetchImpl = globalThis.fetch, timeoutMs = T
      *  rediscovers now; `generation` is the one this process holds, answered `{ unchanged: true }` while
      *  it is current. Throws the store's failure (503 while discovery cannot answer): a caller offers
      *  no tools then, never the last list. */
-    async mcpDiscovery({ force = false, generation = null } = {}) {
-      const { status, body } = await call('mcp/discovery', { ...(force ? { force: true } : {}), ...(Number.isSafeInteger(generation) ? { generation } : {}) }, MCP_DISCOVERY_WAIT_MS);
+    async mcpDiscovery({ force = false, generation = null, incarnation = null } = {}) {
+      const { status, body } = await call('mcp/discovery', { ...(typeof incarnation === 'string' ? { incarnation } : {}), ...(force ? { force: true } : {}), ...(Number.isSafeInteger(generation) ? { generation } : {}) }, MCP_DISCOVERY_WAIT_MS);
       if (status === 200 && body && (body.unchanged === true || (body.version === 1 && Array.isArray(body.servers) && Array.isArray(body.offers) && Array.isArray(body.boxes)))) return body;
       throw failure(status, body);
     },

@@ -19,8 +19,9 @@ const isTool = (t, name) => isObject(t) && t.type === 'function' && isObject(t.f
 function validate(snap) {
   const bad = (why) => { throw Object.assign(new Error(`MCP discovery answered something unexpected (${why}).`), { status: 502, code: 'MCP_DISCOVERY_SHAPE' }); };
   if (!isObject(snap)) bad('not an object');
+  if (typeof snap.incarnation !== 'string' || !snap.incarnation || snap.incarnation.length > 128) bad('incarnation');
   if (snap.unchanged === true) {
-    if (!Number.isSafeInteger(snap.generation)) bad('generation');
+    if (!Number.isSafeInteger(snap.generation) || snap.generation < 0) bad('generation');
     return snap;
   }
   if (snap.version !== 1 || !Number.isSafeInteger(snap.generation) || snap.generation < 0) bad('version or generation');
@@ -53,8 +54,8 @@ function validate(snap) {
 function createNativeDiscovery({ broker }) {
   if (!broker || typeof broker.mcpDiscovery !== 'function') throw new TypeError('the Rust front\'s MCP discovery is required');
   return Object.freeze({
-    async discover({ force = false, generation = null } = {}) {
-      return validate(await broker.mcpDiscovery({ force: !!force, generation }));
+    async discover({ force = false, generation = null, incarnation = null } = {}) {
+      return validate(await broker.mcpDiscovery({ force: !!force, generation, incarnation }));
     },
   });
 }

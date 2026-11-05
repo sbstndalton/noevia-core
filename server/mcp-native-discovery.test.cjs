@@ -9,7 +9,7 @@ const { createNativeDiscovery, validate } = require('./mcp-native-discovery.cjs'
 
 const fn = (name) => ({ type: 'function', function: { name, description: `${name} thing`, parameters: { type: 'object', properties: {}, required: [] } } });
 const snap = (generation, over = {}) => ({
-  version: 1, generation, enabled: true, error: null, discoveredAt: 1000, failedAt: 0, remoteFailStreak: 0,
+  version: 1, incarnation: "front-a", generation, enabled: true, error: null, discoveredAt: 1000, failedAt: 0, remoteFailStreak: 0,
   servers: [{ id: 'a', url: 'http://a/mcp', auth: 'none', error: null, discoveredAt: 1000, toolCount: 2 }, { id: 'b', url: 'http://b/mcp', auth: 'none', error: 'fetch failed', discoveredAt: 1000, toolCount: 0 }],
   offers: [{ name: 'one', server: 'a', readOnly: true, tool: fn('one') }, { name: 'dup', server: 'a', readOnly: null, tool: fn('dup') }, { name: 'dup', server: 'b', readOnly: false, tool: fn('dup') }],
   boxes: [{ id: 'box', server: 'a', label: 'Box', description: 'd', source: 'mcp', inApp: true, tools: [fn('one')], reads: ['one'] }],
@@ -43,7 +43,7 @@ test('the snapshot becomes mcpState: first server wins a name, every offer is ke
 });
 
 test('the held generation is sent, and "unchanged" keeps the state', async () => {
-  const { wiring, asked } = build([snap(3), { unchanged: true, generation: 3 }]);
+  const { wiring, asked } = build([snap(3), { unchanged: true, incarnation: "front-a", generation: 3 }]);
   await wiring.discoverMcpTools();
   const state = await wiring.discoverMcpTools();
   assert.deepEqual(asked.map((a) => [a.force, a.generation]), [[false, null], [false, 3]]);
@@ -108,4 +108,45 @@ test('refreshSoon asks at most once at a time and not again within the pause', a
   await new Promise((r) => setImmediate(r));
   wiring.refreshSoon();
   assert.equal(asked.length, 1, 'inside the pause');
+});
+
+const deferred = () => { let resolve; const promise = new Promise(r => { resolve = r; }); return { promise, resolve }; };
+test('late success after a newer failure cannot resurrect tools or reset the high-water mark', async () => {
+  const late = deferred();
+  const { wiring } = build([snap(5), () => late.promise, new Error('down'), snap(4)]);
+  await wiring.discoverMcpTools();
+  const pending = wiring.discoverMcpTools();
+  await wiring.discoverMcpTools();
+  late.resolve(snap(4)); await pending;
+  assert.equal(wiring.state.tools.size, 0);
+  await wiring.discoverMcpTools();
+  assert.equal(wiring.state.tools.size, 0);
+});
+test('a front restart accepts generation zero and fences an old incarnation reply', async () => {
+  const late = deferred();
+  const { wiring } = build([snap(5), () => late.promise, snap(0, { incarnation: 'front-b' })]);
+  await wiring.discoverMcpTools(); const pending = wiring.discoverMcpTools();
+  await wiring.discoverMcpTools();
+  assert.equal(wiring.state.generation, 0);
+  late.resolve(snap(9)); await pending;
+  assert.equal(wiring.state.incarnation, 'front-b');
+  assert.equal(wiring.state.generation, 0);
+});
+for (const generation of [-1, 4, 6]) test(`unchanged generation ${generation} fails closed`, async () => {
+  const { wiring } = build([snap(5), { unchanged: true, incarnation: 'front-a', generation }]);
+  await wiring.discoverMcpTools(); await wiring.discoverMcpTools();
+  assert.equal(wiring.state.tools.size, 0);
+});
+test('unchanged after concurrent invalidation cannot retain or resurrect state', async () => {
+  const late = deferred();
+  const { wiring } = build([snap(5), () => late.promise, new Error('down')]);
+  await wiring.discoverMcpTools(); const pending = wiring.discoverMcpTools();
+  await wiring.discoverMcpTools();
+  late.resolve({ unchanged: true, incarnation: 'front-a', generation: 5 }); await pending;
+  assert.equal(wiring.state.tools.size, 0);
+});
+test('unchanged for a different incarnation fails closed', async () => {
+  const { wiring } = build([snap(5), { unchanged: true, incarnation: 'front-b', generation: 5 }]);
+  await wiring.discoverMcpTools(); await wiring.discoverMcpTools();
+  assert.equal(wiring.state.tools.size, 0);
 });

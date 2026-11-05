@@ -289,8 +289,12 @@ function createMcpWiring({
     error: null,
     /** The front's generation this state is of (never goes backwards), or null while it holds none. */
     generation: null,
+    incarnation: null,
   };
   let applying = Promise.resolve();
+  let requestEpoch = 0;
+  let highWater = -1;
+  let frontIncarnation = null;
   let askedAt = 0;
   let refreshing = null;
   /** A look at the toolboxes asks the front whether discovery moved, in the background and at most every few
@@ -309,23 +313,40 @@ function createMcpWiring({
     // The server list the executor works from follows the directory table; a changed table is
     // rediscovered now.
     if (refreshDirectory(true)) force = true;
+    const epoch = ++requestEpoch;
     const held = mcpState.generation;
+    const incarnation = mcpState.incarnation;
     let snap;
     try {
-      snap = await discovery.discover({ force, generation: held });
-    } catch (err) {
-      // Fail closed: no tool may be called on the strength of a list the front no longer stands behind.
-      applying = applying.then(() => { clearState('MCP tool discovery is unavailable right now.'); mcpState.generation = null; });
+      snap = await discovery.discover({ force, generation: held, incarnation });
+    } catch {
+      applying = applying.then(() => {
+        if (epoch !== requestEpoch) return;
+        clearState('MCP tool discovery is unavailable right now.');
+        mcpState.generation = null;
+        mcpState.incarnation = null;
+      });
       await applying;
-      logger.warn(`[mcp] discovery unavailable: ${String((err && err.message) || err).slice(0, 200)}`);
+      logger.warn('[mcp] discovery unavailable');
       return mcpState;
     }
     applying = applying.then(() => {
-      if (snap.unchanged === true) return;
-      if (mcpState.generation !== null && snap.generation < mcpState.generation) return;
-      if (!MCP_ENABLED && snap.enabled) return; // this process has not seen the table the front has: the next call will
+      if (epoch !== requestEpoch) return;
+      if (snap.unchanged === true) {
+        if (held !== null && snap.generation === held && snap.incarnation === incarnation
+            && mcpState.generation === held && mcpState.incarnation === incarnation) return;
+        clearState('MCP tool discovery is unavailable right now.');
+        mcpState.generation = null; mcpState.incarnation = null;
+        return;
+      }
+      if (snap.incarnation === frontIncarnation && snap.generation < highWater) return;
+      if (!MCP_ENABLED && snap.enabled) return;
+      if (snap.incarnation !== frontIncarnation) highWater = -1;
+      frontIncarnation = snap.incarnation;
+      highWater = Math.max(highWater, snap.generation);
       applySnapshot(snap);
       mcpState.generation = snap.generation;
+      mcpState.incarnation = snap.incarnation;
     });
     await applying;
     return mcpState;
