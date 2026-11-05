@@ -23,6 +23,10 @@ function fixture({ enabled = true, routing = false, models = [], loaded = [], en
   };
   const service = createModelService({
     fetchJson: fetchJson || (async (url, init) => { calls.push(['fetch', url, init]); return { ok: true, status: 200, body: { unregistered: ['x'] } }; }),
+    scanAuthority: {scanRead: async () => {
+      const response = await (fetchJson || (async (url,init) => { calls.push(['fetch',url,init]); return {ok:true,body:{unregistered:['x']}}; }))(`${env.MODEL_LOADER_URL}/api/v1/models`, {method:'GET'});
+      return response?.ok ? response.body : null;
+    }, scanInvalidate: async () => {}},
     env, modelManager, currentWorkspace: () => workspace,
     listWorkspaces: () => [workspace, ...otherWorkspaces],
   });
@@ -171,14 +175,8 @@ test('the manager call carries the token and the folder scan is cached once', as
   assert.equal(f.calls[0][2].headers['X-Model-Loader-Token'], 't0k');
   await f.service.managerFetch('sections/a/safe-defaults', 'POST');
   assert.equal(f.calls[1][2].body, '{}');
-  f.service.refreshModelScan();
-  f.service.refreshModelScan();
-  await new Promise((r) => setImmediate(r));
-  assert.equal(f.calls.filter((c) => c[0] === 'fetch').length, 3, 'a scan already in flight is not repeated');
-  assert.deepEqual(f.service.modelScanCache.get('models').body, { unregistered: ['x'] });
-  const unset = fixture({ env: {} });
-  unset.service.refreshModelScan();
-  assert.equal(unset.calls.length, 0, 'no service URL: nothing to scan');
+  assert.equal(f.service.refreshModelScan, undefined, 'Node does not run cache refreshes');
+  assert.equal(f.service.publishModelScan, undefined, 'Node cannot publish cache entries');
 });
 
 test('clearRoleReferences drops the optional roles and falls the required ones back to each other', () => {
@@ -272,40 +270,7 @@ test('#545: an unreadable or empty folder scan never marks presets missing', asy
   assert.equal((await noLoader.service.modelsInstalled())[0].missingFile, false);
 });
 
-test('#796: a scan that resolves after clear() cannot bring a deleted model back', async () => {
-  let release;
-  const pending = new Promise((resolve) => { release = resolve; });
-  const f = fixture({ env: { MODEL_LOADER_URL: 'http://loader:9000' }, fetchJson: async () => { await pending; return { ok: true, status: 200, body: { models: [{ key: 'deleted.gguf' }] } }; } });
-  f.service.refreshModelScan(); // requested before the delete
-  f.service.modelScanCache.clear(); // the delete route clears the cache
-  release();
-  await new Promise((r) => setImmediate(r));
-  await new Promise((r) => setImmediate(r));
-  assert.equal(f.service.modelScanCache.get('models'), undefined, 'the pre-delete scan is discarded');
-  // A scan requested after the clear is kept, and a proxied GET that straddles a clear is not.
-  const g = f.service.modelScanCache.generation();
-  f.service.modelScanCache.set('models', { body: 'fresh' }, g);
-  assert.equal(f.service.modelScanCache.get('models').body, 'fresh');
-  f.service.modelScanCache.clear();
-  f.service.modelScanCache.set('models', { body: 'stale' }, g);
-  assert.equal(f.service.modelScanCache.get('models'), undefined);
-  f.service.modelScanCache.set('models', { body: 'direct' });
-  assert.equal(f.service.modelScanCache.get('models').body, 'direct');
-});
-
-test('#796 F2: a folder scan read before a delete cannot be written back after it', async () => {
-  let release, reached;
-  const inFlight = new Promise((resolve) => { reached = resolve; });
-  const gate = new Promise((resolve) => { release = resolve; });
-  const f = fixture({ env: { MODEL_LOADER_URL: 'http://loader:9000' }, models: [{ id: 'm', source: 'preset', size: 1 }],
-    fetchJson: async () => { reached(); await gate; return { ok: true, status: 200, body: { models: [{ key: 'deleted.gguf', modelId: 'm' }] } }; } });
-  const scan = f.service.modelsInstalled(); // reads the folder scan for preset rows
-  await inFlight; // the scan request is out
-  f.service.modelScanCache.clear(); // the delete route clears the cache while the scan is in flight
-  release();
-  await scan;
-  assert.equal(f.service.modelScanCache.get('models'), undefined, 'the pre-delete list is not cached');
-});
+// Generation-fence regression cases moved to native model_manager_scan.rs.
 
 test('#1084: size and shape come from the loader scan, joined by section or model id, with the router size as fallback', async () => {
   const shape = { arch: 'gemma4', moe: false, experts: 0, active: 0, label: 'dense' };

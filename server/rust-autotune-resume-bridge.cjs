@@ -23,7 +23,7 @@ function createAutotuneResumeBridge({ secret, json, readJson, autotune, invalida
       const answer = !live ? { available: false } : action === 'facts' ? { available: true, ...live.resumeFacts() }
         : action === 'prepare' ? await live.prepareResume(ask.token, { stage: ask.stage, selectors: ask.selectors }, controller.signal)
         : live.compareAndResume(ask.token, ask.plan);
-      if (action === 'commit' && answer.applied === true) invalidate();
+      if (action === 'commit' && answer.applied === true) await invalidate();
       if (Buffer.byteLength(JSON.stringify(answer)) > MAX_BYTES) throw Error('facts over cap');
       json(res, answer.applied === false ? 409 : 200, answer);
     } catch {

@@ -1111,9 +1111,6 @@ const providerRoutes = require('./routes/providers.cjs').createProviderRoutes({
 const modelAssignmentsFacts = require('./rust-model-assignments-facts.cjs').createModelAssignmentsFacts({
   secret: FRONT_SECRET, json, readJson, env: process.env, modelsInstalled: modelService.modelsInstalled, decisionSettings, rerankSettings,
 });
-const modelManagerScanCache = require('./rust-model-manager-scan-cache.cjs').createModelManagerScanCache({
-  secret: FRONT_SECRET, json, readJson, service: modelService,
-});
 const modelConfigBridge = require('./rust-model-config.cjs').createBridge({ secret: FRONT_SECRET, json, readJson, env: process.env, service: modelService });
 const modelRoutes = require('./routes/models.cjs').createModelRoutes({
   json, readBody, readJson, fetchJson, env: process.env, modelManager, currentWorkspace, service: modelService, inferenceBudget, idleUnload, decisionSettings, rerankSettings,
@@ -1398,7 +1395,6 @@ async function handleRequestInner(req, res) {
   if (require('./rust-calibration-routes.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   if (await calibrationRoutesBridge(req, res)) return;
   if (require('./rust-model-manager-scan.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
-  if (await modelManagerScanCache(req, res)) return;
   if (require('./rust-autotune-cancel.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   if (await autotuneCancelBridge(req, res)) return;
   if (require('./rust-calibration-cancel.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;

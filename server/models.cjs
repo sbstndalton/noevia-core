@@ -21,53 +21,24 @@ const MODEL_READ_TTL_MS = 2000;
 const { isSidecarModel, sidecarModelNames, isSystemModel, modelPathFromArgs } = require('./model-system.cjs');
 
 // #1840: `roleOnMachine(role)` is true for a chat role served by an Inference machine; it is never warmed here.
-function createModelService({ fetchJson, env, modelManager, currentWorkspace, listWorkspaces, roleOnMachine = () => false }) {
+function createModelService({ fetchJson, env, modelManager, currentWorkspace, listWorkspaces, roleOnMachine = () => false, scanAuthority = null }) {
   // One call to the model management service, with its token. Same path the proxy route uses.
   function managerFetch(rest, method = 'GET') {
     return fetchJson(`${env.MODEL_LOADER_URL.replace(/\/+$/, '')}/api/v1/${rest}`,
       { method, headers: { 'Content-Type': 'application/json', ...(env.MODEL_LOADER_TOKEN ? { 'X-Model-Loader-Token': env.MODEL_LOADER_TOKEN } : {}) }, ...(method === 'POST' ? { body: '{}' } : {}) }, 120000).catch(() => null);
   }
 
-  // Model files that appear in the models folder get safe defaults on their own (roadmap C3).
-  // Needs the model management service; the engine's own preset file is edited through it.
-  // Last model-folder scan, served instantly by the model-manager proxy (see there).
-  // Every clear() starts a new generation. A scan that was requested before a clear (a delete,
-  // a preset write...) and resolves after it describes files that may no longer exist, so its
-  // result is discarded instead of resurrecting a deleted model in the cached list (#796).
-  const modelScanCache = (() => {
-    const entries = new Map();
-    let generation = 0;
-    // #2304: opaque process-instance fences, not another scan cache or TTL owner.
-    const crypto = require('node:crypto'), epoch = crypto.randomBytes(32);
-    const sign = value => crypto.createHmac('sha256', epoch).update(JSON.stringify(value)).digest('hex');
-    const token = () => sign({generation});
-    const entryToken = () => sign({generation, hit:entries.get('models') || null});
-    return {
-      get: (key) => entries.get(key),
-      // `scanGeneration` is the generation read before the request was sent; omit it for a write
-      // that has no request in flight.
-      set(key, value, scanGeneration = generation) { if (scanGeneration === generation) entries.set(key, value); return this; },
-      clear() { generation++; entries.clear(); },
-      generation: () => generation,
-      snapshot: () => ({token:token(),entryToken:entryToken(),now:Date.now(),hit:entries.get('models') || null}),
-      publish(body, expected) {
-        if (expected !== token()) return {applied:false};
-        entries.set('models',{at:Date.now(),body});return {applied:true};
-      },
-      refresh(expected) {
-        if (expected !== entryToken()) return {applied:false};
-        refreshModelScan();return {applied:true};
-      },
-    };
-  })();
-  let modelScanInflight = null;
-  function refreshModelScan() {
-    if (modelScanInflight || !env.MODEL_LOADER_URL) return;
-    const generation = modelScanCache.generation();
-    modelScanInflight = fetchJson(`${env.MODEL_LOADER_URL.replace(/\/+$/, '')}/api/v1/models`, { method: 'GET', headers: { 'Content-Type': 'application/json', ...(env.MODEL_LOADER_TOKEN ? { 'X-Model-Loader-Token': env.MODEL_LOADER_TOKEN } : {}) } })
-      .then((r) => { if (r?.ok && r.body && typeof r.body === 'object') modelScanCache.set('models', { at: Date.now(), body: r.body }, generation); })
-      .catch(() => undefined).finally(() => { modelScanInflight = null; });
-  }
+  // Storage, refresh coalescing and generation fences belong to the native G1 authority.
+  // The compatibility facade holds no entries and never publishes scan results.
+  const nativeScan = () => {
+    const owner = scanAuthority || require('./rust-model-facts.cjs').current();
+    if (!owner) throw Object.assign(Error('Model scan cache is unavailable.'), {status:503});
+    return owner;
+  };
+  const modelScanCache = {
+    async get(key) { return key === 'models' ? {body: await nativeScan().scanRead()} : undefined; },
+    clear: () => nativeScan().scanInvalidate(),
+  };
 
   // ── Optional model manager ─────────────────────────────────────────────────
 
@@ -200,15 +171,8 @@ function createModelService({ fetchJson, env, modelManager, currentWorkspace, li
   // is read. An unreadable scan, or an empty one (the manager also reports an unmounted models
   // volume as zero files), must never make every preset look missing.
   async function folderScanFiles() {
-    let files = modelScanCache.get('models')?.body?.models;
-    if (!Array.isArray(files) && env.MODEL_LOADER_URL) {
-      const generation = modelScanCache.generation(); // a delete while this scan is in flight must win
-      const fresh = await fetchJson(`${env.MODEL_LOADER_URL.replace(/\/+$/, '')}/api/v1/models`, { method: 'GET', headers: { 'Content-Type': 'application/json', ...(env.MODEL_LOADER_TOKEN ? { 'X-Model-Loader-Token': env.MODEL_LOADER_TOKEN } : {}) } }, 8000).catch(() => null);
-      if (fresh?.ok && fresh.body && typeof fresh.body === 'object') {
-        modelScanCache.set('models', { at: Date.now(), body: fresh.body }, generation);
-        files = generation === modelScanCache.generation() ? fresh.body.models : null;
-      }
-    }
+    if (!env.MODEL_LOADER_URL) return null;
+    const files = (await modelScanCache.get('models'))?.body?.models;
     return Array.isArray(files) && files.length ? files : null;
   }
 
@@ -253,14 +217,14 @@ function createModelService({ fetchJson, env, modelManager, currentWorkspace, li
   // names and reports (embedding service state) and the shared folder scan. A list read used to name the first loaded model
   // as a side effect, which the code roles fall back to; the front's read keeps that by naming it here.
   async function installedFacts({ ids, scan, firstLoaded }) {
-    const generation = modelScanCache.generation();
+
     if (!LAST_LOADED_MODEL && firstLoaded) LAST_LOADED_MODEL = firstLoaded;
     const sidecarLoaded = await sidecarLoadedAmong(ids);
     const files = scan ? await scanRead.get().catch(() => null) : null;
     return {
       sidecarNames: [...sidecarModelNames(env)],
       sidecarLoaded: [...sidecarLoaded],
-      scan: generation === modelScanCache.generation() && files ? files.map((f) => ({ modelId: f?.modelId, sections: f?.sections, bytes: f?.bytes, shape: f?.shape })) : null,
+      scan: files ? files.map((f) => ({ modelId: f?.modelId, sections: f?.sections, bytes: f?.bytes, shape: f?.shape })) : null,
     };
   }
 
@@ -377,10 +341,7 @@ function createModelService({ fetchJson, env, modelManager, currentWorkspace, li
 
   return {
     rememberFirstLoaded: name => { if (!LAST_LOADED_MODEL && name) LAST_LOADED_MODEL=name; },
-    managerFetch, modelScanCache, refreshModelScan, lastLoadedModel, clearLastLoadedModel,
-    modelScanSnapshot: () => modelScanCache.snapshot(),
-    publishModelScan: (body,token) => modelScanCache.publish(body,token),
-    requestModelScanRefresh: token => modelScanCache.refresh(token),
+    managerFetch, modelScanCache, lastLoadedModel, clearLastLoadedModel,
     autoRoles, setAutoRoles, clearRoleReferences, ensureModelLoaded, ensureRolesLoaded,
     servedCatalogue, modelsInstalled, modelsInstalledFresh, invalidateModelReads, installedFacts, deriveUserModelName,
   };

@@ -68,8 +68,14 @@ function clientMessage(e, fallback) {
 const STATS_REFUSAL = Object.freeze({ error: 'Engine statistics are owned by the Rust front.' });
 const ROUTING_DEFAULT_REFUSAL = Object.freeze({ error: 'Routing default is owned by the Rust front.' });
 const AUTO_ROLES_REFUSAL = Object.freeze({ error: 'The auto-roles read is owned by the Rust front.', code: 'RUST_AUTO_ROLES_OWNED' });
-function createModelRoutes({ servedEmbeddingModels = (target) => require('../rag.cjs').servedModelsCached(target), json, readBody, readJson, fetchJson, env, modelManager, currentWorkspace, service, inferenceBudget = null, idleUnload = null, sweepGuardOptions = {}, decisionSettings = null, rerankSettings = null }) {
-  const { modelScanCache, refreshModelScan, autoRoles, setAutoRoles, ensureRolesLoaded, servedCatalogue, modelsInstalled, deriveUserModelName, lastLoadedModel, clearLastLoadedModel, clearRoleReferences } = service;
+function createModelRoutes({ servedEmbeddingModels = (target) => require('../rag.cjs').servedModelsCached(target), json: sendJson, readBody, readJson, fetchJson, env, modelManager, currentWorkspace, service, inferenceBudget = null, idleUnload = null, sweepGuardOptions = {}, decisionSettings = null, rerankSettings = null }) {
+  const { modelScanCache, autoRoles, setAutoRoles, ensureRolesLoaded, servedCatalogue, modelsInstalled, deriveUserModelName, lastLoadedModel, clearLastLoadedModel, clearRoleReferences } = service;
+  const pendingScanFence = new WeakSet();
+  async function json(res, status, body) {
+    // Invalidate after the writer settles, before its answer can release another reader.
+    if (pendingScanFence.has(res)) await modelScanCache.clear();
+    return sendJson(res, status, body);
+  }
   // #1461: the installed list is shared for a moment (service.modelsInstalled). A decision that must confirm
   // the engine's state right now (a delete that checks the model exists, a load that checks it is not missing)
   // asks for a fresh read instead.
@@ -164,7 +170,7 @@ function createModelRoutes({ servedEmbeddingModels = (target) => require('../rag
   }
   async function pruneMissingPresets() {
     // A cached scan (possibly the glitch itself) must not drive a delete: drop it and the shared list.
-    modelScanCache.clear();
+    await modelScanCache.clear();
     if (service.invalidateModelReads) service.invalidateModelReads();
     const scan = await freshFolderScan();
     if (!scan || scan.length === 0) return { ok: false, status: 409, code: 'scanUntrusted', error: SCAN_UNTRUSTED };
@@ -189,11 +195,25 @@ function createModelRoutes({ servedEmbeddingModels = (target) => require('../rag
       if (typeof modelManager.forgetIdentity === 'function') modelManager.forgetIdentity(name);
     }
     const { reloaded } = held;
-    if (removed.length) { modelScanCache.clear(); if (service.invalidateModelReads) service.invalidateModelReads(); }
+    if (removed.length) { await modelScanCache.clear(); if (service.invalidateModelReads) service.invalidateModelReads(); }
     return { ok: true, status: 200, removed, kept, reloaded };
   }
 
-  async function handle(req, res, { path: p, authn, url }) {
+  async function handle(req, res, context) {
+    // Keep raw manager segments visible to validation before URL normalization (#2406).
+    const rawPath = String(req.url || '').split('?')[0];
+    if (rawPath.startsWith('/api/model-manager/')) context = {...context, path: rawPath};
+    const method = req.method || 'GET', p = context.path;
+    const changesScan = (p.startsWith('/api/model-manager/') && method !== 'GET')
+      || (/^\/api\/(models|auto-roles)(\/|$)/.test(p) && !['GET','HEAD','OPTIONS'].includes(method));
+    if (!changesScan) return handleInner(req, res, context);
+    try {
+      await modelScanCache.clear();
+      pendingScanFence.add(res);
+      return await handleInner(req, res, context);
+    } finally { pendingScanFence.delete(res); await modelScanCache.clear(); }
+  }
+  async function handleInner(req, res, { path: p, authn, url }) {
     // #1461: a write that can change what the shared reads report drops them first, so the next read is not older than the write.
     if (!['GET', 'HEAD'].includes(req.method || 'GET') && /^\/api\/(models|model-manager|auto-roles)(\/|$)/.test(p)) {
       if (service.invalidateModelReads) {
@@ -304,7 +324,7 @@ function createModelRoutes({ servedEmbeddingModels = (target) => require('../rag
     }
 
     // A change to the models anywhere else (load, unload, download, delete) also invalidates the scan.
-    if (p.startsWith('/api/models/') && !['GET','HEAD','OPTIONS'].includes(req.method || 'GET')) modelScanCache.clear();
+    if (p.startsWith('/api/models/') && !['GET','HEAD','OPTIONS'].includes(req.method || 'GET')) await modelScanCache.clear();
     // Model manager (folded-in Model Loader) JSON API, administrators only.
     if (p.startsWith('/api/model-manager/')) {
       if(authn.user.role!=='admin')return json(res,403,{error:'Administrator required for model management'});
@@ -364,13 +384,12 @@ function createModelRoutes({ servedEmbeddingModels = (target) => require('../rag
         if (embeddingProtectionUnknown(env)) return json(res, 409, { error: 'Embedding model protection is not current.', errorId: 'modelInUse' });
         let payload; try{payload=JSON.parse(body||'{}');}catch{payload={};}
         const keys=Array.isArray(payload.models)?payload.models:[];
-        let scanned=modelScanCache.get('models')?.body?.models;
+        let scanned=(await modelScanCache.get('models'))?.body?.models;
         // An empty cache (cold start, or any write just cleared it) must not skip the guard: scan first.
         if(keys.length&&!Array.isArray(scanned)){
           const fresh=await fetchJson(`${env.MODEL_LOADER_URL.replace(/\/+$/,'')}/api/v1/models`,{method:'GET',headers:{'Content-Type':'application/json',...(env.MODEL_LOADER_TOKEN?{'X-Model-Loader-Token':env.MODEL_LOADER_TOKEN}:{})}},60*1000).catch(()=>null);
           scanned=fresh?.ok&&fresh.body&&typeof fresh.body==='object'?fresh.body.models:undefined;
           if(!Array.isArray(scanned))return json(res,409,{error:'Could not confirm these files are not system models. Refresh the model list and try again.'});
-          modelScanCache.set('models',{at:Date.now(),body:fresh.body});
         }
         if(keys.length){
           const blocked=keys.some(key=>{const entry=scanned.find(f=>f.key===key);return entry&&(isSystemModel(entry.modelId)||(entry.sections||[]).some(s=>isSystemModel(s)));});
@@ -391,7 +410,7 @@ function createModelRoutes({ servedEmbeddingModels = (target) => require('../rag
       const sectionMatch = /^sections\/([^/]+)(?:\/rename)?$/.exec(rest);
       if (sectionMatch && ['DELETE','POST','PUT'].includes(method)) {
         const name = sectionMatch[1];
-        const scanned = modelScanCache.get('models')?.body?.models;
+        const scanned = (await modelScanCache.get('models'))?.body?.models;
         const cachedEntry = Array.isArray(scanned) ? scanned.find(f => (f.sections||[]).includes(name)) : null;
         if (isSystemModel(name) || (cachedEntry && isSystemModel(cachedEntry.modelId))) {
           return json(res,400,{error:SYSTEM_MODEL_DELETE_REASON,errorId:'systemModel',service:'decision'});
@@ -429,9 +448,9 @@ function createModelRoutes({ servedEmbeddingModels = (target) => require('../rag
           if (refusal) return json(res, refusal.code === 'invalid_size' ? 400 : 409, refusal);
         }
       }
-      if(method!=='GET')modelScanCache.clear();
+      if(method!=='GET')await modelScanCache.clear();
       // #2304: exact GET /api/model-manager/models is refused before this legacy proxy;
-      // native policy reads/publishes the same cache through its raw conditional operations.
+      // native policy owns storage and all conditional operations.
       // #697: the model manager's autoconfig sizes against the inference budget, set here rather
       // than by the browser (any budget_gib the client sent is replaced).
       let search=url.search;
@@ -481,7 +500,7 @@ function createModelRoutes({ servedEmbeddingModels = (target) => require('../rag
           if(lastLoadedModel()===id)clearLastLoadedModel(id);
           if(typeof modelManager.forgetIdentity==='function')modelManager.forgetIdentity(id);
         }
-        modelScanCache.clear();
+        await modelScanCache.clear();
         return json(res,result.status,{...detail,unloaded,rolesCleared:[...rolesCleared]});
       }
       return json(res,result.status,result.ok?detail:{error:detail.detail||detail.error||'Model management request failed.'});
@@ -715,7 +734,7 @@ function createModelRoutes({ servedEmbeddingModels = (target) => require('../rag
       if (typeof modelManager.forgetIdentity === 'function') modelManager.forgetIdentity(body.name);
       // #1695: the router still lists a removed section until it re-reads models.ini.
       const reloaded = !!held?.reloaded;
-      modelScanCache.clear();
+      await modelScanCache.clear();
       if (service.invalidateModelReads) service.invalidateModelReads();
       return json(res, 200, { ok: true, unloaded, rolesCleared, presetRemoved: preset.removed, ...(held?.refused ? { presetBusy: true } : {}), ...(preset.removed ? { presetsReloaded: reloaded } : {}) });
     }

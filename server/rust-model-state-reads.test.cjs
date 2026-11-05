@@ -7,43 +7,6 @@ const test=require('node:test');
 const {createNativeFacts}=require('./rust-model-facts.cjs');
 const {createModelService}=require('./models.cjs');
 const {createClient}=require('./project-store-client.cjs');
-test('installedFacts: sidecar names and reports, one scan, and the first loaded model is remembered once', async () => {
-  const fetched = [];
-  const env = { MODEL_LOADER_URL: 'http://loader', EMBEDDING_MODEL: 'syn-embed' };
-  const fetchJson = async (url) => {
-    fetched.push(url);
-    if (url.endsWith('/backends')) return { ok: true, body: { backends: [{ status: 'running', loaded_model: 'syn-embed, other' }, { status: 'stopped', loaded_model: 'no' }] } };
-    return { ok: true, body: { models: [{ modelId: 'syn-chat', sections: ['syn-chat'], bytes: 5e9, shape: { layers: 1 }, secretPath: '/data/x' }] } };
-  };
-  const service = createModelService({ fetchJson, env, modelManager: {}, currentWorkspace: () => ({}) });
-  const [a, b] = await Promise.all([
-    service.installedFacts({ ids: ['syn-chat', 'syn-embed'], scan: true, firstLoaded: 'syn-chat' }),
-    service.installedFacts({ ids: ['syn-chat'], scan: true, firstLoaded: 'later' }),
-  ]);
-  assert.deepEqual(a, { sidecarNames: ['syn-embed'], sidecarLoaded: ['syn-embed', 'other'], scan: [{ modelId: 'syn-chat', sections: ['syn-chat'], bytes: 5e9, shape: { layers: 1 } }] });
-  assert.deepEqual(b.sidecarLoaded, [], 'no sidecar among the ids: the loader is not asked');
-  assert.equal(service.lastLoadedModel(), 'syn-chat');
-  assert.equal(fetched.filter((u) => u.endsWith('/models')).length, 1, 'concurrent cold reads share one scan');
-  const none = await service.installedFacts({ ids: [], scan: false });
-  assert.equal(none.scan, null);
-});
-
-test('installedFacts never returns a scan captured before cache invalidation (#2386)', async () => {
-  let finish;
-  const pending = new Promise((resolve) => { finish = resolve; });
-  const service = createModelService({
-    fetchJson: () => pending,
-    env: { MODEL_LOADER_URL: 'http://synthetic-loader' },
-    modelManager: {}, currentWorkspace: () => ({}),
-  });
-  const reading = service.installedFacts({ ids: [], scan: true });
-  // Let installedFacts pass its sidecar await and capture the scan generation.
-  await new Promise((resolve) => setImmediate(resolve));
-  service.modelScanCache.clear();
-  finish({ ok: true, body: { models: [{ modelId: 'synthetic-deleted', bytes: 5e9 }] } });
-  assert.equal((await reading).scan, null);
-  assert.equal(service.modelScanCache.get('models'), undefined);
-});
 
 function fixture(t) {
  const root=fs.mkdtempSync(path.join(os.tmpdir(),'native-facts-'));t.after(()=>fs.rmSync(root,{recursive:true,force:true}));

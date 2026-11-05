@@ -79,7 +79,7 @@ test('a list built with a failed folder scan is served but not kept, so the next
     if (String(url).endsWith('/api/v1/models')) { scans += 1; return scans === 1 ? { ok: false, status: 504, body: {} } : { ok: true, status: 200, body: { models: [] } }; }
     return { ok: false };
   };
-  const svc = createModelService({ fetchJson, env: { MODEL_LOADER_URL: 'http://loader' }, modelManager, currentWorkspace: () => workspace, listWorkspaces: () => [workspace] });
+  const svc = createModelService({ scanAuthority: {scanRead: async () => { const r = await fetchJson('http://loader/api/v1/models'); return r?.ok ? r.body : null; }}, fetchJson, env: { MODEL_LOADER_URL: 'http://loader' }, modelManager, currentWorkspace: () => workspace, listWorkspaces: () => [workspace] });
   await svc.modelsInstalled();
   await svc.modelsInstalled();
   assert.equal(calls.list, 2, 'the degraded list was not kept');

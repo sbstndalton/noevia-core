@@ -26,7 +26,7 @@ function build({ scan = () => ({ ok: true, status: 200, body: shapes.scan }), en
     throw new Error(`unexpected request ${url}`);
   };
   const modelManager = createModelManager({ kind: 'llamacpp', baseUrl: 'http://router', apiKey: 'local', fetchJson });
-  const service = createModelService({ fetchJson, env: e, modelManager, currentWorkspace: () => ({}), listWorkspaces: () => [] });
+  const service = createModelService({ scanAuthority: {scanRead: async () => { const r = await fetchJson('http://loader:8090/api/v1/models'); return r?.ok ? r.body : null; }}, fetchJson, env: e, modelManager, currentWorkspace: () => ({}), listWorkspaces: () => [] });
   return { service, calls };
 }
 const byName = (list) => Object.fromEntries(list.map((m) => [m.name, m]));

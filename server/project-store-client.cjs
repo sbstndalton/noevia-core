@@ -133,6 +133,15 @@ function createClient({ port, token, fetchImpl = globalThis.fetch, timeoutMs = T
     return call(`preset-baseline/${op}`, payload, wait);
   }
   return {
+    async modelScanRead() {
+      const {status,body}=await call('model-scan/read',{},15000);
+      if(status!==200) throw Object.assign(Error('Model scan cache is unavailable.'),{status:503});
+      return body;
+    },
+    async modelScanInvalidate() {
+      const {status,body}=await call('model-scan/invalidate',{});
+      if(status!==200 || body?.ok!==true) throw Object.assign(Error('Model scan cache is unavailable.'),{status:503});
+    },
     featureContext,
     presetBaseline,
     async modelBudget(value) {

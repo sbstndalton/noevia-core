@@ -18,7 +18,9 @@ function makeWorkspace(autoRoles = null) {
 function fixture({ env = {}, enabled = true, kind = 'llamacpp', manager = {}, workspace = { userId: 'u1' }, catalogue = [{ name: 'm' }], servedCatalogue = async () => catalogue, modelsInstalled = async () => [{ name: 'm', loaded: true }], initialRoles = null, initialLastLoaded = null, otherWorkspaces = [], inferenceBudget = null, idleUnload = null, sweepGuardOptions, fetchReply = null, machineModels = undefined } = {}) {
   const sent = [], headers = [], fetched = [], invalidations = [];
   let lastRes = null;
-  const scan = new Map();
+  const scan = new Map(), nativeSource = new Map();
+  const seedScan = scan.set.bind(scan);
+  scan.set = (key,value) => { nativeSource.set(key,value); return seedScan(key,value); };
   let refreshes = 0;
   const roles = { current: initialRoles, warmed: undefined };
   const lastLoaded = { current: initialLastLoaded };
@@ -54,7 +56,7 @@ function fixture({ env = {}, enabled = true, kind = 'llamacpp', manager = {}, wo
     missingRoles: (r, catalogue) => ({ roles: r, catalogue }),
     currentWorkspace: () => workspace,
     service: {
-      modelScanCache: scan, refreshModelScan: () => { refreshes += 1; },
+      modelScanCache: {get: async key => nativeSource.get(key), clear: async () => scan.clear()}, refreshModelScan: () => { refreshes += 1; },
       autoRoles: () => roles.current, setAutoRoles: (next) => { roles.current = next; }, ensureRolesLoaded: () => { roles.warmed = true; },
       servedCatalogue, modelsInstalled, invalidateModelReads: () => { invalidations.push(Date.now()); },
       deriveUserModelName: (c) => `user.${c}`,

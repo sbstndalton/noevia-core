@@ -25,6 +25,8 @@ function createNativeFacts({ dataDir, start, storeClient, now = Date.now, config
     sidecarNames: () => { const s=snapshot(); if(configRevision && s.configRevision!==configRevision()) throw unavailable(); const names = s.sidecarNames; if (!Array.isArray(names) || !names.every(n => typeof n === 'string')) throw unavailable(); return new Set(names); },
     async save(body, actor) { const result = await storeClient.modelBudget(body); audit('inference.budget', actor, { budgetGib: result.budgetGib }); return result; },
     installed: () => storeClient.modelInstalled(),
+    scanRead: () => storeClient.modelScanRead(),
+    scanInvalidate: () => storeClient.modelScanInvalidate(),
   };
 }
 let current = null;
