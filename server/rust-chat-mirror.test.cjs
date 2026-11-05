@@ -134,13 +134,15 @@ test('disconnect reconciliation holds actual execution, preserves built, and rej
   const http = require('node:http');
   const { createBrainRunner } = require('./chat-brain.cjs');
   const deferred = () => { let resolve; const promise = new Promise(r => { resolve = r; }); return { promise, resolve }; };
-  const entered = deferred(), release = deferred();
+  const entered = deferred(), release = deferred(), fourthBody = deferred();
+  let bodies = 0;
   let active = 0, maximum = 0, builds = 0;
   const writes = [];
   const brains = createBrainRunner({ enabled: () => true, chat: () => ({ updatedAt: builds + 1 }),
     readHistory: () => [], store: { read: () => null, write: (_u, _c, record) => writes.push(record) },
     builder: { build: async () => { builds++; active++; maximum = Math.max(maximum, active); entered.resolve(); await release.promise; active--; return { ok: true, brain: { build: builds } }; } } });
-  const handle = createExecutorBridge({ secret: SECRET, mirror: {}, brains, readJson,
+  const handle = createExecutorBridge({ secret: SECRET, mirror: {}, brains,
+    readJson: async req => { const body = await readJson(req); if (++bodies === 4) fourthBody.resolve(); return body; },
     json: (res, status, body) => { res.writeHead(status); res.end(JSON.stringify(body)); } });
   const server = http.createServer((req, res) => { void handle(req, res); });
   await new Promise(r => server.listen(0, '127.0.0.1', r));
@@ -163,6 +165,7 @@ test('disconnect reconciliation holds actual execution, preserves built, and rej
   const newer = await send({ ...body, sequence: 2 }).result;
   assert.equal(newer.status, 409, 'unconfirmed execution must keep the caller queue held');
   const restartedFront = send({ ...body, incarnation: 'b'.repeat(32) });
+  await fourthBody.promise; // Prove the second incarnation reached Node before allowing publication.
   await new Promise(r => setImmediate(r));
   assert.equal(builds, 1, 'even a new front incarnation cannot overlap actual work');
   release.resolve();
