@@ -73,26 +73,27 @@ test.before(() => {
 });
 
 test('rejects API requests without a token', async () => {
-  const response = await request('/api/chats/search');
+  // GET /api/chats/search is the Rust front's (rust-chat-search.cjs); a GET of the framing suggestion
+  // is still Node's, behind the same gate (405 once signed in).
+  const response = await request('/api/chat-framing/suggest');
   assert.equal(response.status, 401);
   assert.match(response.headers['WWW-Authenticate'] || '', /^Bearer /);
   assert.deepEqual(JSON.parse(response.text), { error: 'unauthorized' });
 });
 
 test('rejects API requests with the wrong token', async () => {
-  const response = await request('/api/chats/search', {
+  const response = await request('/api/chat-framing/suggest', {
     headers: { authorization: 'Bearer wrong-token' },
   });
   assert.equal(response.status, 401);
 });
 
 test('accepts a valid bearer token', async () => {
-  const response = await request('/api/chats/search', {
+  const response = await request('/api/chat-framing/suggest', {
     headers: { authorization: 'Bearer test-cowork-token' },
   });
-  assert.equal(response.status, 200);
-  const body = JSON.parse(response.text);
-  assert.ok(Array.isArray(body.chats));
+  assert.equal(response.status, 405, 'signed in: the route itself answers');
+  assert.deepEqual(JSON.parse(response.text), { error: 'method not allowed' });
 });
 
 test('provider creation is the Rust front\'s: Node refuses it before authentication and creates nothing', async () => {
@@ -187,18 +188,18 @@ test('a large authenticated request to a route the front owns is refused before 
   assert.equal(JSON.parse(result.text).code, 'RUST_PROJECT_CONFIG_OWNED');
 });
 
-test('diary file routes require auth and forward conflicts without losing the error', async (t) => {
-  assert.equal((await request('/api/diary/files')).status, 401);
-  // The Diary preference is written by the Rust front (#1071).
+test('the diary file routes are the Rust front\'s: Node refuses them before auth and never reaches the sidecar', async (t) => {
+  // The files/file proxies (their auth, add-on gate and 409 relay) moved to the front with the Diary proxy
+  // port: noevia-rs crates/server-diary/tests/proxy_parity.rs:25 and bins/noevia-server/tests/diary.rs:1028.
+  // The Diary preference is written by the Rust front (#1071); the chat test below needs it on.
   require('../tests/server/seed-account.cjs').setUserFeatures(testDataDir, adminId, { diaryEnabled: true });
-  t.mock.method(globalThis, 'fetch', async (url, opts) => {
-    assert.match(String(url), /\/api\/file$/);
-    assert.ok(opts.headers['X-Cowork-User-ID']);
-    assert.equal(opts.redirect, 'error');
-    return Response.json({ detail: 'File changed elsewhere' }, { status: 409 });
-  });
-  const r = await request('/api/diary/file', { method: 'PUT', headers: adminHeaders, body: JSON.stringify({path:'MEMORY.md',content:'edited',version:'old'}) });
-  assert.equal(r.status,409);assert.match(r.text,/changed elsewhere/);
+  t.mock.method(globalThis, 'fetch', async () => { throw new Error('the sidecar must not be called'); });
+  for (const [path, init] of [['/api/diary/files', {}], ['/api/diary/files', { headers: adminHeaders }],
+    ['/api/diary/file', { method: 'PUT', headers: adminHeaders, body: JSON.stringify({path:'MEMORY.md',content:'edited',version:'old'}) }]]) {
+    const r = await request(path, init);
+    assert.equal(r.status, 503, path);
+    assert.equal(JSON.parse(r.text).code, 'RUST_DIARY_OWNED', path);
+  }
 });
 test('diary forwards browser date and selected day to the pipeline', async (t) => {
   let sent;

@@ -26,6 +26,19 @@ const PATH = '/api/chat-framing/suggest';
 const BRIDGE_PATH = '/internal/chat-framing/suggest';
 /** The front cuts the message to this many UTF-16 units (`message.slice(0, 4000)`). */
 const MESSAGE_CAP = 4000;
+/** The longest user id the bridge takes (UTF-16 units). Account ids are far shorter. */
+const USER_CAP = 1024;
+/** The front's public body limit: http.cjs readBody's default. */
+const PUBLIC_BODY_LIMIT = 1024 * 1024;
+/**
+ * The bridge's own body limit. The front re-sends a public body of at most PUBLIC_BODY_LIMIT bytes as
+ * {user, message, chatId}: the chat id is a span of that body after UTF-8 replacement (an invalid byte
+ * becomes U+FFFD, three bytes), so at most 3 x PUBLIC_BODY_LIMIT; the message is at most MESSAGE_CAP units,
+ * the user at most USER_CAP, each up to six bytes a unit when escaped, plus the JSON framing. All of that
+ * fits in 64 KiB over the chat id's bound. The default 1 MiB would refuse a valid public request.
+ */
+const ENVELOPE_LIMIT = 64 * 1024;
+const BRIDGE_BODY_LIMIT = 3 * PUBLIC_BODY_LIMIT + ENVELOPE_LIMIT;
 
 const owned = (method, pathname) => method === 'POST' && pathname === PATH;
 
@@ -50,9 +63,9 @@ function createSuggestBridge({ secret, asUser, framing, workspace, json, readJso
     if (String(req.url || '').split('?')[0] !== BRIDGE_PATH) return false;
     if (!trustedFront(req, secret) || req.method !== 'POST') { json(res, 404, { error: 'Not found' }); return true; }
     let body;
-    try { body = await readJson(req); } catch { json(res, 400, { error: 'invalid JSON' }); return true; }
+    try { body = await readJson(req, BRIDGE_BODY_LIMIT); } catch { json(res, 400, { error: 'invalid JSON' }); return true; }
     const { user, message, chatId } = body || {};
-    if (typeof user !== 'string' || !user || typeof message !== 'string' || message.length > MESSAGE_CAP || (chatId !== null && typeof chatId !== 'string')) {
+    if (typeof user !== 'string' || !user || user.length > USER_CAP || typeof message !== 'string' || message.length > MESSAGE_CAP || (chatId !== null && typeof chatId !== 'string')) {
       json(res, 400, { error: 'A user, a message and a chat id or null are required.' });
       return true;
     }
@@ -71,4 +84,4 @@ function createSuggestBridge({ secret, asUser, framing, workspace, json, readJso
   };
 }
 
-module.exports = { OWNED_ROUTES, ROUTE_REFUSAL, PATH, BRIDGE_PATH, MESSAGE_CAP, owned, refuseOwned, createSuggestBridge };
+module.exports = { OWNED_ROUTES, ROUTE_REFUSAL, PATH, BRIDGE_PATH, MESSAGE_CAP, USER_CAP, PUBLIC_BODY_LIMIT, BRIDGE_BODY_LIMIT, owned, refuseOwned, createSuggestBridge };
