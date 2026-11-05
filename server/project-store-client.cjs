@@ -134,6 +134,15 @@ function createClient({ port, token, fetchImpl = globalThis.fetch, timeoutMs = T
   }
   return {
     featureContext,
+    async autoRolesReady() {
+      const { status, body } = await call('auto-roles/proof', {});
+      if (status !== 200 || body?.capability !== 'rust-auto-roles-write') throw new Error('Native auto-roles write pairing is required');
+    },
+    async clearAutoRoles(user, name) {
+      const { status, body } = await call('auto-roles/clear', { user, name }, RESEAL_WAIT_MS);
+      if (status !== 200 || !Array.isArray(body?.cleared)) throw failure(status, body);
+      return body.cleared;
+    },
     presetBaseline,
     async grantContext(user, chat) {
       const { status, body } = await call('chat/grant-context', { user, chat });
