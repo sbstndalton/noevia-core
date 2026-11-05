@@ -1,8 +1,8 @@
 'use strict';
 // sbstndalton/noevia#2190 round 3: the Rust front answers GET|PUT /api/chat-vault-mirror/preferences
 // (noevia-rs crates/server-account vault_mirror.rs) and is the only writer of
-// users/<id>/chat-vault-mirror.json; the mirror here keeps reading it on every use
-// (chat-vault-mirror.cjs readPreferences). Node's route answered every method on the exact path
+// users/<id>/chat-vault-mirror.json; the mirror (the front's too, crates/chat-mirror-exec) reads it on every use
+// (server-account vault_mirror exec_gates). Node's route answered every method on the exact path
 // (405 for the others), so every method is refused here, before authentication: a stale route
 // table cannot make two processes answer.
 //

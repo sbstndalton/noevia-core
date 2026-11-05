@@ -953,51 +953,22 @@ const chatFramingSuggestBridge = require('./rust-chat-framing-suggest.cjs').crea
   // #810: only Chat-mode, unarchived projects are offered as a destination; every own chat still counts for links and tags.
   workspace: () => { const projects = PROJECTS.filter((proj) => !diaryExtras.internalProject(proj)); return { projects: projects.filter(require('./project-modes.cjs').chatDestination).map((proj) => ({ id: proj.id, name: proj.name })), chats: [...Array.from(FREE_CHATS), ...projects.flatMap((proj) => proj.chats || [])] }; },
 });
-// #741: "Mirror chats to Diary", per user and off by default. One-way, debounced, through the Diary
-// files client above, as the chat's own user. Runs only with chatFraming on and the Diary add-on on.
+// #741/#742: "Mirror chats to Diary" and the chat brains are the Rust front's, schedule and work (rust-chat-mirror-v1,
+// rust-chat-mirror-exec-v1): it writes the notes, the index and the brains itself. This process tells the front
+// what only it sees (rust-chat-mirror.cjs schedule client) and answers its engine seam: the answer model, the
+// reasoner's admission (same budget gate as #740) and the call on the default provider.
 const vaultMirrorLib = require('./chat-vault-mirror.cjs');
 const chatBrainLib = require('./chat-brain.cjs');
-const vaultMirrorAvailable = (userId) => features.enabled('chatFraming') && authService.diaryEnabled(userId);
-const chatVaultMirror = vaultMirrorLib.createChatVaultMirror({
-  enabled: (userId) => vaultMirrorAvailable(userId) && vaultMirrorLib.readPreferences(workspaceStore.get(userId).dir).enabled,
-  lists: (userId) => diaryAsUser(userId, () => ({ freeChats: Array.from(FREE_CHATS), projects: PROJECTS.filter((proj) => !diaryExtras.internalProject(proj)) })),
-  deleted: (userId) => diaryAsUser(userId, () => require('./chat-lists.cjs').readTombstones(currentWorkspace().dir)),
-  readHistory: (userId, chatId) => diaryAsUser(userId, () => readHistory(chatId)),
-  readBrain: (userId, chatId) => chatBrainLib.readBrain(workspaceStore.get(userId).dir, chatId)?.brain || null,
-  files: diaryFiles,
-  index: { read: (userId) => vaultMirrorLib.readIndex(workspaceStore.get(userId).dir), write: (userId, state) => vaultMirrorLib.writeIndex(workspaceStore.get(userId).dir, state) },
-  log: (...args) => console.warn(...args),
-});
-// rust-chat-mirror-v1: the Rust front decides when the mirror and the brains run (it tails the change journal, debounces,
-// retries); this process does their work (rust-chat-mirror.cjs) and tells the front what only it sees.
 const chatMirrorClient = require('./rust-chat-mirror.cjs').createScheduleClient({ store: PROJECT_STORE });
 projectsChangedElsewhere = (userId) => chatMirrorClient.schedule(userId, null);
-// #742: each mirrored chat gets a small "brain" when it goes idle, built by the reasoner role (same
-// engine and budget gate as #740; skipped without a reasoner model). Needs framingReasoner +
-// chatFraming AND the user's mirror opt-in. Stored per chat in the user's own workspace.
-const brainStore = { read: (userId, chatId) => chatBrainLib.readBrain(workspaceStore.get(userId).dir, chatId),
-  write: (userId, chatId, record) => chatBrainLib.writeBrain(workspaceStore.get(userId).dir, chatId, record),
-  remove: (userId, chatId) => chatBrainLib.removeBrain(workspaceStore.get(userId).dir, chatId) };
-const chatBrains = chatBrainLib.createBrainRunner({
-  enabled: (userId) => features.enabled('framingReasoner') && vaultMirrorAvailable(userId) && vaultMirrorLib.readPreferences(workspaceStore.get(userId).dir).enabled,
-  chat: (userId, chatId) => diaryAsUser(userId, () => [...Array.from(FREE_CHATS), ...PROJECTS.filter((proj) => !diaryExtras.internalProject(proj)).flatMap((proj) => proj.chats || [])].find((c) => c && c.id === chatId) || null),
-  readHistory: (userId, chatId) => diaryAsUser(userId, () => readHistory(chatId)),
-  deleted: (userId) => diaryAsUser(userId, () => require('./chat-lists.cjs').readTombstones(currentWorkspace().dir)),
-  store: brainStore,
-  builder: chatBrainLib.createBrainBuilder({
-    enabled: () => features.enabled('framingReasoner') && features.enabled('chatFraming'),
-    model: () => framingSettings.get().framingReasonerModel,
-    complete: require('./framing-reasoner.cjs').createEngineCompletion({ getProvider, providerHeaders, providerId: DEFAULT_PROVIDER_ID, fetch: (...a) => fetch(...a) }),
-    admit: (model, { answerModel, answerIsLocal }) => require('./framing-reasoner.cjs').admitReasoner({ model, answerModel, answerIsLocal,
-      keep: require('./llamacpp-manager.cjs').keepAlongside(), loadRefusal: typeof modelManager.loadRefusal === 'function' ? modelManager.loadRefusal : null }),
-    loadedModel: () => lastLoadedModel(),
-    log: (entry) => recordDecision('chat-brain', entry),
-  }),
-  log: (...args) => console.warn(...args),
+const chatMirrorEngine = require('./rust-chat-mirror.cjs').createEngineSeam({
+  secret: FRONT_SECRET, json, readJson,
+  loaded: () => lastLoadedModel(),
+  admit: (model, { answerModel, answerIsLocal }) => require('./framing-reasoner.cjs').admitReasoner({ model, answerModel, answerIsLocal,
+    keep: require('./llamacpp-manager.cjs').keepAlongside(), loadRefusal: typeof modelManager.loadRefusal === 'function' ? modelManager.loadRefusal : null }),
+  complete: require('./framing-reasoner.cjs').createEngineCompletion({ getProvider, providerHeaders, providerId: DEFAULT_PROVIDER_ID, fetch: (...a) => fetch(...a) }),
+  record: (entry) => recordDecision('chat-brain', entry),
 });
-// #2153: transcripts are written by the Rust store alone; the front tails its per-user change journal and runs
-// the mirror and brain schedules (rust-chat-mirror-v1). It calls these two executors on loopback.
-const chatMirrorBridge = require('./rust-chat-mirror.cjs').createExecutorBridge({ secret: FRONT_SECRET, json, readJson, mirror: chatVaultMirror, brains: chatBrains });
 // #682: a decision experiment switched on that cannot run (no service, or one without `choice`)
 // says so once at startup; Settings shows the same reason, and the chat path skips it silently.
 for (const [key, id] of [['COWORK_DECISION_MODEL', process.env.COWORK_DECISION_MODEL], ['COWORK_SENSITIVITY_DECISION_MODEL', process.env.COWORK_SENSITIVITY_DECISION_MODEL]]) {
@@ -1339,7 +1310,7 @@ async function handleRequestInner(req, res) {
   // And the framing suggestion's POST (chat port S4), with the front's loopback call for the lists and the decision.
   if (require('./rust-chat-framing-suggest.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   if (await chatFramingSuggestBridge(req, res)) return;
-  if (await chatMirrorBridge(req, res)) return;
+  if (await chatMirrorEngine(req, res)) return;
   if (require('./routes/features.cjs').refuseOwnedFeatures(req, res, { parseRequestUrl, json })) return;
   // The Diary routes that are only a proxy and a policy are the Rust front's (#2185).
   if (require('./rust-diary.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;

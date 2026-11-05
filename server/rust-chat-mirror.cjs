@@ -1,18 +1,21 @@
 'use strict';
-// The chat change-journal consumer and the Diary mirror / chat brain schedules are the Rust front's
-// (noevia-rs crates/chat-mirror-sched, bins/noevia-server chat_mirror.rs, capability rust-chat-mirror-v1;
-// sbstndalton/noevia#2153, #741, #742). It tails each active account's journal, debounces and coalesces the
-// mirror passes, times the per-chat brain builds and retries on a backoff. What a pass or a build *does*
-// stays here: the Diary file writes and the reasoner call. REMAINING: those two executors.
+// The chat change-journal consumer, the Diary mirror / chat brain schedules AND their work are the Rust front's
+// (noevia-rs crates/chat-mirror-sched and crates/chat-mirror-exec, bins/noevia-server chat_mirror.rs and
+// chat_mirror_work.rs; capabilities rust-chat-mirror-v1 and rust-chat-mirror-exec-v1; sbstndalton/noevia#2153,
+// #741, #742). The front writes the vault notes, the per-user index, the Trash moves and the brains itself, and
+// builds the reasoner's prompt, schema and parameters.
 //
-// The front reaches them on loopback with the per-start secret (trusted-front.cjs), one pass at a time per
-// account for the mirror and one build at a time for the brains:
+// What stays here is the engine seam: the answer model, the reasoner's admission (keep-alongside list and load
+// budget, framing-reasoner.cjs admitReasoner) and the call on the default provider (createEngineCompletion), which
+// still belong to this process. The front reaches it on loopback with the per-start secret (trusted-front.cjs):
 //
-//   POST /internal/chat-mirror/sync  {user, chats: [id...]}  -> 200 {outcome: 'done' | 'off' | 'failed'}
-//   POST /internal/chat-mirror/brain {user, chatId}          -> 200 {reason}
+//   POST /internal/chat-mirror/engine {op: 'loaded'}                       -> 200 {model: string|null}
+//   POST /internal/chat-mirror/engine {op: 'admit', model, answerModel}    -> 200 {refusal: string|null}
+//   POST /internal/chat-mirror/engine {op: 'complete', model, schema, messages} -> 200 {content} | 502
+//   POST /internal/chat-mirror/engine {op: 'record', entry}                -> 204 (the decision log, 'chat-brain')
 //
-// 'off' is a mirror switched off for that account (nothing written, nothing to retry); 'failed' is retried by the
-// front on its backoff, with the same chats. Any other answer, or none, is a failed pass there.
+// A client that goes away aborts the engine call. REMAINING: when the front owns the engine admission (row H) and
+// the provider registry, this seam goes too.
 //
 // This process asks the front for the two things only it sees, over the project store (POST /v1/chat-mirror/*):
 // `schedule` when a project change or an import should make an account's mirror look again, and `touch` at a
@@ -23,42 +26,65 @@ const { trustedFront } = require('./trusted-front.cjs');
 /** Grep marker for noevia deploy/tools/assemble-release.sh and build/web-supervisor.sh: this core leaves the
  *  journal tail and the mirror and brain schedules to the front. */
 const RUST_CHAT_MIRROR_OWNED = 'rust-chat-mirror-v1';
-const SYNC_PATH = '/internal/chat-mirror/sync';
-const BRAIN_PATH = '/internal/chat-mirror/brain';
-const USER_CAP = 1024;
-const CHATS_CAP = 100000;
+/** Grep marker: this core has no mirror or brain executor; the front does that work (only the engine seam is here). */
+const RUST_CHAT_MIRROR_EXEC_OWNED = 'rust-chat-mirror-exec-v1';
+const ENGINE_PATH = '/internal/chat-mirror/engine';
+const MODEL_CAP = 512;
 /** The front's journal read has a 15-minute activity window; one touch per account per half minute is as good as every request. */
 const TOUCH_EVERY_MS = 30000;
 
 /**
+ * The engine seam. `loaded()` is the model the local engine has loaded (or null); `admit(model, ctx)` is
+ * framing-reasoner.cjs admitReasoner's answer (null or a refusal reason); `complete({model, schema, messages, signal})`
+ * is createEngineCompletion. Nothing here builds a prompt or picks a parameter.
  * @param {object} deps
  * @param {string} deps.secret  the per-start secret (an empty one trusts nobody)
- * @param {{ pass: (user: string, chats: string[]) => Promise<'done'|'off'|'failed'> }} deps.mirror
- * @param {{ run: (user: string, chatId: string) => Promise<string> }} deps.brains
  */
-function createExecutorBridge({ secret, mirror, brains, json, readJson, log = (m) => console.warn(m) }) {
+function createEngineSeam({ secret, loaded, admit, complete, record = () => {}, json, readJson, log = (m) => console.warn(m) }) {
   return async function handle(req, res) {
     const path = String(req.url || '').split('?')[0];
-    if (path !== SYNC_PATH && path !== BRAIN_PATH) return false;
+    if (path !== ENGINE_PATH) return false;
     // Anything not from the front gets the 404 of an unknown path: with file sharing on, this listener is not loopback only.
     if (!trustedFront(req, secret) || req.method !== 'POST') { json(res, 404, { error: 'Not found' }); return true; }
     let body;
     try { body = await readJson(req, 4 * 1024 * 1024); } catch { json(res, 400, { error: 'invalid JSON' }); return true; }
-    const user = body?.user;
-    if (typeof user !== 'string' || !user || user.length > USER_CAP) { json(res, 400, { error: 'A user is required.' }); return true; }
+    const model = body?.model;
+    const okModel = (m) => typeof m === 'string' && m.length > 0 && m.length <= MODEL_CAP;
     try {
-      if (path === SYNC_PATH) {
-        const chats = body.chats;
-        if (!Array.isArray(chats) || chats.length > CHATS_CAP || !chats.every((c) => typeof c === 'string')) { json(res, 400, { error: 'chats must be a list of chat ids.' }); return true; }
-        json(res, 200, { outcome: await mirror.pass(user, chats) });
-      } else {
-        const chatId = body.chatId;
-        if (typeof chatId !== 'string' || !chatId) { json(res, 400, { error: 'A chat id is required.' }); return true; }
-        json(res, 200, { reason: await brains.run(user, chatId) });
+      if (body?.op === 'record') {
+        const entry = body.entry;
+        const ok = entry && typeof entry === 'object' && !Array.isArray(entry) && ['brain.fallback', 'brain.built'].includes(entry.event);
+        if (!ok) { json(res, 400, { error: 'A brain entry is required.' }); return true; }
+        try { record(entry); } catch { /* logging never changes the outcome */ }
+        res.writeHead(204); res.end();
+        return true;
       }
+      if (body?.op === 'loaded') { json(res, 200, { model: (await loaded()) || null }); return true; }
+      if (body?.op === 'admit') {
+        const answerModel = body.answerModel ?? null;
+        if (!okModel(model) || (answerModel !== null && !okModel(answerModel))) { json(res, 400, { error: 'A model is required.' }); return true; }
+        const refusal = await admit(model, { answerModel, answerIsLocal: !!answerModel });
+        json(res, 200, { refusal: refusal || null });
+        return true;
+      }
+      if (body?.op === 'complete') {
+        if (!okModel(model) || !Array.isArray(body.messages) || !body.schema || typeof body.schema !== 'object') { json(res, 400, { error: 'A model, a schema and messages are required.' }); return true; }
+        const controller = new AbortController();
+        const abort = () => controller.abort();
+        req.once?.('close', () => { if (!res.writableEnded) abort(); });
+        try {
+          const content = await complete({ model, schema: body.schema, messages: body.messages, signal: controller.signal });
+          json(res, 200, { content });
+        } catch (error) {
+          log(`[chat-mirror] engine call failed: ${error?.status || error?.code || error?.name || 'error'}`);
+          json(res, 502, { error: 'engine call failed' });
+        }
+        return true;
+      }
+      json(res, 400, { error: 'Unknown op.' });
     } catch (error) {
-      log(`[chat-mirror] executor failed: ${error?.code || error?.name || 'error'}`);
-      json(res, 500, { error: 'executor failed' });
+      log(`[chat-mirror] engine seam failed: ${error?.code || error?.name || 'error'}`);
+      json(res, 500, { error: 'engine seam failed' });
     }
     return true;
   };
@@ -94,4 +120,4 @@ function createScheduleClient({ store, log = (m) => console.warn(m), now = Date.
   };
 }
 
-module.exports = { RUST_CHAT_MIRROR_OWNED, SYNC_PATH, BRAIN_PATH, TOUCH_EVERY_MS, createExecutorBridge, createScheduleClient };
+module.exports = { RUST_CHAT_MIRROR_OWNED, RUST_CHAT_MIRROR_EXEC_OWNED, ENGINE_PATH, TOUCH_EVERY_MS, createEngineSeam, createScheduleClient };

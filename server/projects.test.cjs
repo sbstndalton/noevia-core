@@ -321,7 +321,10 @@ test('every delete path goes through the store\'s delete; Node removes no meter,
     for (const id of ['c-a', 'c-b', 'c-keep', 'c-free']) {
       context.save(f.dir, id, meter);
       fs.writeFileSync(f.workspace.historyPath(id), '[]');
-      brain.writeBrain(f.dir, id, { brain: { brain_schema: 1, summary: 'qa', decisions: [], facts: [], open_questions: [], entities: [] } });
+      // A brain as the Rust front stores it (crates/chat-mirror-exec; chat-brains/<sha256(id)>.json).
+      const bfile = require('node:path').join(f.dir, brain.BRAIN_DIR, `${require('node:crypto').createHash('sha256').update(id).digest('hex')}.json`);
+      fs.mkdirSync(require('node:path').dirname(bfile), { recursive: true });
+      fs.writeFileSync(bfile, JSON.stringify({ chatId: id, sourceUpdatedAt: 0, builtAt: 0, brain: { brain_schema: 1, summary: 'qa', decisions: [], facts: [], open_questions: [], entities: [] } }));
     }
     assert.equal(await f.store.deleteChat(keep.id, 'c-keep'), true);
     assert.equal(await f.store.deleteFreeChat('c-free'), true);
