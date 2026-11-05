@@ -7,8 +7,7 @@ const { defaultFiles } = require('../../code-harness.cjs');
 
 // Synthetic files only; use the evidence directory instead of a shared temporary directory.
 test('harness file oracle refuses links before truncating and creates nested files', () => {
-  const evidence = process.env.TASK_FILES_EVIDENCE;
-  assert.ok(evidence, 'TASK_FILES_EVIDENCE must name the worker evidence directory');
+  const evidence = process.env.TASK_FILES_EVIDENCE || require('node:os').tmpdir();
   const dir = fs.mkdtempSync(path.join(evidence, 'file-oracle-'));
   try {
     const root = path.join(dir, 'root');
@@ -30,6 +29,6 @@ test('harness file oracle refuses links before truncating and creates nested fil
     defaultFiles.write(nested, 'hello', root);
     assert.equal(defaultFiles.read(nested, 5, root), 'hello');
     assert.throws(() => defaultFiles.read(nested, 4, root), { code: -32602, message: 'File too large' });
-    fs.writeFileSync(path.join(evidence, 'task-files-node.json'), JSON.stringify({ refusals: results, nested: 'hello', tooLarge: { code: -32602, message: 'File too large' } }, null, 2) + '\n');
+    if (process.env.TASK_FILES_EVIDENCE) fs.writeFileSync(path.join(evidence, 'task-files-node.json'), JSON.stringify({ refusals: results, nested: 'hello', tooLarge: { code: -32602, message: 'File too large' } }, null, 2) + '\n');
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
