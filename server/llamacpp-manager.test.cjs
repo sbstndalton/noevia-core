@@ -268,23 +268,19 @@ test('noevia#2115: a load waiting for its lease observes cancellation and loads 
  assert.equal(manager.inferenceBusy(0),false);
 });
 
-test('noevia#2115: the gate\'s refusal to unload a model in use reaches the caller; unloading it anyway needs the admin token',async()=>{
+test('noevia#2115: the gate\'s refusal to unload a model in use reaches the caller; the watchdog\'s forced unload needs the admin token',async()=>{
  const answer=(route,body,options)=>route==='/models/unload'&&!(body.force===true&&options.headers?.['X-Noevia-Gate-Admin'])?gateRefusal(409,'model_in_use','The model is answering a request. Unload it when it is idle, or unload it anyway as an admin.',true):null;
  const calls=[],plain=createModelManager({gate:fakeGate(),kind:'llamacpp',baseUrl:'http://synthetic',fetchJson:routerFake({alpha:'loaded'},calls,{answer})});
  const refused=await plain.unload('alpha');
  assert.equal(refused.status,409);assert.equal(refused.body.error.code,'model_in_use');
  assert.equal(plain.gateAdmin(),false);
- const noAdmin=await plain.unloadAnyway('alpha');
- assert.equal(noAdmin.status,403);assert.equal(noAdmin.body.code,'admin_required');
- assert.equal(calls.filter(c=>c.route==='/models/unload').length,1,'nothing is sent without the admin token');
+ assert.equal(calls.filter(c=>c.route==='/models/unload').length,1);
  // The memory watchdog without the token: a plain unload, which the gate refuses for a model in use.
  assert.equal((await plain.emergencyUnload('alpha')).status,409);
  assert.deepEqual(calls.at(-1).body,{model:'alpha'});
  const adminCalls=[],admin=createModelManager({gate:fakeGate({admin:'synthetic-admin-0001'}),kind:'llamacpp',baseUrl:'http://synthetic',fetchJson:routerFake({alpha:'loaded'},adminCalls,{answer})});
  assert.equal(admin.gateAdmin(),true);
  assert.equal((await admin.unload('alpha')).status,409,'a plain unload stays refused with a token configured');
- assert.equal((await admin.unloadAnyway('alpha')).ok,true);
- assert.deepEqual(adminCalls.at(-1).body,{model:'alpha',force:true});assert.equal(adminCalls.at(-1).admin,'synthetic-admin-0001');
  assert.equal((await admin.emergencyUnload('alpha')).ok,true);
  assert.deepEqual(adminCalls.at(-1).body,{model:'alpha',force:true});assert.equal(adminCalls.at(-1).admin,'synthetic-admin-0001');
 });

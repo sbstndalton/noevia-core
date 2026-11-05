@@ -1310,11 +1310,15 @@ const autoRolesWriteBridge = require('./rust-auto-roles-write.cjs').createBridge
   secret: FRONT_SECRET, json, readJson, service: modelService,
   asUser: diaryAsUser, user: id => authService.db.prepare('SELECT role FROM users WHERE id=?').get(id),
 });
+// Row A: the front's model load/unload asks this process to drop its shared model reads (rust-model-load.cjs).
+const modelLoadInvalidate = require('./rust-model-load.cjs').createInvalidateBridge({ secret: FRONT_SECRET, json, readJson, service: modelService });
 async function handleRequestInner(req, res) {
   // The ownership refusals below answer before handleRequestScoped; they carry the same headers.
   publicHeaders(res);
   if (require('./rust-auto-roles-write.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   if (await autoRolesWriteBridge(req, res)) return;
+  if (require('./rust-model-load.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
+  if (await modelLoadInvalidate(req, res)) return;
   if (require('./rust-tool-approvals.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   if (require('./rust-idle-unload-read.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   if (await idleUnloadFacts(req, res)) return;

@@ -169,7 +169,7 @@ function createAdmissionRoutes({ secret, modelManager, admitEngineModel, chatMac
       } catch (e) {
         if (signal.aborted) { res.destroy?.(); return true; }
         const status = KEPT.includes(e?.status) ? e.status : 503;
-        json(res, status, { error: e?.publicMessage || BUSY, ...(e?.code ? { code: e.code } : {}) });
+        json(res, status, { error: e?.publicMessage || BUSY, ...(e?.code ? { code: e.code } : {}), ...(e?.retryable === true ? { retryable: true } : {}) });
       }
       return true;
     }

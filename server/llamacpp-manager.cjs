@@ -786,12 +786,9 @@ function createLlamaCppManager({ budgetWatchDir = null, baseUrl, apiKey, fetchJs
     evidenceApplied: (handle,options)=>evidenceInbox?evidenceInbox.applied(handle,options):Promise.resolve(true),
     calibration: calibrator ? { stateFacts: calibrator.stateFacts, listingFacts: calibrator.listingFacts, preparationFacts: calibrator.preparationFacts, compareAndLaunch: calibrator.compareAndLaunch, cancellationFacts: calibrator.cancellationFacts, compareAndAbort: calibrator.compareAndAbort, recover: calibrator.recover } : null,
     autotune: autotuner ? { start: (...args) => { const fault = budgetFaultReason(); return fault ? Promise.resolve({ ok: false, status: 503, body: budgetFaultBody('Auto-tune unavailable', fault) }) : autotuner.start(...args); }, resumeFacts: autotuner.resumeFacts, prepareResume: autotuner.prepareResume, compareAndResume: autotuner.compareAndResume, cancellationFacts: autotuner.cancellationFacts, compareAndAbort: autotuner.compareAndAbort, clearFacts: autotuner.clearFacts, compareAndClear: autotuner.compareAndClear, statusFacts: autotuner.statusFacts, settingsFacts: autotuner.settingsFacts, commitSettings: autotuner.commitSettings, recover: autotuner.recover, scanFacts: autotuner.scanFacts } : null,
-    // noevia#2115: the gate refuses to unload a model in use (409 `model_in_use`); `unloadAnyway` is the
-    // admin's choice to end what it is answering, and needs INFERENCE_GATE_ADMIN_TOKEN.
+    // noevia#2115: the gate refuses to unload a model in use (409 `model_in_use`). The admin's "unload anyway"
+    // is the Rust front's (row A, model_load_routes.rs); the watchdog's forced unload stays below.
     unload: model => mutate(()=>post('/models/unload', { model })),
-    unloadAnyway: model => gateClient.hasAdmin()
-      ? mutate(()=>forcedUnload(model, 60000))
-      : Promise.resolve({ ok: false, status: 403, body: { error: 'Unloading a model in use is not set up on this server.', code: 'admin_required' } }),
     gateAdmin: () => gateClient.hasAdmin(),
     // A shutdown: every lease still held is given back (best effort; the gate ends the rest by idle time).
     releaseLeases: options => typeof gateClient.releaseAll === 'function' ? gateClient.releaseAll(options) : Promise.resolve(0),

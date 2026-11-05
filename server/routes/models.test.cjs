@@ -243,15 +243,7 @@ test('any write under /api/models/ drops the scan, and pull/delete/load keep the
   assert.deepEqual(f.sent.pop(), { status: 502, body: { error: 'delete failed: 500', unloaded: true } }, 'a failed delete still reports whether the unload before it succeeded (#302 follow-up)');
   await f.call('POST', '/api/models/delete', { name: 'laya_multilingual_f16' }, 'admin');
   assert.deepEqual(f.sent.pop(), { status: 400, body: { error: 'System routing model — not deleted', errorId: 'systemModel', service: 'decision' } });
-  await f.call('POST', '/api/models/load', { name: 'm', mtp: true }, 'admin');
-  assert.deepEqual(f.sent.pop(), { status: 400, body: { error: 'Use the native preset editor to configure speculative decoding.' } });
-  await f.call('POST', '/api/models/unload', { name: 'm' }, 'admin');
-  assert.deepEqual(f.sent.pop(), { status: 200, body: { ok: true } });
-  await f.call('POST', '/api/models/load', '{', 'admin');
-  assert.deepEqual(f.sent.pop(), { status: 400, body: { error: 'invalid JSON' } });
   const off = fixture({ enabled: false });
-  await off.call('POST', '/api/models/load', { name: 'm' }, 'admin');
-  assert.deepEqual(off.sent.pop(), { status: 404, body: { error: 'model management is disabled' } });
   await off.call('HEAD', '/api/models/downloads');
   assert.deepEqual(off.sent.pop(), { status: 200, body: [] });
 });
@@ -536,39 +528,14 @@ test('evidence import (#266, #2210) is the Rust front\'s: a POST that reaches th
   assert.deepEqual(calls, [], 'the front does the import, not this route');
 });
 
-test('#548: load and unload refuse Laya and the in-use sidecar models with 409 and never reach the engine', async () => {
+test('row A: load and unload are not this route\'s; nothing reaches the engine (the Rust front owns them)', async () => {
   const calls = [];
-  const f = fixture({ env: { EMBEDDING_MODEL: 'nomic-embed-text-v1', NOEVIA_FEATURE_RAG_RERANK: '1', RERANK_MODEL: 'qwen3-reranker-0.6b-q8_0' },
-    manager: { load: async (n) => { calls.push(['load', n]); return { ok: true }; }, unload: async (n) => { calls.push(['unload', n]); return { ok: true }; } } });
+  const f = fixture({ manager: { load: async (n) => { calls.push(['load', n]); return { ok: true }; }, unload: async (n) => { calls.push(['unload', n]); return { ok: true }; } } });
   for (const verb of ['load', 'unload']) {
-    for (const name of ['laya_multilingual_f16', 'nomic-embed-text-v1', 'qwen3-reranker-0.6b-q8_0']) {
-      await f.call('POST', `/api/models/${verb}`, { name }, 'admin');
-      const sent = f.sent.pop();
-      assert.equal(sent.status, 409, `${verb} ${name}`);
-      assert.match(sent.body.error, /not loaded or unloaded here/);
-    }
+    await f.call('POST', `/api/models/${verb}`, { name: 'chat-7b' }, 'admin');
   }
   assert.deepEqual(calls, []);
-  await f.call('POST', '/api/models/load', { name: 'chat-7b' }, 'admin');
-  assert.equal(f.sent.pop().status, 200, 'an ordinary model still loads');
-  await f.call('POST', '/api/models/unload', { name: 'chat-7b' }, 'admin');
-  assert.equal(f.sent.pop().status, 200);
-  assert.deepEqual(calls, [['load', 'chat-7b'], ['unload', 'chat-7b']]);
-});
-
-test('#545: load refuses a preset whose model file is missing with 409, but unload is still allowed', async () => {
-  const calls = [];
-  const f = fixture({ modelsInstalled: async () => [{ name: 'ghost', missingFile: true, failed: true }, { name: 'ok', loaded: false }],
-    manager: { load: async (n) => { calls.push(['load', n]); return { ok: true }; }, unload: async (n) => { calls.push(['unload', n]); return { ok: true }; } } });
-  await f.call('POST', '/api/models/load', { name: 'ghost' }, 'admin');
-  const sent = f.sent.pop();
-  assert.equal(sent.status, 409);
-  assert.match(sent.body.error, /not in the models folder/);
-  assert.deepEqual(calls, []);
-  await f.call('POST', '/api/models/unload', { name: 'ghost' }, 'admin');
-  assert.equal(f.sent.pop().status, 200);
-  await f.call('POST', '/api/models/load', { name: 'ok' }, 'admin');
-  assert.equal(f.sent.pop().status, 200);
+  assert.equal(f.sent.filter((r) => r.status === 200).length, 0);
 });
 
 // #697: the inference memory budget setting, the estimates beside it, and the two proxied paths
@@ -941,7 +908,8 @@ test('#2298 stable saved reranker is protected beside the deployment seed in pub
   try {
     for (const name of ['rerank-seed-a', 'rerank-current-b']) {
       const f = fixture({ env, manager: { load: forbidden, unload: forbidden, deleteModel: forbidden, request: forbidden } });
-      for (const action of ['load', 'unload', 'delete']) {
+      // load and unload are the Rust front's (row A); it asks this process's sidecar names (rust-model-facts.cjs).
+      for (const action of ['delete']) {
         await f.call('POST', `/api/models/${action}`, { name }, 'admin');
         assert.equal(f.sent.at(-1)?.status, 409, `${action} must protect ${name}`);
         if (action === 'delete') assert.equal(f.sent.at(-1).body.service, 'reranker');
@@ -976,8 +944,6 @@ test('#2298 unreadable current reranker state refuses unsafe public actions befo
       const f = fixture({ env, manager: { load: forbidden, unload: forbidden, deleteModel: forbidden, request: forbidden } });
       f.scan.set('models', { at: Date.now(), body: { models: [{ key: 'synthetic.gguf', modelId: 'm', sections: ['m'] }] } });
       for (const [method, path, body] of [
-        ['POST', '/api/models/load', { name: 'm' }],
-        ['POST', '/api/models/unload', { name: 'm' }],
         ['POST', '/api/models/delete', { name: 'm' }],
         ['DELETE', '/api/model-manager/sections/m'],
         ['POST', '/api/model-manager/models/delete', { models: ['synthetic.gguf'] }],

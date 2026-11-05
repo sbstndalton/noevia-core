@@ -27,7 +27,7 @@ const PATH_OPTION_ALIASES = Object.fromEntries([
   ['mmproj', ['mmproj', 'mm', 'LLAMA_ARG_MMPROJ']],
   ['model-draft', ['model-draft', 'md', 'LLAMA_ARG_MODEL_DRAFT']],
 ].flatMap(([canonical, names]) => names.map(n => [n, canonical])));
-const { isSystemModel, modelPathFromArgs, SYSTEM_MODEL_DELETE_REASON, SYSTEM_MODEL_LOAD_REASON, SIDECAR_MODEL_LOAD_REASON, MISSING_MODEL_FILE_REASON, rerankModelNames, isSidecarModel, SIDECAR_MODEL_DELETE_REASON } = require('../model-system.cjs');
+const { isSystemModel, modelPathFromArgs, SYSTEM_MODEL_DELETE_REASON, rerankModelNames, isSidecarModel, SIDECAR_MODEL_DELETE_REASON } = require('../model-system.cjs');
 
 // noevia#2115: a refusal from the inference gate, as { status, code, error, retryable }, or null. The gate answers in
 // the router's error shape; the model manager passes on a refusal it got while asking for a lease in its own shape.
@@ -659,67 +659,8 @@ function createModelRoutes({ servedEmbeddingModels = (target) => require('../rag
       return json(res, 200, { ok: true, unloaded, rolesCleared, presetRemoved: preset.removed, ...(held?.refused ? { presetBusy: true } : {}), ...(preset.removed ? { presetsReloaded: reloaded } : {}) });
     }
 
-    for (const verb of ['load', 'unload']) {
-      if (p === `/api/models/${verb}` && req.method === 'POST') {
-        const raw = await readBody(req);
-        let body;
-        try {
-          body = JSON.parse(raw);
-        } catch {
-          return json(res, 400, { error: 'invalid JSON' });
-        }
-        if (!body.name) return json(res, 400, { error: 'name required' });
-        if (!modelManager.enabled) return json(res, 404, { error: 'model management is disabled' });
-        // #548: Laya and the in-use embedding/reranker models are run by their own sidecars; a
-        // load would duplicate them in the router and an unload would silently break RAG. 409, not
-        // 400: a valid model, just not one this route may touch.
-        if (isSystemModel(body.name)) return json(res, 409, { error: SYSTEM_MODEL_LOAD_REASON });
-        if (isSidecarModel(body.name, env)) return json(res, 409, { error: SIDECAR_MODEL_LOAD_REASON });
-        // #545: a preset whose GGUF is gone can only fail to load. Unloading it stays allowed.
-        if (verb === 'load') {
-          let installed = null;
-          try { installed = await modelsInstalledNow(); } catch { installed = null; }
-          if (Array.isArray(installed) && installed.find((m) => m.name === body.name)?.missingFile) return json(res, 409, { error: MISSING_MODEL_FILE_REASON });
-        }
-        if (verb === 'load' && body.mtp !== undefined && modelManager.kind === 'llamacpp') return json(res,400,{error:'Use the native preset editor to configure speculative decoding.'});
-        if (verb === 'load' && body.mtp !== undefined) {
-          const listing = await modelManager.listModels();
-          if (!listing.ok) return json(res,502,{error:'Could not verify MTP support'});
-          const model = (listing.body.data || []).find(m=>(m.id || m.model_name)===body.name);
-          if (!model) return json(res,404,{error:'Model not installed'});
-          let options;
-          try { options = require('../mtp.cjs').loadOptions(model,body.mtp); }
-          catch(error) { return json(res,400,{error:error.message}); }
-          const loaded = await modelManager.load(body.name,options);
-          if (!loaded.ok) return json(res,502,{error:'Model could not load with that MTP setting. Previous saved settings were kept.'});
-          const saved = await modelManager.load(body.name,{...options,save_options:true});
-          return json(res,saved.ok?200:502,saved.ok?{ok:true}:{error:'Model loaded, but its MTP preference could not be saved. Check before reloading.'});
-        }
-        // noevia#2115: the inference gate refuses to unload a model that is answering a request (409 model_in_use).
-        // The admin may then unload it anyway (`force: true`), which ends what it is answering; the gate logs it.
-        if (verb === 'unload' && body.force === true) {
-          if (typeof modelManager.unloadAnyway !== 'function') return json(res, 400, { error: 'This model engine cannot unload a model in use.' });
-          const forced = await modelManager.unloadAnyway(body.name);
-          if (forced.ok) return json(res, 200, { ok: true, forced: true });
-          const refusal = refusalOf(forced);
-          return refusal ? json(res, refusal.status, { error: refusal.error, code: refusal.code, retryable: refusal.retryable }) : json(res, 502, { error: `unload failed: ${forced.status}` });
-        }
-        // noevia#2115: a load waits in the gate's queue, up to the gate's limit. An admin who closes the page or
-        // cancels leaves that queue and starts no switch: the request's abort signal goes to the load.
-        const gone = new AbortController();
-        const onClose = () => { if (!res.writableEnded) gone.abort(); };
-        res.once?.('close', onClose);
-        let r;
-        try { r = verb === 'load' ? await modelManager.load(body.name, {}, gone.signal) : await modelManager[verb](body.name); }
-        catch (error) { if (gone.signal.aborted) return true; throw error; }
-        finally { res.off?.('close', onClose); }
-        if (r.ok) return json(res, 200, { ok: true });
-        const refusal = refusalOf(r);
-        if (refusal) return json(res, refusal.status, { error: refusal.error, code: refusal.code, retryable: refusal.retryable,
-          ...(verb === 'unload' && refusal.code === 'model_in_use' ? { canForce: modelManager.gateAdmin?.() === true } : {}) });
-        return json(res, 502, { error: `${verb} failed: ${r.status}` });
-      }
-    }
+    // POST /api/models/load and /api/models/unload are the Rust front's (row A, noevia-rs
+    // model_load_routes.rs); index.cjs refuses them before this route (rust-model-load.cjs).
 
     // Exact GET is native; retain the historical behavior for other methods.
     if (p === '/api/models/downloads' && req.method !== 'GET') {

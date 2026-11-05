@@ -115,7 +115,7 @@ test('a device token acts as its own account, as a member, and reads without wri
   const memberTokens = deviceFor(memberId, 'Member phone');
   for (const t of [tokens, memberTokens]) assert.equal((await asDevice(t.access, '/api/chat-framing/suggest')).status, 405);
   // Role-gated routes outside /api/admin see a member.
-  assert.equal((await asDevice(tokens.access, '/api/models/unload', { method: 'POST', body: { name: 'synthetic' } })).status, 403);
+  assert.equal((await asDevice(tokens.access, '/api/models/delete', { method: 'POST', body: { name: 'synthetic' } })).status, 403);
   // The gate is read-only here: the front moves last_used_at before it proxies (server-auth upkeep).
   const db = new (require('better-sqlite3'))(path.join(dataDir, 'cowork.db'), { readonly: true });
   try {
