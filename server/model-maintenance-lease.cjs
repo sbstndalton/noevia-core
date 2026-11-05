@@ -21,7 +21,8 @@
 //    The front, holding the authority's lease, asks for the latch over the loopback connection it already
 //    proxies through; a latch is a local-only hold of this process's gate (holdLocal: no second trip to the
 //    authority) and has no authority of its own. It ends with the front's lease: the front releases it, or
-//    it expires by the same ttl/hard limits when the front stops renewing (a front that dies frees chat).
+//    it expires by the same ttl/hard limits when the front stops renewing, transferring admission to
+//    recovery-required exclusion until a fresh covered repair confirms settlement.
 //
 //   POST   /internal/model-maintenance/lease             201 {lease, ttlMs, renewMs, hardMs}; 409 {error, chatActive} while busy
 //          body (optional): {maxMs}: the hard cap the front's lease has (a calibration run), clamped to
@@ -52,8 +53,8 @@ const MAX_MS = 24 * 60 * 60 * 1000;
 const BODY_LIMIT = 4096;
 /** The cap a lease gets for `requested` (undefined: the default). */
 const capFor = (requested, hardMs, maxMs) => (requested === undefined ? hardMs : Math.min(Math.max(requested, hardMs), Math.max(hardMs, maxMs)));
-/** Delta review P2: how long, and how many, given-back tickets are remembered so a POST that arrives (or is
- *  granted) after its DELETE is refused rather than latched. Longer than any front call to this route. */
+/** Cancellation retention capacity. With no enforced arrival lifetime, retention lasts until restart;
+ *  saturation refuses new admissions rather than evicting a still-admissible cancellation. */
 const TICKET_TOMBSTONE_MS = 10 * 60 * 1000;
 const TICKET_TOMBSTONES = 1024;
 
@@ -70,15 +71,28 @@ function createLeases({ hold, ttlMs = TTL_MS, hardMs = HARD_MS, maxMs = MAX_MS, 
   // Tickets have no enforced arrival lifetime. Never forget a cancellation within this process.
   // At capacity refuse new admissions rather than resurrecting delayed requests.
   let saturated = false, unbar = null;
-  function requireRecovery() { if (!unbar && barrier) unbar = barrier(); }
-  function completeRecovery() { const lift = unbar; unbar = null; lift?.(); }
+  const recoveryKeys = new Set(), completedRecoveries = new Set();
+  function requireRecovery(ticket='legacy') {
+    if(completedRecoveries.has(ticket))return;
+    recoveryKeys.add(ticket);
+    if (!unbar && barrier) unbar = barrier();
+  }
+  function completeRecovery(ticket='legacy') {
+    // One exclusive repair settles every earlier latch. Retire its ticket too, so a delayed
+    // barrier POST from a released hold cannot re-arm an already completed incident.
+    completedRecoveries.add(ticket);
+    for(const key of recoveryKeys)completedRecoveries.add(key);
+    recoveryKeys.clear();
+    if(completedRecoveries.size >= ticketTombstones)saturated=true;
+    const lift = unbar; unbar = null; lift?.();
+  }
   function tombstoned(ticket) { return !!ticket && tombstones.has(ticket); }
   function end(id, why) {
     const lease = leases.get(id);
     if (!lease) return false;
     leases.delete(id);
     clearTimeout(lease.timer);
-    if (why) requireRecovery();
+    if (why) requireRecovery(lease.ticket || id);
     lease.release();
     if (why) log(`[models] the front's maintenance lease ${why}; chat and tuning may run again`);
     return true;
@@ -311,9 +325,11 @@ function createLeaseRoutes({ secret, hold, json, ...options }) {
     if (target !== PREFIX && !target.startsWith(`${PREFIX}/`)) return false;
     const notFound = () => { json(res, 404, { error: 'Not found' }); return true; };
     if (!trusted(req) || !leases) return notFound();
-    if (target === `${PREFIX}/recovery`) {
-      if (req.method === 'POST') { leases.requireRecovery(); json(res, 204, null); return true; }
-      if (req.method === 'DELETE') { leases.completeRecovery(); json(res, 204, null); return true; }
+    if (target.startsWith(`${PREFIX}/recovery/`)) {
+      const ticket=target.slice(`${PREFIX}/recovery/`.length);
+      if(!/^[0-9a-f]{32}$/.test(ticket))return notFound();
+      if (req.method === 'POST') { leases.requireRecovery(ticket); json(res, 204, null); return true; }
+      if (req.method === 'DELETE') { leases.completeRecovery(ticket); json(res, 204, null); return true; }
       return notFound();
     }
     if (target === PREFIX) {

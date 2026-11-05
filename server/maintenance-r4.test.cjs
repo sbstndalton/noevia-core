@@ -35,3 +35,10 @@ test('sweep loss plus progress outage and local deadline never proves external t
  assert.throws(()=>gate.enter(),e=>e.status===503);assert.equal(guard.active(),true);
  terminal=true;await tick();gate.enter()();
 });
+
+test('late recovery barrier acknowledgement cannot resurrect a completed incident',()=>{
+ const gate=createMaintenanceGate();const l=createLeases({hold:()=>gate.holdLocal(),barrier:()=>gate.barrier('repair',{recovery:true})});
+ l.requireRecovery('old');l.completeRecovery('old');l.requireRecovery('old');gate.enter()();
+ l.requireRecovery('new');assert.throws(()=>gate.enter(),e=>e.status===503);
+ l.completeRecovery('new');gate.enter()();
+});
