@@ -33,6 +33,8 @@ const RESEAL_WAIT_MS = 120000;
 // sbstndalton/noevia#2202: an MCP session may refresh at the sign-in service (10 s); a start may
 // discover and register (up to five 8 s requests).
 const MCP_WAIT_MS = 45000;
+/** One discovery lists every server together (each listing is bounded at 60 s on the front) and may wait for a place. */
+const MCP_DISCOVERY_WAIT_MS = 90000;
 const MCP_START_WAIT_MS = 120000;
 const REPLY_CAP = 2 * 32 * 1024 * 1024 + 64 * 1024;
 // providers.json (sbstndalton/noevia#2190 round 6) is the account's private provider rows: the Rust
@@ -306,6 +308,15 @@ function createClient({ port, token, fetchImpl = globalThis.fetch, timeoutMs = T
     async mcpKeySet(user, server, headers) {
       const { status, body } = await call('mcp/key-set', { user, server, headers }, MCP_WAIT_MS);
       return status === 200 && body?.ok === true ? { ok: true } : mcpRefusal(status, body);
+    },
+    /** sbstndalton/noevia row T: what the front's MCP discovery knows (mcp_discovery_actor.rs). `force`
+     *  rediscovers now; `generation` is the one this process holds, answered `{ unchanged: true }` while
+     *  it is current. Throws the store's failure (503 while discovery cannot answer): a caller offers
+     *  no tools then, never the last list. */
+    async mcpDiscovery({ force = false, generation = null } = {}) {
+      const { status, body } = await call('mcp/discovery', { ...(force ? { force: true } : {}), ...(Number.isSafeInteger(generation) ? { generation } : {}) }, MCP_DISCOVERY_WAIT_MS);
+      if (status === 200 && body && (body.unchanged === true || (body.version === 1 && Array.isArray(body.servers) && Array.isArray(body.offers) && Array.isArray(body.boxes)))) return body;
+      throw failure(status, body);
     },
     /** The three credential tables' re-seal for a secrets rotation (rust-mcp-credentials.cjs). */
     async mcpReseal() {

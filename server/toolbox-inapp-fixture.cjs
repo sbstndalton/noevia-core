@@ -4,7 +4,7 @@
 // so a test can ask each server path what it says about each one. No network, no data dir.
 const { AsyncLocalStorage } = require('node:async_hooks');
 const { createToolboxes } = require('./toolboxes.cjs');
-const { bindBoxes } = require('./mcp-boxes.cjs');
+const { bindBoxes } = require('../tests/server/oracle/mcp-boxes.cjs');
 const { buildToolboxManifest } = require('./mcp-toolbox-manifest.cjs');
 
 const fn = (name) => ({ type: 'function', function: { name, description: 'synthetic', parameters: { type: 'object', properties: {} } } });
