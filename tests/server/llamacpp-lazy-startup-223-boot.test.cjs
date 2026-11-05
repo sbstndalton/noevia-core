@@ -40,6 +40,16 @@ const HEADER = { 'general.architecture': [8, 'llama'], 'llama.context_length': [
 const PRELOAD = `'use strict';
 const path = require('node:path');
 const dir = process.env.SERVER_DIR_223, mode = process.env.FAULT_223;
+// The test front is synthetic: supply its native facts contract, without engine work.
+const facts = require(path.join(dir, 'rust-model-facts.cjs'));
+const createFacts = facts.createNativeFacts;
+facts.createNativeFacts = (options) => ({ ...createFacts(options),
+  budgetGib: () => 64,
+  installed: async () => [{ name: 'small', loaded: false, missingFile: false, labels: [] }],
+  sidecarNames: () => new Set(),
+  scanInvalidate: async () => {},
+  scanRead: async () => ({ models: [{ name: 'small', loaded: false, missingFile: false, labels: [] }] }),
+});
 const autoconfig = require(path.join(dir, 'llamacpp-autoconfig.cjs'));
 const define = (name, descriptor) => Object.defineProperty(autoconfig, name, { configurable: true, enumerable: true, ...descriptor });
 if (mode === 'memory-limit') define('parseMemoryLimit', { writable: true, value() { throw new autoconfig.AutoconfigImplError('parseMemoryLimit'); } });
