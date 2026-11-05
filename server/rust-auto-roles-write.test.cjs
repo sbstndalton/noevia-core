@@ -2,7 +2,11 @@
 const test = require('node:test'), assert = require('node:assert/strict');
 const { EventEmitter } = require('node:events');
 const { createModelRoutes } = require('./routes/models.cjs');
-const { createBridge } = require('./rust-auto-roles-write.cjs');
+const { RUST_AUTO_ROLES_WRITE_OWNED, createBridge } = require('./rust-auto-roles-write.cjs');
+
+test('the native writer advertises its paired capability', () => {
+  assert.equal(RUST_AUTO_ROLES_WRITE_OWNED, 'rust-auto-roles-write');
+});
 
 test('#2408 a disconnect before commit cannot consume the final invalidation', async () => {
   let release, started, value = 'old';
@@ -31,4 +35,38 @@ test('native warm bridge authenticates, rechecks admin and invokes the existing 
   assert.equal((await call('warm', {user:'u', roles:{fast:'x'}})).status,400);
   assert.deepEqual((await call('facts')).body, {catalogue:null});
   assert.equal((await call('invalidate')).status,200);
+});
+
+test('the bridge warms only the existing trigger against a synthetic engine', async t => {
+  const http = require('node:http');
+  const { AsyncLocalStorage } = require('node:async_hooks');
+  const scope = new AsyncLocalStorage(), calls = [];
+  let loaded;
+  const done = new Promise(resolve => { loaded = resolve; });
+  const engine = http.createServer((req, res) => {
+    calls.push(req.url); res.setHeader('Content-Type', 'application/json'); res.end('{"ok":true}');
+    loaded();
+  });
+  await new Promise(resolve => engine.listen(0, '127.0.0.1', resolve));
+  t.after(() => new Promise(resolve => engine.close(resolve)));
+  const manager = { enabled: true, requireEnabled() {}, capabilities: { routing: false },
+    listModels: async () => ({ok:true, body:{data:[{id:'alpha'},{id:'beta'},{id:'creative'}]}}),
+    health: async () => ({ok:true, body:{all_models_loaded:[{model_name:'alpha',loaded:true}]}}),
+    load: async name => (await fetch(`http://127.0.0.1:${engine.address().port}/load/${name}`, {method:'POST'})).json(),
+  };
+  const service = require('./models.cjs').createModelService({env:{}, modelManager:manager,
+    currentWorkspace: () => { assert.equal(scope.getStore(), 'synthetic-admin'); return {autoRoles:{fast:'alpha',smart:'beta',creative:'creative'}}; },
+  });
+  const bridge = createBridge({secret:'synthetic-secret',service,user:()=>({role:'admin'}),
+    asUser:(user,fn)=>scope.run(user,fn),readJson:async()=>({user:'synthetic-admin'}),
+    json:(res,status)=>{res.status=status;},
+  });
+  const req={method:'POST',url:'/internal/auto-roles/warm',headers:{'x-noevia-store-token':'synthetic-secret'},socket:{remoteAddress:'127.0.0.1'}};
+  const res={}; await bridge(req,res); assert.equal(res.status,200);
+  await Promise.race([done,new Promise((_,reject)=>{const timer=setTimeout(()=>reject(new Error('synthetic warm timeout')),2000);timer.unref();})]);
+  // The loop skips separately configured Creative; Fast is already loaded.
+  assert.deepEqual(calls,['/load/beta']);
+  manager.capabilities.routing=true;
+  await bridge(req,{});
+  assert.deepEqual(calls,['/load/beta']);
 });

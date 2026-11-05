@@ -1,6 +1,7 @@
 'use strict';
 // F1: Rust is the only per-user roles writer. This bridge supplies live facts and
 // invokes the existing warming trigger; it never accepts roles or writes them.
+const RUST_AUTO_ROLES_WRITE_OWNED = 'rust-auto-roles-write';
 const { trustedFront } = require('./trusted-front.cjs');
 const ROUTE_REFUSAL = Object.freeze({ error: 'The auto-roles write is owned by the Rust front.', code: 'RUST_AUTO_ROLES_WRITE_OWNED' });
 const owned = (method, pathname) => method === 'PUT' && pathname === '/api/auto-roles';
@@ -30,4 +31,4 @@ function createBridge({ secret, json, readJson, service, asUser, user }) {
     return true;
   };
 }
-module.exports = { ROUTE_REFUSAL, owned, refuseOwned, createBridge };
+module.exports = { RUST_AUTO_ROLES_WRITE_OWNED, ROUTE_REFUSAL, owned, refuseOwned, createBridge };

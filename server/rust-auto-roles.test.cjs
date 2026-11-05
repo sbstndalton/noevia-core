@@ -1,8 +1,8 @@
 'use strict';
 // sbstndalton/noevia#2190 close-out: GET /api/auto-roles is the Rust front's (noevia-rs
 // bins/noevia-server auto_roles_routes.rs, tested there through real HTTP). Node refuses the GET before
-// authentication, still owns the PUT (a save warms the roles in the engine) and the file the front
-// reads, and publishes what only it knows (the served catalogue, the roles on other machines and their
+// authentication; the native PUT owns the file and invokes Node only for its existing warming
+// trigger. Node publishes what only it knows (the served catalogue, the roles on other machines and their
 // models) as auto-roles-snapshot.json.
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
@@ -17,7 +17,7 @@ const json = (res, status, body) => Object.assign(res, { status, body });
 const refuse = (method, url) => { const res = {}; return roles.refuseOwned({ url, method, headers: {}, on() { throw new Error('body listener'); } }, res, { parseRequestUrl, json }) ? res : null; };
 const wait = (ms) => new Promise((r) => setTimeout(r, ms));
 
-test('exactly the GET of the exact path is refused, before authentication; the PUT is Node\'s', () => {
+test('exactly the GET of the exact path is refused, before authentication; the PUT has its own native refusal', () => {
   assert.equal(roles.ROUTE_REFUSAL.code, 'RUST_AUTO_ROLES_OWNED');
   assert.deepEqual(refuse('GET', '/api/auto-roles'), { status: 503, body: roles.ROUTE_REFUSAL });
   assert.deepEqual(refuse('GET', '/api/auto-roles?x=1'), { status: 503, body: roles.ROUTE_REFUSAL });
