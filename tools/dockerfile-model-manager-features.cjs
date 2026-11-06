@@ -15,9 +15,12 @@
 //      produce noevia-model-manager. Another `cargo build -p <other>` is ignored only when every -p
 //      value is a plain package name other than noevia-model-manager. Any other cargo invocation
 //      (second build, with or without features, test/run/install, nested shells) is refused.
-//   3. That build uses only --release, --locked, -p/--package, --bin, --features/-F with a literal
-//      list of `package/feature` items, and --no-default-features; no `$`/ARG expansion, glob or
-//      backtick anywhere in a cargo command; it is not conditional (reached through `&&` only).
+//   3. That build uses only --release (required), --locked, -p/--package (must name the model manager),
+//      --bin (only the model manager), --features/-F with a literal list of `package/feature` items,
+//      and --no-default-features; no `$`/ARG expansion, glob or backtick anywhere in a cargo command;
+//      no inline environment assignment, `cd`/`pushd`, --target/--target-dir/--profile or
+//      CARGO_TARGET_DIR, so it writes <WORKDIR>/target/release/noevia-model-manager, which is the
+//      copy source; it is not conditional (reached through `&&` only).
 // Anything else is an Error naming the reason.
 
 const path = require('node:path');
@@ -58,6 +61,7 @@ function instructions(text) {
 function stages(text) {
   const list = [];
   for (const ins of instructions(text)) {
+    noHeredoc(ins); // anywhere in the file: a heredoc body could even hide a FROM line
     if (ins.kw === 'FROM') {
       const m = /^(?:--\S+\s+)*(\S+)(?:\s+AS\s+(\S+))?\s*$/i.exec(ins.args);
       if (!m) fail(`unreadable FROM ${ins.args}`);
@@ -235,6 +239,12 @@ function copyOf(ins, workdir) {
   return { from, srcs: words, dest: d };
 }
 
+// A heredoc turns the lines after it into data (or a script), not instructions, and this parser reads
+// physical lines; so any `<<` in a RUN, COPY or ADD anywhere in the file is refused outright.
+function noHeredoc(ins) {
+  if (['RUN', 'COPY', 'ADD'].includes(ins.kw) && ins.args.includes('<<')) fail(`${ins.kw} with a heredoc (<<) cannot be checked: its body would be read as instructions`);
+}
+
 // ---- the build stage ---------------------------------------------------------------------------
 
 function proveBuild(all, stage) {
@@ -250,7 +260,7 @@ function proveBuild(all, stage) {
         continue;
       }
       if (ins.kw !== 'RUN') continue;
-      if (/^\s*(--|\[)/.test(ins.args) || /<<-?\s*['"]?\w/.test(ins.args)) fail('a RUN with flags, exec form or a heredoc in the build stage chain cannot be checked');
+      if (/^\s*(--|\[)/.test(ins.args)) fail('a RUN with flags or exec form in the build stage chain cannot be checked');
       const segs = shell(ins.args);
       const afterBuildAtStart = afterBuild;
       let seenBuild = false;
@@ -261,12 +271,16 @@ function proveBuild(all, stage) {
         if (at < 0) return;
         const cmd = seg.words[at];
         const cmdBase = base(cmd);
+        if (['cd', 'pushd', 'popd'].includes(cmdBase)) fail('the build stage changes the shell working directory, so the build output is not under the Docker WORKDIR');
         if (cmdBase === 'cargo') {
+          if (at > 0) fail('cargo is run with an inline environment assignment or group opener (it could redirect the build output)');
           if (cmd.dollar) fail('cargo is invoked through an expansion');
           const b = parseCargo(seg, at);
           if (b.kind !== 'build' || !couldProduce(b)) return;
           if (found) fail(`a second cargo build could produce ${PKG}: only one build is accepted`);
           if (!b.packages.includes(PKG)) fail(`the cargo build does not name -p ${PKG}`);
+          if (!b.options.includes('--release')) fail('the cargo build lacks --release, so it would not produce target/release/' + PKG);
+          if (!b.bins.every((x) => x === PKG)) fail(`the cargo build has --bin ${b.bins.join(',')}, which is not ${PKG}`);
           // Reached only through && (pipes before it are fine), and followed only by && or the end.
           for (let p = 0; p < si; p++) if (segs[p].after && !['&&', '|'].includes(segs[p].after)) fail(`the cargo build is conditional or backgrounded (${segs[p].after} before it)`);
           for (let p = 0; p < si; p++) if (segs[p].words[0] && RESERVED.has(segs[p].words[0].v)) fail('the cargo build sits inside a shell construct');

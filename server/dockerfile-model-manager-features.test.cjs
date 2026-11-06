@@ -143,3 +143,41 @@ test('the final stage must inherit the copy; a different base or a late stage is
   // The copy in the final chain is the one that counts, even if the build stage is renamed away.
   bad(df().replace('AS gguf-meta', 'AS renamed'), /does not name a stage/);
 });
+
+test('a heredoc anywhere is refused: its body is data, not instructions (round 3)', () => {
+  // The reviewer's probe: the production COPY exists only as heredoc data written to /tmp.
+  const heredocCopy = df({ copy: `RUN cat <<'EOF' > /tmp/copy-example\nCOPY --from=gguf-meta /src/target/release/noevia-model-manager ${BIN}\nEOF` });
+  bad(heredocCopy, /heredoc/);
+  bad(df({ build: `RUN cat <<EOF > /tmp/x\n${BUILD}\nEOF` }), /heredoc/);
+  bad(df({ tail: 'FROM runtime AS production\nCOPY <<EOF /etc/motd\nhi\nEOF' }), /heredoc/);
+  // An unrelated stage's heredoc could hide a FROM line and change which stage is last.
+  bad(df().replace('FROM debian AS runtime', "FROM debian AS other\nRUN cat <<'EOF' > /tmp/x\nFROM scratch AS production\nEOF\nFROM debian AS runtime"), /heredoc/);
+  bad(REAL.replace('FROM runtime AS production', "RUN cat <<'EOF' > /tmp/x\nEOF\nFROM runtime AS production"), /heredoc/);
+});
+
+test('the counted build must produce the copied release binary (round 3)', () => {
+  const stale = (run) => ['FROM rust AS builder', 'WORKDIR /src', 'COPY stale-release /src/target/release/noevia-model-manager', run,
+    'FROM debian AS runtime', `COPY --from=builder /src/target/release/noevia-model-manager ${BIN}`, 'FROM runtime AS production', ''].join('\n');
+  const F = '--features noevia-model-manager/native-routing';
+  // The reviewer's probes: redirected output, no --release, and a different working directory.
+  bad(stale(`RUN CARGO_TARGET_DIR=/tmp/other cargo build --release -p noevia-model-manager ${F}`), /inline environment assignment/);
+  bad(stale(`RUN cargo build -p noevia-model-manager ${F}`), /lacks --release/);
+  bad(stale(`RUN cd /other && cargo build --release -p noevia-model-manager ${F}`), /changes the shell working directory/);
+  // Neighbours: other assignments and a group opener, other ways to move or rename the output.
+  bad(stale(`RUN RUSTFLAGS=-Cdebuginfo=0 cargo build --release -p noevia-model-manager ${F}`), /inline environment assignment/);
+  bad(stale(`RUN { cargo build --release -p noevia-model-manager ${F}; }`), /inline environment assignment|conditional|shell construct/);
+  bad(stale(`RUN pushd /other && cargo build --release -p noevia-model-manager ${F}`), /changes the shell working directory/);
+  bad(stale(`RUN cargo build --release -p noevia-model-manager --target-dir /tmp/other ${F}`), /outside the supported set/);
+  bad(stale(`RUN cargo build --release -p noevia-model-manager --target x86_64-unknown-linux-musl ${F}`), /outside the supported set/);
+  bad(stale(`RUN cargo build --profile release-lto -p noevia-model-manager ${F}`), /outside the supported set/);
+  bad(stale(`RUN cargo build --release -p noevia-model-manager --bin other-bin ${F}`), /--bin other-bin, which is not noevia-model-manager/);
+  bad(stale(`ARG CARGO_TARGET_DIR=/tmp/other\nRUN cargo build --release -p noevia-model-manager ${F}`), /redirects cargo output/);
+  bad(stale(`ENV CARGO_BUILD_TARGET=x\nRUN cargo build --release -p noevia-model-manager ${F}`), /redirects cargo output/);
+  // WORKDIR binding: the copy source must be <WORKDIR>/target/release/... of the build's own WORKDIR.
+  bad(stale(`RUN cargo build --release -p noevia-model-manager ${F}`).replace('WORKDIR /src', 'WORKDIR /src\nWORKDIR /other').replace('COPY stale-release /src/', 'COPY stale-release /other/'), /not the release binary/);
+  // The plain, correct form is still accepted (the stale file is simply overwritten by the build).
+  assert.deepEqual(proveFeatures(stale(`RUN cargo build --release -p noevia-model-manager ${F}`)).features, ['native-routing']);
+  // The real Dockerfile with --release removed, or with an inline assignment on its build, is refused.
+  bad(REAL.replace(/(cargo build )--release( --locked -p gguf-meta -p model-files-cli -p model-autoconfig-cli -p noevia-model-manager)/, '$1$2'), /lacks --release/);
+  bad(REAL.replace(' && cargo build --release --locked -p gguf-meta -p model-files-cli', ' && CARGO_TARGET_DIR=/tmp/o cargo build --release --locked -p gguf-meta -p model-files-cli'), /inline environment assignment/);
+});
