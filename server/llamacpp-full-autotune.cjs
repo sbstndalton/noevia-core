@@ -976,27 +976,55 @@ function createFullAutotuner({ request: engineRequest, rawModels: engineRawModel
     maintenance.requireRecovery('autotune:' + j.id, () => recoverTrial(j),
       'Chat is paused while noevia restores the settings an interrupted tune left behind.');
   }
+  // K r3 P1: this callback runs on J's recovery lease, which covers the engine, not this process's right to
+  // write the tune state. Every irreversible step (the models.ini restore, the baseline invalidation, the
+  // router's re-read) is therefore taken through the owned effect wrappers, only after the queued state has
+  // reached the owner and this actor is still its current writer, and the check is repeated after every
+  // await in between. A fenced actor stops where it is and hands the rest to the legitimate owner: the
+  // `_recovery` record is in the state the owner holds, and the writer that replaced this one asks for it again
+  // (recover() -> requireTrialRecovery); it never retries on a closure over an obsolete replica.
+  const handedOff = () => Object.assign(Error('Auto-tune recovery was handed to the state owner.'), { handedOff: true });
   async function recoverTrial(j) {
     const rec = j._recovery;
     if (!rec) return;
-    // The engine is idle here (the recovery's settle step). Restore only our own version; an operator's
-    // later edit stands, and the router re-reads whatever models.ini holds now.
-    if (presets.snapshot().revision === rec.revision) {
+    const after = () => { if (fenced) throw handedOff(); };
+    const current = async () => {
+      after();
+      try { await flush(); } catch { throw handedOff(); }
+      after();
+    };
+    try {
+      await current();
+      // The engine is idle here (the recovery's settle step). Restore only our own version; an operator's
+      // later edit stands, and the router re-reads whatever models.ini holds now.
+      if (presets.snapshot().revision === rec.revision) {
+        maintenance?.assertCovered?.();
+        await current();
+        await ownedCommit({ baseRevision: rec.revision, text: rec.text }, rec.backedUp ? { backup: false } : undefined);
+        after();
+        j._revision = presets.snapshot().revision;
+      }
+      j._reloadPending = true; save();
       maintenance?.assertCovered?.();
-      await presets.commit({ baseRevision: rec.revision, text: rec.text }, rec.backedUp ? { backup: false } : undefined);
-      j._revision = presets.snapshot().revision;
+      await current();
+      const acknowledged = await invalidateBaseline('autotune');
+      after();
+      if (!acknowledged) throw Error('The preset reload baseline did not acknowledge the restore.');
+      maintenance?.assertCovered?.();
+      await current();
+      const reload = await ownedRequest('/models?reload=1', {}, 120000);
+      after();
+      if (!reload.ok) throw Error('The router did not confirm restored settings.');
+      maintenance?.assertCovered?.();
+      for (const item of j.models || []) for (const phase of item.phases || []) if (phase._beforeText != null) { delete phase._beforeText; phase.restored = true; }
+      delete j.originalText;
+      delete j._recovery; j._reloadPending = false; j._unsafe = false; j.restored = true;
+      note(j, 'Settings an interrupted tune left behind were restored, and the model server re-read them.');
+      save();
+    } catch (e) {
+      if (e?.handedOff || e?.fenced) { console.warn('[autotune] recovery handed to the state owner: this actor no longer owns the state'); return; }
+      throw e;
     }
-    j._reloadPending = true; save();
-    maintenance?.assertCovered?.();
-    if (!(await invalidateBaseline('autotune'))) throw Error('The preset reload baseline did not acknowledge the restore.');
-    const reload = await request('/models?reload=1', {}, 120000);
-    if (!reload.ok) throw Error('The router did not confirm restored settings.');
-    maintenance?.assertCovered?.();
-    for (const item of j.models || []) for (const phase of item.phases || []) if (phase._beforeText != null) { delete phase._beforeText; phase.restored = true; }
-    delete j.originalText;
-    delete j._recovery; j._reloadPending = false; j._unsafe = false; j.restored = true;
-    note(j, 'Settings an interrupted tune left behind were restored, and the model server re-read them.');
-    save();
   }
   async function restorePhase(j, p) {
     if (p._beforeText == null) return true;
@@ -1794,6 +1822,34 @@ function createFullAutotuner({ request: engineRequest, rawModels: engineRawModel
     try { return await recoverState(); } finally { await flush().catch(() => {}); }
   }
   // ---- what the Rust front (the state owner) asks of this actor: noevia-rs autotune_state.rs ----
+  // The ledger of front-issued operations that have effects (K r3): each carries the id the front minted. A
+  // receipt (settle) turns an operation whose response the front lost into an authenticated terminal
+  // state: still running, settled with its outcome, or refused. An operation the actor never received is
+  // fenced by asking for its receipt, so a late arrival is refused and can no longer have any effect.
+  const ledger = new Map(), LEDGER_MAX = 512, OP_ID = /^[0-9a-f-]{8,64}$/;
+  function ledgerBegin(op, kind) {
+    if (op === undefined) return undefined;
+    if (typeof op !== 'string' || !OP_ID.test(op)) throw Error('Invalid operation id');
+    if (ledger.has(op)) return null;
+    const entry = { kind, state: 'running', outcome: null };
+    ledger.set(op, entry);
+    for (const [key, value] of ledger) { if (ledger.size <= LEDGER_MAX) break; if (value.state !== 'running') ledger.delete(key); }
+    return entry;
+  }
+  function ledgerEnd(entry, outcome) { if (entry && entry.state === 'running') { entry.state = 'settled'; entry.outcome = outcome; } }
+  async function settle({ op, repair = false } = {}) {
+    if (typeof op !== 'string' || !OP_ID.test(op)) throw Error('Invalid operation id');
+    const entry = ledger.get(op);
+    if (!entry) { ledgerBegin(op, 'fenced'); const fenced = ledger.get(op); fenced.state = 'refused'; return { state: 'refused' }; }
+    if (entry.state === 'running') return { state: 'running' };
+    if (entry.state === 'refused') return { state: 'refused' };
+    if (entry.outcome?.needsRepair && repair === true) {
+      // The covered repair: the router's re-read the acknowledged answer said was still owed.
+      try { await flushReload(null); await flush(); entry.outcome = { ...entry.outcome, needsRepair: false }; }
+      catch { return { state: 'settled', outcome: entry.outcome, repaired: false }; }
+    }
+    return { state: 'settled', outcome: entry.outcome, repaired: !entry.outcome?.needsRepair };
+  }
   // Facts only this process has. Synchronous, no engine request.
   function outsideFacts(models = []) {
     if (!Array.isArray(models) || models.length > 1024 || models.some(m => typeof m !== 'string')) throw Error('Invalid outside request');
@@ -1801,8 +1857,15 @@ function createFullAutotuner({ request: engineRequest, rawModels: engineRawModel
       models: Object.fromEntries(models.map(m => [m, { configured: !!presets.get(m).exists, system: isSystemModel(m) }])) };
   }
   // The router's listing for the queue the owner holds (one resume preparation stage).
-  async function listingFacts(items, signal) {
+  async function listingFacts(items, signal, op) {
     if (!Array.isArray(items) || items.length > 512) throw Error('Invalid queue');
+    const entry = ledgerBegin(op, 'listing');
+    if (entry === null) return { applied: false };
+    try { return await listing(items, signal); }
+    catch (e) { ledgerEnd(entry, { error: true }); throw e; }
+    finally { if (entry?.state === 'running') ledgerEnd(entry, { ok: true }); }
+  }
+  async function listing(items, signal) {
     const rows = await rawModels().catch(() => null);
     if (signal?.aborted) return { applied: false };
     const data = rows?.ok && Array.isArray(rows.body?.data) && rows.body.data.length <= 8192 ? rows.body.data : null;
@@ -1812,8 +1875,18 @@ function createFullAutotuner({ request: engineRequest, rawModels: engineRawModel
   }
   // The pending router re-read (the one change a preparation allows across its await) and each
   // selected queued model's identity. The note it records must reach the owner before this answers.
-  async function identityFacts(selectors, signal) {
+  async function identityFacts(selectors, signal, op) {
     if (!Array.isArray(selectors) || selectors.length > 512) throw Error('Invalid selectors');
+    const entry = ledgerBegin(op, 'identities');
+    if (entry === null) return { applied: false };
+    try {
+      const answer = await identities(selectors, signal);
+      // The acknowledged "router has not re-read yet" leaves a repair owed; the receipt says so.
+      ledgerEnd(entry, answer.fault === 'reload' ? { fault: 'reload', needsRepair: true } : { ok: true });
+      return answer;
+    } catch (e) { ledgerEnd(entry, { error: true }); throw e; }
+  }
+  async function identities(selectors, signal) {
     const stale = () => Object.assign(Error('Resume state changed'), { code: 'resume_stale' });
     const guard = () => { if (signal?.aborted) throw stale(); };
     try {
@@ -1845,7 +1918,14 @@ function createFullAutotuner({ request: engineRequest, rawModels: engineRawModel
   }
   // The owner patched a resumable job and persisted it as running: this actor runs it. Only an
   // idle actor takes it; it adopts the owner's job and history, never its own older copy.
-  async function launch({ epoch, jobRev, job, history } = {}) {
+  async function launch(ask = {}) {
+    const entry = ledgerBegin(ask.op, 'launch');
+    if (entry === null) return { launched: false };
+    let out = { launched: false };
+    try { out = await launchRun_(ask); return out; }
+    finally { ledgerEnd(entry, { launched: out.launched === true }); }
+  }
+  async function launchRun_({ epoch, jobRev, job, history } = {}) {
     if (runActive || starting || fenced || !job || typeof job !== 'object' || Array.isArray(job) || job.status !== 'running' || !Number.isFinite(epoch)) return { launched: false };
     // A delayed request must still name the authority's current running generation. Do not
     // adopt a supplied revision before checking it against the authenticated store.
@@ -1860,6 +1940,6 @@ function createFullAutotuner({ request: engineRequest, rawModels: engineRawModel
     launchRun(state.job);
     return { launched: true };
   }
-  return { start, abort, launch, outsideFacts, listingFacts, identityFacts, statusFacts, scanFacts, recover, attach, ready, flushReload, completion: () => completion };
+  return { start, abort, launch, settle, outsideFacts, listingFacts, identityFacts, statusFacts, scanFacts, recover, attach, ready, flushReload, completion: () => completion };
 }
 module.exports = { createFullAutotuner, qualityCheck, qualityFailure, QUALITY, VERSION, newModel, hasHarmonyReasoning, kvCandidates, preferKv, bf16Unsupported, MODES, LONG_PROFILE_REASON };

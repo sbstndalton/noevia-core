@@ -18,13 +18,13 @@ for (const stage of ['invalidation', 'reload']) test(`cancel during ${stage} wai
 
 test('delayed launch validates current authority generation before any runner effect', async () => {
   const src = fs.readFileSync(require.resolve('./llamacpp-full-autotune.cjs'), 'utf8');
-  const start = src.search(/  (?:async )?function launch\(/);
+  const start = src.search(/  (?:async )?function launchRun_\(/);
   const end = src.indexOf('  return { start, abort, launch', start);
   let effects = 0;
   const context = { runActive: false, starting: false, fenced: null, state: { history: {} },
     stateClient: { sync: async () => ({ epoch: 9, jobRev: 9, state: { job: { id: 'new', status: 'running' } } }), setRun: () => {} },
     launchRun: () => { effects++; } };
-  vm.createContext(context); vm.runInContext(src.slice(start, end) + ';this.launch=launch;', context);
+  vm.createContext(context); vm.runInContext(src.slice(start, end) + ';this.launch=launchRun_;', context);
   const answer = await context.launch({ epoch: 8, jobRev: 8, job: { id: 'old', status: 'running' }, history: {} });
   assert.equal(answer.launched, false); assert.equal(effects, 0);
 });

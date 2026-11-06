@@ -9,6 +9,7 @@
 //   abort       - the owner recorded a cancellation: the running tune's abort signal fires
 //   launch      - the owner persisted a resumed job as running: this process runs it
 //   invalidate  - the model scan cache, after a queue-only resume
+//   settle      - the receipt of an earlier operation by its id (see the actor's ledger)
 //
 // Trusted front only (trusted-front.cjs): loopback, not a proxied request, the per-start secret.
 // A preparation call ends when the front stops waiting (its connection closes), which fires the
@@ -16,7 +17,7 @@
 const { trustedFront } = require('./trusted-front.cjs');
 
 const PREFIX = '/internal/autotune-actor/';
-const OPS = ['outside', 'listing', 'identities', 'abort', 'launch', 'invalidate'];
+const OPS = ['outside', 'listing', 'identities', 'abort', 'launch', 'invalidate', 'settle'];
 const MAX_BYTES = 64 * 1024 * 1024;
 const MAX_REPLY = 8 * 1024 * 1024;
 
@@ -38,9 +39,10 @@ function createAutotuneActorBridge({ secret, json, readJson, autotune, invalidat
       if (!live) { json(res, 503, { error: 'Auto-tune is unavailable.' }); return true; }
       let answer;
       if (op === 'outside') answer = live.outsideFacts(ask.models);
-      else if (op === 'listing') answer = await live.listingFacts(ask.items, controller.signal);
-      else if (op === 'identities') answer = await live.identityFacts(ask.selectors, controller.signal);
+      else if (op === 'listing') answer = await live.listingFacts(ask.items, controller.signal, ask.op);
+      else if (op === 'identities') answer = await live.identityFacts(ask.selectors, controller.signal, ask.op);
       else if (op === 'abort') answer = live.abort(ask);
+      else if (op === 'settle') answer = await live.settle(ask);
       else if (op === 'launch') { answer = await live.launch(ask); if (answer.launched) invalidate(); }
       else { invalidate(); answer = { ok: true }; }
       if (Buffer.byteLength(JSON.stringify(answer)) > MAX_REPLY) throw Error('reply over cap');

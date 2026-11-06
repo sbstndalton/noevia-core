@@ -21,7 +21,7 @@
 // Release pairing (noevia deploy/tools/assemble-release.sh autotune_state_pairing): this core keeps no
 // auto-tune state of its own and writes it only through the front's owner. Keep the quoted literal: the
 // release check reads it from this file, and pairs it with a front that serves the same store.
-const AUTOTUNE_STATE_CLIENT_MARKER = 'noevia-autotune-state-client/1';
+const AUTOTUNE_STATE_CLIENT_MARKER = 'noevia-autotune-state-client/2';
 const WRITER = /^[0-9a-f]{32}$/;
 
 class Fenced extends Error {

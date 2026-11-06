@@ -88,3 +88,19 @@ test('attachWhenReady retries until the front answers, then recovers; a deployme
   await attachWhenReady({ actor: { attach: async () => {}, recover: async () => { throw Error('x'); } }, log: m => log.push(m) });
   assert.equal(log.at(-1), '[autotune-actor] recovery failed');
 });
+
+test('K r3: the operation id travels with listing, identities and launch, and settle answers the actor\'s receipt', async () => {
+  const seen = [];
+  const actor = live({ listingFacts: async (items, _s, op) => { seen.push(['listing', op]); return { models: [] }; },
+    identityFacts: async (sel, _s, op) => { seen.push(['identities', op]); return { identities: [] }; },
+    launch: async ask => { seen.push(['launch', ask.op]); return { launched: true }; },
+    settle: async ask => { seen.push(['settle', ask.op, ask.repair]); return { state: 'settled', outcome: { ok: true }, repaired: true }; } });
+  const OP = '00000000-0000-4000-8000-000000000001';
+  for (const [op, ask] of [['listing', { items: [], op: OP }], ['identities', { selectors: [], op: OP }], ['launch', { epoch: 1, op: OP }], ['settle', { op: OP, repair: true }]]) {
+    const r = rig(actor, { ask });
+    await r.handle(request(op), { writableFinished: true });
+    assert.equal(r.sent[0].status, 200, op);
+  }
+  assert.deepEqual(seen, [['listing', OP], ['identities', OP], ['launch', OP], ['settle', OP, true]]);
+  assert.ok(OPS.includes('settle'));
+});
