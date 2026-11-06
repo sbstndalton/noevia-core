@@ -163,7 +163,7 @@ async function fetchJson(url, opts, timeoutMs, maxResponseBytes) {
     } catch {
       body = text;
     }
-    return { ok: res.ok, status: res.status, body };
+    return { ok: res.ok, status: res.status, body, ...(res.headers.get('x-noevia-maintenance-uncertain')==='1'?{maintenanceUncertain:true}:{}) };
   } finally {
     clearTimeout(timer);
     external?.removeEventListener('abort', onAbort);

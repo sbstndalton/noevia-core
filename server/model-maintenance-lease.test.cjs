@@ -230,3 +230,23 @@ test('a foreign gate hold is visible to real-manager tuningActive and inferenceB
   assert.equal(manager.inferenceBusy(),false);
   assert.ok(paths.every(p=>p.startsWith('GET /gate/v1/status')||p.startsWith('POST /gate/v1/maintenance')||p.startsWith('DELETE /gate/v1/maintenance/')),'no model/load/inference path was called');
 });
+
+
+test('recovery HTTP completion requires the current repair generation and cannot clear a later incident', async (t) => {
+  const gate=createMaintenanceGate();
+  const {ask}=await serve(t,{hold:({recovery}={})=>gate.holdLocal(undefined,{recovery}),barrier:()=>gate.barrier('repair',{recovery:true})});
+  const A='a'.repeat(32),B='b'.repeat(32);
+  const headers={'x-noevia-store-token':SECRET};
+  const incident=t=>`${PREFIX}/recovery/${t}`;
+  await ask('POST',incident(A));
+  assert.equal((await ask('DELETE',incident(A))).status,400);
+  const repair=(await ask('POST',PREFIX,headers,JSON.stringify({recovery:true}))).body;
+  assert.equal((await ask('DELETE',incident(A),headers,JSON.stringify({...repair,generation:repair.generation+1,ttlMs:undefined,renewMs:undefined,hardMs:undefined}))).status,409);
+  const proof=JSON.stringify({lease:repair.lease,generation:repair.generation});
+  assert.equal((await ask('DELETE',incident(A),headers,proof)).status,204);
+  await ask('DELETE',`${PREFIX}/${repair.lease}`);
+  await ask('POST',incident(B));
+  assert.equal((await ask('DELETE',incident(A),headers,proof)).status,204);
+  await ask('POST',incident(B));
+  assert.throws(()=>gate.enter(),e=>e.status===503);
+});

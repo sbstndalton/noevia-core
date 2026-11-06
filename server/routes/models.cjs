@@ -77,7 +77,8 @@ function createModelRoutes({ servedEmbeddingModels = (target) => require('../rag
   const loaderHeaders = () => ({ 'Content-Type': 'application/json', ...(env.MODEL_LOADER_TOKEN ? { 'X-Model-Loader-Token': env.MODEL_LOADER_TOKEN } : {}) });
   // #873: the throughput sweep holds the inference maintenance gate for as long as it runs.
   const sweepGuard = typeof modelManager.holdMaintenance === 'function' ? require('../benchmark-sweep-guard.cjs').createSweepGuard({
-    hold: reason => modelManager.holdMaintenance(reason),
+    hold: (reason, options) => modelManager.holdMaintenance(reason, options),
+    barrier: typeof modelManager.maintenanceBarrier === 'function' ? reason => modelManager.maintenanceBarrier(reason) : null,
     progress: () => fetchJson(`${String(env.MODEL_LOADER_URL || '').replace(/\/+$/, '')}/api/v1/benchmark/progress`, { method: 'GET', headers: loaderHeaders() }, 15000),
     log: message => console.log(message),
     ...sweepGuardOptions,
@@ -288,7 +289,7 @@ function createModelRoutes({ servedEmbeddingModels = (target) => require('../rag
           if(refusal)return json(res,409,refusal);
         }
         if(sweepGuard&&aliases.length){
-          try{sweepRelease=await sweepGuard.acquire();}catch(e){return json(res,409,{error:e.publicMessage||'The sweep could not start.'});}
+          try{sweepRelease=await sweepGuard.acquire();}catch(e){return json(res,e?.status===503?503:409,{error:e.publicMessage||'The sweep could not start.',...(e?.status===503?{code:e.code,retryable:true}:{})});}
           sweepModels=aliases.length;
         }
       }
@@ -496,12 +497,13 @@ function createModelRoutes({ servedEmbeddingModels = (target) => require('../rag
       return json(res,405,{error:'Method not allowed'});
     }
 
+    // The GET is the Rust front's (rust-preset-read.cjs) and so is the PUT, the preset editor (D2,
+    // rust-preset-write.cjs); both are refused before authentication. Other methods keep this answer.
     if (p === '/api/models/preset') {
       if(authn.user.role!=='admin')return json(res,403,{error:'Administrator required for shared model profiles'});
-      if(!modelManager.applyPreset)return json(res,404,{error:'Native presets are unavailable'});
-      if(req.method!=='PUT')return json(res,405,{error:'Method not allowed'});
-      const result=await modelManager.applyPreset(await readJson(req));
-      return json(res,result.status,result.body);
+      // Only the llama.cpp adapter has native presets (presetFacts); another engine says so, as it always did.
+      if(!modelManager.presetFacts)return json(res,404,{error:'Native presets are unavailable'});
+      return json(res,405,{error:'Method not allowed'});
     }
 
     // #2187: GET /api/models/capabilities and GET /api/models/hardware are the Rust front's

@@ -272,6 +272,15 @@ test('engine-specific routes say what is unavailable and guard the method', asyn
   assert.deepEqual(f.sent.pop(), { status: 404, body: { error: 'Auto-tune is unavailable' } });
   await f.call('GET', '/api/models/preset', undefined, 'member');
   assert.deepEqual(f.sent.pop(), { status: 403, body: { error: 'Administrator required for shared model profiles' } });
+  // The preset editor's PUT is the Rust front's (D2, rust-preset-write.cjs): a PUT that gets past the refusal
+  // does not run the manager; an administrator is told 405, a member 403 first.
+  await f.call('PUT', '/api/models/preset', { model: 'm' }, 'member');
+  assert.deepEqual(f.sent.pop(), { status: 403, body: { error: 'administrator required' } });
+  await f.call('PUT', '/api/models/preset', { model: 'm' }, 'admin');
+  assert.deepEqual(f.sent.pop(), { status: 404, body: { error: 'Native presets are unavailable' } }, 'an engine without native presets');
+  const withPresets = fixture({ manager: { presetFacts: () => null } });
+  await withPresets.call('PUT', '/api/models/preset', { model: 'm' }, 'admin');
+  assert.deepEqual(withPresets.sent.pop(), { status: 405, body: { error: 'Method not allowed' } });
   await f.call('GET', '/api/models/mtp-artifact', undefined, 'member', '?repo=bad');
   assert.deepEqual(f.sent.pop(), { status: 400, body: { error: 'Invalid repository' } });
   await f.call('POST', '/api/models/installed', undefined, 'admin');
@@ -705,7 +714,7 @@ test('#873: a sweep still running after a web restart takes the gate back at sta
   const timers = [];
   const make = (job, gate = createMaintenanceGate()) => {
     let current = job;
-    const f = fixture({ env: { MODEL_LOADER_URL: 'http://loader' }, manager: { holdMaintenance: (reason) => gate.hold(reason) },
+    const f = fixture({ env: { MODEL_LOADER_URL: 'http://loader' }, manager: { holdMaintenance: (reason, options) => gate.hold(reason, options), maintenanceBarrier: reason=>gate.barrier(reason,{recovery:true}) },
       fetchReply: (url) => (url.endsWith('/benchmark/progress') ? { ok: true, status: 200, body: { job: current } } : { ok: true, status: 200, body: {} }),
       sweepGuardOptions: { setTimer: (fn) => { timers.push(fn); return { unref() {} }; }, clearTimer: () => {} } });
     return { f, gate, finish: () => { current = { active: false, unit: 'models' }; } };
@@ -725,7 +734,10 @@ test('#873: a sweep still running after a web restart takes the gate back at sta
   // A gate already held (requests in flight cannot be at startup, but a calibration can) is not fought over.
   const busyGate = createMaintenanceGate(); const release = busyGate.hold('calibrating');
   const busy = make({ active: true, unit: 'models', total: 1 }, busyGate);
-  assert.equal(await busy.f.ready, false); release();
+  await new Promise(setImmediate); release();
+  timers.shift()();
+  assert.equal(await busy.f.ready, true, 'known sweep is adopted after the earlier writer settles');
+  busy.finish();await timers.shift()();
   assert.equal(timers.length, 0);
 });
 

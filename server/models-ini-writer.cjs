@@ -42,10 +42,10 @@ function createModelsIniWriter({mode,url,token,fetchJson}) {
   const endpoint=String(url).replace(/\/+$/,'')+'/api/v1/models-ini';
   return {
     kind,
-    async write({baseRevision,text,backup}) {
+    async write({baseRevision,text,backup,maintenance}) {
       let result;
       try {
-        result=await fetchJson(endpoint,{method:'PUT',headers:{'Content-Type':'application/json',...(token?{'X-Model-Loader-Token':token}:{})},body:JSON.stringify({baseRevision,text,...(backup===false?{backup:false}:{})})},30000);
+        result=await fetchJson(endpoint,{method:'PUT',headers:{'Content-Type':'application/json',...(token?{'X-Model-Loader-Token':token}:{})},body:JSON.stringify({baseRevision,text,...(maintenance?{maintenance}:{}),...(backup===false?{backup:false}:{})})},30000);
       } catch {throw error(503,UNCERTAIN,{uncertain:true});}
       if(result?.ok&&result.body?.ok===true)return {revision:result.body.revision};
       // 401/403: token mismatch, told apart from an outage (the token itself is never echoed).
