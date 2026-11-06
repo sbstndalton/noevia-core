@@ -130,3 +130,4 @@ test('the replaced Node code is gone and index.cjs is wired to the front, with t
   const client = fs.readFileSync(path.join(__dirname, 'project-store-client.cjs'), 'utf8');
   assert.ok(!client.includes('changesRead'));
 });
+
