@@ -184,6 +184,7 @@ function unavailable(cause) {
 function createNativeLeaseClient({ port, token, fetchImpl = globalThis.fetch, boot = crypto.randomBytes(16).toString('hex'), startedAt = Date.now(), timeoutMs = CALL_TIMEOUT_MS, retryMs = 1000, now = () => Date.now() }) {
   const ok = Number.isInteger(port) && port > 0 && port < 65536 && String(token || '').length > 0;
   let incarnation = null, retired = false;
+  const repairGrants = new Map();
   async function call(op, body, wait = timeoutMs, signal = null) {
     if (!ok) throw unavailable();
     const deadline = AbortSignal.timeout(wait);
@@ -239,14 +240,15 @@ function createNativeLeaseClient({ port, token, fetchImpl = globalThis.fetch, bo
     ready,
     /** A native grant {token, native, askedAt, ttlMs, renewMs, hardMs, generation, header: false} | throws
      *  409 (held) | throws 503 (no answer, or this start was retired). */
-    async holdMaintenance(reason, { waitMs = 0, signal, maxMs = MAX_MS } = {}) {
+    async holdMaintenance(reason, { waitMs = 0, signal, maxMs = MAX_MS, recovery = false } = {}) {
       const wait = Math.max(0, Math.min(MAX_WAIT_MS, Number(waitMs) || 0));
       const inc = await registered();
       const askedAt = now();
-      const ask = { incarnation: inc, reason: String(reason || '').slice(0, 300), waitMs: wait, maxMs };
+      const ask = { incarnation: inc, reason: String(reason || '').slice(0, 300), waitMs: wait, maxMs, ...(recovery?{recovery:true}:{}) };
       const { status, body } = await call('acquire', ask, wait + timeoutMs, signal);
       if (status === 201 && body && typeof body.lease === 'string' && /^[0-9a-f]{32}$/.test(body.lease)
         && [body.ttlMs, body.renewMs, body.hardMs].every((v) => Number.isSafeInteger(v) && v > 0)) {
+        if(recovery)repairGrants.set(body.lease,{generation:body.generation,incident:body.incident??null});
         return { token: body.lease, native: true, askedAt, ttlMs: body.ttlMs, renewMs: body.renewMs, hardMs: body.hardMs, generation: body.generation, epoch: body.epoch, idleTtlMs: body.renewMs * 3, header: false };
       }
       if (status === 409) throw Object.assign(new Error(body?.error || 'Inference is busy.'), { status: 409, code: 'maintenance_held', chatActive: false });
@@ -261,6 +263,7 @@ function createNativeLeaseClient({ port, token, fetchImpl = globalThis.fetch, bo
       } catch { return null; }
     },
     async releaseMaintenance(lease) {
+      repairGrants.delete(lease);
       if (retired || incarnation === null) return;
       try { await call('release', { incarnation, lease }); } catch { /* an unreleased lease ends by itself */ }
     },
@@ -271,6 +274,12 @@ function createNativeLeaseClient({ port, token, fetchImpl = globalThis.fetch, bo
         return status === 200 && typeof body?.held === 'boolean' ? body.held : null;
       } catch { return null; }
     },
+    async completeRecovery(lease) {
+      const inc=await registered();
+      const proof=repairGrants.get(lease);if(!proof)throw unavailable();
+      const result=await call('complete-recovery',{incarnation:inc,lease,...proof},timeoutMs);
+      if(result.status!==200)throw unavailable();
+    },
     session,
   };
 }
@@ -278,25 +287,35 @@ function createNativeLeaseClient({ port, token, fetchImpl = globalThis.fetch, bo
 /** The inference gate first (#2187: the authority when it has the hold API), the native authority when
  *  the gate answers it has none (null). Each token is renewed and released where it was granted. */
 function chainRemotes(gate, native) {
-  const fromNative = new Set();
+  const grants = new Map();
+  const pair = t => grants.get(t);
   return {
     hasAdmin: () => true,
     ...(typeof native.ready === 'function' ? { ready: () => native.ready() } : {}),
     async holdMaintenance(reason, options) {
-      const granted = await gate.holdMaintenance(reason, options);
-      if (granted !== null) return granted;
       const own = await native.holdMaintenance(reason, options);
-      fromNative.add(own.token);
-      return own;
+      const operation = require('./preset-publication.cjs').beginOperation(own,'acquire');
+      try {
+        const delegated = await gate.holdMaintenance(reason, {...options, maintenance:operation?.fence});
+        operation?.settle();
+        const token=delegated?.token || own.token;
+        grants.set(token,{own,delegated});
+        return {...own,token,authorityLease:own.token,header:!!delegated};
+      } catch(e) { void native.releaseMaintenance(own.token); throw e; }
     },
-    renewMaintenance: (t, reason) => (fromNative.has(t) ? native : gate).renewMaintenance(t, reason),
-    releaseMaintenance(t) { const n = fromNative.delete(t); return (n ? native : gate).releaseMaintenance(t); },
-    async maintenanceHeld() {
-      const held = typeof gate.maintenanceHeld === 'function' ? await gate.maintenanceHeld().catch(() => null) : null;
-      if (held === true) return true;
-      const own = await native.maintenanceHeld();
-      return held === false && own === null ? false : own;
+    async renewMaintenance(t, reason) {
+      const p=pair(t);if(!p)return false;
+      const n=await native.renewMaintenance(p.own.token,reason);
+      const g=p.delegated?await gate.renewMaintenance(p.delegated.token,reason):true;
+      return n===true&&g===true?true:n===false||g===false?false:null;
     },
+    async releaseMaintenance(t) {
+      const p=pair(t);grants.delete(t);if(!p)return true;
+      if(p.delegated)await gate.releaseMaintenance(p.delegated.token);
+      return native.releaseMaintenance(p.own.token);
+    },
+    completeRecovery(t) {const p=pair(t);return native.completeRecovery(p?.own.token || t);},
+    async maintenanceHeld() {return native.maintenanceHeld();},
   };
 }
 

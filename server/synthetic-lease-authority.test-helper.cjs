@@ -39,6 +39,7 @@ async function authority(t, { ttlMs = 180000, renewMs = 10000, hardMs = 3600000 
         holder = { origin: 'node', lease: crypto.randomBytes(16).toString('hex'), generation: ++generation, until: now() + ttlMs, hardAt: now() + hardMs };
         return send(201, { lease: holder.lease, generation: holder.generation, epoch: 'e', ttlMs, renewMs, hardMs });
       }
+      if(op==='complete-recovery')return send(holder&&holder.lease===body.lease&&holder.generation===body.generation&&body.incident==null?200:409,{});
       if (op === 'renew') {
         if (renew === 'hang') return; // never answers: the client's call times out (no answer)
         if (renew === 'error') return send(500, {});

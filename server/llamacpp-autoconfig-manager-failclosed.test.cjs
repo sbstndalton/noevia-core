@@ -77,9 +77,7 @@ test('manager: a faulty evaluator refuses a preset save, leaving the ini untouch
   const refusal = await m.presetRefusal('small', { 'ctx-size': '8192' });
   assert.ok(probe.ran > 0);
   assert.equal(refusal.code, 'autoconfig_impl'); assert.match(refusal.error, /^Not saved: /);
-  const rev = m.presetFacts('small').revision;
-  const saved = await m.applyPreset({ model: 'small', baseRevision: rev, confirmReload: true, options: { 'ctx-size': '8192' } });
-  assert.equal(saved.status, 409); assert.equal(saved.body.code, 'autoconfig_impl');
+  // The preset editor's own save (PUT /api/models/preset) is the Rust front's; it refuses closed the same way.
   assert.equal(fs.readFileSync(ini, 'utf8'), before);
   assert.ok(!calls.includes('POST /models/load'), calls.join('\n'));
 });

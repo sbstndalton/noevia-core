@@ -302,7 +302,7 @@ test('a cancelled wait for the authority takes nothing and rejects as cancelled'
   assert.equal(a.held().origin, 'front');
 });
 
-test('chainRemotes: the inference gate when it grants, the authority when it has no hold API', async (t) => {
+test('chainRemotes: native authority and configured inference gate grant a paired hold', async (t) => {
   const a = await authority(t);
   const native = createNativeLeaseClient({ port: a.port, token: SECRET, boot: 'b', startedAt: 1 });
   const gateCalls = [];
@@ -317,7 +317,11 @@ test('chainRemotes: the inference gate when it grants, the authority when it has
   assert.deepEqual(gateCalls, [], 'a native token never goes to the gate');
   const granted = chainRemotes({ ...gate, holdMaintenance: async () => ({ token: 'a'.repeat(32), idleTtlMs: 60000 }) }, native);
   assert.equal((await granted.holdMaintenance('x', {})).token, 'a'.repeat(32));
-  assert.equal(a.held(), null, 'the authority is not asked when the gate grants');
+  assert.ok(a.held(), 'the native generation also excludes Node while the gate grants');
+  assert.equal(await granted.renewMaintenance('a'.repeat(32)),true);
+  await granted.releaseMaintenance('a'.repeat(32));
+  assert.equal(a.held(),null);
+  assert.deepEqual(gateCalls,[['renew','a'.repeat(32)],['release','a'.repeat(32)]]);
 });
 
 // ---- Delta review P1: every engine dispatch is covered, and the loss aborts work in flight. ----
@@ -375,7 +379,7 @@ test('P1 a router call in flight when the lease is lost is aborted, and chat sta
   const client = createNativeLeaseClient({ port: a.port, token: SECRET, boot: 'b', startedAt: 1 });
   let aborted = false, engineBusy = true, idleChecks = 0;
   const { m } = routed(client, async (name, opts) => {
-    if (name === 'GET /models?reload') {
+    if (name === 'GET /models?reload' && !aborted) {
       a.setRenew('ended');
       await new Promise((resolve) => { if (opts.signal?.aborted) resolve(); opts.signal?.addEventListener('abort', resolve, { once: true }); });
       aborted = true;

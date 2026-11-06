@@ -55,14 +55,33 @@ function createLlamaCppManager({ budgetWatchDir = null, baseUrl, apiKey, fetchJs
   // flight is aborted when it is lost (set once the maintenance gate exists, below).
   let dispatchSignal = (signal) => signal;
   let lostReason = () => null;
-  const covered = (send) => async (path, options = {}, timeout) => {
+  let beginOperation = () => null;
+  const covered = (send, streaming=false) => async (path, options = {}, timeout) => {
     const signal = dispatchSignal(options.signal);
-    try { return await send(path, signal === options.signal ? options : { ...options, signal }, timeout); }
-    catch (e) { throw lostReason(signal) || e; }
+    const reload = /[?&]reload=/.test(path);
+    const writes = !['GET','HEAD'].includes(String(options.method||'GET').toUpperCase());
+    const kind = reload ? 'reload' : path==='/models' && writes ? 'pull' : 'control';
+    let expected=null;
+    if(reload || kind==='pull')try{expected=presets?.snapshot().revision??null;}catch{}
+    const op = reload || writes ? beginOperation(kind,expected) : null;
+    const unknown=()=>{if(op){try{op.unknown();}catch{} maintenance.operationUnknown();}};
+    const scoped = op ? {...options,headers:{...options.headers,'X-Noevia-Maintenance-Fence':JSON.stringify(op.fence)}} : options;
+    try {
+      const result = await send(path, signal === options.signal ? scoped : {...scoped,signal}, timeout);
+      if(result?.maintenanceUncertain || result?.headers?.get?.('x-noevia-maintenance-uncertain')==='1')unknown();
+      else if(op && streaming && result?.body?.getReader){
+        const reader=result.body.getReader();
+        const body=new ReadableStream({
+          async pull(controller){try{const {done,value}=await reader.read();if(done){op.settle();controller.close();}else controller.enqueue(value);}catch(e){unknown();controller.error(e);}},
+          async cancel(reason){unknown();await reader.cancel(reason);}
+        });
+        return new Response(body,{status:result.status,statusText:result.statusText,headers:result.headers});
+      } else op?.settle();
+      return result;
+    } catch (e) { unknown();throw lostReason(signal) || e; }
   };
   const rawRequest = covered((path, options = {}, timeout = 8000) => fetchJson(base + path, { ...options, headers: headers(options.headers) }, timeout));
-  // The same for a streamed engine call: the stream is aborted with the lease.
-  const stream = covered((path, opts = {}) => (fetchStream || fetch)(base + path, { ...opts, headers: headers(opts.headers), redirect: 'error' }));
+  const stream = covered((path, opts = {}) => (fetchStream || fetch)(base + path, { ...opts, headers: headers(opts.headers), redirect: 'error' }),true);
   // #697: every load this process asks for (the Models page, calibration, auto-tune) passes the
   // inference memory budget first. Chat turns pass it in prepareLoad, before they ask for a lease.
   async function request(path, options = {}, timeout = 8000) {
@@ -91,7 +110,11 @@ function createLlamaCppManager({ budgetWatchDir = null, baseUrl, apiKey, fetchJs
   // Every commit (apply, calibration, auto-tune, restores) settles an uncertain Model Loader
   // write by reading models.ini back instead of assuming nothing changed (#339).
   const {commitReconciled}=require('./models-ini-writer.cjs');
-  const presets=store ? {...store,commit:(candidate,options)=>commitReconciled(store,candidate,options)} : null;
+  const presets=store ? {...store,commit:async(candidate,options)=>{
+    const op=beginOperation('preset-write',candidate.baseRevision);
+    try { const result=await commitReconciled(store,candidate,{...options,...(op?{maintenance:op.fence}:{})}); op?.settle(); return result; }
+    catch(e){if(op){try{op.unknown();}catch{} maintenance.operationUnknown();}throw e;}
+  }} : null;
   // #2187: the inference gate is the maintenance authority whenever it is configured (and has the
   // hold API); this process's own gate is the fallback without one (inference-maintenance.cjs).
   // Row J: without one, the Rust front's lease authority (model-maintenance-lease.cjs createNativeLeaseClient).
@@ -101,6 +124,8 @@ function createLlamaCppManager({ budgetWatchDir = null, baseUrl, apiKey, fetchJs
   const PRESET_STEP_MS=Number.isFinite(maintenanceGateOptions.presetStepMs)?maintenanceGateOptions.presetStepMs:150000;
   const maintenance=require('./inference-maintenance.cjs').createMaintenanceGate({remote:maintenanceRemote,observeMs:gate?0:3000,...maintenanceGateOptions});
   holdHeaders=maintenance.holdHeaders;
+  beginOperation=(kind,expected)=>maintenance.beginPublication(kind,expected,presetPath);
+  maintenance.recoveryReread=async()=>{const result=await routerReload(120000);if(!result.ok)throw Error('Native preset reread did not settle.');};
   dispatchSignal=signal=>maintenance.dispatchSignal(signal);
   // Delta review P1: the settle step of every recovery from lost coverage, under the fresh lease: the
   // engine confirmed idle (every model unloaded, as the router itself reports), not just our HTTP call
@@ -295,25 +320,8 @@ function createLlamaCppManager({ budgetWatchDir = null, baseUrl, apiKey, fetchJs
     }
     return {ok:true,status:200,body:require('./llamacpp-metrics.cjs').summarize(rows)};
   }
-  async function applyPreset(body) {
-    if(!presets)return unsupported('Native preset editing; configure LLAMACPP_PRESET_PATH');
-    if(body?.confirmReload!==true) return {ok:false,status:400,body:{error:'Confirm that other clients and Diary background inference are stopped before reloading.'}};
-    return maintenance.exclusive(async()=>{
-      const {isSystemModel,modelPathFromArgs,SYSTEM_MODEL_REASON}=require('./model-system.cjs');
-      const listing=await rawModels();
-      if(listing.ok){
-        const row=(listing.body?.data||[]).find(m=>m.id===body?.model);
-        if(row && isSystemModel(row.id, modelPathFromArgs(row.status?.args))) return {ok:false,status:400,body:{error:SYSTEM_MODEL_REASON}};
-      }
-      // #697: a dry run of the same write, estimated before anything is committed.
-      let section=null;
-      try {const candidate=presets.prepare(body);section=require('./llamacpp-presets.cjs').parse(candidate.text).sections.get(body.model)?.options||null;} catch {}
-      const refusal=section?await presetRefusal(body.model,section):null;
-      if(refusal)return {ok:false,status:409,body:refusal};
-      return applyUnlocked(body);
-    });
-  }
-  // Caller must hold the maintenance gate (applyPreset or a calibration job).
+  // Caller must hold the maintenance gate (a calibration or auto-tune job). The public preset editor (PUT
+  // /api/models/preset) is the Rust front's (rust-preset-write.cjs); this is the same write for the jobs that remain here.
   // writeOptions.backup:false is auto-tune's alone (#1003); request bodies cannot ask for it.
   async function applyUnlocked(body, writeOptions = {}) {
     const listing=await rawModels();
@@ -824,7 +832,6 @@ function createLlamaCppManager({ budgetWatchDir = null, baseUrl, apiKey, fetchJs
     maintenanceRecoveryPending: () => maintenance.recoveryPending(),
     tuningActive: () => maintenance.held() || calibrator?.stateFacts().job?.status === 'running' || autotuner?.statusFacts().job?.status === 'running',
     presetFacts: model => presets?.get(model) ?? null,
-    applyPreset,
     // #697: the load guard and the budget, for the proxied benchmark start and the watchdog.
     loadRefusal: model => overBudget(model).then(r => r ? r.body : null),
     // LLAMACPP_PRESETS_IMPL=wasm: an entry the Rust port folds differently is refused (400), never dropped.

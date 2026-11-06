@@ -1185,6 +1185,9 @@ const modelDownloadsFacts = require('./rust-model-downloads-read-facts.cjs').cre
 const presetReadBridge = require('./rust-preset-read-bridge.cjs').createPresetReadBridge({
   secret: FRONT_SECRET, json, readJson, manager: () => modelManager,
 });
+const presetWriteEffects = require('./rust-preset-write-effects.cjs').createPresetWriteEffects({
+  secret: FRONT_SECRET, json, service: modelService,
+});
 const autotuneReadBridge = require('./rust-autotune-read-bridge.cjs').createAutotuneReadBridge({
   secret: FRONT_SECRET, json, readJson, autotune: () => modelManager.autotune,
 });
@@ -1301,6 +1304,8 @@ async function handleRequestInner(req, res) {
   if (embeddingOwner.handle(req, res, json)) return;
   if (require('./rust-preset-read.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   if (await presetReadBridge(req, res)) return;
+  if (require('./rust-preset-write.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
+  if (await presetWriteEffects(req, res)) return;
   if (await autotuneReadBridge(req, res)) return;
   if (require('./rust-autotune-resume.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   if (await autotuneResumeBridge(req, res)) return;
