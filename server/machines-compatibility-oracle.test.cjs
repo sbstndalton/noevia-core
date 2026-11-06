@@ -41,6 +41,8 @@ test('replacement coercion: String() of the name/address value, ToPrimitive fail
   assert.deepEqual(byRaw('[1,[2,[null,{"x":{"toString":1}}]]]').add, { ok: '1,2,,[object Object]' });
   // Deep arrays: String() recurses and V8 throws RangeError far below the 1 MiB body cap.
   assert.deepEqual(byNest(2500, '"x"').add, { ok: 'x' });
+  assert.deepEqual(byNest(2601, '"x"').add, { ok: 'x' });
+  assert.deepEqual(byNest(2610, '"x"').add, { ok: 'x' });
   assert.deepEqual(byNest(5000, '"x"').add, { throws: 'RangeError', writes: 0 });
   assert.deepEqual(byNest(100000, '{"toString":1}').coerce, { throws: 'RangeError' });
   assert.deepEqual(byNest(100, '{"toString":1}').coerce, { throws: 'TypeError' });
