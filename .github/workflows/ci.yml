@@ -138,7 +138,9 @@ jobs:
           # The native model manager's route table and models.ini cap (noevia-services#216 retired the Python
           # app server/model-loader-contract.test.cjs used to scan): tests/fixtures/model-manager-routes.v1.json
           # is read from routing.rs / section_writes/mod.rs by tools/gen-model-manager-routes.cjs.
-          node tools/gen-model-manager-routes.cjs --check "$RUNNER_TEMP/rs"
+          # Fail closed: the generator proves the declarations are the active ones and that the cargo features
+          # gating them are enabled by the production image build (services/model-manager/Dockerfile).
+          node tools/gen-model-manager-routes.cjs --check --image-dockerfile ../../services/model-manager/Dockerfile "$RUNNER_TEMP/rs"
           rustup target add wasm32-unknown-unknown --toolchain 1.99.0
           "$RUNNER_TEMP/rs/tools/build-dav-parse-wasm.sh" "$PWD/server/wasm/dav-parse.wasm"
           echo "$DAV_PARSE_WASM_SHA256  server/wasm/dav-parse.wasm" | sha256sum -c -

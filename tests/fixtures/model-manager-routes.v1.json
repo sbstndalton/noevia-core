@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "source": {"repo":"sbstndalton/noevia-rs","ref":"6e4730c65cc956de7aabf05c3ef87c99a3d3f38e","files":["bins/noevia-model-manager/src/routing.rs","bins/noevia-model-manager/src/section_writes/mod.rs"]},
+  "source": {"repo":"sbstndalton/noevia-rs","ref":"6e4730c65cc956de7aabf05c3ef87c99a3d3f38e","files":["bins/noevia-model-manager/src/routing.rs","bins/noevia-model-manager/src/section_writes/mod.rs","bins/noevia-model-manager/src/lib.rs","bins/noevia-model-manager/Cargo.toml"]},
   "routes": [
     ["GET","/api/v1/overview"],
     ["GET","/api/v1/models"],
