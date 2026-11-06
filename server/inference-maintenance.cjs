@@ -70,9 +70,9 @@ function createMaintenanceGate({ remote = null, log = (line) => console.log(line
   // step (assertCovered, the release's signal), while this process keeps its local exclusion until the work
   // releases, so nothing of this process runs beside a step still in flight.
   function nativeHolding(message, granted) {
-    maintenance=true;reason=message||'';holdToken=granted.token;holdHeader=false;
+    maintenance=true;reason=message||'';holdToken=granted.token;holdHeader=granted.header!==false;
     foreignHeld=false;generation++;
-    const state={lost:false,why:'',confirmedAt:granted.askedAt,hardAt:granted.askedAt+granted.hardMs,ttl:granted.ttlMs,controller:new AbortController()};
+    const state={lost:false,why:'',confirmedAt:granted.askedAt,hardAt:granted.askedAt+granted.hardMs,ttl:granted.ttlMs,controller:new AbortController(),grant:granted};
     coverage=state;
     let released=false,renewing=false;
     const lose=why=>{
@@ -100,6 +100,7 @@ function createMaintenanceGate({ remote = null, log = (line) => console.log(line
     const timer=setTimer(tick,Math.max(1,granted.renewMs||10000));
     timer?.unref?.();
     const release=()=>{
+      if(require('./preset-publication.cjs').incidentPending())requireRecovery('publication-unknown',null,'An interrupted native operation needs reconciliation.');
       if(released)return;
       released=true;clearTimer(timer);
       const token=holdToken;
@@ -259,6 +260,9 @@ function createMaintenanceGate({ remote = null, log = (line) => console.log(line
         gate.assertCovered();
         recoveries.delete(key);
       }
+      if(typeof gate.recoveryReread==='function')await gate.recoveryReread(ctx);
+      gate.assertCovered();
+      if(typeof remote?.completeRecovery==='function')await remote.completeRecovery(holdToken);
       ok=true;
     }catch(e){
       log(`[models] recovery from interrupted model maintenance did not finish (${e?.message||e}); chat stays paused and it is tried again`);
@@ -294,7 +298,7 @@ function createMaintenanceGate({ remote = null, log = (line) => console.log(line
         }
       }
     },
-    enter() {if(closed())throw Object.assign(Error((maintenance&&reason)||(bootFenced&&bootReason)||(barriers>0&&barrierReason)||(recoveries.size>0&&recoveryReason)||'Model configuration is being applied. Try again shortly.'),{status:503});active++;let released=false;return ()=>{if(!released){released=true;active--;wake();}};},
+    enter() {if(closed()||require('./preset-publication.cjs').admissionClosed())throw Object.assign(Error((maintenance&&reason)||(bootFenced&&bootReason)||(barriers>0&&barrierReason)||(recoveries.size>0&&recoveryReason)||'Model configuration is being applied. Try again shortly.'),{status:503});active++;let released=false;return ()=>{if(!released){released=true;active--;wake();}};},
     async exclusive(fn) {const release=await hold();try{return await fn();}finally{release();}},
     hold,
     holdLocal,
@@ -315,6 +319,10 @@ function createMaintenanceGate({ remote = null, log = (line) => console.log(line
       if(now()+coverageMarginMs>=c.confirmedAt+c.ttl){c.lose?.('could not be renewed');throw coverageError('could not be renewed');}
       if(now()+coverageMarginMs>=c.hardAt){c.lose?.('passed its limit');throw coverageError('passed its limit');}
       if(now()+Math.max(0,Number(stepMs)||0)+coverageMarginMs>=c.hardAt)throw coverageError('cannot cover the next step');
+    },
+    beginPublication() {
+      gate.assertCovered();
+      return require('./preset-publication.cjs').beginOperation(coverage?.grant || null);
     },
     // The current lease's lost-coverage signal (null when no lease of the front's authority is held).
     coverageSignal: () => coverage?.controller.signal || null,

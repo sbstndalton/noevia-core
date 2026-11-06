@@ -55,10 +55,17 @@ function createLlamaCppManager({ budgetWatchDir = null, baseUrl, apiKey, fetchJs
   // flight is aborted when it is lost (set once the maintenance gate exists, below).
   let dispatchSignal = (signal) => signal;
   let lostReason = () => null;
+  let beginOperation = () => null;
   const covered = (send) => async (path, options = {}, timeout) => {
     const signal = dispatchSignal(options.signal);
-    try { return await send(path, signal === options.signal ? options : { ...options, signal }, timeout); }
-    catch (e) { throw lostReason(signal) || e; }
+    const op = beginOperation();
+    const scoped = op ? {...options,headers:{...options.headers,'X-Noevia-Maintenance-Fence':JSON.stringify(op.fence)}} : options;
+    try {
+      const result = await send(path, signal === options.signal ? scoped : {...scoped,signal}, timeout);
+      if(result?.maintenanceUncertain && op)maintenance.requireRecovery('publication-unknown',null,'A native operation outcome is uncertain.');
+      else op?.settle();
+      return result;
+    } catch (e) { if(op)maintenance.requireRecovery('publication-unknown',null,'A native operation outcome is uncertain.'); throw lostReason(signal) || e; }
   };
   const rawRequest = covered((path, options = {}, timeout = 8000) => fetchJson(base + path, { ...options, headers: headers(options.headers) }, timeout));
   // The same for a streamed engine call: the stream is aborted with the lease.
@@ -91,7 +98,11 @@ function createLlamaCppManager({ budgetWatchDir = null, baseUrl, apiKey, fetchJs
   // Every commit (apply, calibration, auto-tune, restores) settles an uncertain Model Loader
   // write by reading models.ini back instead of assuming nothing changed (#339).
   const {commitReconciled}=require('./models-ini-writer.cjs');
-  const presets=store ? {...store,commit:(candidate,options)=>commitReconciled(store,candidate,options)} : null;
+  const presets=store ? {...store,commit:async(candidate,options)=>{
+    const op=beginOperation();
+    try { const result=await commitReconciled(store,candidate,{...options,...(op?{maintenance:op.fence}:{})}); op?.settle(); return result; }
+    catch(e){ if(op)maintenance.requireRecovery('publication-unknown',null,'A native preset save outcome is uncertain.'); throw e; }
+  }} : null;
   // #2187: the inference gate is the maintenance authority whenever it is configured (and has the
   // hold API); this process's own gate is the fallback without one (inference-maintenance.cjs).
   // Row J: without one, the Rust front's lease authority (model-maintenance-lease.cjs createNativeLeaseClient).
@@ -101,6 +112,8 @@ function createLlamaCppManager({ budgetWatchDir = null, baseUrl, apiKey, fetchJs
   const PRESET_STEP_MS=Number.isFinite(maintenanceGateOptions.presetStepMs)?maintenanceGateOptions.presetStepMs:150000;
   const maintenance=require('./inference-maintenance.cjs').createMaintenanceGate({remote:maintenanceRemote,observeMs:gate?0:3000,...maintenanceGateOptions});
   holdHeaders=maintenance.holdHeaders;
+  beginOperation=()=>maintenance.beginPublication();
+  maintenance.recoveryReread=async()=>{const result=await routerReload(120000);if(!result.ok)throw Error('Native preset reread did not settle.');};
   dispatchSignal=signal=>maintenance.dispatchSignal(signal);
   // Delta review P1: the settle step of every recovery from lost coverage, under the fresh lease: the
   // engine confirmed idle (every model unloaded, as the router itself reports), not just our HTTP call

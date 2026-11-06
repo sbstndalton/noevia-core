@@ -261,11 +261,11 @@ function createGateClient({ baseUrl, fetch = (url, init) => globalThis.fetch(url
    * @param {string} reason  plain text for people (shown in the gate's status)
    * @param {{ waitMs?: number, signal?: AbortSignal }} [options]
    */
-  async function holdMaintenance(reason, { waitMs = 0, signal } = {}) {
+  async function holdMaintenance(reason, { waitMs = 0, signal, maintenance } = {}) {
     signal?.throwIfAborted();
     if (!token || (holdAbsentAt !== null && now() - holdAbsentAt < holdReprobeMs)) return null;
     const wait = Math.max(0, Math.min(MAX_HOLD_WAIT_MS, Math.floor(Number(waitMs) || 0)));
-    const { status, body } = await gateJson('/gate/v1/maintenance', { body: { reason: String(reason || '').slice(0, 300), wait_ms: wait }, signal, timeoutMs: wait + 10000 });
+    const { status, body } = await gateJson('/gate/v1/maintenance', { body: { reason: String(reason || '').slice(0, 300), wait_ms: wait, idle_ttl_ms:600000, ...(maintenance?{maintenance}:{}) }, signal, timeoutMs: wait + 10000 });
     if (status !== 404 && holdAbsentAt !== null) {
       log('[inference-gate] the engine address now has the maintenance hold; holds go to the gate again');
       holdAbsentAt = null;
