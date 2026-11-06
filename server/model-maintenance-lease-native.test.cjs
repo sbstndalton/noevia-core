@@ -29,8 +29,8 @@ function manager(client, { gateOptions = {}, router = [] } = {}) {
 async function ready(m, client) { await client.ready(); await delay(5); return m; }
 
 test('the client carries the release marker the assembly pairs with the front', () => {
-  assert.equal(LEASE_CLIENT_MARKER, 'noevia-maintenance-lease-client/1');
-  assert.match(require('node:fs').readFileSync(require.resolve('./model-maintenance-lease.cjs'), 'utf8'), /'noevia-maintenance-lease-client\/1'/);
+  assert.equal(LEASE_CLIENT_MARKER, 'noevia-maintenance-lease-client/2');
+  assert.match(require('node:fs').readFileSync(require.resolve('./model-maintenance-lease.cjs'), 'utf8'), /'noevia-maintenance-lease-client\/2'/);
 });
 
 test('a Node hold is a lease of the front\'s authority: registered start, exclusive, given back there', async (t) => {
