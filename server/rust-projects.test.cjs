@@ -485,5 +485,7 @@ test('slice7: public move is Rust-owned POST only, explicit owner, direct Node r
 test('slice7 capabilities are exported by the actual client, dispatcher and journal reader', () => {
   assert.equal(require('./project-store-client.cjs').CHAT_MOVE_CLIENT_MARKER, 'noevia-chat-move-client/1');
   assert.equal(require('./chat.cjs').CHAT_MOVE_ENFORCEMENT_MARKER, 'noevia-chat-move-enforcement/1');
-  assert.equal(require('./chat-change-journal.cjs').CHAT_MOVE_READER_MARKER, 'noevia-chat-move-reader/1');
+  // The move journal's reader is the Rust front's chat mirror schedule now (rust-chat-mirror-v1), not this process.
+  assert.equal(require('./rust-chat-mirror.cjs').RUST_CHAT_MIRROR_OWNED, 'rust-chat-mirror-v1');
+  assert.ok(!fs.existsSync(path.join(__dirname, 'chat-change-journal.cjs')));
 });

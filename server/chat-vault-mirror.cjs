@@ -21,8 +21,10 @@
 //
 // Writes go through the Diary files client the DAV listener already uses (read, write, mkdir, ops:
 // /api/file, /api/directory, /api/workspace-ops), always as the chat's own user. Saves are
-// debounced per user; a failed sync keeps the index as it was and is retried later. Nothing here
-// runs on the request path and nothing here can throw into it.
+// debounced per user by the Rust front (noevia-rs crates/chat-mirror-sched, capability
+// rust-chat-mirror-v1), which also tails the change journal, retries a failed pass on a backoff and calls
+// `pass` here over the loopback bridge (rust-chat-mirror.cjs). A failed sync keeps the index as it was.
+// Nothing here runs on the request path and nothing here can throw into it.
 const crypto = require('node:crypto');
 const { chatMarkdown } = require('./chat-export.cjs');
 const chatBrain = require('./chat-brain.cjs');
@@ -32,7 +34,6 @@ const INBOX = 'Inbox';
 const BRAIN_SCHEMA = 0;            // a note without a brain; with one it is chatBrain.BRAIN_SCHEMA (#742)
 const MAX_NOTE_BYTES = 500 * 1024;          // the companion's editor limit is 512 KiB
 const MAX_NAME = 100;
-const DEFAULT_DELAY_MS = 5000, DEFAULT_MAX_WAIT_MS = 30000, DEFAULT_RETRY_MS = 60000, DEFAULT_MAX_RETRY_MS = 60 * 60 * 1000;
 const RESERVED = /^(con|prn|aux|nul|com[0-9]|lpt[0-9])$/i;
 
 /** A file or folder name that cannot leave its folder, hide itself or break a sync client:
@@ -108,7 +109,8 @@ const noteName = (path) => path.slice(path.lastIndexOf('/') + 1).replace(/\.md$/
 /** Should a finished request make this user's mirror look again? Writes to chat lists, moves,
  *  project changes (a renamed project moves its notes) and imports. A transcript save is the Rust
  *  front's (POST /api/chats/{id}/history, sbstndalton/noevia#1071 slice 5): Node never answers it,
- *  and chat-change-journal.cjs schedules the mirror (and the brain) from the store's journal. */
+ *  and the Rust front's chat mirror schedule (rust-chat-mirror-v1) schedules the mirror (and the brain)
+ *  from the store's journal. */
 function mirrorTrigger(method, path) {
   if (!method || ['GET', 'HEAD', 'OPTIONS'].includes(method)) return null;
   const move = /^\/api\/chats\/([^/]+)\/move$/.exec(path || '');
@@ -117,6 +119,8 @@ function mirrorTrigger(method, path) {
 }
 
 /**
+ * The mirror's work. The Rust front decides when an account's mirror looks again (debounce, coalescing,
+ * backoff) and calls `pass`.
  * @param {object} deps
  * @param {(userId:string) => boolean} deps.enabled      flag on, Diary on and the user opted in
  * @param {(userId:string) => {freeChats:object[], projects:object[]}} deps.lists   the user's own lists
@@ -126,55 +130,27 @@ function mirrorTrigger(method, path) {
  * @param {{read:(userId:string)=>object, write:(userId:string, state:object)=>void}} deps.index
  * @param {(userId:string, chatId:string) => object|null} [deps.readBrain]  the chat's brain from the user's own workspace (#742)
  */
-function createChatVaultMirror({ enabled, lists, deleted = () => new Set(), readHistory, readBrain = () => null, files, index, log = () => {},
-  delayMs = DEFAULT_DELAY_MS, maxWaitMs = DEFAULT_MAX_WAIT_MS, retryMs = DEFAULT_RETRY_MS, maxRetryMs = DEFAULT_MAX_RETRY_MS,
-  setTimer = setTimeout, clearTimer = clearTimeout, now = Date.now }) {
-  const users = new Map(); // userId -> { timer, firstAt, dirty:Set, running, again, failures, loggedDelay }
+function createChatVaultMirror({ enabled, lists, deleted = () => new Set(), readHistory, readBrain = () => null, files, index, log = () => {} }) {
+  const tails = new Map(); // userId -> the account's latest pass (a pass is never run beside another)
 
-  function schedule(userId, chatId = null, { immediate = false } = {}) {
-    if (typeof userId !== 'string' || !userId) return;
-    let u = users.get(userId);
-    if (!u) { u = { timer: null, firstAt: 0, dirty: new Set(), running: false, again: false, failures: 0, loggedDelay: 0 }; users.set(userId, u); }
-    if (chatId) u.dirty.add(chatId);
-    // A new nudge (a fresh save, or the person switching the mirror on) starts the backoff over.
-    u.failures = 0; u.loggedDelay = 0;
-    if (u.running) { u.again = true; return; }
-    if (u.timer) clearTimer(u.timer); else u.firstAt = now();
-    // Debounced, but a chat that keeps changing is still mirrored at least every maxWaitMs.
-    const wait = immediate ? 0 : Math.max(0, Math.min(delayMs, u.firstAt + maxWaitMs - now()));
-    u.timer = setTimer(() => { u.timer = null; return run(userId); }, wait);
-    u.timer?.unref?.();
-  }
-
-  async function run(userId) {
-    const u = users.get(userId);
-    if (!u || u.running) return;
-    u.running = true; u.again = false;
-    const dirty = u.dirty; u.dirty = new Set();
-    let failed = false;
-    try {
-      // Checked when the sync runs, not when it was scheduled: switching off stops writes at once.
-      if (enabled(userId)) failed = !(await sync(userId, dirty));
-    } catch (error) {
-      failed = true;
-      log('chat-vault-mirror: sync failed', error?.message || String(error));
-    } finally {
-      u.running = false;
-      if (failed && u.again) {
-        // Nudged while this pass ran: the nudge already reset the backoff; go again on the debounce.
-        for (const id of dirty) u.dirty.add(id);
-        schedule(userId);
-      } else if (failed) {
-        // Exponential backoff (#758): 1, 2, 4 ... x retryMs, capped at maxRetryMs, then hourly for
-        // good. Logged once per step, not on every attempt.
-        for (const id of dirty) u.dirty.add(id);
-        u.failures += 1;
-        const wait = Math.min(maxRetryMs, retryMs * 2 ** Math.min(u.failures - 1, 30));
-        if (wait !== u.loggedDelay) { u.loggedDelay = wait; log('chat-vault-mirror: retrying in', `${Math.round(wait / 1000)}s`, `after ${u.failures} failed pass(es)`); }
-        u.firstAt = now(); u.timer = setTimer(() => { u.timer = null; return run(userId); }, wait); u.timer?.unref?.();
-      } else if (u.again) { u.failures = 0; u.loggedDelay = 0; schedule(userId); }
-      else if (!u.timer) users.delete(userId);
-    }
+  /** One pass for the account over the chats that changed (an empty list: look at everything).
+   *  Resolves 'done', 'off' (the mirror is switched off: nothing was written) or 'failed' (some note
+   *  failed; the Rust schedule retries it). Never rejects. Checked when it runs, not when it was
+   *  asked for: switching off stops writes at once. */
+  function pass(userId, dirty = []) {
+    const run = (tails.get(userId) || Promise.resolve()).then(async () => {
+      try {
+        if (!enabled(userId)) return 'off';
+        return (await sync(userId, new Set(dirty))) ? 'done' : 'failed';
+      } catch (error) {
+        log('chat-vault-mirror: sync failed', error?.message || String(error));
+        return 'failed';
+      }
+    });
+    const tail = run.then(() => {}, () => {});
+    tails.set(userId, tail);
+    tail.then(() => { if (tails.get(userId) === tail) tails.delete(userId); });
+    return run;
   }
 
   const missing = (error) => error?.status === 404;
@@ -316,7 +292,7 @@ function createChatVaultMirror({ enabled, lists, deleted = () => new Set(), read
     return ok;
   }
 
-  return { schedule, run, sync, pending: (userId) => users.has(userId) };
+  return { pass, sync };
 }
 
 // Per-user preference and index, two small files in the user's own workspace directory (like the
