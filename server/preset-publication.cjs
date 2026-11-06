@@ -87,5 +87,16 @@ function readClosed(includeActive) {
     return !r || (includeActive && !!r.active) || !!r.recovery || !!db.prepare(`SELECT id FROM preset_operations WHERE ${pending} LIMIT 1`).get();
   } catch { return true; } finally { db?.close(); }
 }
+function assertPresetRecovery() {
+  const file=process.env.NOEVIA_PRESET_AUTHORITY_FILE;
+  if(!file)return;
+  let db;
+  try {
+    db=new Database(file,{readonly:true,fileMustExist:true,timeout:25});
+    const presetKinds=new Set(['legacy','acquire','control','preset-write','restore','reload','reread','pull','register','delete','prune']);
+    if(db.prepare(`SELECT DISTINCT kind FROM preset_operations WHERE ${pending}`).all().some(r=>!presetKinds.has(r.kind)))
+      throw Object.assign(Error('The interrupted operation needs its own recovery owner.'),{status:503});
+  } finally {db?.close();}
+}
 module.exports={withPublication,PUBLICATION_CLIENT_MARKER,authorityPath,validate,finish,observeRevision,beginOperation,
-  admissionClosed:()=>readClosed(true),incidentPending:()=>readClosed(false)};
+  assertPresetRecovery,admissionClosed:()=>readClosed(true),incidentPending:()=>readClosed(false)};

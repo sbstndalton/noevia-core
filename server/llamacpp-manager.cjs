@@ -133,11 +133,12 @@ function createLlamaCppManager({ budgetWatchDir = null, baseUrl, apiKey, fetchJs
   const RECOVERY_SETTLE_MS=Number.isFinite(maintenanceGateOptions.recoverySettleMs)?maintenanceGateOptions.recoverySettleMs:120000;
   const RECOVERY_POLL_MS=Number.isFinite(maintenanceGateOptions.recoveryPollMs)?maintenanceGateOptions.recoveryPollMs:500;
   maintenance.setRecoverySettle(async()=>{
+    require('./preset-publication.cjs').assertPresetRecovery();
     const deadline=Date.now()+RECOVERY_SETTLE_MS;
     for(;;){
       const listing=await rawModels();
       if(!listing.ok||!Array.isArray(listing.body?.data))throw Error('The model server did not answer.');
-      const live=listing.body.data.filter(m=>['loaded','loading','sleeping','unloading'].includes(m.status?.value));
+      const live=listing.body.data.filter(m=>['loaded','loading','sleeping','unloading','downloading'].includes(m.status?.value));
       if(!live.length)return;
       for(const m of live)if(['loaded','sleeping'].includes(m.status.value))await forcedUnload(m.id,60000).catch(e=>{if(e?.coverageLost)throw e;});
       if(Date.now()>=deadline)throw Error('The model server did not confirm every model stopped.');

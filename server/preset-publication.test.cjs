@@ -6,6 +6,20 @@ const os = require('node:os');
 const path = require('node:path');
 const crypto = require('node:crypto');
 const { spawn } = require('node:child_process');
+test('preset recovery cannot retire a pending managed-service effect', t=>{
+  const publication=require('./preset-publication.cjs');
+  const dir=fs.mkdtempSync(path.join(os.tmpdir(),'publication-recovery-'));
+  const file=path.join(dir,'models.ini');
+  const previous=process.env.NOEVIA_PRESET_AUTHORITY_FILE;
+  process.env.NOEVIA_PRESET_AUTHORITY_FILE=path.join(dir,'authority.sqlite');
+  t.after(()=>{if(previous===undefined)delete process.env.NOEVIA_PRESET_AUTHORITY_FILE;else process.env.NOEVIA_PRESET_AUTHORITY_FILE=previous;fs.rmSync(dir,{recursive:true,force:true});});
+  publication.withPublication(file,db=>db.prepare("INSERT INTO preset_operations(id,incarnation,lease,generation,kind,state) VALUES('service','front','grant','1','service-start','recovery')").run());
+  assert.throws(()=>publication.assertPresetRecovery(),{status:503});
+  publication.withPublication(file,db=>db.prepare("UPDATE preset_operations SET state='settled' WHERE id='service'").run());
+  assert.doesNotThrow(()=>publication.assertPresetRecovery());
+  publication.withPublication(file,db=>db.prepare("INSERT INTO preset_operations(id,incarnation,lease,generation,kind,state) VALUES('preset','front','grant','1','reload','recovery')").run());
+  assert.doesNotThrow(()=>publication.assertPresetRecovery());
+});
 const worker = `
 const fs=require('node:fs');
 const {createPresetStore}=require(process.argv[1]);
