@@ -88,27 +88,27 @@ function createDriver({launch, request, notify = () => {}}) {
     },
     async dispose({element}) { const e=elements.get(element);elements.delete(element);if(e)await e.dispose();return {}; },
     async screenshot({page:id}) { return {png:(await getPage(id).screenshot({type:'png'})).toString('base64')}; },
-    async extract({page:id,selector}) { const p=getPage(id);return {text:selector?await p.locator(String(selector)).innerText({timeout:TIMEOUT}):await p.locator('body').innerText({timeout:TIMEOUT})}; },
+    async extract({page:id,selector}) { const p=getPage(id);return {text:selector?await p.locator(String(selector)).first().innerText({timeout:TIMEOUT}):await p.locator('body').innerText({timeout:TIMEOUT})}; },
     async dispatch({page:id,element,kind,url,text,key,values,files,dy,ms}) {
       const p=getPage(id), e=element?getElement(element):null;
       // Only fixed engine primitives; no caller-supplied script or evaluation expression.
       switch(kind) {
-        case 'navigate':await p.goto(url,{waitUntil:'domcontentloaded',timeout:TIMEOUT});break;
+        case 'navigate':await p.goto(url,{timeout:TIMEOUT});break;
         case 'click':await e.click({timeout:TIMEOUT});break;
         case 'hover':await e.hover({timeout:TIMEOUT});break;
         case 'type':await e.fill(text,{timeout:TIMEOUT});break;
         case 'select':await e.selectOption(values,{timeout:TIMEOUT});break;
         case 'press':if(e)await e.press(key,{timeout:TIMEOUT});else await p.keyboard.press(key);break;
         case 'upload':await e.setInputFiles(files,{timeout:TIMEOUT});break;
-        case 'submit':await e.evaluate(el=>{const form=el.form||el.closest('form');if(form){if(form.requestSubmit)form.requestSubmit();else form.submit();}});break;
+        case 'submit':await e.evaluate(el=>{const form=el.form||el.closest('form')||el;if(form.requestSubmit)form.requestSubmit();else form.submit();});break;
         case 'scroll':await p.mouse.wheel(0,dy);break;
         case 'wait':await p.waitForTimeout(ms);break;
         default:throw Error('command');
       }
-      if(kind!=='navigate')await p.waitForLoadState('domcontentloaded',{timeout:TIMEOUT}).catch(()=>{});
+      await p.waitForLoadState('domcontentloaded',{timeout:TIMEOUT}).catch(()=>{});
       return {};
     },
-    async back({page:id}) {await getPage(id).goBack({waitUntil:'domcontentloaded',timeout:TIMEOUT}).catch(()=>{});return {};},
+    async back({page:id}) {await getPage(id).goBack({timeout:TIMEOUT}).catch(()=>{});return {};},
     async download({download,path}) {const d=downloads.get(download);if(!d)throw Error('download');await d.saveAs(path);downloads.delete(download);return {};},
     async closeContext() {if(context)await context.close();return {};},
     async close() {
