@@ -154,19 +154,22 @@ function createPresetStore(file,{writer=null,cacheRam=null,backupKeep=BACKUP_KEE
     if(writer){await writer.write({baseRevision:candidate.baseRevision,text:candidate.text,...(backup===false?{backup:false}:{})});return;}
     // Web writer on a read-only mount: an explicit 503 before the backup, not a raw EROFS (#269).
     require('./models-ini-writer.cjs').assertWebWritable(file);
-    // Immutable recovery copy precedes the new file; contains operator settings.
-    const backupFile=file+'.noevia-backup-'+candidate.baseRevision;
-    if(backup!==false)try {const fd=fs.openSync(backupFile,'wx',0o600);try{fs.writeFileSync(fd,read().text);fs.fsyncSync(fd);}finally{fs.closeSync(fd);}}catch(e){if(e.code!=='EEXIST')throw e;}
-    const temporary=file+'.noevia-'+crypto.randomUUID();
-    try {
-      // Directory bind mount required: rename is atomic and router sees the new inode.
-      const fd=fs.openSync(temporary,'wx',fs.statSync(file).mode & 0o777);
-      try {fs.writeFileSync(fd,candidate.text);fs.fsyncSync(fd);}finally{fs.closeSync(fd);}
-      fs.renameSync(temporary,file);
-      const fdDir=fs.openSync(path.dirname(file),'r');try{fs.fsyncSync(fdDir);}finally{fs.closeSync(fdDir);}
-    } finally {fs.rmSync(temporary,{force:true});}
-    // Only after the new file is in place; best-effort, never fails the write.
-    try{pruneBackups(file,backupKeep);}catch{}
+    return require('./preset-publication.cjs').withPublication(file, () => {
+      if(read().revision!==candidate.baseRevision)throw error(409,'Presets changed while applying. Reload before retrying.');
+      // Immutable recovery copy precedes the new file; contains operator settings.
+      const backupFile=file+'.noevia-backup-'+candidate.baseRevision;
+      if(backup!==false)try {const fd=fs.openSync(backupFile,'wx',0o600);try{fs.writeFileSync(fd,read().text);fs.fsyncSync(fd);}finally{fs.closeSync(fd);}}catch(e){if(e.code!=='EEXIST')throw e;}
+      const temporary=file+'.noevia-'+crypto.randomUUID();
+      try {
+        // Directory bind mount required: rename is atomic and router sees the new inode.
+        const fd=fs.openSync(temporary,'wx',fs.statSync(file).mode & 0o777);
+        try {fs.writeFileSync(fd,candidate.text);fs.fsyncSync(fd);}finally{fs.closeSync(fd);}
+        fs.renameSync(temporary,file);
+        const fdDir=fs.openSync(path.dirname(file),'r');try{fs.fsyncSync(fdDir);}finally{fs.closeSync(fdDir);}
+      } finally {fs.rmSync(temporary,{force:true});}
+      // Only after the new file is in place; best-effort, never fails the write.
+      try{pruneBackups(file,backupKeep);}catch{}
+    });
   }
   // Container paths of the files a section loads. Read-only; used for size estimates.
   // The speculative draft model's file: not an editable option, so parse() does not keep it (#2215).
