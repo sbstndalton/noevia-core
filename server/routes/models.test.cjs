@@ -672,7 +672,7 @@ test('#873: a sweep still running after a web restart takes the gate back at sta
   const timers = [];
   const make = (job, gate = createMaintenanceGate()) => {
     let current = job;
-    const f = fixture({ env: { MODEL_LOADER_URL: 'http://loader' }, manager: { holdMaintenance: (reason) => gate.hold(reason) },
+    const f = fixture({ env: { MODEL_LOADER_URL: 'http://loader' }, manager: { holdMaintenance: (reason, options) => gate.hold(reason, options), maintenanceBarrier: reason=>gate.barrier(reason,{recovery:true}) },
       fetchReply: (url) => (url.endsWith('/benchmark/progress') ? { ok: true, status: 200, body: { job: current } } : { ok: true, status: 200, body: {} }),
       sweepGuardOptions: { setTimer: (fn) => { timers.push(fn); return { unref() {} }; }, clearTimer: () => {} } });
     return { f, gate, finish: () => { current = { active: false, unit: 'models' }; } };
@@ -692,7 +692,10 @@ test('#873: a sweep still running after a web restart takes the gate back at sta
   // A gate already held (requests in flight cannot be at startup, but a calibration can) is not fought over.
   const busyGate = createMaintenanceGate(); const release = busyGate.hold('calibrating');
   const busy = make({ active: true, unit: 'models', total: 1 }, busyGate);
-  assert.equal(await busy.f.ready, false); release();
+  await new Promise(setImmediate); release();
+  timers.shift()();
+  assert.equal(await busy.f.ready, true, 'known sweep is adopted after the earlier writer settles');
+  busy.finish();await timers.shift()();
   assert.equal(timers.length, 0);
 });
 

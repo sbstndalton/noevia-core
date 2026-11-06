@@ -336,7 +336,10 @@ const autoconfigBudget = (() => {
   }
 })();
 
+// Row J: the Rust front is the one maintenance lease authority; this process's gate asks it.
+const maintenanceAuthority = require('./model-maintenance-lease.cjs').createNativeLeaseClient({ port: Number(process.env.NOEVIA_PROJECT_STORE_PORT), token: FRONT_SECRET });
 const modelManager = createModelManager({
+  maintenanceAuthority,
   kind: MODEL_MANAGER_KIND,
   presetPath: process.env.LLAMACPP_PRESET_PATH,
   // MODELS_INI_WRITER=model-loader makes the sidecar the single models.ini writer (#295).
@@ -1290,9 +1293,10 @@ const toolboxPickerFacts = require('./rust-toolbox-picker-facts.cjs').createTool
   mcp: () => ({ enabled: mcpWiring.enabled(), state: mcpState, servers: MCP_SERVERS, manifest: MCP_TOOLBOX_MANIFEST }),
 });
 
-// With no inference gate, the Rust front's reload holds this process's own maintenance gate (#2210).
+// Row J: a lease of the front's authority pauses this process's chat through this latch (a local-only hold).
 const maintenanceLeases = require('./model-maintenance-lease.cjs').createLeaseRoutes({
-  secret: FRONT_SECRET, json, hold: typeof modelManager.holdMaintenance === 'function' ? () => modelManager.holdMaintenance() : null,
+  barrier: () => modelManager.maintenanceBarrier('Interrupted maintenance is being recovered.'),
+  secret: FRONT_SECRET, json, hold: typeof modelManager.holdMaintenanceLocal === 'function' ? options => modelManager.holdMaintenanceLocal(undefined, options) : null,
 });
 
 // #2303: the front's calibration loads ask this process's load decision (overBudget) first.
