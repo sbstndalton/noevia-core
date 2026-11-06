@@ -320,9 +320,13 @@ function createMaintenanceGate({ remote = null, log = (line) => console.log(line
       if(now()+coverageMarginMs>=c.hardAt){c.lose?.('passed its limit');throw coverageError('passed its limit');}
       if(now()+Math.max(0,Number(stepMs)||0)+coverageMarginMs>=c.hardAt)throw coverageError('cannot cover the next step');
     },
-    beginPublication() {
+    operationUnknown() {
+      coverage?.lose?.('has an unsettled operation');
+      requireRecovery('publication-unknown',null,'A native operation outcome is uncertain.');
+    },
+    beginPublication(kind,expectedRevision,file) {
       gate.assertCovered();
-      return require('./preset-publication.cjs').beginOperation(coverage?.grant || null);
+      return require('./preset-publication.cjs').beginOperation(coverage?.grant || null,kind,expectedRevision,file);
     },
     // The current lease's lost-coverage signal (null when no lease of the front's authority is held).
     coverageSignal: () => coverage?.controller.signal || null,

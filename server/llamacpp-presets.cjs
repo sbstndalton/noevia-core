@@ -155,7 +155,7 @@ function createPresetStore(file,{writer=null,cacheRam=null,backupKeep=BACKUP_KEE
     // Web writer on a read-only mount: an explicit 503 before the backup, not a raw EROFS (#269).
     require('./models-ini-writer.cjs').assertWebWritable(file);
     return require('./preset-publication.cjs').withPublication(file, db => {
-      const covered = () => { if(maintenance)require('./preset-publication.cjs').validate(db,maintenance); };
+      const covered = () => { if(maintenance)require('./preset-publication.cjs').validate(db,maintenance,read().revision); };
       covered();
       if(read().revision!==candidate.baseRevision)throw error(409,'Presets changed while applying. Reload before retrying.');
       // Immutable recovery copy precedes the new file; contains operator settings.
@@ -170,6 +170,9 @@ function createPresetStore(file,{writer=null,cacheRam=null,backupKeep=BACKUP_KEE
       fs.renameSync(temporary,file);
         const fdDir=fs.openSync(path.dirname(file),'r');try{fs.fsyncSync(fdDir);}finally{fs.closeSync(fdDir);}
       } finally {fs.rmSync(temporary,{force:true});}
+      const publication=require('./preset-publication.cjs');
+      publication.observeRevision(db,revision(candidate.text));
+      if(maintenance)publication.finish(db,maintenance,'settled',revision(candidate.text));
       // Only after the new file is in place; best-effort, never fails the write.
       try{pruneBackups(file,backupKeep);}catch{}
     });

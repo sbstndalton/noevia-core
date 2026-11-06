@@ -60,3 +60,24 @@ test('independent processes serialize revision read through rename and reject th
   assert.equal(await stale.done, '409', 'stale revision refused after publication settles');
   assert.equal(fs.readFileSync(file, 'utf8'), a);
 });
+
+test('a separate publisher rejects an authority generation changed after its permit was issued', async t=>{
+  const Database=require('better-sqlite3');
+  const dir=fs.mkdtempSync(path.join(os.tmpdir(),'publication-generation-'));
+  t.after(()=>fs.rmSync(dir,{recursive:true,force:true}));
+  const file=path.join(dir,'models.ini'),authority=path.join(dir,'authority.sqlite');
+  const before='[m]\nmodel = /models/m.gguf\n',after=before+'ctx-size = 8192\n';
+  fs.writeFileSync(file,before);const base=crypto.createHash('sha256').update(before).digest('hex');
+  const db=new Database(authority);db.pragma('journal_mode = WAL');
+  db.exec("CREATE TABLE preset_authority(singleton INTEGER PRIMARY KEY,incarnation TEXT,lease TEXT,generation TEXT,active INTEGER,until_ms TEXT,recovery INTEGER); CREATE TABLE preset_operations(id TEXT PRIMARY KEY,incarnation TEXT,lease TEXT,generation TEXT,kind TEXT,expected_revision TEXT,state TEXT,revision TEXT,created_ms INTEGER); CREATE TABLE preset_revision(singleton INTEGER PRIMARY KEY,revision TEXT)");
+  db.prepare('INSERT INTO preset_authority VALUES(1,?,?,?,1,?,0)').run('front','lease','2',String(Date.now()+60000));
+  const fence={incarnation:'front',lease:'lease',generation:1,operation:'stale-op',kind:'preset-write',expectedRevision:base};
+  db.prepare("INSERT INTO preset_operations VALUES(?,?,?,?,?,?,'issued',NULL,?)").run(fence.operation,'front','lease','1',fence.kind,base,Date.now());db.close();
+  const module=process.env.NOEVIA_PUBLICATION_TEST_STORE || require.resolve('./llamacpp-presets.cjs');
+  const script=`const {createPresetStore}=require(process.argv[1]); const [file,base,before,text,fence]=process.argv.slice(2);createPresetStore(file).commit({baseRevision:base,before,text},{maintenance:JSON.parse(fence)}).then(()=>process.stdout.write('200')).catch(e=>process.stdout.write(String(e.status||500)));`;
+  const child=spawn(process.execPath,['-e',script,module,file,base,before,after,JSON.stringify(fence)],{env:{...process.env,NOEVIA_PRESET_AUTHORITY_FILE:authority},stdio:['ignore','pipe','pipe']});
+  let result='',errors='';child.stdout.on('data',b=>result+=b);child.stderr.on('data',b=>errors+=b);
+  const code=await new Promise((resolve,reject)=>{child.on('close',resolve);child.on('error',reject);});
+  assert.equal(code,0,errors);assert.equal(result,'409','a correct INI revision does not authorize a stale holder');
+  assert.equal(fs.readFileSync(file,'utf8'),before,'stale process made no file or torn publication');
+});

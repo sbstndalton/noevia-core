@@ -184,6 +184,7 @@ function unavailable(cause) {
 function createNativeLeaseClient({ port, token, fetchImpl = globalThis.fetch, boot = crypto.randomBytes(16).toString('hex'), startedAt = Date.now(), timeoutMs = CALL_TIMEOUT_MS, retryMs = 1000, now = () => Date.now() }) {
   const ok = Number.isInteger(port) && port > 0 && port < 65536 && String(token || '').length > 0;
   let incarnation = null, retired = false;
+  const repairGrants = new Map();
   async function call(op, body, wait = timeoutMs, signal = null) {
     if (!ok) throw unavailable();
     const deadline = AbortSignal.timeout(wait);
@@ -247,6 +248,7 @@ function createNativeLeaseClient({ port, token, fetchImpl = globalThis.fetch, bo
       const { status, body } = await call('acquire', ask, wait + timeoutMs, signal);
       if (status === 201 && body && typeof body.lease === 'string' && /^[0-9a-f]{32}$/.test(body.lease)
         && [body.ttlMs, body.renewMs, body.hardMs].every((v) => Number.isSafeInteger(v) && v > 0)) {
+        if(recovery)repairGrants.set(body.lease,{generation:body.generation,incident:body.incident??null});
         return { token: body.lease, native: true, askedAt, ttlMs: body.ttlMs, renewMs: body.renewMs, hardMs: body.hardMs, generation: body.generation, epoch: body.epoch, idleTtlMs: body.renewMs * 3, header: false };
       }
       if (status === 409) throw Object.assign(new Error(body?.error || 'Inference is busy.'), { status: 409, code: 'maintenance_held', chatActive: false });
@@ -261,6 +263,7 @@ function createNativeLeaseClient({ port, token, fetchImpl = globalThis.fetch, bo
       } catch { return null; }
     },
     async releaseMaintenance(lease) {
+      repairGrants.delete(lease);
       if (retired || incarnation === null) return;
       try { await call('release', { incarnation, lease }); } catch { /* an unreleased lease ends by itself */ }
     },
@@ -273,7 +276,8 @@ function createNativeLeaseClient({ port, token, fetchImpl = globalThis.fetch, bo
     },
     async completeRecovery(lease) {
       const inc=await registered();
-      const result=await call('complete-recovery',{incarnation:inc,lease},timeoutMs);
+      const proof=repairGrants.get(lease);if(!proof)throw unavailable();
+      const result=await call('complete-recovery',{incarnation:inc,lease,...proof},timeoutMs);
       if(result.status!==200)throw unavailable();
     },
     session,
@@ -290,7 +294,7 @@ function chainRemotes(gate, native) {
     ...(typeof native.ready === 'function' ? { ready: () => native.ready() } : {}),
     async holdMaintenance(reason, options) {
       const own = await native.holdMaintenance(reason, options);
-      const operation = require('./preset-publication.cjs').beginOperation(own);
+      const operation = require('./preset-publication.cjs').beginOperation(own,'acquire');
       try {
         const delegated = await gate.holdMaintenance(reason, {...options, maintenance:operation?.fence});
         operation?.settle();
