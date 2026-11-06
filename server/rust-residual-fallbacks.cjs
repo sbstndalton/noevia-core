@@ -4,7 +4,7 @@
 const RUST_RESIDUAL_FALLBACKS_OWNED = 'rust-residual-fallbacks-v1';
 const ROUTE_REFUSAL = Object.freeze({ error: 'Residual route responses are owned by the Rust front.', code: 'RUST_RESIDUAL_FALLBACKS_OWNED' });
 // Exact manifest routes remain with their existing owners. All other model paths
-// are residuals, except the two substantive handlers behind the single-segment wildcard.
+// are residuals, except the substantive handlers behind the single-segment wildcard.
 const MODEL_ROUTES = new Set([
   '/api/models/assignments', '/api/models/autotune', '/api/models/autotune/cancel',
   '/api/models/autotune/clear', '/api/models/autotune/resume', '/api/models/autotune/settings',
