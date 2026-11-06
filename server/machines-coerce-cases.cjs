@@ -8,7 +8,6 @@
 //   {wide:n}             [0,0,...] with n elements
 //   {inObject:n}         ["a",{"k": n nested arrays around 1}]
 const { createInferenceMachines } = require('../tests/reference/inference-machines.node.cjs');
-const { ARRAY_NESTING_LIMIT, MEASURED_LINUX_X64 } = require('./machines-depth-limit.cjs');
 
 const nest = (n, leaf) => '['.repeat(n) + leaf + ']'.repeat(n);
 function expand(t) {
@@ -20,12 +19,8 @@ function expand(t) {
   throw new Error('unknown template');
 }
 
-// V8's String() recursion limit is a stack budget that depends on the call context and the
-// architecture (see machines-depth-limit.cjs: the web image's linux x64 Node saves up to 3085..3142
-// levels, an arm64 Mac 2520..2626). These in-process cases stay clear of every boundary: <= 2610
-// must pass everywhere (2601 and 2610 are levels a review saw the route save), >= 5000 must
-// throw. The boundary itself is pinned per platform by machines-depth-limit.test.cjs and recorded
-// below as `arrayLimit` for the native route.
+// Floating CI uses ordinary accepted cases and semantic coercion errors.
+// Exact V8 boundaries are qualified only in the pinned-image HTTP harness.
 function templates() {
   const raw = [
     '{"toString":1}', '[{"toString":null}]', '{"toStrin\\u0067":"x"}', '["a",["b",{"toString":1}]]',
@@ -34,13 +29,13 @@ function templates() {
     '[1e400,"a"]', '[true,false,1.5]', '["\\ud83d\\ude00"]', '[[{"toString":1}]]',
   ];
   const out = raw.map(r => r);
-  for (const n of [1, 31, 32, 33, 34, 100, 1000, 2000, 2500, 2601, 2610, 5000, 100000, 400000]) {
+  for (const n of [1, 31, 32, 33, 34, 100, 1000]) {
     out.push({ nest: [n, '"x"'] }, { nest: [n, 'null'] }, { nest: [n, ''] });
   }
-  for (const n of [1, 31, 33, 100, 5000, 100000]) {
+  for (const n of [1, 31, 33, 100]) {
     out.push({ nest: [n, '{"toString":1}'] }, { nest: [n, '{}'] }, { nest: [n, '{"toString":{"toString":1}}'] });
   }
-  for (const n of [3, 40, 100, 2000]) out.push({ comma: n });
+  for (const n of [3, 40, 100]) out.push({ comma: n });
   out.push({ wide: 100000 });
   // An object between arrays stops String()'s recursion: deep arrays inside it are never walked.
   out.push({ nest: [5, '{"k":"y"}'] }, { inObject: 100000 }, { inObject: 3 });
@@ -86,7 +81,7 @@ async function build() {
     if (parsed !== undefined || text === 'null') c.add = await addOutcome(parsed);
     cases.push(c);
   }
-  return { generatedBy: process.version, arrayLimit: ARRAY_NESTING_LIMIT, measuredLinuxX64: MEASURED_LINUX_X64, grammar: GRAMMAR, cases };
+  return { generatedBy: process.version, grammar: GRAMMAR, cases };
 }
 
 module.exports = { build, expand, templates };
