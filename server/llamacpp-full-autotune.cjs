@@ -356,7 +356,7 @@ function createFullAutotuner({ request: engineRequest, rawModels: engineRawModel
   const ownedCommit = (...args) => { authority(); return presets.commit(...args); };
   const ownedApply = (...args) => { authority(); return applyUnlocked(...args); };
   const ownedRequest = (...args) => { authority(); return request(...args); };
-  const ownedReload = () => { authority(); return routerReload ? routerReload() : request('/models?reload=1', {}, 120000); };
+  const ownedReload = () => { authority(); return trackReload(Promise.resolve(routerReload ? routerReload() : request('/models?reload=1', {}, 120000))); };
   const check = () => { authority(); if (cancelled) throw cancelledError(); };
   const note = (j, text) => { (j.log ||= []).push({ at: now(), text }); if (j.log.length > 400) j.log.shift(); save(); };
   const phaseOf = (item, id) => item.phases.find(p => p.id === id);
@@ -1012,7 +1012,7 @@ function createFullAutotuner({ request: engineRequest, rawModels: engineRawModel
       if (!acknowledged) throw Error('The preset reload baseline did not acknowledge the restore.');
       maintenance?.assertCovered?.();
       await current();
-      const reload = await ownedRequest('/models?reload=1', {}, 120000);
+      const reload = await trackReload(ownedRequest('/models?reload=1', {}, 120000));
       after();
       if (!reload.ok) throw Error('The router did not confirm restored settings.');
       maintenance?.assertCovered?.();
@@ -1084,7 +1084,7 @@ function createFullAutotuner({ request: engineRequest, rawModels: engineRawModel
   async function reloadRouter(j) {
     if ((await othersLiveNow(j.model)) === false) {
       if (await invalidateBaseline('autotune')) {
-        const reload = await ownedRequest('/models?reload=1', {}, 120000);
+        const reload = await trackReload(ownedRequest('/models?reload=1', {}, 120000));
         if (!reload.ok) throw Error('The router did not confirm restored settings.');
         j._reloadPending = false; save();
         return;
@@ -1110,7 +1110,7 @@ function createFullAutotuner({ request: engineRequest, rawModels: engineRawModel
       if ((await othersLiveNow(j.model)) === false) {
         // #1072: a flush may have re-read the file while this check was in flight; no second re-read.
         if (fenced || !j._reloadPending) return;
-        try { if (await invalidateBaseline('autotune')) { const r = await ownedRequest('/models?reload=1', {}, 120000); if (r.ok) { j._reloadPending = false; note(j, 'The model server re-read the restored models.ini.'); return; } } } catch { /* retried below */ }
+        try { if (await invalidateBaseline('autotune') && !fenced && j._reloadPending) { const r = await trackReload(ownedRequest('/models?reload=1', {}, 120000)); if (r.ok) { j._reloadPending = false; note(j, 'The model server re-read the restored models.ini.'); return; } } } catch { /* retried below */ }
       }
       scheduleReload(j, tries + 1);
     }, Math.max(foreignPollMs * 15, 1));
@@ -1131,7 +1131,7 @@ function createFullAutotuner({ request: engineRequest, rawModels: engineRawModel
     guard?.();
     const invalidated = await invalidateBaseline('autotune');
     guard?.();
-    const r = invalidated ? await ownedRequest('/models?reload=1', {}, 120000).catch(() => null) : null;
+    const r = invalidated ? await trackReload(ownedRequest('/models?reload=1', {}, 120000)).catch(() => null) : null;
     guard?.();
     if (!r?.ok) {
       scheduleReload(j);
@@ -1790,7 +1790,7 @@ function createFullAutotuner({ request: engineRequest, rawModels: engineRawModel
         await ownedCommit({ baseRevision: j.lastRevision, text: j.originalText });
         // Not acknowledged: no re-read now; it stays owed and is retried in the background.
         if (!(await invalidateBaseline('autotune'))) { j._reloadPending = true; throw Error('The router did not confirm restored settings.'); }
-        const reload = await ownedRequest('/models?reload=1', {}, 120000);
+        const reload = await trackReload(ownedRequest('/models?reload=1', {}, 120000));
         if (!reload.ok) throw Error('The router did not confirm restored settings.');
         j.restored = true;
       } catch { j.restored = false; }
@@ -1827,26 +1827,76 @@ function createFullAutotuner({ request: engineRequest, rawModels: engineRawModel
   // state: still running, settled with its outcome, or refused. An operation the actor never received is
   // fenced by asking for its receipt, so a late arrival is refused and can no longer have any effect.
   const ledger = new Map(), LEDGER_MAX = 512, OP_ID = /^[0-9a-f-]{8,64}$/;
+  // K r4: the ledger is an admission bound, not a cache. An entry is forgotten only once it is settled,
+  // owes no repair and the front has said it will never ask for its receipt again (forget). Running,
+  // repairing and refused entries are never evicted: a refusal fences a request that may still arrive. At
+  // capacity new operations are refused (503) rather than resurrecting a forgotten id.
+  const ledgerFull = () => Object.assign(Error('Auto-tune is still settling earlier operations. Try again shortly.'), { status: 503, public: true });
+  function ledgerRoom() {
+    if (ledger.size < LEDGER_MAX) return true;
+    for (const [key, value] of ledger) {
+      if (value.state === 'settled' && value.forgotten && !value.repairing && !value.outcome?.needsRepair) ledger.delete(key);
+      if (ledger.size < LEDGER_MAX) return true;
+    }
+    return false;
+  }
   function ledgerBegin(op, kind) {
     if (op === undefined) return undefined;
     if (typeof op !== 'string' || !OP_ID.test(op)) throw Error('Invalid operation id');
     if (ledger.has(op)) return null;
-    const entry = { kind, state: 'running', outcome: null };
+    if (!ledgerRoom()) throw ledgerFull();
+    const entry = { kind, state: 'running', outcome: null, repairing: null, forgotten: false };
     ledger.set(op, entry);
-    for (const [key, value] of ledger) { if (ledger.size <= LEDGER_MAX) break; if (value.state !== 'running') ledger.delete(key); }
     return entry;
   }
   function ledgerEnd(entry, outcome) { if (entry && entry.state === 'running') { entry.state = 'settled'; entry.outcome = outcome; } }
-  async function settle({ op, repair = false } = {}) {
+  // Every router re-read this actor has dispatched and not yet seen finish (any path: flush, scheduled
+  // retry, restore, recovery). A repair is settled only when none is left in flight.
+  const reloadsInFlight = new Set();
+  function trackReload(promise) {
+    reloadsInFlight.add(promise);
+    const done = () => reloadsInFlight.delete(promise);
+    promise.then(done, done);
+    return promise;
+  }
+  async function reloadsSettled() { while (reloadsInFlight.size) await Promise.allSettled([...reloadsInFlight]); }
+  // The covered repair's coverage: this actor still writes for the owner and this process's maintenance
+  // gate is still held (the front's recovery latch). Checked before and after every awaited effect.
+  function repairCovered() {
+    if (fenced) throw fenced;
+    if (typeof maintenance?.held === 'function' && !maintenance.held()) throw publicFail('Auto-tune lost its maintenance hold. Try again shortly.');
+  }
+  async function settle({ op, repair = false, forget = false } = {}) {
     if (typeof op !== 'string' || !OP_ID.test(op)) throw Error('Invalid operation id');
     const entry = ledger.get(op);
-    if (!entry) { ledgerBegin(op, 'fenced'); const fenced = ledger.get(op); fenced.state = 'refused'; return { state: 'refused' }; }
-    if (entry.state === 'running') return { state: 'running' };
+    if (!entry) {
+      // Fences an operation this actor never received: a late arrival is refused. Retained for this
+      // process's lifetime (ids are not reusable); without room the answer is unknown, not refused.
+      if (!ledgerRoom()) throw ledgerFull();
+      ledger.set(op, { kind: 'fenced', state: 'refused', outcome: null, repairing: null, forgotten: false });
+      return { state: 'refused' };
+    }
+    if (entry.state === 'running' || entry.repairing) return { state: 'running' };
     if (entry.state === 'refused') return { state: 'refused' };
+    if (forget === true) {
+      if (!entry.outcome?.needsRepair) entry.forgotten = true;
+      return { state: 'settled', outcome: entry.outcome, repaired: !entry.outcome?.needsRepair };
+    }
     if (entry.outcome?.needsRepair && repair === true) {
-      // The covered repair: the router's re-read the acknowledged answer said was still owed.
-      try { await flushReload(null); await flush(); entry.outcome = { ...entry.outcome, needsRepair: false }; }
-      catch { return { state: 'settled', outcome: entry.outcome, repaired: false }; }
+      // The covered repair, single-flight: a retry while it runs is told 'running' and joins it. It is
+      // terminal only after its own re-read and every other in-flight re-read have finished.
+      const run = (async () => {
+        repairCovered();
+        await flushReload(null, repairCovered);
+        repairCovered();
+        await flush();
+        await reloadsSettled();
+        repairCovered();
+      })();
+      entry.repairing = run;
+      try { await run; entry.outcome = { ...entry.outcome, needsRepair: false }; }
+      catch { await reloadsSettled().catch(() => {}); return { state: 'settled', outcome: entry.outcome, repaired: false }; }
+      finally { entry.repairing = null; }
     }
     return { state: 'settled', outcome: entry.outcome, repaired: !entry.outcome?.needsRepair };
   }

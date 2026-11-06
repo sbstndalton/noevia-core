@@ -8,7 +8,7 @@ for (const stage of ['invalidation', 'reload']) test(`cancel during ${stage} wai
   const context = { ready: async () => {}, state: { job: { _reloadPending: true } }, clearTimeout, reloadTimer: null,
     invalidateBaseline: async () => { if (stage === 'invalidation') { enter(); await blocked; terminal = true; } return true; },
     ownedRequest: async () => { calls++; if (stage === 'reload') { enter(); await blocked; terminal = true; } return { ok: true }; },
-    scheduleReload: () => {}, publicFail: Error, note: () => {} };
+    scheduleReload: () => {}, publicFail: Error, note: () => {}, trackReload: p => p };
   vm.createContext(context); vm.runInContext(code + ';this.flushReload=flushReload;', context);
   const pending = context.flushReload(null, () => { if (cancelled) throw Error('cancelled'); });
   await entered; cancelled = true; assert.equal(terminal, false); release();
