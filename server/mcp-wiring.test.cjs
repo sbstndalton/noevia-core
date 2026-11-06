@@ -24,7 +24,7 @@ function fakeMcp(catalogues) {
   };
 }
 
-function build({ servers, catalogues, directoryServers = [], env = {}, storage = { kind: 'local' }, origins = '', manifest = [], isUserDisabled, discoveryFailTtlMs, discoveryTtlMs, discoveryRetryMs, mcpOAuth, mcpKeys, mcpExec, mcp: mcpOverride } = {}) {
+function build({ servers, catalogues, directoryServers = [], env = {}, storage = { kind: 'local' }, origins = '', manifest = [], isUserDisabled, discoveryFailTtlMs, discoveryTtlMs, discoveryRetryMs, mcpOAuth, mcpKeys, mcpExec, logger, shared, mcp: mcpOverride } = {}) {
   const mcp = mcpOverride || fakeMcp(catalogues);
   const scope = new AsyncLocalStorage();
   const minted = [];
@@ -34,14 +34,14 @@ function build({ servers, catalogues, directoryServers = [], env = {}, storage =
     servers, manifest, mcp,
     bindBoxes: ({ manifest, perServer }) => manifest.map((m) => ({ id: m.id, tools: [...(perServer.get(m.server) || new Map()).values()].map((e) => e.tool), server: m.server })),
     directoryCheckMs: 0,
-    directoryMcp: { signal: () => { dirState.looks += 1; return dirState.version; }, asServers: () => dirState.servers, boxFor: (sv, names) => ({ id: sv.id, server: sv.id, tools: [...names] }), headersFor: () => ({ 'X-Key': 'dir' }) },
+    directoryMcp: { signal: () => { dirState.looks += 1; return dirState.version; }, asServers: () => dirState.servers, boxFor: (sv, names) => ({ id: sv.id, server: sv.id, tools: [...names] }), headersFor: () => shared || ({ 'X-Key': 'dir' }) },
     // The brokers (rust-mcp-credentials.cjs): one call's key headers / access token, asked per call.
     mcpKeys: mcpKeys || { hasKey: (uid) => uid === 'keyed', headers: async (uid) => (uid === 'keyed' ? { 'X-Key': 'mine' } : null) },
     mcpOAuth: mcpOAuth || { connected: (uid) => uid === 'signed', tokenFor: async (uid) => (uid === 'signed' ? 'oauth-token' : null) },
     directoryUrlAllowed: async (url) => !url.includes('private'),
     scope, isWriteTool: (name) => name.endsWith('_write'), ...(mcpExec ? { mcpExec } : {}),
     internal: { mintToken: (_k, claims) => { minted.push(claims); return 'cap' } }, internalKey: 'k',
-    env, logger: { log() {}, warn() {} },
+    env, logger: logger || { log() {}, warn() {} },
     ...(isUserDisabled ? { isUserDisabled } : {}),
     ...(discoveryFailTtlMs !== undefined ? { discoveryFailTtlMs } : {}),
     ...(discoveryTtlMs !== undefined ? { discoveryTtlMs } : {}),
@@ -235,6 +235,73 @@ test('a front that cannot be asked, or does not answer, refuses the call: it nev
   const stopped = build({ servers, catalogues: { 'http://b/mcp': [rawTool('b_read')] }, mcpExec: async (_r, { signal }) => { controller.abort(); throw Object.assign(new Error('x'), { name: 'AbortError' }); } });
   await stopped.wiring.discoverMcpTools();
   assert.equal(await stopped.wiring.executeMcpToolCall('b_read', {}, controller.signal), 'ERROR calling b_read: This operation was aborted');
+});
+
+// #2218 review r3: discovery sends a server its credential, and what the server says back is its own text.
+test('a server that repeats the credential discovery sent it never gets it into the log, the state, the catalogue or the picker', async () => {
+  const { buildCatalogue } = require('./mcp-discovery-snapshot.cjs');
+  const SECRET = 'SYNTH-api-secret-1234';
+  const CUSTOM = 'SYNTH-custom-hdr-92ac11e0';
+  const BEARER = 'SYNTH-bearer-tok-4f7a91c2';
+  const errors = {
+    'HTTP 401 body': () => Object.assign(new Error(`MCP 401: invalid key ${SECRET} and ${CUSTOM} and Bearer ${BEARER} end`), { httpStatus: 401 }),
+    'JSON-RPC message': () => new Error(`MCP error -32001: rejected ${SECRET} / ${CUSTOM} / ${BEARER}`),
+    'JSON-RPC numeric code': () => new Error('MCP error 12345: nope'),
+    'reply id': () => new Error('MCP: reply id 12345 does not match request 3'),
+  };
+  for (const [what, make] of Object.entries(errors)) {
+    for (const mode of ['directory shared key', 'personal key', 'bearer']) {
+      const numeric = /numeric|reply id/.test(what);
+      const shared = { 'X-Api-Key': numeric ? '12345' : SECRET, 'X-Custom-Auth': CUSTOM };
+      const server = mode === 'bearer' ? { id: 'b', url: 'http://b/mcp', auth: 'bearer', tokenEnv: 'B_TOKEN' }
+        : { id: 'dir-x', url: 'https://x.example/mcp', auth: mode === 'personal' ? 'personal' : 'directory', directory: true, title: 'X', addedBy: 'keyed' };
+      const warned = [];
+      const mcp = { ...fakeMcp({}), async listTools() { throw make(); } };
+      const w = build({
+        servers: mode === 'bearer' ? [server] : [], directoryServers: mode === 'bearer' ? [] : [server], catalogues: {}, mcp,
+        env: { B_TOKEN: numeric ? '12345' : BEARER }, logger: { log() {}, warn: (l) => warned.push(l) },
+        shared, mcpKeys: { hasKey: () => true, headers: async () => shared },
+      });
+      const state = await w.wiring.discoverMcpTools(true);
+      const err = state.servers.get(server.id).error;
+      const published = JSON.stringify(buildCatalogue({
+        allToolboxes: () => state.boxes, manifest: [], mcpEnabled: () => true, servers: [{ ...server }], state,
+        isWriteTool: () => false, harnessEnabled: () => false, hasRepositories: () => false,
+        nextcloudOrigins: [], defaultToolboxes: [], connectorBoxes: [],
+      }));
+      const sinks = { error: err, state: JSON.stringify([...state.servers.values()]), log: warned.join('\n'), catalogue: published };
+      for (const [sink, text] of Object.entries(sinks)) {
+        for (const secret of (mode === 'bearer' ? [BEARER] : [SECRET, CUSTOM])) assert.equal(text.includes(secret), false, `${what} / ${mode} / ${sink}: ${text.slice(0, 200)}`);
+        if (numeric && sink === 'error') assert.doesNotMatch(text, /\b12345\b/, `${what} / ${mode}: ${text}`);
+      }
+      assert.match(err, /^MCP/, 'the accepted shape stays');
+      if (what === 'HTTP 401 body' && mode !== 'bearer') assert.match(err, /^MCP 401: invalid key \[redacted\]/);
+    }
+  }
+});
+
+test('tool names and descriptions a server fills with the credential it was sent are scrubbed or dropped, with the diagnostics', async () => {
+  const { buildCatalogue } = require('./mcp-discovery-snapshot.cjs');
+  const KEY = 'SYNTH-listing-key-5521';
+  const warned = [];
+  const server = { id: 'dir-x', url: 'https://x.example/mcp', auth: 'directory', directory: true, title: 'X', addedBy: 'admin' };
+  const catalogues = { 'https://x.example/mcp': [
+    { ...rawTool('good_tool'), description: `Use key ${KEY} to search` },
+    rawTool(`name-${KEY}`),
+    { name: `bad ${KEY}`, description: 'x', inputSchema: { type: 'object' } },
+  ] };
+  const w = build({ servers: [], directoryServers: [server], catalogues, shared: { 'X-Api-Key': KEY }, logger: { log() {}, warn: (l) => warned.push(l) } });
+  const state = await w.wiring.discoverMcpTools(true);
+  assert.deepEqual([...state.tools.keys()], ['good_tool'], 'a name that repeats the credential is dropped');
+  const published = JSON.stringify(buildCatalogue({
+    allToolboxes: () => state.boxes, manifest: [], mcpEnabled: () => true, servers: [server], state,
+    isWriteTool: () => false, harnessEnabled: () => false, hasRepositories: () => false, nextcloudOrigins: [], defaultToolboxes: [], connectorBoxes: [],
+  }));
+  assert.equal(published.includes(KEY), false, published);
+  assert.match(published, /Use key \[redacted\] to search/);
+  const log = warned.join('\n');
+  assert.equal(log.includes(KEY), false, log);
+  assert.match(log, /dropped 2 unconvertible tools/);
 });
 
 test('a directory server that stops resolving to a public host is dropped at discovery and refused at call time', async () => {

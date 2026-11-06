@@ -10,6 +10,8 @@
 // curated boxes are mcp-boxes.cjs; the directory and OAuth stores are
 // injected, so this module holds no database and tests need no server.
 
+const { createSecrets, scrubbedError } = require('./mcp-scrub.cjs');
+
 /** Whether a directory server's address may be used at all. Directory servers
  *  are strangers' metadata, so only a public host is acceptable — except that
  *  QA (NOEVIA_QA_ALLOW_LOOPBACK_MCP=1) may stand a synthetic server on
@@ -270,19 +272,30 @@ function createMcpWiring({
       headers = { Authorization: `Bearer ${token}` };
     }
     const transport = transportFor(server);
-    const { session } = await transport.connect(server.url, headers);
+    // Everything this server says comes back through one scrub with the headers actually sent (#2218 review): a failure's
+    // message (an HTTP body, a JSON-RPC message or code) reaches the log, mcpState.servers, the catalogue the Rust front
+    // reads and the admin directory; a tool's name and description reach the same catalogue and the toolbox picker.
+    const secrets = createSecrets(headers);
     let discovered;
     try {
-      discovered = await transport.listTools(server.url, session, headers);
-    } finally {
-      await transport.disconnect(server.url, session, headers);
+      const { session } = await transport.connect(server.url, headers);
+      try {
+        discovered = await transport.listTools(server.url, session, headers);
+      } finally {
+        await transport.disconnect(server.url, session, headers);
+      }
+    } catch (err) {
+      throw scrubbedError(err, secrets);
     }
     const byName = new Map();
     const dropped = [];
     for (const t of discovered) {
       const conv = mcp.convertTool(t);
-      if (!conv.ok) { dropped.push(`${(t && t.name) || '(unnamed)'}: ${conv.reason}`); continue; }
-      byName.set(conv.tool.function.name, { tool: conv.tool, readOnly: mcp.readOnlyHint(t), serverId: server.id });
+      if (!conv.ok) { dropped.push(secrets.scrub(`${(t && t.name) || '(unnamed)'}: ${conv.reason}`)); continue; }
+      const name = conv.tool.function.name;
+      if (secrets.scrub(name) !== name) { dropped.push(`${secrets.scrub(name)}: its name repeats a credential`); continue; }
+      if (typeof conv.tool.function.description === 'string') conv.tool.function.description = secrets.scrub(conv.tool.function.description);
+      byName.set(name, { tool: conv.tool, readOnly: mcp.readOnlyHint(t), serverId: server.id });
     }
     if (dropped.length) logger.warn(`[mcp:${server.id}] dropped ${dropped.length} unconvertible tools: ${dropped.join(' | ')}`);
     return byName;
