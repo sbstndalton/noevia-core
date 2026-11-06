@@ -14,7 +14,7 @@
 //   POST /internal/chat-mirror/engine {op: 'complete', model, schema, messages} -> 200 {content} | 502
 //   POST /internal/chat-mirror/engine {op: 'record', entry}                -> 204 (the decision log, 'chat-brain')
 //
-// A client that goes away aborts the engine call. REMAINING: when the front owns the engine admission (row H) and
+// A client that goes away aborts the engine call (its response closes), and so does a 35 s deadline of its own. REMAINING: when the front owns the engine admission (row H) and
 // the provider registry, this seam goes too.
 //
 // This process asks the front for the two things only it sees, over the project store (POST /v1/chat-mirror/*):
@@ -30,6 +30,9 @@ const RUST_CHAT_MIRROR_OWNED = 'rust-chat-mirror-v1';
 const RUST_CHAT_MIRROR_EXEC_OWNED = 'rust-chat-mirror-exec-v1';
 const ENGINE_PATH = '/internal/chat-mirror/engine';
 const MODEL_CAP = 512;
+/** The front gives a reasoner call 30 s (crates/chat-mirror-exec brain DEFAULT_DEADLINE) and drops it then; a call it
+ *  could not drop (a lost connection nobody noticed) still ends here. */
+const COMPLETE_DEADLINE_MS = 35000;
 /** The front's journal read has a 15-minute activity window; one touch per account per half minute is as good as every request. */
 const TOUCH_EVERY_MS = 30000;
 
@@ -40,7 +43,7 @@ const TOUCH_EVERY_MS = 30000;
  * @param {object} deps
  * @param {string} deps.secret  the per-start secret (an empty one trusts nobody)
  */
-function createEngineSeam({ secret, loaded, admit, complete, record = () => {}, json, readJson, log = (m) => console.warn(m) }) {
+function createEngineSeam({ secret, loaded, admit, complete, record = () => {}, json, readJson, log = (m) => console.warn(m), completeDeadlineMs = COMPLETE_DEADLINE_MS }) {
   return async function handle(req, res) {
     const path = String(req.url || '').split('?')[0];
     if (path !== ENGINE_PATH) return false;
@@ -69,15 +72,26 @@ function createEngineSeam({ secret, loaded, admit, complete, record = () => {}, 
       }
       if (body?.op === 'complete') {
         if (!okModel(model) || !Array.isArray(body.messages) || !body.schema || typeof body.schema !== 'object') { json(res, 400, { error: 'A model, a schema and messages are required.' }); return true; }
+        // The call ends when the front goes away (its own deadline dropped the request): the RESPONSE closes then,
+        // not the request, whose 'close' already fired once the body was read. A front already gone before the call
+        // starts never starts it. An independent deadline ends a call nobody ends otherwise. Listeners go when done.
         const controller = new AbortController();
-        const abort = () => controller.abort();
-        req.once?.('close', () => { if (!res.writableEnded) abort(); });
+        const abort = () => { if (!controller.signal.aborted) controller.abort(); };
+        const onClose = () => { if (!res.writableEnded) abort(); };
+        res.on?.('close', onClose);
+        const timer = setTimeout(abort, completeDeadlineMs);
+        timer.unref?.();
+        if (res.destroyed || req.socket?.destroyed) abort();
         try {
+          if (controller.signal.aborted) throw Object.assign(new Error('the front went away'), { name: 'AbortError' });
           const content = await complete({ model, schema: body.schema, messages: body.messages, signal: controller.signal });
-          json(res, 200, { content });
+          if (!res.destroyed) json(res, 200, { content });
         } catch (error) {
           log(`[chat-mirror] engine call failed: ${error?.status || error?.code || error?.name || 'error'}`);
-          json(res, 502, { error: 'engine call failed' });
+          if (!res.destroyed) json(res, 502, { error: 'engine call failed' });
+        } finally {
+          clearTimeout(timer);
+          res.off?.('close', onClose);
         }
         return true;
       }

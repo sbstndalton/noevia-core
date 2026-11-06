@@ -131,3 +131,68 @@ test('the replaced Node code is gone and index.cjs is wired to the front, with t
   assert.ok(!client.includes('changesRead'));
 });
 
+
+// Review 2026-11-05 P2: over real HTTP, a front that disconnects while the call runs aborts it (the request's
+// 'close' fired when its body was read; the response's 'close' is the one that tells), a front gone before the call
+// starts never starts it, the listeners are removed when the call ends, and a call nobody ends stops at the deadline.
+test('a front that goes away aborts the engine call over real HTTP; a deadline ends one nobody ends', async () => {
+  const http = require('node:http');
+  const { json: realJson, readJson: realReadJson } = require('./http.cjs');
+  const seen = [];
+  let started, release;
+  const open = new Promise((r) => { started = r; });
+  const handle = createEngineSeam({
+    secret: SECRET, json: realJson, readJson: realReadJson, log: () => {}, completeDeadlineMs: 300,
+    loaded: () => null, admit: async () => null,
+    complete: ({ signal, model }) => new Promise((resolve, reject) => {
+      seen.push(['start', model]);
+      started();
+      if (model === 'qa-done') { release = () => resolve('QA content'); return; }
+      signal.addEventListener('abort', () => { seen.push(['aborted', model]); reject(Object.assign(new Error('aborted'), { name: 'AbortError' })); });
+    }),
+  });
+  const responses = [];
+  const server = http.createServer(async (req, res) => { responses.push(res); if (!(await handle(req, res))) { res.writeHead(404); res.end(); } });
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  const port = server.address().port;
+  const post = (model) => {
+    const body = JSON.stringify({ op: 'complete', model, schema: { type: 'object' }, messages: [] });
+    return http.request({ host: '127.0.0.1', port, path: ENGINE_PATH, method: 'POST', headers: { 'x-noevia-store-token': SECRET, 'content-type': 'application/json', 'content-length': Buffer.byteLength(body) } }, () => {}).on('error', () => {}).end(body);
+  };
+  const until = async (check) => { for (let i = 0; i < 200 && !check(); i++) await new Promise((r) => setTimeout(r, 5)); assert.ok(check()); };
+  try {
+    // Disconnect mid-call.
+    const req = post('qa-gone');
+    await open;
+    req.destroy();
+    await until(() => seen.some(([k, m]) => k === 'aborted' && m === 'qa-gone'));
+    // A call nobody ends: the seam's own deadline.
+    post('qa-stuck');
+    await until(() => seen.some(([k, m]) => k === 'aborted' && m === 'qa-stuck'));
+    // A finished call: answered, and no close listener left behind on the response.
+    const done = await new Promise((resolve) => {
+      const body = JSON.stringify({ op: 'complete', model: 'qa-done', schema: { type: 'object' }, messages: [] });
+      const r = http.request({ host: '127.0.0.1', port, path: ENGINE_PATH, method: 'POST', headers: { 'x-noevia-store-token': SECRET, 'content-length': Buffer.byteLength(body) } }, (res) => {
+        const chunks = []; res.on('data', (c) => chunks.push(c)); res.on('end', () => resolve([res.statusCode, JSON.parse(Buffer.concat(chunks).toString())]));
+      });
+      r.end(body);
+      const wait = setInterval(() => { if (release) { clearInterval(wait); release(); } }, 5);
+    });
+    assert.deepEqual(done, [200, { content: 'QA content' }]);
+    assert.equal(responses.at(-1).listenerCount('close'), 0, 'listener removed');
+    assert.ok(!seen.some(([k, m]) => k === 'aborted' && m === 'qa-done'));
+  } finally {
+    server.closeAllConnections?.();
+    await new Promise((r) => server.close(r));
+  }
+});
+
+test('a front already gone before the call starts never starts it', async () => {
+  const calls = [];
+  const req = request(ENGINE_PATH, { body: { op: 'complete', model: 'm', schema: {}, messages: [] } });
+  const res = { destroyed: true, writeHead() {}, end() {} };
+  const handle = createEngineSeam({ secret: SECRET, json, readJson, log: () => {}, loaded: () => null, admit: async () => null,
+    complete: async () => { calls.push(['complete']); return 'x'; } });
+  assert.equal(await handle(req, res), true);
+  assert.deepEqual(calls, []);
+});
