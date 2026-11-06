@@ -33,7 +33,7 @@ async function resumeWorker(manager) {
 // #1057: the fake engine's f16 quirks (failLoadF16, badF16, the shorter recall) hold for both
 // unquantized cache types, bf16 being the first candidate now.
 const unq = o => ['bf16', 'f16'].includes(o['cache-type-k']);
-function fixture(t, { badSampling = false, models = ['synthetic'], onChat, onUnload, badQ4 = true, badF16 = false, noHead = false, rejectAll = false, rejectModel = '', badBatch = false, failFinal = false, formattedQuality = false, reasoningOnly = false, truncatedWorkloads = false, idleTimeoutMs = 300000, loseIdentityAfterStart = false, reloadFail = false, unloadPolls = 0, unloadStuck = false, answerFor = null, failLoadF16 = false, failLoadBf16 = false, httpFor = null, chatTemplate = null, servingFor = null, servingChecks = null, autotuneExtra = {}, onLoad = null, loadHang = null, calibrationExtra = {}, loadReply = null, streamReply = null, metricsFor = null, strictUnload = false, onReload = null, reloadAddsSections = false, presetBaselineClient = null } = {}) {
+function fixture(t, { badSampling = false, models = ['synthetic'], onChat, onUnload, badQ4 = true, badF16 = false, noHead = false, rejectAll = false, rejectModel = '', badBatch = false, failFinal = false, formattedQuality = false, reasoningOnly = false, truncatedWorkloads = false, idleTimeoutMs = 300000, loseIdentityAfterStart = false, reloadFail = false, unloadPolls = 0, unloadStuck = false, answerFor = null, failLoadF16 = false, failLoadBf16 = false, httpFor = null, chatTemplate = null, servingFor = null, servingChecks = null, autotuneExtra = {}, onLoad = null, loadHang = null, calibrationExtra = {}, loadReply = null, streamReply = null, metricsFor = null, strictUnload = false, onReload = null, reloadAddsSections = false, presetBaselineClient = null , managerExtra = {}} = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'full-tune-'));
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
   const ini = path.join(dir, 'models.ini'), stateFile = path.join(dir, 'tune.json');
@@ -100,7 +100,7 @@ function fixture(t, { badSampling = false, models = ['synthetic'], onChat, onUnl
   };
   let owner = null;
   const makeManager = () => { owner = createOwnerDouble(stateFile); const m = makeManagerWith(owner); Object.defineProperty(m, 'testOwner', { value: owner }); return m; };
-  const makeManagerWith = owner => createModelManager({ kind: 'llamacpp', baseUrl: 'http://synthetic', presetPath: ini, fetchJson, fetchStream, presetBaselineClient,
+  const makeManagerWith = owner => createModelManager({ ...managerExtra, kind: 'llamacpp', baseUrl: 'http://synthetic', presetPath: ini, fetchJson, fetchStream, presetBaselineClient,
     calibrationStatePath: path.join(dir, 'cal.json'), autotuneStatePath: stateFile,
     calibrationOptions: { identityFor: async()=>({arch:null,quant:null,artifact:'synthetic-artifact',build:null,profile:require('node:crypto').createHash('sha256').update(fs.readFileSync(ini)).digest('hex'),hardware:null}), sleep: async () => {}, readMemory: () => 20, ...calibrationExtra },
     autotuneOptions: { stateClient: owner, ...autotuneExtra, ...(servingChecks ? { servingChecks } : {}), ...(unloadPolls || unloadStuck ? { sleep: async () => {} } : {}), betweenModelsMs: 25, idleTimeoutMs, readMemory: () => 20, identityFor: async m => (++identityReads > 1 && loseIdentityAfterStart ? null : testIdentity(m, build)) } });
@@ -1837,8 +1837,8 @@ test('#1062 a pending re-read is re-armed after a restart and forced by the next
   const before = reloads.length;
   f.status.outside = 'unloaded';
   assert.equal((await manager.autotune.start('synthetic', { confirmPause: true })).status, 202);
-  assert.ok(reloads.length > before);
-  assert.equal(reloads[before].synthetic, 'unloaded', 'the restored file was re-read before the new tune loaded anything');
+  assert.ok(before > 0, 'startup recovery re-read the restored file before admitting a successor');
+  assert.equal(reloads[before-1].synthetic, 'unloaded', 'startup recovery settled the engine');
   await finished(manager);
 });
 
@@ -2323,8 +2323,9 @@ test('an unacknowledged invalidation: the flush before a load refuses the load a
   const f = fixture(t, { presetBaselineClient: noFront(log), onReload: () => log.push('RELOAD') });
   fs.writeFileSync(f.stateFile, JSON.stringify({ history: {}, job: { status: 'interrupted', model: 'synthetic', _reloadPending: true, models: [] } }));
   const manager = f.restart();
+  await manager.autotune.recover();
   const refused = await manager.load('synthetic').catch(e => e);
-  assert.match(String(refused?.publicMessage || JSON.stringify(refused)), /has not re-read the restored settings yet/);
+  assert.equal(refused.status,503,'pending restart recovery fences every load');
   assert.equal(f.status.synthetic, 'unloaded', 'nothing was loaded');
   assert.ok(log.includes('bridge invalidate:autotune'));
   assert.equal(log.filter(e => e === 'RELOAD').length, 0);
@@ -2451,4 +2452,110 @@ test('refused save during long-profile reload prevents compensation and every la
   await finished(f.manager);
   assert.equal(fs.readFileSync(f.ini, 'utf8'), atFence, 'no compensating INI write after refusal');
   assert.equal(f.requests.length, requests, 'no unload or load after refusal');
+});
+
+// ---- Row J delta review: tuning under a lease of the Rust front's authority (synthetic). ----
+const { createNativeLeaseClient } = require('./model-maintenance-lease.cjs');
+const { authority, SECRET } = require('./synthetic-lease-authority.test-helper.cjs');
+const pause = ms => new Promise(r => setTimeout(r, ms));
+async function settledTune(manager, ms = 30000) {
+  for (let i = 0; i < ms / 10; i++) { const j = manager.autotune.statusFacts().job; if (j && j.status !== 'running') return j; await pause(10); }
+  throw Error('Tuning did not finish');
+}
+async function nativeTune(t, options = {}, gateOptions = {}, authorityOptions = {}) {
+  const a = await authority(t, authorityOptions);
+  const client = createNativeLeaseClient({ port: a.port, token: SECRET, boot: 'tune', startedAt: 1 });
+  const f = fixture(t, { ...options, managerExtra: { maintenanceAuthority: client, maintenanceGateOptions: gateOptions } });
+  await client.ready(); await pause(5);
+  return { ...f, a, client };
+}
+
+test('P2 an ordinary tune on a native lease (production TTL, default 600 s load timeouts) passes', async t => {
+  const f = await nativeTune(t);
+  assert.equal((await f.manager.autotune.start('synthetic', { confirmPause: true })).status, 202);
+  const j = await settledTune(f.manager);
+  assert.equal(j.status, 'passed', j.error);
+  assert.equal(f.options('synthetic')['cache-type-k'], 'bf16');
+  f.manager.enterInference()();
+});
+
+test('P1 a tune that loses its lease after a trial load keeps chat closed until a recovery restores and re-reads the original', async t => {
+  let f, tripped = false, failReloads = 0;
+  f = await nativeTune(t, {
+    onChat: async ({ manager }) => {
+      if (tripped || !f) return;
+      tripped = true;
+      f.a.setRenew('ended');
+      for (let i = 0; i < 300; i++) { try { manager.assertMaintenanceCovered(0); } catch { break; } await pause(10); }
+      failReloads = 3; // the first recoveries cannot get the router to re-read: chat stays closed through them
+    },
+    onReload: () => { if (failReloads > 0) { failReloads--; throw Error('synthetic reload failure'); } },
+  }, { coverageMarginMs: 50, recoveryRetryMs: 20, recoveryMaxDelayMs: 40, recoveryPollMs: 5 }, { ttlMs: 600, renewMs: 100 });
+  assert.equal((await f.manager.autotune.start('synthetic', { confirmPause: true })).status, 202);
+  const j = await settledTune(f.manager);
+  assert.notEqual(j.status, 'passed');
+  assert.ok(tripped);
+  f.a.setRenew('ok');
+  // Through every failed recovery attempt chat stays closed, on a file that may still hold the trial.
+  while (failReloads > 0) {
+    assert.throws(() => f.manager.enterInference(), e => e.status === 503, 'chat closed until recovery settles');
+    await pause(5);
+  }
+  for (let i = 0; i < 500 && f.manager.maintenanceHeld(); i++) await pause(10);
+  assert.equal(f.manager.maintenanceHeld(), false, 'recovered without a restart');
+  assert.equal(fs.readFileSync(f.ini, 'utf8'), f.original, 'the original models.ini is back');
+  assert.ok(Object.values(f.status).every(v => v === 'unloaded'), 'the engine was confirmed idle');
+  const saved = JSON.parse(fs.readFileSync(f.stateFile, 'utf8')).job;
+  assert.equal(saved._recovery, undefined, 'the durable recovery record is cleared once it settled');
+  f.manager.enterInference()();
+});
+
+test('P1 an unrestored trial recorded by an earlier process keeps chat closed at start until it is recovered', async t => {
+  const f = await nativeTune(t, {}, { recoveryRetryMs: 20, recoveryPollMs: 5 });
+  const trial = f.original.replace('ctx-size = 8192', 'ctx-size = 4096');
+  fs.writeFileSync(f.ini, trial);
+  const revision = require('./llamacpp-presets.cjs').createPresetStore(f.ini).snapshot().revision;
+  fs.writeFileSync(f.stateFile, JSON.stringify({ history: {}, settings: {}, job: { id: 'synthetic-job', model: 'synthetic', status: 'failed', models: [], _revision: revision,
+    _recovery: { revision, text: f.original, backedUp: false } } }));
+  const m = f.restart();
+  await pause(1);
+  assert.throws(() => m.enterInference(), e => e.status === 503, 'closed from the start');
+  for (let i = 0; i < 500 && m.maintenanceHeld(); i++) await pause(10);
+  assert.equal(m.maintenanceHeld(), false);
+  assert.equal(fs.readFileSync(f.ini, 'utf8'), f.original);
+  m.enterInference()();
+});
+
+test('R4 restart before loss handler registers trial recovery synchronously', async t => {
+  const f = await nativeTune(t, {}, { recoveryRetryMs: 20, recoveryPollMs: 5 });
+  const trial = f.original.replace('ctx-size = 8192', 'ctx-size = 4096');
+  fs.writeFileSync(f.ini, trial);
+  const revision = require('./llamacpp-presets.cjs').createPresetStore(f.ini).snapshot().revision;
+  fs.writeFileSync(f.stateFile, JSON.stringify({ history: {}, settings: {}, job: { id: 'synthetic-job', model: 'synthetic', status: 'running', models: [{model:'synthetic',status:'running',phases:[{status:'running',_beforeText:f.original,steps:[]}]}], _revision: revision } }));
+  const m = f.restart();
+
+  assert.throws(() => m.enterInference(), e => e.status === 503, 'closed from the start');
+  for (let i = 0; i < 500 && m.maintenanceHeld(); i++) await pause(10);
+  assert.equal(m.maintenanceHeld(), false);
+  assert.equal(fs.readFileSync(f.ini, 'utf8'), f.original);
+  m.enterInference()();
+});
+
+test('R4 restart trial stays fenced while authority is unavailable', async t => {
+  const f = await nativeTune(t, {}, { recoveryRetryMs: 20, recoveryPollMs: 5 });
+  const trial = f.original.replace('ctx-size = 8192', 'ctx-size = 4096');
+  fs.writeFileSync(f.ini, trial);
+  const revision = require('./llamacpp-presets.cjs').createPresetStore(f.ini).snapshot().revision;
+  fs.writeFileSync(f.stateFile, JSON.stringify({ history: {}, settings: {}, job: { id: 'synthetic-job', model: 'synthetic', status: 'running', models: [{model:'synthetic',status:'running',phases:[{status:'running',_beforeText:f.original,steps:[]}]}], _revision: revision } }));
+  f.a.takeAsFront();
+  const m = f.restart();
+  await pause(30);
+  assert.equal(fs.readFileSync(f.ini,'utf8'), trial);
+
+  assert.throws(() => m.enterInference(), e => e.status === 503, 'closed from the start');
+  f.a.releaseFront();
+  for (let i = 0; i < 500 && m.maintenanceHeld(); i++) await pause(10);
+  assert.equal(m.maintenanceHeld(), false);
+  assert.equal(fs.readFileSync(f.ini, 'utf8'), f.original);
+  m.enterInference()();
 });
