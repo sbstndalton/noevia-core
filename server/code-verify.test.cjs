@@ -5,7 +5,7 @@
 const test = require('node:test'), assert = require('node:assert/strict');
 const fs = require('node:fs'), os = require('node:os'), path = require('node:path'), net = require('node:net'), zlib = require('node:zlib');
 const { execFileSync } = require('node:child_process');
-const { createVerifier, parseVerify, verifyEnv, createTail, SCRATCH_PREFIX } = require('../../../services/code-sandbox/tests/oracles/node-verifier.cjs');
+const { createVerifier, parseVerify, verifyEnv, createTail, SCRATCH_PREFIX } = require('../code-sandbox/tests/oracles/node-verifier.cjs');
 const { createCodeWorkspaces } = require('./code-workspace.cjs');
 const { createCodeVerify, isMeasured, cleanTail } = require('./code-verify.cjs');
 
@@ -100,9 +100,9 @@ test('the verify environment is fixed, the tail is bounded, untrusted text is cl
 });
 
 test('the agent sandbox supervisor has no verify mode', () => {
-  const sup = require('../../../services/code-sandbox/supervisor.cjs');
+  const sup = require('../code-sandbox/supervisor.cjs');
   assert.equal(sup.parseVerify, undefined);
-  const text = fs.readFileSync(require.resolve('../../../services/code-sandbox/supervisor.cjs'), 'utf8');
+  const text = fs.readFileSync(require.resolve('../code-sandbox/supervisor.cjs'), 'utf8');
   assert.doesNotMatch(text, /CODE_VERIFY|'verify'/);
 });
 
@@ -195,7 +195,7 @@ test('the verifier refuses a hostile source config, an unconfigured repository, 
 });
 
 test('a source path that could inject git config is refused before any config is written (#855)', async () => {
-  const { configSafePath } = require('../../../services/code-sandbox/tests/oracles/node-verifier.cjs');
+  const { configSafePath } = require('../code-sandbox/tests/oracles/node-verifier.cjs');
   assert.equal(configSafePath('/workspaces/repos/a b#c;d'), true, 'ordinary punctuation is fine inside a quoted value');
   for (const bad of ['/w/a\nb', '/w/a\rb', '/w/a\tb', '/w/a\u0000b', '/w/a\u007fb', '/w/a"b', '/w/a\\b', '']) {
     assert.equal(configSafePath(bad), false, JSON.stringify(bad));
@@ -431,7 +431,7 @@ test('the verifier is one-shot; web retries while it restarts and reports busy c
 
 // The compose override is the control for the verifier's isolation, as it is for the sandbox's.
 test('the verifier container is isolated from the agent sandbox in the override', () => {
-  const yaml = fs.readFileSync(path.join(__dirname, '../../../deploy/examples/code-sandbox.override.yml'), 'utf8');
+  const yaml = fs.readFileSync(path.join(process.env.NOEVIA_TOP_ROOT || path.join(__dirname, '../../..'), 'deploy/examples/code-sandbox.override.yml'), 'utf8');
   const code = yaml.split('\n').map((l) => l.replace(/#.*$/, '')).join('\n');
   const section = (name) => { const m = code.match(new RegExp(`\\n  ${name}:\\n([\\s\\S]*?)(?=\\n  [a-z][\\w-]*:\\n|\\n[a-z]|$)`)); return m ? m[1] : ''; };
   const verify = section('code-verify'), sandbox = section('code-sandbox');
@@ -452,7 +452,7 @@ test('the verifier container is isolated from the agent sandbox in the override'
   assert.match(verify, /\/verify\/run:[^\n]*mode=0700,uid=1003/);
   assert.match(verify, /CODE_VERIFY:/);
   assert.doesNotMatch(verify, /\bports:|PROXY|egress/i);
-  const dockerfile = fs.readFileSync(path.join(__dirname, '../../../services/code-sandbox/Dockerfile'), 'utf8');
+  const dockerfile = fs.readFileSync(path.join(__dirname, '../code-sandbox/Dockerfile'), 'utf8');
   assert.match(dockerfile, /chown 0:0 \/run\/noevia-verify && chmod 0770 \/run\/noevia-verify/, 'the socket directory is root’s');
   assert.doesNotMatch(sandbox, /CODE_VERIFY|code-verify-socket/, 'the agent sandbox never sees the command or the socket');
   assert.match(sandbox, /user:\s*"1000:1000"/);
