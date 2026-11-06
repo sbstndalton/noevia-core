@@ -148,25 +148,34 @@ function createPresetStore(file,{writer=null,cacheRam=null,backupKeep=BACKUP_KEE
   // Async in both modes so callers need not know who the writer is.
   // backup:false (#1003): a write inside an auto-tune run that already kept its one recovery copy.
   // The web writer skips its copy; Model Loader gets the same hint (older sidecars ignore it).
-  async function commit(candidate,{backup=true}={}) {
+  async function commit(candidate,{backup=true,maintenance=null}={}) {
     if(read().revision!==candidate.baseRevision)throw error(409,'Presets changed while applying. Reload before retrying.');
     // Single-writer mode: the sidecar does the revision check, backup and atomic rename.
-    if(writer){await writer.write({baseRevision:candidate.baseRevision,text:candidate.text,...(backup===false?{backup:false}:{})});return;}
+    if(writer){await writer.write({baseRevision:candidate.baseRevision,text:candidate.text,...(maintenance?{maintenance}:{}),...(backup===false?{backup:false}:{})});return;}
     // Web writer on a read-only mount: an explicit 503 before the backup, not a raw EROFS (#269).
     require('./models-ini-writer.cjs').assertWebWritable(file);
-    // Immutable recovery copy precedes the new file; contains operator settings.
-    const backupFile=file+'.noevia-backup-'+candidate.baseRevision;
-    if(backup!==false)try {const fd=fs.openSync(backupFile,'wx',0o600);try{fs.writeFileSync(fd,read().text);fs.fsyncSync(fd);}finally{fs.closeSync(fd);}}catch(e){if(e.code!=='EEXIST')throw e;}
-    const temporary=file+'.noevia-'+crypto.randomUUID();
-    try {
-      // Directory bind mount required: rename is atomic and router sees the new inode.
-      const fd=fs.openSync(temporary,'wx',fs.statSync(file).mode & 0o777);
-      try {fs.writeFileSync(fd,candidate.text);fs.fsyncSync(fd);}finally{fs.closeSync(fd);}
+    return require('./preset-publication.cjs').withPublication(file, db => {
+      const covered = () => { if(maintenance)require('./preset-publication.cjs').validate(db,maintenance,read().revision); };
+      covered();
+      if(read().revision!==candidate.baseRevision)throw error(409,'Presets changed while applying. Reload before retrying.');
+      // Immutable recovery copy precedes the new file; contains operator settings.
+      const backupFile=file+'.noevia-backup-'+candidate.baseRevision;
+      if(backup!==false)try {const fd=fs.openSync(backupFile,'wx',0o600);try{fs.writeFileSync(fd,read().text);fs.fsyncSync(fd);}finally{fs.closeSync(fd);}}catch(e){if(e.code!=='EEXIST')throw e;}
+      const temporary=file+'.noevia-'+crypto.randomUUID();
+      try {
+        // Directory bind mount required: rename is atomic and router sees the new inode.
+        const fd=fs.openSync(temporary,'wx',fs.statSync(file).mode & 0o777);
+        try {fs.writeFileSync(fd,candidate.text);fs.fsyncSync(fd);}finally{fs.closeSync(fd);}
+        covered();
       fs.renameSync(temporary,file);
-      const fdDir=fs.openSync(path.dirname(file),'r');try{fs.fsyncSync(fdDir);}finally{fs.closeSync(fdDir);}
-    } finally {fs.rmSync(temporary,{force:true});}
-    // Only after the new file is in place; best-effort, never fails the write.
-    try{pruneBackups(file,backupKeep);}catch{}
+        const fdDir=fs.openSync(path.dirname(file),'r');try{fs.fsyncSync(fdDir);}finally{fs.closeSync(fdDir);}
+      } finally {fs.rmSync(temporary,{force:true});}
+      const publication=require('./preset-publication.cjs');
+      publication.observeRevision(db,revision(candidate.text));
+      if(maintenance)publication.finish(db,maintenance,'settled',revision(candidate.text));
+      // Only after the new file is in place; best-effort, never fails the write.
+      try{pruneBackups(file,backupKeep);}catch{}
+    });
   }
   // Container paths of the files a section loads. Read-only; used for size estimates.
   // The speculative draft model's file: not an editable option, so parse() does not keep it (#2215).
