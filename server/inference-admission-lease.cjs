@@ -104,6 +104,17 @@ function createAdmission({ modelManager, admitEngineModel, chatMachines = null, 
   }
   return (ask, signal) => {
     const text = (v) => typeof v === 'string' && v.length > 0 && v.length <= 1024;
+    // Code tasks hold only the shared maintenance count. Their executor/model path accounts
+    // for its own engine use; asking here must never load a model or reserve unrelated memory.
+    if (ask && typeof ask === 'object' && 'maintenance' in ask) {
+      if (ask.maintenance !== true || Object.keys(ask).some(k => k !== 'maintenance')) throw refusal(400, 'Invalid maintenance lease.');
+      signal?.throwIfAborted();
+      if (typeof modelManager.enterInference !== 'function') throw refusal(503, BUSY);
+      const leave = modelManager.enterInference();
+      if (typeof leave !== 'function') throw refusal(503, BUSY);
+      let released = false;
+      return Promise.resolve({ headers: null, release() { if (!released) { released = true; leave(); } } });
+    }
     if (ask && typeof ask === 'object' && 'diaryExchange' in ask) {
       if (typeof diaryExchange?.rateLimited !== 'function') throw refusal(400, 'Diary exchanges are not admitted here.');
       if ('model' in ask || 'role' in ask || 'machine' in ask || !text(ask.diaryExchange?.user)) throw refusal(400, 'A user is required.');
