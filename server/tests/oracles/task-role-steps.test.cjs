@@ -1,0 +1,9 @@
+'use strict';const{test}=require('node:test');const assert=require('node:assert/strict');const fs=require('node:fs'),path=require('node:path');const{createPlannerPlan}=require('../../planner-plan.cjs');const{createPlannerReview}=require('../../code-review.cjs');
+test('Planner and reviewer hooks validate role answers without approving anything',async()=>{
+ const state={taskId:'22222222-2222-4222-8222-222222222222',tenantId:'11111111-1111-4111-8111-111111111111',request:'Change widget',capabilities:[{name:'edit_file'}]};const plan={goal:'Change widget',context:[],constraints:[],investigation:[],steps:[{n:1,do:'Edit widget',done_when:'Tests pass'}],capabilities:['edit_file'],approval_boundaries:[],verification:['Run tests'],completion:'Widget changed',non_goals:[]};const verdict={verdict:'approve',summary:'Fine',findings:[]};const fixtures=[];const constraint={applied:false,mode:null,reason:'flag_off',fallback:false};
+ for(const [kind,output]of [['plan',plan],['plan',{...plan,capabilities:['network']}],['plan',{...plan,steps:[{n:2,do:'x',done_when:'y'}]}],['plan','bad'],['review',verdict],['review',{...verdict,verdict:'request_changes'}],['review',{...verdict,summary:''}],['review',{...verdict,findings:[{severity:'blocker',file:'widget',message:'Broken'}]}],['review','bad']]){
+  const session={call:async()=>output==='bad'?{ok:false,code:'invalid',reason:'invalid',constraint}:{ok:true,text:JSON.stringify(output),corrected:false,attempts:1,constraint}};
+  const result=kind==='plan'?await createPlannerPlan({engine:()=>({})}).generate({state,session}):await createPlannerReview().review({state,session});fixtures.push({kind,state,output,result});
+ }assert.equal(fixtures[0].result.ok,true);assert.equal(fixtures[1].result.ok,false);assert.equal(fixtures[4].result.ok,true);
+ if(process.env.TASK_JOURNAL_EVIDENCE)fs.writeFileSync(path.join(process.env.TASK_JOURNAL_EVIDENCE,'task-role-steps-node.json'),JSON.stringify(fixtures,null,2)+'\n');
+});
