@@ -15,7 +15,9 @@
 // to contain it. Scrub FIRST, clip afterwards.
 const SUBSTRING_MIN = 8;
 const REDACTED = '[redacted]';
-const WORD = /[\p{L}\p{N}_]/u;
+// One word-character policy for Node and the front (mcp_scrub.rs): Unicode Alphabetic, Number, and underscore. (Rust's
+// char::is_alphanumeric is Alphabetic or Numeric; a combining mark such as U+0345 is Alphabetic in both.)
+const WORD = /[\p{Alphabetic}\p{N}_]/u;
 
 const percentEncoded = (v) => [...Buffer.from(v, 'utf8')].map((b) => (/[A-Za-z0-9\-_.~]/.test(String.fromCharCode(b)) ? String.fromCharCode(b) : `%${b.toString(16).toUpperCase().padStart(2, '0')}`)).join('');
 
@@ -33,8 +35,11 @@ function createSecrets(headers = null) {
     const scheme = value.slice(0, at);
     const rest = value.slice(at + 1).trim();
     add(rest);
-    if (scheme.toLowerCase() === 'basic' && /^[A-Za-z0-9+/]*={0,2}$/.test(rest)) {
-      const raw = Buffer.from(rest, 'base64').toString('utf8');
+    // One Base64 acceptance policy for Node and the front: at most two trailing '=' (padding is optional, trailing bits are
+    // ignored), the standard alphabet only, and a length that can be Base64 at all (not 1 mod 4 once the padding is off).
+    const unpadded = rest.replace(/=+$/, '');
+    if (scheme.toLowerCase() === 'basic' && rest.length - unpadded.length <= 2 && /^[A-Za-z0-9+/]*$/.test(unpadded) && unpadded.length % 4 !== 1) {
+      const raw = Buffer.from(unpadded, 'base64').toString('utf8');
       add(raw);
       const colon = raw.indexOf(':');
       if (colon >= 0) { add(raw.slice(0, colon)); add(raw.slice(colon + 1)); }
@@ -84,6 +89,57 @@ function createSecrets(headers = null) {
   };
 }
 
+// Where a string of a tool's schema is the server's own *description* (it may be rewritten without changing what the tool
+// is) rather than part of its contract (a property name, an enum value, a default, a pattern: it may not).
+const DESCRIPTIVE = new Set(['description', 'title', '$comment', 'examples', 'example']);
+const MAX_SCHEMA_DEPTH = 64;
+
+/**
+ * A tool definition a server listed, with the credentials its request carried taken out (sbstndalton/noevia#2218):
+ * a tool whose NAME repeats one is dropped; its description and title, and every descriptive string anywhere in its
+ * input schema (descriptions, titles, comments, examples at any depth), are scrubbed; and a tool whose schema repeats
+ * one anywhere else (a property name, an enum or default value, a pattern) is dropped, because replacing it would change
+ * what the tool is. Returns `{ tool }` (a copy) or `{ dropped: reason }`. The front's mcp_tools.rs does the same.
+ */
+function sanitizeTool(tool, secrets) {
+  if (!tool || typeof tool !== 'object' || Array.isArray(tool)) return { tool };
+  const same = (text) => secrets.scrub(text) === text;
+  if (typeof tool.name === 'string' && !same(tool.name)) return { dropped: 'its name repeats a credential' };
+  const out = { ...tool };
+  for (const key of ['description', 'title']) if (typeof out[key] === 'string') out[key] = secrets.scrub(out[key]);
+  if ('inputSchema' in out) {
+    const walked = walkSchema(out.inputSchema, false, 0, secrets);
+    if (walked === DROP) return { dropped: 'its schema repeats a credential' };
+    out.inputSchema = walked;
+  }
+  return { tool: out };
+}
+
+const DROP = Symbol('drop');
+function walkSchema(node, descriptive, depth, secrets) {
+  if (depth > MAX_SCHEMA_DEPTH) return DROP;
+  if (typeof node === 'string') {
+    const scrubbed = secrets.scrub(node);
+    return descriptive || scrubbed === node ? scrubbed : DROP;
+  }
+  if (Array.isArray(node)) {
+    const out = [];
+    for (const item of node) { const w = walkSchema(item, descriptive, depth + 1, secrets); if (w === DROP) return DROP; out.push(w); }
+    return out;
+  }
+  if (node && typeof node === 'object') {
+    const out = {};
+    for (const [key, value] of Object.entries(node)) {
+      if (secrets.scrub(key) !== key) return DROP;
+      const w = walkSchema(value, descriptive || DESCRIPTIVE.has(key), depth + 1, secrets);
+      if (w === DROP) return DROP;
+      out[key] = w;
+    }
+    return out;
+  }
+  return node;
+}
+
 /** A failure of an upstream exchange with the credentials taken out of its message; its HTTP status (a number the caller may show) and a plain upper-case error code are kept. */
 function scrubbedError(err, secrets) {
   const out = new Error(secrets.scrub(String((err && err.message) || err)));
@@ -92,4 +148,4 @@ function scrubbedError(err, secrets) {
   return out;
 }
 
-module.exports = { createSecrets, scrubbedError, SUBSTRING_MIN, REDACTED };
+module.exports = { createSecrets, scrubbedError, sanitizeTool, SUBSTRING_MIN, REDACTED };

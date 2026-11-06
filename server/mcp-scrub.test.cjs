@@ -2,7 +2,10 @@
 // The Node half of the credential scrub (noevia-rs bins/noevia-server mcp_scrub.rs has the same cases).
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { createSecrets, scrubbedError, REDACTED } = require('./mcp-scrub.cjs');
+const fs = require('node:fs');
+const path = require('node:path');
+const { execFileSync } = require('node:child_process');
+const { createSecrets, scrubbedError, sanitizeTool, REDACTED } = require('./mcp-scrub.cjs');
 
 const secretsOf = (...values) => { const s = createSecrets(); for (const v of values) s.addValue(v); return s; };
 
@@ -39,4 +42,41 @@ test('numbers and booleans are text to the scrub, and the scrubbed error keeps i
   const e = scrubbedError(Object.assign(new Error('MCP 401: key 12345'), { httpStatus: 401, code: 'EPRIVATEADDR', retryAfter: '3' }), s);
   assert.deepEqual([e.message, e.httpStatus, e.code, e.retryAfter], ['MCP 401: key [redacted]', 401, 'EPRIVATEADDR', undefined]);
   assert.equal(scrubbedError(Object.assign(new Error('x'), { code: 'has a secret 12345' }), s).code, undefined);
+});
+
+// ── the one policy, two implementations: tests/fixtures/mcp-scrub.v1.json is read by noevia-rs too ──
+
+const FIXTURE = path.join(__dirname, '..', 'tests', 'fixtures', 'mcp-scrub.v1.json');
+const fixture = () => JSON.parse(fs.readFileSync(FIXTURE, 'utf8'));
+const secretsFrom = (headers) => createSecrets(Object.fromEntries(headers));
+
+test('every shared text case scrubs as recorded', () => {
+  const { text } = fixture();
+  assert.ok(text.length >= 35);
+  for (const c of text) assert.equal(secretsFrom(c.headers).scrub(c.text), c.expect, c.id);
+});
+
+test('every shared tool case is sanitized as recorded', () => {
+  const { tool } = fixture();
+  assert.ok(tool.length >= 18);
+  for (const c of tool) {
+    const out = sanitizeTool(c.tool, secretsFrom(c.headers));
+    assert.deepEqual(out.dropped ? { dropped: out.dropped } : { tool: out.tool }, c.expect, c.id);
+  }
+});
+
+test('the committed shared fixture is what the reference says', { timeout: 60000 }, () => {
+  const fresh = execFileSync(process.execPath, [path.join(__dirname, '..', 'tools', 'gen-mcp-scrub-fixtures.cjs')], { encoding: 'utf8' });
+  assert.equal(fresh, fs.readFileSync(FIXTURE, 'utf8'), 'regenerate: node tools/gen-mcp-scrub-fixtures.cjs > tests/fixtures/mcp-scrub.v1.json (and copy it to noevia-rs)');
+});
+
+test('a sanitized tool never repeats the credential anywhere, and a scrubbed schema keeps its shape', () => {
+  const KEY = 'SYNTH-api-secret-1234';
+  const secrets = createSecrets({ 'X-Api-Key': KEY });
+  const input = { name: 'ok', description: `d ${KEY}`, inputSchema: { type: 'object', properties: { q: { type: 'string', description: `use ${KEY}`, minLength: 1 } }, required: ['q'] } };
+  const { tool } = sanitizeTool(input, secrets);
+  assert.equal(JSON.stringify(tool).includes(KEY), false);
+  assert.deepEqual(tool.inputSchema.required, ['q']);
+  assert.equal(tool.inputSchema.properties.q.minLength, 1);
+  assert.equal(input.description.includes(KEY), true, 'the listed definition itself is not mutated');
 });

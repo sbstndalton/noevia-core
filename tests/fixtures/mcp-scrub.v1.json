@@ -1,0 +1,1191 @@
+{
+ "version": 1,
+ "text": [
+  {
+   "id": "length-1",
+   "headers": [
+    [
+     "X-Api-Key",
+     "a"
+    ]
+   ],
+   "text": "bad token a. (a) a",
+   "expect": "bad token [redacted]. ([redacted]) [redacted]"
+  },
+  {
+   "id": "length-2",
+   "headers": [
+    [
+     "X-Api-Key",
+     "q7"
+    ]
+   ],
+   "text": "bad token q7. (q7) q7",
+   "expect": "bad token [redacted]. ([redacted]) [redacted]"
+  },
+  {
+   "id": "length-3",
+   "headers": [
+    [
+     "X-Api-Key",
+     "q7Z"
+    ]
+   ],
+   "text": "bad token q7Z. (q7Z) q7Z",
+   "expect": "bad token [redacted]. ([redacted]) [redacted]"
+  },
+  {
+   "id": "length-4",
+   "headers": [
+    [
+     "X-Api-Key",
+     "q7Z!"
+    ]
+   ],
+   "text": "bad token q7Z!. (q7Z!) q7Z!",
+   "expect": "bad token [redacted]. ([redacted]) [redacted]"
+  },
+  {
+   "id": "length-5",
+   "headers": [
+    [
+     "X-Api-Key",
+     "q7Z!2"
+    ]
+   ],
+   "text": "bad token q7Z!2. (q7Z!2) q7Z!2",
+   "expect": "bad token [redacted]. ([redacted]) [redacted]"
+  },
+  {
+   "id": "length-6",
+   "headers": [
+    [
+     "X-Api-Key",
+     "q7Z!2x"
+    ]
+   ],
+   "text": "bad token q7Z!2x. (q7Z!2x) q7Z!2x",
+   "expect": "bad token [redacted]. ([redacted]) [redacted]"
+  },
+  {
+   "id": "length-7",
+   "headers": [
+    [
+     "X-Api-Key",
+     "q7Z!2xy"
+    ]
+   ],
+   "text": "bad token q7Z!2xy. (q7Z!2xy) q7Z!2xy",
+   "expect": "bad token [redacted]. ([redacted]) [redacted]"
+  },
+  {
+   "id": "length-8",
+   "headers": [
+    [
+     "X-Api-Key",
+     "q7Z!2xyz"
+    ]
+   ],
+   "text": "bad token q7Z!2xyz. (q7Z!2xyz) q7Z!2xyz",
+   "expect": "bad token [redacted]. ([redacted]) [redacted]"
+  },
+  {
+   "id": "short-inside-words",
+   "headers": [
+    [
+     "X-Api-Key",
+     "ab"
+    ]
+   ],
+   "text": "cabin about ab ab_c ab9 9ab",
+   "expect": "cabin about [redacted] ab_c ab9 9ab"
+  },
+  {
+   "id": "seven-bytes-is-a-token",
+   "headers": [
+    [
+     "X-Api-Key",
+     "abcdefg"
+    ]
+   ],
+   "text": "xabcdefgx abcdefg",
+   "expect": "xabcdefgx [redacted]"
+  },
+  {
+   "id": "eight-bytes-anywhere",
+   "headers": [
+    [
+     "X-Api-Key",
+     "abcdefgh"
+    ]
+   ],
+   "text": "xabcdefghx abcdefgh",
+   "expect": "x[redacted]x [redacted]"
+  },
+  {
+   "id": "multibyte-length-is-bytes",
+   "headers": [
+    [
+     "X-Api-Key",
+     "éé"
+    ]
+   ],
+   "text": "aééb éé",
+   "expect": "aééb [redacted]"
+  },
+  {
+   "id": "boundary-combining-mark-before",
+   "headers": [
+    [
+     "X-Api-Key",
+     "q7"
+    ]
+   ],
+   "text": "ͅq7 q7ͅ q7",
+   "expect": "ͅq7 q7ͅ [redacted]"
+  },
+  {
+   "id": "boundary-accented-letter",
+   "headers": [
+    [
+     "X-Api-Key",
+     "q7"
+    ]
+   ],
+   "text": "éq7 q7é q7",
+   "expect": "éq7 q7é [redacted]"
+  },
+  {
+   "id": "boundary-other-scripts-and-digits",
+   "headers": [
+    [
+     "X-Api-Key",
+     "q7"
+    ]
+   ],
+   "text": "дq7 q7д 5q7 q7٣ 漢q7 q7",
+   "expect": "дq7 q7д 5q7 q7٣ 漢q7 [redacted]"
+  },
+  {
+   "id": "boundary-emoji-and-punctuation",
+   "headers": [
+    [
+     "X-Api-Key",
+     "q7"
+    ]
+   ],
+   "text": "😀q7 q7😀 -q7- _q7 q7_",
+   "expect": "😀[redacted] [redacted]😀 -[redacted]- _q7 q7_"
+  },
+  {
+   "id": "boundary-roman-numeral-and-marks",
+   "headers": [
+    [
+     "X-Api-Key",
+     "q7"
+    ]
+   ],
+   "text": "Ⅻq7 ²q7 q7​ q7́",
+   "expect": "Ⅻq7 ²q7 [redacted]​ [redacted]́"
+  },
+  {
+   "id": "bearer-scheme-stripped",
+   "headers": [
+    [
+     "Authorization",
+     "Bearer t9x"
+    ]
+   ],
+   "text": "Bearer t9x t9x Bearer",
+   "expect": "[redacted] [redacted] Bearer"
+  },
+  {
+   "id": "scheme-only-no-rest",
+   "headers": [
+    [
+     "Authorization",
+     "Bearer"
+    ]
+   ],
+   "text": "Bearer token",
+   "expect": "[redacted] token"
+  },
+  {
+   "id": "scheme-with-trailing-space",
+   "headers": [
+    [
+     "Authorization",
+     "Bearer abc  "
+    ]
+   ],
+   "text": "abc Bearer abc",
+   "expect": "[redacted] Bearer [redacted]"
+  },
+  {
+   "id": "basic-padded",
+   "headers": [
+    [
+     "Authorization",
+     "Basic YWw6cHcxMg=="
+    ]
+   ],
+   "text": "YWw6cHcxMg== al:pw12 al pw12",
+   "expect": "[redacted] [redacted] [redacted] [redacted]"
+  },
+  {
+   "id": "basic-unpadded",
+   "headers": [
+    [
+     "Authorization",
+     "Basic dTpwdzE"
+    ]
+   ],
+   "text": "dTpwdzE u:pw1 u pw1",
+   "expect": "[redacted] [redacted] [redacted] [redacted]"
+  },
+  {
+   "id": "basic-noncanonical-trailing-bits",
+   "headers": [
+    [
+     "Authorization",
+     "Basic dTpwdzF="
+    ]
+   ],
+   "text": "dTpwdzF= u:pw1 u pw1",
+   "expect": "[redacted] [redacted] [redacted] [redacted]"
+  },
+  {
+   "id": "basic-too-much-padding",
+   "headers": [
+    [
+     "Authorization",
+     "Basic dTpwdzE==="
+    ]
+   ],
+   "text": "u:pw1 u pw1 dTpwdzE===",
+   "expect": "u:pw1 u pw1 [redacted]"
+  },
+  {
+   "id": "basic-impossible-length",
+   "headers": [
+    [
+     "Authorization",
+     "Basic dTpwd"
+    ]
+   ],
+   "text": "u:pw u pw dTpwd",
+   "expect": "u:pw u pw [redacted]"
+  },
+  {
+   "id": "basic-padding-in-the-middle",
+   "headers": [
+    [
+     "Authorization",
+     "Basic dT=pwdzE"
+    ]
+   ],
+   "text": "u:pw1 pw1",
+   "expect": "u:pw1 pw1"
+  },
+  {
+   "id": "basic-url-safe-alphabet-is-not-base64",
+   "headers": [
+    [
+     "Authorization",
+     "Basic dT-pwd_zE"
+    ]
+   ],
+   "text": "dT-pwd_zE",
+   "expect": "[redacted]"
+  },
+  {
+   "id": "basic-no-colon",
+   "headers": [
+    [
+     "Authorization",
+     "Basic anVzdGFzZWNyZXQ="
+    ]
+   ],
+   "text": "justasecret",
+   "expect": "[redacted]"
+  },
+  {
+   "id": "basic-scheme-case",
+   "headers": [
+    [
+     "Authorization",
+     "bAsIc dTpwdzE="
+    ]
+   ],
+   "text": "u pw1",
+   "expect": "[redacted] [redacted]"
+  },
+  {
+   "id": "basic-invalid-utf8",
+   "headers": [
+    [
+     "Authorization",
+     "Basic /+8="
+    ]
+   ],
+   "text": "plain",
+   "expect": "plain"
+  },
+  {
+   "id": "trim-nbsp-and-bom",
+   "headers": [
+    [
+     "Authorization",
+     "Bearer  tok1﻿"
+    ]
+   ],
+   "text": "tok1  tok1﻿",
+   "expect": "[redacted]  [redacted]﻿"
+  },
+  {
+   "id": "trim-next-line-is-not-whitespace",
+   "headers": [
+    [
+     "X-Api-Key",
+     "key9"
+    ]
+   ],
+   "text": "key9 key9",
+   "expect": "key9 [redacted]"
+  },
+  {
+   "id": "blank-value-adds-nothing",
+   "headers": [
+    [
+     "X-Api-Key",
+     "   "
+    ],
+    [
+     "X-Other",
+     ""
+    ]
+   ],
+   "text": "nothing to hide here",
+   "expect": "nothing to hide here"
+  },
+  {
+   "id": "json-escaped-spelling",
+   "headers": [
+    [
+     "X-Api-Key",
+     "k\"q\\ü\n1"
+    ]
+   ],
+   "text": "{\"m\":\"k\\\"q\\\\ü\\n1\"} k\"q\\ü\n1",
+   "expect": "{\"m\":\"[redacted]\"} [redacted]"
+  },
+  {
+   "id": "percent-encoded-spelling",
+   "headers": [
+    [
+     "X-Api-Key",
+     "a b/ü~x"
+    ]
+   ],
+   "text": "a%20b%2F%C3%BC~x a b/ü~x",
+   "expect": "[redacted] [redacted]"
+  },
+  {
+   "id": "account-id-is-not-a-credential",
+   "headers": [
+    [
+     "X-Cowork-User-ID",
+     "user-1"
+    ],
+    [
+     "x-cowork-user-id",
+     "user-2"
+    ]
+   ],
+   "text": "user-1 user-2",
+   "expect": "user-1 user-2"
+  },
+  {
+   "id": "overlapping-values-merge",
+   "headers": [
+    [
+     "A",
+     "abcdefghij"
+    ],
+    [
+     "B",
+     "defghijklm"
+    ]
+   ],
+   "text": "xx abcdefghijklm yy",
+   "expect": "xx [redacted] yy"
+  },
+  {
+   "id": "numeric-and-boolean-words",
+   "headers": [
+    [
+     "X-Api-Key",
+     "12345"
+    ],
+    [
+     "X-Flag",
+     "true"
+    ]
+   ],
+   "text": "MCP error 12345: boolean true; 123456; truest",
+   "expect": "MCP error [redacted]: boolean [redacted]; 123456; truest"
+  },
+  {
+   "id": "nothing-to-scrub",
+   "headers": [],
+   "text": "SYNTH-api-secret-1234",
+   "expect": "SYNTH-api-secret-1234"
+  }
+ ],
+ "tool": [
+  {
+   "id": "clean-tool-unchanged",
+   "headers": [
+    [
+     "X-Api-Key",
+     "SYNTH-api-secret-1234"
+    ]
+   ],
+   "tool": {
+    "name": "search",
+    "description": "Searches",
+    "inputSchema": {
+     "type": "object",
+     "properties": {}
+    },
+    "title": "Search"
+   },
+   "expect": {
+    "tool": {
+     "name": "search",
+     "description": "Searches",
+     "inputSchema": {
+      "type": "object",
+      "properties": {}
+     },
+     "title": "Search"
+    }
+   }
+  },
+  {
+   "id": "name-repeats-the-credential",
+   "headers": [
+    [
+     "X-Api-Key",
+     "SYNTH-api-secret-1234"
+    ]
+   ],
+   "tool": {
+    "name": "SYNTH-api-secret-1234",
+    "description": "d",
+    "inputSchema": {
+     "type": "object",
+     "properties": {}
+    }
+   },
+   "expect": {
+    "dropped": "its name repeats a credential"
+   }
+  },
+  {
+   "id": "name-contains-a-long-credential",
+   "headers": [
+    [
+     "X-Api-Key",
+     "SYNTH-api-secret-1234"
+    ]
+   ],
+   "tool": {
+    "name": "x_SYNTH-api-secret-1234_y",
+    "description": "d",
+    "inputSchema": {
+     "type": "object",
+     "properties": {}
+    }
+   },
+   "expect": {
+    "dropped": "its name repeats a credential"
+   }
+  },
+  {
+   "id": "description-and-title-scrubbed",
+   "headers": [
+    [
+     "X-Api-Key",
+     "SYNTH-api-secret-1234"
+    ]
+   ],
+   "tool": {
+    "name": "t",
+    "description": "Use SYNTH-api-secret-1234 to search",
+    "inputSchema": {
+     "type": "object",
+     "properties": {}
+    },
+    "title": "T SYNTH-api-secret-1234"
+   },
+   "expect": {
+    "tool": {
+     "name": "t",
+     "description": "Use [redacted] to search",
+     "inputSchema": {
+      "type": "object",
+      "properties": {}
+     },
+     "title": "T [redacted]"
+    }
+   }
+  },
+  {
+   "id": "nested-description-scrubbed",
+   "headers": [
+    [
+     "X-Api-Key",
+     "SYNTH-api-secret-1234"
+    ]
+   ],
+   "tool": {
+    "name": "t",
+    "description": "d",
+    "inputSchema": {
+     "type": "object",
+     "properties": {
+      "query": {
+       "type": "string",
+       "description": "Use SYNTH-api-secret-1234"
+      }
+     }
+    }
+   },
+   "expect": {
+    "tool": {
+     "name": "t",
+     "description": "d",
+     "inputSchema": {
+      "type": "object",
+      "properties": {
+       "query": {
+        "type": "string",
+        "description": "Use [redacted]"
+       }
+      }
+     }
+    }
+   }
+  },
+  {
+   "id": "deep-nested-descriptions-in-items-and-alternatives",
+   "headers": [
+    [
+     "X-Api-Key",
+     "SYNTH-api-secret-1234"
+    ]
+   ],
+   "tool": {
+    "name": "t",
+    "description": "d",
+    "inputSchema": {
+     "type": "object",
+     "properties": {
+      "q": {
+       "type": "array",
+       "items": {
+        "anyOf": [
+         {
+          "type": "string",
+          "description": "a SYNTH-api-secret-1234"
+         },
+         {
+          "type": "object",
+          "properties": {
+           "z": {
+            "description": "b SYNTH-api-secret-1234",
+            "title": "c SYNTH-api-secret-1234",
+            "$comment": "SYNTH-api-secret-1234"
+           }
+          }
+         }
+        ]
+       }
+      }
+     }
+    }
+   },
+   "expect": {
+    "tool": {
+     "name": "t",
+     "description": "d",
+     "inputSchema": {
+      "type": "object",
+      "properties": {
+       "q": {
+        "type": "array",
+        "items": {
+         "anyOf": [
+          {
+           "type": "string",
+           "description": "a [redacted]"
+          },
+          {
+           "type": "object",
+           "properties": {
+            "z": {
+             "description": "b [redacted]",
+             "title": "c [redacted]",
+             "$comment": "[redacted]"
+            }
+           }
+          }
+         ]
+        }
+       }
+      }
+     }
+    }
+   }
+  },
+  {
+   "id": "examples-are-descriptive",
+   "headers": [
+    [
+     "X-Api-Key",
+     "SYNTH-api-secret-1234"
+    ]
+   ],
+   "tool": {
+    "name": "t",
+    "description": "d",
+    "inputSchema": {
+     "type": "object",
+     "properties": {
+      "q": {
+       "type": "string",
+       "examples": [
+        "SYNTH-api-secret-1234",
+        "ok"
+       ],
+       "example": {
+        "k": "SYNTH-api-secret-1234"
+       }
+      }
+     }
+    }
+   },
+   "expect": {
+    "tool": {
+     "name": "t",
+     "description": "d",
+     "inputSchema": {
+      "type": "object",
+      "properties": {
+       "q": {
+        "type": "string",
+        "examples": [
+         "[redacted]",
+         "ok"
+        ],
+        "example": {
+         "k": "[redacted]"
+        }
+       }
+      }
+     }
+    }
+   }
+  },
+  {
+   "id": "default-repeats-the-credential-drops-the-tool",
+   "headers": [
+    [
+     "X-Api-Key",
+     "SYNTH-api-secret-1234"
+    ]
+   ],
+   "tool": {
+    "name": "t",
+    "description": "d",
+    "inputSchema": {
+     "type": "object",
+     "properties": {
+      "q": {
+       "type": "string",
+       "default": "SYNTH-api-secret-1234"
+      }
+     }
+    }
+   },
+   "expect": {
+    "dropped": "its schema repeats a credential"
+   }
+  },
+  {
+   "id": "enum-repeats-the-credential-drops-the-tool",
+   "headers": [
+    [
+     "X-Api-Key",
+     "SYNTH-api-secret-1234"
+    ]
+   ],
+   "tool": {
+    "name": "t",
+    "description": "d",
+    "inputSchema": {
+     "type": "object",
+     "properties": {
+      "q": {
+       "enum": [
+        "a",
+        "SYNTH-api-secret-1234"
+       ]
+      }
+     }
+    }
+   },
+   "expect": {
+    "dropped": "its schema repeats a credential"
+   }
+  },
+  {
+   "id": "property-name-repeats-the-credential-drops-the-tool",
+   "headers": [
+    [
+     "X-Api-Key",
+     "SYNTH-api-secret-1234"
+    ]
+   ],
+   "tool": {
+    "name": "t",
+    "description": "d",
+    "inputSchema": {
+     "type": "object",
+     "properties": {
+      "SYNTH-api-secret-1234": {
+       "type": "string"
+      }
+     }
+    }
+   },
+   "expect": {
+    "dropped": "its schema repeats a credential"
+   }
+  },
+  {
+   "id": "pattern-and-required-drop-the-tool",
+   "headers": [
+    [
+     "X-Api-Key",
+     "SYNTH-api-secret-1234"
+    ]
+   ],
+   "tool": {
+    "name": "t",
+    "description": "d",
+    "inputSchema": {
+     "type": "object",
+     "properties": {
+      "q": {
+       "type": "string",
+       "pattern": "^SYNTH-api-secret-1234$"
+      }
+     }
+    }
+   },
+   "expect": {
+    "dropped": "its schema repeats a credential"
+   }
+  },
+  {
+   "id": "required-entry-drops-the-tool",
+   "headers": [
+    [
+     "X-Api-Key",
+     "SYNTH-api-secret-1234"
+    ]
+   ],
+   "tool": {
+    "name": "t",
+    "description": "d",
+    "inputSchema": {
+     "type": "object",
+     "properties": {
+      "q": {
+       "type": "string"
+      }
+     },
+     "required": [
+      "SYNTH-api-secret-1234"
+     ]
+    }
+   },
+   "expect": {
+    "dropped": "its schema repeats a credential"
+   }
+  },
+  {
+   "id": "defs-key-drops-the-tool",
+   "headers": [
+    [
+     "X-Api-Key",
+     "SYNTH-api-secret-1234"
+    ]
+   ],
+   "tool": {
+    "name": "t",
+    "description": "d",
+    "inputSchema": {
+     "type": "object",
+     "properties": {},
+     "$defs": {
+      "SYNTH-api-secret-1234": {
+       "type": "string"
+      }
+     }
+    }
+   },
+   "expect": {
+    "dropped": "its schema repeats a credential"
+   }
+  },
+  {
+   "id": "short-credential-token-in-description",
+   "headers": [
+    [
+     "X-Api-Key",
+     "q7"
+    ]
+   ],
+   "tool": {
+    "name": "t",
+    "description": "d",
+    "inputSchema": {
+     "type": "object",
+     "properties": {
+      "q": {
+       "description": "use q7 now; q7z stays"
+      }
+     }
+    }
+   },
+   "expect": {
+    "tool": {
+     "name": "t",
+     "description": "d",
+     "inputSchema": {
+      "type": "object",
+      "properties": {
+       "q": {
+        "description": "use [redacted] now; q7z stays"
+       }
+      }
+     }
+    }
+   }
+  },
+  {
+   "id": "short-credential-as-a-property-name-drops",
+   "headers": [
+    [
+     "X-Api-Key",
+     "q7"
+    ]
+   ],
+   "tool": {
+    "name": "t",
+    "description": "d",
+    "inputSchema": {
+     "type": "object",
+     "properties": {
+      "q7": {
+       "type": "string"
+      }
+     }
+    }
+   },
+   "expect": {
+    "dropped": "its schema repeats a credential"
+   }
+  },
+  {
+   "id": "short-credential-inside-a-name-stays",
+   "headers": [
+    [
+     "X-Api-Key",
+     "q7"
+    ]
+   ],
+   "tool": {
+    "name": "aq7b",
+    "description": "d",
+    "inputSchema": {
+     "type": "object",
+     "properties": {}
+    }
+   },
+   "expect": {
+    "tool": {
+     "name": "aq7b",
+     "description": "d",
+     "inputSchema": {
+      "type": "object",
+      "properties": {}
+     }
+    }
+   }
+  },
+  {
+   "id": "numeric-credential-in-a-number-default-stays",
+   "headers": [
+    [
+     "X-Api-Key",
+     "12345"
+    ]
+   ],
+   "tool": {
+    "name": "t",
+    "description": "d",
+    "inputSchema": {
+     "type": "object",
+     "properties": {
+      "n": {
+       "type": "integer",
+       "default": 12345,
+       "description": "n is 12345"
+      }
+     }
+    }
+   },
+   "expect": {
+    "tool": {
+     "name": "t",
+     "description": "d",
+     "inputSchema": {
+      "type": "object",
+      "properties": {
+       "n": {
+        "type": "integer",
+        "default": 12345,
+        "description": "n is [redacted]"
+       }
+      }
+     }
+    }
+   }
+  },
+  {
+   "id": "too-deep-drops-the-tool",
+   "headers": [
+    [
+     "X-Api-Key",
+     "SYNTH-api-secret-1234"
+    ]
+   ],
+   "tool": {
+    "name": "t",
+    "description": "d",
+    "inputSchema": {
+     "type": "object",
+     "properties": {
+      "a": {
+       "items": {
+        "items": {
+         "items": {
+          "items": {
+           "items": {
+            "items": {
+             "items": {
+              "items": {
+               "items": {
+                "items": {
+                 "items": {
+                  "items": {
+                   "items": {
+                    "items": {
+                     "items": {
+                      "items": {
+                       "items": {
+                        "items": {
+                         "items": {
+                          "items": {
+                           "items": {
+                            "items": {
+                             "items": {
+                              "items": {
+                               "items": {
+                                "items": {
+                                 "items": {
+                                  "items": {
+                                   "items": {
+                                    "items": {
+                                     "items": {
+                                      "items": {
+                                       "items": {
+                                        "items": {
+                                         "items": {
+                                          "items": {
+                                           "items": {
+                                            "items": {
+                                             "items": {
+                                              "items": {
+                                               "items": {
+                                                "items": {
+                                                 "items": {
+                                                  "items": {
+                                                   "items": {
+                                                    "items": {
+                                                     "items": {
+                                                      "items": {
+                                                       "items": {
+                                                        "items": {
+                                                         "items": {
+                                                          "items": {
+                                                           "items": {
+                                                            "items": {
+                                                             "items": {
+                                                              "items": {
+                                                               "items": {
+                                                                "items": {
+                                                                 "items": {
+                                                                  "items": {
+                                                                   "items": {
+                                                                    "items": {
+                                                                     "items": {
+                                                                      "items": {
+                                                                       "items": {
+                                                                        "items": {
+                                                                         "items": {
+                                                                          "items": {
+                                                                           "items": {
+                                                                            "items": {
+                                                                             "type": "string"
+                                                                            }
+                                                                           }
+                                                                          }
+                                                                         }
+                                                                        }
+                                                                       }
+                                                                      }
+                                                                     }
+                                                                    }
+                                                                   }
+                                                                  }
+                                                                 }
+                                                                }
+                                                               }
+                                                              }
+                                                             }
+                                                            }
+                                                           }
+                                                          }
+                                                         }
+                                                        }
+                                                       }
+                                                      }
+                                                     }
+                                                    }
+                                                   }
+                                                  }
+                                                 }
+                                                }
+                                               }
+                                              }
+                                             }
+                                            }
+                                           }
+                                          }
+                                         }
+                                        }
+                                       }
+                                      }
+                                     }
+                                    }
+                                   }
+                                  }
+                                 }
+                                }
+                               }
+                              }
+                             }
+                            }
+                           }
+                          }
+                         }
+                        }
+                       }
+                      }
+                     }
+                    }
+                   }
+                  }
+                 }
+                }
+               }
+              }
+             }
+            }
+           }
+          }
+         }
+        }
+       }
+      }
+     }
+    }
+   },
+   "expect": {
+    "dropped": "its schema repeats a credential"
+   }
+  },
+  {
+   "id": "no-credentials-nothing-changes",
+   "headers": [],
+   "tool": {
+    "name": "t",
+    "description": "d",
+    "inputSchema": {
+     "type": "object",
+     "properties": {
+      "q": {
+       "type": "string",
+       "description": "SYNTH-api-secret-1234",
+       "default": "SYNTH-api-secret-1234"
+      }
+     }
+    }
+   },
+   "expect": {
+    "tool": {
+     "name": "t",
+     "description": "d",
+     "inputSchema": {
+      "type": "object",
+      "properties": {
+       "q": {
+        "type": "string",
+        "description": "SYNTH-api-secret-1234",
+        "default": "SYNTH-api-secret-1234"
+       }
+      }
+     }
+    }
+   }
+  },
+  {
+   "id": "not-an-object-passes-through",
+   "headers": [
+    [
+     "X-Api-Key",
+     "SYNTH-api-secret-1234"
+    ]
+   ],
+   "tool": "just a string",
+   "expect": {
+    "tool": "just a string"
+   }
+  }
+ ]
+}

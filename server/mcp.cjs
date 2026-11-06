@@ -23,6 +23,7 @@
 //     request must echo, along with `MCP-Protocol-Version`. Omit it and the
 //     server rejects the call.
 
+const { createSecrets } = require('./mcp-scrub.cjs');
 const PROTOCOL_VERSION = '2025-06-18';
 const CLIENT_INFO = { name: 'noevia', version: '1' };
 // A remote MCP server is not trusted infrastructure: nothing stops it from
@@ -187,13 +188,15 @@ async function rpc(baseUrl, session, body, { headers = {}, timeoutMs = 30000, no
       const detail = await readBodyCapped(res, controller).catch(() => '');
       // The snippet is for logs/operators only; `httpStatus` lets the chat
       // path hand the model a neutral message instead of the server's body.
-      throw Object.assign(new Error(`MCP ${res.status}: ${detail.slice(0, 200)}`), { httpStatus: res.status, retryAfter: res.headers.get('retry-after') });
+      // The body is the server's text and can repeat the credential it was sent: the credential values come out of the
+      // WHOLE body first and the clip comes after, so one that crosses the cutoff leaves no prefix of itself.
+      throw Object.assign(new Error(`MCP ${res.status}: ${createSecrets(headers).scrubClip(detail, 200)}`), { httpStatus: res.status, retryAfter: res.headers.get('retry-after') });
     }
     // Notifications have no id and the server answers 202 with an empty body.
     if (notify) return null;
     const text = await readBodyCapped(res, controller, MAX_RESPONSE_BYTES, { capFallback: true });
     const msg = parseRpcBody(res.headers.get('content-type'), text, body.id);
-    if (msg.error) throw new Error(`MCP error ${msg.error.code}: ${msg.error.message}`);
+    if (msg.error) throw new Error(createSecrets(headers).scrub(`MCP error ${msg.error.code}: ${msg.error.message}`));
     return msg.result;
   } finally {
     clearTimeout(timer);

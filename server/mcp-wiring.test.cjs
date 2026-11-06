@@ -304,6 +304,62 @@ test('tool names and descriptions a server fills with the credential it was sent
   assert.match(log, /dropped 2 unconvertible tools/);
 });
 
+test('#2218 r4: an HTTP error body that carries the credential across the 200-unit clip leaves no prefix (real transport)', async (t) => {
+  const http = require('node:http');
+  const realMcp = require('./mcp.cjs');
+  const { buildCatalogue } = require('./mcp-discovery-snapshot.cjs');
+  const KEY = 'SYNTH-api-secret-1234';
+  for (const pad of [150, 185, 190, 195, 199, 200, 210]) {
+    const server = http.createServer((req, res) => {
+      req.resume();
+      req.on('end', () => { res.statusCode = 401; res.end(`${'.'.repeat(pad)}${KEY} tail`); });
+    });
+    await new Promise((r) => server.listen(0, '127.0.0.1', r));
+    t.after(() => { server.closeAllConnections(); server.close(); });
+    const url = `http://127.0.0.1:${server.address().port}/mcp`;
+    const warned = [];
+    const dir = { id: 'dir-x', url, auth: 'directory', directory: true, title: 'X', addedBy: 'admin' };
+    const w = build({ servers: [], directoryServers: [dir], catalogues: {}, mcp: realMcp, shared: { 'X-Api-Key': KEY }, logger: { log() {}, warn: (l) => warned.push(l) } });
+    const state = await w.wiring.discoverMcpTools(true);
+    const err = state.servers.get('dir-x').error;
+    const published = JSON.stringify(buildCatalogue({
+      allToolboxes: () => state.boxes, manifest: [], mcpEnabled: () => true, servers: [dir], state,
+      isWriteTool: () => false, harnessEnabled: () => false, hasRepositories: () => false, nextcloudOrigins: [], defaultToolboxes: [], connectorBoxes: [],
+    }));
+    for (const [sink, text] of Object.entries({ error: err, state: JSON.stringify([...state.servers.values()]), log: warned.join('\n'), catalogue: published })) {
+      assert.equal(/SYNTH/.test(text), false, `pad ${pad} / ${sink}: ${text.slice(0, 260)}`);
+    }
+    assert.match(err, /^MCP 401: /);
+    assert.ok(err.length <= 'MCP 401: '.length + 200 + 30, 'the clip still applies');
+  }
+});
+
+test('#2218 r4: a credential nested anywhere in a tool schema never reaches the registry, the box or the model request', async () => {
+  const { createToolboxes } = require('./toolboxes.cjs');
+  const KEY = 'SYNTH-api-secret-1234';
+  const server = { id: 'dir-x', url: 'https://x.example/mcp', auth: 'directory', directory: true, title: 'X', addedBy: 'admin' };
+  const withSchema = (name, properties, more = {}) => ({ name, description: name, inputSchema: { type: 'object', properties, ...more }, annotations: { readOnlyHint: true } });
+  const catalogues = { 'https://x.example/mcp': [
+    withSchema('nested_desc', { query: { type: 'string', description: `Use ${KEY}` } }),
+    withSchema('deep', { q: { type: 'array', items: { anyOf: [{ type: 'object', properties: { z: { description: `b ${KEY}`, examples: [KEY] } } }] } } }),
+    withSchema('key_name', { [KEY]: { type: 'string' } }),
+    withSchema('default_value', { q: { type: 'string', default: KEY } }),
+    withSchema('enum_value', { q: { enum: ['a', KEY] } }),
+    withSchema('clean', { q: { type: 'string', description: 'a query' } }),
+  ] };
+  const warned = [];
+  const w = build({ servers: [], directoryServers: [server], catalogues, shared: { 'X-Api-Key': KEY }, logger: { log() {}, warn: (l) => warned.push(l) } });
+  const state = await w.wiring.discoverMcpTools(true);
+  assert.deepEqual([...state.tools.keys()].sort(), ['clean', 'deep', 'nested_desc'], 'tools whose contract repeats the credential are dropped');
+  const tb = createToolboxes({ mcpBoxes: () => state.boxes, mcpTools: () => state.tools, prefill: { budgetFor: () => null, rateFor: () => 0 }, scope: w.scope, documentSources: { notice: () => '' }, executeMcp: async () => '' });
+  const resolved = tb.resolveTools({ id: 'p1', toolboxes: ['dir-x'] }, 'model-70b');
+  const everything = JSON.stringify({ tools: [...state.tools.values()], offers: [...state.offers], boxes: state.boxes, resolved: resolved.tools, log: warned });
+  assert.equal(everything.includes(KEY), false, everything.slice(0, 300));
+  assert.equal(resolved.tools.length, 3);
+  assert.match(JSON.stringify(resolved.tools), /Use \[redacted\]/);
+  assert.match(warned.join('\n'), /dropped 3 unconvertible tools/);
+});
+
 test('a directory server that stops resolving to a public host is dropped at discovery and refused at call time', async () => {
   const dir = [{ id: 'd', url: 'https://private.example/mcp', auth: 'directory', directory: true }];
   const { wiring } = build({ servers: [], catalogues: {}, directoryServers: dir });

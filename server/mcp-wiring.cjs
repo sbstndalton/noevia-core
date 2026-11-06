@@ -10,7 +10,7 @@
 // curated boxes are mcp-boxes.cjs; the directory and OAuth stores are
 // injected, so this module holds no database and tests need no server.
 
-const { createSecrets, scrubbedError } = require('./mcp-scrub.cjs');
+const { createSecrets, scrubbedError, sanitizeTool } = require('./mcp-scrub.cjs');
 
 /** Whether a directory server's address may be used at all. Directory servers
  *  are strangers' metadata, so only a public host is acceptable — except that
@@ -289,13 +289,15 @@ function createMcpWiring({
     }
     const byName = new Map();
     const dropped = [];
-    for (const t of discovered) {
+    for (const listed of discovered) {
+      // The whole definition, before anything is stored or converted: the name, the description and every nested
+      // descriptive string of the schema are scrubbed, and a tool whose contract itself repeats a credential is dropped.
+      const clean = sanitizeTool(listed, secrets);
+      if (clean.dropped) { dropped.push(`${secrets.scrub(String((listed && listed.name) || '(unnamed)'))}: ${clean.dropped}`); continue; }
+      const t = clean.tool;
       const conv = mcp.convertTool(t);
       if (!conv.ok) { dropped.push(secrets.scrub(`${(t && t.name) || '(unnamed)'}: ${conv.reason}`)); continue; }
-      const name = conv.tool.function.name;
-      if (secrets.scrub(name) !== name) { dropped.push(`${secrets.scrub(name)}: its name repeats a credential`); continue; }
-      if (typeof conv.tool.function.description === 'string') conv.tool.function.description = secrets.scrub(conv.tool.function.description);
-      byName.set(name, { tool: conv.tool, readOnly: mcp.readOnlyHint(t), serverId: server.id });
+      byName.set(conv.tool.function.name, { tool: conv.tool, readOnly: mcp.readOnlyHint(t), serverId: server.id });
     }
     if (dropped.length) logger.warn(`[mcp:${server.id}] dropped ${dropped.length} unconvertible tools: ${dropped.join(' | ')}`);
     return byName;
