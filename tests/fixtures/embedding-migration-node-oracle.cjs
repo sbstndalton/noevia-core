@@ -1,3 +1,4 @@
+// Test-only baseline oracle. Never imported by server runtime.
 'use strict';
 // #1636 / #1638: the one path that changes the embedding model, profile or endpoint of project
 // retrieval. Nothing else writes the embedding configuration.
@@ -24,8 +25,8 @@
 // time and, after each batch, a pause so that the pass is busy at most `duty` of the wall time
 // (EMBEDDING_REINDEX_DUTY, default 0.5; the embed sidecar also serves queries in parallel slots).
 
-const { sameIdentity, sameTarget, normalizeTarget } = require('./embedding-config.cjs');
-const { checkServed } = require('./embedding-served.cjs');
+const { sameIdentity, sameTarget, normalizeTarget } = require('../../server/embedding-config.cjs');
+const { checkServed } = require('../../server/embedding-served.cjs');
 
 // Fixed synthetic strings for the same-model endpoint check: never user content.
 const PARITY_SAMPLE = [

@@ -21,9 +21,9 @@ function createSourceMembershipGuard({ userExists, workspaceFor }) {
   };
 }
 // frontSecret: the per-start store secret, captured before project-store-client deletes it from process.env (#1916).
-function createOwner({ sourceMember = () => false, sourceChanged = (user, project) => require('./multimodal-rag.cjs').sourceChanged(user, project), foregroundBusy = () => require('./rag.cjs').foregroundBusy(), env = process.env, frontSecret = '', dataDir, now = Date.now, verifyPair = true, features = () => execFileSync(env.NOEVIA_SERVER_BIN || '/usr/local/bin/noevia-server', ['--features'], { encoding: 'utf8', timeout: 5000 }) }) {
+function createOwner({ requiredFeatures = [], sourceMember = () => false, sourceChanged = (user, project) => require('./multimodal-rag.cjs').sourceChanged(user, project), foregroundBusy = () => require('./rag.cjs').foregroundBusy(), env = process.env, frontSecret = '', dataDir, now = Date.now, verifyPair = true, features = () => execFileSync(env.NOEVIA_SERVER_BIN || '/usr/local/bin/noevia-server', ['--features'], { encoding: 'utf8', timeout: 5000 }) }) {
   const start = String(env.NOEVIA_START_ID || '');
-  if (verifyPair && (!start || !frontSecret || ![RUST_EMBEDDING_OWNED, RUST_INDEX_OUTBOX_OWNED].every(f => features().split(/\s+/).includes(f)))) throw Error('Embedding background requires a coherent paired front and current start');
+  if (verifyPair && (!start || !frontSecret || ![RUST_EMBEDDING_OWNED, RUST_INDEX_OUTBOX_OWNED, ...requiredFeatures].every(f => features().split(/\s+/).includes(f)))) throw Error('Embedding background requires a coherent paired front and current start');
   let stopped = false, sequence = 0;
   return {
     snapshot() {

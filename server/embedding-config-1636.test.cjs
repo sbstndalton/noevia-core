@@ -10,7 +10,7 @@ const path = require('node:path');
 const { frame, profileNamed, DEFAULT_PROFILE } = require('./embedding-profile.cjs');
 const { createEmbeddingConfig, seedFromEnv, normalizeTarget } = require('./embedding-config.cjs');
 const { checkEmbeddingAddress, guardSeededAddresses, deniedAddress } = require('./embedding-address.cjs');
-const { createEmbeddingRoutes } = require('./routes/embedding.cjs');
+const { createEmbeddingRoutes } = require('../tests/fixtures/embedding-route-node-oracle.cjs');
 
 const SAMPLE = ['Plain text.', '  spaced  ', 'title: looks like a prefix | text: but is content', '', 'Zeilen\nUmbruch'];
 

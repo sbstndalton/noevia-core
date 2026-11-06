@@ -1,3 +1,4 @@
+// Test-only baseline oracle. Never imported by server runtime.
 'use strict';
 // #1636 / #1638: the embedding model of retrieval, for administrators. This is the seam the
 // Settings page (and the later "Inference machines" page) calls; it never changes anything except
@@ -19,9 +20,9 @@
 // name that does not resolve, is refused. Cloud models are reached as chat providers, never as the
 // embedding server.
 
-const { checkServed } = require('../embedding-served.cjs');
+const { checkServed } = require('../../server/embedding-served.cjs');
 
-const { sameTarget } = require('../embedding-config.cjs');
+const { sameTarget } = require('../../server/embedding-config.cjs');
 
 const PASS = Symbol('unhandled');
 const ACTIONS = new Set(['set-next', 'clear-next', 'switch', 'rollback', 'finish', 'service-switch', 'service-off']);
@@ -39,7 +40,7 @@ const SCOPES = new Set(['all', 'projects', 'diary']);
  * @param {() => object} [deps.diaryServiceHeaders]
  * @param {(url:string) => Promise<{ok:boolean,reason?:string}>} [deps.checkAddress]
  */
-function createEmbeddingRoutes({ json, readJson, migration, authService, fetchJson, DIARY_BASE = '', diaryServiceHeaders = () => ({ 'Content-Type': 'application/json' }), checkAddress = require('../embedding-address.cjs').checkEmbeddingAddress, servedModels = (target) => require('../rag.cjs').servedModels(target), service = null, resolveFile = null, waitTimeoutMs = 180000 }) {
+function createEmbeddingRoutes({ json, readJson, migration, authService, fetchJson, DIARY_BASE = '', diaryServiceHeaders = () => ({ 'Content-Type': 'application/json' }), checkAddress = require('../../server/embedding-address.cjs').checkEmbeddingAddress, servedModels = (target) => require('../../server/rag.cjs').servedModels(target), service = null, resolveFile = null, waitTimeoutMs = 180000 }) {
   const diaryUrl = DIARY_BASE ? `${String(DIARY_BASE).replace(/\/+$/, '')}/api/internal/embedding` : '';
 
   async function diary(method, body) {

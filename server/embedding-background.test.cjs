@@ -4,7 +4,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs'), os = require('node:os'), path = require('node:path');
 const { createOwner, scheduleLegacy, PROTOCOL } = require('./rust-embedding-background.cjs');
 const { createEmbeddingConfig } = require('./embedding-config.cjs');
-const { createEmbeddingMigration } = require('./embedding-migration.cjs');
+const { createEmbeddingMigration } = require('../tests/fixtures/embedding-migration-node-oracle.cjs');
 const { createEmbeddingService } = require('./embedding-service.cjs');
 const { createAdmission } = require('./inference-admission-lease.cjs');
 function fixture(t) {
@@ -146,7 +146,7 @@ for (const action of ['clear-next', 'rollback', 'finish']) {
     const migration = createEmbeddingMigration({ config, nativeOwner: f.owner, rag: { listIndexes: () => [] }, log() {} });
     const audits = [], diaryCalls = [], replies = [];
     let diaryRefuses = false;
-    const routes = require('./routes/embedding.cjs').createEmbeddingRoutes({
+    const routes = require('../tests/fixtures/embedding-route-node-oracle.cjs').createEmbeddingRoutes({
       json: (_, status, body) => replies.push({ status, body }),
       readJson: async req => req.body,
       migration, authService: { audit: (...args) => audits.push(args) },

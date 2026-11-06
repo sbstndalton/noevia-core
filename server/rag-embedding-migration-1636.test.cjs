@@ -13,7 +13,7 @@ delete process.env.RAG_DIR;
 for (const k of ['EMBEDDING_BASE_URL', 'EMBEDDING_MODEL', 'EMBED_MODEL', 'EMBEDDING_PROFILE', 'EMBEDDING_NEXT_MODEL', 'EMBEDDING_NEXT_BASE_URL', 'EMBEDDING_NEXT_PROFILE']) delete process.env[k];
 
 const { createEmbeddingConfig } = require('./embedding-config.cjs');
-const { createEmbeddingMigration } = require('./embedding-migration.cjs');
+const { createEmbeddingMigration } = require('../tests/fixtures/embedding-migration-node-oracle.cjs');
 
 let depsOk = true;
 try { require('better-sqlite3'); require('sqlite-vec'); } catch { depsOk = false; }

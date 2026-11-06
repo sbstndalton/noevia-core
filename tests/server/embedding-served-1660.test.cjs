@@ -11,7 +11,7 @@ const http = require('node:http');
 
 const { servesModel, checkServed } = require('../../server/embedding-served.cjs');
 const { createEmbeddingConfig } = require('../../server/embedding-config.cjs');
-const { createEmbeddingMigration } = require('../../server/embedding-migration.cjs');
+const { createEmbeddingMigration } = require('../fixtures/embedding-migration-node-oracle.cjs');
 
 // ── matching ──────────────────────────────────────────────────────────────────────────────────
 

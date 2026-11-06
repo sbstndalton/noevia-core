@@ -8,8 +8,8 @@ const http = require('node:http');
 const embeddingService = require('../../server/embedding-service.cjs');
 const embeddingConfigModule = require('../../server/embedding-config.cjs');
 const { createEmbeddingConfig } = embeddingConfigModule;
-const { createEmbeddingMigration } = require('../../server/embedding-migration.cjs');
-const { createEmbeddingRoutes } = require('../../server/routes/embedding.cjs');
+const { createEmbeddingMigration } = require('../fixtures/embedding-migration-node-oracle.cjs');
+const { createEmbeddingRoutes } = require('../fixtures/embedding-route-node-oracle.cjs');
 const { sidecarModelNames, isSidecarModel } = require('../../server/model-system.cjs');
 const rag = require('../../server/rag.cjs');
 

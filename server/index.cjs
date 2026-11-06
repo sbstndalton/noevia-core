@@ -234,7 +234,7 @@ function arrayProxy(field) {
 // #1636/#1638: the one embedding configuration (endpoint, model, profile), seeded from the environment
 // and saved beside the data once changed through /api/embedding (embedding-migration.cjs).
 const embeddingBackground = require('./rust-embedding-background.cjs');
-const embeddingOwner = embeddingBackground.createOwner({ env: process.env, frontSecret: FRONT_SECRET, dataDir: DATA_DIR, verifyPair: require.main === module,
+const embeddingOwner = embeddingBackground.createOwner({ requiredFeatures: [require('./rust-embedding-routes.cjs').FRONT_FEATURE], env: process.env, frontSecret: FRONT_SECRET, dataDir: DATA_DIR, verifyPair: require.main === module,
   sourceMember: embeddingBackground.createSourceMembershipGuard({
     userExists: user => !!authService.db.prepare('SELECT 1 FROM users WHERE id=?').get(user) && !workspaceStore.isRemoved(user),
     workspaceFor: user => workspaceStore.get(user),
@@ -251,7 +251,7 @@ rag.configureRerank(() => rerankSettings.effectiveEnv());
 require('./embedding-address.cjs').guardSeededAddresses(embeddingConfig);
 // #1762: embeddings are local-only; say so at start-up if the address they would use (the inference one when no embeddings URL is set) is public.
 require('./embedding-address.cjs').warnPublicEmbeddingUrl({ inferenceBase: INFERENCE_BASE });
-const embeddingMigration = require('./embedding-migration.cjs').createEmbeddingMigration({ config: embeddingConfig, rag, nativeOwner: embeddingOwner });
+const embeddingMigration = { kick: () => embeddingOwner.kick(), stop: () => {} };
 // #1668: the embedding service as the model manager runs it (which models cowork-embed serves, or
 // off). Refreshed in the background so the delete guard (model-system.cjs) follows it.
 const embeddingService = require('./embedding-service.cjs').install(require('./embedding-service.cjs').createEmbeddingService({ env: process.env, fetchJson, nativeOwner: embeddingOwner }));
@@ -1216,8 +1216,7 @@ const routingModeRoutes = require('./routes/routing-mode.cjs').createRoutingMode
 const reasoningSettingsRoutes = require('./routes/reasoning-settings.cjs').createReasoningSettingsRoutes({ json, authService, getProject, getProvider, reasoningEffort, DEFAULT_PROVIDER_ID });
 const samplingSettingsRoutes = require('./routes/sampling-settings.cjs').createSamplingSettingsRoutes({ json });
 // The embedding model of retrieval, for administrators (routes/embedding.cjs, #1636).
-const embeddingRoutes = require('./routes/embedding.cjs').createEmbeddingRoutes({ json, readJson, migration: embeddingMigration, authService, fetchJson, DIARY_BASE, diaryServiceHeaders: diary.serviceHeaders,
-  service: embeddingService, resolveFile: (model) => require('./embedding-service.cjs').resolveModelFile({ env: process.env, fetchJson, model }) });
+
 // Settings → Inference machines (routes/inference-machines.cjs, #1638), administrators only.
 const inferenceMachineRoutes = require('./routes/inference-machines.cjs').createInferenceMachineRoutes({ json, readJson, machines: inferenceMachines,
   health: machineHealth, chatMachines, machineTune,
@@ -1304,6 +1303,7 @@ async function handleRequestInner(req, res) {
   if (embeddingOwner.handle(req, res, json)) return;
   if (require('./rust-preset-read.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   if (await presetReadBridge(req, res)) return;
+  if (require('./rust-embedding-routes.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   if (require('./rust-preset-write.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   if (await presetWriteEffects(req, res)) return;
   if (await autotuneReadBridge(req, res)) return;
@@ -1489,7 +1489,7 @@ async function handleRequestScoped(req, res) {
     if (await routingModeRoutes(req, res, { path: p, authn, url })) return;
     if (await samplingSettingsRoutes(req, res, { path: p, authn, url })) return;
 
-    if (await embeddingRoutes(req, res, { path: p, authn })) return;
+
     if (await inferenceMachineRoutes(req, res, { path: p, authn, url })) return;
 
     if (await modelRoutes(req, res, { path: p, authn, url })) return;

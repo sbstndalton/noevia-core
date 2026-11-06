@@ -5,7 +5,7 @@ const http = require('node:http');
 const fs = require('node:fs');
 const path = require('node:path');
 const { createEmbeddingConfig } = require('../../server/embedding-config.cjs');
-const { createEmbeddingRoutes } = require('../../server/routes/embedding.cjs');
+const { createEmbeddingRoutes } = require('../fixtures/embedding-route-node-oracle.cjs');
 
 // Record against the unmodified route at the pinned main. The only network peer
 // is a disposable loopback server; no inference or user text is involved.
