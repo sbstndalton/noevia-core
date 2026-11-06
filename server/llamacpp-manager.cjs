@@ -64,7 +64,7 @@ function createLlamaCppManager({ budgetWatchDir = null, baseUrl, apiKey, fetchJs
     let expected=null;
     if(reload || kind==='pull')try{expected=presets?.snapshot().revision??null;}catch{}
     const op = reload || writes ? beginOperation(kind,expected) : null;
-    const unknown=()=>{if(op){try{op.unknown();}catch{} maintenance.operationUnknown();}};
+    const unknown=()=>{if(op){try{op.unknown();}catch{} maintenance.operationUnknown({retainCoveredForRollback:reload});}};
     const scoped = op ? {...options,headers:{...options.headers,'X-Noevia-Maintenance-Fence':JSON.stringify(op.fence)}} : options;
     try {
       const result = await send(path, signal === options.signal ? scoped : {...scoped,signal}, timeout);

@@ -320,8 +320,10 @@ function createMaintenanceGate({ remote = null, log = (line) => console.log(line
       if(now()+coverageMarginMs>=c.hardAt){c.lose?.('passed its limit');throw coverageError('passed its limit');}
       if(now()+Math.max(0,Number(stepMs)||0)+coverageMarginMs>=c.hardAt)throw coverageError('cannot cover the next step');
     },
-    operationUnknown() {
-      coverage?.lose?.('has an unsettled operation');
+    operationUnknown({retainCoveredForRollback=false}={}) {
+      // An uncertain reload can still roll its file back under this same confirmed hold.
+      // Its receipt and incident remain pending; no replacement work is admitted at release.
+      if(!retainCoveredForRollback)coverage?.lose?.('has an unsettled operation');
       requireRecovery('publication-unknown',null,'A native operation outcome is uncertain.');
     },
     beginPublication(kind,expectedRevision,file) {

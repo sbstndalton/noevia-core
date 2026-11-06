@@ -2,6 +2,22 @@
 const test = require('node:test'), assert = require('node:assert/strict');
 const { createMaintenanceGate } = require('./inference-maintenance.cjs');
 
+test('an uncertain reload retains its covered rollback hold and still requires recovery after release', async()=>{
+  let released=0;
+  const remote={holdMaintenance:async()=>({native:true,token:'original',askedAt:Date.now(),ttlMs:60000,renewMs:10000,hardMs:600000}),releaseMaintenance:async()=>{released++;}};
+  const gate=createMaintenanceGate({remote,setTimer:()=>({unref(){}}),clearTimer:()=>{},log:()=>{}});
+  const release=await gate.hold('preset');
+  gate.operationUnknown({retainCoveredForRollback:true});
+  assert.doesNotThrow(()=>gate.assertCovered());
+  assert.equal(gate.coverageSignal().aborted,false);
+  assert.throws(()=>gate.enter(),e=>e.status===503);
+  assert.equal(gate.recoveryPending(),true);
+  await gate.releaseRemote();release();
+  assert.equal(released,1);
+  assert.throws(()=>gate.enter(),e=>e.status===503);
+  assert.throws(()=>gate.hold('new work'),e=>e.status===409);
+});
+
 test('idle acquisition waits for an active chat and exposes the current phase reason', async () => {
   const gate = createMaintenanceGate(), leave = gate.enter();
   const pending = gate.holdWhenIdle('First phase', { timeoutMs: 1000 });
