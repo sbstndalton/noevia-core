@@ -135,6 +135,10 @@ jobs:
           cmp "$RUNNER_TEMP/rs/crates/toolboxes-permitted/tests/fixtures/toolboxes-permitted.v1.json" tests/fixtures/toolboxes-permitted.v1.json
           cmp "$RUNNER_TEMP/rs/crates/llamacpp-presets/tests/fixtures/llamacpp-presets.v1.json" tests/fixtures/llamacpp-presets.v1.json
           cmp "$RUNNER_TEMP/rs/crates/llamacpp-autoconfig/tests/fixtures/llamacpp-autoconfig.v1.json" tests/fixtures/llamacpp-autoconfig.v1.json
+          # The native model manager's route table and models.ini cap (noevia-services#216 retired the Python
+          # app server/model-loader-contract.test.cjs used to scan): tests/fixtures/model-manager-routes.v1.json
+          # is read from routing.rs / section_writes/mod.rs by tools/gen-model-manager-routes.cjs.
+          node tools/gen-model-manager-routes.cjs --check "$RUNNER_TEMP/rs"
           rustup target add wasm32-unknown-unknown --toolchain 1.99.0
           "$RUNNER_TEMP/rs/tools/build-dav-parse-wasm.sh" "$PWD/server/wasm/dav-parse.wasm"
           echo "$DAV_PARSE_WASM_SHA256  server/wasm/dav-parse.wasm" | sha256sum -c -
