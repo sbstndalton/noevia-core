@@ -41,7 +41,7 @@ function createAutotuneActorBridge({ secret, json, readJson, autotune, invalidat
       else if (op === 'listing') answer = await live.listingFacts(ask.items, controller.signal);
       else if (op === 'identities') answer = await live.identityFacts(ask.selectors, controller.signal);
       else if (op === 'abort') answer = live.abort(ask);
-      else if (op === 'launch') { answer = live.launch(ask); if (answer.launched) invalidate(); }
+      else if (op === 'launch') { answer = await live.launch(ask); if (answer.launched) invalidate(); }
       else { invalidate(); answer = { ok: true }; }
       if (Buffer.byteLength(JSON.stringify(answer)) > MAX_REPLY) throw Error('reply over cap');
       json(res, 200, answer);
@@ -58,12 +58,16 @@ function createAutotuneActorBridge({ secret, json, readJson, autotune, invalidat
  * answers (it may start after this process). `actor` null: the deployment has no tuner, and the
  * owner is told so (the public routes then answer "unavailable" instead of "not ready").
  */
-async function attachWhenReady({ actor, unavailableClient, sleep = ms => new Promise(r => setTimeout(r, ms)), log = m => console.warn(m), retryMs = 5000 }) {
+async function attachWhenReady({ actor, unavailableClient, sleep = ms => new Promise(r => setTimeout(r, ms)), log = m => console.warn(m), retryMs = 5000, barrier = () => () => {} }) {
+  const release = barrier();
   for (;;) {
     try { await (actor ? actor.attach() : unavailableClient.attach()); break; }
     catch { log('[autotune-actor] waiting for the state owner'); await sleep(retryMs); }
   }
-  if (actor) await actor.recover().catch(() => log('[autotune-actor] recovery failed'));
+  if (actor) {
+    try { await actor.recover(); } catch { log('[autotune-actor] recovery failed'); return; }
+  }
+  release();
 }
 
 module.exports = { createAutotuneActorBridge, attachWhenReady, PREFIX, OPS, MAX_BYTES };

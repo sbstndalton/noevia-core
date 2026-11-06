@@ -26,7 +26,7 @@ async function resumeWorker(manager) {
       keepSteps: item.plan && ['context', 'verify'].includes(p.id) ? p.steps.flatMap((s, i) => ['passed', 'failed'].includes(s.status) ? [i] : []) : null,
     }]),
   }]);
-  const launched = manager.autotune.launch(owner.launchPatch(reset));
+  const launched = await manager.autotune.launch(owner.launchPatch(reset));
   return { applied: launched.launched, ...launched };
 }
 
@@ -99,7 +99,7 @@ function fixture(t, { badSampling = false, models = ['synthetic'], onChat, onUnl
     return new Response(`data: ${JSON.stringify({ choices: [{ delta: { content } }], timings: { prompt_n: Math.floor(text.length / 5), prompt_ms: 100, prompt_per_second: 100000 } })}\n\ndata: [DONE]\n\n`);
   };
   let owner = null;
-  const makeManager = () => { owner = createOwnerDouble(stateFile); const m = makeManagerWith(owner); Object.defineProperty(m, 'testOwner', { value: owner }); return m; };
+  const makeManager = () => { owner = createOwnerDouble(stateFile); const m = makeManagerWith(owner); Object.defineProperty(m, 'testOwner', { value: owner }); if (managerExtra.maintenanceAuthority) void require('./rust-autotune-actor-bridge.cjs').attachWhenReady({ actor: m.autotune, barrier: () => m.maintenanceBarrier('Checking interrupted auto-tune work.') }); return m; };
   const makeManagerWith = owner => createModelManager({ ...managerExtra, kind: 'llamacpp', baseUrl: 'http://synthetic', presetPath: ini, fetchJson, fetchStream, presetBaselineClient,
     calibrationStatePath: path.join(dir, 'cal.json'), autotuneStatePath: stateFile,
     calibrationOptions: { identityFor: async()=>({arch:null,quant:null,artifact:'synthetic-artifact',build:null,profile:require('node:crypto').createHash('sha256').update(fs.readFileSync(ini)).digest('hex'),hardware:null}), sleep: async () => {}, readMemory: () => 20, ...calibrationExtra },
@@ -2405,11 +2405,11 @@ test('launch runs the job the owner persisted, adopting its job and history, and
   await f.manager.autotune.start('synthetic', { confirmPause: true });
   const failed = await finished(f.manager);
   assert.equal(failed.status, 'failed');
-  assert.deepEqual(again, { launched: false }, 'a running actor takes no second job');
+  assert.deepEqual(await again, { launched: false }, 'a running actor takes no second job');
   const launched = await resumeWorker(f.manager);
   assert.equal(launched.applied, true);
-  assert.deepEqual(f.manager.autotune.launch({ epoch: 1, jobRev: 1, job: { status: 'passed' }, history: {} }), { launched: false });
-  assert.deepEqual(f.manager.autotune.launch({}), { launched: false });
+  assert.deepEqual(await f.manager.autotune.launch({ epoch: 1, jobRev: 1, job: { status: 'passed' }, history: {} }), { launched: false });
+  assert.deepEqual(await f.manager.autotune.launch({}), { launched: false });
   const j = await finished(f.manager);
   assert.equal(j.id, failed.id, 'the same job resumes under a new run');
 });
@@ -2518,7 +2518,6 @@ test('P1 an unrestored trial recorded by an earlier process keeps chat closed at
   fs.writeFileSync(f.stateFile, JSON.stringify({ history: {}, settings: {}, job: { id: 'synthetic-job', model: 'synthetic', status: 'failed', models: [], _revision: revision,
     _recovery: { revision, text: f.original, backedUp: false } } }));
   const m = f.restart();
-  await pause(1);
   assert.throws(() => m.enterInference(), e => e.status === 503, 'closed from the start');
   for (let i = 0; i < 500 && m.maintenanceHeld(); i++) await pause(10);
   assert.equal(m.maintenanceHeld(), false);
@@ -2558,4 +2557,15 @@ test('R4 restart trial stays fenced while authority is unavailable', async t => 
   assert.equal(m.maintenanceHeld(), false);
   assert.equal(fs.readFileSync(f.ini, 'utf8'), f.original);
   m.enterInference()();
+});
+
+test('delayed launch cannot adopt a generation superseded at the authority', async t => {
+  const f = fixture(t, { badBatch: true });
+  await f.manager.autotune.start('synthetic', { confirmPause: true });
+  await finished(f.manager);
+  const owner = f.manager.testOwner;
+  const delayed = owner.launchPatch([]);
+  owner.launchPatch([]); // authority advances the running generation before delayed delivery
+  assert.deepEqual(await f.manager.autotune.launch(delayed), { launched: false });
+  assert.equal(f.manager.autotune.statusFacts().job.status, 'failed', 'stale supplied job was not adopted');
 });

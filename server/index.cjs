@@ -1665,6 +1665,7 @@ if (require.main === module) {
     // Auto-tune's state is the Rust front's: bind to it (retrying until it answers), then finish what
     // a restart interrupted. Without a tuner the front is told so, and answers "unavailable".
     require('./rust-autotune-actor-bridge.cjs').attachWhenReady({
+      barrier: () => modelManager.maintenanceBarrier('Checking interrupted auto-tune work.'),
       actor: modelManager.autotune,
       unavailableClient: require('./autotune-state-client.cjs').createAutotuneStateClient({
         call: PROJECT_STORE.autotuneState, base: path.basename(AUTOTUNE_STATE_PATH), available: false }),

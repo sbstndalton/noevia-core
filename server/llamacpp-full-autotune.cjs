@@ -1100,7 +1100,10 @@ function createFullAutotuner({ request: engineRequest, rawModels: engineRawModel
     // #1072: a request that throws (the server unreachable) is the same refusal as a bad answer, and the
     // re-read is still owed, so it is re-armed rather than left for the next flush alone.
     // Not acknowledged: no re-read, the same refusal as a failed one (re-armed below).
-    const r = (await invalidateBaseline('autotune')) ? await ownedRequest('/models?reload=1', {}, 120000).catch(() => null) : null;
+    guard?.();
+    const invalidated = await invalidateBaseline('autotune');
+    guard?.();
+    const r = invalidated ? await ownedRequest('/models?reload=1', {}, 120000).catch(() => null) : null;
     guard?.();
     if (!r?.ok) {
       scheduleReload(j);
@@ -1711,7 +1714,7 @@ function createFullAutotuner({ request: engineRequest, rawModels: engineRawModel
   // A trial left unrestored by an earlier process keeps chat closed from the start.
   // Register synchronously during construction, before the listener can admit chat.
   function armStartupRecovery(j) {
-    if (!j || !recoverable()) return false;
+    if (!j || !recoverable() || (!j._recovery && j.status !== 'running' && !j._reloadPending)) return false;
     if (!j._recovery) {
       const phase = j.models?.flatMap(m => m.phases || []).find(p => p._beforeText != null);
       const text = phase?._beforeText ?? j.originalText;
@@ -1829,7 +1832,7 @@ function createFullAutotuner({ request: engineRequest, rawModels: engineRawModel
       return { identities };
     } catch (error) {
       if (error?.code === 'resume_stale' || signal?.aborted) return { applied: false };
-      if (error?.publicMessage === 'The model server has not re-read the restored settings yet. Try again shortly.') return { fault: 'reload' };
+      if (error?.publicMessage === 'The model server has not re-read the restored settings yet. Try again shortly.') return { fault: 'reload', recoveryRequired: true };
       throw error;
     }
   }
@@ -1842,8 +1845,14 @@ function createFullAutotuner({ request: engineRequest, rawModels: engineRawModel
   }
   // The owner patched a resumable job and persisted it as running: this actor runs it. Only an
   // idle actor takes it; it adopts the owner's job and history, never its own older copy.
-  function launch({ epoch, jobRev, job, history } = {}) {
+  async function launch({ epoch, jobRev, job, history } = {}) {
     if (runActive || starting || fenced || !job || typeof job !== 'object' || Array.isArray(job) || job.status !== 'running' || !Number.isFinite(epoch)) return { launched: false };
+    // A delayed request must still name the authority's current running generation. Do not
+    // adopt a supplied revision before checking it against the authenticated store.
+    let current;
+    try { current = await stateClient.sync(); } catch { return { launched: false }; }
+    if (runActive || starting || fenced || current.epoch !== epoch || current.jobRev !== jobRev ||
+        current.state?.job?.id !== job.id || current.state?.job?.status !== 'running') return { launched: false };
     state.job = job;
     state.history = history && typeof history === 'object' && !Array.isArray(history) ? history : (state.history || {});
     stateClient.setRun({ jobRev, epoch }); runEpoch = epoch;
