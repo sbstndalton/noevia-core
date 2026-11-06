@@ -39,8 +39,8 @@ const { trustedFront } = require('./trusted-front.cjs');
 
 const PREFIX = '/internal/model-maintenance/lease';
 // noevia deploy/tools/assemble-release.sh pairs this core with a front whose authority carries
-// "noevia-maintenance-lease-authority/1" (and refuses this client without it). Keep the quoted literal.
-const LEASE_CLIENT_MARKER = 'noevia-maintenance-lease-client/1';
+// "noevia-maintenance-lease-authority/2" (and refuses this client without it). Keep the quoted literal.
+const LEASE_CLIENT_MARKER = 'noevia-maintenance-lease-client/2';
 const NATIVE_PREFIX = '/v1/maintenance-lease';
 const CALL_TIMEOUT_MS = 5000;
 const MAX_WAIT_MS = 30000;
@@ -72,24 +72,27 @@ function createLeases({ hold, ttlMs = TTL_MS, hardMs = HARD_MS, maxMs = MAX_MS, 
   // At capacity refuse new admissions rather than resurrecting delayed requests.
   let saturated = false, unbar = null;
   const recoveryKeys = new Set(), completedRecoveries = new Set();
-  let recoveryOverflow=false;
+  let recoveryOverflow=false, generation=0;
   function requireRecovery(ticket='legacy') {
     if(completedRecoveries.has(ticket))return;
     if(!recoveryKeys.has(ticket) && recoveryKeys.size >= ticketTombstones) { recoveryOverflow=true;saturated=true; }
     else recoveryKeys.add(ticket);
     if (!unbar && barrier) unbar = barrier();
   }
-  function completeRecovery(ticket='legacy') {
-    if(recoveryOverflow || new Set([...completedRecoveries,...recoveryKeys,ticket]).size > ticketTombstones) {
-      recoveryOverflow=true;saturated=true;if(!unbar&&barrier)unbar=barrier();return;
+  function completeRecovery(ticket='legacy', proof) {
+    // A retry for an already completed incident is harmless, including after another incident arose.
+    if (completedRecoveries.has(ticket)) return true;
+    const lease = leases.get(proof?.lease);
+    if (!lease || !lease.recovery || lease.generation !== proof?.generation
+      || lease.hardAt <= now() || lease.until <= now() || !lease.incidents.has(ticket)) return false;
+    if(recoveryOverflow || new Set([...completedRecoveries,...lease.incidents]).size > ticketTombstones) {
+      recoveryOverflow=true;saturated=true;if(!unbar&&barrier)unbar=barrier();return false;
     }
-    // One exclusive repair settles every earlier latch. Retire its ticket too, so a delayed
-    // barrier POST from a released hold cannot re-arm an already completed incident.
-    completedRecoveries.add(ticket);
-    for(const key of recoveryKeys)completedRecoveries.add(key);
-    recoveryKeys.clear();
+    // Complete only the obligations present when this exact exclusive repair acquired its latch.
+    for(const key of lease.incidents) { completedRecoveries.add(key); recoveryKeys.delete(key); }
     if(completedRecoveries.size >= ticketTombstones)saturated=true;
-    const lift = unbar; unbar = null; lift?.();
+    if (!recoveryKeys.size) { const lift = unbar; unbar = null; lift?.(); }
+    return true;
   }
   function tombstoned(ticket) { return !!ticket && tombstones.has(ticket); }
   function end(id, why) {
@@ -107,10 +110,11 @@ function createLeases({ hold, ttlMs = TTL_MS, hardMs = HARD_MS, maxMs = MAX_MS, 
     if (!lease) return;
     clearTimeout(lease.timer);
     const left = Math.min(ttlMs, lease.hardAt - now());
+    lease.until = now() + Math.max(0, left);
     lease.timer = setTimeout(() => end(id, lease.hardAt <= now() ? 'passed its limit' : 'was not renewed'), Math.max(0, left));
     lease.timer.unref?.();
   }
-  const grantOf = (id, lease) => ({ lease: id, ttlMs, renewMs: Math.min(RENEW_MS, Math.max(1, Math.floor(ttlMs / 3))), hardMs: lease.cap });
+  const grantOf = (id, lease) => ({ lease: id, ttlMs, renewMs: Math.min(RENEW_MS, Math.max(1, Math.floor(ttlMs / 3))), hardMs: lease.cap, generation: lease.generation });
   async function take(requested, ticket, state, recovery=false) {
     const cap = capFor(requested, hardMs, maxMs);
     inflight++;
@@ -119,7 +123,7 @@ function createLeases({ hold, ttlMs = TTL_MS, hardMs = HARD_MS, maxMs = MAX_MS, 
     // A DELETE that came while the hold was being taken: give it back at once.
     if (state?.cancelled || tombstoned(ticket)) { release(); throw cancelledTicket(); }
     const id = crypto.randomBytes(16).toString('hex');
-    const lease = { release, timer: null, hardAt: now() + cap, cap, ticket: ticket || null };
+    const lease = { release, timer: null, hardAt: now() + cap, cap, ticket: ticket || null, recovery, generation: ++generation, incidents: new Set(recoveryKeys) };
     leases.set(id, lease);
     arm(id);
     return grantOf(id, lease);
@@ -297,7 +301,7 @@ function chainRemotes(gate, native) {
 }
 
 /** The acquire body: `{ maxMs }` or `{}` (empty is `{}`); null when it is not one (a 400). Bounded in size and time. */
-function readAsk(req) {
+function readAsk(req, completion = false) {
   return new Promise((resolve) => {
     const chunks = [];
     let size = 0, done = false;
@@ -308,10 +312,15 @@ function readAsk(req) {
     req.on('error', () => finish(null));
     req.on('end', () => {
       const text = Buffer.concat(chunks).toString('utf8');
-      if (!text.trim()) return finish({});
+      if (!text.trim()) return finish(completion ? null : {});
       let ask;
       try { ask = JSON.parse(text); } catch { return finish(null); }
       if (!ask || typeof ask !== 'object' || Array.isArray(ask)) return finish(null);
+      if (completion) {
+        if (Object.keys(ask).some(k => k !== 'lease' && k !== 'generation')
+          || !/^[0-9a-f]{32}$/.test(ask.lease || '') || !Number.isSafeInteger(ask.generation) || ask.generation <= 0) return finish(null);
+        return finish(ask);
+      }
       if (Object.keys(ask).some((k) => k !== 'maxMs' && k !== 'ticket' && k !== 'recovery')) return finish(null);
       if (Object.hasOwn(ask, 'recovery') && typeof ask.recovery !== 'boolean') return finish(null);
       if (Object.hasOwn(ask, 'ticket') && !(typeof ask.ticket === 'string' && /^[0-9a-f]{32}$/.test(ask.ticket))) return finish(null);
@@ -334,7 +343,12 @@ function createLeaseRoutes({ secret, hold, json, ...options }) {
       const ticket=target.slice(`${PREFIX}/recovery/`.length);
       if(!/^[0-9a-f]{32}$/.test(ticket))return notFound();
       if (req.method === 'POST') { leases.requireRecovery(ticket); json(res, 204, null); return true; }
-      if (req.method === 'DELETE') { leases.completeRecovery(ticket); json(res, 204, null); return true; }
+      if (req.method === 'DELETE') {
+        const proof = await readAsk(req, true);
+        if (!proof) { json(res, 400, { error: 'A current repair lease and generation are required.' }); return true; }
+        if (!leases.completeRecovery(ticket, proof)) { json(res, 409, { error: 'That repair no longer covers this incident.' }); return true; }
+        json(res, 204, null); return true;
+      }
       return notFound();
     }
     if (target === PREFIX) {
