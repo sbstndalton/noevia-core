@@ -85,15 +85,17 @@ test('the lexer keeps literals opaque: lifetimes, chars, nested comments and raw
   assert.throws(() => gen.lex('fn f( {'), /unbalanced|unclosed/);
 });
 
-test('the shipped features come from the production build stage and the crate feature graph', () => {
+test('the shipped features come from the final stage\'s copied build and the crate feature graph', () => {
   const dockerfile = [
-    'FROM rust AS gguf-meta', ' && cargo build --release -p noevia-model-manager --features noevia-model-manager/native-routing,noevia-model-manager/native-section-writes \\',
+    'FROM rust AS legacy-builder', 'RUN cargo build --release -p noevia-model-manager --features noevia-model-manager/native-legacy-only',
+    'FROM rust AS gguf-meta', 'WORKDIR /src', 'RUN cargo build --release -p noevia-model-manager --features noevia-model-manager/native-routing,noevia-model-manager/native-section-writes',
     'FROM debian AS runtime', 'COPY --from=gguf-meta /src/target/release/noevia-model-manager /usr/local/bin/noevia-model-manager',
-    'FROM rust AS legacy-builder', ' && cargo build --release -p noevia-model-manager --features noevia-model-manager/native-legacy-only',
+    'FROM runtime AS production',
   ].join('\n');
   const cargo = '[features]\ndefault = []\n# a comment\nnative-routing = ["native-a", "dep:x"]\nnative-a = []\nnative-section-writes = [\n  "native-a", # trailing\n]\nnative-legacy-only = []\n[lints]\n';
   const enabled = gen.enabledFeatures(dockerfile, cargo);
   assert.deepEqual([...enabled].sort(), ['native-a', 'native-routing', 'native-section-writes']);
-  assert.throws(() => gen.enabledFeatures(dockerfile.replace('COPY --from=gguf-meta', 'COPY --from=other'), cargo), /no longer copies/);
+  assert.throws(() => gen.enabledFeatures(dockerfile.replace('COPY --from=gguf-meta', 'COPY --from=other'), cargo), /does not name a stage/);
   assert.throws(() => gen.enabledFeatures(dockerfile, cargo.replace('native-a = []', '')), /not declared/);
+  // The proof itself is exercised in dockerfile-model-manager-features.test.cjs.
 });

@@ -30,13 +30,15 @@
 // Every refusal names the reason. Unsupported syntax is rejected, never guessed at.
 //
 // Cargo features: lib.rs gates `routing` and `section_writes` on `native-routing` and
-// `native-section-writes`. The generator proves those are on from the image's own build command
-// (the one `cargo build ... -p noevia-model-manager --features noevia-model-manager/...` line of
-// services/model-manager/Dockerfile) plus the feature graph in the crate's Cargo.toml; a feature it
-// cannot show enabled is an error. `--image-dockerfile` is therefore required.
+// `native-section-writes`. The generator proves those are on from the image's own Dockerfile: the final
+// stage must copy noevia-model-manager out of one fully understood `cargo build` (see
+// tools/dockerfile-model-manager-features.cjs), whose --features list plus the feature graph in the
+// crate's Cargo.toml gives the enabled set. A feature it cannot show enabled, a second build, an
+// ARG-expanded list or an unclear copy chain is an error. `--image-dockerfile` is therefore required.
 
 const fs = require('node:fs');
 const path = require('node:path');
+const { proveFeatures } = require('./dockerfile-model-manager-features.cjs');
 
 const CRATE = 'bins/noevia-model-manager';
 const FILES = {
@@ -266,18 +268,12 @@ function checkModuleDeclaration(libSrc, name, enabled, { file = 'lib.rs' } = {})
 
 // ---- features the image enables ----------------------------------------------------------------
 
-// The production binary is the one the `gguf-meta` build stage compiles (the `runtime` stage, and so
-// `production`, copies it from there); the legacy and qualification stages build other configurations.
+// The shipped binary is the one the final Dockerfile stage copies out of a single, fully understood
+// cargo build; see tools/dockerfile-model-manager-features.cjs for exactly what is accepted.
 function imageFeatures(dockerfileText) {
-  if (!/^COPY --from=gguf-meta \/src\/target\/release\/noevia-model-manager /m.test(dockerfileText)) throw new Error('Dockerfile: the image no longer copies noevia-model-manager from the gguf-meta stage');
-  const stage = /^FROM [^\n]* AS gguf-meta\s*$([\s\S]*?)(?=^FROM |(?![\s\S]))/m.exec(dockerfileText);
-  if (!stage) throw new Error('Dockerfile: no gguf-meta build stage');
-  const lines = stage[1].split('\n').filter((l) => /\bcargo build\b/.test(l) && /(^|\s)-p noevia-model-manager(\s|$)/.test(l) && /--features\s/.test(l));
-  if (lines.length !== 1) throw new Error(`Dockerfile: expected exactly one \`cargo build -p noevia-model-manager --features ...\` line in the gguf-meta stage, found ${lines.length}`);
-  const list = /--features\s+([^\s\\]+)/.exec(lines[0])[1];
-  const mine = list.split(',').filter((f) => f.startsWith('noevia-model-manager/')).map((f) => f.slice('noevia-model-manager/'.length));
-  if (mine.length === 0) throw new Error('Dockerfile: the model-manager build enables no noevia-model-manager features');
-  return mine;
+  const proof = proveFeatures(dockerfileText);
+  if (proof.features.length === 0) throw new Error('Dockerfile: the model-manager build enables no noevia-model-manager features');
+  return proof;
 }
 
 function featureGraph(cargoText) {
@@ -294,7 +290,9 @@ function featureGraph(cargoText) {
 function enabledFeatures(dockerfileText, cargoText) {
   const graph = featureGraph(cargoText);
   const out = new Set();
-  const todo = [...imageFeatures(dockerfileText), ...(graph.get('default') || [])];
+  const proof = imageFeatures(dockerfileText);
+  // --no-default-features: only the listed features count, so the crate's defaults are not added.
+  const todo = [...proof.features, ...(proof.noDefault ? [] : graph.get('default') || [])];
   while (todo.length) {
     const f = todo.pop();
     if (out.has(f)) continue;
