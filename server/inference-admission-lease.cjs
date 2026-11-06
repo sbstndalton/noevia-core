@@ -241,6 +241,14 @@ function createAdmissionRoutes({ secret, modelManager, admitEngineModel, chatMac
     if (target !== PREFIX && !target.startsWith(`${PREFIX}/`)) return false;
     const notFound = () => { json(res, 404, { error: 'Not found' }); return true; };
     if (!trustedFront(req, secret)) return notFound();
+    if (target === `${PREFIX}/maintenance` && req.method === 'GET') {
+      const rejected = fenced(req);
+      if (rejected) { json(res, rejected, { error: BUSY }); return true; }
+      let paused;
+      try { paused = modelManager.tuningActive?.() === true; }
+      catch { json(res, 503, { error: BUSY }); return true; }
+      json(res, 200, { paused }); return true;
+    }
     const match = /^\/([0-9a-f]{32})(\/renew)?$/.exec(target.slice(PREFIX.length));
     if (!match) return notFound();
     const id = match[1];

@@ -314,3 +314,12 @@ test('the session registers with the front, keeps its incarnation, follows a new
   const unconfigured = createAuthoritySession({ port: 0, token: '', fetchImpl: async () => { throw new Error('never'); } });
   assert.equal(await unconfigured.register(), null);
 });
+
+test('maintenance pause snapshot uses the producer fence and takes no model or permit',async(t)=>{
+ let held=0,paused=true;const{base,authority}=await serve(t,{modelManager:{tuningActive:()=>paused,enterInference:()=>{held++;return()=>held--;},acquireLease:()=>{throw Error('unexpected load');}}});
+ const path=`${PREFIX}/maintenance`;
+ let response=await ask(base,null,FRONT,path,'GET');assert.equal(response.status,200);assert.deepEqual(await response.json(),{paused:true});assert.equal(held,0);
+ paused=false;response=await ask(base,null,FRONT,path,'GET');assert.deepEqual(await response.json(),{paused:false});
+ authority.set({epoch:'d'.repeat(32),incarnation:2});assert.equal((await ask(base,null,FRONT,path,'GET')).status,410);assert.equal(held,0);
+ assert.equal((await ask(base,null,{},path,'GET')).status,404);
+});
