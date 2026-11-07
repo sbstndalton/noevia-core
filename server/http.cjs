@@ -76,8 +76,13 @@ async function readCappedText(response, cap) {
       const piece = value.byteLength > room ? value.subarray(0, room) : value;
       chunks.push(Buffer.from(piece));
       size += piece.byteLength;
+      if (value.byteLength > room) {
+        capped = true;
+        reader.cancel().catch(() => {});
+        break;
+      }
     }
-    if (size >= cap) {
+    if (size >= cap && !capped) {
       const next = await reader.read().catch(() => ({ done: true }));
       // Not awaited: cancelling one branch of a cloned (teed) body settles only once the other
       // branch is cancelled or read too, so awaiting it here would hang.
@@ -111,8 +116,13 @@ async function readCappedBuffer(response, cap) {
       const piece = value.byteLength > room ? value.subarray(0, room) : value;
       chunks.push(Buffer.from(piece));
       size += piece.byteLength;
+      if (value.byteLength > room) {
+        capped = true;
+        reader.cancel().catch(() => {});
+        break;
+      }
     }
-    if (size >= cap) {
+    if (size >= cap && !capped) {
       const next = await reader.read().catch(() => ({ done: true }));
       if (!next.done) { capped = true; reader.cancel().catch(() => {}); }
     }
