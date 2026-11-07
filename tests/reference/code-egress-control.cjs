@@ -1,4 +1,8 @@
 'use strict';
+// FROZEN ORACLE (row V): the retired Node issuer of the code-egress control key and signed task grants.
+// The native front (noevia-rs crates/egress-issuer) is the only issuer; this file exists solely so the
+// differential fixtures (tests/reference/code-egress-issuer-fixtures.cjs) can be regenerated from the
+// behaviour Node had. Nothing in server/ may require it.
 // Private control/data-key closures; static capability metadata is never a Ready proof.
 const crypto = require('node:crypto');
 const http = require('node:http');
@@ -383,4 +387,30 @@ function createControlClient({ fileKey, endpoint, now = Date.now, monotonic = ()
   async function close() { closed = true; stopTimers(); if (readyFlight) await readyFlight.catch(() => {}); const until=mono()+10000; const pending = [...active]; let cursor = 0; const results = []; await Promise.all(Array.from({ length: Math.min(4, pending.length) }, async () => { while (cursor < pending.length) { const r = pending[cursor++]; results.push(await revoke(r.handle, Math.max(0,until-mono()))); } })); return results; }
   return Object.freeze({ impl: 'rust-controlled', capability: CAPABILITY, endpoint, start, available, ready, renew, grant, activity, revoke, forget, close, sweep: () => 0 });
 }
-module.exports = { CAPABILITY, ROUTES, ControlError, publishWebKey, republishMissingKey, createKeyKeeper, deriveFileKey, deriveControlKey, deriveGrantKey, requestMac, responseMac, createControlClient, defaultTransport };
+// The retired server glue (server/code-egress.cjs before row V), kept for the real-binary oracle tests.
+const DEFAULT_GRANT_LIFETIME_MS = 2 * 60 * 60 * 1000;
+function startControlledEgressFromEnv(env = process.env, { log = () => {}, secrets = null, transport } = {}) {
+  const rawPort = String(env.CODE_EGRESS_PORT || '').trim();
+  if (!rawPort || rawPort === '0') return null;
+  const unavailable = () => Object.assign(Error('Native egress configuration is unavailable.'), { code: 'EGRESS_UNAVAILABLE', status: 503 });
+  if (!/^[1-9][0-9]{0,4}$/.test(rawPort) || Number(rawPort) > 65535 || String(env.CODE_EGRESS_IMPL || 'rust').trim() !== 'rust') throw unavailable();
+  const host = String(env.CODE_EGRESS_RUST_HOST || 'egress-rs-code').trim();
+  if (!/^[a-z0-9.-]{1,253}$/i.test(host) || !secrets || typeof secrets.derive !== 'function') throw unavailable();
+  const integer = (name, zero = false) => {
+    const value = String(env[name] ?? '');
+    if (!/^(0|[1-9][0-9]{0,9})$/.test(value) || Number(value) >= 0xffffffff || (!zero && Number(value) === 0)) throw unavailable();
+    return Number(value);
+  };
+  const uid = integer('CODE_EGRESS_KEY_UID', true), gid = integer('CODE_EGRESS_KEY_GID');
+  const positive = (name, fallback) => { const value = env[name]; if (value === undefined || value === '') return fallback; const n = Number(value); if (!Number.isSafeInteger(n) || n <= 0) throw unavailable(); return n; };
+  const ttlMs = positive('CODE_EGRESS_TOKEN_TTL_MS', DEFAULT_TOKEN_TTL_MS);
+  const lifetimeMs = positive('CODE_EGRESS_GRANT_LIFETIME_MS', DEFAULT_GRANT_LIFETIME_MS);
+  const file = String(env.CODE_EGRESS_CONTROL_KEY_FILE || '');
+  let fileKey;
+  try { fileKey = publishWebKey({ masterKey: secrets.derive('code-egress-grant', 32), file, uid, gid }); }
+  catch { throw unavailable(); }
+  const client = createControlClient({ fileKey, endpoint: `${host}:${rawPort}`, ttlMs, lifetimeMs, log, keeper: createKeyKeeper({ deriveMaster: () => secrets.derive('code-egress-grant', 32), fileKey, file, uid, gid }), ...(transport ? { transport } : {}) });
+  try { log({ event: 'egress.rust_control_client', endpoint: client.endpoint }); } catch { /* diagnostics cannot change readiness */ }
+  return client;
+}
+module.exports = { startControlledEgressFromEnv, CAPABILITY, ROUTES, ControlError, publishWebKey, republishMissingKey, createKeyKeeper, deriveFileKey, deriveControlKey, deriveGrantKey, requestMac, responseMac, createControlClient, defaultTransport };

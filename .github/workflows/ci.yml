@@ -203,6 +203,10 @@ jobs:
           digest="$(sha256sum "$binary" | cut -d ' ' -f 1)"
           printf 'NOEVIA_EGRESS_CONTROL_BINARY=%s\nNOEVIA_EGRESS_CONTROL_BINARY_SHA256=%s\nNOEVIA_RS_CONTROL_CONTRACT_DIR=%s\nNOEVIA_HERMETIC_NATIVE_REQUIRED=1\n' \
             "$binary" "$digest" "$native_source/contracts" >> "$GITHUB_ENV"
+      # The control oracle includes real sidecar restart and authenticated wire checks.
+      # Run it with the reviewed native fixture and hermetic guard as a required qualification.
+      - name: Required native code-egress control qualification
+        run: node --require ./tests/hermetic-network.cjs --test --test-concurrency=1 --test-timeout=240000 tests/server/code-egress-control-oracle.qualification.cjs
       - run: npm run test:server
         env:
           DAV_PARSE_WASM_REQUIRED: '1'
