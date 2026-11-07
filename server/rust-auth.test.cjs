@@ -399,3 +399,32 @@ test('sbstndalton/noevia#2190 round 4: no Node source writes storage_connections
   const rotate = fs.readFileSync(path.join(__dirname, 'secrets-rotate.cjs'), 'utf8');
   assert.match(rotate, /UPDATE \$\{table\} SET \$\{column\}=\? WHERE \$\{keys\.map\(\(k\) => `\$\{k\}=\?`\)\.join\(' AND '\)\} AND \$\{column\}=\?/);
 });
+
+test('#2396: DELETE FROM settings WHERE key=? is judged by its bound key, like an INSERT', () => {
+  const Database = require('better-sqlite3');
+  const db = new Database(':memory:');
+  try {
+    db.exec("CREATE TABLE settings(key TEXT PRIMARY KEY,value);INSERT INTO settings VALUES('rerank:configuration','{}'),('public_origin','before'),('decision:configuration','{}')");
+    const guard = createRustAuthGuard(); guard.install(db);
+    // Node's own key: the reset runs, positionally, as an array, bound first, and with the value check.
+    db.prepare('DELETE FROM settings WHERE key=?').run('rerank:configuration');
+    assert.equal(db.prepare("SELECT count(*) AS n FROM settings WHERE key='rerank:configuration'").get().n, 0);
+    db.prepare('INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)').run('rerank:configuration', '{}');
+    db.prepare('DELETE FROM settings WHERE key=?').run(['rerank:configuration']);
+    db.prepare('INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)').run('rerank:configuration', '{}');
+    db.prepare('DELETE FROM settings WHERE key=?').bind('rerank:configuration').run();
+    db.prepare('INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)').run('rerank:configuration', '{}');
+    db.prepare('DELETE FROM settings WHERE key=? AND value=?').run('rerank:configuration', '{}');
+    assert.equal(db.prepare("SELECT count(*) AS n FROM settings WHERE key='rerank:configuration'").get().n, 0);
+    // The same ownership rule as the other statements: the front's keys are refused with their own codes, the auth keys
+    // outside exempt(), and a bound key the guard cannot read fails closed.
+    assert.throws(() => db.prepare('DELETE FROM settings WHERE key=?').run('decision:configuration'), { code: 'RUST_DECISION_SETTINGS_OWNED', status: 503 });
+    assert.throws(() => guard.exempt(() => db.prepare('DELETE FROM settings WHERE key=?').run('decision:configuration')), { code: 'RUST_DECISION_SETTINGS_OWNED' });
+    assert.throws(() => db.prepare('DELETE FROM settings WHERE key=?').run('public_origin'), { code: 'RUST_AUTH_OWNED', status: 503 });
+    assert.throws(() => db.prepare('DELETE FROM settings WHERE key=?').bind('public_origin').run(), { code: 'RUST_AUTH_OWNED' });
+    assert.throws(() => db.prepare('DELETE FROM settings WHERE key=?').run(7), { code: 'RUST_AUTH_OWNED' });
+    assert.throws(() => db.prepare('DELETE FROM settings WHERE key LIKE ?').run('rerank%'), { code: 'RUST_AUTH_OWNED' });
+    assert.throws(() => db.prepare('DELETE FROM settings WHERE key=? OR 1=1').run('rerank:configuration'), { code: 'RUST_AUTH_OWNED' });
+    assert.deepEqual(db.prepare('SELECT key FROM settings ORDER BY key').all().map((r) => r.key), ['decision:configuration', 'public_origin']);
+  } finally { db.close(); }
+});
