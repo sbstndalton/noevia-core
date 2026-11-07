@@ -184,8 +184,8 @@ const driveAccounts = require('./gdrive-broker.cjs').createDriveAccounts({
   apiBase: process.env.GOOGLE_DRIVE_API_BASE_URL || undefined, uploadBase: process.env.GOOGLE_DRIVE_UPLOAD_BASE_URL || undefined,
 });
 const webAddressRoutes = require('./routes/web-address.cjs').createWebAddressRoutes({ auth: authService, json });
-const davConfig = require('./dav-settings.cjs').configuration(process.env, authService.origin);
-const davSettings = require('./dav-settings.cjs').createDavSettings({ auth: authService });
+// Account schema bootstrap only; the native listener owns sharing requests.
+require('./dav-settings.cjs').createDavSettings({ auth: authService });
 if (process.env.LEMONADE_BASE_URL && !process.env.INFERENCE_BASE_URL) console.warn('LEMONADE_BASE_URL is deprecated; use INFERENCE_BASE_URL');
 if (process.env.LEMONADE_API_KEY && !process.env.INFERENCE_API_KEY) console.warn('LEMONADE_API_KEY is deprecated; use INFERENCE_API_KEY');
 // The default row's capabilities come from the engine kind the deployment declares (providers.cjs).
@@ -1565,13 +1565,7 @@ if (require.main === module) {
   // comfortably past APPROVAL_TIMEOUT_MS, which is the limit that should
   // actually bite. headersTimeout still guards the slow-header attack this
   // setting otherwise protects against.
-  if (davConfig.available) {
-    const handler = require('./dav.cjs').createDavHandler({ auth: authService, settings: davSettings, config: davConfig, files: diaryFiles });
-    const davServer = http.createServer(codeNetGuard.wrap((req, res) => handler(req, res).catch(() => res.destroy()), 'file-sharing'));
-    davServer.requestTimeout = 60000; davServer.headersTimeout = 15000;
-    davServer.setTimeout(60000, socket => socket.destroy());
-    davServer.listen(davConfig.port, davConfig.bindHost, () => console.log(`Diary file sharing listener on port ${davConfig.port}; scope ${davConfig.scope}; per-user opt-in required`));
-  }
+  // Dedicated sharing is owned by the paired native listener (rust-dav-listener.cjs).
   // ── noevia's own MCP server ──────────────────────────────────────────
   //
   // Second listener, loopback only, started only when a port is configured
@@ -1642,9 +1636,7 @@ if (require.main === module) {
   process.on('unhandledRejection', (reason) => {
     console.error('[noevia] unhandled promise rejection:', reason?.stack || reason);
   });
-  // #1806: inline source text moves to per-source files before the first request (workspace.cjs).
-  try { workspaceStore.migrateSourceText(authService.listUsers().map((u) => u.id)); }
-  catch (e) { console.warn('[sources] startup migration skipped:', e?.message || e); }
+  // Source-text startup migration is owned by the paired native front.
   server.listen(PORT, HOST, () => {
     processReady = true;
     console.log(`cowork-ui listening on http://${HOST}:${PORT} (inference: ${INFERENCE_BASE}, manager: ${modelManager.kind}, diary: ${DIARY_BASE}, mcp: ${mcpWiring.enabled() ? MCP_SERVERS.map((sv) => sv.id).join('+') : 'disabled'})`);
