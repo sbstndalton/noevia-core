@@ -250,6 +250,39 @@ test('#1071: under native auth the front\'s setting keys are refused in real SQL
     } finally { db.close(); }
   }
 });
+test('reranker revision rejects Node rewrites through the actual settings store and bound statements', () => {
+  const Database = require('better-sqlite3');
+  const { settingsStore } = require('./features.cjs');
+  const db = new Database(':memory:');
+  try {
+    db.exec('CREATE TABLE settings(key TEXT PRIMARY KEY,value)');
+    const configuration = '{"enabled":false}';
+    db.prepare('INSERT INTO settings(key,value) VALUES(?,?)').run('rerank:configuration', configuration);
+    db.prepare('INSERT INTO settings(key,value) VALUES(?,?)').run('rerank:revision', '7');
+    const guard = createRustAuthGuard();
+    guard.install(db);
+    const store = settingsStore(db);
+    const attempts = [
+      () => store.set('rerank:revision', '6'),
+      () => store.set('rerank:revision', 'invalid'),
+      () => db.prepare("INSERT OR REPLACE INTO settings(key,value) VALUES('rerank:revision',?)").run('6'),
+      () => db.prepare('INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)').run('rerank:revision', '6'),
+      () => db.prepare('INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)').run(['rerank:revision', '6']),
+      () => db.prepare('INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)').bind('rerank:revision', '6').run(),
+      () => db.prepare('INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)').bind(['rerank:revision', '6']).run(),
+    ];
+    for (const attempt of attempts) {
+      for (const run of [attempt, () => guard.exempt(attempt)]) {
+        assert.throws(run, { status: 503, code: 'RUST_RERANKER_SETTINGS_OWNED' });
+        assert.equal(store.get('rerank:revision'), '7');
+        assert.equal(store.get('rerank:configuration'), configuration);
+      }
+    }
+    store.set('synthetic_node_key', 'still allowed');
+    assert.equal(store.get('synthetic_node_key'), 'still allowed');
+  } finally { db.close(); }
+});
+
 test('quoted identifiers are detected without treating string/comment payloads as writes', () => {
   const Database = require('better-sqlite3');
   const db = new Database(':memory:');

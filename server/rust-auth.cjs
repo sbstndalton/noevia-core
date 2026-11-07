@@ -168,6 +168,7 @@ const FRONT_SETTING_KEYS = Object.freeze({
   auto_sampling_presets_enabled: ['Sampling settings are written by the Rust front', 'RUST_SAMPLING_SETTINGS_OWNED'],
   // #2190: Settings -> Models -> Decision service; decision-settings.cjs only re-reads it.
   'rerank:configuration': ['Reranker settings are owned by the Rust front.', 'RUST_RERANKER_SETTINGS_OWNED'],
+  'rerank:revision': ['Reranker settings are owned by the Rust front.', 'RUST_RERANKER_SETTINGS_OWNED'],
   'decision:configuration': ['Decision settings are owned by the Rust front.', 'RUST_DECISION_SETTINGS_OWNED'],
 });
 // Tables only the Rust front writes, each refused with its own code even inside exempt(); `allowed`
