@@ -935,20 +935,69 @@ function createFullAutotuner({ request: engineRequest, rawModels: engineRawModel
   }
   const planOf = j => j.models?.find(m => m.model === j.model)?.plan || null;
   const phaseRuns = { sampling: runSampling, kv: runKv, context: runContext, drafting: runDrafting, batch: runBatch };
+  // Delta review P1: a phase whose lease of the front's authority was lost is not restored on that lease
+  // (nothing more runs on it). Its original text is kept in the job (durable) and the gate keeps chat and
+  // new maintenance closed until a recovery under a fresh lease has confirmed the engine idle, restored
+  // the text and had the router re-read it (recoverTrial); after a restart, recover() asks for it again.
+  const coverageLost = () => maintenance?.coverageSignal?.()?.aborted === true;
+  const recoverable = () => typeof maintenance?.requireRecovery === 'function';
+  function requireTrialRecovery(j) {
+    if (!j._recovery || !recoverable()) return;
+    maintenance.requireRecovery('autotune:' + j.id, () => recoverTrial(j),
+      'Chat is paused while noevia restores the settings an interrupted tune left behind.');
+  }
+  async function recoverTrial(j) {
+    const rec = j._recovery;
+    if (!rec) return;
+    // The engine is idle here (the recovery's settle step). Restore only our own version; an operator's
+    // later edit stands, and the router re-reads whatever models.ini holds now.
+    if (presets.snapshot().revision === rec.revision) {
+      maintenance?.assertCovered?.();
+      await presets.commit({ baseRevision: rec.revision, text: rec.text }, rec.backedUp ? { backup: false } : undefined);
+      j._revision = presets.snapshot().revision;
+    }
+    j._reloadPending = true; save();
+    maintenance?.assertCovered?.();
+    if (!(await invalidateBaseline('autotune'))) throw Error('The preset reload baseline did not acknowledge the restore.');
+    const reload = await request('/models?reload=1', {}, 120000);
+    if (!reload.ok) throw Error('The router did not confirm restored settings.');
+    maintenance?.assertCovered?.();
+    for (const item of j.models || []) for (const phase of item.phases || []) if (phase._beforeText != null) { delete phase._beforeText; phase.restored = true; }
+    delete j.originalText;
+    delete j._recovery; j._reloadPending = false; j._unsafe = false; j.restored = true;
+    note(j, 'Settings an interrupted tune left behind were restored, and the model server re-read them.');
+    save();
+  }
   async function restorePhase(j, p) {
     if (p._beforeText == null) return true;
     if (presets.snapshot().revision !== j._revision) { p.restored = false; return false; }
+    if (recoverable() && coverageLost()) {
+      j._recovery ||= { revision: j._revision, text: p._beforeText, backedUp: !!j._backedUp };
+      p.restored = false; save();
+      requireTrialRecovery(j);
+      return false;
+    }
     try {
       // #1068: restoring the file needs only the compact model stopped, never another client's; the
       // router's re-read waits while another client has a model live.
       await unloadOwn(j);
+      maintenance?.assertCovered?.();
       await presets.commit({ baseRevision: j._revision, text: p._beforeText }, j._backedUp ? { backup: false } : undefined);
       j._revision = presets.snapshot().revision; save();
       await reloadRouter(j);
       p.restored = true;
       delete p._beforeText; save();
       return true;
-    } catch { p.restored = false; save(); return false; }
+    } catch (e) {
+      // Lost during the restore itself: the recovery finishes it.
+      if (recoverable() && (e?.coverageLost || coverageLost())) {
+        j._recovery ||= { revision: j._revision, text: p._beforeText, backedUp: !!j._backedUp };
+        p.restored = false; save();
+        requireTrialRecovery(j);
+        return false;
+      }
+      p.restored = false; save(); return false;
+    }
   }
   async function unloadOwn(j) {
     // The compact model is often gone already (evicted by another client): ask only when it runs, and
@@ -996,7 +1045,7 @@ function createFullAutotuner({ request: engineRequest, rawModels: engineRawModel
   function scheduleReload(j, tries = 0) {
     clearTimeout(reloadTimer);
     if (!j._reloadPending) return;
-    if (tries > 120) { note(j, 'The model server has not re-read the restored models.ini; it does so before this model next loads.'); return; }
+    if (tries > 120) { try { note(j, 'The model server has not re-read the restored models.ini; it does so before this model next loads.'); } catch { /* The durable job may be unavailable during shutdown; the re-read remains owed. */ } return; }
     reloadTimer = setTimeout(async () => {
       if (!j._reloadPending) return;
       if ((await othersLiveNow(j.model)) === false) {
@@ -1619,13 +1668,50 @@ function createFullAutotuner({ request: engineRequest, rawModels: engineRawModel
   function compareAndClear(token) {
     if (typeof token !== 'string' || clearFacts().token !== token) return { applied: false };
     const job = state.job;
-    if (starting || !job || !['failed', 'cancelled', 'interrupted', 'passed'].includes(job.status) || job._reloadPending) return { applied: false };
+    if (starting || !job || !['failed', 'cancelled', 'interrupted', 'passed'].includes(job.status) || job._reloadPending || job._recovery) return { applied: false };
     delete state.job;
     try { save(); } catch (error) { state.job = job; throw error; }
     return { applied: true };
   }
+  // A trial left unrestored by an earlier process keeps chat closed from the start.
+  // Register synchronously during construction, before the listener can admit chat.
+  function armStartupRecovery(j) {
+    if (!j || !recoverable()) return false;
+    if (!j._recovery) {
+      const phase = j.models?.flatMap(m => m.phases || []).find(p => p._beforeText != null);
+      const text = phase?._beforeText ?? j.originalText;
+      if (text != null || j._reloadPending) {
+        j._recovery = { revision: j._pendingRevision || j._revision || j.lastRevision,
+          text: text ?? presets.snapshot().text, backedUp: !!j._backedUp };
+        save();
+      }
+    }
+    if (!j._recovery) return false;
+    requireTrialRecovery(j);
+    return true;
+  }
+  armStartupRecovery(state.job);
   async function recover() {
     const j = state.job;
+    if (armStartupRecovery(j)) {
+      if (j.status === 'running') {
+        for (const item of j.models || []) if(item.status === 'running') {
+          item.status = 'interrupted';
+          for (const phase of item.phases || []) if(phase.status === 'running') {
+            phase.status = 'interrupted'; phase.reason = 'Restart interrupted this phase.';
+            for(const step of phase.steps || []) if(step.status === 'running') step.status = 'interrupted';
+          }
+        }
+        stoppedAt(j);
+        j.status = 'interrupted'; j.phase = 'Interrupted'; j.finishedAt = now(); j.restored = false;
+        j.error = 'Restart interrupted tuning. Completed settings remain saved.'; save();
+      }
+      await maintenance.recoverNow?.();
+      if(j._recovery && j.restored === false) {
+        j.error = 'Restart interrupted tuning; settings could not safely be restored. Inspect models.ini before resuming.'; save();
+      }
+      return;
+    }
     if (j?._reloadPending) scheduleReload(j);
     if (j) adoptPendingRevision(j);
     if (j?.status !== 'running') return;

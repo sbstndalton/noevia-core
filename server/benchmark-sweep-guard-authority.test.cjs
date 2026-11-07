@@ -1,0 +1,90 @@
+'use strict';
+// Row J review P2: an unavailable maintenance lease authority (503 maintenanceAuthorityUnavailable) is an
+// outage, not a busy engine: a sweep start answers 503, and a running sweep's recovery after a restart keeps
+// chat closed behind a barrier while it retries the hold. Synthetic manager progress and gate only.
+const test = require('node:test'), assert = require('node:assert/strict');
+const { createSweepGuard, SWEEP_UNAVAILABLE_ERROR, SWEEP_PAUSE_REASON } = require('./benchmark-sweep-guard.cjs');
+const { createMaintenanceGate } = require('./inference-maintenance.cjs');
+
+const outage = () => Object.assign(Error('The maintenance lease authority is not answering.'), { status: 503, code: 'maintenanceAuthorityUnavailable' });
+
+function harness({ hold, progress, ...options }) {
+  const gate = createMaintenanceGate(), logs = [];
+  const guard = createSweepGuard({ hold: hold || ((r) => gate.hold(r)), progress, barrier: (r) => gate.barrier(r), log: (m) => logs.push(m),
+    adoptRetryMs: 1, adoptMaxDelayMs: 2, adoptAttempts: 3, pollMs: 60000,
+    // Timers the guard cannot unref: the event loop must stay alive while adopt() retries in a test.
+    // The adopted sweep's long watch poll may still be unref'd, so the test can end.
+    setTimer: (fn, ms) => { const t = setTimeout(fn, ms); return { t, unref() { if (ms >= 60000) t.unref(); } }; }, clearTimer: (h) => clearTimeout(h?.t), ...options });
+  return { gate, guard, logs };
+}
+
+test('a sweep start keeps the authority outage as 503, not a misleading busy 409', async () => {
+  const { guard } = harness({ hold: () => Promise.reject(outage()), progress: async () => null });
+  await assert.rejects(guard.acquire(), (e) => e.status === 503 && e.code === 'maintenanceAuthorityUnavailable'
+    && e.publicMessage === SWEEP_UNAVAILABLE_ERROR && e.waitable === true);
+  const sync = harness({ hold: () => { throw outage(); }, progress: async () => null });
+  assert.throws(() => sync.guard.acquire(), (e) => e.status === 503 && e.unavailable === true);
+  // A busy refusal stays the 409.
+  const busy = harness({ hold: () => { throw Object.assign(Error('busy'), { status: 409 }); }, progress: async () => null });
+  assert.throws(() => busy.guard.acquire(), (e) => e.status === 409);
+});
+
+test('recovery: chat is closed behind a barrier through the outage, and the hold is adopted when the authority answers', async () => {
+  let fails = 6; // more than adoptAttempts: an outage does not use up the attempts
+  const gate = createMaintenanceGate();
+  const seen = [];
+  const { guard } = harness({
+    hold: (r) => { if (fails-- > 0) { try { gate.enter()(); seen.push('open'); } catch { seen.push('closed'); } throw outage(); } return gate.hold(r); },
+    progress: async () => ({ ok: true, body: { job: { active: true, unit: 'models', total: 1 } } }),
+    barrier: (r) => gate.barrier(r),
+  });
+  assert.equal(await guard.adopt(), true);
+  assert.deepEqual(seen.slice(1), ['closed', 'closed', 'closed', 'closed', 'closed'], 'chat closed after the first outage answer');
+  assert.throws(() => gate.enter(), (e) => e.message === SWEEP_PAUSE_REASON, 'now held by the adopted sweep');
+  assert.equal(guard.active(), true, 'the sweep is watched');
+  assert.equal(seen[0], 'closed', 'restart barrier precedes the first await');
+});
+
+test('recovery: a sweep that finishes during the outage lifts the barrier and adopts nothing', async () => {
+  let polls = 0;
+  const gate = createMaintenanceGate();
+  const { guard, logs } = harness({
+    hold: () => { throw outage(); },
+    progress: async () => ({ ok: true, body: { job: polls++ < 3 ? { active: true, unit: 'models', total: 1 } : { active: false, unit: 'models' } } }),
+    barrier: (r) => gate.barrier(r),
+  });
+  assert.equal(await guard.adopt(), false);
+  gate.enter()();
+  assert.equal(gate.held(), false);
+  assert.ok(logs.some((l) => /finished while chat was paused/.test(l)), logs.join('\n'));
+});
+
+test('recovery: outage past a local bound retains the barrier until terminal acknowledgement', async () => {
+  let t = 0, calls = 0;
+  const gate = createMaintenanceGate();
+  const { guard } = harness({
+    hold: () => { t += 1000; throw outage(); },
+    progress: async () => { calls++; if (calls > 6) return {ok:true,body:{job:{active:false}}};
+      if(calls > 3) assert.throws(()=>gate.enter(), e=>e.status===503);
+      return {ok:true,body:{job:{active:true,unit:'models',total:1}}}; },
+    barrier:r=>gate.barrier(r),now:()=>t,perModelMs:2000,slackMs:0,
+  });
+  assert.equal(await guard.adopt(),false);
+  assert.ok(t>2000);gate.enter()();
+});
+
+test('delta P1: a lease lost while a sweep runs keeps chat closed until the sweep reports it is over', async () => {
+  let active = true, released = 0;
+  const lost = new AbortController();
+  const { guard, logs } = harness({ progress: async () => ({ ok: true, body: { job: { active, unit: 'models', total: 1 } } }), pollMs: 5 });
+  const release = Object.assign(() => { released++; }, { signal: lost.signal });
+  const entry = guard.watch(release, 1);
+  lost.abort();
+  await new Promise((r) => setTimeout(r, 40));
+  assert.equal(entry.lost(), true);
+  assert.equal(released, 0, 'not released while the sweep still runs in its container');
+  assert.ok(logs.some((l) => /maintenance lease was lost/.test(l)), logs.join('\n'));
+  active = false;
+  for (let i = 0; i < 100 && !released; i++) await new Promise((r) => setTimeout(r, 5));
+  assert.equal(released, 1, 'released once the sweep is over (the gate then recovers)');
+});
