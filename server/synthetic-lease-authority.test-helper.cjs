@@ -10,17 +10,17 @@ const SECRET = 'synthetic-store-token-0123456789abcdef';
 
 /** A synthetic authority with the front's semantics (lease.rs): one lease, generation fence, ordered
  *  server-issued incarnations (410 for retired ones), front leases bound to the incarnation they latched. */
-async function authority(t, { ttlMs = 180000, renewMs = 10000, hardMs = 3600000 } = {}) {
+function createAuthority({ token = SECRET, ttlMs = 180000, renewMs = 10000, hardMs = 3600000 } = {}) {
   const calls = [];
   let holder = null, generation = 0, node = null, incarnations = 0, renew = 'ok';
   const now = () => Date.now();
   const expire = () => { if (holder && (now() >= holder.until || now() >= holder.hardAt)) holder = null; };
-  const server = http.createServer((req, res) => {
+  const handler = (req, res) => {
     let raw = '';
     req.on('data', (c) => { raw += c; });
     req.on('end', () => {
       const send = (status, body) => { res.writeHead(status, { 'content-type': 'application/json' }); res.end(body === undefined ? '' : JSON.stringify(body)); };
-      if (req.headers['x-noevia-store-token'] !== SECRET) return send(401, { error: 'unauthorised' });
+      if (req.headers['x-noevia-store-token'] !== token) return send(401, { error: 'unauthorised' });
       const op = req.url.replace('/v1/maintenance-lease/', '');
       const body = JSON.parse(raw || '{}');
       calls.push({ op, body });
@@ -49,11 +49,9 @@ async function authority(t, { ttlMs = 180000, renewMs = 10000, hardMs = 3600000 
       if (op === 'held') return send(200, { held: !!holder, front: holder?.origin === 'front' });
       return send(404, { error: 'Not found' });
     });
-  });
-  await new Promise((r) => server.listen(0, '127.0.0.1', r));
-  t.after(() => new Promise((r) => { server.closeAllConnections(); server.close(r); }));
+  };
   return {
-    port: server.address().port, calls,
+    handler, calls,
     acquires: () => calls.filter((c) => c.op === 'acquire').length,
     takeAsFront: () => { holder = { origin: 'front', lease: 'f'.repeat(32), generation: ++generation, until: Infinity, hardAt: Infinity, bound: node?.inc ?? null }; },
     releaseFront: () => { if (holder?.origin === 'front') holder = null; },
@@ -63,4 +61,12 @@ async function authority(t, { ttlMs = 180000, renewMs = 10000, hardMs = 3600000 
   };
 }
 
-module.exports = { authority, SECRET };
+async function authority(t, options = {}) {
+  const state = createAuthority(options);
+  const server = http.createServer(state.handler);
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  t.after(() => new Promise((r) => { server.closeAllConnections(); server.close(r); }));
+  return { ...state, port: server.address().port };
+}
+
+module.exports = { authority, createAuthority, SECRET };

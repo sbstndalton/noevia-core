@@ -400,3 +400,24 @@ test('P1 a router call in flight when the lease is lost is aborted, and chat sta
   assert.ok(await until(() => !m.maintenanceHeld()), 'recovered');
   m.enterInference()();
 });
+
+
+test('the native authority reply limit refuses an oversized valid JSON prefix', async () => {
+  const text = JSON.stringify({ incarnation: 7, frontHeld: false });
+  for (const bytes of [4096, 4097]) {
+    const client = createNativeLeaseClient({ port: 1, token: SECRET, boot: 'boot', startedAt: 1,
+      fetchImpl: async () => new Response(text + ' '.repeat(bytes - Buffer.byteLength(text)), { status: 200 }) });
+    if (bytes === 4096) assert.equal((await client.session()).incarnation, 7);
+    else await assert.rejects(client.session(), e => e.status === 503 && e.code === 'maintenanceAuthorityUnavailable');
+  }
+});
+
+test('authority body reads keep the original deadline after headers', async () => {
+  const client = createNativeLeaseClient({ port: 1, token: SECRET, timeoutMs: 20,
+    fetchImpl: async (_url, request) => new Response(new ReadableStream({ start(controller) {
+      request.signal.addEventListener('abort', () => controller.error(Error('synthetic body deadline')), { once: true });
+    } }), { status: 200 }) });
+  const keep = setTimeout(() => {}, 1000);
+  try { await assert.rejects(client.session(), e => e.status === 503 && e.code === 'maintenanceAuthorityUnavailable'); }
+  finally { clearTimeout(keep); }
+});

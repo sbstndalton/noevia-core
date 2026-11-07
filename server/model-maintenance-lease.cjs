@@ -36,6 +36,7 @@
 // request the front is proxying. Anything else is the same 404 as an unknown path.
 const crypto = require('node:crypto');
 const { trustedFront } = require('./trusted-front.cjs');
+const { readCappedJson } = require('./http.cjs');
 
 const PREFIX = '/internal/model-maintenance/lease';
 // noevia deploy/tools/assemble-release.sh pairs this core with a front whose authority carries
@@ -200,7 +201,7 @@ function createNativeLeaseClient({ port, token, fetchImpl = globalThis.fetch, bo
       throw unavailable(err);
     }
     let parsed = null;
-    try { const text = await res.text(); parsed = text ? JSON.parse(text) : null; } catch { parsed = null; }
+    try { parsed = await readCappedJson(res, BODY_LIMIT); } catch { parsed = null; }
     if (res.status === 410) { retired = true; incarnation = null; }
     return { status: res.status, body: parsed };
   }
