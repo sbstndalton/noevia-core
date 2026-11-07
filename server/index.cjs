@@ -922,6 +922,10 @@ const reasoningTraces = { enabled: (dir) => require('./chat-framing.cjs').readPr
 const chatFramingRoutes = require('./routes/chat-framing.cjs').createChatFramingRoutes({ json, readJson, settings: framingSettings });
 // Chat port S4: POST /api/chat-framing/suggest is the Rust front's (its 10-a-minute budget too); this is
 // the front's loopback call for what only this process has: the user's lists and the decision service.
+// Chat port S5: POST /api/chat is the Rust front's relay; it reaches the unchanged pipeline through this bridge.
+const chatTurnBridge = require('./rust-chat-turn.cjs').createTurnBridge({
+  secret: FRONT_SECRET, json,
+});
 const chatFramingSuggestBridge = require('./rust-chat-framing-suggest.cjs').createSuggestBridge({
   secret: FRONT_SECRET, json, readJson, framing: chatFraming,
   asUser: (userId, fn) => diaryAsUser(userId, fn),
@@ -1323,6 +1327,8 @@ async function handleRequestInner(req, res) {
   // And the framing suggestion's POST (chat port S4), with the front's loopback call for the lists and the decision.
   if (require('./rust-chat-framing-suggest.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   if (await chatFramingSuggestBridge(req, res)) return;
+  // And the chat turn itself (chat port S5): only the front's relay reaches the pipeline below (rust-chat-turn.cjs).
+  if (require('./rust-chat-turn.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   if (require('./routes/features.cjs').refuseOwnedFeatures(req, res, { parseRequestUrl, json })) return;
   // The Diary routes that are only a proxy and a policy are the Rust front's (#2185).
   if (require('./rust-diary.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
@@ -1406,6 +1412,9 @@ async function handleRequestInner(req, res) {
   if (require('./rust-chat-export.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   await readyFeatures();
   const preAuth = requestAuth.authenticate(req);
+  // A relayed turn's credentials must still be those of the user the front authenticated, or it is signed out.
+  const relayUser = require('./rust-chat-turn.cjs').relayedUser(req);
+  if (relayUser && (!preAuth || preAuth.user.id !== relayUser)) return unauthorized(res);
   // accountRole: a device token acts as a member, but its account's workspace is the same one.
   const workspace = preAuth ? workspaceStore.get(preAuth.user.id, {
     claim: (preAuth.accountRole || preAuth.user.role) === 'admin',
@@ -1508,15 +1517,22 @@ async function handleRequestScoped(req, res) {
 
 async function handleRequest(req,res) {
   // An unparseable request target (e.g. `//[`) is the client's error: 400, no stack logged.
-  const parsed=parseRequestUrl(req);
+  let parsed=parseRequestUrl(req);
   if(!parsed)return badRequestUrl(res);
+  // Chat port S5: the Rust front's relayed turn (and its gate probe) becomes POST /api/chat here, before the gate,
+  // so the turn runs exactly the pipeline below; anything else on those paths is answered by the bridge.
+  const relay=chatTurnBridge.accept(req,res);
+  if(relay==='done')return;
+  if(relay)parsed=parseRequestUrl(req);
   const pathname=parsed.pathname;
   // This is a browser/core contract marker, including unauthenticated and error
   // responses. Set it before the maintenance gate, which may return early.
   if (pathname.startsWith('/api/')) res.setHeader('X-Noevia-API', '1');
   // The Diary routes the Rust front owns (rust-diary.cjs, rust-diary-routes.cjs, rust-diary-local-exchange.cjs) are
   // refused below and never take the gate; the front's local exchange takes it through its admission lease.
-  const inference=req.method!=='GET' && (pathname==='/api/chat' || (pathname.startsWith('/api/diary/') && !require('./rust-diary.cjs').owned(pathname) && !require('./rust-diary-routes.cjs').owned(req.method,pathname) && !require('./rust-diary-local-exchange.cjs').owned(pathname)));
+  // A POST /api/chat that did not come through the front is refused (rust-chat-turn.cjs) and takes no gate either.
+  const chatTurnOwned=!relay && require('./rust-chat-turn.cjs').owned(req.method,pathname);
+  const inference=req.method!=='GET' && ((pathname==='/api/chat' && !chatTurnOwned) || (pathname.startsWith('/api/diary/') && !require('./rust-diary.cjs').owned(pathname) && !require('./rust-diary-routes.cjs').owned(req.method,pathname) && !require('./rust-diary-local-exchange.cjs').owned(pathname)));
   let leave;
   // #1896: a chat turn waits a moment (<= 3 s) for a briefly held gate, then answers a retryable 503 and logs its reason.
   const chatAdmission=require('./chat-admission.cjs');
@@ -1527,6 +1543,8 @@ async function handleRequest(req,res) {
     if(pathname==='/api/chat'&&status===503){chatAdmission.log503('maintenance');res.setHeader('Retry-After','3');return json(res,503,chatAdmission.refusalBody(error));}
     return json(res,status,{error:error.message});
   }
+  // The front's probe of the gate alone, for a request it refuses (401/403): Node's gate answers first.
+  if(relay==='gate'){if(leave)leave();res.statusCode=204;res.end();return;}
   if(leave){res.once('finish',leave);res.once('close',leave);}
   // #1881: while a chat or Diary turn runs, the long-document backfill makes no embed request (rag.cjs foreground).
   if(inference){const fg=rag.foreground();res.once('finish',fg);res.once('close',fg);}
