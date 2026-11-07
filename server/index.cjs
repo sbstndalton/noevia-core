@@ -233,7 +233,13 @@ function arrayProxy(field) {
 }
 // #1636/#1638: the one embedding configuration (endpoint, model, profile), seeded from the environment
 // and saved beside the data once changed through /api/embedding (embedding-migration.cjs).
-const embeddingOwner = require('./rust-embedding-background.cjs').createOwner({ env: process.env, frontSecret: FRONT_SECRET, dataDir: DATA_DIR, verifyPair: require.main === module });
+const embeddingBackground = require('./rust-embedding-background.cjs');
+const embeddingOwner = embeddingBackground.createOwner({ env: process.env, frontSecret: FRONT_SECRET, dataDir: DATA_DIR, verifyPair: require.main === module,
+  sourceMember: embeddingBackground.createSourceMembershipGuard({
+    userExists: user => !!authService.db.prepare('SELECT 1 FROM users WHERE id=?').get(user) && !workspaceStore.isRemoved(user),
+    workspaceFor: user => workspaceStore.get(user),
+  }),
+});
 const embeddingConfig = require('./embedding-config.cjs').install(require('./embedding-config.cjs').loadEmbeddingConfig({
   env: process.env, nativeOwner: embeddingOwner, stateFile: path.join(DATA_DIR, 'embedding-config.json') }));
 rag.init({ dataDir: DATA_DIR, inferenceUrl: INFERENCE_BASE, headersFn: () => inferenceHeaders(), userDataDirFn: workspaceStore.userDir,
@@ -553,11 +559,8 @@ const {
   saveProjects, getProject, sanitizeChats, loadChats, saveChats, deleteChat, saveFreeChats, deleteFreeChat, createProject,
   readHistory, ownsFile, ensureProjectFolder, withSourceLock, pruneDocuments, writeProjectTextFile, sweepDeletedProject, indexSource,
 } = projectStore;
-// #2191 round 2: the Rust front creates and deletes projects (rust-project-lifecycle.cjs). It reads the
-// toolbox catalogue published here (MCP discovery is this process's), and leaves the RAG index of
-// create-time files in the user's index outbox, which this executor drains (round 3: the storage folder
-// sweep and #687's create-time storage step are the front's own, rust-project-storage.cjs);
-// a delete's tombstone stops an index run of that project still in flight (rag.cjs lifecycle guard).
+// The front owns durable RAG outbox execution. Core keeps a read-only lifecycle
+// guard for its remaining request-time RAG calls and publishes the toolbox catalogue.
 const projectCatalogue = require('./project-catalogue.cjs').createCataloguePublisher({
   dataDir: DATA_DIR,
   current: () => ({
@@ -568,42 +571,11 @@ const projectCatalogue = require('./project-catalogue.cjs').createCataloguePubli
   }),
 });
 const indexOutbox = require('./rust-index-outbox.cjs').createIndexOutbox({
-  // #2191 round 3: only this process's job kinds; the front runs its own (the storage sweep).
-  kinds: require('./rust-project-storage.cjs').CORE_KINDS,
   userDir: (userId) => workspaceStore.userDir(userId),
-  userIds: () => authService.db.prepare('SELECT id FROM users').all().map((r) => r.id).filter((id) => !workspaceStore.isRemoved(id)),
-  runAs: (userId, fn) => {
-    const user = authService.publicUser(authService.db.prepare('SELECT * FROM users WHERE id=?').get(userId));
-    return requestScope.run({ workspace: workspaceStore.get(userId), authn: { user, legacy: false } }, fn);
-  },
-  runJob: async (job, userId) => {
-    const workspace = currentWorkspace();
-    if (job.kind === 'index') {
-      // The project as the front saved it (re-read when projects.json changed), the file's text as it is now.
-      if (workspace.projectsFile) workspace.projectsFile.refresh(workspace.projects);
-      const project = getProject(job.project);
-      const file = (project?.files || []).find((f) => f && f.name === job.file);
-      if (!project || !file) return; // removed or replaced since: nothing left to index
-      await indexSource(project, file);
-      return;
-    }
-    if (job.kind === 'unindex') {
-      // #2191 round 3 (rust-project-files.cjs): a source file the front removed. Its rows go unless a
-      // file of that name is listed again by now (#1919: a re-upload's fresh rows stay), or the project
-      // is gone (its delete removed the whole index; opening it here would make it again).
-      if (workspace.projectsFile) workspace.projectsFile.refresh(workspace.projects);
-      const project = getProject(job.project);
-      if (!project || (project.files || []).some((f) => f && f.name === job.file)) return;
-      rag.deleteProjectFile(job.project, job.file, userId);
-      return;
-    }
-    throw new Error(`unknown outbox job kind ${job.kind}`);
-  },
 });
 rag.setLifecycleGuard(indexOutbox);
 afterNativeReady(() => {
   projectCatalogue.publish();
-  setInterval(() => { indexOutbox.tick().catch((err) => console.warn('[index-outbox] pass failed:', err.message)); }, 2000).unref();
 });
 
 // ── MCP toolboxes (master step 15): curated in mcp-toolbox-manifest.cjs ─────────
@@ -1325,6 +1297,7 @@ async function handleRequestInner(req, res) {
   if (require('./rust-model-downloads-read.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   if (await modelDownloadsFacts(req, res)) return;
   if (require('./rust-autotune-read.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
+  if (await embeddingOwner.handleSourceChanged(req, res, json)) return;
   if (embeddingOwner.handle(req, res, json)) return;
   if (require('./rust-preset-read.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   if (await presetReadBridge(req, res)) return;
@@ -1344,7 +1317,6 @@ async function handleRequestInner(req, res) {
   // (project-catalogue.cjs; written only when it changed).
   projectCatalogue.publish();
   // ... and index or sweep work the front queued in an outbox starts now, not only on the 2 s interval.
-  indexOutbox.kick();
   // GET /api/integrations/storage is the Rust front's (#1071): refused before authentication.
   if (require('./features.cjs').refuseRustStorageRead(req, res, { parseRequestUrl, badRequestUrl, json })) return;
   if (require('./routes/chat-framing.cjs').refuseOwnedPreferences(req, res, { parseRequestUrl, json })) return;
