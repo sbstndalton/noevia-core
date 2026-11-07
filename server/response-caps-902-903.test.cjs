@@ -13,7 +13,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs'), os = require('node:os'), path = require('node:path');
 const { EventEmitter } = require('node:events');
 const { Readable } = require('node:stream');
-const { readCappedText, readCappedJson } = require('./http.cjs');
+const { readCappedText, readCappedJson, readCappedBuffer } = require('./http.cjs');
 
 const CHUNK = 64 * 1024;
 const MB = 1024 * 1024;
@@ -44,6 +44,17 @@ test('readCappedText stops after the cap and reports it; a short body reads whol
   assert.equal(meter.cancelled, true);
   assert.deepEqual(await readCappedText(new Response('{"a":1}'), 1024), { text: '{"a":1}', capped: false });
   assert.deepEqual(await readCappedText({ text: async () => 'stub' }, 1024), { text: 'stub', capped: false });
+});
+
+test('a single final chunk larger than the cap is overflow even when the next read is EOF', async () => {
+  const body = '{"ok":true}' + ' '.repeat(20);
+  const text = await readCappedText(new Response(body), 16);
+  assert.equal(Buffer.byteLength(text.text), 16);
+  assert.equal(text.capped, true);
+  const buffer = await readCappedBuffer(new Response(body), 16);
+  assert.equal(buffer.bytes.length, 16);
+  assert.equal(buffer.capped, true);
+  await assert.rejects(readCappedJson(new Response(body), 16), e => e.code === 'too_large');
 });
 
 test('readCappedText on a clone settles, and the original still reads afterwards (teed body)', async () => {
