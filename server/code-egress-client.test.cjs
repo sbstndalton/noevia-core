@@ -130,3 +130,26 @@ test('unconfirmed cleanups do not accumulate across recoveries: Node drops its r
   revokeStatus = 200;
   const results = await c.close(); assert.equal(results.length, 1); assert.equal(c.retained(), 0); void live;
 });
+
+
+for (const extra of [0, 1]) test(`the issuer reply ${extra ? 'over' : 'at'} its byte cap is read without buffering the whole body`, async () => {
+    const cap = 256 * 1024;
+    const answer = JSON.stringify({ handle: 'h-1', taskId: 'task:bounded', domains: [], token: 'ngr1.synthetic' });
+    const bytes = Buffer.from(answer + ' '.repeat(cap + extra - Buffer.byteLength(answer)));
+    let read = false, cancelled = false, released = false, wholeReads = 0;
+    const reader = {
+      read: async () => { if (read) return { done: true }; read = true; return { done: false, value: bytes }; },
+      cancel: async () => { cancelled = true; },
+      releaseLock: () => { released = true; },
+    };
+    const c = createEgressClient({ port: 1, token: TOKEN, fetchImpl: async () => ({
+      status: 200, body: { getReader: () => reader },
+      text: async () => { wholeReads++; return bytes.toString('utf8'); },
+    }) });
+    const grant = c.grant({ taskId: 'task:bounded', domains: [] });
+    if (extra) await assert.rejects(grant, e => e.code === 'EGRESS_UNAVAILABLE' && e.reason === 'response');
+    else assert.equal((await grant).taskId, 'task:bounded');
+    assert.equal(wholeReads, 0, 'the client never buffers the whole response before applying the cap');
+    assert.equal(released, true, 'the stream reader is released');
+    assert.equal(cancelled, extra === 1, 'only an overflowing body is cancelled');
+});

@@ -7,6 +7,7 @@
 // the task. Anything that goes wrong (front unreachable, refusing, answering oddly, a handle from an
 // earlier front incarnation) refuses: no grant is invented, none is re-acquired, and a cleanup that
 // cannot be confirmed says so (`confirmed: false`).
+const { readCappedText } = require('./http.cjs');
 const CAPABILITY = 'noevia-code-egress-control/1';
 // Keep the quoted literal: noevia deploy/tools/assemble-release.sh pairs this core with a front that
 // carries "noevia-code-egress-issuer/1" (and refuses the reverse pairings).
@@ -29,8 +30,11 @@ function createEgressClient({ port, token, endpoint, fetchImpl = globalThis.fetc
       res = await fetchImpl(`http://127.0.0.1:${port}/v1/egress/${op}`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-noevia-store-token': token }, body: JSON.stringify(body), signal: AbortSignal.timeout(waitMs) });
     } catch { throw new EgressUnavailableError('transport'); }
     let text;
-    try { text = await res.text(); } catch { throw new EgressUnavailableError('response'); }
-    if (text.length > REPLY_CAP) throw new EgressUnavailableError('response');
+    try {
+      const reply = await readCappedText(res, REPLY_CAP);
+      if (reply.capped) throw new EgressUnavailableError('response');
+      text = reply.text;
+    } catch { throw new EgressUnavailableError('response'); }
     let value = null; try { value = text ? JSON.parse(text) : null; } catch { /* answered below */ }
     return { status: res.status, value };
   }
