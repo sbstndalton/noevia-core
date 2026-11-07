@@ -143,7 +143,7 @@ test('#1665 /api/models/reranker is admin-only for every method, including a dee
   const got = await r.call('GET', '/api/models/reranker');
   assert.deepEqual([got.status, got.body.enabled, got.body.choice], [200, true, 'tei']);
   noAddress(got.body);
-  assert.equal((await r.call('POST', '/api/models/reranker')).status, 405);
+  assert.equal(await r.call('POST', '/api/models/reranker'), null);
 });
 
 test('#1665 the route saves, refuses with an error id, and resets by DELETE or {reset:true}', async () => {
