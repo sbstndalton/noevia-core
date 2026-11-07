@@ -233,29 +233,10 @@ test('#1666 reset forgets the chosen model with the URL; a saved record from bef
 
 // ── #1667 ───────────────────────────────────────────────────────────────────────────────────────
 
-test('#1667 PUT /api/auto-roles saves an optional Creative model, refuses a non-chat one, and an old client keeps it', async () => {
-  const catalogue = async () => [{ name: 'synthetic-fast' }, { name: 'synthetic-smart' }, { name: 'synthetic-creative' }, { name: 'synthetic-reranker-q8', labels: ['reranking'] }];
-  const r = routesFixture({ installed: catalogue });
-  const saved = await r.call('PUT', '/api/auto-roles', { body: { fast: 'synthetic-fast', smart: 'synthetic-smart', creative: 'synthetic-creative' } });
-  assert.equal(saved.status, 200);
-  assert.equal(r.roles.current.creative, 'synthetic-creative');
-  // A client from before #1667 sends no `creative`: the saved one stays.
-  await r.call('PUT', '/api/auto-roles', { body: { fast: 'synthetic-fast', smart: 'synthetic-smart', vision: '', code: '' } });
-  assert.equal(r.roles.current.creative, 'synthetic-creative');
-  // An explicit '' clears it.
-  await r.call('PUT', '/api/auto-roles', { body: { fast: 'synthetic-fast', smart: 'synthetic-smart', creative: '' } });
-  assert.equal(r.roles.current.creative, undefined);
-  const unknown = await r.call('PUT', '/api/auto-roles', { body: { fast: 'synthetic-fast', smart: 'synthetic-smart', creative: 'nope' } });
-  assert.equal(unknown.status, 400);
-  const nonChat = await r.call('PUT', '/api/auto-roles', { body: { fast: 'synthetic-fast', smart: 'synthetic-smart', creative: 'synthetic-reranker-q8' } });
-  assert.deepEqual([nonChat.status, /creative role needs a chat model/.test(nonChat.body.error)], [400, true]);
-});
-
-test('#1667 deleting the Creative model clears only that optional role', () => {
-  const ws = { userId: 'u1', autoRoles: { fast: 'f', smart: 's', creative: 'c' }, saves: 0, saveAutoRoles() { this.saves += 1; } };
-  const service = createModelService({ modelManager: { enabled: false, capabilities: {} }, currentWorkspace: () => ws, listWorkspaces: () => [ws] });
-  assert.deepEqual(service.clearRoleReferences('c'), ['creative']);
-  assert.deepEqual(ws.autoRoles, { fast: 'f', smart: 's' });
+test('#1667 auto-roles PUT is refused in Core; validation and Creative retention are native', async () => {
+  const r = routesFixture();
+  assert.deepEqual(await r.call('PUT','/api/auto-roles',{body:{fast:'a',smart:'b',creative:'c'}}), {status:503,body:require('../../server/rust-auto-roles-write.cjs').ROUTE_REFUSAL});
+  assert.equal(r.roles.current,null);
 });
 
 test('#1817 turning reranking off with a saved choice that is no longer offered succeeds, and keeps the choice', () => {
