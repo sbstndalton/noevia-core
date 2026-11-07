@@ -8,7 +8,9 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const { Readable } = require('node:stream');
-const { createRerankSettings } = require('../../server/rerank-settings.cjs');
+// Preserve the original policy assertions against the existing frozen differential oracle.
+// The production owner is native; no Node policy implementation is restored here.
+const { createRerankSettings } = require('../../server/fixtures/rerank-settings-reference.cjs');
 const { rerankTarget } = require('../../server/rerank-target.cjs');
 const { createDecisionSettings, describeDecision } = require('../../server/decision-settings.cjs');
 const { rustSavesDecision, rustResetsDecision } = require('./rust-decision-row.cjs');

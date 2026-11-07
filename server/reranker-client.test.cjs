@@ -71,3 +71,20 @@ test('existing model action permissions precede native settings availability',as
   assert.equal(reads,1);
  }finally{install(prior);}
 });
+
+test('unrelated HTTP fixtures explicitly provide an authenticated disabled native snapshot', async (t) => {
+ const fs = require('node:fs'), os = require('node:os'), path = require('node:path');
+ const {startProjectStore} = require('../tests/server/project-store-server.cjs');
+ const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'reranker-fixture-'));
+ t.after(() => fs.rmSync(dir, {recursive:true,force:true}));
+ const store = await startProjectStore(dir, {reranker:true});
+ t.after(() => store.close());
+ const e = {NOEVIA_PROJECT_STORE_PORT:String(store.port),NOEVIA_PROJECT_STORE_TOKEN:store.token};
+ const client = createClient({env:e});
+ await client.run(() => assert.deepEqual(client.effectiveEnv(), {RERANK_API_KEY:'',NOEVIA_FEATURE_RAG_RERANK:'false'}));
+ assert.deepEqual(await client.get(), {enabled:false,choice:null,source:'deployment',options:[]});
+ await assert.rejects(createClient({env:{...e,NOEVIA_PROJECT_STORE_TOKEN:'x'.repeat(32)}}).read(), e => e.status===503);
+ const closed = await startProjectStore(dir);
+ t.after(() => closed.close());
+ await assert.rejects(createClient({env:{NOEVIA_PROJECT_STORE_PORT:String(closed.port),NOEVIA_PROJECT_STORE_TOKEN:closed.token}}).read(), e => e.status===503);
+});

@@ -108,7 +108,7 @@ async function boot(t, mode) {
   fs.writeFileSync(ini, 'version = 1\n\n[small]\nmodel = /models/q.gguf\nctx-size = 4096\ncache-ram = 0\n');
   const preload = path.join(root, 'fault-preload.cjs');
   fs.writeFileSync(preload, PRELOAD);
-  const router = await fakeRouter(), diary = await fakeDiary(), store = await startProjectStore(dataDir, { maintenance: true });
+  const router = await fakeRouter(), diary = await fakeDiary(), store = await startProjectStore(dataDir, { maintenance: true, reranker: true });
   const port = await new Promise((resolve) => { const s = http.createServer(); s.listen(0, '127.0.0.1', () => { const p = s.address().port; s.close(() => resolve(p)); }); });
   const base = `http://127.0.0.1:${port}`;
   const env = {
