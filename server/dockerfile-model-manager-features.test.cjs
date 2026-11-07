@@ -181,3 +181,16 @@ test('the counted build must produce the copied release binary (round 3)', () =>
   bad(REAL.replace(/(cargo build )--release( --locked -p gguf-meta -p model-files-cli -p model-autoconfig-cli -p noevia-model-manager)/, '$1$2'), /lacks --release/);
   bad(REAL.replace(' && cargo build --release --locked -p gguf-meta -p model-files-cli', ' && CARGO_TARGET_DIR=/tmp/o cargo build --release --locked -p gguf-meta -p model-files-cli'), /inline environment assignment/);
 });
+
+test('shell exports and persistent assignments cannot redirect the counted output', () => {
+  for (const setup of [
+    'export CARGO_TARGET_DIR=/tmp/other',
+    'export CARGO_BUILD_TARGET=x86_64-unknown-linux-musl',
+    'export CARGO_BUILD_BUILD_DIR=/tmp/other',
+    'export "CARGO_"TARGET_DIR=/tmp/other',
+    'set -a && CARGO_TARGET_DIR=/tmp/other',
+    'readonly CARGO_TARGET_DIR=/tmp/other',
+  ]) bad(df({ build: `RUN ${setup} && ${BUILD}` }), /redirects cargo output/);
+  assert.deepEqual(proveFeatures(df({ build: `RUN export CARGO_BUILD_JOBS=2 && ${BUILD}` })).features,
+    ['native-routing', 'native-section-writes']);
+});

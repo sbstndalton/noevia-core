@@ -266,6 +266,9 @@ function proveBuild(all, stage) {
       let seenBuild = false;
       segs.forEach((seg, si) => {
         for (const x of seg.words) for (const s of x.subst) if (/\bcargo\b/.test(s)) fail('cargo is hidden inside a command substitution');
+        // An export or an assignment-only command can affect a later cargo command in this RUN.
+        // Inspect decoded shell words before command(), which skips assignment-only segments.
+        if (seg.words.some((x) => /^CARGO_(?:BUILD_)?TARGET(?:_DIR)?(?:=|$)|^CARGO_BUILD_BUILD_DIR(?:=|$)/.test(x.v))) fail('the build stage redirects cargo output (inline environment assignment or persistent shell variable)');
         if (!found && seg.words[0] && RESERVED.has(seg.words[0].v)) fail(`shell construct "${seg.words[0].v}" before the build in the build stage`);
         const at = command(seg);
         if (at < 0) return;
