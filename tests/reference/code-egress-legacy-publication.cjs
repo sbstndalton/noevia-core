@@ -22,7 +22,7 @@ function withFixedNonce(run) {
 /** Publishes the web key the way Node's start did, into `dir` (a 0750 directory of this uid/gid), and describes it. */
 function publishInto(dir) {
   const { publishWebKey } = require('./code-egress-control.cjs');
-  const uid = process.getuid(), gid = process.getgid();
+  const uid = process.getuid(), gid = process.getgid() || (uid === 0 ? 1 : 0);
   const file = path.join(dir, 'current.key');
   const key = withFixedNonce(() => publishWebKey({ masterKey: MASTER, file, uid, gid }));
   const st = fs.lstatSync(file), bytes = fs.readFileSync(file);
@@ -35,7 +35,8 @@ function publishInto(dir) {
 
 function prepareDir(root) {
   const dir = path.join(root, 'egress-control');
-  fs.mkdirSync(dir); fs.chownSync(dir, process.getuid(), process.getgid()); fs.chmodSync(dir, 0o750);
+  const uid = process.getuid(), gid = process.getgid() || (uid === 0 ? 1 : 0);
+  fs.mkdirSync(dir); fs.chownSync(dir, uid, gid); fs.chmodSync(dir, 0o750);
   return dir;
 }
 

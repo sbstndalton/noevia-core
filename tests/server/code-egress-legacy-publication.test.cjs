@@ -41,7 +41,7 @@ test('rollback to Node after the native issuer adopted the key: its own state be
     const state = path.join(dir, 'issuer'); fs.mkdirSync(state, { mode: 0o700 });
     fs.writeFileSync(path.join(state, 'code-egress-issuer.json'), JSON.stringify({ version: 1, key: key.toString('hex'), next: null, epoch: null }), { mode: 0o600 });
     // Node's keeper recognises the adopted file as its own key (nothing was rewritten)...
-    const uid = process.getuid(), gid = process.getgid();
+    const uid = process.getuid(), gid = fs.lstatSync(dir).gid;
     const keeper = createKeyKeeper({ deriveMaster: () => gen.MASTER, fileKey: key, file, uid, gid });
     assert.equal(keeper.restore(), 'present');
     assert.deepEqual(fs.readFileSync(file), bytes);
