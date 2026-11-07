@@ -70,3 +70,72 @@ test('the bridge warms only the existing trigger against a synthetic engine', as
   await bridge(req,{});
   assert.deepEqual(calls,['/load/beta']);
 });
+
+function nativeSettingsWarmFixture(t, fetchImpl) {
+  const settings = require('./rerank-settings.cjs');
+  const previous = settings.current();
+  const state = { role: 'admin', snapshots: 0, triggers: 0 };
+  settings.install(settings.createClient({
+    env: { NOEVIA_PROJECT_STORE_PORT: '12345', NOEVIA_PROJECT_STORE_TOKEN: 's'.repeat(32) },
+    fetchImpl: async (...args) => { state.snapshots++; return fetchImpl(...args); },
+  }));
+  t.after(() => settings.install(previous));
+  const service = require('./models.cjs').createModelService({
+    env: {}, currentWorkspace: () => { throw new Error('routing manager must not inspect roles'); },
+    modelManager: { get capabilities() { state.triggers++; return { routing: true }; } },
+  });
+  const bridge = createBridge({
+    secret: 'synthetic-secret', service, user: () => ({ role: state.role }),
+    asUser: (_id, fn) => fn(), readJson: async () => ({ user: 'synthetic-admin' }),
+    json: (res, status, body) => Object.assign(res, { status, body }),
+  });
+  state.call = res => bridge({
+    method: 'POST', url: '/internal/auto-roles/warm',
+    headers: { 'x-noevia-store-token': 'synthetic-secret' }, socket: { remoteAddress: '127.0.0.1' },
+  }, res);
+  return state;
+}
+
+test('native warm bridge reports a settings refusal without dispatch or an unhandled rejection', async t => {
+  const unhandled = [];
+  const rejected = error => unhandled.push(error?.code);
+  process.on('unhandledRejection', rejected);
+  t.after(() => process.off('unhandledRejection', rejected));
+  const fixture = nativeSettingsWarmFixture(t, async () => { throw new Error('synthetic owner unavailable'); });
+  const res = {};
+  await fixture.call(res);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(res.status, 503);
+  assert.deepEqual(res.body, { error: 'Auto-roles state is unavailable.' });
+  assert.equal(fixture.snapshots, 1);
+  assert.equal(fixture.triggers, 0);
+  assert.deepEqual(unhandled, []);
+});
+
+test('native warm bridge waits for the settings snapshot and still denies a non-admin', async t => {
+  let entered, release;
+  const started = new Promise(resolve => { entered = resolve; });
+  const pending = new Promise(resolve => { release = resolve; });
+  t.after(() => release());
+  const fixture = nativeSettingsWarmFixture(t, async () => {
+    entered(); await pending;
+    return new Response(JSON.stringify({
+      revision: 'a'.repeat(32) + ':1', env: { RERANK_API_KEY: '' },
+      view: { enabled: false, source: 'deployment', choice: null, options: [] },
+    }));
+  });
+  const res = {};
+  const done = fixture.call(res);
+  await started;
+  assert.equal(res.status, undefined, 'success must wait for snapshot acquisition and trigger invocation');
+  assert.equal(fixture.triggers, 0);
+  release(); await done;
+  assert.equal(res.status, 200);
+  assert.deepEqual(res.body, { ok: true });
+  assert.equal(fixture.triggers, 1);
+  fixture.role = 'member';
+  const denied = {}; await fixture.call(denied);
+  assert.equal(denied.status, 403);
+  assert.equal(fixture.snapshots, 1, 'admin denial precedes settings or warming');
+  assert.equal(fixture.triggers, 1);
+});

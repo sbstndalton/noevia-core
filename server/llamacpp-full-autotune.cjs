@@ -471,7 +471,8 @@ function createFullAutotuner({ request: engineRequest, rawModels: engineRawModel
   }
   // Bounded per-use owner facts only; both the runner and native public discovery use Rust's
   // same classification/signature/selection. No cache, selection duplicate or public reply here.
-  async function scanFacts({ signal } = {}) {
+  async function scanFacts(options = {}) { return require('./rerank-settings.cjs').withSettings(() => scanFactsNow(options)); }
+  async function scanFactsNow({ signal } = {}) {
     signal?.throwIfAborted();
     const r = await rawModels();
     signal?.throwIfAborted();

@@ -224,14 +224,14 @@ function createRoleEngine({ engine, fetch = (url, init) => globalThis.fetch(url,
   if (typeof engine !== 'function') throw Error('createRoleEngine needs engine()');
   const machineKey = (endpoint) => (endpoint?.machine ? `${endpoint.machine.machine?.id}|${endpoint.machine.baseUrl}|${endpoint.machine.model}` : null);
   const admit = typeof admission === 'function' ? admission : (work) => work();
-  const keepIds = () => { try { const k = keep(); return Array.isArray(k) ? k.filter((x) => typeof x === 'string') : []; } catch { return []; } };
+  const keepIds = async () => { const k = await keep(); if (!Array.isArray(k)) throw Object.assign(Error('Model protection is unavailable.'),{status:503}); return k.filter(x => typeof x === 'string'); };
   const budgetFor = (role) => ({ ...FALLBACK_DEFAULTS, ...(ROLE_DEFAULTS[role] || {}), ...((roleDefaults && roleDefaults[role]) || {}) });
   const record = (entry) => { try { log(entry); } catch { /* logging never changes the outcome */ } };
   const base = (endpoint) => String(endpoint.baseUrl || '').replace(/\/+$/, '');
   const headersFor = (endpoint) => ({ 'Content-Type': 'application/json', ...(endpoint.apiKey && endpoint.apiKey !== 'local' ? { Authorization: `Bearer ${endpoint.apiKey}` } : {}) });
 
   async function readLoaded(endpoint) {
-    const kept = keepIds();
+    const kept = await keepIds();
     if (typeof loadedModels === 'function') {
       const ids = await loadedModels();
       if (!Array.isArray(ids)) throw Error('loaded models unreadable');

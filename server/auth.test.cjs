@@ -16,7 +16,7 @@ process.env.DIARY_AUTH_TOKEN = 'test-cowork-token';
 process.env.UI_AUTH_TOKEN = 'test-cowork-token';
 process.env.UI_DATA_DIR = testDataDir;
 // #1071: Node saves projects.json / free-chats.json only through the Rust project store.
-require('../tests/server/project-store-server.cjs').installProjectStore(testDataDir);
+require('../tests/server/project-store-server.cjs').installProjectStore(testDataDir, process.env, { reranker: true });
 process.env.LEGACY_AUTH_COMPAT = 'true';
 process.env.PUBLIC_ORIGIN = 'http://localhost';
 
@@ -117,6 +117,14 @@ test('the provider registry\'s other methods are refused too (the Rust front rem
     assert.equal(refused.status, 503, `${method} ${url}`);
     assert.equal(JSON.parse(refused.text).code, 'RUST_PROVIDERS_OWNED');
   }
+});
+
+test('startup reranker client retains its private credential after the store removes it from env', async () => {
+  assert.equal(process.env.NOEVIA_PROJECT_STORE_TOKEN, undefined, 'the secret must stay out of child environments');
+  // Use the actual client installed by index.cjs, not a separately constructed test client.
+  const value = await require('./rerank-settings.cjs').current().read();
+  assert.deepEqual(value.view, { enabled: false, choice: null, source: 'deployment', options: [] });
+  assert.equal(value.env.NOEVIA_FEATURE_RAG_RERANK, 'false');
 });
 
 test('chat reports upstream errors in SSE without writing headers twice', async (t) => {

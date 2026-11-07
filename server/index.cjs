@@ -148,8 +148,12 @@ const decisionSettings = require('./decision-settings.cjs').createDecisionSettin
 // #1841: OCR and Docling read their address from the same registry (document-workers.cjs), the environment being the fallback.
 require('./document-workers.cjs').useMachines((kind) => inferenceMachines.urlFor(kind));
 // #1665: the reranker's on/off and model, saved in Settings over the deployment's RERANK_* environment.
-const rerankSettings = require('./rerank-settings.cjs').install(require('./rerank-settings.cjs').createRerankSettings({ store: require('./features.cjs').settingsStore(authService.db), audit: (action,actor,detail)=>authService.audit(action,actor,actor,detail), onChange: () => rag.reloadRerank(),
-  machine: () => { const url = inferenceMachines.urlFor('reranker'); return url ? { url, protocol: inferenceMachines.rerankProtocol() } : null; } }));
+const rerankSettings = require('./rerank-settings.cjs').install(require('./rerank-settings.cjs').createClient({
+  // clientFromEnv already removed the secret; keep only this private binding,
+  // never put it back into process.env or a child process environment.
+  env: { NOEVIA_PROJECT_STORE_PORT: process.env.NOEVIA_PROJECT_STORE_PORT, NOEVIA_PROJECT_STORE_TOKEN: FRONT_SECRET },
+  onChange: () => { rag.reloadRerank(); modelService.invalidateModelReads(); },
+}));
 // #697: the inference memory budget (admin setting; INFERENCE_MEMORY_BUDGET_GIB is its initial value).
 const inferenceBudget = require('./inference-budget.cjs').createInferenceBudget({ store: require('./features.cjs').settingsStore(authService.db), audit: (action,actor,detail)=>authService.audit(action,actor,actor,detail) });
 let featureRuntime;
@@ -633,7 +637,7 @@ const codeRoleEndpoint = () => {
   };
 };
 const codeRoleEngine = require('./role-engine.cjs').createRoleEngine({ fetch: (...args) => globalThis.fetch(...args), log: codeRoleLog, engine: codeRoleEndpoint, machines: chatMachines,
-  keep: () => [...require('./model-system.cjs').sidecarModelNames(process.env)],
+  keep: () => require('./rerank-settings.cjs').withSettings(() => [...require('./model-system.cjs').sidecarModelNames(process.env)]),
   // noevia#2115: no local admission lock. The inference gate queues a request for another model until the
   // resident one is idle, so the residency check and the send no longer need to be one step.
   admission: null,
@@ -914,8 +918,8 @@ const framingReasoner = require('./framing-reasoner.cjs').createFramingReasoner(
   enabled: () => features.enabled('framingReasoner') && features.enabled('chatFraming'),
   model: () => framingSettings.get().framingReasonerModel,
   complete: require('./framing-reasoner.cjs').createEngineCompletion({ getProvider, providerHeaders, providerId: DEFAULT_PROVIDER_ID, fetch: (...a) => fetch(...a) }),
-  admit: (model, { answerModel, answerIsLocal }) => require('./framing-reasoner.cjs').admitReasoner({ model, answerModel, answerIsLocal,
-    keep: require('./llamacpp-manager.cjs').keepAlongside(), loadRefusal: typeof modelManager.loadRefusal === 'function' ? modelManager.loadRefusal : null }),
+  admit: async (model, { answerModel, answerIsLocal }) => require('./framing-reasoner.cjs').admitReasoner({ model, answerModel, answerIsLocal,
+    keep: await require('./rerank-settings.cjs').withSettings(() => require('./llamacpp-manager.cjs').keepAlongside()), loadRefusal: typeof modelManager.loadRefusal === 'function' ? modelManager.loadRefusal : null }),
   log: (entry) => recordDecision('chat-reasoner', entry),
 });
 const reasoningTraces = { enabled: (dir) => require('./chat-framing.cjs').readPreferences(dir).keepReasoningTraces === true,
@@ -961,8 +965,8 @@ const chatBrains = chatBrainLib.createBrainScheduler({
     enabled: () => features.enabled('framingReasoner') && features.enabled('chatFraming'),
     model: () => framingSettings.get().framingReasonerModel,
     complete: require('./framing-reasoner.cjs').createEngineCompletion({ getProvider, providerHeaders, providerId: DEFAULT_PROVIDER_ID, fetch: (...a) => fetch(...a) }),
-    admit: (model, { answerModel, answerIsLocal }) => require('./framing-reasoner.cjs').admitReasoner({ model, answerModel, answerIsLocal,
-      keep: require('./llamacpp-manager.cjs').keepAlongside(), loadRefusal: typeof modelManager.loadRefusal === 'function' ? modelManager.loadRefusal : null }),
+    admit: async (model, { answerModel, answerIsLocal }) => require('./framing-reasoner.cjs').admitReasoner({ model, answerModel, answerIsLocal,
+      keep: await require('./rerank-settings.cjs').withSettings(() => require('./llamacpp-manager.cjs').keepAlongside()), loadRefusal: typeof modelManager.loadRefusal === 'function' ? modelManager.loadRefusal : null }),
     loadedModel: () => lastLoadedModel(),
     log: (entry) => recordDecision('chat-brain', entry),
   }),
@@ -1101,7 +1105,7 @@ const modelManagerScanCache = require('./rust-model-manager-scan-cache.cjs').cre
   secret: FRONT_SECRET, json, readJson, service: modelService,
 });
 const modelRoutes = require('./routes/models.cjs').createModelRoutes({
-  json, readBody, readJson, fetchJson, env: process.env, modelManager, currentWorkspace, service: modelService, inferenceBudget, idleUnload, decisionSettings, rerankSettings,
+  json, readBody, readJson, fetchJson, env: process.env, modelManager, currentWorkspace, service: modelService, inferenceBudget, idleUnload, decisionSettings,
 });
 // State only this process knows, published for the Rust front (published-snapshot.cjs): the retrieval
 // status behind GET /api/health (rust-health.cjs) and the served catalogue and machine models behind
@@ -1234,7 +1238,7 @@ const inferenceMachineRoutes = require('./routes/inference-machines.cjs').create
     ocr: () => require('./document-workers.cjs').resolve('ocr').url || null,
     documents: () => require('./document-workers.cjs').resolve('documents').url || null,
     embedding: () => require('./embedding-config.cjs').current()?.active()?.baseUrl || null,
-    reranker: () => { const t = require('./rerank-target.cjs').rerankTarget(rerankSettings.effectiveEnv()); return t.enabled ? t.baseUrl : null; },
+    reranker: () => require('./rerank-settings.cjs').withSettings(() => { const t = require('./rerank-target.cjs').rerankTarget(rerankSettings.effectiveEnv()); return t.enabled ? t.baseUrl : null; }),
   } });
 // GET /api/ready (#297): unauthenticated, mounted before the session gate below alongside the
 // sign-in routes. isReady is set once startup wiring under require.main finishes (see below).

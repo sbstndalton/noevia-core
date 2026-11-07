@@ -934,7 +934,7 @@ test('native embedding protection missing or stale refuses all delete entrypoint
 });
 
 test('#2298 stable saved reranker is protected beside the deployment seed in public model actions', async () => {
-  const settings = require('../rerank-settings.cjs');
+  const settings = require('../fixtures/rerank-settings-reference.cjs');
   const prior = settings.current();
   const env = { NOEVIA_FEATURE_RAG_RERANK: 'true', RERANK_BACKEND: 'llamacpp', RERANK_BASE_URL: 'http://synthetic-rerank', RERANK_MODEL: 'rerank-seed-a', MODEL_LOADER_URL: 'http://synthetic-loader' };
   const store = new Map([[settings.KEY, JSON.stringify({ enabled: true, choice: 'llamacpp:rerank-current-b' })]]);
@@ -962,7 +962,7 @@ test('#2298 stable saved reranker is protected beside the deployment seed in pub
 
 
 test('#2298 unreadable current reranker state refuses unsafe public actions before operations', async () => {
-  const settings = require('../rerank-settings.cjs');
+  const settings = require('../fixtures/rerank-settings-reference.cjs');
   const prior = settings.current();
   const env = { MODEL_LOADER_URL: 'http://synthetic-loader' };
   let operations = 0;
