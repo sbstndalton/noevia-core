@@ -147,7 +147,12 @@ const decisionSettings = require('./decision-settings.cjs').createDecisionSettin
 // #1841: OCR and Docling read their address from the same registry (document-workers.cjs), the environment being the fallback.
 require('./document-workers.cjs').useMachines((kind) => inferenceMachines.urlFor(kind));
 // #1665: the reranker's on/off and model, saved in Settings over the deployment's RERANK_* environment.
-const rerankSettings = require('./rerank-settings.cjs').install(require('./rerank-settings.cjs').createClient({ onChange: () => { rag.reloadRerank(); modelService.invalidateModelReads(); } }));
+const rerankSettings = require('./rerank-settings.cjs').install(require('./rerank-settings.cjs').createClient({
+  // clientFromEnv already removed the secret; keep only this private binding,
+  // never put it back into process.env or a child process environment.
+  env: { NOEVIA_PROJECT_STORE_PORT: process.env.NOEVIA_PROJECT_STORE_PORT, NOEVIA_PROJECT_STORE_TOKEN: FRONT_SECRET },
+  onChange: () => { rag.reloadRerank(); modelService.invalidateModelReads(); },
+}));
 // #697: the inference memory budget (admin setting; INFERENCE_MEMORY_BUDGET_GIB is its initial value).
 const inferenceBudget = require('./inference-budget.cjs').createInferenceBudget({ store: require('./features.cjs').settingsStore(authService.db), audit: (action,actor,detail)=>authService.audit(action,actor,actor,detail) });
 let featureRuntime;

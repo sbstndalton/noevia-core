@@ -119,6 +119,14 @@ test('the provider registry\'s other methods are refused too (the Rust front rem
   }
 });
 
+test('startup reranker client retains its private credential after the store removes it from env', async () => {
+  assert.equal(process.env.NOEVIA_PROJECT_STORE_TOKEN, undefined, 'the secret must stay out of child environments');
+  // Use the actual client installed by index.cjs, not a separately constructed test client.
+  const value = await require('./rerank-settings.cjs').current().read();
+  assert.deepEqual(value.view, { enabled: false, choice: null, source: 'deployment', options: [] });
+  assert.equal(value.env.NOEVIA_FEATURE_RAG_RERANK, 'false');
+});
+
 test('chat reports upstream errors in SSE without writing headers twice', async (t) => {
   const projectId = createProjectAs(testDataDir, adminId, {name:'Failure test', model:'model'}).id;
   for (const fetchStub of [async () => { throw new Error('offline'); }, async () => new Response('unavailable', {status:503})]) {
