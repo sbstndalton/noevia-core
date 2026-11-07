@@ -80,7 +80,7 @@ function fixture(t) {
   };
 }
 
-test('Docker source pins the native archive and leaves verifier on explicit Node command', () => {
+test('Docker source pins the native supervisor and packages the native-only verifier', () => {
   assert.match(dockerfile, /NATIVE_SUPERVISOR_RS_REF=120533acc5362a81a2c24483320534873d402f9d/);
   assert.match(dockerfile, /NATIVE_SUPERVISOR_RS_SHA256=18add3ce17a73666a3673ea16d94b5b4d88b81a204cad214ffd8a4e1cbe8026c/);
   assert.match(dockerfile, /sha256sum -c -/);
@@ -88,7 +88,9 @@ test('Docker source pins the native archive and leaves verifier on explicit Node
   assert.match(dockerfile, /COPY --from=native-supervisor --chmod=0555 .*code-sandbox-supervisor/);
   assert.match(dockerfile, /COPY --from=native-supervisor --chmod=0555 .*code-sandbox-session-exec/);
   assert.match(dockerfile, /COPY --chmod=0555 native-supervisor-entrypoint\.sh \/srv\/native-supervisor-entrypoint\.sh/);
-  assert.match(dockerfile, /COPY supervisor\.cjs pi-acp-bridge\.cjs verifier\.cjs/);
+  assert.match(dockerfile, /^COPY supervisor\.cjs pi-acp-bridge\.cjs \.\/$/m);
+  assert.match(dockerfile, /^COPY --from=native-verifier --chmod=0555 .*code-verify-native \/usr\/local\/libexec\/noevia\/code-verify-native$/m);
+  assert.doesNotMatch(dockerfile, /^COPY\b[^\n]*\bverifier\.cjs\b/m);
   assert.match(dockerfile, /CMD \["\/srv\/native-supervisor-entrypoint\.sh"\]/);
   assert.doesNotMatch(dockerfile, /^ENTRYPOINT\b/m);
   assert.match(dockerfile, /FROM node:22-bookworm-slim\s*$/m);
