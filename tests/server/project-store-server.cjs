@@ -286,7 +286,10 @@ function valid(file, text) {
 }
 
 /** The request handler over `<dataDir>/users/<user>/<file>`; `writes` lists the files written. */
-function createHandler(dataDir, token, writes = [], failures = [], { changes = false } = {}) {
+function createHandler(dataDir, token, writes = [], failures = [], { changes = false, maintenance = false } = {}) {
+  const leaseAuthority = maintenance
+    ? require('../../server/synthetic-lease-authority.test-helper.cjs').createAuthority({ token })
+    : null;
   // Reuse the existing test-only source journal stand-in across HTTP calls. Production
   // clients still have no Node journal fallback; Rust tests cover the actual store.
   // Test-only transport stand-in for unrelated index fixtures. It never claims
@@ -305,7 +308,8 @@ function createHandler(dataDir, token, writes = [], failures = [], { changes = f
     } finally {db.close();}
   };
 
-  return (req, res) => {
+  const handler = (req, res) => {
+    if (leaseAuthority && req.url.startsWith('/v1/maintenance-lease/')) return leaseAuthority.handler(req, res);
     const chunks = [];
     req.on('data', (c) => chunks.push(c));
     req.on('end', async () => {
@@ -355,6 +359,7 @@ function createHandler(dataDir, token, writes = [], failures = [], { changes = f
       }
     });
   };
+  return Object.assign(handler, { maintenance: leaseAuthority });
 }
 
 /** The paired Rust front as the web supervisor installs it, for tests that spawn server/index.cjs: an executable in
@@ -367,14 +372,15 @@ function syntheticFrontBin(dir) {
 }
 
 /** Starts the store on 127.0.0.1 (port 0 by default); resolves { port, token, server, writes, close }. */
-async function startProjectStore(dataDir, { port = 0, token = crypto.randomBytes(32).toString('hex'), changes = false } = {}) {
+async function startProjectStore(dataDir, { port = 0, token = crypto.randomBytes(32).toString('hex'), changes = false, maintenance = false } = {}) {
   const writes = [];
   const failures = [];
-  const server = http.createServer(createHandler(dataDir, token, writes, failures, { changes }));
+  const handler = createHandler(dataDir, token, writes, failures, { changes, maintenance });
+  const server = http.createServer(handler);
   await new Promise((resolve, reject) => { server.once('error', reject); server.listen(port, '127.0.0.1', resolve); });
   const failNext = (status, body, { url = '/v1/write', times = 1 } = {}) => { failures.push({ status, body, url, times }); };
   const clearFailures = () => { failures.length = 0; };
-  return { port: server.address().port, token, server, writes, failNext, clearFailures, close: () => new Promise((r) => server.close(() => r())) };
+  return { port: server.address().port, token, server, writes, failNext, clearFailures, maintenance: handler.maintenance, close: () => new Promise((r) => server.close(() => r())) };
 }
 
 /** A free loopback port, found synchronously (a child binds port 0 and reports it). */
