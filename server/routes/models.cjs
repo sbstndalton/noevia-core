@@ -69,7 +69,7 @@ const STATS_REFUSAL = Object.freeze({ error: 'Engine statistics are owned by the
 const ROUTING_DEFAULT_REFUSAL = Object.freeze({ error: 'Routing default is owned by the Rust front.' });
 const AUTO_ROLES_REFUSAL = Object.freeze({ error: 'The auto-roles read is owned by the Rust front.', code: 'RUST_AUTO_ROLES_OWNED' });
 function createModelRoutes({ servedEmbeddingModels = (target) => require('../rag.cjs').servedModelsCached(target), json, readBody, readJson, fetchJson, env, modelManager, currentWorkspace, service, inferenceBudget = null, idleUnload = null, sweepGuardOptions = {}, decisionSettings = null, rerankSettings = null }) {
-  const { modelScanCache, refreshModelScan, autoRoles, setAutoRoles, ensureRolesLoaded, servedCatalogue, modelsInstalled, deriveUserModelName, lastLoadedModel, clearLastLoadedModel, clearRoleReferences } = service;
+  const { modelScanCache, refreshModelScan, autoRoles, servedCatalogue, modelsInstalled, deriveUserModelName, lastLoadedModel, clearLastLoadedModel, clearRoleReferences } = service;
   // #1461: the installed list is shared for a moment (service.modelsInstalled). A decision that must confirm
   // the engine's state right now (a delete that checks the model exists, a load that checks it is not missing)
   // asks for a fresh read instead.
@@ -77,7 +77,8 @@ function createModelRoutes({ servedEmbeddingModels = (target) => require('../rag
   const loaderHeaders = () => ({ 'Content-Type': 'application/json', ...(env.MODEL_LOADER_TOKEN ? { 'X-Model-Loader-Token': env.MODEL_LOADER_TOKEN } : {}) });
   // #873: the throughput sweep holds the inference maintenance gate for as long as it runs.
   const sweepGuard = typeof modelManager.holdMaintenance === 'function' ? require('../benchmark-sweep-guard.cjs').createSweepGuard({
-    hold: reason => modelManager.holdMaintenance(reason),
+    hold: (reason, options) => modelManager.holdMaintenance(reason, options),
+    barrier: typeof modelManager.maintenanceBarrier === 'function' ? reason => modelManager.maintenanceBarrier(reason) : null,
     progress: () => fetchJson(`${String(env.MODEL_LOADER_URL || '').replace(/\/+$/, '')}/api/v1/benchmark/progress`, { method: 'GET', headers: loaderHeaders() }, 15000),
     log: message => console.log(message),
     ...sweepGuardOptions,
@@ -184,7 +185,7 @@ function createModelRoutes({ servedEmbeddingModels = (target) => require('../rag
     }, () => removed.length > 0);
     if (held.refused) return { ok: false, status: 409, code: 'maintenance_held', error: PRESETS_BUSY, retryable: true };
     for (const name of removed) {
-      clearRoleReferences(name);
+      await clearRoleReferences(name);
       if (lastLoadedModel() === name) clearLastLoadedModel(name);
       if (typeof modelManager.forgetIdentity === 'function') modelManager.forgetIdentity(name);
     }
@@ -198,16 +199,7 @@ function createModelRoutes({ servedEmbeddingModels = (target) => require('../rag
     if (!['GET', 'HEAD'].includes(req.method || 'GET') && /^\/api\/(models|model-manager|auto-roles)(\/|$)/.test(p)) {
       if (service.invalidateModelReads) {
         service.invalidateModelReads();
-        // The write lands after this. A read in between can cache the old state, and the snapshot the Rust front
-        // reads is rebuilt from those same reads (rust-auto-roles.cjs watches this call to republish at once), so
-        // the reads are dropped again, and the snapshot republished, when the answer is out. Once, whichever of
-        // 'finish' (answered) and 'close' (the client left first) comes first.
-        if (typeof res.once === 'function') {
-          let again = false;
-          const afterWrite = () => { if (again) return; again = true; service.invalidateModelReads(); };
-          res.once('finish', afterWrite);
-          res.once('close', afterWrite);
-        }
+
       }
     }
     if (p.startsWith('/api/models/') && !['GET', 'HEAD'].includes(req.method || 'GET') && authn.user.role !== 'admin') {
@@ -248,59 +240,7 @@ function createModelRoutes({ servedEmbeddingModels = (target) => require('../rag
       // The GET is the Rust front's (sbstndalton/noevia#2190 close-out, rust-auto-roles.cjs): index.cjs refuses it
       // before authentication; this is the same refusal for a mount that is reached some other way.
       if (req.method === 'GET') return json(res, 503, AUTO_ROLES_REFUSAL);
-      if (req.method === 'PUT') {
-        const raw = await readBody(req);
-        let body;
-        try {
-          body = JSON.parse(raw);
-        } catch {
-          return json(res, 400, { error: 'invalid JSON' });
-        }
-        if (!isJsonObject(body)) return json(res, 400, { error: 'request body must be a JSON object' });
-        const fast = typeof body.fast === 'string' ? body.fast.trim() : '';
-        const smart = typeof body.smart === 'string' ? body.smart.trim() : '';
-        const vision = typeof body.vision === 'string' ? body.vision.trim() : '';
-        const code = typeof body.code === 'string' ? body.code.trim() : '';
-        // #1667: optional, like code and vision. An older client that omits the field keeps the saved one.
-        const creative = typeof body.creative === 'string' ? body.creative.trim() : body.creative === undefined ? (autoRoles()?.creative || '') : '';
-        if (!fast || !smart) return json(res, 400, { error: 'both fast and smart model names are required' });
-        // Names must resolve to installed models, or a bad id would keep producing repeated
-        // load-warning log lines forever (ensureRolesLoaded retries every save/warm-up). Skip
-        // the check only when the catalogue itself cannot be read (engine unreachable): saving
-        // is still allowed, since the alternative is a member/admin locked out of the page.
-        const catalogue = await servedCatalogue();
-        const named = { fast, smart, ...(vision ? { vision } : {}), ...(code ? { code } : {}), ...(creative ? { creative } : {}) };
-        if (Array.isArray(catalogue)) {
-          const known = new Set(catalogue.map((m) => m.name));
-          const bad = Object.entries(named).filter(([, name]) => !known.has(name)).map(([, name]) => name);
-          if (bad.length) return json(res, 400, { error: `unknown model(s): ${bad.join(', ')}` });
-        }
-        // #343/#442: fast/smart/vision/code all route chat-generation prompts — an embedding,
-        // reranking or routing model there fails every request through it (auto-router.cjs
-        // classifyFastOrSmart fails open to fast, so a bad `fast` breaks Auto entirely; a Laya or
-        // embedding `vision` role would send image-description duty to a model that cannot see).
-        // Same helper the sibling benchmark/start handler above already uses. This does not
-        // additionally require a `vision`/`multimodal` label: unlike Laya (name-flagged as a
-        // system model) or an embedding/reranking model (label-flagged), an ordinary chat model
-        // with no vision label is not known to be incapable of the image-description role, only
-        // unconfirmed — the client's picker narrows further to models the server actually
-        // reported as vision-capable (ModelsSettings.tsx), but the server accepts any chat model
-        // here so a hand-written /api/auto-roles call from a working setup never breaks.
-        const { nonChatAliases } = require('../chat-model-kind.cjs');
-        const textRoles = { fast, smart, ...(vision ? { vision } : {}), ...(code ? { code } : {}), ...(creative ? { creative } : {}) };
-        const nonChat = new Set(nonChatAliases(Object.values(textRoles), catalogue));
-        const badRole = Object.entries(textRoles).find(([, name]) => nonChat.has(name));
-        if (badRole) {
-          const [role, model] = badRole;
-          return json(res, 400, { error: `The ${role} role needs a chat model; ${model} is an embedding, reranking or routing model.` });
-        }
-        setAutoRoles({ fast, smart, vision, code, ...(creative ? { creative } : {}) });
-        // Loading models for the shared engine is an administrative action: a member's save is
-        // stored per workspace like anyone else's, but only an admin's save may warm models up
-        // (native routing stays on demand either way; see ensureRolesLoaded above it).
-        if (authn.user.role === 'admin') ensureRolesLoaded();
-        return json(res, 200, { configured: true, roles: autoRoles() });
-      }
+      if (req.method === 'PUT') return json(res, 503, require('../rust-auto-roles-write.cjs').ROUTE_REFUSAL);
     }
 
     // A change to the models anywhere else (load, unload, download, delete) also invalidates the scan.
@@ -349,7 +289,7 @@ function createModelRoutes({ servedEmbeddingModels = (target) => require('../rag
           if(refusal)return json(res,409,refusal);
         }
         if(sweepGuard&&aliases.length){
-          try{sweepRelease=await sweepGuard.acquire();}catch(e){return json(res,409,{error:e.publicMessage||'The sweep could not start.'});}
+          try{sweepRelease=await sweepGuard.acquire();}catch(e){return json(res,e?.status===503?503:409,{error:e.publicMessage||'The sweep could not start.',...(e?.status===503?{code:e.code,retryable:true}:{})});}
           sweepModels=aliases.length;
         }
       }
@@ -477,7 +417,7 @@ function createModelRoutes({ servedEmbeddingModels = (target) => require('../rag
             const u=await modelManager.unload(id).catch(()=>null);
             if(u?.ok)unloaded=true;
           }
-          for(const role of clearRoleReferences(id))rolesCleared.add(role);
+          for(const role of await clearRoleReferences(id))rolesCleared.add(role);
           if(lastLoadedModel()===id)clearLastLoadedModel(id);
           if(typeof modelManager.forgetIdentity==='function')modelManager.forgetIdentity(id);
         }
@@ -577,24 +517,7 @@ function createModelRoutes({ servedEmbeddingModels = (target) => require('../rag
     // server can rerank with); CSRF/origin run before routes. GET -> { enabled, choice, source, options };
     // PUT { enabled, choice? } saves (audited, applies at once); DELETE or PUT { reset: true } returns to the
     // deployment's configuration. No address is ever sent: a choice is an id the server maps to its address.
-    if (p === '/api/models/reranker') {
-      if (authn.user.role !== 'admin') return json(res, 403, { error: 'administrator required' });
-      if (!rerankSettings) return json(res, 503, { error: 'Reranker settings are unavailable.' });
-      if (!['GET', 'PUT', 'DELETE'].includes(req.method || 'GET')) return json(res, 405, { error: 'method not allowed' });
-      let installed = null;
-      try { installed = await modelsInstalled(); } catch { installed = null; }
-      if (!Array.isArray(installed)) installed = null;
-      try {
-        if (req.method === 'GET') return json(res, 200, rerankSettings.get(installed));
-        if (req.method === 'DELETE') return json(res, 200, rerankSettings.reset(authn.user.id, installed));
-        let body;
-        try { body = await readJson(req); } catch { return json(res, 400, { error: 'invalid JSON', errorId: 'invalidInput' }); }
-        if (isJsonObject(body) && body.reset === true) return json(res, 200, rerankSettings.reset(authn.user.id, installed));
-        return json(res, 200, rerankSettings.save(body, authn.user.id, installed));
-      } catch (error) {
-        return json(res, error.status || 400, { error: error.status ? error.message : 'Invalid reranker settings', ...(error.messageId ? { errorId: error.messageId } : {}) });
-      }
-    }
+    if (p === '/api/models/reranker') return json(res, 503, {error:'Reranker settings are owned by the Rust front.',code:'RUST_RERANKER_SETTINGS_OWNED'});
 
     // #1695: idempotent cleanup of presets whose model file is gone (the web runs it when the
     // admin's list has any; a release may call it too). POST only, admin only (guarded above).
@@ -710,7 +633,7 @@ function createModelRoutes({ servedEmbeddingModels = (target) => require('../rag
       // The model is gone: drop every auto-role that pointed at it, the shared "last loaded
       // model" default if it was this one, and the cached folder scan, so nothing still
       // served by this route can hand the deleted name back out.
-      const rolesCleared = clearRoleReferences(body.name);
+      const rolesCleared = await clearRoleReferences(body.name);
       if (lastLoadedModel() === body.name) clearLastLoadedModel(body.name);
       if (typeof modelManager.forgetIdentity === 'function') modelManager.forgetIdentity(body.name);
       // #1695: the router still lists a removed section until it re-reads models.ini.
@@ -801,7 +724,16 @@ function createModelRoutes({ servedEmbeddingModels = (target) => require('../rag
   }
 
   const modelRoutes = async function modelRoutes(req, res, ctx) {
-    return (await handle(req, res, ctx)) !== PASS;
+    const run = async () => {
+      try { return (await handle(req, res, ctx)) !== PASS; }
+      finally {
+        // A disconnected client can emit close before an asynchronous write lands.
+        // Fence readers after the operation settles, even when no response is sent.
+        if (!['GET', 'HEAD'].includes(req.method || 'GET') && /^\/api\/(models|model-manager|auto-roles)(\/|$)/.test(ctx.path)) service.invalidateModelReads?.();
+      }
+    };
+    const protectedAction = req.method === 'POST' && ['/api/models/prune-missing', '/api/models/delete', '/api/models/load'].includes(ctx.path) || ctx.path.startsWith('/api/model-manager/') && !['GET', 'HEAD', 'OPTIONS'].includes(req.method);
+    return protectedAction && ctx.authn?.user?.role === 'admin' ? require('../rerank-settings.cjs').withSettings(run) : run();
   };
   // Settles once the startup check for a still-running sweep is done (tests await it).
   modelRoutes.sweepAdopted = sweepAdopted;

@@ -81,7 +81,7 @@ function init({ dataDir, embedModel, inferenceUrl, headersFn, userDataDirFn, use
   inferenceBase = inferenceUrl;
   if (headersFn) inferenceHeaders = headersFn;
   if (inferenceGuard) enterInference = inferenceGuard;
-  initRerank();
+  if (!require('./rerank-settings.cjs').current()?.run) initRerank();
   // A new init() (endpoint/model swap, or a test isolating scenarios) invalidates whatever the
   // last readiness probe found — never serve a cached verdict from before the reconfiguration.
   retrievalProbeCache = null;
@@ -116,23 +116,24 @@ let rerank = null; // { decisions, pool, keep, deadlineMs }
 // #1665: the environment the reranker is configured from. The deployment's by default; index.cjs points it at
 // rerank-settings.cjs (the admin's saved switch over the deployment's) and calls reloadRerank() after a change.
 let rerankEnv = () => process.env;
-let liveRerank = false;
+let rerankConfiguration = null;
 function configureRerank(envFn) {
-  liveRerank = typeof envFn === 'function';
   rerankEnv = typeof envFn === 'function' ? envFn : () => process.env;
-  initRerank();
+  rerankConfiguration = null;
+  if (!require('./rerank-settings.cjs').current()?.run) initRerank();
 }
-function reloadRerank() { initRerank(); }
+function reloadRerank() { rerankConfiguration = null; if (require('./rerank-settings.cjs').current()?.run) { rerank=null; return; } initRerank(); }
 function initRerank() {
   // #697: never on the shared inference engine unless the operator allows it (rerank-target.cjs).
   let env;
-  try { env = rerankEnv() || process.env; } catch (err) {
-    if (err?.code === 'machinesUnavailable') { rerank = null; throw err; }
-    env = process.env;
+  try { env = rerankEnv(); } catch (error) {
+    rerank = null; rerankConfiguration = null; throw error;
   }
+  const configuration = crypto.createHash('sha256').update(JSON.stringify([env, process.env.RAG_RERANK_POOL, process.env.RAG_RERANK_KEEP, process.env.RAG_RERANK_DEADLINE_MS])).digest('hex');
+  if (configuration === rerankConfiguration) return;
   const target = require('./rerank-target.cjs').rerankTarget(env);
   if (target.reason) console.warn('[rag] rerank off:', target.reason);
-  if (!target.enabled) { rerank = null; return; }
+  if (!target.enabled) { rerank = null; rerankConfiguration = configuration; return; }
   const baseUrl = target.baseUrl;
   const { createDecisions } = require('./decision/index.cjs');
   const backend = rerankBackend(baseUrl, target.backend, target.model, Object.prototype.hasOwnProperty.call(env, 'RERANK_API_KEY') ? env.RERANK_API_KEY || null : process.env.RERANK_API_KEY || null);
@@ -142,6 +143,7 @@ function initRerank() {
     log: (e) => { if (e.failed || e.fellBack) console.warn('[rag] rerank', JSON.stringify(e)); },
   });
   rerank = { backend: target.backend, decisions, pool: clampInt(process.env.RAG_RERANK_POOL, 12, TOP_K, RERANK_POOL_MAX), keep: clampInt(process.env.RAG_RERANK_KEEP, 6, 1, RERANK_POOL_MAX), deadlineMs: clampInt(process.env.RAG_RERANK_DEADLINE_MS, 3000, 100, 30000) };
+  rerankConfiguration = configuration;
 }
 function clampInt(v, dflt, lo, hi) { const n = parseInt(v, 10); return Number.isFinite(n) ? Math.min(hi, Math.max(lo, n)) : dflt; }
 
@@ -890,6 +892,7 @@ async function searchProjectNow(projectId, query, userId) {
     if (!qvec || qvec.length !== index.slot.dim) return [];
     return await textHits(index, serializeF32(qvec), projectId, query, userId);
   } catch (err) {
+    if (err?.code === 'RERANKER_SETTINGS_UNAVAILABLE') throw err;
     console.warn(`[rag] search failed for ${projectId}: ${err.message}`);
     return [];
   } finally {
@@ -900,9 +903,10 @@ async function searchProjectNow(projectId, query, userId) {
 // The text side of a search: cosine pool, version filter, then the optional reranker. Unchanged by #1726
 // apart from the kind filter, which matches every row of an index that holds no image rows.
 async function textHits(index, qbuf, projectId, query, userId) {
-  // Re-read the native placement before using an adapter: a committed mutation may
-  // outlive its best-effort invalidation callback to this process.
-  if (liveRerank) initRerank();
+  const settings=require('./rerank-settings.cjs');
+  return settings.withSettings(() => { initRerank(); return textHitsConfigured(index,qbuf,projectId,query,userId,rerank); });
+}
+async function textHitsConfigured(index,qbuf,projectId,query,userId,rerank) {
   const rows = index.db
     .prepare(
       `SELECT c.file, c.chunk_no, c.body, c.version, 1.0 - vec_distance_cosine(v.embedding, ?) AS score
@@ -957,6 +961,7 @@ async function searchProjectWithImagesNow(projectId, query, userId) {
       .filter(Boolean);
     return { text, images, indexed };
   } catch (err) {
+    if (err?.code === 'RERANKER_SETTINGS_UNAVAILABLE') throw err;
     console.warn(`[rag] search failed for ${projectId}: ${err.message}`);
     return empty;
   } finally {

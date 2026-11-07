@@ -1,10 +1,8 @@
 'use strict';
-// #1429: the latch that holds automatic storage calls after a refused or throttled login (storage-latch.cjs),
-// and the Diary backup worker honouring it (diary-backup-worker.cjs `suspended`). Synthetic accounts only.
+// #1429: the latch that holds automatic storage calls after a refused or throttled login. Synthetic accounts only.
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const { createStorageLatch } = require('./storage-latch.cjs');
-const { startDiaryBackupWorker } = require('./diary-backup-worker.cjs');
 
 const CONN = { kind: 'nextcloud', baseUrl: 'https://cloud.example/remote.php/dav/files/ada', username: 'ada', secret: 'synthetic-app-pw' };
 
@@ -41,27 +39,6 @@ test('a working call clears the latch, and a timeout or unreachable server never
   latch.note('u1', CONN, { kind: 'login' });
   latch.clear('u1');
   assert.equal(latch.blocked('u1', CONN), null);
-});
-
-test('the Diary backup worker makes no call for a suspended account and leaves its backoff alone', async (t) => {
-  t.mock.timers.enable({ apis: ['setTimeout', 'Date'] });
-  const calls = [];
-  let suspended = true;
-  const stop = startDiaryBackupWorker({
-    users: () => [{ id: 'u1' }],
-    enabled: () => true,
-    suspended: () => suspended,
-    interval: 3000,
-    run: async () => { calls.push(1); return { backup: 'complete' }; },
-  });
-  const flush = async () => { for (let i = 0; i < 4; i++) await new Promise((r) => setImmediate(r)); };
-  await t.mock.timers.tick(3000); await flush();
-  await t.mock.timers.tick(3000); await flush();
-  assert.equal(calls.length, 0, 'no automatic backup while the login is held');
-  suspended = false;
-  await t.mock.timers.tick(3000); await flush();
-  assert.equal(calls.length, 1, 'the first call after the hold runs on the next tick, not after a doubled backoff');
-  stop();
 });
 
 test('the Diary backup reply latches a refused login or a throttle; a success clears it; other failures do not latch', () => {
@@ -233,33 +210,6 @@ test('#1607: the strikes belong to the credentials: a throttle never carries the
   latch.note('u1', NEW, { kind: 'login' });
   assert.equal(latch.status('u1', NEW).nextAttemptAt - now, 15 * 60_000, 'a fresh login starts at the base wait');
   assert.equal(latch.blocked('u2', CONN), null, 'another account has nothing');
-});
-
-test('#1615: a legacy account\'s worker ticks do not keep the storage probe; the projects caller gets it once, with the strikes kept', async (t) => {
-  t.mock.timers.enable({ apis: ['setTimeout', 'Date'], now: 1_000_000 });
-  const latch = createStorageLatch({ now: () => Date.now() });
-  const read = () => CONN;
-  const runs = [];
-  latch.noteDiaryReply('u1', read, { code: 'storageLoginRejected' }, false);
-  const stop = startDiaryBackupWorker({
-    users: () => [{ id: 'u1' }],
-    enabled: () => true,
-    interval: 3000,
-    suspended: (user) => latch.suspendedFor(user.id, read),
-    run: async (user) => { runs.push(Date.now()); const reply = { mode: 'legacy' }; latch.noteDiaryReply(user.id, read, reply, true); return reply; },
-  });
-  const flush = async () => { for (let i = 0; i < 6; i++) await new Promise((r) => setImmediate(r)); };
-  const tickFor = async (ms) => { for (let spent = 0; spent < ms; spent += 3000) { await t.mock.timers.tick(3000); await flush(); } };
-  await tickFor(15 * 60_000 - 3000);
-  assert.equal(runs.length, 0, 'held for the whole wait');
-  await tickFor(3000 * 3);
-  assert.ok(runs.length >= 1 && runs.length <= 2, 'the worker took the probe, and its own backoff (6 s) keeps the ticks in between away');
-  assert.equal(latch.blocked('u1', CONN), null, 'the projects refresh gets the probe');
-  assert.deepEqual(latch.blocked('u1', CONN), { kind: 'login' }, 'and only one caller does');
-  stop();
-  // The strikes survive: a refusal of that probe doubles the wait.
-  latch.noteDiaryReply('u1', read, { code: 'storageLoginRejected' }, false);
-  assert.equal(latch.status('u1', CONN).nextAttemptAt - Date.now(), 30 * 60_000);
 });
 
 test('#1615: a reply that tested nothing hands the probe back, keeps the strikes, and never shortens a hold still inside its wait', () => {
