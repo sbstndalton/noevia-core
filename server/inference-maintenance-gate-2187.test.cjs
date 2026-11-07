@@ -376,11 +376,11 @@ test('#2187: a hold taken again while shutdown gives the old one back is given b
   release();
 });
 
-test('#2187: a restart adopt waits out this process\'s own chat and an unreachable gate, but not its own hold', async () => {
+test('#2187: a restart adopt retains exclusion while this process owns another hold', {timeout:5000}, async () => {
   const { createSweepGuard } = require('./benchmark-sweep-guard.cjs');
   const job = { active: true, unit: 'models', total: 1 };
-  const make = (hold) => createSweepGuard({ hold, progress: async () => ({ ok: true, body: { job } }),
-    adoptRetryMs: 1, adoptMaxDelayMs: 2, adoptAttempts: 5, pollMs: 60000,
+  const make = (hold,pollMs=60000) => createSweepGuard({ hold, progress: async () => ({ ok: true, body: { job } }),
+    adoptRetryMs: 1, adoptMaxDelayMs: 2, adoptAttempts: 5, pollMs,
     setTimer: (fn, ms) => { const h = setTimeout(fn, ms); if (ms >= 1000) h.unref(); return { h }; }, clearTimer: (x) => clearTimeout(x?.h) });
   // This process's chat is still running: the sync busy refusal is waited out.
   const local = createMaintenanceGate();
@@ -394,9 +394,18 @@ test('#2187: a restart adopt waits out this process\'s own chat and an unreachab
   const viaGate = createMaintenanceGate({ remote, setTimer: () => null, clearTimer: () => {}, log: () => {} });
   const g2 = make((r) => viaGate.hold(r));
   assert.equal(await g2.adopt(), true); assert.equal(asks, 2); g2.cancelAdopt();
-  // A hold of this process (a calibration) is still not fought over: no second ask.
+  // The known running sweep cannot be declared finished because another writer
+  // owns custody. Wait for the real old release, then adopt under a fresh hold.
   const mine = createMaintenanceGate(); const rel = mine.hold('calibrating');
-  let tries = 0;
-  const g3 = make((r) => { tries += 1; return mine.hold(r); });
-  assert.equal(await g3.adopt(), false); assert.equal(tries, 1); rel();
+  let tries = 0,done=false;
+  const g3 = make((r) => { tries += 1; return mine.hold(r); },1);
+  const pending=g3.adopt().then(value=>{done=true;return value;});
+  const deadline=Date.now()+2000;
+  while(!tries){assert.ok(Date.now()<deadline);await tick();}
+  assert.equal(done,false);assert.equal(mine.held(),true);assert.equal(g3.active(),false);
+  rel();
+  assert.equal(await pending,true);assert.equal(mine.held(),true);assert.equal(g3.active(),true);
+  job.active=false;
+  while(mine.held()){assert.ok(Date.now()<deadline,'actual terminal progress releases custody');await tick();}
+  assert.equal(g3.active(),false);g3.cancelAdopt();
 });
