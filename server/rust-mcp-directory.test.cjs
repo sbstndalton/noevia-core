@@ -58,8 +58,9 @@ test('index.cjs mounts the three refusals before authentication and no longer bu
     assert.ok(at > 0 && at < pre, name);
   }
   assert.doesNotMatch(index, /routes\/mcp-directory\.cjs|routes\/connectors\.cjs|createMcpDirectoryRoutes|createConnectorRoutes|permittedToolsCache|createFingerprintedCache|computePermittedTools/);
-  assert.match(index, /createMcpDiscoveryPublisher\(/);
-  assert.match(index, /mcpDiscoveryPublisher\.start\(\)/);
+  assert.match(index, /createChatFactsPublisher\(/);
+  assert.match(index, /chatFacts\.start\(\)/);
+  assert.doesNotMatch(index, /createMcpDiscoveryPublisher|mcp-discovery-snapshot/);
   for (const gone of ['routes/mcp-directory.cjs', 'routes/connectors.cjs']) assert.equal(fs.existsSync(path.join(__dirname, gone)), false, gone);
 });
 

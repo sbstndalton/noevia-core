@@ -21,7 +21,6 @@ const { projectAppearance } = require('./project-appearance.cjs');
 // Defer scheduled work until the configured native authority proves Ready.
 const readyRuntime = [];
 const afterNativeReady = (start) => readyRuntime.push(start);
-const { bindBoxes } = require('./mcp-boxes.cjs');
 const { createMcpWiring, createDirectoryUrlAllowed, createCredentialOriginCheck } = require('./mcp-wiring.cjs');
 
 const http = require('http');
@@ -497,14 +496,15 @@ const driveTools = require('./gdrive-tools.cjs').createDriveTools({ accounts: dr
 // MCP state and the executor are injected as closures: mcpState and toolboxOffered are declared
 // further down and only read at call time.
 const {
-  TOOLBOXES, CONNECTOR_BOXES, DEFAULT_TOOLBOXES, connectedBoxes, allToolboxes, toolTokenBudgetFor,
+  TOOLBOXES, CONNECTOR_BOXES, DEFAULT_TOOLBOXES, connectedBoxes, allToolboxes, builtinToolboxes, toolTokenBudgetFor,
   resolveTools, isWriteTool, sanitizeToolboxes, executeToolCall,
 } = createToolboxes({
   boxes: [kiwixTools && kiwixTools.box, driveTools.box].filter(Boolean),
   kiwixTools, driveTools,
   // A directory server the Rust front added (or removed) meanwhile is rediscovered in the background and shows from
-  // the next look (discoverMcpTools also re-reads the directory itself).
-  mcpBoxes: () => { if (mcpWiring.refreshDirectory()) discoverMcpTools(true).catch(() => undefined); return mcpState.boxes; },
+  // the next look; otherwise the look asks the front, at most every few seconds, whether discovery moved
+  // (discovery itself is the front's, mcp_discovery_actor.rs).
+  mcpBoxes: () => { if (mcpWiring.refreshDirectory()) discoverMcpTools(true).catch(() => undefined); else mcpWiring.refreshSoon(); return mcpState.boxes; },
   mcpTools: () => mcpState.tools,
   offered: (id) => toolboxOffered(id),
   prefill,
@@ -578,9 +578,10 @@ afterNativeReady(() => {
   projectCatalogue.publish();
 });
 
-// ── MCP toolboxes (master step 15): curated in mcp-toolbox-manifest.cjs ─────────
+// ── MCP toolboxes (master step 15): curated, discovered and bound by the Rust front (mcp_manifest.rs) ─────────
+// The curation data stays here as the source the front's copy is differential-tested against (noevia-rs
+// tests/mcp-discovery-oracle.cjs) and the tests read; nothing in this process binds boxes from it any more.
 const MCP_TOOLBOX_MANIFEST = require('./mcp-toolbox-manifest.cjs').buildToolboxManifest({ diaryMcpWrite:featureConstruction.diaryMcpWrite });
-
 
 // MCP server list and curated-box filter: parsed in mcp-servers.cjs.
 const { parseMcpServers, parseEnabledToolboxes, createToolboxOffered } = require('./mcp-servers.cjs');
@@ -810,14 +811,15 @@ const mcpCredentialOriginAllowed = createCredentialOriginCheck(process.env.MCP_N
 // The live server list, discovery, per-server credentials and the MCP executor: mcp-wiring.cjs.
 // It appends the directory servers to MCP_SERVERS itself and keeps that array current.
 const mcpWiring = createMcpWiring({
-  servers: MCP_SERVERS, manifest: MCP_TOOLBOX_MANIFEST, mcp, bindBoxes, directoryMcp, mcpOAuth, mcpKeys, directoryUrlAllowed,
+  servers: MCP_SERVERS, mcp, directoryMcp, mcpOAuth, mcpKeys, directoryUrlAllowed,
+  // Discovery is the Rust front's (mcp_discovery_actor.rs); this process asks it over the internal store.
+  discovery: require('./mcp-native-discovery.cjs').createNativeDiscovery({ broker: PROJECT_STORE }),
   publicFetch: mcpPublicFetch,
   credentialOriginAllowed: mcpCredentialOriginAllowed, scope: requestScope,
   storageFor: (userId) => authService.getStorage(userId, true),
   isWriteTool: (name) => isWriteTool(name),
   internal: mcpInternal, internalKey: MCP_INTERNAL_KEY,
   reduceToolResult, resultCap: TOOL_RESULT_CAP,
-  isUserDisabled: (userId) => !!authService.listUsers().find((u) => u.id === userId)?.disabled,
 });
 const { state: mcpState, oauthServerIds, accountReady, discoverMcpTools, executeMcpToolCall, operatorServerFor, executeOperatorToolCall } = mcpWiring;
 
@@ -1116,23 +1118,19 @@ const modelRoutes = require('./routes/models.cjs').createModelRoutes({
     remoteRoles: () => chatMachines.remoteRoles(), machineModels: () => chatMachines.machineModels(), demand,
   });
   autoRolesSnapshot.watch(modelService);
-  // And what only this process's live MCP client knows, for the front's permitted-tools view, connectors page and admin
-  // directory listing (sbstndalton/noevia#2202 round 2; mcp-discovery-snapshot.cjs), on the same demand marker.
-  const mcpDiscoveryPublisher = require('./mcp-discovery-snapshot.cjs').createMcpDiscoveryPublisher({
+  // And what only this process knows about the toolboxes - the built-in boxes, the coding harness facts and
+  // the prefill measurements - for the front's permitted-tools view, connectors page, admin directory listing
+  // and picker (toolbox-chat-facts.cjs), on the same demand marker. MCP discovery is the front's own.
+  const chatFacts = require('./toolbox-chat-facts.cjs').createChatFactsPublisher({
     dataDir: DATA_DIR, demand,
-    discoverMcpTools: () => discoverMcpTools(),
-    catalogue: () => require('./mcp-discovery-snapshot.cjs').buildCatalogue({
-      allToolboxes: () => allToolboxes(),
-      manifest: MCP_TOOLBOX_MANIFEST.filter((b) => toolboxOffered(b.id)),
-      mcpEnabled: () => mcpWiring.enabled(), servers: MCP_SERVERS, state: mcpState,
-      isWriteTool: (name) => isWriteTool(name),
+    facts: () => require('./toolbox-chat-facts.cjs').buildFacts({
+      builtin: () => builtinToolboxes(), defaultToolboxes: DEFAULT_TOOLBOXES, connectorBoxes: CONNECTOR_BOXES,
       harnessEnabled: () => features.enabled('codeHarness'),
       hasRepositories: () => codeService.repositories().length > 0,
-      nextcloudOrigins: require('./mcp-wiring.cjs').parseNextcloudOrigins(process.env.MCP_NEXTCLOUD_ORIGINS),
-      defaultToolboxes: DEFAULT_TOOLBOXES, connectorBoxes: CONNECTOR_BOXES,
+      prefill: { targetMs: TOOL_PREFILL_TARGET_MS, stats: () => prefill.stats() },
     }),
   });
-  afterNativeReady(() => mcpDiscoveryPublisher.start());
+  afterNativeReady(() => chatFacts.start());
   afterNativeReady(() => { ragStatus.start(); autoRolesSnapshot.start(); demand.start(); });
 }
 // ── Routing ────────────────────────────────────────────────────────────────
@@ -1249,14 +1247,8 @@ const calibrationRoutesBridge = require('./rust-calibration-routes-bridge.cjs').
 const calibrationCancelBridge = require('./rust-calibration-cancel-bridge.cjs').createCalibrationCancelBridge({
   secret: FRONT_SECRET, json, readJson, calibration: () => modelManager.calibration,
 });
-// #2281: the Rust front owns the picker response; only raw live discovery/prefill facts stay here.
 const autotuneCancelBridge = require('./rust-autotune-cancel-bridge.cjs').createAutotuneCancelBridge({
   secret: FRONT_SECRET, json, readJson, autotune: () => modelManager.autotune,
-});
-const toolboxPickerFacts = require('./rust-toolbox-picker-facts.cjs').createToolboxPickerFacts({
-  secret: FRONT_SECRET, discoverMcpTools: async () => { await readyFeatures(); await discoverMcpTools(); }, allToolboxes, connectorBoxes: CONNECTOR_BOXES, json, readJson,
-  prefill: { targetMs: TOOL_PREFILL_TARGET_MS, stats: () => prefill.stats() },
-  mcp: () => ({ enabled: mcpWiring.enabled(), state: mcpState, servers: MCP_SERVERS, manifest: MCP_TOOLBOX_MANIFEST }),
 });
 
 // Row J: a lease of the front's authority pauses this process's chat through this latch (a local-only hold).
@@ -1394,7 +1386,6 @@ async function handleRequestInner(req, res) {
   if (await autotuneCancelBridge(req, res)) return;
   if (require('./rust-calibration-cancel.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   if (await calibrationCancelBridge(req, res)) return;
-  if (await toolboxPickerFacts(req, res)) return;
   if (require('./rust-connectors.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   if (require('./rust-vault-mirror-preferences.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   if (require('./rust-google-drive.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
