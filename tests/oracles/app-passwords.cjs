@@ -1,7 +1,8 @@
 // Historical synthetic-test oracle; never imported by the application.
 'use strict';
 const crypto = require('node:crypto');
-const { hash, verify, Algorithm } = require('@node-rs/argon2');
+// Resolved from server/, where the dependency is installed (tests/ has no node_modules of its own).
+const { hash, verify, Algorithm } = require(require.resolve('@node-rs/argon2', { paths: [require('node:path').join(__dirname, '..', '..', 'server')] }));
 
 // DAV credentials have no connection to session issuance or account passwords. Creating, listing
 // and revoking them in Settings is the Rust front's (sbstndalton/noevia#1071); this module keeps
