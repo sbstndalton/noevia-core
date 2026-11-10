@@ -316,7 +316,7 @@ function createWorkspaceStore(rootDir, defaultProvider, secrets, { projectStore 
       providers: [],
       // #1420: free-chats.json holding null (or any non-list) is an empty list, never a null the routes trip on.
       freeChats: (() => { const list = freeChatsFile.load(); return Array.isArray(list) ? list : []; })(),
-      autoRoles: readJson(path.join(dir, 'auto-roles.json'), null),
+      get autoRoles() { return readJson(path.join(dir, 'auto-roles.json'), null); },
       // Per-user settings with no better home. defaultRouting: what new projects start as.
       preferences: readJson(path.join(dir, 'preferences.json'), {}) || {},
       saveProjects() {
@@ -363,7 +363,6 @@ function createWorkspaceStore(rootDir, defaultProvider, secrets, { projectStore 
         if (saved && typeof saved.then === 'function') return this.storeSaved(saved, 'free-chats.json');
       },
       savePreferences() { this.assertActive(); atomicJson(path.join(dir, 'preferences.json'), this.preferences); },
-      saveAutoRoles() { this.assertActive(); atomicJson(path.join(dir, 'auto-roles.json'), this.autoRoles); },
       historyPath(id) { return path.join(dir, `history-${String(id).replace(/[^a-zA-Z0-9_-]/g, '')}.json`); },
       // sbstndalton/noevia#1071 slice 4: the transcript is written by the Rust store only, for this
       // account only (project-store-client.cjs transcriptsFor). historyPath is for reads.

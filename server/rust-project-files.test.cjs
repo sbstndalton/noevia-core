@@ -37,12 +37,15 @@ test('an owned request is refused with a 503 before its body is read; the rest f
   assert.equal(refuseOwned({ url: '//[', method: 'DELETE', headers: {} }, {}, { parseRequestUrl, json }), false);
 });
 
-test('the dead Node handler is gone; this process runs the unindex jobs', () => {
+test('the dead Node handler is gone; the native outbox runs the unindex jobs', () => {
   const routes = ''; assert.equal(fs.existsSync(path.join(__dirname, 'routes', 'projects.cjs')), false, 'no project route file is left (#2191 round 9)');
   assert.equal(routes.includes('projFileDel'), false);
   assert.ok(require('./rust-project-storage.cjs').CORE_KINDS.includes('unindex'));
+  // The index outbox (index and unindex jobs) executes natively (sbstndalton/noevia#2389); Core
+  // keeps no drain of its own.
   const index = fs.readFileSync(path.join(__dirname, 'index.cjs'), 'utf8');
-  assert.ok(index.includes("job.kind === 'unindex'") && index.includes('rag.deleteProjectFile(job.project, job.file, userId)'));
+  assert.equal(index.includes("job.kind === 'unindex'"), false);
+  assert.equal(index.includes('rag.deleteProjectFile(job.project, job.file, userId)'), false);
 });
 
 // ── through the real router ─────────────────────────────────────────────────────
