@@ -98,10 +98,7 @@ test('the address follows settings the Rust front writes', async (t) => {
 
 test('the writers that stay Node\'s still work', async (t) => {
   const f = await fixture(t);
-  // The DAV listener's last_used_at.
-  const dav = await f.auth.appPasswords.verifyDav('owner', f.app.password, 'lan');
-  assert.equal(dav.credentialId, f.app.id);
-  assert.ok(row(f.auth.db, 'SELECT last_used_at FROM app_passwords WHERE id=?', f.app.id).last_used_at > 0);
+  assert.equal(f.auth.appPasswords.verifyDav, undefined, 'DAV credential verification is native');
   // Switching native-client sign-in off revokes every grant.
   const grant = seedDeviceToken(f.dir, f.userId, { clientName: 'Mac', now: 1 });
   f.clock.t = 2;
