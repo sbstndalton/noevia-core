@@ -2,7 +2,7 @@
 // #697: one inference memory budget for the native engine. Every model the router loads is
 // estimated first (llamacpp-autoconfig.cjs estimateFootprint) and refused when the estimate is
 // above this budget; autoconfig never suggests past it; a watchdog unloads the model when the
-// measured usage runs well over it (inference-budget-watch.cjs).
+// measured usage runs well over it (native Rust: noevia-rs model_maint/budget_watch.rs).
 //
 // The budget is an administrator setting stored like the other admin settings. The deployment
 // variable INFERENCE_MEMORY_BUDGET_GIB only supplies its initial value, and DEFAULT_BUDGET_GIB
