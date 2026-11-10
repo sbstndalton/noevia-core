@@ -699,7 +699,7 @@ test('#873: a sweep still running after a web restart takes the gate back at sta
   const timers = [];
   const make = (job, gate = createMaintenanceGate()) => {
     let current = job;
-    const f = fixture({ env: { MODEL_LOADER_URL: 'http://loader' }, manager: { holdMaintenance: (reason) => gate.hold(reason) },
+    const f = fixture({ env: { MODEL_LOADER_URL: 'http://loader' }, manager: { holdMaintenance: (reason, options) => gate.hold(reason, options), maintenanceBarrier: reason=>gate.barrier(reason,{recovery:true}) },
       fetchReply: (url) => (url.endsWith('/benchmark/progress') ? { ok: true, status: 200, body: { job: current } } : { ok: true, status: 200, body: {} }),
       sweepGuardOptions: { setTimer: (fn) => { timers.push(fn); return { unref() {} }; }, clearTimer: () => {} } });
     return { f, gate, finish: () => { current = { active: false, unit: 'models' }; } };
@@ -719,7 +719,10 @@ test('#873: a sweep still running after a web restart takes the gate back at sta
   // A gate already held (requests in flight cannot be at startup, but a calibration can) is not fought over.
   const busyGate = createMaintenanceGate(); const release = busyGate.hold('calibrating');
   const busy = make({ active: true, unit: 'models', total: 1 }, busyGate);
-  assert.equal(await busy.f.ready, false); release();
+  await new Promise(setImmediate); release();
+  timers.shift()();
+  assert.equal(await busy.f.ready, true, 'known sweep is adopted after the earlier writer settles');
+  busy.finish();await timers.shift()();
   assert.equal(timers.length, 0);
 });
 
@@ -925,7 +928,7 @@ test('native embedding protection missing or stale refuses all delete entrypoint
 });
 
 test('#2298 stable saved reranker is protected beside the deployment seed in public model actions', async () => {
-  const settings = require('../rerank-settings.cjs');
+  const settings = require('../fixtures/rerank-settings-reference.cjs');
   const prior = settings.current();
   const env = { NOEVIA_FEATURE_RAG_RERANK: 'true', RERANK_BACKEND: 'llamacpp', RERANK_BASE_URL: 'http://synthetic-rerank', RERANK_MODEL: 'rerank-seed-a', MODEL_LOADER_URL: 'http://synthetic-loader' };
   const store = new Map([[settings.KEY, JSON.stringify({ enabled: true, choice: 'llamacpp:rerank-current-b' })]]);
@@ -953,7 +956,7 @@ test('#2298 stable saved reranker is protected beside the deployment seed in pub
 
 
 test('#2298 unreadable current reranker state refuses unsafe public actions before operations', async () => {
-  const settings = require('../rerank-settings.cjs');
+  const settings = require('../fixtures/rerank-settings-reference.cjs');
   const prior = settings.current();
   const env = { MODEL_LOADER_URL: 'http://synthetic-loader' };
   let operations = 0;

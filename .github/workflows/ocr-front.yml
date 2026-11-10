@@ -25,10 +25,11 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           repository: sbstndalton/noevia-rs
-          # The front owns the embedding background and its --features advertises rust-embedding-background-v1, which this
-          # Core's boot pairs with (server/rust-embedding-background.cjs); acceptance input only. The head of the noevia-rs
-          # embeddings PR (sbstndalton/noevia-rs#403, move/embedding-input-framing), which contains the research round head.
-          ref: 5fdee7b42e9b014377e675c4e88290f143752fde
+          # The front owns the embedding background and the RAG index outbox; its --features advertises
+          # rust-embedding-background-v1 and rust-index-outbox-v3, which this Core's boot pairs with
+          # (server/rust-embedding-background.cjs); acceptance input only. The head of the noevia-rs outbox PR
+          # (sbstndalton/noevia-rs#412, move/rag-index-outbox), which contains the embeddings round.
+          ref: 90f10da5ddbad07a8b9949081c9874f01e6f2a46
           path: rs
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:

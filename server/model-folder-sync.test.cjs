@@ -152,6 +152,8 @@ test('#2305 configured loader wires the gated folder writer after manager creati
     require, console, inferenceBudget: {}, fetchJson: () => { throw Error('no network during construction'); },
     // The front's store client (index.cjs PROJECT_STORE); none here, so the manager keeps the local preset reload guard.
     PROJECT_STORE: null,
+    // Row J: no store secret here, so the lease authority client answers unavailable (and never reaches the network).
+    FRONT_SECRET: '',
     createModelManager: () => manager,
     modelService: { async managerFetch(route, method) {
       if (route === 'models') return { ok: true, body: { unregistered: ['synthetic'] } };

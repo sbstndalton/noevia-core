@@ -24,7 +24,7 @@ function createBridge({ secret, json, readJson, service, asUser, user }) {
       else if (warm) {
         // Recheck the live account: a role changed since the front's gate must not warm.
         if (user(ask.user)?.role !== 'admin') { json(res, 403, { error: 'administrator required' }); return true; }
-        asUser(ask.user, () => service.ensureRolesLoaded());
+        await asUser(ask.user, () => service.ensureRolesLoaded());
         json(res, 200, { ok: true });
       } else { service.invalidateModelReads(); json(res, 200, { ok: true }); }
     } catch { json(res, 503, { error: 'Auto-roles state is unavailable.' }); }

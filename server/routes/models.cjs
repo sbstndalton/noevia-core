@@ -77,7 +77,8 @@ function createModelRoutes({ servedEmbeddingModels = (target) => require('../rag
   const loaderHeaders = () => ({ 'Content-Type': 'application/json', ...(env.MODEL_LOADER_TOKEN ? { 'X-Model-Loader-Token': env.MODEL_LOADER_TOKEN } : {}) });
   // #873: the throughput sweep holds the inference maintenance gate for as long as it runs.
   const sweepGuard = typeof modelManager.holdMaintenance === 'function' ? require('../benchmark-sweep-guard.cjs').createSweepGuard({
-    hold: reason => modelManager.holdMaintenance(reason),
+    hold: (reason, options) => modelManager.holdMaintenance(reason, options),
+    barrier: typeof modelManager.maintenanceBarrier === 'function' ? reason => modelManager.maintenanceBarrier(reason) : null,
     progress: () => fetchJson(`${String(env.MODEL_LOADER_URL || '').replace(/\/+$/, '')}/api/v1/benchmark/progress`, { method: 'GET', headers: loaderHeaders() }, 15000),
     log: message => console.log(message),
     ...sweepGuardOptions,
@@ -288,7 +289,7 @@ function createModelRoutes({ servedEmbeddingModels = (target) => require('../rag
           if(refusal)return json(res,409,refusal);
         }
         if(sweepGuard&&aliases.length){
-          try{sweepRelease=await sweepGuard.acquire();}catch(e){return json(res,409,{error:e.publicMessage||'The sweep could not start.'});}
+          try{sweepRelease=await sweepGuard.acquire();}catch(e){return json(res,e?.status===503?503:409,{error:e.publicMessage||'The sweep could not start.',...(e?.status===503?{code:e.code,retryable:true}:{})});}
           sweepModels=aliases.length;
         }
       }
@@ -504,23 +505,7 @@ function createModelRoutes({ servedEmbeddingModels = (target) => require('../rag
     // server can rerank with); CSRF/origin run before routes. GET -> { enabled, choice, source, options };
     // PUT { enabled, choice? } saves (audited, applies at once); DELETE or PUT { reset: true } returns to the
     // deployment's configuration. No address is ever sent: a choice is an id the server maps to its address.
-    if (p === '/api/models/reranker' && ['GET', 'PUT', 'DELETE'].includes(req.method || 'GET')) {
-      if (authn.user.role !== 'admin') return json(res, 403, { error: 'administrator required' });
-      if (!rerankSettings) return json(res, 503, { error: 'Reranker settings are unavailable.' });
-      let installed = null;
-      try { installed = await modelsInstalled(); } catch { installed = null; }
-      if (!Array.isArray(installed)) installed = null;
-      try {
-        if (req.method === 'GET') return json(res, 200, rerankSettings.get(installed));
-        if (req.method === 'DELETE') return json(res, 200, rerankSettings.reset(authn.user.id, installed));
-        let body;
-        try { body = await readJson(req); } catch { return json(res, 400, { error: 'invalid JSON', errorId: 'invalidInput' }); }
-        if (isJsonObject(body) && body.reset === true) return json(res, 200, rerankSettings.reset(authn.user.id, installed));
-        return json(res, 200, rerankSettings.save(body, authn.user.id, installed));
-      } catch (error) {
-        return json(res, error.status || 400, { error: error.status ? error.message : 'Invalid reranker settings', ...(error.messageId ? { errorId: error.messageId } : {}) });
-      }
-    }
+    if (p === '/api/models/reranker') return json(res, 503, {error:'Reranker settings are owned by the Rust front.',code:'RUST_RERANKER_SETTINGS_OWNED'});
 
     // #1695: idempotent cleanup of presets whose model file is gone (the web runs it when the
     // admin's list has any; a release may call it too). POST only, admin only (guarded above).
@@ -710,12 +695,16 @@ function createModelRoutes({ servedEmbeddingModels = (target) => require('../rag
   }
 
   const modelRoutes = async function modelRoutes(req, res, ctx) {
-    try { return (await handle(req, res, ctx)) !== PASS; }
-    finally {
-      // A disconnected client can emit close before an asynchronous write lands.
-      // Fence readers after the operation settles, even when no response is sent.
-      if (!['GET', 'HEAD'].includes(req.method || 'GET') && /^\/api\/(models|model-manager|auto-roles)(\/|$)/.test(ctx.path)) service.invalidateModelReads?.();
-    }
+    const run = async () => {
+      try { return (await handle(req, res, ctx)) !== PASS; }
+      finally {
+        // A disconnected client can emit close before an asynchronous write lands.
+        // Fence readers after the operation settles, even when no response is sent.
+        if (!['GET', 'HEAD'].includes(req.method || 'GET') && /^\/api\/(models|model-manager|auto-roles)(\/|$)/.test(ctx.path)) service.invalidateModelReads?.();
+      }
+    };
+    const protectedAction = req.method === 'POST' && ['/api/models/prune-missing', '/api/models/delete', '/api/models/load'].includes(ctx.path) || ctx.path.startsWith('/api/model-manager/') && !['GET', 'HEAD', 'OPTIONS'].includes(req.method);
+    return protectedAction && ctx.authn?.user?.role === 'admin' ? require('../rerank-settings.cjs').withSettings(run) : run();
   };
   // Settles once the startup check for a still-running sweep is done (tests await it).
   modelRoutes.sweepAdopted = sweepAdopted;

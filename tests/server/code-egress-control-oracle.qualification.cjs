@@ -1,9 +1,9 @@
 'use strict';
 const test = require('node:test'), assert = require('node:assert/strict');
 const fs = require('node:fs'), path = require('node:path'), os = require('node:os'), crypto = require('node:crypto');
-const { CAPABILITY, ROUTES, deriveFileKey, deriveControlKey, deriveGrantKey, requestMac, responseMac, createControlClient, publishWebKey, republishMissingKey, createKeyKeeper } = require('./code-egress-control.cjs');
-const { mintGrant } = require('./code-egress.cjs');
-const vectors = require('../contracts/egress-control.v1.vectors.json');
+const { CAPABILITY, ROUTES, deriveFileKey, deriveControlKey, deriveGrantKey, requestMac, responseMac, createControlClient, publishWebKey, republishMissingKey, createKeyKeeper } = require('../reference/code-egress-control.cjs');
+const { mintGrant } = require('../reference/code-egress.cjs');
+const vectors = require('../../contracts/egress-control.v1.vectors.json');
 const file = Buffer.alloc(32, 7), boot = 'ab'.repeat(16), session = 'cd'.repeat(16), snapshot = 'ef'.repeat(16);
 function headers(tag, bytes) { return ['content-type', 'application/json', 'content-length', String(bytes.length), 'cache-control', 'no-store', 'connection', 'close', 'x-noevia-control-mac', tag]; }
 function response(req, value, status = 200, key = file) { const bytes = Buffer.from(JSON.stringify({ version: 1, requestId: req.headers['x-noevia-request-id'], ...value })); return { status, rawHeaders: headers(responseMac(key, req.headers['x-noevia-control-mac'], status, bytes), bytes), body: bytes }; }
@@ -27,7 +27,7 @@ test('independent frozen byte vectors and copied Rust contracts agree', () => {
   for (const c of vectors.cases) { const meta = { requestId: c.requestId, deadlineMs: c.deadlineMs, bootId: c.bootId, keyFingerprint: c.keyFingerprint }; assert.equal(requestMac(k, c.route, meta, Buffer.from(c.body)), c.requestMac); assert.equal(responseMac(k, c.requestMac, c.responseStatus, Buffer.from(c.responseBody)), c.responseMac); }
   const tokenBody = JSON.parse(Buffer.from(vectors.grantToken.split('.')[1], 'base64url')); assert.equal(mintGrant(deriveGrantKey(k, vectors.bootId, vectors.sessionId), tokenBody), vectors.grantToken);
   const dir = process.env.NOEVIA_RS_CONTROL_CONTRACT_DIR; assert.ok(dir, 'explicit reviewed Rust contract directory is required');
-  for (const name of ['egress-control.v1.schema.json', 'egress-control.v1.vectors.json']) assert.deepEqual(fs.readFileSync(path.join(__dirname, '../contracts', name)), fs.readFileSync(path.join(dir, name)));
+  for (const name of ['egress-control.v1.schema.json', 'egress-control.v1.vectors.json']) assert.deepEqual(fs.readFileSync(path.join(__dirname, '../../contracts', name)), fs.readFileSync(path.join(dir, name)));
 });
 test('one Ready flight, ordered renewal and private scoped grant handles', async () => {
   const f = fake(), c = createControlClient({ fileKey: file, endpoint: 'localhost:3001', transport: f.transport, autoRenew: false });
@@ -310,7 +310,7 @@ test('#2226: a real proxy restart and a boot outage recover by themselves, witho
   const kill = async () => { child.kill('SIGKILL'); await closed; release?.(); child = null; };
   try {
     // Boot outage: web starts first, with nothing listening.
-    client = require('./code-egress.cjs').startEgressFromEnv({ CODE_EGRESS_PORT: String(free), CODE_EGRESS_RUST_HOST: '127.0.0.1', CODE_EGRESS_CONTROL_KEY_FILE: keyFile, CODE_EGRESS_KEY_UID: String(uid), CODE_EGRESS_KEY_GID: String(gid) }, { secrets: { derive: () => Buffer.alloc(32, 41) }, log: (e) => events.push(e) });
+    client = require('../reference/code-egress-control.cjs').startControlledEgressFromEnv({ CODE_EGRESS_PORT: String(free), CODE_EGRESS_RUST_HOST: '127.0.0.1', CODE_EGRESS_CONTROL_KEY_FILE: keyFile, CODE_EGRESS_KEY_UID: String(uid), CODE_EGRESS_KEY_GID: String(gid) }, { secrets: { derive: () => Buffer.alloc(32, 41) }, log: (e) => events.push(e) });
     client.start(); await until(() => events.some((e) => e.event === 'egress.control_unavailable'));
     assert.equal(client.available(), false); await assert.rejects(client.grant({ taskId: 'boot.refused', domains: ['example.com'] }), { code: 'EGRESS_UNAVAILABLE' });
     await launch(); await until(() => client.available(), 30000);
@@ -330,8 +330,8 @@ test('#2226: a real proxy restart and a boot outage recover by themselves, witho
     assert.ok(events.some((e) => e.event === 'egress.key_republished'));
     // A Ready the real proxy committed, its reply lost past the budget: no restart of anything.
     await kill(); await assert.rejects(client.renew()); await client.close(); events.length = 0;
-    const { defaultTransport } = require('./code-egress-control.cjs'); let lose = true;
-    client = require('./code-egress.cjs').startEgressFromEnv({ CODE_EGRESS_PORT: String(free), CODE_EGRESS_RUST_HOST: '127.0.0.1', CODE_EGRESS_CONTROL_KEY_FILE: keyFile, CODE_EGRESS_KEY_UID: String(uid), CODE_EGRESS_KEY_GID: String(gid) }, { secrets: { derive: () => Buffer.alloc(32, 41) }, log: (e) => events.push(e), transport: async (req) => { const reply = await defaultTransport(req); if (lose && req.route === ROUTES.ready) throw Error('synthetic reply lost after commit'); return reply; } });
+    const { defaultTransport } = require('../reference/code-egress-control.cjs'); let lose = true;
+    client = require('../reference/code-egress-control.cjs').startControlledEgressFromEnv({ CODE_EGRESS_PORT: String(free), CODE_EGRESS_RUST_HOST: '127.0.0.1', CODE_EGRESS_CONTROL_KEY_FILE: keyFile, CODE_EGRESS_KEY_UID: String(uid), CODE_EGRESS_KEY_GID: String(gid) }, { secrets: { derive: () => Buffer.alloc(32, 41) }, log: (e) => events.push(e), transport: async (req) => { const reply = await defaultTransport(req); if (lose && req.route === ROUTES.ready) throw Error('synthetic reply lost after commit'); return reply; } });
     await launch(); client.start(); await until(() => events.some((e) => e.event === 'egress.control_unavailable'));
     lose = false; await until(() => client.available(), 90000);
     assert.ok(events.some((e) => e.event === 'egress.control_conflict')); assert.ok(events.some((e) => e.event === 'egress.control_rekeyed'));
@@ -375,8 +375,8 @@ test('actual paired Rust binary authenticates Ready, scoped cleanup, retained re
       releaseNative = reservation.adopt(child);
       assert.throws(() => reservation.adopt(child), /ownership refused/);
     }
-    const { defaultTransport } = require('./code-egress-control.cjs'); let dropped = false;
-    client = require('./code-egress.cjs').startEgressFromEnv({ CODE_EGRESS_PORT: String(port), CODE_EGRESS_RUST_HOST: '127.0.0.1', CODE_EGRESS_CONTROL_KEY_FILE: keyFile, CODE_EGRESS_KEY_UID: String(uid), CODE_EGRESS_KEY_GID: String(gid) }, { secrets: { derive: () => Buffer.alloc(32, 29) }, transport: async (req) => {
+    const { defaultTransport } = require('../reference/code-egress-control.cjs'); let dropped = false;
+    client = require('../reference/code-egress-control.cjs').startControlledEgressFromEnv({ CODE_EGRESS_PORT: String(port), CODE_EGRESS_RUST_HOST: '127.0.0.1', CODE_EGRESS_CONTROL_KEY_FILE: keyFile, CODE_EGRESS_KEY_UID: String(uid), CODE_EGRESS_KEY_GID: String(gid) }, { secrets: { derive: () => Buffer.alloc(32, 29) }, transport: async (req) => {
       const reply = await defaultTransport(req);
       if (req.route === ROUTES.revoke && !dropped) { dropped = true; throw Error('owned synthetic lost reply after native commit'); }
       return reply;
@@ -425,7 +425,7 @@ test('#2243: a FIFO at the key path is not opened blocking, and a key file is ne
     const keyFile = path.join(k.dir, 'control.key'), master = Buffer.alloc(32, 8), own = publishWebKey({ masterKey: master, file: keyFile, uid: k.uid, gid: k.gid });
     // A child process, so a blocking open() fails this test by timeout instead of hanging the runner.
     const probe = (note) => spawnSync(process.execPath, ['-e', `
-      const { createKeyKeeper } = require(${JSON.stringify(path.join(__dirname, 'code-egress-control.cjs'))});
+      const { createKeyKeeper } = require(${JSON.stringify(path.join(__dirname, '../reference/code-egress-control.cjs'))});
       const keeper = createKeyKeeper({ deriveMaster: () => Buffer.alloc(32, 8), fileKey: Buffer.from(${JSON.stringify(own.toString('hex'))}, 'hex'), file: ${JSON.stringify(keyFile)}, uid: ${k.uid}, gid: ${k.gid} });
       console.log(JSON.stringify({ restore: keeper.restore(), rekey: keeper.rekey() }));`], { timeout: 4000, encoding: 'utf8' });
     fs.unlinkSync(keyFile); execFileSync('mkfifo', [keyFile]);

@@ -8,7 +8,9 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const { Readable } = require('node:stream');
-const { createRerankSettings } = require('../../server/rerank-settings.cjs');
+// Preserve the original policy assertions against the existing frozen differential oracle.
+// The production owner is native; no Node policy implementation is restored here.
+const { createRerankSettings } = require('../../server/fixtures/rerank-settings-reference.cjs');
 const { rerankTarget } = require('../../server/rerank-target.cjs');
 const { createDecisionSettings, describeDecision } = require('../../server/decision-settings.cjs');
 const { rustSavesDecision, rustResetsDecision } = require('./rust-decision-row.cjs');
@@ -134,35 +136,39 @@ function routesFixture({ env = TEI_ENV, rerankSettings = rerankFixture(env).sett
   return { call, sent, roles };
 }
 
-test('#1665 /api/models/reranker is admin-only for every method, including a deep-linked GET', async () => {
-  const r = routesFixture();
-  for (const method of ['GET', 'PUT', 'DELETE']) {
-    const res = await r.call(method, '/api/models/reranker', { role: 'member', body: { enabled: false } });
-    assert.equal(res.status, 403, `member ${method}`);
-  }
-  const got = await r.call('GET', '/api/models/reranker');
-  assert.deepEqual([got.status, got.body.enabled, got.body.choice], [200, true, 'tei']);
-  noAddress(got.body);
-  assert.equal(await r.call('POST', '/api/models/reranker'), null);
-});
-
-test('#1665 the route saves, refuses with an error id, and resets by DELETE or {reset:true}', async () => {
+// Public 401/403/200/400/405, durable writes and audits now run against the
+// actual Rust front in tests/reranker_settings.rs::original_public_*.
+// Direct Node requests must remain retired; these are not external API expectations.
+test('#1665 direct Node reranker methods refuse instead of serving a second owner', async () => {
   const f = rerankFixture();
   const r = routesFixture({ rerankSettings: f.settings });
-  const off = await r.call('PUT', '/api/models/reranker', { body: { enabled: false } });
-  assert.deepEqual([off.status, off.body.enabled, off.body.source], [200, false, 'admin']);
-  assert.deepEqual(f.audits.at(-1).slice(0, 2), ['rerank.configure', 'admin-1']);
-  const bad = await r.call('PUT', '/api/models/reranker', { body: { enabled: true, choice: 'llamacpp:x' } });
-  assert.deepEqual([bad.status, bad.body.errorId], [400, 'unknownReranker']);
-  const junk = await r.call('PUT', '/api/models/reranker', { raw: '{' });
-  assert.deepEqual([junk.status, junk.body.errorId], [400, 'invalidInput']);
-  const reset = await r.call('PUT', '/api/models/reranker', { body: { reset: true } });
-  assert.deepEqual([reset.status, reset.body.source], [200, 'deployment']);
-  await r.call('PUT', '/api/models/reranker', { body: { enabled: false } });
-  const del = await r.call('DELETE', '/api/models/reranker');
-  assert.deepEqual([del.status, del.body.source, del.body.enabled], [200, 'deployment', true]);
+  for (const method of ['GET', 'PUT', 'DELETE', 'POST']) {
+    const got = await r.call(method, '/api/models/reranker', { body: { enabled: false } });
+    assert.deepEqual(got, { status: 503, body: {
+      error: 'Reranker settings are owned by the Rust front.', code: 'RUST_RERANKER_SETTINGS_OWNED',
+    } }, method);
+    noAddress(got.body);
+  }
+  assert.equal(f.store.map.size, 0);
+  assert.equal(f.audits.length, 0);
+  assert.equal(f.changes(), 0);
 });
 
+test('#1665 direct Node retirement never validates or mutates reranker settings', async () => {
+  const forbidden = new Proxy({}, { get() { assert.fail('Node must never invoke retired settings authority'); } });
+  const r = routesFixture({ rerankSettings: forbidden, installed: async () => assert.fail('no catalogue needed for retirement') });
+  for (const [method, input] of [
+    ['PUT', { body: { enabled: false } }],
+    ['PUT', { body: { enabled: true, choice: 'llamacpp:x' } }],
+    ['PUT', { raw: '{' }],
+    ['PUT', { body: { reset: true } }],
+    ['DELETE', {}],
+  ]) {
+    const got = await r.call(method, '/api/models/reranker', input);
+    assert.equal(got.status, 503);
+    assert.equal(got.body.code, 'RUST_RERANKER_SETTINGS_OWNED');
+  }
+});
 
 test('#1665 retrieval follows the saved switch (rag.configureRerank / reloadRerank), fail-open path unchanged', () => {
   const rag = require('../../server/rag.cjs');
