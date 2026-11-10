@@ -74,7 +74,9 @@ test('#652 the models rate says jetons/s in French, like every other French toke
 test('#652 the file-sharing "not configured" reason is a catalogue string in every locale, in that locale\'s words', () => {
   const en = catalogue('en-GB')['sharing.reason.notConfigured'];
   assert.equal(en, 'The operator has not configured a file-sharing endpoint.', 'the English catalogue matches the server\'s fallback sentence');
-  const server = require('../../server/dav-settings.cjs').configuration({});
+  // The live sentence is the native sharing module's (noevia-rs server-account sharing NOT_CONFIGURED);
+  // the retired Node configuration kept as the synthetic oracle carries the same fallback.
+  const server = require('../oracles/dav-settings.cjs').configuration({});
   assert.equal(server.reason, en, 'the server fallback and the English string are the same sentence');
   for (const l of Object.keys(FILES).filter((l) => l !== 'en-GB')) {
     const text = catalogue(l)['sharing.reason.notConfigured'];
