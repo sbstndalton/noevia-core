@@ -88,7 +88,15 @@ test('#1695 prune-missing removes only presets whose file is gone by both checks
 
 test('#1695 prune-missing is POST-only', async () => {
   const f = routes({ installed: [], sections: [] });
-  assert.equal((await f.call('GET', '/api/models/prune-missing')).status, 405);
+  // Its other methods are residuals: refused at the front ownership boundary before authentication
+  // (the Rust front answers Node's former 405: noevia-rs tests/residual_grid.rs), never run here.
+  const residual = require('../../server/rust-residual-fallbacks.cjs');
+  for (const m of ['GET', 'HEAD', 'PUT', 'DELETE']) {
+    assert.equal(residual.owned(m, '/api/models/prune-missing'), true, m);
+    assert.equal(await f.call(m, '/api/models/prune-missing'), undefined, `${m} is not answered by the route`);
+  }
+  assert.equal(residual.owned('POST', '/api/models/prune-missing'), false);
+  assert.deepEqual(f.fetched, [], 'nothing reached the model manager');
 });
 
 
