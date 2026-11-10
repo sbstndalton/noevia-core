@@ -2,7 +2,7 @@
 // #697 runtime safety net, now the Rust front's (--features rust-budget-watch-v3, noevia-rs
 // bins/noevia-server/src/model_maint/budget_watch.rs). The front samples the inference memory every
 // interval, keeps the strikes, the idle baseline and the cooldown, and unloads through the inference
-// gate exactly as inference-budget-watch.cjs did here. This process no longer starts that watch;
+// gate exactly as the retired Node watch did here. This process no longer starts that watch;
 // release assembly and the web supervisor pair the two by BUDGET_WATCH_OWNER, so there is never a
 // double run (both sampling and unloading) or no run at all.
 //
