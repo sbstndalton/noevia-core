@@ -278,7 +278,10 @@ function valid(file, text) {
 }
 
 /** The request handler over `<dataDir>/users/<user>/<file>`; `writes` lists the files written. */
-function createHandler(dataDir, token, writes = [], failures = [], { mirror = [] } = {}) {
+function createHandler(dataDir, token, writes = [], failures = [], { mirror = [], maintenance = false, reranker = false } = {}) {
+  const leaseAuthority = maintenance
+    ? require('../../server/synthetic-lease-authority.test-helper.cjs').createAuthority({ token })
+    : null;
   // Reuse the existing test-only source journal stand-in across HTTP calls. Production
   // clients still have no Node journal fallback; Rust tests cover the actual store.
   // Test-only transport stand-in for unrelated index fixtures. It never claims
@@ -297,17 +300,26 @@ function createHandler(dataDir, token, writes = [], failures = [], { mirror = []
     } finally {db.close();}
   };
 
-  return (req, res) => {
+  const handler = (req, res) => {
+    if (leaseAuthority && req.url.startsWith('/v1/maintenance-lease/')) return leaseAuthority.handler(req, res);
     const chunks = [];
     req.on('data', (c) => chunks.push(c));
     req.on('end', async () => {
       try {
-        if (req.method !== 'POST' || !(['/v1/read', '/v1/write','/v1/features/context','/v1/storage/legacy-webdav','/v1/auto-roles/proof','/v1/chat-mirror/schedule','/v1/chat-mirror/touch'].includes(req.url) || HISTORY_OPS.has(req.url))) return send(res, 404, { error: 'not found' });
+        if (req.method !== 'POST' || !(['/v1/read', '/v1/write','/v1/features/context','/v1/storage/legacy-webdav','/v1/auto-roles/proof','/v1/chat-mirror/schedule','/v1/chat-mirror/touch', ...(reranker ? ['/v1/reranker/settings'] : [])].includes(req.url) || HISTORY_OPS.has(req.url))) return send(res, 404, { error: 'not found' });
         if (req.headers['x-noevia-store-token'] !== token) return send(res, 401, { error: 'unauthorised' });
         const planned = failures.find((f) => f.url === req.url && f.times > 0);
         if (planned) { planned.times -= 1; return send(res, planned.status, planned.body); }
         let body;
         try { body = JSON.parse(Buffer.concat(chunks).toString('utf8')); } catch { return send(res, 400, { error: 'invalid JSON' }); }
+        // Opt-in transport fixture for unrelated chat/boot tests. This fixed disabled
+        // snapshot supplies no settings mutation, selection, or generation policy.
+        // Actual native owner and cross-process policy qualification stay separate.
+        if (reranker && req.url === '/v1/reranker/settings') return send(res, 200, {
+          revision: STORE_START + ':0',
+          env: { RERANK_API_KEY: '', NOEVIA_FEATURE_RAG_RERANK: 'false' },
+          view: { enabled: false, choice: null, source: 'deployment', options: [] },
+        });
         if(req.url==='/v1/auto-roles/proof')return send(res,200,{capability:'rust-auto-roles-write'});
         if(req.url.startsWith('/v1/chat-mirror/')){mirror.push({url:req.url,body});return send(res,200,{});}
         if(req.url==='/v1/features/context')return send(res,200,contextReply(body));
@@ -347,6 +359,7 @@ function createHandler(dataDir, token, writes = [], failures = [], { mirror = []
       }
     });
   };
+  return Object.assign(handler, { maintenance: leaseAuthority });
 }
 
 /** The paired Rust front as the web supervisor installs it, for tests that spawn server/index.cjs: an executable in
@@ -354,20 +367,21 @@ function createHandler(dataDir, token, writes = [], failures = [], { mirror = []
  *  (server/rust-embedding-background.cjs), so a real boot pairs; pass its path as NOEVIA_SERVER_BIN. */
 function syntheticFrontBin(dir) {
   const file = path.join(dir, 'synthetic-noevia-server');
-  fs.writeFileSync(file, `#!/bin/sh\n[ "$1" = --features ] && echo ${require('../../server/rust-embedding-background.cjs').RUST_EMBEDDING_OWNED}\n`, { mode: 0o755 });
+  fs.writeFileSync(file, `#!/bin/sh\n[ "$1" = --features ] && echo ${require('../../server/rust-embedding-background.cjs').RUST_EMBEDDING_OWNED} ${require('../../server/rust-index-outbox.cjs').RUST_INDEX_OUTBOX_OWNED}\n`, { mode: 0o755 });
   return file;
 }
 
 /** Starts the store on 127.0.0.1 (port 0 by default); resolves { port, token, server, writes, close }. */
-async function startProjectStore(dataDir, { port = 0, token = crypto.randomBytes(32).toString('hex') } = {}) {
+async function startProjectStore(dataDir, { port = 0, token = crypto.randomBytes(32).toString('hex'), maintenance = false, reranker = false } = {}) {
   const writes = [];
   const mirror = [];
   const failures = [];
-  const server = http.createServer(createHandler(dataDir, token, writes, failures, { mirror }));
+  const handler = createHandler(dataDir, token, writes, failures, { mirror, maintenance, reranker });
+  const server = http.createServer(handler);
   await new Promise((resolve, reject) => { server.once('error', reject); server.listen(port, '127.0.0.1', resolve); });
   const failNext = (status, body, { url = '/v1/write', times = 1 } = {}) => { failures.push({ status, body, url, times }); };
   const clearFailures = () => { failures.length = 0; };
-  return { port: server.address().port, token, server, writes, mirror, failNext, clearFailures, close: () => new Promise((r) => server.close(() => r())) };
+  return { port: server.address().port, token, server, writes, mirror, failNext, clearFailures, maintenance: handler.maintenance, close: () => new Promise((r) => server.close(() => r())) };
 }
 
 /** A free loopback port, found synchronously (a child binds port 0 and reports it). */
@@ -382,7 +396,7 @@ function freePortSync() {
  *  NOEVIA_PROJECT_STORE_TOKEN in `env` now (index.cjs reads them when it loads, and takes the
  *  secret out of the environment) and starts the store on that port, unref'd so it never keeps
  *  the test process alive. Call it before requiring index.cjs. */
-function installProjectStore(dataDir, env = process.env) {
+function installProjectStore(dataDir, env = process.env, options = {}) {
   if(!/^[0-9a-f]{32}$/.test(env.NOEVIA_START_ID||''))env.NOEVIA_START_ID=crypto.randomBytes(16).toString('hex');
   const port = freePortSync();
   const token = crypto.randomBytes(32).toString('hex');
@@ -390,7 +404,7 @@ function installProjectStore(dataDir, env = process.env) {
   env.NOEVIA_PROJECT_STORE_TOKEN = token;
   const writes = [];
   const failures = [];
-  const server = http.createServer(createHandler(dataDir, token, writes, failures));
+  const server = http.createServer(createHandler(dataDir, token, writes, failures, options));
   const failNext = (status, body, { url = '/v1/write', times = 1 } = {}) => { failures.push({ status, body, url, times }); };
   server.on('error', (e) => { console.error(`project store stand-in on ${port}: ${e.message}`); process.exitCode = 1; });
   server.listen(port, '127.0.0.1');

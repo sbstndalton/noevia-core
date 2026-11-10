@@ -76,29 +76,19 @@ test('suggestion picks the largest fitting context and adds projector and MTP se
 // The manager's suggestion and Will-it-fit reads (file mounts, budget, never a write) are the Rust
 // front's since #2189: noevia-rs bins/noevia-server tests/model_sizing.rs replays core's own answers.
 
-test('the context ladder matches the Python planner exactly', () => {
-  // These two lists are the same list in two languages. The planner
-  // (services/model-manager/app/autoconfig_core.py) decides what to recommend; the
-  // calibrator (llamacpp-calibration.cjs) walks the JS copy to verify what
-  // actually loads. When they drift, noevia recommends contexts it can never
-  // verify — which is what had happened: six values existed only in Python,
-  // added by the densification explained in that file's own comment and never
-  // carried across.
-  // The tuple moved from autoconfig.py to autoconfig_core.py (noevia-services#8/#10): read the core
-  // module first, then the old one, and fail by naming both when neither declares it.
-  const dir = path.join(__dirname, '..', '..', '..', 'services', 'model-manager', 'app');
-  let block = null; const looked = [];
-  for (const file of ['autoconfig_core.py', 'autoconfig.py']) {
-    const full = path.join(dir, file);
-    if (!fs.existsSync(full)) { looked.push(`${file} (missing)`); continue; }
-    block = /^_CTX_CANDIDATES = \(([\s\S]*?)\)/m.exec(fs.readFileSync(full, 'utf8'));
-    if (block) break;
-    looked.push(`${file} (no _CTX_CANDIDATES tuple)`);
-  }
-  assert.ok(block, `the planner declares _CTX_CANDIDATES as a tuple in neither file: ${looked.join(', ')}`);
-  const expected = block[1].match(/\d+/g).map(Number);
-  assert.deepEqual(CTX_CANDIDATES, expected);
-  // Alignment invariant the Python comment relies on.
+test('the context ladder is one list: the Rust planner, the frozen JS reference and the calibrator walk the same values', () => {
+  // Once this was the same list in two languages: the Python planner (_CTX_CANDIDATES) decided what to
+  // recommend, the calibrator walked the JS copy to verify what loads, and they had drifted by six
+  // values. The Python planner is retired (noevia-services#216). The planner is now the Rust program
+  // (CTX_CANDIDATES in noevia-rs crates/llamacpp-autoconfig, read here through the wasm) and the
+  // calibrator reads that same list (#223). The frozen JS reference is the remaining second copy, so
+  // moving the pinned Rust ladder without carrying it across still fails here.
+  const reference = require('../tests/reference/llamacpp-autoconfig-js.cjs').CTX_CANDIDATES;
+  assert.deepEqual(CTX_CANDIDATES, reference);
+  // The calibrator's ladder for a model trained to the top of the list is exactly the planner's list.
+  const {ladder} = require('./llamacpp-calibration.cjs');
+  assert.deepEqual(ladder(CTX_CANDIDATES.at(-1)), CTX_CANDIDATES);
+  assert.ok(CTX_CANDIDATES.length > 40, 'the ladder read looks broken');
   assert.ok(CTX_CANDIDATES.every((v) => v % 4096 === 0), 'every candidate is 4096-aligned');
   assert.deepEqual(CTX_CANDIDATES, [...CTX_CANDIDATES].sort((a, b) => a - b), 'and ascending');
 });

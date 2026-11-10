@@ -7,8 +7,8 @@
 //                                     write client), the list, the prune (#1914 order)
 //
 // The file's RAG rows are this process's (sqlite-vec is loaded by rag.cjs only): the front queues an
-// `unindex` job in the user's index outbox, which rust-index-outbox.cjs runs here (rag.cjs
-// deleteProjectFile) unless a file of that name is listed again by then (#1919).
+// `unindex` job in the user's index outbox, which the native outbox executor runs (#2389) unless a
+// file of that name is listed again by then (#1919).
 //
 // A direct Node request is refused before authentication, whoever asks, so a stale route table
 // cannot make two processes answer. Every other method of the path falls through as before.

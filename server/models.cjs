@@ -137,7 +137,7 @@ function createModelService({ fetchJson, env, modelManager, currentWorkspace, ro
   // The served model list, or null when it cannot be read (never treat an outage as "nothing installed").
   async function servedCatalogue() {
     if (!modelManager.enabled) return null;
-    try { return await modelsInstalled(); } catch { return null; }
+    try { return await modelsInstalled(); } catch (error) { if (error?.code === 'RERANKER_SETTINGS_UNAVAILABLE') throw error; return null; }
   }
 
   // #545: the folder scan's list of model files, or null when it cannot be trusted. The cached scan
@@ -316,8 +316,10 @@ function createModelService({ fetchJson, env, modelManager, currentWorkspace, ro
     modelScanSnapshot: () => modelScanCache.snapshot(),
     publishModelScan: (body,token) => modelScanCache.publish(body,token),
     requestModelScanRefresh: token => modelScanCache.refresh(token),
-    autoRoles, clearRoleReferences, ensureModelLoaded, ensureRolesLoaded,
-    servedCatalogue, modelsInstalled, modelsInstalledFresh, invalidateModelReads, installedFacts, deriveUserModelName,
+    autoRoles, clearRoleReferences,
+    ensureModelLoaded: (...args) => require('./rerank-settings.cjs').withSettings(() => ensureModelLoaded(...args)),
+    ensureRolesLoaded: (...args) => require('./rerank-settings.cjs').withSettings(() => ensureRolesLoaded(...args)),
+    servedCatalogue: (...args) => require('./rerank-settings.cjs').withSettings(() => servedCatalogue(...args)), modelsInstalled: (...args) => require('./rerank-settings.cjs').withSettings(() => modelsInstalled(...args)), modelsInstalledFresh: (...args) => require('./rerank-settings.cjs').withSettings(() => modelsInstalledFresh(...args)), invalidateModelReads, installedFacts: (...args) => require('./rerank-settings.cjs').withSettings(() => installedFacts(...args)), deriveUserModelName,
   };
 }
 

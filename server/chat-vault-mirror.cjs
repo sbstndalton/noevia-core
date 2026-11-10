@@ -14,7 +14,7 @@
 // Deleted means positively tombstoned (chat-lists.cjs deleted-chats.json), never merely absent from
 // the lists: an empty or partial list (a load hiccup, a swallowed read error, an import mid-write)
 // must not trash a vault. Every delete path tombstones: a single delete, project deletion
-// (purgeProjectChats) and the retention sweep (chat-retention.cjs, through the normal delete
+// (purgeProjectChats) and the retention sweep (native Rust, through the normal delete
 // path). A chat that leaves the lists without a tombstone (or whose tombstone aged out of the
 // capped file) keeps its note and its index entry; that is the safe side. A note
 // someone edited in the vault keeps its edited copy in Trash before noevia overwrites it.
