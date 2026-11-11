@@ -26,7 +26,7 @@ test('model identifiers fall through null and missing fields only', () => {
   }
 });
 
-test('replacement coercion: String() of the name/address value, ToPrimitive failures and V8 depth', async () => {
+test('replacement coercion: String() of the name/address value and ToPrimitive failures', async () => {
   const { build } = require('./machines-coerce-cases.cjs');
   const { cases } = await build();
   const byRaw = raw => cases.find(c => c.input.raw === raw);
@@ -39,13 +39,11 @@ test('replacement coercion: String() of the name/address value, ToPrimitive fail
   assert.deepEqual(byRaw('{"valueOf":1}').add, { ok: '[object Object]' });
   assert.deepEqual(byRaw('{"a":{"toString":1}}').add, { ok: '[object Object]' });
   assert.deepEqual(byRaw('[1,[2,[null,{"x":{"toString":1}}]]]').add, { ok: '1,2,,[object Object]' });
-  // Deep arrays: String() recurses and V8 throws RangeError far below the 1 MiB body cap.
-  assert.deepEqual(byNest(2500, '"x"').add, { ok: 'x' });
-  assert.deepEqual(byNest(2601, '"x"').add, { ok: 'x' });
-  assert.deepEqual(byNest(2610, '"x"').add, { ok: 'x' });
-  assert.deepEqual(byNest(5000, '"x"').add, { throws: 'RangeError', writes: 0 });
-  assert.deepEqual(byNest(100000, '{"toString":1}').coerce, { throws: 'RangeError' });
+  // Ordinary nesting coerces through String(). The corpus holds no stack-sensitive depths: the
+  // exact V8 boundary is qualified only by the pinned-image harness (noevia qualify-machines-depth.sh).
+  assert.deepEqual(byNest(1000, '"x"').add, { ok: 'x' });
   assert.deepEqual(byNest(100, '{"toString":1}').coerce, { throws: 'TypeError' });
+  assert.equal(cases.some(c => c.input.nest && c.input.nest[0] > 1000), false);
   // A deep array inside an object is never walked.
   assert.deepEqual(cases.find(c => c.input.inObject === 100000).coerce, { text: 'a,[object Object]' });
 });
