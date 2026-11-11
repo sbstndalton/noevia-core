@@ -126,7 +126,9 @@ function reloadRerank() { rerankConfiguration = null; if (require('./rerank-sett
 function initRerank() {
   // #697: never on the shared inference engine unless the operator allows it (rerank-target.cjs).
   let env;
-  env = rerankEnv();
+  try { env = rerankEnv(); } catch (error) {
+    rerank = null; rerankConfiguration = null; throw error;
+  }
   const configuration = crypto.createHash('sha256').update(JSON.stringify([env, process.env.RAG_RERANK_POOL, process.env.RAG_RERANK_KEEP, process.env.RAG_RERANK_DEADLINE_MS])).digest('hex');
   if (configuration === rerankConfiguration) return;
   const target = require('./rerank-target.cjs').rerankTarget(env);

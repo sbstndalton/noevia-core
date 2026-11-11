@@ -25,10 +25,7 @@
 const { machineState, machineReason, machineFailing } = require('../machine-health.cjs');
 const { SERVICES } = require('../inference-machines.cjs');
 
-const PASS = Symbol('unhandled');
 const PATH = '/api/models/machines';
-const ACTIONS = new Set(['add', 'update', 'remove', 'assign']);
-const TUNE_ACTIONS = new Set(['tune', 'tuneAbort']);
 
 /**
  * @param {object} deps
@@ -40,10 +37,10 @@ const TUNE_ACTIONS = new Set(['tune', 'tuneAbort']);
  * @param {Record<string, (url:string) => (object|null)>} [deps.authHeaders]  #1856: the headers the real client sends to that same address (decision, sensitivity); null/{} when none
  * @param {() => ({url:string, path:string, headers?:object}|null)} [deps.engine]  #1856: what to ask of this machine's own inference engine / model loader
  */
-function createInferenceMachineRoutes({ json, readJson, machines, health, effective = {}, chatMachines = null, authHeaders = {}, engine = null, machineTune = null }) {
+function createInferenceMachineRoutes({ json, readJson, machines, health, effective = {}, chatMachines = null, authHeaders = {}, engine = null, machineTune = null, secret }) {
   // #1840: a chat role on a machine reaches that machine's server; on this machine it has no address of its own here.
   const chatUrl = (service) => { const role = SERVICES[service]?.mode === 'chat' ? SERVICES[service].role : null; const t = role && machines.chatTarget ? machines.chatTarget(role) : null; return t ? t.baseUrl : null; };
-  const effectiveUrl = async (service) => { if (SERVICES[service]?.mode === 'chat') return chatUrl(service); try { return effective[service] ? await effective[service]() || null : null; } catch (error) { if (error?.code === 'RERANKER_SETTINGS_UNAVAILABLE') throw error; return null; } };
+  const effectiveUrl = async (service) => { if (SERVICES[service]?.mode === 'chat') return chatUrl(service); try { return effective[service] ? await effective[service]() || null : null; } catch (error) { if (error?.code === 'RERANKER_SETTINGS_UNAVAILABLE' || error?.code === 'machinesUnavailable') throw error; return null; } };
 
   async function healthOf(view) {
     // #1841/#1844: OCR, Docling and the sensitivity check are probed the same way (GET /health at their origin); the sensitivity
@@ -92,72 +89,22 @@ function createInferenceMachineRoutes({ json, readJson, machines, health, effect
     return { ...view, services: await Promise.all(view.services.map(async (s) => (effective[s.id] || chatUrl(s.id) ? { ...s, url: await effectiveUrl(s.id) } : s))) };
   }
 
-  /** #1840: a chat role moves to a machine only with a model that machine lists now. */
-  async function assignChecked(body, actor) {
-    const service = String(body?.service || '');
-    if (SERVICES[service]?.mode === 'chat' && body.machine && body.machine !== 'local' && chatMachines) {
-      const model = typeof body.model === 'string' ? body.model.trim() : '';
-      if (!model) throw Object.assign(Error('Choose the model this machine serves for the role.'), { status: 400, code: 'invalidModel' });
-      const served = await chatMachines.listModels(body.machine, body.port);
-      if (!served.includes(model)) throw Object.assign(Error(`That machine does not serve ${model} on port ${body.port}.`), { status: 400, code: 'unknownModel', models: served });
+  return async function inferenceMachineRoutes(req, res) {
+    if (req.url === '/internal/inference-machines/probes' || req.url === '/internal/inference-machines/ready') {
+      if (req.method !== 'POST' || !require('../trusted-front.cjs').trustedFront(req, secret) || Object.hasOwn(req.headers, 'x-forwarded-for') || Object.hasOwn(req.headers, 'x-noevia-client-ip')) { json(res, 404, {error:'Not found'}); return true; }
+      try {
+        const body = await readJson(req, 1024 * 1024);
+        if (req.url.endsWith('/ready')) { if (!body?.target?.machine?.id) { json(res,400,{error:'Invalid machine readiness request.'}); return true; } json(res,200,await chatMachines.ready(body.target)); return true; }
+        if (!body || typeof body.health !== 'boolean' || !Array.isArray(body.view?.machines) || !Array.isArray(body.view?.services)) { json(res,400,{error:'Invalid machine probes request.'}); return true; }
+        if (Array.isArray(body.changed) && body.changed.every(service => Object.hasOwn(SERVICES, service))) machines.notifyChanges?.(body.changed);
+        const view = await withUrls(body.view);
+        json(res,200,{...view,...(body.health ? {health:await healthOf(body.view)} : {})});
+      } catch { json(res,503,{error:'Inference machine probes are unavailable.'}); }
+      return true;
     }
-    return machines.assign(body, actor);
-  }
-
-  async function handle(req, res, { path: p, authn, url }) {
-    if (p !== PATH) return PASS;
-    res.setHeader?.('Cache-Control', 'no-store');
-    if (!authn?.user) return json(res, 401, { error: 'Sign in required' });
-    if (authn.user.role !== 'admin') return json(res, 403, { error: 'Administrator required' });
-    if (req.method === 'GET') {
-      const modelsOf = url?.searchParams?.get?.('models');
-      if (modelsOf !== null && modelsOf !== undefined) {
-        if (!chatMachines) return json(res, 404, { error: 'Not available' });
-        try { return json(res, 200, { models: await chatMachines.listModels(modelsOf, url.searchParams.get('port')) }); }
-        catch (err) { return json(res, err?.status || 502, { error: err?.status ? err.message : 'The machine could not be asked for its models.', code: err?.code }); }
-      }
-      if (url?.searchParams?.get?.('tune') === '1') {
-        if (!machineTune) return json(res, 404, { error: 'Not available' });
-        return json(res, 200, { tune: machineTune.status() });
-      }
-      const view = machines.view();
-      const wantHealth = url?.searchParams?.get?.('health') === '1';
-      return json(res, 200, { ...await withUrls(view), ...(wantHealth ? { health: await healthOf(view) } : {}) });
-    }
-    if (req.method !== 'POST') return json(res, 405, { error: 'Method not allowed' });
-    let body;
-    try { body = await readJson(req); } catch { return json(res, 400, { error: 'invalid JSON' }); }
-    if (!body || typeof body !== 'object' || Array.isArray(body)) return json(res, 400, { error: 'A JSON object is required' });
-    const action = String(body.action || '');
-    if (TUNE_ACTIONS.has(action)) {
-      if (!machineTune) return json(res, 404, { error: 'Not available' });
-      if (action === 'tuneAbort') return json(res, 200, { tune: machineTune.abort(authn.user.id) });
-      try { return json(res, 202, { tune: await machineTune.start({ service: body.service, confirm: body.confirm, actor: authn.user.id }) }); }
-      catch (err) {
-        if (!err?.status) { console.error('[machines] tune', String(err?.message || err).slice(0, 200)); return json(res, 500, { error: 'The measurement could not be started.' }); }
-        return json(res, err.status, { error: err.message, code: err.code });
-      }
-    }
-    if (!ACTIONS.has(action)) return json(res, 400, { error: `action must be one of ${[...ACTIONS, ...(machineTune ? TUNE_ACTIONS : [])].join(', ')}`, code: 'invalidAction' });
-    try {
-      const actor = authn.user.id;
-      const out = action === 'add' ? await machines.add(body, actor)
-        : action === 'update' ? await machines.update(body, actor)
-          : action === 'remove' ? machines.remove(body, actor)
-            : await assignChecked(body, actor);
-      return json(res, action === 'add' ? 201 : 200, await withUrls(out));
-    } catch (err) {
-      if (!err?.status) {
-        console.error('[machines]', String(err?.message || err).slice(0, 200));
-        return json(res, 500, { error: 'The inference machines could not be changed.' });
-      }
-      return json(res, err.status, { error: err.message, code: err.code, ...(err.target ? { target: err.target } : {}), ...(err.services ? { services: err.services } : {}), ...(err.models ? { models: err.models } : {}) });
-    }
-  }
-
-  return async function inferenceMachineRoutes(req, res, ctx) {
-    return (await handle(req, res, ctx)) !== PASS;
+    if (new URL(req.url, 'http://localhost').pathname !== PATH) return false;
+    json(res,503,require('../rust-inference-machines.cjs').ROUTE_REFUSAL);
+    return true;
   };
 }
-
 module.exports = { createInferenceMachineRoutes, PATH };

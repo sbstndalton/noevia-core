@@ -42,9 +42,9 @@ async function autoRolesState({ servedCatalogue, remoteRoles, machineModels }) {
     ? rows.filter((m) => m && typeof m.name === 'string').map((m) => ({ name: m.name, missingFile: !!m.missingFile }))
     : null;
   let machineRoles = [];
-  try { machineRoles = Object.keys(remoteRoles() || {}); } catch { machineRoles = []; }
+  try { machineRoles = Object.keys(remoteRoles() || {}); } catch (err) { if (err?.code === 'machinesUnavailable') throw err; machineRoles = []; }
   let onMachines = [];
-  try { onMachines = machineModels() || []; } catch { onMachines = []; }
+  try { onMachines = machineModels() || []; } catch (err) { if (err?.code === 'machinesUnavailable') throw err; onMachines = []; }
   if (onMachines.length) {
     // #1855: a name this machine's served catalogue lists is answered here, so it is left out of the list.
     const served = new Set((Array.isArray(rows) ? rows : []).map((m) => m?.name));

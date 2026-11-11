@@ -29,14 +29,14 @@ function useMachines(urlFor) { machineUrl = typeof urlFor === 'function' ? urlFo
  */
 function resolve(kind) {
   let assigned = null;
-  try { assigned = machineUrl(kind); } catch { assigned = null; }
+  try { assigned = machineUrl(kind); } catch (err) { if (err?.code === 'machinesUnavailable') throw err; assigned = null; }
   if (typeof assigned === 'string' && assigned) return { url: assigned, fetch: serviceFetch, machine: true };
   return { url: process.env[ENV[kind]], fetch: globalThis.fetch, machine: false };
 }
 
 /** The machine address the worker is assigned to, or null (nothing assigned: the environment applies). */
 function assigned(kind) {
-  try { const u = machineUrl(kind); return typeof u === 'string' && u ? u : null; } catch { return null; }
+  try { const u = machineUrl(kind); return typeof u === 'string' && u ? u : null; } catch (err) { if (err?.code === 'machinesUnavailable') throw err; return null; }
 }
 
 /** Whether the worker is configured at all (a machine or the environment). */

@@ -107,6 +107,7 @@ if (!require('./project-store-client.cjs').enabledFrom(process.env)) {
 // sbstndalton/noevia#2210, #2218: kept in this closure only: the front proves itself with it (trusted-front.cjs) when it asks for a
 // maintenance lease, an admission lease or the research bridge. Taken here, before clientFromEnv deletes it from process.env.
 const FRONT_SECRET = String(process.env.NOEVIA_PROJECT_STORE_TOKEN || '');
+require('./native-machines-client.cjs').configure({port: process.env.NOEVIA_PROJECT_STORE_PORT, token: FRONT_SECRET});
 const FRONT_PORT = Number(process.env.NOEVIA_PROJECT_STORE_PORT);
 const PROJECT_STORE = require('./project-store-client.cjs').clientFromEnv(process.env); // #1916: the secret leaves process.env here
 const authService = createAuth({
@@ -131,18 +132,14 @@ const authService = createAuth({
 // #1638: Settings → Inference machines: which machine each service runs on (default: all on this one). The decision
 // service and the reranker read their address from it; embeddings move only through the #1636 re-index.
 const featureSourceStore = require('./feature-setting-source.cjs').createStore(authService.db);
-const inferenceMachines = require('./inference-machines.cjs').createInferenceMachines({ store: featureSourceStore, audit: (action,actor,detail)=>authService.audit(action,actor,actor,detail),
-  embeddingActive: () => require('./embedding-config.cjs').current()?.active() || null,
-  localEmbeddingUrl: () => require('./embedding-service.cjs').current()?.baseUrl || String(process.env.EMBEDDING_BASE_URL || '').trim() || null,
-  modelsAt: (address, port) => chatMachines.modelsAt(address, port), // #1851 (chatMachines is built just below)
+const inferenceMachines = require('./inference-machines.cjs').createInferenceMachines({
   onChange: (service) => { if (service === 'reranker') rag.reloadRerank(); } });
 // #1638/#1840: one health-probe cache for the Settings page and the chat turns of roles on a machine.
 const machineHealth = require('./machine-health.cjs').createMachineHealth();
 // #1840: chat roles (Fast, Smart, Code, Creative) and Vision on an Inference machine (chat-machines.cjs).
 const chatMachines = require('./chat-machines.cjs').createChatMachines({ machines: inferenceMachines, health: machineHealth });
 // #1880: an administrator-started measurement of a chat role's model on its machine (nothing on this machine changes).
-const machineTune = require('./machine-tune.cjs').createMachineTune({ machines: inferenceMachines, chatMachines, store: require('./features.cjs').settingsStore(authService.db),
-  audit: (action,actor,detail)=>authService.audit(action,actor,actor,detail) });
+const machineTune = require('./machine-tune.cjs').createMachineTune();
 const decisionSettings = require('./decision-settings.cjs').createDecisionSettings({ store: featureSourceStore, machineUrl: () => inferenceMachines.urlFor('decision'), sensitivityMachineUrl: () => inferenceMachines.urlFor('sensitivity') });
 // #1841: OCR and Docling read their address from the same registry (document-workers.cjs), the environment being the fallback.
 require('./document-workers.cjs').useMachines((kind) => inferenceMachines.urlFor(kind));
@@ -1153,7 +1150,7 @@ const samplingSettingsRoutes = require('./routes/sampling-settings.cjs').createS
 const embeddingRoutes = require('./routes/embedding.cjs').createEmbeddingRoutes({ json, readJson, migration: embeddingMigration, authService, fetchJson, DIARY_BASE, diaryServiceHeaders: diary.serviceHeaders,
   service: embeddingService, resolveFile: (model) => require('./embedding-service.cjs').resolveModelFile({ env: process.env, fetchJson, model }) });
 // Settings → Inference machines (routes/inference-machines.cjs, #1638), administrators only.
-const inferenceMachineRoutes = require('./routes/inference-machines.cjs').createInferenceMachineRoutes({ json, readJson, machines: inferenceMachines,
+const inferenceMachineRoutes = require('./routes/inference-machines.cjs').createInferenceMachineRoutes({ secret: FRONT_SECRET, json, readJson, machines: inferenceMachines,
   health: machineHealth, chatMachines, machineTune,
   // #1856: the same key the decision client sends, to its own host only (backend().baseUrl must be the probed origin).
   authHeaders: {
@@ -1319,6 +1316,7 @@ async function handleRequestInner(req, res) {
   if (require('./rust-toolbox-picker.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   if (require('./rust-model-assignments.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   if (await modelAssignmentsFacts(req, res)) return;
+  if (req.url?.startsWith('/internal/inference-machines/') && await inferenceMachineRoutes(req, res)) return;
   if (require('./rust-calibration-routes.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   if (await calibrationRoutesBridge(req, res)) return;
   if (require('./rust-model-manager-scan.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
