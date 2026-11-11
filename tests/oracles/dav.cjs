@@ -1,6 +1,7 @@
+// Historical synthetic-test oracle; never imported by the application.
 'use strict';
 const crypto = require('node:crypto');
-const { createRateLimiter } = require('./auth.cjs');
+const { createRateLimiter } = require('../../server/auth.cjs');
 const xml = value => String(value).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&apos;'}[c]));
 const ALLOW = 'OPTIONS, HEAD, GET, PROPFIND, PUT';
 const MAX_BODY = 512 * 1024;

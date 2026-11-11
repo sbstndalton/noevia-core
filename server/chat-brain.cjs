@@ -20,8 +20,8 @@
 //   - A new schema version is a new number; validators reject numbers they do not know.
 //
 // Generation runs when a chat goes idle, never on the request path: createBrainBuilder (one model
-// call, same engine, budget gate and fallbacks as #740) and createBrainScheduler (a per-chat idle
-// timer, one build at a time across all users). Brains are stored one JSON file per chat in the
+// call, same engine, budget gate and fallbacks as #740) and createBrainRunner (one chat's build; the
+// per-chat idle timer and the one-build-at-a-time queue are the Rust front's). Brains are stored one JSON file per chat in the
 // user's own workspace directory (chat-brains/<sha256(chatId)>.json), so a brain is only ever read
 // from the workspace of the person whose chat it is.
 const crypto = require('node:crypto');
@@ -292,46 +292,25 @@ function createBrainBuilder({ enabled, model, complete, admit, loadedModel = () 
   return { build };
 }
 
-const DEFAULT_IDLE_MS = 3 * 60 * 1000;
-const DEFAULT_RETRY_MS = 15 * 60 * 1000;
 /**
- * A per-chat idle timer: every change to a chat restarts its timer; when the chat has been quiet for
- * idleMs, its brain is built (unless the stored brain already matches the chat's updatedAt) and the
- * mirror is nudged. Builds run one at a time across all users, so the reasoner never runs twice at
- * once. A failed build keeps the previous brain and is retried once after retryMs.
+ * One chat's brain build (the work of #742). The Rust front schedules it (noevia-rs crates/chat-mirror-sched,
+ * capability rust-chat-mirror-v1): a per-chat idle timer of three minutes, one build at a time across all
+ * accounts, one retry after fifteen minutes for a transient failure, and the mirror nudge after a build. It
+ * calls `run` here over the loopback bridge (rust-chat-mirror.cjs). Builds are skipped when the stored brain
+ * already matches the chat's updatedAt.
  * @param {object} deps
  * @param {(userId:string) => boolean} deps.enabled    reasoner flag on AND the user's mirror opt-in
  * @param {(userId:string, chatId:string) => object|null} deps.chat      the chat meta from the user's own lists
  * @param {(userId:string, chatId:string) => object[]} deps.readHistory  the user's own transcript
  * @param {{ read:(userId, chatId)=>object|null, write:(userId, chatId, record)=>void, remove?:(userId, chatId)=>void }} deps.store
  * @param {{ build: Function }} deps.builder
- * @param {(userId:string, chatId:string) => void} [deps.built]  called after a new brain was stored
  * @param {(userId:string) => Set<string>} [deps.deleted]  the user's own tombstoned chat ids
  * @param {(...args: any[]) => void} [deps.log]
- * @param {number} [deps.idleMs]
- * @param {number} [deps.retryMs]
- * @param {Function} [deps.setTimer]
- * @param {Function} [deps.clearTimer]
  * @param {() => number} [deps.now]
  */
-function createBrainScheduler({ enabled, chat, readHistory, store, builder, built = () => {}, deleted = () => new Set(), log = () => {},
-  idleMs = DEFAULT_IDLE_MS, retryMs = DEFAULT_RETRY_MS, setTimer = setTimeout, clearTimer = clearTimeout, now = Date.now }) {
-  const timers = new Map(); // `${userId}\n${chatId}` -> { timer, retried }
-  let queue = Promise.resolve();
-
-  function schedule(userId, chatId, { delay = idleMs, retried = false } = {}) {
-    if (typeof userId !== 'string' || !userId || typeof chatId !== 'string' || !chatId) return;
-    const key = `${userId}\n${chatId}`;
-    const prev = timers.get(key);
-    if (prev?.timer) clearTimer(prev.timer);
-    const entry = { timer: null, retried };
-    entry.timer = setTimer(() => { entry.timer = null; timers.delete(key); queue = queue.then(() => run(userId, chatId, retried)); return queue; }, delay);
-    entry.timer?.unref?.();
-    timers.set(key, entry);
-  }
-
+function createBrainRunner({ enabled, chat, readHistory, store, builder, deleted = () => new Set(), log = () => {}, now = Date.now }) {
   /** Returns the outcome reason ('built', 'current', 'off', 'gone' or a builder fallback). */
-  async function run(userId, chatId, retried = false) {
+  async function run(userId, chatId) {
     try {
       if (enabled(userId) !== true) return 'off';
       const meta = chat(userId, chatId);
@@ -344,11 +323,7 @@ function createBrainScheduler({ enabled, chat, readHistory, store, builder, buil
       const stored = store.read(userId, chatId);
       if (stored && updatedAt && stored.sourceUpdatedAt === updatedAt) return 'current';
       const result = await builder.build({ chat: meta, history: readHistory(userId, chatId) });
-      if (!result.ok) {
-        // Only transient failures are worth one retry; a missing model or an empty chat is not.
-        if (!retried && ['deadline', 'error', 'budget', 'invalid-json', 'schema'].includes(result.reason)) schedule(userId, chatId, { delay: retryMs, retried: true });
-        return result.reason;
-      }
+      if (!result.ok) return result.reason;
       // Re-checked after the model call: switching the mirror off stops the write at once.
       if (enabled(userId) !== true) return 'off';
       // #811: so is deletion. A chat deleted (tombstoned) or gone from the user's lists while the
@@ -359,7 +334,6 @@ function createBrainScheduler({ enabled, chat, readHistory, store, builder, buil
         return 'gone';
       }
       store.write(userId, chatId, { brain: result.brain, sourceUpdatedAt: updatedAt, builtAt: now() });
-      try { built(userId, chatId); } catch { /* the mirror nudge never fails a build */ }
       return 'built';
     } catch (error) {
       log('chat-brain: build failed', error?.message || String(error));
@@ -367,7 +341,7 @@ function createBrainScheduler({ enabled, chat, readHistory, store, builder, buil
     }
   }
 
-  return { schedule, run, pending: (userId, chatId) => timers.has(`${userId}\n${chatId}`), idle: () => queue };
+  return { run };
 }
 
 function safeLog(log, entry) { try { log(entry); } catch { /* logging never changes the outcome */ } }
@@ -378,4 +352,4 @@ function deepFreeze(v) {
 
 module.exports = { BRAIN_SCHEMA, BRAIN_JSON_SCHEMA, LIMITS, MAX_CONTEXT_BRAINS, BRAIN_DIR, SYSTEM, CONTEXT_INTRO,
   validateBrain, parseBrain, renderBrainMarkdown, renderBrainContext, linkedBrainBlock, readBrain, writeBrain, removeBrain,
-  createBrainBuilder, createBrainScheduler, clipTranscript };
+  createBrainBuilder, createBrainRunner, clipTranscript };

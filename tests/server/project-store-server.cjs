@@ -23,13 +23,12 @@
 // and its chat change journal (sbstndalton/noevia#2153; noevia-rs journal.rs): each mutation above
 // takes an optional `origin` (history|import|turn|remove|other; absent/null: other; else 400,
 // nothing changed) and appends `{ seq, chatId, revision, op, origin, start, at }` to the user's
-// chat-changes.jsonl, which
+// chat-changes.jsonl. The front reads that journal in process (rust-chat-mirror-v1); this stand-in
+// only records the two nudges Node sends to the front's mirror schedule, and answers 200 {}:
 //
-//   POST /v1/changes/read { user, after? }   -> 200 { entries, oldestSeq, latestSeq, more, start }
+//   POST /v1/chat-mirror/schedule { user, chatId|null, immediate }     POST /v1/chat-mirror/touch { user }
 //
-// answers (no rotation here) when the store is started with `{ changes: true }`; otherwise that op
-// is 404, as an older front answers it, so a Node loaded against the stand-in leaves its journal
-// reader idle (the default for every test that only needs the store).
+// (the `mirror` list of startProjectStore holds them as { url, body }).
 //
 // and a chat's whole delete (sbstndalton/noevia#1071 slice 6; noevia-rs chat_delete.rs):
 //
@@ -56,7 +55,7 @@ const crypto = require('node:crypto');
 const { spawnSync } = require('node:child_process');
 
 const FILES = new Set(['projects.json', 'free-chats.json']);
-const HISTORY_OPS = new Set(['/v1/history/read', '/v1/history/write', '/v1/history/append-if-last', '/v1/history/remove-if', '/v1/changes/read', '/v1/chat/delete', '/v1/chat/move', '/v1/chat/grant-context']);
+const HISTORY_OPS = new Set(['/v1/history/read', '/v1/history/write', '/v1/history/append-if-last', '/v1/history/remove-if', '/v1/chat/delete', '/v1/chat/move', '/v1/chat/grant-context']);
 const ORIGINS = new Set(['history', 'import', 'turn', 'remove', 'other']);
 const JOURNAL = 'chat-changes.jsonl';
 const STORE_START = crypto.randomBytes(16).toString('hex');
@@ -203,13 +202,6 @@ function historyOp(url, body, dir) {
   if (url === '/v1/chat/delete') return chatDeleteOp(body, dir);
   if (url === '/v1/chat/move' || url === '/v1/chat/grant-context') return chatMoveOp(body,dir,url === '/v1/chat/move');
   const chat = typeof body.chat === 'string' ? body.chat.replace(/[^a-zA-Z0-9_-]/g, '') : '';
-  if (url === '/v1/changes/read') {
-    const after = body.after === undefined || body.after === null ? 0 : body.after;
-    if (!Number.isInteger(after) || after < 0) return [400, { error: 'after must be a non-negative integer' }];
-    const all = journalEntries(dir);
-    const newer = all.filter((e) => e.seq > after);
-    return [200, { entries: newer.slice(0, 1000), oldestSeq: all[0]?.seq ?? null, latestSeq: all.at(-1)?.seq ?? null, more: newer.length > 1000, start: STORE_START }];
-  }
   if (!chat) return [400, { error: typeof body.chat === 'string' ? 'invalid chat id' : 'user and chat required' }];
   const origin = body.origin === undefined || body.origin === null ? 'other' : body.origin;
   if (url !== '/v1/history/read' && !ORIGINS.has(origin)) return [400, { error: 'origin must be one of history, import, turn, remove, other' }];
@@ -313,7 +305,7 @@ function createMachineReply(dataDir) {
 
 }
 
-function createHandler(dataDir, token, writes = [], failures = [], { changes = false, maintenance = false, reranker = false } = {}) {
+function createHandler(dataDir, token, writes = [], failures = [], { mirror = [], maintenance = false, reranker = false } = {}) {
   const leaseAuthority = maintenance
     ? require('../../server/synthetic-lease-authority.test-helper.cjs').createAuthority({ token })
     : null;
@@ -343,8 +335,7 @@ function createHandler(dataDir, token, writes = [], failures = [], { changes = f
     req.on('data', (c) => chunks.push(c));
     req.on('end', async () => {
       try {
-        if (req.method !== 'POST' || !(['/v1/read', '/v1/write','/v1/features/context','/v1/inference-machines','/v1/storage/legacy-webdav','/v1/auto-roles/proof', ...(reranker ? ['/v1/reranker/settings'] : [])].includes(req.url) || HISTORY_OPS.has(req.url))) return send(res, 404, { error: 'not found' });
-        if (req.url === '/v1/changes/read' && !changes) return send(res, 404, { error: 'not found' });
+        if (req.method !== 'POST' || !(['/v1/read', '/v1/write','/v1/features/context','/v1/inference-machines','/v1/storage/legacy-webdav','/v1/auto-roles/proof','/v1/chat-mirror/schedule','/v1/chat-mirror/touch', ...(reranker ? ['/v1/reranker/settings'] : [])].includes(req.url) || HISTORY_OPS.has(req.url))) return send(res, 404, { error: 'not found' });
         if (req.headers['x-noevia-store-token'] !== token) return send(res, 401, { error: 'unauthorised' });
         const planned = failures.find((f) => f.url === req.url && f.times > 0);
         if (planned) { planned.times -= 1; return send(res, planned.status, planned.body); }
@@ -360,6 +351,7 @@ function createHandler(dataDir, token, writes = [], failures = [], { changes = f
           view: { enabled: false, choice: null, source: 'deployment', options: [] },
         });
         if(req.url==='/v1/auto-roles/proof')return send(res,200,{capability:'rust-auto-roles-write'});
+        if(req.url.startsWith('/v1/chat-mirror/')){mirror.push({url:req.url,body});return send(res,200,{});}
         if(req.url==='/v1/features/context')return send(res,200,contextReply(body));
         // sbstndalton/noevia#2190 round 4: the legacy WebDAV setup, saved as the front saves it (only
         // while the account has no row or a local one; noevia-rs project_store.rs legacy_webdav).
@@ -410,15 +402,16 @@ function syntheticFrontBin(dir) {
 }
 
 /** Starts the store on 127.0.0.1 (port 0 by default); resolves { port, token, server, writes, close }. */
-async function startProjectStore(dataDir, { port = 0, token = crypto.randomBytes(32).toString('hex'), changes = false, maintenance = false, reranker = false } = {}) {
+async function startProjectStore(dataDir, { port = 0, token = crypto.randomBytes(32).toString('hex'), maintenance = false, reranker = false } = {}) {
   const writes = [];
+  const mirror = [];
   const failures = [];
-  const handler = createHandler(dataDir, token, writes, failures, { changes, maintenance, reranker });
+  const handler = createHandler(dataDir, token, writes, failures, { mirror, maintenance, reranker });
   const server = http.createServer(handler);
   await new Promise((resolve, reject) => { server.once('error', reject); server.listen(port, '127.0.0.1', resolve); });
   const failNext = (status, body, { url = '/v1/write', times = 1 } = {}) => { failures.push({ status, body, url, times }); };
   const clearFailures = () => { failures.length = 0; };
-  return { port: server.address().port, token, server, writes, failNext, clearFailures, maintenance: handler.maintenance, close: () => new Promise((r) => server.close(() => r())) };
+  return { port: server.address().port, token, server, writes, mirror, failNext, clearFailures, maintenance: handler.maintenance, close: () => new Promise((r) => server.close(() => r())) };
 }
 
 /** A free loopback port, found synchronously (a child binds port 0 and reports it). */

@@ -1,6 +1,6 @@
 'use strict';
 const test=require('node:test'),assert=require('node:assert/strict'),http=require('node:http'),crypto=require('node:crypto');
-const {configuration,createDavSettings}=require('./dav-settings.cjs'),{createDavHandler,properties}=require('./dav.cjs');
+const {configuration,createDavSettings}=require('../tests/oracles/dav-settings.cjs'),{createDavHandler,properties}=require('../tests/oracles/dav.cjs');
 const Database=require('better-sqlite3');
 // Settings -> Sharing writes the opt-in in the Rust front (#1071); these tests seed the row directly.
 const optIn=(db,id,scope)=>db.prepare('INSERT INTO dav_settings VALUES(?,?,?,?) ON CONFLICT(user_id) DO UPDATE SET scope=excluded.scope').run(id,scope,null,1);
