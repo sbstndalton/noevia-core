@@ -2,7 +2,7 @@
 const { binding: permissionBinding } = require('../../tests/server/chat-grant-fixture.cjs');
 // The chat-list routes over a fake store: the workspace view with its sanitized chats and the
 // hourly sweep, a free chat's delete, and the transcript's revision check. The merge and
-// tombstones are chat-lists.test.cjs; the sweep's rules are chat-retention.test.cjs; the
+// tombstones are chat-lists.test.cjs; the sweep's rules are native Rust (noevia-rs retention.rs); the
 // same routes end to end are chat-lists-routes.test.cjs and chat-history-routes.test.cjs.
 const test = require('node:test');
 const assert = require('node:assert/strict');

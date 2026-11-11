@@ -8,7 +8,6 @@ const { estimateFootprint, suggest } = require('./llamacpp-autoconfig.cjs');
 const { kvCacheBytes } = require('../tests/reference/llamacpp-autoconfig-js.cjs');
 const { createPresetStore } = require('./llamacpp-presets.cjs');
 const { createModelManager } = require('./model-manager.cjs');
-const { createInferenceBudgetWatch, gpuMemoryFiles, readGpuMemory, engineReaderFromModelLoader, isEngineContainer } = require('./inference-budget-watch.cjs');
 const { rerankTarget } = require('./rerank-target.cjs');
 const { keepAlongside } = require('./llamacpp-manager.cjs');
 const { fakeGate } = require('./fixtures/fake-inference-gate.cjs');
@@ -251,129 +250,6 @@ test('autoconfig sizes against the inference budget, lowered only by an explicit
   assert.equal(make({ budgetGib: 14 }, 0).sizingBudgetGib(), 14, 'no inference budget: the deployment figure as before');
 });
 
-// ── Runtime safety net ──────────────────────────────────────────────────────
-
-function watchFixture({ used, env = {}, loaded = ['chat'], budget = 12 }) {
-  const log = [], unloaded = [];
-  let t = 0;
-  const w = createInferenceBudgetWatch({ env, budgetGib: () => budget, readGpu: async () => used.gpu, readEngine: async () => used.engine,
-    listLoaded: async () => loaded, unload: async m => { unloaded.push(m); return { ok: true }; }, log: l => log.push(l), now: () => t,
-    setIntervalFn: () => ({ unref() {} }), clearIntervalFn: () => {} });
-  return { w, log, unloaded, advance: ms => { t += ms; } };
-}
-
-test('usage above the budget by more than 10% for two readings unloads the model and logs numbers only', async () => {
-  const used = { gpu: { gttGib: 12, vramGib: 0.5 }, engine: { containerGib: 1.5 } }; // 14 GiB > 13.2
-  const { w, log, unloaded } = watchFixture({ used });
-  assert.equal((await w.tick()).state, 'over'); assert.deepEqual(unloaded, []);
-  const r = await w.tick();
-  assert.equal(r.state, 'unloaded'); assert.deepEqual(unloaded, ['chat']);
-  assert.equal(log.length, 1);
-  const event = JSON.parse(log[0].replace('[inference-budget] ', ''));
-  assert.deepEqual(Object.keys(event).sort(), ['baselineGib', 'budgetGib', 'containerGib', 'event', 'failed', 'gttGib', 'limitGib', 'models', 'usedGib', 'vramGib'].sort());
-  assert.equal(event.event, 'unload'); assert.equal(event.usedGib, 14); assert.equal(event.limitGib, 13.2);
-});
-
-test('usage within the 10% overshoot, or a single spike, leaves the model alone', async () => {
-  const used = { gpu: { gttGib: 12.6, vramGib: 0.5 }, engine: { containerGib: 0 } }; // 13.1 <= 13.2
-  const a = watchFixture({ used });
-  for (let i = 0; i < 5; i++) assert.equal((await a.w.tick()).state, 'ok');
-  assert.deepEqual(a.unloaded, []);
-  const spike = { gpu: { gttGib: 20, vramGib: 0 }, engine: null };
-  const b = watchFixture({ used: spike });
-  await b.w.tick(); spike.gpu.gttGib = 4; assert.equal((await b.w.tick()).state, 'ok'); spike.gpu.gttGib = 20; await b.w.tick();
-  assert.deepEqual(b.unloaded, [], 'strikes reset after a reading under the limit');
-});
-
-test('after an unload the watchdog waits out its cooldown before acting again', async () => {
-  const used = { gpu: { gttGib: 20, vramGib: 0 }, engine: null };
-  const f = watchFixture({ used });
-  await f.w.tick(); await f.w.tick(); assert.equal(f.unloaded.length, 1);
-  await f.w.tick(); await f.w.tick(); assert.equal(f.unloaded.length, 1);
-  f.advance(61000); await f.w.tick(); assert.equal(f.unloaded.length, 2);
-});
-
-test('the overshoot and interval are configurable and the watchdog can be turned off', async () => {
-  const used = { gpu: { gttGib: 12.5, vramGib: 0 }, engine: null };
-  const strict = watchFixture({ used, env: { INFERENCE_BUDGET_OVERSHOOT_PCT: '0' } });
-  await strict.w.tick(); await strict.w.tick(); assert.deepEqual(strict.unloaded, ['chat']);
-  assert.equal(watchFixture({ used, env: { INFERENCE_BUDGET_WATCH_INTERVAL_MS: '30000' } }).w.intervalMs, 30000);
-  const offWatch = watchFixture({ used, env: { INFERENCE_BUDGET_WATCH: 'off' } }).w;
-  assert.equal(offWatch.enabled, false); assert.equal(offWatch.start(), false);
-  assert.equal(watchFixture({ used }).w.start(), true, 'on by default');
-});
-
-test('with nothing measurable the watchdog does nothing', async () => {
-  const f = watchFixture({ used: { gpu: null, engine: null } });
-  assert.equal((await f.w.tick()).state, 'unavailable'); assert.deepEqual(f.unloaded, []);
-});
-
-test('GPU memory comes from the configured sysfs counters, or every DRM card when unset', () => {
-  const files = { '/sys/class/drm/card1/device/mem_info_gtt_used': String(12 * GIB), '/sys/class/drm/card1/device/mem_info_vram_used': String(GIB / 2) };
-  const exists = f => Object.hasOwn(files, f);
-  const auto = gpuMemoryFiles({}, { readdir: () => ['card0', 'card1', 'card1-DP-1', 'renderD129'], exists });
-  assert.deepEqual(auto, { gtt: ['/sys/class/drm/card1/device/mem_info_gtt_used'], vram: ['/sys/class/drm/card1/device/mem_info_vram_used'] });
-  assert.deepEqual(readGpuMemory(auto, f => files[f]), { gttGib: 12, vramGib: 0.5 });
-  const pinned = gpuMemoryFiles({ INFERENCE_GTT_USED_PATH: '/host-sys/card7/mem_info_gtt_used' }, { readdir: () => { throw Error('unused'); }, exists: () => false });
-  assert.deepEqual(pinned, { gtt: ['/host-sys/card7/mem_info_gtt_used'], vram: [] });
-  assert.equal(readGpuMemory(pinned, () => { throw Error('EACCES'); }), null);
-});
-
-test('engine memory counts only the main engine container, as anonymous memory', async () => {
-  // embed and rerank share the engine's image, so the model manager lists them too.
-  const backends = [
-    { name: 'cowork-llama-1', stats: { ok: true, container: { mem_used_gb: 7.5, mem_anon_gb: 3.5 }, gpu: { shared_used_gb: 9, vram_used_gb: 0.4 } } },
-    { name: 'cowork-embed-1', stats: { ok: true, container: { mem_used_gb: 0.9, mem_anon_gb: 0.8 }, gpu: null } },
-    { name: 'cowork-rerank-1', stats: { ok: true, container: { mem_used_gb: 1.2, mem_anon_gb: 1.1 }, gpu: null } },
-    { name: 'cowork-llama-2', stats: { ok: false } },
-  ];
-  const fetchJson = async url => { assert.match(url, /\/api\/v1\/backends$/); return { ok: true, status: 200, body: { backends } }; };
-  const env = { MODEL_LOADER_URL: 'http://model-loader:8090' };
-  assert.deepEqual(await engineReaderFromModelLoader({ env, fetchJson })(), { containerGib: 3.5, gttGib: 9, vramGib: 0.4 }, 'anon, not usage with page cache');
-  assert.deepEqual(await engineReaderFromModelLoader({ env: { ...env, INFERENCE_ENGINE_CONTAINER: 'cowork-embed-1' }, fetchJson })(), { containerGib: 0.8, gttGib: 0, vramGib: 0 }, 'configurable by name');
-  // An older model manager without mem_anon_gb: usage less the page cache.
-  backends[0].stats.container = { mem_used_gb: 4.2 };
-  assert.equal((await engineReaderFromModelLoader({ env, fetchJson })()).containerGib, 4.2);
-  assert.equal(await engineReaderFromModelLoader({ env: {}, fetchJson })(), null);
-  assert.equal(isEngineContainer('llama'), true); assert.equal(isEngineContainer('cowork_llama_1'), true);
-  assert.equal(isEngineContainer('cowork-embed-1'), false); assert.equal(isEngineContainer('llama-rerank'), false);
-});
-
-test('an idle GPU baseline, sampled with no model loaded, is not charged to inference', async () => {
-  const used = { gpu: { gttGib: 1.5, vramGib: 0.5 }, engine: { containerGib: 0 } };
-  let loaded = [];
-  const unloaded = [];
-  const w = createInferenceBudgetWatch({ env: {}, budgetGib: () => 12, readGpu: async () => used.gpu, readEngine: async () => used.engine,
-    listLoaded: async () => loaded, unload: async m => { unloaded.push(m); return { ok: true }; }, log: () => {}, now: () => 0 });
-  assert.equal((await w.tick()).baselineGib, 2, 'startup with nothing loaded');
-  loaded = ['chat']; used.gpu.gttGib = 14; // 14.5 GiB on the device, 12.5 GiB of it the model
-  const r = await w.tick();
-  assert.equal(r.state, 'ok'); assert.equal(r.usedGib, 12.5, '12.5 <= 13.2 once the 2 GiB baseline is taken off');
-  used.gpu.gttGib = 15; await w.tick(); assert.equal((await w.tick()).state, 'unloaded');
-  assert.deepEqual(unloaded, ['chat']);
-});
-
-test('without an idle reading the baseline is zero (a model was loaded at startup)', async () => {
-  const w = createInferenceBudgetWatch({ env: {}, budgetGib: () => 12, readGpu: async () => ({ gttGib: 13, vramGib: 0.5 }), readEngine: async () => null,
-    listLoaded: async () => ['chat'], unload: async () => ({ ok: true }), log: () => {}, now: () => 0 });
-  const r = await w.tick();
-  assert.equal(r.baselineGib, 0); assert.equal(r.usedGib, 13.5); assert.equal(r.state, 'over');
-});
-
-test('nothing loaded means nothing to unload, whatever the device reads', async () => {
-  const f = watchFixture({ used: { gpu: { gttGib: 30, vramGib: 0 }, engine: null }, loaded: [] });
-  await f.w.tick(); await f.w.tick(); await f.w.tick();
-  assert.deepEqual(f.unloaded, []);
-});
-
-test('the watchdog hands every model it unloaded to the quarantine with the budget', async () => {
-  const held = [];
-  const w = createInferenceBudgetWatch({ env: {}, budgetGib: () => 12, readGpu: async () => ({ gttGib: 20, vramGib: 0 }), readEngine: async () => null,
-    listLoaded: async () => ['chat'], unload: async () => ({ ok: true }), onUnloaded: (m, b) => held.push([m, b]), log: () => {}, now: () => 0 });
-  await w.tick(); await w.tick();
-  assert.deepEqual(held, [['chat', 12]]);
-});
-
 // ── Reranker routing ─────────────────────────────────────────────────────────
 
 test('the RAG reranker never runs on the shared engine unless the operator allows it', () => {
@@ -557,41 +433,6 @@ test('the embed parity check samples many strings and requires cosine and top-5 
   assert.equal(ranked.ok, false); assert.equal(ranked.similarity >= 0.997, true);
   await assert.rejects(check({ ...args, fetchImpl: async () => ({ ok: false, status: 404 }) }), /HTTP 404/);
   await assert.rejects(check({ ...args, fetchImpl: async () => ({ ok: true, json: async () => ({ data: [] }) }) }), /0 embeddings for/);
-});
-
-test('#874 a failed model listing is unknown, not idle: no baseline from it, and the tick is skipped', async () => {
-  const { loadedFromListing } = require('./inference-budget-watch.cjs');
-  assert.equal(loadedFromListing({ ok: false, status: 502, body: { error: 'down' } }), null);
-  assert.equal(loadedFromListing({ ok: true, status: 200, body: {} }), null);
-  assert.equal(loadedFromListing(null), null);
-  assert.deepEqual(loadedFromListing({ ok: true, body: { data: [{ id: 'a', status: { value: 'loaded' } }, { id: 'b', status: { value: 'unloaded' } }, { id: 'c', status: { value: 'loading' } }] } }), ['a', 'c']);
-  // A 13 GiB model is resident; the engine answers /models with an error for one reading.
-  const used = { gpu: { gttGib: 13, vramGib: 0.5 }, engine: null };
-  let listing = { ok: false, status: 503, body: {} };
-  const unloaded = [];
-  const w = createInferenceBudgetWatch({ env: {}, budgetGib: () => 12, readGpu: async () => used.gpu, readEngine: async () => used.engine,
-    listLoaded: async () => loadedFromListing(listing), unload: async m => { unloaded.push(m); return { ok: true }; }, log: () => {}, now: () => 0 });
-  assert.equal((await w.tick()).state, 'models-unknown');
-  listing = { ok: true, body: { data: [{ id: 'chat', status: { value: 'loaded' } }] } };
-  const r = await w.tick();
-  assert.equal(r.baselineGib, 0, 'the loaded model was not taken as the idle baseline');
-  assert.equal(r.state, 'over'); assert.equal(r.usedGib, 13.5);
-  assert.equal((await w.tick()).state, 'unloaded'); assert.deepEqual(unloaded, ['chat']);
-  // A thrown listing is unknown too.
-  const t = createInferenceBudgetWatch({ env: {}, budgetGib: () => 12, readGpu: async () => used.gpu, listLoaded: async () => { throw Error('ECONNREFUSED'); }, unload: async () => ({ ok: true }), log: () => {}, now: () => 0 });
-  assert.equal((await t.tick()).state, 'models-unknown');
-});
-
-test('#873 no idle baseline is taken while the maintenance gate is held (a llama-bench sweep owns the GPU)', async () => {
-  let held = true;
-  const used = { gpu: { gttGib: 11, vramGib: 0 }, engine: null };
-  const w = createInferenceBudgetWatch({ env: {}, budgetGib: () => 12, readGpu: async () => used.gpu, readEngine: async () => null,
-    listLoaded: async () => [], unload: async () => ({ ok: true }), log: () => {}, now: () => 0, baselineAllowed: () => !held });
-  assert.equal((await w.tick()).baselineGib, 0, 'the sweep\'s 11 GiB is not the idle baseline');
-  held = false; used.gpu.gttGib = 1;
-  assert.equal((await w.tick()).baselineGib, 1, 'a real idle reading after the sweep is');
-  const throwing = createInferenceBudgetWatch({ env: {}, budgetGib: () => 12, readGpu: async () => used.gpu, listLoaded: async () => [], unload: async () => ({ ok: true }), log: () => {}, now: () => 0, baselineAllowed: () => { throw Error('x'); } });
-  assert.equal((await throwing.tick()).baselineGib, 0);
 });
 
 // noevia#1132: an infinite or non-integer context never passes the load gate or a save.

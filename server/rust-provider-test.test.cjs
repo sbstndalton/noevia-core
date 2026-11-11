@@ -30,8 +30,9 @@ test('index.cjs refuses the probe before authentication; the Node probe is gone'
   const index = fs.readFileSync(path.join(__dirname, 'index.cjs'), 'utf8');
   const at = index.indexOf("require('./rust-provider-test.cjs').refuseOwned(req, res, { parseRequestUrl, json })");
   assert.ok(at > 0 && at < index.indexOf('const preAuth = requestAuth.authenticate(req);'));
-  const routes = fs.readFileSync(path.join(__dirname, 'routes', 'providers.cjs'), 'utf8');
-  assert.doesNotMatch(routes, /probeKey|valid baseUrl required/);
+  // The provider routes mount is retired, so no Node probe remains anywhere on the path.
+  assert.equal(fs.existsSync(path.join(__dirname, 'routes', 'providers.cjs')), false);
+  assert.doesNotMatch(index, /routes\/providers\.cjs|probeKey|valid baseUrl required/);
 });
 
 test('the stored key format the front opens: enc:v1, unbound, as workspace.cjs seals provider rows', (t) => {
