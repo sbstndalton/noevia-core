@@ -1,8 +1,9 @@
 'use strict';
-// Synthetic oracle. Run against the pre-port Core tree with Node 22.
-const backfill = require('../../tests/oracles/media-u2/document-backfill.cjs');
-const figures = require('../../tests/oracles/media-u2/figure-sweep.cjs');
-const rag = require('../rag.cjs');
+// Synthetic oracle. Run against the pre-port Core tree with Node 22; its stdout is fixtures/media-u2-node.json.
+// It lives outside server/ so no production module or image ships an oracle load (oracle-isolation.test.cjs).
+const backfill = require('./document-backfill.cjs');
+const figures = require('./figure-sweep.cjs');
+const rag = require('../../../server/rag.cjs');
 const hash = 'a'.repeat(64);
 const base = { name: 'sample.pdf', content: 'head', document: { version: hash, byteHash: hash, availableVersion: hash, extractor: 'old', indexing: 'ready', state: 'ready' } };
 const cases = [
@@ -30,7 +31,7 @@ const windows = [
   ['all', head, {}], ['resume', head, { fromPage: 3 }], ['limited', head, { textLimit: 30 }],
   ['one-window', head, { maxChars: 1 }], ['mismatch', 'unrelated', {}], ['empty-head', '', {}],
 ].map(([name, content, options]) => ({ name, content, record: pages, options, result: backfill.tailWindow(content, pages, { chunkText: rag.chunkText, ...options }) }));
-const source = require('node:fs').readFileSync(require.resolve('../rag.cjs'), 'utf8');
+const source = require('node:fs').readFileSync(require.resolve('../../../server/rag.cjs'), 'utf8');
 const clampSource = source.match(/^function clampInt[^\n]+/m)?.[0];
 if (!clampSource) throw new Error('Node clampInt oracle unavailable');
 const clamp = require('node:vm').runInNewContext(`(${clampSource})`, {}, { timeout: 2000 });
