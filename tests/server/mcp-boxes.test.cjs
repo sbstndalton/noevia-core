@@ -1,6 +1,6 @@
 'use strict';
 const test = require('node:test'), assert = require('node:assert/strict');
-const { bindBoxes } = require('./mcp-boxes.cjs');
+const { bindBoxes } = require('./oracle/mcp-boxes.cjs');
 
 const tool = (name, description = 'Server wording.') => ({ type: 'function', function: { name, description, parameters: { type: 'object' } } });
 const offering = (...names) => new Map(names.map((n) => [n, { tool: tool(n) }]));

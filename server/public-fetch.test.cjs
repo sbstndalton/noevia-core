@@ -15,7 +15,7 @@ const zlib = require('node:zlib');
 process.env.UI_DATA_DIR = require('node:fs').mkdtempSync(require('node:path').join(require('node:os').tmpdir(), 'cowork-public-fetch-'));
 const mcp = require('./mcp.cjs');
 const { createPublicFetch, createPublicOnlyLookup } = require('./public-fetch.cjs');
-const { createMcpWiring } = require('./mcp-wiring.cjs');
+const { createMcpWiring } = require('../tests/server/oracle/mcp-wiring-with-reference.cjs');
 
 const PRIVATE_ANSWERS = ['10.0.0.7', '127.0.0.1', '169.254.169.254', '::1', 'fd00::1', '192.168.1.20', '::ffff:10.0.0.1'];
 

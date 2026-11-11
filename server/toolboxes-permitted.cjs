@@ -6,7 +6,7 @@
 // The per-turn view of which TOOLS an account could use (GET /api/toolboxes/permitted, with every box's state and
 // every tool's permission) is the Rust front's since sbstndalton/noevia#2202 round 2 (rust-toolboxes-permitted.cjs):
 // the front runs the same crate over what it owns at the time of the request, and over the discovery snapshot this
-// process publishes (mcp-discovery-snapshot.cjs). What stays here is the chat loop's two questions - which box ids
+// process publishes (noevia-rs mcp_discovery.rs). What stays here is the chat loop's two questions - which box ids
 // a project selects - asked of the crate. A fault, a refusal or a reply of another shape carries no box id, as
 // before. Warnings are logged once, and again at the 10th, 100th, 1000th and so on, per event and reason, and
 // carry no input.

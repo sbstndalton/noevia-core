@@ -9,7 +9,7 @@
 //
 // GET /api/connectors and PUT /api/connectors/nextcloud/policy followed in sbstndalton/noevia#2202 round 2
 // (rust-connectors.cjs): the Nextcloud half lists the toolbox tools the live MCP servers offer and whether each
-// writes, which this process publishes for the front (mcp-discovery-snapshot.cjs). The store calls it used to make
+// writes, which this process publishes for the front (noevia-rs mcp_discovery.rs). The store calls it used to make
 // for that page are gone from the client and from the front.
 //
 // Node's chat tools hold no refresh token: they ask the broker for a short-lived access token over the
