@@ -1085,12 +1085,7 @@ const chatRoutes = require('./routes/chat.cjs').createChatRoutes({
 // through storage-login-proofs.json, re-read when it changes.
 // #2191 round 8: the hold is UI_DATA_DIR/storage-latch.db, shared with the front's project source sync.
 const storageLatch = require('./storage-latch.cjs').createStorageLatch({ file: require('node:path').join(DATA_DIR, 'storage-latch.db'), proofOf: require('./rust-storage-integrations.cjs').createProofReader(DATA_DIR) });
-// What is left of the provider registry's mount (routes/providers.cjs): the registry itself is the
-// Rust front's (rust-providers.cjs), so this answers only the other methods on the Sign in with
-// ChatGPT paths (chatgptOAuth, built beside mcpOAuth above) and refuses a bypass.
-const providerRoutes = require('./routes/providers.cjs').createProviderRoutes({
-  json, chatgptOAuth, chatgptEnabled: () => features.enabled('chatgptOAuth'),
-});
+// Provider HTTP responses, including residual broker methods, are owned by the front.
 // Statistics, the auto-router roles, the model manager proxy and /api/models/* (routes/models.cjs).
 const modelAssignmentsFacts = require('./rust-model-assignments-facts.cjs').createModelAssignmentsFacts({
   secret: FRONT_SECRET, json, readJson, env: process.env, modelsInstalled: modelService.modelsInstalled, decisionSettings, rerankSettings,
@@ -1369,6 +1364,7 @@ async function handleRequestInner(req, res) {
   if (require('./rust-chatgpt-oauth.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   if (require('./rust-provider-models.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   if (require('./rust-providers.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
+  if (require('./rust-residual-fallbacks.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   if (require('./rust-mcp-credentials.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   // And the admin MCP directory, the permitted-tools view and the connectors list (#2202 round 2).
   if (require('./rust-mcp-directory.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
@@ -1466,7 +1462,6 @@ async function handleRequestScoped(req, res) {
 
     if (await chatListRoutes(req, res, { path: p, authn, url })) return;
 
-    if (await providerRoutes(req, res, { path: p, authn, url })) return;
 
     if (authn && await usageRoutes(req, res, { path: p, authn })) return;
     if (await reasoningSettingsRoutes(req, res, { path: p, authn, url })) return;

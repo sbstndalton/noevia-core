@@ -89,7 +89,12 @@ test('a member who has not finished onboarding gets no administrator or global m
   const calibration = await request('/api/models/calibration', { method: 'POST', headers: headers(member), body: '{}' });
   assert.equal(calibration.status, 503);
   assert.equal(JSON.parse(calibration.text).code, 'RUST_CALIBRATION_OWNED');
-  for (const url of ['/api/models/download', '/api/model-manager/sections', '/api/model-manager/backends/cowork-llama-1/logs']) {
+  // An unknown model path is a residual the Rust front answers (its 403 for a member is asserted in
+  // noevia-rs tests/residual_grid.rs): Node refuses it before authentication, whoever asks.
+  const download = await request('/api/models/download', { method: 'POST', headers: headers(member), body: '{}' });
+  assert.equal(download.status, 503, '/api/models/download');
+  assert.equal(JSON.parse(download.text).code, 'RUST_RESIDUAL_FALLBACKS_OWNED');
+  for (const url of ['/api/model-manager/sections', '/api/model-manager/backends/cowork-llama-1/logs']) {
     const method = url.endsWith('/logs') ? 'GET' : 'POST';
     assert.equal((await request(url, { method, headers: headers(member), body: method === 'POST' ? '{}' : '' })).status, 403, url);
   }
