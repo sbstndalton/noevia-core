@@ -28,7 +28,7 @@ const TOOLS = path.join(__dirname, '..', 'tools');
 
 test('the oracle modules exist', { skip: !fs.existsSync(ORACLE) && 'no tests/server/oracle here' }, () => {
   const names = fs.readdirSync(ORACLE).filter((n) => n.endsWith('.cjs')).sort();
-  assert.deepEqual(names, ['auth-tokens.cjs', 'chat-context.cjs', 'chat-framing-preferences.cjs', 'code-review-verdict.cjs', 'dav-listing.cjs', 'decision.cjs', 'mcp-servers.cjs', 'mcp.cjs', 'prompt-framing.cjs', 'provenance-policy.cjs', 'public-fetch.cjs', 's3-listing.cjs', 's3-sign.cjs', 'secret-envelope.cjs', 'ssrf.cjs', 'storage-path.cjs', 'task-packet.cjs', 'tool-exchange.cjs', 'tool-policy.cjs', 'upload-sniff.cjs']);
+  assert.deepEqual(names, ['auth-tokens.cjs', 'chat-context.cjs', 'chat-framing-preferences.cjs', 'code-review-verdict.cjs', 'dav-listing.cjs', 'decision.cjs', 'mcp-boxes.cjs', 'mcp-discovery.cjs', 'mcp-servers.cjs', 'mcp-wiring-with-reference.cjs', 'mcp.cjs', 'prompt-framing.cjs', 'provenance-policy.cjs', 'public-fetch.cjs', 's3-listing.cjs', 's3-sign.cjs', 'secret-envelope.cjs', 'ssrf.cjs', 'storage-path.cjs', 'task-packet.cjs', 'tool-exchange.cjs', 'tool-policy.cjs', 'upload-sniff.cjs']);
 });
 
 // The shipped web image has no tools/ (like the differential tests' "no generator here").

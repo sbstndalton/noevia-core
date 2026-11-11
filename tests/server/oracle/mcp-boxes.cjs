@@ -6,7 +6,7 @@
 // tools from its own server.** Curation is by explicit tool name, and a second server — rogue,
 // or merely careless — must not be able to slip a tool into a box the user trusts by offering
 // the same name.
-const { hintTool } = require('./tool-hints.cjs');
+const { hintTool } = require('../../../server/tool-hints.cjs');
 
 /**
  * @param {{manifest: object[], perServer: Map<string, Map<string, {tool: object}>>,

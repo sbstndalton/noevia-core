@@ -168,6 +168,11 @@ function createToolboxes({
     ];
   }
 
+  /** The built-in boxes this deployment offers (what the front adds the MCP boxes to for the picker and the permitted view). */
+  function builtinToolboxes() {
+    return TOOLBOXES.filter((b) => CONNECTOR_BOXES.has(b.id) || offered(b.id));
+  }
+
   // A COUNT cap alone is the wrong unit, which only became clear once real MCP
   // tools arrived. Measured against the reference server: nc_calendar_create_event
   // is ~2,739 calibrated tokens while nc_notes_search_notes is 449. "12 tools"
@@ -433,7 +438,7 @@ function createToolboxes({
   }
 
   return {
-    TOOLBOXES, CONNECTOR_BOXES, DEFAULT_TOOLBOXES, connectedBoxes, allToolboxes,
+    TOOLBOXES, CONNECTOR_BOXES, DEFAULT_TOOLBOXES, connectedBoxes, allToolboxes, builtinToolboxes,
     toolTokenBudgetFor, resolveTools, readOnlyToolNames, isWriteTool, sanitizeToolboxes,
     executeToolCall,
   };
