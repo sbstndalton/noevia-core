@@ -895,14 +895,17 @@ const chatVaultMirror = vaultMirrorLib.createChatVaultMirror({
   index: { read: (userId) => vaultMirrorLib.readIndex(workspaceStore.get(userId).dir), write: (userId, state) => vaultMirrorLib.writeIndex(workspaceStore.get(userId).dir, state) },
   log: (...args) => console.warn(...args),
 });
-projectsChangedElsewhere = (userId) => chatVaultMirror.schedule(userId, null);
+// rust-chat-mirror-v1: the Rust front decides when the mirror and the brains run (it tails the change journal, debounces,
+// retries); this process does their work (rust-chat-mirror.cjs) and tells the front what only it sees.
+const chatMirrorClient = require('./rust-chat-mirror.cjs').createScheduleClient({ store: PROJECT_STORE });
+projectsChangedElsewhere = (userId) => chatMirrorClient.schedule(userId, null);
 // #742: each mirrored chat gets a small "brain" when it goes idle, built by the reasoner role (same
 // engine and budget gate as #740; skipped without a reasoner model). Needs framingReasoner +
 // chatFraming AND the user's mirror opt-in. Stored per chat in the user's own workspace.
 const brainStore = { read: (userId, chatId) => chatBrainLib.readBrain(workspaceStore.get(userId).dir, chatId),
   write: (userId, chatId, record) => chatBrainLib.writeBrain(workspaceStore.get(userId).dir, chatId, record),
   remove: (userId, chatId) => chatBrainLib.removeBrain(workspaceStore.get(userId).dir, chatId) };
-const chatBrains = chatBrainLib.createBrainScheduler({
+const chatBrains = chatBrainLib.createBrainRunner({
   enabled: (userId) => features.enabled('framingReasoner') && vaultMirrorAvailable(userId) && vaultMirrorLib.readPreferences(workspaceStore.get(userId).dir).enabled,
   chat: (userId, chatId) => diaryAsUser(userId, () => [...Array.from(FREE_CHATS), ...PROJECTS.filter((proj) => !diaryExtras.internalProject(proj)).flatMap((proj) => proj.chats || [])].find((c) => c && c.id === chatId) || null),
   readHistory: (userId, chatId) => diaryAsUser(userId, () => readHistory(chatId)),
@@ -917,22 +920,11 @@ const chatBrains = chatBrainLib.createBrainScheduler({
     loadedModel: () => lastLoadedModel(),
     log: (entry) => recordDecision('chat-brain', entry),
   }),
-  built: (userId, chatId) => chatVaultMirror.schedule(userId, chatId),
   log: (...args) => console.warn(...args),
 });
-// #2153: transcripts are written by the Rust store alone; its per-user change journal tells Node
-// which chats changed, including history saves Node never sees, so the mirror and brain follow.
-const changeJournal = require('./chat-change-journal.cjs').createChangeJournalReader({
-  read: (userId, after) => PROJECT_STORE.changesRead(userId, after),
-  onChange: require('./chat-change-journal.cjs').scheduleMirrorAndBrain({ chatVaultMirror, chatBrains }),
-  onRescan: (userId) => chatVaultMirror.schedule(userId),
-  stamp: (userId) => require('./chat-change-journal.cjs').fileStamp(DATA_DIR, userId),
-  // Chat port S3: the users the Rust front saw, so one who only uses its routes is still read.
-  activity: require('./chat-activity.cjs').createActivitySource({ dataDir: DATA_DIR }),
-});
-afterNativeReady(() => changeJournal.start());
-// #2190: the Rust front owns the mirror preferences; a save that turns the mirror on nudges it here.
-afterNativeReady(() => require('./rust-vault-mirror-preferences.cjs').startNudges({ dataDir: DATA_DIR, schedule: chatVaultMirror.schedule }));
+// #2153: transcripts are written by the Rust store alone; the front tails its per-user change journal and runs
+// the mirror and brain schedules (rust-chat-mirror-v1). It calls these two executors on loopback.
+const chatMirrorBridge = require('./rust-chat-mirror.cjs').createExecutorBridge({ secret: FRONT_SECRET, json, readJson, mirror: chatVaultMirror, brains: chatBrains });
 // #682: a decision experiment switched on that cannot run (no service, or one without `choice`)
 // says so once at startup; Settings shows the same reason, and the chat path skips it silently.
 for (const [key, id] of [['COWORK_DECISION_MODEL', process.env.COWORK_DECISION_MODEL], ['COWORK_SENSITIVITY_DECISION_MODEL', process.env.COWORK_SENSITIVITY_DECISION_MODEL]]) {
@@ -1275,6 +1267,7 @@ async function handleRequestInner(req, res) {
   // And the framing suggestion's POST (chat port S4), with the front's loopback call for the lists and the decision.
   if (require('./rust-chat-framing-suggest.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   if (await chatFramingSuggestBridge(req, res)) return;
+  if (await chatMirrorBridge(req, res)) return;
   if (require('./routes/features.cjs').refuseOwnedFeatures(req, res, { parseRequestUrl, json })) return;
   // The Diary routes that are only a proxy and a policy are the Rust front's (#2185).
   if (require('./rust-diary.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
@@ -1415,9 +1408,9 @@ async function handleRequestScoped(req, res) {
     if (authn && await chatFramingRoutes(req, res, { path: p, authn })) return;
     // #741: a successful change to the user's chats nudges their mirror (debounced; a no-op unless opted in).
     const mirrorNudge = authn ? vaultMirrorLib.mirrorTrigger(req.method, p) : null;
-    // #2153: a history save is the Rust front's; the change journal schedules it (touch: read this user).
-    if (authn) changeJournal.touch(authn.user.id);
-    if (mirrorNudge && typeof res.once === 'function') res.once('finish', () => { if (res.statusCode >= 200 && res.statusCode < 300) { chatVaultMirror.schedule(authn.user.id, mirrorNudge.chatId); if (mirrorNudge.chatId) chatBrains.schedule(authn.user.id, mirrorNudge.chatId); } });
+    // #2153: a history save is the Rust front's; its journal consumer schedules it (touch: this user is active).
+    if (authn) chatMirrorClient.touch(authn.user.id);
+    if (mirrorNudge && typeof res.once === 'function') res.once('finish', () => { if (res.statusCode >= 200 && res.statusCode < 300) { chatMirrorClient.schedule(authn.user.id, mirrorNudge.chatId); } });
     if (authn && await exportRoutes(req, res, { path: p, authn })) return;
     if (authn && await importRoutes(req, res, { path: p, authn })) return;
     if (authn && await accountRoutes(req, res, { path: p, authn })) return;
