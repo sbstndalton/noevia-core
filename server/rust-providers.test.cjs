@@ -32,23 +32,6 @@ test('the registry\'s methods are refused before the body is read; everything el
   ]) assert.equal(refuse(method, url), null, `${method} ${url}`);
 });
 
-test('a request that reaches the routes mount is refused for every registry method, and the other methods keep their Node answers', async () => {
-  const { createProviderRoutes } = require('./routes/providers.cjs');
-  const sent = [];
-  const mount = (chatgptOn) => createProviderRoutes({ json: (_res, status, body) => { sent.push({ status, body }); }, chatgptOAuth: chatgptOn ? {} : null, chatgptEnabled: () => chatgptOn });
-  const ask = async (routes, method, p, authn = { user: { id: 'u', role: 'admin' } }) => { sent.length = 0; const handled = await routes({ method }, {}, { path: p, authn }); return { handled, sent: sent.slice() }; };
-  const off = mount(false), on = mount(true);
-  for (const [method, p] of [['GET', '/api/providers'], ['POST', '/api/providers'], ['PUT', '/api/providers/prov-1'], ['DELETE', '/api/providers/prov-1'], ['DELETE', '/api/providers/chatgpt'], ['PUT', '/api/providers/test'], ['DELETE', '/api/providers/test']]) {
-    for (const routes of [off, on]) assert.deepEqual(await ask(routes, method, p), { handled: true, sent: [{ status: 503, body: owned.ROUTE_REFUSAL }] }, `${method} ${p}`);
-  }
-  // What stays Node's on the sign-in paths: 404 while the feature is off, 401 signed out, else 405.
-  assert.deepEqual((await ask(off, 'PUT', '/api/providers/chatgpt')).sent, [{ status: 404, body: { error: 'Sign in with ChatGPT is turned off on this server.' } }]);
-  assert.deepEqual((await ask(on, 'PUT', '/api/providers/chatgpt', {})).sent, [{ status: 401, body: { error: 'Sign in to noevia first.' } }]);
-  assert.deepEqual((await ask(on, 'PUT', '/api/providers/chatgpt')).sent, [{ status: 405, body: { error: 'method not allowed' } }]);
-  // A path the mount does not own is passed on, not answered.
-  assert.deepEqual(await ask(on, 'GET', '/api/providers/prov-1'), { handled: false, sent: [] });
-});
-
 test('the provider registry module has no writer left (the workspace\'s is in workspace-shared.test.cjs)', () => {
   const providers = require('./providers.cjs');
   assert.deepEqual(Object.keys(providers.createProviderRegistry({ PROVIDERS: [], DEFAULT_PROVIDER_ID: 'default' })).sort(), ['getProvider', 'providerHeaders']);
@@ -105,6 +88,15 @@ test('through the router: the registry\'s methods are refused before authenticat
       const r = await request(url, { method, headers, body });
       assert.equal(r.status, 503, `${method} ${url}`);
       assert.deepEqual(r.json, owned.ROUTE_REFUSAL, `${method} ${url}`);
+      assert.equal(r.headers['x-noevia-api'], '1');
+    }
+  }
+  const residual = require('./rust-residual-fallbacks.cjs');
+  for (const [method, url] of [['PUT', '/api/providers/chatgpt'], ['GET', '/api/providers/chatgpt/grid-unmatched'], ['HEAD', '/api/models/downloads'], ['POST', '/api/models/installed'], ['GET', '/api/models/prune-missing'], ['HEAD', '/api/models/estimate']]) {
+    for (const headers of [{}, as(member), as(admin)]) {
+      const r = await request(url, { method, headers });
+      assert.equal(r.status, 503, `${method} ${url}`);
+      assert.deepEqual(r.json, residual.ROUTE_REFUSAL);
       assert.equal(r.headers['x-noevia-api'], '1');
     }
   }
