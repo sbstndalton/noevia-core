@@ -108,6 +108,7 @@ if (!require('./project-store-client.cjs').enabledFrom(process.env)) {
 // sbstndalton/noevia#2210, #2218: kept in this closure only: the front proves itself with it (trusted-front.cjs) when it asks for a
 // maintenance lease, an admission lease or the research bridge. Taken here, before clientFromEnv deletes it from process.env.
 const FRONT_SECRET = String(process.env.NOEVIA_PROJECT_STORE_TOKEN || '');
+const FRONT_PORT = Number(process.env.NOEVIA_PROJECT_STORE_PORT);
 const PROJECT_STORE = require('./project-store-client.cjs').clientFromEnv(process.env); // #1916: the secret leaves process.env here
 const authService = createAuth({
   rustAuth,
@@ -147,8 +148,12 @@ const decisionSettings = require('./decision-settings.cjs').createDecisionSettin
 // #1841: OCR and Docling read their address from the same registry (document-workers.cjs), the environment being the fallback.
 require('./document-workers.cjs').useMachines((kind) => inferenceMachines.urlFor(kind));
 // #1665: the reranker's on/off and model, saved in Settings over the deployment's RERANK_* environment.
-const rerankSettings = require('./rerank-settings.cjs').install(require('./rerank-settings.cjs').createRerankSettings({ store: require('./features.cjs').settingsStore(authService.db), audit: (action,actor,detail)=>authService.audit(action,actor,actor,detail), onChange: () => rag.reloadRerank(),
-  machine: () => { const url = inferenceMachines.urlFor('reranker'); return url ? { url, protocol: inferenceMachines.rerankProtocol() } : null; } }));
+const rerankSettings = require('./rerank-settings.cjs').install(require('./rerank-settings.cjs').createClient({
+  // clientFromEnv already removed the secret; keep only this private binding,
+  // never put it back into process.env or a child process environment.
+  env: { NOEVIA_PROJECT_STORE_PORT: process.env.NOEVIA_PROJECT_STORE_PORT, NOEVIA_PROJECT_STORE_TOKEN: FRONT_SECRET },
+  onChange: () => { rag.reloadRerank(); modelService.invalidateModelReads(); },
+}));
 // #697: the inference memory budget (admin setting; INFERENCE_MEMORY_BUDGET_GIB is its initial value).
 const inferenceBudget = require('./inference-budget.cjs').createInferenceBudget({ store: require('./features.cjs').settingsStore(authService.db), audit: (action,actor,detail)=>authService.audit(action,actor,actor,detail) });
 let featureRuntime;
@@ -160,8 +165,11 @@ featureRuntime = require('./feature-runtime.cjs').createFeatureRuntime({
 });
 // One initial barrier, shared by real startup and the existing imported request API.
 // Ordinary enabled/flags/describe never initiate an RPC or bypass the live lease.
-let featureStartup=null;
-const readyFeatures=()=>featureStartup ||= featureRuntime.ready();
+let featureStartup=null, autoRolesProof=null;
+// The native auto-roles write pairing proof is remembered once established or definitively
+// refused; a busy or unreachable store is not, so the next request asks again.
+const autoRolesReady=()=>autoRolesProof ||= PROJECT_STORE.autoRolesReady().catch((err)=>{ if (err && err.code==='PROJECTS_BUSY') autoRolesProof=null; throw err; });
+const readyFeatures=()=>Promise.all([featureStartup ||= featureRuntime.ready(), autoRolesReady()]);
 
 const featureRoutes = require('./routes/features.cjs').createFeatureRoutes({ json });
 // Settings → Data: the signed-in user's conversations as a ZIP (routes/export.cjs).
@@ -181,8 +189,8 @@ const driveAccounts = require('./gdrive-broker.cjs').createDriveAccounts({
   apiBase: process.env.GOOGLE_DRIVE_API_BASE_URL || undefined, uploadBase: process.env.GOOGLE_DRIVE_UPLOAD_BASE_URL || undefined,
 });
 const webAddressRoutes = require('./routes/web-address.cjs').createWebAddressRoutes({ auth: authService, json });
-const davConfig = require('./dav-settings.cjs').configuration(process.env, authService.origin);
-const davSettings = require('./dav-settings.cjs').createDavSettings({ auth: authService });
+// Account schema bootstrap only; the native listener owns sharing requests.
+require('./dav-settings.cjs').createDavSettings({ auth: authService });
 if (process.env.LEMONADE_BASE_URL && !process.env.INFERENCE_BASE_URL) console.warn('LEMONADE_BASE_URL is deprecated; use INFERENCE_BASE_URL');
 if (process.env.LEMONADE_API_KEY && !process.env.INFERENCE_API_KEY) console.warn('LEMONADE_API_KEY is deprecated; use INFERENCE_API_KEY');
 // The default row's capabilities come from the engine kind the deployment declares (providers.cjs).
@@ -286,7 +294,10 @@ const autoconfigBudget = (() => {
   }
 })();
 
+// Row J: the Rust front is the one maintenance lease authority; this process's gate asks it.
+const maintenanceAuthority = require('./model-maintenance-lease.cjs').createNativeLeaseClient({ port: Number(process.env.NOEVIA_PROJECT_STORE_PORT), token: FRONT_SECRET });
 const modelManager = createModelManager({
+  maintenanceAuthority,
   kind: MODEL_MANAGER_KIND,
   presetPath: process.env.LLAMACPP_PRESET_PATH,
   // MODELS_INI_WRITER=model-loader makes the sidecar the single models.ini writer (#295).
@@ -383,10 +394,8 @@ require('./models-ini-writer.cjs').reportModelsIniWriter({ mode: process.env.MOD
 // default, the auto-router roles, the manager service call and the cached folder scan (models.cjs).
 const modelService = require('./models.cjs').createModelService({
   fetchJson, env: process.env, modelManager, currentWorkspace,
-  // Auto-roles are per workspace: a deleted model's role reference must be cleared out of
-  // every workspace's config, not just whichever one happened to make the delete request.
-  listWorkspaces: () => authService.listUsers().map((u) => workspaceStore.get(u.id)),
   roleOnMachine: (role) => !!chatMachines.target(role),
+  autoRolesWriter: (user, name) => PROJECT_STORE.clearAutoRoles(user, name),
 });
 const { autoRoles, ensureRolesLoaded, servedCatalogue, modelsInstalled, lastLoadedModel } = modelService;
 
@@ -537,7 +546,7 @@ const toolboxOffered = createToolboxOffered(ENABLED_TOOLBOXES);
 // coding harness installed simply has nothing to start.
 // One proxy per deployment (it binds CODE_EGRESS_PORT): Code and Browser tasks share it, each
 // scoped by its own per-task grant/token.
-const codeEgress = require('./code-egress.cjs').startEgressFromEnv(process.env, { secrets: secretStore, log: (entry) => console.log('[egress]', JSON.stringify(entry)) });
+const codeEgress = require('./code-egress.cjs').startEgressFromEnv(process.env, { store: { port: FRONT_PORT, token: FRONT_SECRET }, log: (entry) => console.log('[egress]', JSON.stringify(entry)) });
 // #853: the UI and file-sharing listeners refuse requests that arrive over the internal code
 // network (COWORK_CODE_NET_ADDR, code-net-guard.cjs). The egress proxy above is not wrapped.
 const codeNetGuard = require('./code-net-guard.cjs').createCodeNetGuard({ spec: process.env.COWORK_CODE_NET_ADDR || '',
@@ -575,7 +584,7 @@ const codeRoleEndpoint = () => {
   };
 };
 const codeRoleEngine = require('./role-engine.cjs').createRoleEngine({ fetch: (...args) => globalThis.fetch(...args), log: codeRoleLog, engine: codeRoleEndpoint, machines: chatMachines,
-  keep: () => [...require('./model-system.cjs').sidecarModelNames(process.env)],
+  keep: () => require('./rerank-settings.cjs').withSettings(() => [...require('./model-system.cjs').sidecarModelNames(process.env)]),
   // noevia#2115: no local admission lock. The inference gate queues a request for another model until the
   // resident one is idle, so the residency check and the send no longer need to be one step.
   admission: null,
@@ -856,8 +865,8 @@ const framingReasoner = require('./framing-reasoner.cjs').createFramingReasoner(
   enabled: () => features.enabled('framingReasoner') && features.enabled('chatFraming'),
   model: () => framingSettings.get().framingReasonerModel,
   complete: require('./framing-reasoner.cjs').createEngineCompletion({ getProvider, providerHeaders, providerId: DEFAULT_PROVIDER_ID, fetch: (...a) => fetch(...a) }),
-  admit: (model, { answerModel, answerIsLocal }) => require('./framing-reasoner.cjs').admitReasoner({ model, answerModel, answerIsLocal,
-    keep: require('./llamacpp-manager.cjs').keepAlongside(), loadRefusal: typeof modelManager.loadRefusal === 'function' ? modelManager.loadRefusal : null }),
+  admit: async (model, { answerModel, answerIsLocal }) => require('./framing-reasoner.cjs').admitReasoner({ model, answerModel, answerIsLocal,
+    keep: await require('./rerank-settings.cjs').withSettings(() => require('./llamacpp-manager.cjs').keepAlongside()), loadRefusal: typeof modelManager.loadRefusal === 'function' ? modelManager.loadRefusal : null }),
   log: (entry) => recordDecision('chat-reasoner', entry),
 });
 const reasoningTraces = { enabled: (dir) => require('./chat-framing.cjs').readPreferences(dir).keepReasoningTraces === true,
@@ -903,8 +912,8 @@ const chatBrains = chatBrainLib.createBrainScheduler({
     enabled: () => features.enabled('framingReasoner') && features.enabled('chatFraming'),
     model: () => framingSettings.get().framingReasonerModel,
     complete: require('./framing-reasoner.cjs').createEngineCompletion({ getProvider, providerHeaders, providerId: DEFAULT_PROVIDER_ID, fetch: (...a) => fetch(...a) }),
-    admit: (model, { answerModel, answerIsLocal }) => require('./framing-reasoner.cjs').admitReasoner({ model, answerModel, answerIsLocal,
-      keep: require('./llamacpp-manager.cjs').keepAlongside(), loadRefusal: typeof modelManager.loadRefusal === 'function' ? modelManager.loadRefusal : null }),
+    admit: async (model, { answerModel, answerIsLocal }) => require('./framing-reasoner.cjs').admitReasoner({ model, answerModel, answerIsLocal,
+      keep: await require('./rerank-settings.cjs').withSettings(() => require('./llamacpp-manager.cjs').keepAlongside()), loadRefusal: typeof modelManager.loadRefusal === 'function' ? modelManager.loadRefusal : null }),
     loadedModel: () => lastLoadedModel(),
     log: (entry) => recordDecision('chat-brain', entry),
   }),
@@ -1043,7 +1052,7 @@ const modelManagerScanCache = require('./rust-model-manager-scan-cache.cjs').cre
   secret: FRONT_SECRET, json, readJson, service: modelService,
 });
 const modelRoutes = require('./routes/models.cjs').createModelRoutes({
-  json, readBody, readJson, fetchJson, env: process.env, modelManager, currentWorkspace, service: modelService, inferenceBudget, idleUnload, decisionSettings, rerankSettings,
+  json, readBody, readJson, fetchJson, env: process.env, modelManager, currentWorkspace, service: modelService, inferenceBudget, idleUnload, decisionSettings,
 });
 // State only this process knows, published for the Rust front (published-snapshot.cjs): the retrieval
 // status behind GET /api/health (rust-health.cjs) and the served catalogue and machine models behind
@@ -1176,7 +1185,7 @@ const inferenceMachineRoutes = require('./routes/inference-machines.cjs').create
     ocr: () => require('./document-workers.cjs').resolve('ocr').url || null,
     documents: () => require('./document-workers.cjs').resolve('documents').url || null,
     embedding: () => require('./embedding-config.cjs').current()?.active()?.baseUrl || null,
-    reranker: () => { const t = require('./rerank-target.cjs').rerankTarget(rerankSettings.effectiveEnv()); return t.enabled ? t.baseUrl : null; },
+    reranker: () => require('./rerank-settings.cjs').withSettings(() => { const t = require('./rerank-target.cjs').rerankTarget(rerankSettings.effectiveEnv()); return t.enabled ? t.baseUrl : null; }),
   } });
 // GET /api/ready (#297): unauthenticated, mounted before the session gate below alongside the
 // sign-in routes. isReady is set once startup wiring under require.main finishes (see below).
@@ -1202,9 +1211,10 @@ const toolboxPickerFacts = require('./rust-toolbox-picker-facts.cjs').createTool
   mcp: () => ({ enabled: mcpWiring.enabled(), state: mcpState, servers: MCP_SERVERS, manifest: MCP_TOOLBOX_MANIFEST }),
 });
 
-// With no inference gate, the Rust front's reload holds this process's own maintenance gate (#2210).
+// Row J: a lease of the front's authority pauses this process's chat through this latch (a local-only hold).
 const maintenanceLeases = require('./model-maintenance-lease.cjs').createLeaseRoutes({
-  secret: FRONT_SECRET, json, hold: typeof modelManager.holdMaintenance === 'function' ? () => modelManager.holdMaintenance() : null,
+  barrier: () => modelManager.maintenanceBarrier('Interrupted maintenance is being recovered.'),
+  secret: FRONT_SECRET, json, hold: typeof modelManager.holdMaintenanceLocal === 'function' ? options => modelManager.holdMaintenanceLocal(undefined, options) : null,
 });
 
 // #2303: the front's calibration loads ask this process's load decision (overBudget) first.
@@ -1224,9 +1234,15 @@ function publicHeaders(res) {
   res.setHeader('Permissions-Policy', 'camera=(), microphone=(), geolocation=(), payment=(), usb=(), serial=(), bluetooth=(), hid=(), midi=(), magnetometer=(), gyroscope=(), accelerometer=()');
 }
 
+const autoRolesWriteBridge = require('./rust-auto-roles-write.cjs').createBridge({
+  secret: FRONT_SECRET, json, readJson, service: modelService,
+  asUser: diaryAsUser, user: id => authService.db.prepare('SELECT role FROM users WHERE id=?').get(id),
+});
 async function handleRequestInner(req, res) {
   // The ownership refusals below answer before handleRequestScoped; they carry the same headers.
   publicHeaders(res);
+  if (require('./rust-auto-roles-write.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
+  if (await autoRolesWriteBridge(req, res)) return;
   if (require('./rust-tool-approvals.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   if (require('./rust-idle-unload-read.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   if (await idleUnloadFacts(req, res)) return;
@@ -1501,13 +1517,7 @@ if (require.main === module) {
   // comfortably past APPROVAL_TIMEOUT_MS, which is the limit that should
   // actually bite. headersTimeout still guards the slow-header attack this
   // setting otherwise protects against.
-  if (davConfig.available) {
-    const handler = require('./dav.cjs').createDavHandler({ auth: authService, settings: davSettings, config: davConfig, files: diaryFiles });
-    const davServer = http.createServer(codeNetGuard.wrap((req, res) => handler(req, res).catch(() => res.destroy()), 'file-sharing'));
-    davServer.requestTimeout = 60000; davServer.headersTimeout = 15000;
-    davServer.setTimeout(60000, socket => socket.destroy());
-    davServer.listen(davConfig.port, davConfig.bindHost, () => console.log(`Diary file sharing listener on port ${davConfig.port}; scope ${davConfig.scope}; per-user opt-in required`));
-  }
+  // Dedicated sharing is owned by the paired native listener (rust-dav-listener.cjs).
   // ── noevia's own MCP server ──────────────────────────────────────────
   //
   // Second listener, loopback only, started only when a port is configured
@@ -1578,9 +1588,7 @@ if (require.main === module) {
   process.on('unhandledRejection', (reason) => {
     console.error('[noevia] unhandled promise rejection:', reason?.stack || reason);
   });
-  // #1806: inline source text moves to per-source files before the first request (workspace.cjs).
-  try { workspaceStore.migrateSourceText(authService.listUsers().map((u) => u.id)); }
-  catch (e) { console.warn('[sources] startup migration skipped:', e?.message || e); }
+  // Source-text startup migration is owned by the paired native front.
   server.listen(PORT, HOST, () => {
     processReady = true;
     console.log(`cowork-ui listening on http://${HOST}:${PORT} (inference: ${INFERENCE_BASE}, manager: ${modelManager.kind}, diary: ${DIARY_BASE}, mcp: ${mcpWiring.enabled() ? MCP_SERVERS.map((sv) => sv.id).join('+') : 'disabled'})`);

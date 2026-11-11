@@ -1,7 +1,7 @@
 'use strict';
 // sbstndalton/noevia#2190 close-out: the Rust front answers GET /api/auto-roles (noevia-rs
 // bins/noevia-server auto_roles_routes.rs, capability rust-auto-roles) from the account's
-// auto-roles.json (which this process still writes) and from what only this process knows, published
+// auto-roles.json (written only by the native authority) and from what only this process knows, published
 // here as auto-roles-snapshot.json (published-snapshot.cjs): the served model catalogue (each
 // model's name and missingFile, or null when the engine cannot be read), the chat roles other
 // machines serve and the models those machines serve that this catalogue does not list (#1840,
@@ -10,7 +10,7 @@
 // snapshot it is published only while a signed-in page has asked in the last minute (the front's
 // demand marker, published-snapshot.cjs), so an idle installation does not read the engines.
 //
-// The PUT stays here: a save warms the roles in the engine (ensureRolesLoaded), which is chat-live.
+// The native PUT invokes the existing warming trigger through rust-auto-roles-write.cjs.
 // Only the GET is refused, before authentication, so a stale route table cannot make two processes
 // answer it.
 const path = require('node:path');

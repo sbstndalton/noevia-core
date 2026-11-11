@@ -98,9 +98,7 @@ test('#1758 the budget and eviction treat a sleeping model as not resident', asy
   const r = await manager.load('syn-next');
   assert.equal(r.ok, true);
   assert.deepEqual(calls.filter((c) => c.startsWith('POST /models/unload')), []);
-  // The memory watchdog's resident list leaves it out, (The budget table's row is the Rust front's: noevia-rs tests/model_state_reads.rs.)
-  const { loadedFromListing } = require('./inference-budget-watch.cjs');
-  assert.deepEqual(loadedFromListing({ ok: true, body: { data: [{ id: 'syn-sleeper', status: { value: 'sleeping' } }, { id: 'syn-next', status: { value: 'loaded' } }] } }), ['syn-next']);
+  // (The budget table's row and the memory watchdog's resident list are the Rust front's: noevia-rs tests/model_state_reads.rs.)
 });
 
 test('#1758 the embedding fallback on the chat router counts a sleeping embedding model as served', async (t) => {

@@ -129,14 +129,15 @@ function createCalibrator(deps) {
   async function waitForBackend() {
     const deadline = now() + limits.recover;
     while (now() < deadline) {
-      try { await listing(); return true; } catch {}
+      // Row J delta review: a lost lease is final for this job, not an engine to wait for.
+      try { await listing(); return true; } catch (e) { if (e?.coverageLost) throw e; }
       await sleep(2000);
     }
     return false;
   }
   // #1062: a step that met another client's model and waited for it; run() repeats it.
   const REPEAT = Symbol('repeat step');
-  const othersLive = async model => { try { return loadedOthers(await listing(), model).length > 0; } catch { return false; } };
+  const othersLive = async model => { try { return loadedOthers(await listing(), model).length > 0; } catch (e) { if (e?.coverageLost) throw e; return false; } };
   async function unloadAll(except) {
     for (;;) {
       try { return await unloadAllOnce(except); }
@@ -174,7 +175,7 @@ function createCalibrator(deps) {
     await request('/models/unload', { method: 'POST', body: JSON.stringify({ model }) }, limits.unload).catch(() => {});
     const deadline = now() + limits.unload;
     while (now() < deadline) {
-      try { const row = (await listing()).find(m => m.id === model); if (row?.status?.value === 'unloaded') return; } catch {}
+      try { const row = (await listing()).find(m => m.id === model); if (row?.status?.value === 'unloaded') return; } catch (e) { if (e?.coverageLost) throw e; }
       await sleep(limits.poll);
     }
   }
@@ -403,7 +404,7 @@ function createCalibrator(deps) {
       return finish('passed');
     } catch (e) {
       if (e.cancelled || cancelRequested) { finish('skipped', 'Cancelled.'); throw Object.assign(Error('cancelled'), { cancelled: true }); }
-      if (e.fatal) { finish('failed', e.message); throw e; }
+      if (e.fatal || e.coverageLost) { finish('failed', e.message); throw e; }
       if (record.memoryFloorHit) return finish('failed', `Available memory fell below ${memoryFloorGib} GiB.`, 'oom');
       // The engine went away (for example an out-of-memory restart): that size failed.
       const back = await waitForBackend();
@@ -477,8 +478,20 @@ function createCalibrator(deps) {
       job.status = e.cancelled ? 'cancelled' : 'failed';
       job.phase = e.cancelled ? 'Cancelled' : 'Failed';
       if (!e.cancelled) job.error = e.message || 'Calibration failed.';
+      // Row J delta review: a lost lease restores nothing on that lease; a recovery under a fresh lease
+      // does (chat stays closed until it has).
+      const lost = e?.coverageLost || maintenance?.coverageSignal?.()?.aborted === true;
+      if (lost && typeof maintenance?.requireRecovery === 'function' && job.originalText != null && job.lastRevision) {
+        const text = job.originalText, revision = job.lastRevision;
+        maintenance.requireRecovery('calibration:' + job.id, async () => {
+          if (presets.snapshot().revision === revision) { await presets.commit({ baseRevision: revision, text }); onWrite(presets.snapshot().revision); }
+          if (!(await invalidateBaseline('calibration'))) throw Error('The preset reload baseline did not acknowledge the restore.');
+          const reload = await request('/models?reload=1', {}, 120000);
+          if (!reload.ok) throw Error('The router did not confirm restored settings.');
+        }, 'Chat is paused while noevia restores the settings an interrupted calibration left behind.');
+      }
       // Put the original profile back; never overwrite a file someone else changed since.
-      try {
+      if (!lost) try {
         if (job.originalText != null && job.lastRevision && presets.snapshot().revision === job.lastRevision) {
           await presets.commit({ baseRevision: job.lastRevision, text: job.originalText });
           onWrite(presets.snapshot().revision);

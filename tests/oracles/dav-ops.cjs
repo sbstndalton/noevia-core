@@ -1,3 +1,4 @@
+// Historical synthetic-test oracle; never imported by the application.
 'use strict';
 // D6: DAV DELETE, MOVE and COPY per docs/dav.md § Storage contract. The companion
 // (/api/workspace-ops) owns every rule that touches data — protected paths incl. AI Memory/**,
