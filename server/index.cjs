@@ -266,63 +266,10 @@ const shutdownHooks = require('./shutdown-hooks.cjs').createShutdownHooks();
 shutdownHooks.add(require('./rust-embedding-background.cjs').scheduleLegacy({ owner: embeddingOwner, env: process.env, config: embeddingConfig, service: embeddingService, migration: embeddingMigration, afterReady: afterNativeReady }));
 shutdownHooks.install();
 
-// #1726: multimodal RAG (NOEVIA_MULTIMODAL_RAG, off by default). On, the rate-limited media pass embeds
-// every project's images into its own index, starting shortly after boot (the backfill) and again after
-// each source change (projects.cjs) and every half hour (a model switch leaves the new slot without image
-// vectors). Off, it never runs and stored image vectors are left alone.
-{
-  const multimodal = require('./multimodal-rag.cjs');
-  const mediaBackfill = multimodal.install(multimodal.createMediaBackfill({
-    userIds: () => authService.db.prepare('SELECT id FROM users').all().map((r) => r.id).filter((id) => !workspaceStore.isRemoved(id)),
-    workspaceFor: (userId) => workspaceStore.get(userId),
-    documentDir: (workspace, projectId) => require('./document-sources.cjs').directory(workspace, projectId),
-    rag,
-    // The embeddings router serves at most two models: during a re-index both slots are text models.
-    paused: () => (embeddingConfig.next() ? 'a re-index is under way' : null),
-    release: () => rag.releaseMediaModel(),
-  }));
-  // #1770: documents read before the flag was on are read again once for figures (figure-sweep.cjs), paced
-  // like the re-index and held while one runs; each re-read schedules that project's media pass.
-  const figureSweep = require('./figure-sweep.cjs').createFigureSweep({
-    extractorVersion: () => require('./documents.cjs').EXTRACTOR_VERSION,
-    userIds: () => authService.db.prepare('SELECT id FROM users').all().map((r) => r.id).filter((id) => !workspaceStore.isRemoved(id)),
-    workspaceFor: (userId) => workspaceStore.get(userId),
-    documentDir: (workspace, projectId) => require('./document-sources.cjs').directory(workspace, projectId),
-    runAs: (userId, fn) => {
-      const user = authService.publicUser(authService.db.prepare('SELECT * FROM users WHERE id=?').get(userId));
-      return requestScope.run({ workspace: workspaceStore.get(userId), authn: { user, legacy: false } }, fn);
-    },
-    refresh: (project, file) => projectStore.refreshDocumentFigures(project, file),
-    paused: () => (embeddingConfig.next() ? 'a re-index is under way' : null),
-  });
-  if (multimodal.enabled()) afterNativeReady(() => {
-    setTimeout(() => mediaBackfill.kick(), 45000).unref();
-    setInterval(() => mediaBackfill.kick(), 30 * 60 * 1000).unref();
-    setTimeout(() => figureSweep.kick(), 60000).unref();
-    setInterval(() => figureSweep.kick(), 30 * 60 * 1000).unref();
-  });
-  // #1770 review: on shutdown no new document or image is started.
-  shutdownHooks.add(() => { figureSweep.stop(); mediaBackfill.stop(); });
-}
-
-// #1868/#1869: long documents gain their text past the 200,000-character head in the search index, and
-// uploads made with no storage connection get the completion pass, both paced in the background
-// (document-backfill.cjs) and held while a re-index is under way.
-{
-  const documentBackfill = require('./document-backfill.cjs').createDocumentBackfill({
-    rag,
-    userIds: () => authService.db.prepare('SELECT id FROM users').all().map((r) => r.id).filter((id) => !workspaceStore.isRemoved(id)),
-    workspaceFor: (userId) => workspaceStore.get(userId),
-    documentDir: (workspace, projectId) => require('./document-sources.cjs').directory(workspace, projectId),
-    runAs: (userId, fn) => {
-      const user = authService.publicUser(authService.db.prepare('SELECT * FROM users WHERE id=?').get(userId));
-      return requestScope.run({ workspace: workspaceStore.get(userId), authn: { user, legacy: false } }, fn);
-    },
-    completeUpload: (project, file, options) => projectStore.completeUploadedDocument(project, file, options),
-    paused: () => (embeddingConfig.next() ? 'a re-index is under way' : null),
-  });
-  afterNativeReady(() => documentBackfill.start()); // unref'd timers
-}
+// Native media/figure/document workers share the embedding background owner.
+// Node only posts source-change hints; it owns no timer, batch or retry loop.
+require('./multimodal-rag.cjs').install(require('./rust-media-background.cjs').createClient({ dataDir: DATA_DIR, start: process.env.NOEVIA_START_ID || '' }));
+shutdownHooks.add(() => require('./multimodal-rag.cjs').current()?.stop());
 
 // User-created projects; the earlier fixed demo spaces were removed.
 // spaces were deleted per user request — projects are user-created only.

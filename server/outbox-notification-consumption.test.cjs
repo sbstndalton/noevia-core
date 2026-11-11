@@ -16,7 +16,7 @@ for (const removed of ['file', 'project', 'account', 'none']) {
     // Represents the already successful native preflight, before the async hop.
     assert.equal(sourceMember(body.user,body.project,body.file),true);
     checked.length=0;
-    const owner=createOwner({env:{NOEVIA_START_ID:body.start},frontSecret:'synthetic-token',features:()=>`rust-embedding-background-v1 ${RUST_INDEX_OUTBOX_OWNED}`,sourceMember,sourceChanged:(...args)=>calls.push(args)});
+    const owner=createOwner({env:{NOEVIA_START_ID:body.start},frontSecret:'synthetic-token',features:()=>`rust-embedding-background-v1 ${RUST_INDEX_OUTBOX_OWNED} rust-media-background-v1`,sourceMember,sourceChanged:(...args)=>calls.push(args)});
     let reading;
     const bodyRead=new Promise(resolve=>{reading=resolve;});
     const req=Object.assign(new Readable({read(){reading();}}),{method:'POST',url:'/internal/embedding-worker-owner/source-changed',headers:{'x-noevia-store-token':'synthetic-token'},socket:{remoteAddress:'127.0.0.1'}});
