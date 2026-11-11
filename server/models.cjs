@@ -131,7 +131,7 @@ function createModelService({ fetchJson, env, modelManager, currentWorkspace, ro
           console.warn(`[router] could not load ${role} model (${roles[role]}):`, err?.message || err);
         }
       }
-    })();
+    })().catch(err => { console.warn('[router] could not confirm machine routing:', err?.code || 'unavailable'); });
   }
 
   // The served model list, or null when it cannot be read (never treat an outage as "nothing installed").

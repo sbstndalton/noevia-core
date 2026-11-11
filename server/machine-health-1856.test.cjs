@@ -1,3 +1,4 @@
+// Historical Node registry fixture; runtime clients are covered by native-machines-client tests.
 'use strict';
 // #1856: Settings → Inference machines health. A service that answers 401 is up (needs auth), the decision probe
 // sends the decision client's own key to its own host only, "this machine" asks the model loader / provider the app
@@ -6,7 +7,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const { createMachineHealth, machineState, machineReason } = require('./machine-health.cjs');
 const { createDecisionSettings } = require('./decision-settings.cjs');
-const { createInferenceMachineRoutes } = require('./routes/inference-machines.cjs');
+const { createInferenceMachineRoutes } = require('../tests/reference/inference-machines-route.node.cjs');
 
 const reply = (status) => ({ ok: status >= 200 && status < 300, status, body: { cancel: async () => {} } });
 const refuse = (code, name = 'TypeError') => Object.assign(new Error('fetch failed'), { name, cause: { code } });

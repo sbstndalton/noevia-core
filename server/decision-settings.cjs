@@ -71,8 +71,8 @@ function createDecisionSettings({store,env=process.env,fetchImpl=decisionService
   // automatic: the deployment's COWORK_DECISION_MODEL when the URL is the deployment's own, Laya otherwise, exactly as
   // before). The reply is otherwise unchanged (the recorded HTTP contract corpus); the choosable ids are on the admin's
   // Decision row of /api/models/assignments.
-  const onMachine=()=>{ try { const u=machineUrl(); return typeof u==='string'&&u?u:null; } catch { return null; } };
-  const sensitivityOnMachine=()=>{ try { const u=sensitivityMachineUrl(); return typeof u==='string'&&u?u:null; } catch { return null; } };
+  const onMachine=()=>{ try { const u=machineUrl(); return typeof u==='string'&&u?u:null; } catch (err) { if (err?.code === 'machinesUnavailable') throw err; return null; } };
+  const sensitivityOnMachine=()=>{ try { const u=sensitivityMachineUrl(); return typeof u==='string'&&u?u:null; } catch (err) { if (err?.code === 'machinesUnavailable') throw err; return null; } };
   const get=()=>{
     const current=saved.current();
     const base=current || {url:env.COWORK_DECISION_URL||'',timeoutMs:1500};

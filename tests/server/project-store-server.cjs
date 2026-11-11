@@ -278,6 +278,33 @@ function valid(file, text) {
 }
 
 /** The request handler over `<dataDir>/users/<user>/<file>`; `writes` lists the files written. */
+function createMachineReply(dataDir) {
+  let machineEpoch = 0;
+  return body => {
+    if(body.op === 'session') return {epoch:++machineEpoch};
+    if(['turnBegin','turnEnd'].includes(body.op)) return {ok:true};
+    if(['tuneStatus','tuneResult'].includes(body.op)) return null;
+    // Test-only historical projection of the synthetic database. Production has no Node owner.
+    const db=new (require(require.resolve('better-sqlite3',{paths:[path.join(__dirname,'..','..','server')]})))(path.join(dataDir,'cowork.db'),{fileMustExist:true});
+    try {
+      const owner=require('../reference/inference-machines.node.cjs').createInferenceMachines({store:require('../../server/feature-setting-source.cjs').createStore(db),log:()=>{}});
+      switch(body.op) {
+        case 'view': return owner.view();
+        case 'runtimeSource': return owner.runtimeContextSource();
+        case 'machine': return owner.machine(body.id);
+        case 'chatTarget': return owner.chatTarget(body.role);
+        case 'urlFor': return owner.urlFor(body.service);
+        case 'assignmentOf': return owner.assignmentOf(body.service);
+        case 'embeddingMachine': return owner.embeddingMachine();
+        case 'rerankProtocol': return owner.rerankProtocol();
+        case 'rerankTarget': {const url=owner.urlFor('reranker');return url?{url,protocol:owner.rerankProtocol()}:null;}
+        default: throw Error('unsupported synthetic machine operation');
+      }
+    } finally {db.close();}
+  };
+
+}
+
 function createHandler(dataDir, token, writes = [], failures = [], { mirror = [], maintenance = false, reranker = false } = {}) {
   const leaseAuthority = maintenance
     ? require('../../server/synthetic-lease-authority.test-helper.cjs').createAuthority({ token })
@@ -300,18 +327,21 @@ function createHandler(dataDir, token, writes = [], failures = [], { mirror = []
     } finally {db.close();}
   };
 
+  const machineReply = createMachineReply(dataDir);
+
   const handler = (req, res) => {
     if (leaseAuthority && req.url.startsWith('/v1/maintenance-lease/')) return leaseAuthority.handler(req, res);
     const chunks = [];
     req.on('data', (c) => chunks.push(c));
     req.on('end', async () => {
       try {
-        if (req.method !== 'POST' || !(['/v1/read', '/v1/write','/v1/features/context','/v1/storage/legacy-webdav','/v1/auto-roles/proof','/v1/chat-mirror/schedule','/v1/chat-mirror/touch', ...(reranker ? ['/v1/reranker/settings'] : [])].includes(req.url) || HISTORY_OPS.has(req.url))) return send(res, 404, { error: 'not found' });
+        if (req.method !== 'POST' || !(['/v1/read', '/v1/write','/v1/features/context','/v1/inference-machines','/v1/storage/legacy-webdav','/v1/auto-roles/proof','/v1/chat-mirror/schedule','/v1/chat-mirror/touch', ...(reranker ? ['/v1/reranker/settings'] : [])].includes(req.url) || HISTORY_OPS.has(req.url))) return send(res, 404, { error: 'not found' });
         if (req.headers['x-noevia-store-token'] !== token) return send(res, 401, { error: 'unauthorised' });
         const planned = failures.find((f) => f.url === req.url && f.times > 0);
         if (planned) { planned.times -= 1; return send(res, planned.status, planned.body); }
         let body;
         try { body = JSON.parse(Buffer.concat(chunks).toString('utf8')); } catch { return send(res, 400, { error: 'invalid JSON' }); }
+        if(req.url==='/v1/inference-machines')return send(res,200,machineReply(body));
         // Opt-in transport fixture for unrelated chat/boot tests. This fixed disabled
         // snapshot supplies no settings mutation, selection, or generation policy.
         // Actual native owner and cross-process policy qualification stay separate.
@@ -367,7 +397,7 @@ function createHandler(dataDir, token, writes = [], failures = [], { mirror = []
  *  (server/rust-embedding-background.cjs), so a real boot pairs; pass its path as NOEVIA_SERVER_BIN. */
 function syntheticFrontBin(dir) {
   const file = path.join(dir, 'synthetic-noevia-server');
-  fs.writeFileSync(file, `#!/bin/sh\n[ "$1" = --features ] && echo ${require('../../server/rust-embedding-background.cjs').RUST_EMBEDDING_OWNED} ${require('../../server/rust-index-outbox.cjs').RUST_INDEX_OUTBOX_OWNED} ${require('../../server/rust-media-background.cjs').RUST_MEDIA_BACKGROUND_OWNED}\n`, { mode: 0o755 });
+  fs.writeFileSync(file, `#!/bin/sh\n[ "$1" = --features ] && echo ${require('../../server/rust-embedding-background.cjs').RUST_EMBEDDING_OWNED} ${require('../../server/rust-index-outbox.cjs').RUST_INDEX_OUTBOX_OWNED} ${require('../../server/rust-media-background.cjs').RUST_MEDIA_BACKGROUND_OWNED} rust-inference-machines\n`, { mode: 0o755 });
   return file;
 }
 
@@ -397,6 +427,11 @@ function freePortSync() {
  *  secret out of the environment) and starts the store on that port, unref'd so it never keeps
  *  the test process alive. Call it before requiring index.cjs. */
 function installProjectStore(dataDir, env = process.env, options = {}) {
+  // These tests load Core on the same event loop as their HTTP stand-in. Supply the
+  // native projection double directly; real cross-process RPC is covered separately.
+  const nativePath = require.resolve('../../server/native-machines-client.cjs');
+  const native = require(nativePath), machineReply = createMachineReply(dataDir);
+  require.cache[nativePath].exports = {...native, configure() {}, call: machineReply, callAsync: async body => machineReply(body)};
   if(!/^[0-9a-f]{32}$/.test(env.NOEVIA_START_ID||''))env.NOEVIA_START_ID=crypto.randomBytes(16).toString('hex');
   const port = freePortSync();
   const token = crypto.randomBytes(32).toString('hex');

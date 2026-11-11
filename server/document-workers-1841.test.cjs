@@ -1,10 +1,11 @@
+// Historical Node registry fixture; runtime clients are covered by native-machines-client tests.
 'use strict';
 // #1841 OCR and Docling, #1844 the sensitivity check's own decision service: assignable on Settings → Inference
 // machines. Synthetic addresses and a loopback fixture only.
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const http = require('node:http');
-const { createInferenceMachines } = require('./inference-machines.cjs');
+const { createInferenceMachines } = require('../tests/reference/inference-machines.node.cjs');
 const workers = require('./document-workers.cjs');
 const ocr = require('./ocr.cjs');
 const docling = require('./docling.cjs');
