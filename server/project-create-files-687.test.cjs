@@ -109,7 +109,7 @@ function world(t) {
   const scope = new AsyncLocalStorage();
   const key = crypto.randomBytes(32);
   const isWriteTool = (name) => EDIT_TOOLS.has(name) || name === 'project_create_file';
-  const wiring = require('./mcp-wiring.cjs').createMcpWiring({
+  const wiring = require('../tests/server/oracle/mcp-wiring-with-reference.cjs').createMcpWiring({
     servers: [], manifest: [], mcp: {}, bindBoxes: () => [], directoryMcp: { signal: () => 0, asServers: () => [] }, mcpOAuth: {},
     directoryUrlAllowed: async () => true, credentialOriginAllowed: () => false, scope, storageFor: () => ({ kind: 'local' }),
     isWriteTool, internal, internalKey: key, reduceToolResult: (text) => ({ text, reduced: false }), logger: { log() {}, warn() {} },

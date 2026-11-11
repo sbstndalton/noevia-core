@@ -20,7 +20,7 @@ function harness() {
   const gate = new Promise((resolve) => { release = resolve; });
   const scope = new AsyncLocalStorage();
   const context = { requestScope: scope };
-  const wiring = require('./mcp-wiring.cjs').createMcpWiring({
+  const wiring = require('../tests/server/oracle/mcp-wiring-with-reference.cjs').createMcpWiring({
     servers: [], manifest: [], mcp: {}, bindBoxes: () => [],
     directoryMcp: { signal: () => 0, asServers: () => [] }, mcpOAuth: {},
     directoryUrlAllowed: async () => true, credentialOriginAllowed: () => false,

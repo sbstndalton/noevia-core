@@ -42,3 +42,14 @@ test('v1 still decrypts, v2 binds to the account, and ciphertext-looking input i
   assert.notEqual(store.encrypt(v1), v1);
   assert.equal(store.encrypt(''), '');
 });
+
+test('independent clean installs generate fresh keys outside the source tree', (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'fresh-keys-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const a = createSecretStore(path.join(root, 'a'));
+  const b = createSecretStore(path.join(root, 'b'));
+  const key = fs.readFileSync(a.keyFile);
+  assert.equal(key.length, 32);
+  assert.notDeepEqual(key, fs.readFileSync(b.keyFile));
+  assert.deepEqual(key, fs.readFileSync(createSecretStore(path.join(root, 'a')).keyFile));
+});

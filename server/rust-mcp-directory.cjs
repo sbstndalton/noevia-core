@@ -12,7 +12,7 @@
 // shared-reread.cjs createReread on a change signal; an unreadable table means no directory servers)
 // and opens each server's shared key only when a call or a discovery needs it. Node publishes what only
 // its live client knows - the tools each server offers - for the front's admin listing, the permitted
-// tools and the connectors page (mcp-discovery-snapshot.cjs).
+// tools and the connectors page (noevia-rs mcp_discovery.rs).
 //
 // Node refuses exactly the paths the front's route table gives Rust (a segment matches `[^/]+`, one
 // trailing slash is tolerated) before authentication, so a stale route table cannot make two processes
