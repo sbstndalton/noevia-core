@@ -1,3 +1,4 @@
+// Test-only pre-port behavior oracle. Never imported by the server.
 'use strict';
 // #1770: a one-time, paced sweep that reads existing documents again so they gain figures.
 //
