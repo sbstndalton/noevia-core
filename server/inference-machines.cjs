@@ -21,9 +21,23 @@ const SERVICES = Object.freeze({
 const SERVICE_IDS = Object.freeze(Object.keys(SERVICES));
 /** #1840: the chat role -> its service id. */
 const CHAT_ROLE_SERVICE = Object.freeze(Object.fromEntries(Object.entries(SERVICES).filter(([, d]) => d.mode === 'chat').map(([id, d]) => [d.role, id])));
-function createInferenceMachines({ onChange = () => {} } = {}) {
+// build/web-supervisor.sh starts this process and the front together, so the front's private
+// store may not listen yet when Core loads. The session (which clears the previous process's
+// turns and run) is retried for a bounded time; past it Core refuses to start, never runs local.
+const SESSION_BOOT_MS = 30000;
+const SESSION_RETRY_MS = 200;
+function openSession(call, waitMs) {
+  const deadline = Date.now() + waitMs;
+  for (;;) {
+    try { return call({ op: 'session' }).epoch; } catch (err) {
+      if (err?.code !== 'machinesUnavailable' || Date.now() + SESSION_RETRY_MS > deadline) throw err;
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, SESSION_RETRY_MS);
+    }
+  }
+}
+function createInferenceMachines({ onChange = () => {}, sessionWaitMs = SESSION_BOOT_MS } = {}) {
   const { call, callAsync } = require('./native-machines-client.cjs');
-  const epoch = call({ op: 'session' }).epoch;
+  const epoch = openSession(call, sessionWaitMs);
   let sequence = 0;
   const ask = (op, args = {}) => call({ op, ...args });
   const mutate = (body, actor) => { const out = ask('mutate', { body, actor }); if(body.action === 'assign') onChange(String(body.service || '')); return out; };
