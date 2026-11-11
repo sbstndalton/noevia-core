@@ -352,14 +352,16 @@ function createClient({ port, token, fetchImpl = globalThis.fetch, timeoutMs = T
       }
       return chatgptRefusal(status, body);
     },
-    /** sbstndalton/noevia#2153: the user's chat change journal after `after` (chat-change-journal.cjs):
-     *  { entries, oldestSeq, latestSeq, more, start }, or { unsupported: true } from a store
-     *  without the op (404: an older Rust front). */
-    async changesRead(user, after = 0) {
-      const { status, body } = await call('changes/read', { user, after });
-      if (status === 200 && body && Array.isArray(body.entries)) return body;
-      if (status === 404) return { unsupported: true };
-      throw historyFailure(status, body);
+    /** `rust-chat-mirror-v1`: the account's Diary mirror should look again (a project change, an import):
+     *  at `chatId`, or at everything when null. The front's schedule decides when it runs (rust-chat-mirror.cjs). */
+    async chatMirrorSchedule(user, chatId = null, immediate = false) {
+      const { status } = await call('chat-mirror/schedule', { user, chatId, immediate: immediate === true });
+      if (status !== 200) throw Object.assign(new Error('the chat mirror schedule did not take the request'), { status });
+    },
+    /** A request from `user` started: the front reads their change journal now. */
+    async chatMirrorTouch(user) {
+      const { status } = await call('chat-mirror/touch', { user });
+      if (status !== 200) throw Object.assign(new Error('the chat mirror schedule did not take the request'), { status });
     },
   };
 }

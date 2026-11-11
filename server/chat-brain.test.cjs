@@ -10,7 +10,7 @@ const crypto = require('node:crypto');
 const { EventEmitter } = require('node:events');
 const brainLib = require('./chat-brain.cjs');
 const { BRAIN_SCHEMA, BRAIN_JSON_SCHEMA, LIMITS, validateBrain, parseBrain, renderBrainMarkdown, renderBrainContext, linkedBrainBlock,
-  readBrain, writeBrain, removeBrain, createBrainBuilder, createBrainScheduler, MAX_CONTEXT_BRAINS, CONTEXT_INTRO } = brainLib;
+  readBrain, writeBrain, removeBrain, createBrainBuilder, createBrainRunner, MAX_CONTEXT_BRAINS, CONTEXT_INTRO } = brainLib;
 const { renderNote, createChatVaultMirror } = require('./chat-vault-mirror.cjs');
 const { createFramingSettings } = require('./chat-framing.cjs');
 const { REGISTRY, createFeatures } = require('../tests/server/oracles/features-legacy.cjs');
@@ -147,7 +147,7 @@ test('clipTranscript keeps the start and the end of a long chat', () => {
   assert.ok(c.length <= 1000 && c.startsWith('START') && c.endsWith('END'));
 });
 
-// ── Storage and scheduler ───────────────────────────────────────────────────────────────────
+// ── Storage and runner ───────────────────────────────────────────────────────────────────
 test('storage: one file per chat under the user\'s own dir, hashed name, validated on read', (t) => {
   const dir = tmp(t);
   assert.equal(readBrain(dir, 'c1'), null);
@@ -168,41 +168,33 @@ test('storage: one file per chat under the user\'s own dir, hashed name, validat
   assert.equal(readBrain(dir, 'c3'), null);
 });
 
-function scheduler(over = {}) {
-  const state = { enabled: true, chats: { c1: { id: 'c1', title: 'Shed', updatedAt: 10 } }, stored: {}, built: [], deleted: new Set(), builds: 0, result: { ok: true, brain: good() } };
-  const timers = [];
-  const s = createBrainScheduler({
+function runner(over = {}) {
+  const state = { enabled: true, chats: { c1: { id: 'c1', title: 'Shed', updatedAt: 10 } }, stored: {}, deleted: new Set(), builds: 0, result: { ok: true, brain: good() } };
+  const s = createBrainRunner({
     enabled: () => state.enabled,
     chat: (_u, id) => state.chats[id] || null,
     readHistory: () => history,
     deleted: () => state.deleted,
     store: { read: (u, id) => state.stored[`${u}/${id}`] || null, write: (u, id, r) => { state.stored[`${u}/${id}`] = r; }, remove: (u, id) => { delete state.stored[`${u}/${id}`]; } },
     builder: { build: async () => { state.builds++; return state.result; } },
-    built: (u, id) => state.built.push(`${u}/${id}`),
-    setTimer: (fn, ms) => { const tm = { fn, ms, done: false }; timers.push(tm); return tm; },
-    clearTimer: (tm) => { tm.done = true; },
-    now: () => 99, idleMs: 1000, retryMs: 5000, ...over,
+    now: () => 99, ...over,
   });
-  const fire = async () => { const live = timers.filter((x) => !x.done); for (const x of live) x.done = true; for (const x of live) await x.fn(); };
-  return { s, state, timers, fire };
+  return { s, state };
 }
 
-test('scheduler: an idle chat is built once, stored and the mirror nudged; later changes debounce', async () => {
-  const { s, state, timers, fire } = scheduler();
-  s.schedule('u1', 'c1'); s.schedule('u1', 'c1');
-  assert.equal(timers.filter((x) => !x.done).length, 1, 'a change restarts the idle timer');
-  assert.equal(timers[1].ms, 1000);
-  await fire();
+test('runner: a chat is built once and stored; an up-to-date brain is not rebuilt; scheduling is the Rust front\'s', async () => {
+  const { s, state } = runner();
+  assert.equal(await s.run('u1', 'c1'), 'built');
   assert.equal(state.builds, 1);
   assert.deepEqual(state.stored['u1/c1'], { brain: good(), sourceUpdatedAt: 10, builtAt: 99 });
-  assert.deepEqual(state.built, ['u1/c1']);
   assert.equal(await s.run('u1', 'c1'), 'current', 'an up-to-date brain is not rebuilt');
   state.chats.c1.updatedAt = 11;
   assert.equal(await s.run('u1', 'c1'), 'built');
+  assert.equal(s.schedule, undefined, 'no timers, queue or retry in this process (noevia-rs chat-mirror-sched owns them)');
 });
 
-test('scheduler: opt-out, a gone chat, a failed build and a switch-off mid-build keep the old brain', async () => {
-  const { s, state, timers } = scheduler();
+test('runner: opt-out, a gone chat, a failed build and a switch-off mid-build keep the old brain; the reason is the builder\'s', async () => {
+  const { s, state } = runner();
   state.enabled = false;
   assert.equal(await s.run('u1', 'c1'), 'off');
   assert.equal(state.builds, 0);
@@ -214,31 +206,29 @@ test('scheduler: opt-out, a gone chat, a failed build and a switch-off mid-build
   state.deleted.add('old');
   await s.run('u1', 'old');
   assert.equal(state.stored['u1/old'], undefined, 'tombstoned: the brain goes');
-  state.result = { ok: false, reason: 'deadline' };
-  assert.equal(await s.run('u1', 'c1'), 'deadline');
-  assert.equal(state.stored['u1/c1'], undefined);
-  assert.equal(timers.at(-1).ms, 5000, 'a transient failure is retried once later');
-  assert.equal(await s.run('u1', 'c1', true), 'deadline');
-  const retries = timers.filter((x) => x.ms === 5000).length;
-  assert.equal(retries, 1, 'only once');
-  state.result = { ok: false, reason: 'no-model' };
-  await s.run('u1', 'c1');
-  assert.equal(timers.filter((x) => x.ms === 5000).length, 1, 'no model: no retry');
+  for (const reason of ['deadline', 'budget', 'error', 'no-model', 'invalid-json', 'schema', 'empty']) {
+    state.result = { ok: false, reason };
+    assert.equal(await s.run('u1', 'c1'), reason, 'the front decides what is retried from this reason');
+    assert.equal(state.stored['u1/c1'], undefined);
+  }
   // Switched off while the model ran: nothing is written.
   let flips = 0;
-  const { s: s2, state: st2 } = scheduler({ enabled: () => flips++ === 0 });
+  const { s: s2, state: st2 } = runner({ enabled: () => flips++ === 0 });
   assert.equal(await s2.run('u1', 'c1'), 'off');
   assert.equal(st2.stored['u1/c1'], undefined);
+  // A thrown dependency is an 'error' reason, never a throw.
+  const { s: s3 } = runner({ readHistory: () => { throw new Error('disk'); }, log: () => {} });
+  assert.equal(await s3.run('u1', 'c1'), 'error');
 });
 
-test('scheduler: a chat deleted while its brain was being built gets no brain written back (#811)', async (t) => {
+test('runner: a chat deleted while its brain was being built gets no brain written back (#811)', async (t) => {
   // Against the real store: the delete removes the brain file, then the in-flight build finishes.
   const dir = tmp(t, 'noevia-brain-811-');
   const chats = { c1: { id: 'c1', title: 'Shed', updatedAt: 10 } };
   const deletedIds = new Set();
   const store = { read: (_u, id) => readBrain(dir, id), write: (_u, id, r) => writeBrain(dir, id, r), remove: (_u, id) => removeBrain(dir, id) };
   const deleteChat = (id) => { delete chats[id]; deletedIds.add(id); removeBrain(dir, id); };
-  const make = (onBuild) => createBrainScheduler({ enabled: () => true, chat: (_u, id) => chats[id] || null, readHistory: () => history,
+  const make = (onBuild) => createBrainRunner({ enabled: () => true, chat: (_u, id) => chats[id] || null, readHistory: () => history,
     deleted: () => deletedIds, store, builder: { build: async () => { onBuild(); return { ok: true, brain: good() }; } }, now: () => 99 });
   const files = () => (fs.existsSync(path.join(dir, brainLib.BRAIN_DIR)) ? fs.readdirSync(path.join(dir, brainLib.BRAIN_DIR)) : []);
   assert.equal(await make(() => deleteChat('c1')).run('u1', 'c1'), 'gone');
