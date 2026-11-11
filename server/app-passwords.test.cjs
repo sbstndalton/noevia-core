@@ -8,7 +8,7 @@ const crypto = require('node:crypto');
 const fs = require('node:fs'), os = require('node:os'), path = require('node:path');
 const Database = require('better-sqlite3');
 const { hash, Algorithm } = require('@node-rs/argon2');
-const { createAppPasswords } = require('./app-passwords.cjs');
+const { createAppPasswords } = require('../tests/oracles/app-passwords.cjs');
 const { createRustAuthGuard } = require('./rust-auth.cjs');
 
 const ARGON2 = { algorithm: Algorithm.Argon2id, memoryCost: 19456, timeCost: 2, parallelism: 1 };

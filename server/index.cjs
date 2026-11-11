@@ -107,6 +107,7 @@ if (!require('./project-store-client.cjs').enabledFrom(process.env)) {
 // sbstndalton/noevia#2210, #2218: kept in this closure only: the front proves itself with it (trusted-front.cjs) when it asks for a
 // maintenance lease, an admission lease or the research bridge. Taken here, before clientFromEnv deletes it from process.env.
 const FRONT_SECRET = String(process.env.NOEVIA_PROJECT_STORE_TOKEN || '');
+const FRONT_PORT = Number(process.env.NOEVIA_PROJECT_STORE_PORT);
 const PROJECT_STORE = require('./project-store-client.cjs').clientFromEnv(process.env); // #1916: the secret leaves process.env here
 const authService = createAuth({
   rustAuth,
@@ -146,8 +147,12 @@ const decisionSettings = require('./decision-settings.cjs').createDecisionSettin
 // #1841: OCR and Docling read their address from the same registry (document-workers.cjs), the environment being the fallback.
 require('./document-workers.cjs').useMachines((kind) => inferenceMachines.urlFor(kind));
 // #1665: the reranker's on/off and model, saved in Settings over the deployment's RERANK_* environment.
-const rerankSettings = require('./rerank-settings.cjs').install(require('./rerank-settings.cjs').createRerankSettings({ store: require('./features.cjs').settingsStore(authService.db), audit: (action,actor,detail)=>authService.audit(action,actor,actor,detail), onChange: () => rag.reloadRerank(),
-  machine: () => { const url = inferenceMachines.urlFor('reranker'); return url ? { url, protocol: inferenceMachines.rerankProtocol() } : null; } }));
+const rerankSettings = require('./rerank-settings.cjs').install(require('./rerank-settings.cjs').createClient({
+  // clientFromEnv already removed the secret; keep only this private binding,
+  // never put it back into process.env or a child process environment.
+  env: { NOEVIA_PROJECT_STORE_PORT: process.env.NOEVIA_PROJECT_STORE_PORT, NOEVIA_PROJECT_STORE_TOKEN: FRONT_SECRET },
+  onChange: () => { rag.reloadRerank(); modelService.invalidateModelReads(); },
+}));
 // #697: the inference memory budget (admin setting; INFERENCE_MEMORY_BUDGET_GIB is its initial value).
 const inferenceBudget = require('./inference-budget.cjs').createInferenceBudget({ store: require('./features.cjs').settingsStore(authService.db), audit: (action,actor,detail)=>authService.audit(action,actor,actor,detail) });
 let featureRuntime;
@@ -159,8 +164,11 @@ featureRuntime = require('./feature-runtime.cjs').createFeatureRuntime({
 });
 // One initial barrier, shared by real startup and the existing imported request API.
 // Ordinary enabled/flags/describe never initiate an RPC or bypass the live lease.
-let featureStartup=null;
-const readyFeatures=()=>featureStartup ||= featureRuntime.ready();
+let featureStartup=null, autoRolesProof=null;
+// The native auto-roles write pairing proof is remembered once established or definitively
+// refused; a busy or unreachable store is not, so the next request asks again.
+const autoRolesReady=()=>autoRolesProof ||= PROJECT_STORE.autoRolesReady().catch((err)=>{ if (err && err.code==='PROJECTS_BUSY') autoRolesProof=null; throw err; });
+const readyFeatures=()=>Promise.all([featureStartup ||= featureRuntime.ready(), autoRolesReady()]);
 
 const featureRoutes = require('./routes/features.cjs').createFeatureRoutes({ json });
 // Settings → Data: the signed-in user's conversations as a ZIP (routes/export.cjs).
@@ -180,8 +188,8 @@ const driveAccounts = require('./gdrive-broker.cjs').createDriveAccounts({
   apiBase: process.env.GOOGLE_DRIVE_API_BASE_URL || undefined, uploadBase: process.env.GOOGLE_DRIVE_UPLOAD_BASE_URL || undefined,
 });
 const webAddressRoutes = require('./routes/web-address.cjs').createWebAddressRoutes({ auth: authService, json });
-const davConfig = require('./dav-settings.cjs').configuration(process.env, authService.origin);
-const davSettings = require('./dav-settings.cjs').createDavSettings({ auth: authService });
+// Account schema bootstrap only; the native listener owns sharing requests.
+require('./dav-settings.cjs').createDavSettings({ auth: authService });
 if (process.env.LEMONADE_BASE_URL && !process.env.INFERENCE_BASE_URL) console.warn('LEMONADE_BASE_URL is deprecated; use INFERENCE_BASE_URL');
 if (process.env.LEMONADE_API_KEY && !process.env.INFERENCE_API_KEY) console.warn('LEMONADE_API_KEY is deprecated; use INFERENCE_API_KEY');
 // The default row's capabilities come from the engine kind the deployment declares (providers.cjs).
@@ -229,7 +237,13 @@ function arrayProxy(field) {
 }
 // #1636/#1638: the one embedding configuration (endpoint, model, profile), seeded from the environment
 // and saved beside the data once changed through /api/embedding (embedding-migration.cjs).
-const embeddingOwner = require('./rust-embedding-background.cjs').createOwner({ env: process.env, frontSecret: FRONT_SECRET, dataDir: DATA_DIR, verifyPair: require.main === module });
+const embeddingBackground = require('./rust-embedding-background.cjs');
+const embeddingOwner = embeddingBackground.createOwner({ env: process.env, frontSecret: FRONT_SECRET, dataDir: DATA_DIR, verifyPair: require.main === module,
+  sourceMember: embeddingBackground.createSourceMembershipGuard({
+    userExists: user => !!authService.db.prepare('SELECT 1 FROM users WHERE id=?').get(user) && !workspaceStore.isRemoved(user),
+    workspaceFor: user => workspaceStore.get(user),
+  }),
+});
 const embeddingConfig = require('./embedding-config.cjs').install(require('./embedding-config.cjs').loadEmbeddingConfig({
   env: process.env, nativeOwner: embeddingOwner, stateFile: path.join(DATA_DIR, 'embedding-config.json') }));
 rag.init({ dataDir: DATA_DIR, inferenceUrl: INFERENCE_BASE, headersFn: () => inferenceHeaders(), userDataDirFn: workspaceStore.userDir,
@@ -332,7 +346,10 @@ const autoconfigBudget = (() => {
   }
 })();
 
+// Row J: the Rust front is the one maintenance lease authority; this process's gate asks it.
+const maintenanceAuthority = require('./model-maintenance-lease.cjs').createNativeLeaseClient({ port: Number(process.env.NOEVIA_PROJECT_STORE_PORT), token: FRONT_SECRET });
 const modelManager = createModelManager({
+  maintenanceAuthority,
   kind: MODEL_MANAGER_KIND,
   presetPath: process.env.LLAMACPP_PRESET_PATH,
   // MODELS_INI_WRITER=model-loader makes the sidecar the single models.ini writer (#295).
@@ -429,10 +446,8 @@ require('./models-ini-writer.cjs').reportModelsIniWriter({ mode: process.env.MOD
 // default, the auto-router roles, the manager service call and the cached folder scan (models.cjs).
 const modelService = require('./models.cjs').createModelService({
   fetchJson, env: process.env, modelManager, currentWorkspace,
-  // Auto-roles are per workspace: a deleted model's role reference must be cleared out of
-  // every workspace's config, not just whichever one happened to make the delete request.
-  listWorkspaces: () => authService.listUsers().map((u) => workspaceStore.get(u.id)),
   roleOnMachine: (role) => !!chatMachines.target(role),
+  autoRolesWriter: (user, name) => PROJECT_STORE.clearAutoRoles(user, name),
 });
 const { autoRoles, ensureRolesLoaded, servedCatalogue, modelsInstalled, lastLoadedModel } = modelService;
 
@@ -549,11 +564,8 @@ const {
   saveProjects, getProject, sanitizeChats, loadChats, saveChats, deleteChat, saveFreeChats, deleteFreeChat, createProject,
   readHistory, ownsFile, ensureProjectFolder, withSourceLock, pruneDocuments, writeProjectTextFile, sweepDeletedProject, indexSource,
 } = projectStore;
-// #2191 round 2: the Rust front creates and deletes projects (rust-project-lifecycle.cjs). It reads the
-// toolbox catalogue published here (MCP discovery is this process's), and leaves the RAG index of
-// create-time files in the user's index outbox, which this executor drains (round 3: the storage folder
-// sweep and #687's create-time storage step are the front's own, rust-project-storage.cjs);
-// a delete's tombstone stops an index run of that project still in flight (rag.cjs lifecycle guard).
+// The front owns durable RAG outbox execution. Core keeps a read-only lifecycle
+// guard for its remaining request-time RAG calls and publishes the toolbox catalogue.
 const projectCatalogue = require('./project-catalogue.cjs').createCataloguePublisher({
   dataDir: DATA_DIR,
   current: () => ({
@@ -564,42 +576,11 @@ const projectCatalogue = require('./project-catalogue.cjs').createCataloguePubli
   }),
 });
 const indexOutbox = require('./rust-index-outbox.cjs').createIndexOutbox({
-  // #2191 round 3: only this process's job kinds; the front runs its own (the storage sweep).
-  kinds: require('./rust-project-storage.cjs').CORE_KINDS,
   userDir: (userId) => workspaceStore.userDir(userId),
-  userIds: () => authService.db.prepare('SELECT id FROM users').all().map((r) => r.id).filter((id) => !workspaceStore.isRemoved(id)),
-  runAs: (userId, fn) => {
-    const user = authService.publicUser(authService.db.prepare('SELECT * FROM users WHERE id=?').get(userId));
-    return requestScope.run({ workspace: workspaceStore.get(userId), authn: { user, legacy: false } }, fn);
-  },
-  runJob: async (job, userId) => {
-    const workspace = currentWorkspace();
-    if (job.kind === 'index') {
-      // The project as the front saved it (re-read when projects.json changed), the file's text as it is now.
-      if (workspace.projectsFile) workspace.projectsFile.refresh(workspace.projects);
-      const project = getProject(job.project);
-      const file = (project?.files || []).find((f) => f && f.name === job.file);
-      if (!project || !file) return; // removed or replaced since: nothing left to index
-      await indexSource(project, file);
-      return;
-    }
-    if (job.kind === 'unindex') {
-      // #2191 round 3 (rust-project-files.cjs): a source file the front removed. Its rows go unless a
-      // file of that name is listed again by now (#1919: a re-upload's fresh rows stay), or the project
-      // is gone (its delete removed the whole index; opening it here would make it again).
-      if (workspace.projectsFile) workspace.projectsFile.refresh(workspace.projects);
-      const project = getProject(job.project);
-      if (!project || (project.files || []).some((f) => f && f.name === job.file)) return;
-      rag.deleteProjectFile(job.project, job.file, userId);
-      return;
-    }
-    throw new Error(`unknown outbox job kind ${job.kind}`);
-  },
 });
 rag.setLifecycleGuard(indexOutbox);
 afterNativeReady(() => {
   projectCatalogue.publish();
-  setInterval(() => { indexOutbox.tick().catch((err) => console.warn('[index-outbox] pass failed:', err.message)); }, 2000).unref();
 });
 
 // ── MCP toolboxes (master step 15): curated, discovered and bound by the Rust front (mcp_manifest.rs) ─────────
@@ -619,7 +600,7 @@ const toolboxOffered = createToolboxOffered(ENABLED_TOOLBOXES);
 // coding harness installed simply has nothing to start.
 // One proxy per deployment (it binds CODE_EGRESS_PORT): Code and Browser tasks share it, each
 // scoped by its own per-task grant/token.
-const codeEgress = require('./code-egress.cjs').startEgressFromEnv(process.env, { secrets: secretStore, log: (entry) => console.log('[egress]', JSON.stringify(entry)) });
+const codeEgress = require('./code-egress.cjs').startEgressFromEnv(process.env, { store: { port: FRONT_PORT, token: FRONT_SECRET }, log: (entry) => console.log('[egress]', JSON.stringify(entry)) });
 // #853: the UI and file-sharing listeners refuse requests that arrive over the internal code
 // network (COWORK_CODE_NET_ADDR, code-net-guard.cjs). The egress proxy above is not wrapped.
 const codeNetGuard = require('./code-net-guard.cjs').createCodeNetGuard({ spec: process.env.COWORK_CODE_NET_ADDR || '',
@@ -657,7 +638,7 @@ const codeRoleEndpoint = () => {
   };
 };
 const codeRoleEngine = require('./role-engine.cjs').createRoleEngine({ fetch: (...args) => globalThis.fetch(...args), log: codeRoleLog, engine: codeRoleEndpoint, machines: chatMachines,
-  keep: () => [...require('./model-system.cjs').sidecarModelNames(process.env)],
+  keep: () => require('./rerank-settings.cjs').withSettings(() => [...require('./model-system.cjs').sidecarModelNames(process.env)]),
   // noevia#2115: no local admission lock. The inference gate queues a request for another model until the
   // resident one is idle, so the residency check and the send no longer need to be one step.
   admission: null,
@@ -939,8 +920,8 @@ const framingReasoner = require('./framing-reasoner.cjs').createFramingReasoner(
   enabled: () => features.enabled('framingReasoner') && features.enabled('chatFraming'),
   model: () => framingSettings.get().framingReasonerModel,
   complete: require('./framing-reasoner.cjs').createEngineCompletion({ getProvider, providerHeaders, providerId: DEFAULT_PROVIDER_ID, fetch: (...a) => fetch(...a) }),
-  admit: (model, { answerModel, answerIsLocal }) => require('./framing-reasoner.cjs').admitReasoner({ model, answerModel, answerIsLocal,
-    keep: require('./llamacpp-manager.cjs').keepAlongside(), loadRefusal: typeof modelManager.loadRefusal === 'function' ? modelManager.loadRefusal : null }),
+  admit: async (model, { answerModel, answerIsLocal }) => require('./framing-reasoner.cjs').admitReasoner({ model, answerModel, answerIsLocal,
+    keep: await require('./rerank-settings.cjs').withSettings(() => require('./llamacpp-manager.cjs').keepAlongside()), loadRefusal: typeof modelManager.loadRefusal === 'function' ? modelManager.loadRefusal : null }),
   log: (entry) => recordDecision('chat-reasoner', entry),
 });
 const reasoningTraces = { enabled: (dir) => require('./chat-framing.cjs').readPreferences(dir).keepReasoningTraces === true,
@@ -969,14 +950,17 @@ const chatVaultMirror = vaultMirrorLib.createChatVaultMirror({
   index: { read: (userId) => vaultMirrorLib.readIndex(workspaceStore.get(userId).dir), write: (userId, state) => vaultMirrorLib.writeIndex(workspaceStore.get(userId).dir, state) },
   log: (...args) => console.warn(...args),
 });
-projectsChangedElsewhere = (userId) => chatVaultMirror.schedule(userId, null);
+// rust-chat-mirror-v1: the Rust front decides when the mirror and the brains run (it tails the change journal, debounces,
+// retries); this process does their work (rust-chat-mirror.cjs) and tells the front what only it sees.
+const chatMirrorClient = require('./rust-chat-mirror.cjs').createScheduleClient({ store: PROJECT_STORE });
+projectsChangedElsewhere = (userId) => chatMirrorClient.schedule(userId, null);
 // #742: each mirrored chat gets a small "brain" when it goes idle, built by the reasoner role (same
 // engine and budget gate as #740; skipped without a reasoner model). Needs framingReasoner +
 // chatFraming AND the user's mirror opt-in. Stored per chat in the user's own workspace.
 const brainStore = { read: (userId, chatId) => chatBrainLib.readBrain(workspaceStore.get(userId).dir, chatId),
   write: (userId, chatId, record) => chatBrainLib.writeBrain(workspaceStore.get(userId).dir, chatId, record),
   remove: (userId, chatId) => chatBrainLib.removeBrain(workspaceStore.get(userId).dir, chatId) };
-const chatBrains = chatBrainLib.createBrainScheduler({
+const chatBrains = chatBrainLib.createBrainRunner({
   enabled: (userId) => features.enabled('framingReasoner') && vaultMirrorAvailable(userId) && vaultMirrorLib.readPreferences(workspaceStore.get(userId).dir).enabled,
   chat: (userId, chatId) => diaryAsUser(userId, () => [...Array.from(FREE_CHATS), ...PROJECTS.filter((proj) => !diaryExtras.internalProject(proj)).flatMap((proj) => proj.chats || [])].find((c) => c && c.id === chatId) || null),
   readHistory: (userId, chatId) => diaryAsUser(userId, () => readHistory(chatId)),
@@ -986,27 +970,16 @@ const chatBrains = chatBrainLib.createBrainScheduler({
     enabled: () => features.enabled('framingReasoner') && features.enabled('chatFraming'),
     model: () => framingSettings.get().framingReasonerModel,
     complete: require('./framing-reasoner.cjs').createEngineCompletion({ getProvider, providerHeaders, providerId: DEFAULT_PROVIDER_ID, fetch: (...a) => fetch(...a) }),
-    admit: (model, { answerModel, answerIsLocal }) => require('./framing-reasoner.cjs').admitReasoner({ model, answerModel, answerIsLocal,
-      keep: require('./llamacpp-manager.cjs').keepAlongside(), loadRefusal: typeof modelManager.loadRefusal === 'function' ? modelManager.loadRefusal : null }),
+    admit: async (model, { answerModel, answerIsLocal }) => require('./framing-reasoner.cjs').admitReasoner({ model, answerModel, answerIsLocal,
+      keep: await require('./rerank-settings.cjs').withSettings(() => require('./llamacpp-manager.cjs').keepAlongside()), loadRefusal: typeof modelManager.loadRefusal === 'function' ? modelManager.loadRefusal : null }),
     loadedModel: () => lastLoadedModel(),
     log: (entry) => recordDecision('chat-brain', entry),
   }),
-  built: (userId, chatId) => chatVaultMirror.schedule(userId, chatId),
   log: (...args) => console.warn(...args),
 });
-// #2153: transcripts are written by the Rust store alone; its per-user change journal tells Node
-// which chats changed, including history saves Node never sees, so the mirror and brain follow.
-const changeJournal = require('./chat-change-journal.cjs').createChangeJournalReader({
-  read: (userId, after) => PROJECT_STORE.changesRead(userId, after),
-  onChange: require('./chat-change-journal.cjs').scheduleMirrorAndBrain({ chatVaultMirror, chatBrains }),
-  onRescan: (userId) => chatVaultMirror.schedule(userId),
-  stamp: (userId) => require('./chat-change-journal.cjs').fileStamp(DATA_DIR, userId),
-  // Chat port S3: the users the Rust front saw, so one who only uses its routes is still read.
-  activity: require('./chat-activity.cjs').createActivitySource({ dataDir: DATA_DIR }),
-});
-afterNativeReady(() => changeJournal.start());
-// #2190: the Rust front owns the mirror preferences; a save that turns the mirror on nudges it here.
-afterNativeReady(() => require('./rust-vault-mirror-preferences.cjs').startNudges({ dataDir: DATA_DIR, schedule: chatVaultMirror.schedule }));
+// #2153: transcripts are written by the Rust store alone; the front tails its per-user change journal and runs
+// the mirror and brain schedules (rust-chat-mirror-v1). It calls these two executors on loopback.
+const chatMirrorBridge = require('./rust-chat-mirror.cjs').createExecutorBridge({ secret: FRONT_SECRET, json, readJson, mirror: chatVaultMirror, brains: chatBrains });
 // #682: a decision experiment switched on that cannot run (no service, or one without `choice`)
 // says so once at startup; Settings shows the same reason, and the chat path skips it silently.
 for (const [key, id] of [['COWORK_DECISION_MODEL', process.env.COWORK_DECISION_MODEL], ['COWORK_SENSITIVITY_DECISION_MODEL', process.env.COWORK_SENSITIVITY_DECISION_MODEL]]) {
@@ -1126,7 +1099,7 @@ const modelManagerScanCache = require('./rust-model-manager-scan-cache.cjs').cre
   secret: FRONT_SECRET, json, readJson, service: modelService,
 });
 const modelRoutes = require('./routes/models.cjs').createModelRoutes({
-  json, readBody, readJson, fetchJson, env: process.env, modelManager, currentWorkspace, service: modelService, inferenceBudget, idleUnload, decisionSettings, rerankSettings,
+  json, readBody, readJson, fetchJson, env: process.env, modelManager, currentWorkspace, service: modelService, inferenceBudget, idleUnload, decisionSettings,
 });
 // State only this process knows, published for the Rust front (published-snapshot.cjs): the retrieval
 // status behind GET /api/health (rust-health.cjs) and the served catalogue and machine models behind
@@ -1255,7 +1228,7 @@ const inferenceMachineRoutes = require('./routes/inference-machines.cjs').create
     ocr: () => require('./document-workers.cjs').resolve('ocr').url || null,
     documents: () => require('./document-workers.cjs').resolve('documents').url || null,
     embedding: () => require('./embedding-config.cjs').current()?.active()?.baseUrl || null,
-    reranker: () => { const t = require('./rerank-target.cjs').rerankTarget(rerankSettings.effectiveEnv()); return t.enabled ? t.baseUrl : null; },
+    reranker: () => require('./rerank-settings.cjs').withSettings(() => { const t = require('./rerank-target.cjs').rerankTarget(rerankSettings.effectiveEnv()); return t.enabled ? t.baseUrl : null; }),
   } });
 // GET /api/ready (#297): unauthenticated, mounted before the session gate below alongside the
 // sign-in routes. isReady is set once startup wiring under require.main finishes (see below).
@@ -1275,9 +1248,10 @@ const autotuneCancelBridge = require('./rust-autotune-cancel-bridge.cjs').create
   secret: FRONT_SECRET, json, readJson, autotune: () => modelManager.autotune,
 });
 
-// With no inference gate, the Rust front's reload holds this process's own maintenance gate (#2210).
+// Row J: a lease of the front's authority pauses this process's chat through this latch (a local-only hold).
 const maintenanceLeases = require('./model-maintenance-lease.cjs').createLeaseRoutes({
-  secret: FRONT_SECRET, json, hold: typeof modelManager.holdMaintenance === 'function' ? () => modelManager.holdMaintenance() : null,
+  barrier: () => modelManager.maintenanceBarrier('Interrupted maintenance is being recovered.'),
+  secret: FRONT_SECRET, json, hold: typeof modelManager.holdMaintenanceLocal === 'function' ? options => modelManager.holdMaintenanceLocal(undefined, options) : null,
 });
 
 // #2303: the front's calibration loads ask this process's load decision (overBudget) first.
@@ -1297,15 +1271,22 @@ function publicHeaders(res) {
   res.setHeader('Permissions-Policy', 'camera=(), microphone=(), geolocation=(), payment=(), usb=(), serial=(), bluetooth=(), hid=(), midi=(), magnetometer=(), gyroscope=(), accelerometer=()');
 }
 
+const autoRolesWriteBridge = require('./rust-auto-roles-write.cjs').createBridge({
+  secret: FRONT_SECRET, json, readJson, service: modelService,
+  asUser: diaryAsUser, user: id => authService.db.prepare('SELECT role FROM users WHERE id=?').get(id),
+});
 async function handleRequestInner(req, res) {
   // The ownership refusals below answer before handleRequestScoped; they carry the same headers.
   publicHeaders(res);
+  if (require('./rust-auto-roles-write.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
+  if (await autoRolesWriteBridge(req, res)) return;
   if (require('./rust-tool-approvals.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   if (require('./rust-idle-unload-read.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   if (await idleUnloadFacts(req, res)) return;
   if (require('./rust-model-downloads-read.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   if (await modelDownloadsFacts(req, res)) return;
   if (require('./rust-autotune-read.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
+  if (await embeddingOwner.handleSourceChanged(req, res, json)) return;
   if (embeddingOwner.handle(req, res, json)) return;
   if (require('./rust-preset-read.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   if (await presetReadBridge(req, res)) return;
@@ -1325,13 +1306,13 @@ async function handleRequestInner(req, res) {
   // (project-catalogue.cjs; written only when it changed).
   projectCatalogue.publish();
   // ... and index or sweep work the front queued in an outbox starts now, not only on the 2 s interval.
-  indexOutbox.kick();
   // GET /api/integrations/storage is the Rust front's (#1071): refused before authentication.
   if (require('./features.cjs').refuseRustStorageRead(req, res, { parseRequestUrl, badRequestUrl, json })) return;
   if (require('./routes/chat-framing.cjs').refuseOwnedPreferences(req, res, { parseRequestUrl, json })) return;
   // And the framing suggestion's POST (chat port S4), with the front's loopback call for the lists and the decision.
   if (require('./rust-chat-framing-suggest.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   if (await chatFramingSuggestBridge(req, res)) return;
+  if (await chatMirrorBridge(req, res)) return;
   if (require('./routes/features.cjs').refuseOwnedFeatures(req, res, { parseRequestUrl, json })) return;
   // The Diary routes that are only a proxy and a policy are the Rust front's (#2185).
   if (require('./rust-diary.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
@@ -1471,9 +1452,9 @@ async function handleRequestScoped(req, res) {
     if (authn && await chatFramingRoutes(req, res, { path: p, authn })) return;
     // #741: a successful change to the user's chats nudges their mirror (debounced; a no-op unless opted in).
     const mirrorNudge = authn ? vaultMirrorLib.mirrorTrigger(req.method, p) : null;
-    // #2153: a history save is the Rust front's; the change journal schedules it (touch: read this user).
-    if (authn) changeJournal.touch(authn.user.id);
-    if (mirrorNudge && typeof res.once === 'function') res.once('finish', () => { if (res.statusCode >= 200 && res.statusCode < 300) { chatVaultMirror.schedule(authn.user.id, mirrorNudge.chatId); if (mirrorNudge.chatId) chatBrains.schedule(authn.user.id, mirrorNudge.chatId); } });
+    // #2153: a history save is the Rust front's; its journal consumer schedules it (touch: this user is active).
+    if (authn) chatMirrorClient.touch(authn.user.id);
+    if (mirrorNudge && typeof res.once === 'function') res.once('finish', () => { if (res.statusCode >= 200 && res.statusCode < 300) { chatMirrorClient.schedule(authn.user.id, mirrorNudge.chatId); } });
     if (authn && await exportRoutes(req, res, { path: p, authn })) return;
     if (authn && await importRoutes(req, res, { path: p, authn })) return;
     if (authn && await accountRoutes(req, res, { path: p, authn })) return;
@@ -1573,13 +1554,7 @@ if (require.main === module) {
   // comfortably past APPROVAL_TIMEOUT_MS, which is the limit that should
   // actually bite. headersTimeout still guards the slow-header attack this
   // setting otherwise protects against.
-  if (davConfig.available) {
-    const handler = require('./dav.cjs').createDavHandler({ auth: authService, settings: davSettings, config: davConfig, files: diaryFiles });
-    const davServer = http.createServer(codeNetGuard.wrap((req, res) => handler(req, res).catch(() => res.destroy()), 'file-sharing'));
-    davServer.requestTimeout = 60000; davServer.headersTimeout = 15000;
-    davServer.setTimeout(60000, socket => socket.destroy());
-    davServer.listen(davConfig.port, davConfig.bindHost, () => console.log(`Diary file sharing listener on port ${davConfig.port}; scope ${davConfig.scope}; per-user opt-in required`));
-  }
+  // Dedicated sharing is owned by the paired native listener (rust-dav-listener.cjs).
   // ── noevia's own MCP server ──────────────────────────────────────────
   //
   // Second listener, loopback only, started only when a port is configured
@@ -1650,9 +1625,7 @@ if (require.main === module) {
   process.on('unhandledRejection', (reason) => {
     console.error('[noevia] unhandled promise rejection:', reason?.stack || reason);
   });
-  // #1806: inline source text moves to per-source files before the first request (workspace.cjs).
-  try { workspaceStore.migrateSourceText(authService.listUsers().map((u) => u.id)); }
-  catch (e) { console.warn('[sources] startup migration skipped:', e?.message || e); }
+  // Source-text startup migration is owned by the paired native front.
   server.listen(PORT, HOST, () => {
     processReady = true;
     console.log(`cowork-ui listening on http://${HOST}:${PORT} (inference: ${INFERENCE_BASE}, manager: ${modelManager.kind}, diary: ${DIARY_BASE}, mcp: ${mcpWiring.enabled() ? MCP_SERVERS.map((sv) => sv.id).join('+') : 'disabled'})`);

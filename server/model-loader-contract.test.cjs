@@ -1,7 +1,10 @@
 'use strict';
 // Keeps docs/spec-model-loader-api-v1.md in step with the code on both sides of the web to
-// model-loader contract (#269): the routes model-loader serves (services/model-manager/app/api.py)
-// and the routes web calls (server callers and the admin UI through /api/model-manager).
+// model-loader contract (#269): the routes model-loader serves and the routes web calls (server
+// callers and the admin UI through /api/model-manager). Since noevia-services#216 the Python
+// model-manager is gone and the native noevia-model-manager (noevia-rs) is the only server: its
+// routes come from tests/fixtures/model-manager-routes.v1.json, which tools/gen-model-manager-routes.cjs
+// reads from `ROUTES` in routing.rs and CI re-checks against the pinned noevia-rs source.
 // A route added or removed on either side fails here until the doc table is updated.
 const test = require('node:test'), assert = require('node:assert/strict'), fs = require('node:fs'), path = require('node:path');
 
@@ -25,17 +28,22 @@ function documented() {
   return rows;
 }
 
+const routesFixture = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'tests', 'fixtures', 'model-manager-routes.v1.json'), 'utf8'));
+
+// Routes the native manager serves as optional parent extensions (routing.rs: "Existing parent
+// extensions", available only when the embedding service / idle unloader is configured). The Python
+// app never had them and the v1 contract doc does not list them, so the doc table is compared against
+// everything else; /health and /backends/{name}/logs are also extensions but are documented.
+const UNDOCUMENTED_EXTENSIONS = ['GET /api/v1/embedding-service', 'PUT /api/v1/embedding-service', 'GET /api/v1/idle-unload', 'PUT /api/v1/idle-unload'].map(k => key(...k.split(' ')));
+
 function served() {
-  const src = read('services', 'model-manager', 'app', 'api.py');
-  assert.match(src, /APIRouter\(prefix="\/api\/v1"\)/);
   const out = new Set();
-  for (const m of src.matchAll(/^@router\.(get|post|put|delete|patch)\(\s*"([^"]*)"/gm)) out.add(key(m[1].toUpperCase(), '/api/v1' + m[2]));
-  // #1962: routes the always-native parent serves itself (noevia#1071); the Python app lists them
-  // in NATIVE_OWNED_ROUTES and refuses them, so api.py has no handler for them any more.
-  const main = read('services', 'model-manager', 'app', 'main.py');
-  const owned = main.match(/^NATIVE_OWNED_ROUTES = frozenset\(\{(.*)\}\)$/m);
-  assert.ok(owned, 'NATIVE_OWNED_ROUTES not found in model-manager/app/main.py');
-  for (const m of owned[1].matchAll(/\("([A-Z]+)",\s*"([^"]+)"\)/g)) out.add(key(m[1], m[2]));
+  for (const [method, route] of routesFixture.routes) {
+    assert.match(route, /^\/api\/v1\//, `route outside /api/v1: ${route}`);
+    const k = key(method, route);
+    assert.ok(!out.has(k), `duplicate served route ${k}`);
+    out.add(k);
+  }
   return out;
 }
 
@@ -88,9 +96,11 @@ const diff = (a, b) => [...a].filter(x => !b.has(x)).sort();
 
 test('the doc route table matches the routes model-loader serves', () => {
   const doc = new Set(documented().keys()), code = served();
-  assert.ok(code.size > 30, 'api.py route scan looks broken');
-  assert.deepEqual(diff(code, doc), [], 'routes in api.py that the contract doc does not list');
-  assert.deepEqual(diff(doc, code), [], 'routes in the contract doc that api.py no longer serves');
+  assert.ok(code.size > 30, 'the model-manager route fixture looks broken');
+  for (const k of UNDOCUMENTED_EXTENSIONS) assert.ok(code.has(k), `${k} is listed as an undocumented extension but is no longer served; drop it from UNDOCUMENTED_EXTENSIONS`);
+  const documentedScope = new Set([...code].filter(k => !UNDOCUMENTED_EXTENSIONS.includes(k)));
+  assert.deepEqual(diff(documentedScope, doc), [], 'routes the native model manager serves that the contract doc does not list');
+  assert.deepEqual(diff(doc, code), [], 'routes in the contract doc that the native model manager no longer serves');
 });
 
 test('every route web calls is served, and the doc marks each caller kind', () => {
@@ -111,7 +121,8 @@ test('the documented single-writer contract matches the web client', () => {
   assert.match(w, /,30000\)/, 'PUT /models-ini timeout changed; update section 3 of the doc');
   assert.match(doc, /X-Model-Loader-Token/);
   assert.match(doc, /\| `PUT \/models-ini` \(web `models-ini-writer\.cjs`\) \| 30 s \|/);
-  const py = read('services', 'model-manager', 'app', 'api.py');
-  assert.match(py, /MODELS_INI_MAX_BYTES = 1024 \* 1024/);
+  // The editor limit the doc states (413 over 1 MiB) is the native manager's MODELS_INI_MAX_BYTES.
+  assert.equal(routesFixture.modelsIniMaxBytes, 1024 * 1024);
+  assert.match(doc, /body over 1 MiB/);
   for (const status of ['400', '401', '404', '405', '409', '413']) assert.ok(new RegExp(`\\b${status}\\b`).test(doc), `doc lacks status ${status}`);
 });

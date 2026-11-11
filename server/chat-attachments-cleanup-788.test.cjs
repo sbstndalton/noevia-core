@@ -210,27 +210,7 @@ test("removing an attachments project never purges chats filed under it (#788)",
 // The orphan cleanup (the attachments projects of chats deleted before #788, ten per list) is the Rust workspace list's
 // since the #2191 close-out: noevia-rs tests/workspace.rs.
 
-test('Delete old chats (retention) removes expired chats\' attachments projects through the normal delete (#788)', async () => {
-  const f = fixture();
-  try {
-    const retention = require('./chat-retention.cjs');
-    const now = Date.now(), old = now - 100 * 86400000;
-    f.alice.freeChats.push({ id: 'stale', updatedAt: old }, { id: 'pinned', updatedAt: old, pinned: true }, { id: 'recent', updatedAt: now });
-    const host = seedProject(f.alice, 'proj-host', { chats: [{ id: 'stale-in-project', updatedAt: old }] });
-    const stale = seedProject(f.alice, CONTEXT('stale'));
-    const staleInProject = seedProject(f.alice, CONTEXT('stale-in-project'));
-    const pinned = seedProject(f.alice, CONTEXT('pinned'));
-    const recent = seedProject(f.alice, CONTEXT('recent'));
-    // As index.cjs wires it: the visible lists, removed through deleteChat / deleteFreeChat.
-    const visible = { freeChats: Array.from(f.alice.freeChats), projects: f.alice.projects.filter((p) => !p.id.startsWith('cowork-')) };
-    for (const chat of retention.expired({ ...visible, days: 90, now })) {
-      assert.equal(await (chat.projectId ? f.store.deleteChat(chat.projectId, chat.id) : f.store.deleteFreeChat(chat.id)), true);
-    }
-    await tick();
-    assert.ok(noneExist(stale.paths) && noneExist(staleInProject.paths));
-    assert.ok(allExist(pinned.paths) && allExist(recent.paths) && allExist(host.paths));
-  } finally { f.cleanup(); }
-});
+// The retention sweep (expired chats removed through the normal delete) is native Rust: noevia-rs crates/server-projects/src/retention.rs.
 
 test('a context cleanup failure still lets deleteFreeChat succeed and the chat is gone (#826)', async () => {
   const f = fixture();

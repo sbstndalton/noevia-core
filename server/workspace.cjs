@@ -316,7 +316,7 @@ function createWorkspaceStore(rootDir, defaultProvider, secrets, { projectStore 
       providers: [],
       // #1420: free-chats.json holding null (or any non-list) is an empty list, never a null the routes trip on.
       freeChats: (() => { const list = freeChatsFile.load(); return Array.isArray(list) ? list : []; })(),
-      autoRoles: readJson(path.join(dir, 'auto-roles.json'), null),
+      get autoRoles() { return readJson(path.join(dir, 'auto-roles.json'), null); },
       // Per-user settings with no better home. defaultRouting: what new projects start as.
       preferences: readJson(path.join(dir, 'preferences.json'), {}) || {},
       saveProjects() {
@@ -363,7 +363,6 @@ function createWorkspaceStore(rootDir, defaultProvider, secrets, { projectStore 
         if (saved && typeof saved.then === 'function') return this.storeSaved(saved, 'free-chats.json');
       },
       savePreferences() { this.assertActive(); atomicJson(path.join(dir, 'preferences.json'), this.preferences); },
-      saveAutoRoles() { this.assertActive(); atomicJson(path.join(dir, 'auto-roles.json'), this.autoRoles); },
       historyPath(id) { return path.join(dir, `history-${String(id).replace(/[^a-zA-Z0-9_-]/g, '')}.json`); },
       // sbstndalton/noevia#1071 slice 4: the transcript is written by the Rust store only, for this
       // account only (project-store-client.cjs transcriptsFor). historyPath is for reads.
@@ -402,22 +401,6 @@ function createWorkspaceStore(rootDir, defaultProvider, secrets, { projectStore 
     cache.delete(userId);
     fs.rmSync(dir, { recursive: true, force: true });
   }
-  // #1806: at startup, every workspace whose projects.json still holds source text inline is loaded,
-  // which moves the text to its files (source-text.cjs migrateOnLoad, backup first) before the
-  // first request, and before the Rust front reads the file. Returns the user ids migrated.
-  function migrateSourceText(userIds) {
-    const done = [];
-    for (const userId of userIds) {
-      try {
-        if (removed.has(userId) || cache.has(userId)) continue;
-        const projects = readJson(path.join(userDir(userId), 'projects.json'), { projects: [] }).projects;
-        if (!Array.isArray(projects) || !sourceText.hasInline(projects)) continue;
-        get(userId);
-        done.push(userId);
-      } catch (e) { console.warn(`[sources] could not move source text out of projects.json for ${userId}: ${e.message}`); }
-    }
-    return done;
-  }
   // Whether this process must stop working for an account: removed by it, or no longer in the auth database. The Rust
   // front deletes accounts and tells this process nothing, so the database is asked (#2191 round 9), but not on every
   // call: rag asks once per chunk, so an "exists" answer is kept for USER_CHECK_MS. "Gone" is latched, like remove(),
@@ -444,7 +427,7 @@ function createWorkspaceStore(rootDir, defaultProvider, secrets, { projectStore 
     cache.delete(userId);
     return true;
   }
-  return { get, remove, claimLegacy, userDir, migrateSourceText, isRemoved };
+  return { get, remove, claimLegacy, userDir, isRemoved };
 }
 
 module.exports = { createWorkspaceStore, atomicJson };

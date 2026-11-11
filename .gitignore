@@ -2,5 +2,5 @@ server/wasm/
 code-sandbox/wasm/
 tests/fixtures/real-gguf-headers/
 
-# Runtime state written by local runs; never source or image input.
+# Runtime state written by local runs (keys, setup code, databases); never source or image input.
 server/ui-data/
