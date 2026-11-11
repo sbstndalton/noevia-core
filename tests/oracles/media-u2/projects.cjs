@@ -1,0 +1,865 @@
+// Test-only pre-port behavior oracle. Never imported by the server.
+'use strict';
+// ── Projects: the per-user store and everything that changes it ───────────
+// A project is instructions, files, memories and a model; its chats are
+// history keys. This module owns the accessors (getProject, the chat metas,
+// the free-chat list, the transcript files) and the source pipeline: the
+// project folder in the user's storage, the per-project source lock, the RAG
+// bookkeeping and the cleanup that follows a delete.
+//
+// PROJECTS and FREE_CHATS are the request-scoped array views index.cjs
+// builds over the current workspace; everything else is injected so the
+// store can be exercised with fakes (projects.test.cjs).
+
+// The name length cap (#398) lives in one JSON file so the create/edit dialogs
+// (src/project-limits.ts) enforce the same limit the server applies here and in
+// routes/projects.cjs's PATCH handler.
+const { nameMaxLength: PROJECT_NAME_MAX_LENGTH } = require('../../../contracts/project-limits.json');
+
+/**
+ * @param {object} deps
+ * @param {object} deps.fs
+ * @param {object} deps.path
+ * @param {object} deps.reasoningEffort
+ * @param {(body:object) => object} deps.projectAppearance
+ * @param {object} deps.rag
+ * @param {object} deps.storageClient
+ * @param {object} deps.documentSources
+ * @param {object} deps.authService
+ * @param {() => object} deps.currentWorkspace
+ * @param {object[]} deps.PROJECTS       request-scoped view of the workspace's projects
+ * @param {object[]} deps.FREE_CHATS     request-scoped view of the workspace's free chats
+ * @param {(boxes:any) => string[]|null} deps.sanitizeToolboxes
+ * @param {() => string[]} deps.defaultToolboxes
+ * @param {string} deps.PROJECT_ROOT_FOLDER
+ * @param {(storage, connection, root, project) => Promise<string>} deps.createProjectFolder
+ * @param {{ afterDelete: (args:object) => Promise<any> }} deps.projectSweep
+ * @param {(userId:string) => void} [deps.onProjectsChanged]  workspace.cjs's nudge (the chat vault
+ *   mirror) when a refresh took in another writer's change
+ */
+function createProjectStore({
+  fs, path, reasoningEffort, projectAppearance, rag, storageClient, documentSources, authService, currentWorkspace,
+  PROJECTS, FREE_CHATS, sanitizeToolboxes, defaultToolboxes, PROJECT_ROOT_FOLDER, createProjectFolder, projectSweep,
+  onProjectsChanged = () => {},
+}) {
+  // ── Projects config: instructions, files, memories, model ─────────────────
+
+  function saveProjects(projects) {
+    currentWorkspace().assertActive?.();
+    for (const project of projects) require("../../../server/instruction-skills.cjs").reconcile(project);
+    currentWorkspace().projects = Array.from(projects);
+    return currentWorkspace().saveProjects();
+  }
+
+  // #1914: what may only happen once the list change before it is on disk (a history file, a RAG
+  // index, a document's originals removed). Through the Rust project store a save is written later;
+  // `fn` then runs once every save of this workspace asked so far is written, and not at all if one
+  // failed (the promise rejects with that failure; memory is read again from disk). Without the
+  // store, or with nothing in flight, it runs now, as before.
+  function whenSaved(fn) {
+    const workspace = currentWorkspace();
+    const pending = workspace.pendingStoreWrites ? workspace.pendingStoreWrites() : null;
+    const failed = () => (workspace.storeFailed ? workspace.storeFailed() : null);
+    if (!pending) { const f = failed(); if (f) return Promise.reject(f); return fn(); }
+    return pending.then(() => { const f = failed(); if (f) throw f; return fn(); });
+  }
+  /** whenSaved for a step whose caller does not wait: a skipped step is logged, never thrown. */
+  function afterSaved(fn, what) {
+    let r;
+    try { r = whenSaved(fn); } catch (err) { console.warn(`[projects] ${what} failed:`, err.message); return; }
+    if (r && typeof r.then === 'function') r.catch((err) => console.warn(`[projects] ${what} skipped: the list change was not saved (${err.message})`));
+  }
+
+  function getProject(id) {
+    if (currentWorkspace().revoked) return null;
+    const project = PROJECTS.find((p) => p.id === id) || null;
+    // One-time self-heal for a standalone chat's shadow context project created before #352 was
+    // fixed: it always inherited Diary's routing:'manual' template, with no person ever choosing
+    // it (a real choice is only ever recorded by the routing PATCH, which now also sets
+    // routingChosen). Once healed, or once a person picks a routing explicitly, this never
+    // reruns — routingChosen is set either way.
+    if (project && !project.routingChosen && project.routing === 'manual' && typeof project.id === 'string' && project.id.startsWith('cowork-chat-context-')) {
+      project.routing = 'auto';
+      currentWorkspace().saveProjects();
+    }
+    if (project && require('../../../server/instruction-skills.cjs').reconcile(project)) currentWorkspace().saveProjects();
+    return project;
+  }
+
+  // Chats are history keys; each project holds ordered chat metadata.
+  // Self-heal orphaned placeholder entries: a bare chat-id string (or any
+  // non-object) can land in chats[] if the follow-up POST /chats never fires
+  // (tab closed mid-send). Every path that hands chat metas to a client must go
+  // through this — the client spreads these into objects and reads .title, so a
+  // bare string reaches the sidebar as a title-less record and throws, blanking
+  // the whole app. The next saveChats drops them from disk for good.
+  function sanitizeChats(chats) {
+    return (chats || []).filter((c) => c && typeof c === 'object' && typeof c.id === 'string');
+  }
+
+  // Each meta: { id, title, updatedAt } — the title is the first user message.
+  function loadChats(projectId) {
+    const p = getProject(projectId);
+    if (!p) return [];
+    return sanitizeChats(p.chats);
+  }
+
+  function saveChats(projectId, chats) {
+    const p = getProject(projectId);
+    if (!p) return [];
+    const lists = require('../../../server/chat-lists.cjs');
+    const elsewhere = chatIdsElsewhere(p.id);
+    p.chats = lists.mergeChats(p.chats, chats, lists.readTombstones(currentWorkspace().dir), elsewhere);
+    saveProjects(PROJECTS);
+    // The incoming ids the elsewhere-dedupe dropped (#765), so a stale tab learns to refresh.
+    return lists.skippedElsewhere(chats, elsewhere);
+  }
+
+  // Chat ids held by any list of this workspace other than `listId` (a project id, or null for
+  // the free list). A whole-list save skips these, so a stale tab cannot resurrect a moved chat
+  // into its old list (#755). Request-scoped: PROJECTS and FREE_CHATS are the caller's own.
+  function chatIdsElsewhere(listId) {
+    const ids = new Set();
+    if (listId !== null) for (const c of FREE_CHATS) if (c && typeof c.id === 'string') ids.add(c.id);
+    for (const proj of PROJECTS) if (proj && proj.id !== listId) for (const c of proj.chats || []) if (c && typeof c.id === 'string') ids.add(c.id);
+    return ids;
+  }
+
+  // sbstndalton/noevia#1071 slice 6: a chat's delete is one Rust store operation (noevia-rs
+  // crates/server-projects chat_delete, through project-store-client.cjs chatDelete), run under the
+  // per-user transcript lock: the tombstone (#554), the list without the chat written by the store,
+  // and only then (#1914) the transcript, context meter, brain note and saved partial reply
+  // (#2147). A failed list save takes the tombstone back and removes nothing; the store's error is
+  // thrown (http.cjs saveFailureReply answers it). Node never removes those files itself, so a
+  // running reply's late write can no longer bring a transcript back (#2154). What Node still owns
+  // is the attachments project (#788: its RAG index files, which Node's indexer writes), removed
+  // here once the chat is gone. Returns a promise for whether a chat was deleted.
+  // `requireGone` (the retention sweep, #2230): the caller is about to say the chat is gone, so a store
+  // that deleted the chat but could not remove its transcript (`leftovers`) is a failure, not a delete.
+  function deleteChat(projectId, chatId, { requireGone = false } = {}) {
+    return deleteThroughStore(chatId, { kind: 'project', projectId, requireGone });
+  }
+
+  async function deleteThroughStore(chatId, { kind, projectId, requireGone = false }) {
+    const workspace = currentWorkspace();
+    if (workspace.revoked) return false;
+    workspace.assertActive?.();
+    const done = await workspace.transcripts.deleteChat(chatId, { kind, projectId, origin: 'remove' });
+    if (!done.deleted) return false;
+    refreshLists(workspace);
+    const attachments = removeChatAttachments(chatId);
+    if (attachments && typeof attachments.then === 'function') await attachments.then(() => true, () => true);
+    if (requireGone && Number(done.leftovers) > 0) throw Object.assign(new Error('The chat was removed but its transcript could not be.'), { status: 503, code: 'LEFTOVERS' });
+    return true;
+  }
+
+  // The lists as the store left them (as applyChatMeta reads them again), so this request's view
+  // no longer holds the deleted chat. A save still in flight keeps its base; its merge takes the
+  // store's removal (rust-projects.cjs mergeIdList: a removal on either side wins).
+  function refreshLists(workspace) {
+    const view = typeof workspace.current === 'function' ? workspace.current() : workspace;
+    const projectsChanged = view.projectsFile ? view.projectsFile.refresh(view.projects) : false;
+    const freeChanged = view.freeChatsFile ? view.freeChatsFile.refresh(view) : false;
+    if (projectsChanged || freeChanged) onProjectsChanged(view.userId);
+  }
+
+  // ── A free chat's hidden attachments project (#788) ──────────────────────
+  // Opening a free chat creates `cowork-chat-context-<chatId>` (routes/projects.cjs, the free
+  // context route) to hold its attachments, images and model choice. It belongs to that chat id
+  // and to nothing else, so it goes when the chat is deleted, through deleteProject: the same
+  // cleanup a project delete runs. Only that one id, only in the caller's own workspace (PROJECTS
+  // is request-scoped), never a regular project: chatProjectId only ever yields the context prefix.
+  // Its chat list is NOT purged (a context project is not meant to hold chats; if one somehow
+  // does, those chats are not this delete's to remove). Best effort: the chat delete has already
+  // committed, and a failure here leaves an orphan that the Rust front's workspace list removes later.
+  function removeChatAttachments(chatId) {
+    const id = require('../../../server/diary-extras.cjs').chatProjectId(chatId);
+    if (!id || !PROJECTS.some((p) => p && p.id === id)) return false;
+    const warn = (err) => { console.warn(`[projects] could not remove the attachments of deleted chat ${chatId}: ${String((err && err.message) || err)}`); return false; };
+    try { const r = deleteProject(id, { purgeChats: false }); return r && typeof r.then === 'function' ? r.catch(warn) : r; }
+    catch (err) { return warn(err); }
+  }
+
+  // The attachments projects of chats deleted before #788 are removed by the Rust front's workspace list
+  // (noevia-rs crates/server-projects workspace.rs reap_orphan_contexts, rust-workspace.cjs): tombstone-proven,
+  // ten per list, through the project delete without its chats.
+
+  // Deleting a project deletes its chats too (#554): each one through the store's delete as a chat
+  // no list holds any more (kind 'unlisted', #1071 slice 6: tombstone, transcript, context meter,
+  // brain note, partial reply, under the transcript lock), then its attachments project. A chat
+  // that another list holds by now (moved meanwhile) is refused by the store and keeps its files.
+  // Best effort, one chat at a time; tenant-scoped (the workspace's own store client).
+  async function purgeProjectChats(project) {
+    const workspace = currentWorkspace();
+    for (const chat of project?.chats || []) {
+      if (!chat || typeof chat.id !== 'string') continue;
+      try {
+        const done = await workspace.transcripts.deleteChat(chat.id, { kind: 'unlisted', origin: 'remove' });
+        if (done.listed) continue;
+      } catch (err) {
+        console.warn(`[projects] could not delete chat ${chat.id} of a deleted project: ${String((err && err.message) || err)}`);
+        continue;
+      }
+      const attachments = removeChatAttachments(chat.id);
+      if (attachments && typeof attachments.then === 'function') await attachments.catch(() => false);
+    }
+  }
+
+  // Free (non-project) chat metas — persisted server-side so recent chats
+  // survive across browsers/devices (localStorage was the only home before).
+  // #778 routing flags on a chat's meta, set by a chat turn after its route choice (which can
+  // wait a long time). The workspace's lists were read when the turn started; while the Rust
+  // front saves the lists (M4), it may have changed this chat meanwhile (a new title, or the chat
+  // itself first saved there), so both coordinated files are read again first and only the flags
+  // are changed on what is on disk now (sbstndalton/noevia#1426).
+  function setChatFlags(projectId, chatId, patch) {
+    return applyChatMeta(projectId, chatId, (meta) => { Object.assign(meta, patch); return true; });
+  }
+
+  // #1426/#1785/#1917: a chat turn's change to one meta (its routing flags, its generated title),
+  // made after the turn's long wait: both coordinated files are read again first and only that meta
+  // changes. The turn streams, so it cannot be told a save failed: through the Rust project store
+  // the change is applied to the live view of the account (`current()`: a view dropped after a
+  // failed save is replaced by one read from disk) and, if its save fails, applied once more to
+  // the view read again after that failure. `change(meta)` returns whether it changed the meta.
+  function applyChatMeta(projectId, chatId, change, retried = false) {
+    const held = currentWorkspace();
+    const workspace = typeof held.current === 'function' ? held.current() : held;
+    const projectsChanged = workspace.projectsFile ? workspace.projectsFile.refresh(workspace.projects) : false;
+    const freeChanged = workspace.freeChatsFile ? workspace.freeChatsFile.refresh(workspace) : false;
+    if (projectsChanged || freeChanged) onProjectsChanged(workspace.userId);
+    const project = projectId ? (workspace.projects || []).find((p) => p && p.id === projectId) : null;
+    if (project && workspace === held) getProject(projectId); // its self-heal, as before
+    const list = projectId ? project?.chats : workspace.freeChats;
+    const meta = Array.isArray(list) ? list.find((c) => c && c.id === chatId) : null;
+    if (!meta || !change(meta)) return false;
+    let saved;
+    if (projectId) { for (const p of workspace.projects) require('../../../server/instruction-skills.cjs').reconcile(p); saved = workspace.saveProjects(); }
+    else saved = workspace.saveFreeChats();
+    if (saved && typeof saved.then === 'function' && !retried) {
+      saved.catch(() => {
+        let fresh;
+        try { fresh = typeof workspace.current === 'function' ? workspace.current() : workspace; } catch { return; } // #1919: account gone
+        // The held view's current() is now the one read again: the retry applies there.
+        if (fresh !== workspace) applyChatMeta(projectId, chatId, change, true);
+      });
+    }
+    return true;
+  }
+
+  // #1785: a title generated after the chat's first reply. Same re-read as setChatFlags; the title is changed only
+  // while the stored one is still derived from the first message (or missing), so a name the person gave wins.
+  function setChatTitle(projectId, chatId, title, firstMessage) {
+    if (typeof title !== 'string' || !title.trim()) return false;
+    const chatTitle = require('../../../server/chat-title.cjs');
+    return applyChatMeta(projectId, chatId, (meta) => {
+      if (!chatTitle.isDerivedTitle(meta.title, firstMessage)) return false;
+      meta.title = title.trim().slice(0, chatTitle.TITLE_MAX);
+      return true;
+    });
+  }
+
+  // #1785: whether a chat still carries the title derived from its first message (or has no saved meta yet), so a
+  // generated title may still replace it. A chat whose first reply was stopped stays auto-named until a reply completes.
+  function chatAutoNamed(projectId, chatId, firstMessage) {
+    const list = projectId ? getProject(projectId)?.chats : FREE_CHATS;
+    const meta = Array.isArray(list) ? list.find((c) => c && c.id === chatId) : null;
+    return !meta || require('../../../server/chat-title.cjs').isDerivedTitle(meta.title, firstMessage);
+  }
+
+  function saveFreeChats(list) {
+    currentWorkspace().freeChats = Array.from(list);
+    currentWorkspace().saveFreeChats();
+  }
+
+  function deleteFreeChat(chatId, { requireGone = false } = {}) {
+    return deleteThroughStore(chatId, { kind: 'free', requireGone });
+  }
+
+  // Project DELETE (moved here from routes/projects.cjs so a chat's attachments project, #788, is
+  // removed by exactly the same steps): drop the record; prune its local upload originals, document
+  // pages/originals and image assets (pruneDocuments against the now-absent live record); remove its
+  // RAG index files; tombstone its chats (#554) unless `purgeChats` is false; then sweep the
+  // directories it leaves (D8: empty ones only; in storage only the project's own noevia-allocated
+  // folder, and only when empty — files in storage are never deleted here). Returns whether a project
+  // with that id was removed. Tenant-scoped: PROJECTS and currentWorkspace() are the caller's own.
+  function deleteProject(id, { purgeChats = true } = {}) {
+    const removedProject = getProject(id);
+    const before = PROJECTS.length;
+    const keptProjects = Array.from(PROJECTS).filter((pr) => pr.id !== id);
+    PROJECTS.splice(0, PROJECTS.length, ...keptProjects);
+    if (PROJECTS.length === before) return false;
+    saveProjects(PROJECTS);
+    // #1914: its documents, RAG index and chats go only once the removal is on disk. Returns true,
+    // or a promise for it through the Rust project store (rejecting, with nothing removed, when
+    // the save failed).
+    const workspace = currentWorkspace();
+    return whenSaved(() => {
+      if (removedProject) pruneDocuments(removedProject);
+      // Drop the project's RAG index too (best-effort).
+      try {
+        for (const suffix of ['.db', '.db-wal', '.db-shm']) {
+          fs.rmSync(path.join(workspace.ragDir(), `${id}${suffix}`), { force: true });
+        }
+      } catch { /* best effort */ }
+      if (!removedProject) return true;
+      sweepDeletedProject(removedProject);
+      return purgeChats ? purgeProjectChats(removedProject).then(() => true) : true;
+    });
+  }
+
+  // Creates, saves and indexes a project from a create request body. Throws { status: 400 } on
+  // invalid input. Shared by POST /api/projects and conversation import.
+  async function createProject(body) {
+    if (body.reasoningEffort !== undefined && !reasoningEffort.validEffort(body.reasoningEffort)) throw Object.assign(Error('Invalid reasoning effort'), { status: 400 });
+    const name = String(body.name || '').trim().slice(0, PROJECT_NAME_MAX_LENGTH);
+    if (!name) throw Object.assign(Error('name required'), { status: 400 });
+    let modes = ['chat'];
+    if (body.modes !== undefined) { try { modes = require('../../../server/project-modes.cjs').sanitize(body.modes); } catch (e) { throw Object.assign(Error(e.message), { status: 400 }); } }
+    let appearance;
+    try { appearance = projectAppearance(body); } catch (e) { throw Object.assign(Error(e.message), { status: 400 }); }
+    const project = {
+      ...appearance,
+      id: `proj-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      name,
+      goal: String(body.goal || '').slice(0, 2000),
+      instructions: String(body.instructions || '').slice(0, 8000),
+      pinned: false,
+      archived: false,
+      sourceFolders: [],
+      memories: [],
+      files: Array.isArray(body.files)
+        ? body.files
+            .filter((f) => f && typeof f.name === 'string' && typeof f.content === 'string')
+            .slice(0, 20)
+            .map((f) => ({ name: f.name.slice(0, 200), content: f.content.slice(0, 200000) }))
+        : [],
+      model: typeof body.model === 'string' && body.model ? body.model : undefined,
+      provider: typeof body.provider === 'string' && body.provider ? body.provider : undefined,
+      reasoningEffort: body.reasoningEffort,
+      // Explicit choice, else the user's default (Models → Routing), else Auto (the user's call,
+      // 2026-09-21). Unconfigured Auto uses the project model.
+      routing: body.routing === 'manual' || body.routing === 'auto' ? body.routing : currentWorkspace()?.preferences?.defaultRouting === 'manual' ? 'manual' : 'auto',
+      modes,
+      toolboxes: sanitizeToolboxes(body.toolboxes) || [...defaultToolboxes()], // step 14: core only by default
+      // #1522: Automatic unless the request chose Manual. Without this the stored list alone reads as Manual.
+      toolsMode: require('../../../server/tools-mode.cjs').initialToolsMode(body),
+      // (files normalization below is shared with the config route's RAG bookkeeping)
+      chats: [],
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+    };
+    // Files sent with the create call are uploads: the Project documents box comes with them
+    // (#659), unless the caller chose the toolboxes itself.
+    if (!Array.isArray(body.toolboxes)) {
+      require('../../../server/project-docs-default.cjs').applyProjectDocsDefault(project, {
+        offered: (id) => (sanitizeToolboxes([id]) || []).includes(id), defaults: defaultToolboxes(), hadUploads: false });
+    }
+    // Reserve (name, never create) the unique folder path now so same-named projects stay distinct.
+    try {
+      const conn = authService.getStorage(currentWorkspace().userId, true);
+      if (storageClient.isBrowsable(conn)) project.reservedFolder = require('../../../server/project-folders.cjs').reserveProjectFolder(conn, PROJECT_ROOT_FOLDER, project, PROJECTS);
+    } catch { /* no storage: the first upload allocates */ }
+    // The project's own storage folder is NOT created here (#589). Every upload path creates it on
+    // the first upload (ensureProjectFolder) and attaches it as a source at that moment, so a
+    // project that never receives a file leaves nothing behind in the user's storage.
+    PROJECTS.unshift(project);
+    saveProjects(PROJECTS);
+    // #687: files that arrived with the create call are stored like any upload when storage is
+    // connected: in the project's folder (created now, since there is a file for it), as real files.
+    // Otherwise, or if storage fails, they stay as noevia's own plain-named copies; the first edit
+    // of one moves it into the folder (writeProjectTextFile's adoptTo).
+    if (project.files.length) await storeCreateFiles(project);
+    // Index any files that arrived with the create call (same RAG bookkeeping
+    // as the config route).
+    for (const f of project.files) {
+      indexSource(project, f);
+    }
+    return project;
+  }
+
+  async function storeCreateFiles(project) {
+    let connection;
+    try { connection = authService.getStorage(currentWorkspace().userId, true); } catch { return; }
+    if (!storageClient.isBrowsable(connection)) return;
+    const uploads = require('../../../server/uploads.cjs');
+    try {
+      await withSourceLock(project, async () => {
+        if (getProject(project.id) !== project) return;
+        // Only files that will actually be stored: no folder is created for nothing (#589).
+        const storable = (f) => {
+          if (f.source || f.attachment || f.name.includes('/') || uploads.classify(f.name) !== 'Text') return false;
+          try { uploads.validate(f.name, Buffer.from(f.content, 'utf8')); return true; } catch { return false; }
+        };
+        const pending = project.files.filter(storable);
+        if (!pending.length) return;
+        if (!project.projectFolder) {
+          const folder = await ensureProjectFolder(project);
+          if (!folder) return;
+          project.projectFolder = folder;
+          project.sourceFolders = [...new Set([...(project.sourceFolders || []), folder])];
+          saveProjects(PROJECTS);
+        }
+        for (const inline of pending) {
+          let file;
+          try {
+            // Create-only: on case-insensitive storage a case-variant name (or an upload landing
+            // meanwhile) must not replace a file already there; this one then stays in noevia.
+            file = await uploads.ingest(currentWorkspace(), project, inline.name, Buffer.from(inline.content, 'utf8'), { connection, storageImpl: storageClient, ifNoneMatch: '*' });
+          } catch (err) {
+            console.warn(`[projects] could not store a file of new project ${project.id} in storage; it stays in noevia: ${String((err && err.message) || err)}`);
+            continue;
+          }
+          if (getProject(project.id) !== project) return;
+          project.files = project.files.filter((f) => f === inline || f.name !== file.name).map((f) => (f === inline ? file : f));
+        }
+        project.updatedAt = Date.now();
+        saveProjects(PROJECTS);
+      });
+    } catch (err) {
+      console.warn(`[projects] storing the files of new project ${project.id} failed; they stay in noevia: ${String((err && err.message) || err)}`);
+    }
+  }
+
+  // ── History reads (JSON per space; the Rust store writes it) ───────────────
+
+  function historyPath(spaceId) {
+    const safe = require('../../../server/chat-lists.cjs').safeChatId(spaceId);
+    // Every id that sanitizes to nothing would share one file.
+    if (!safe) throw Object.assign(new Error('invalid chat id'), { status: 400 });
+    return currentWorkspace().historyPath(safe);
+  }
+
+  function readHistory(spaceId) {
+    try {
+      return JSON.parse(fs.readFileSync(historyPath(spaceId), 'utf8')).history || [];
+    } catch {
+      return [];
+    }
+  }
+
+  // sbstndalton/noevia#1071 slice 4: no writeHistory. The transcript is written by the Rust store
+  // only (workspace.transcripts, project-store-client.cjs transcriptsFor).
+
+  /** Whether `target` is a file this project may delete: one sitting directly in
+   *  a folder the project has attached, including its own.
+   *
+   *  Bounded to attached folders rather than the project's own, because an
+   *  attached folder's files are the user's and deleting them is their call —
+   *  but a project must not be a way to delete a path it was never given.
+   *  Sub-paths are refused, so a nested directory cannot be reached through a
+   *  folder that merely contains it.
+   *
+   *  The target must already be in the canonical form the storage client sends (#784):
+   *  storage-client's safeRelativePath turns a backslash into a separator and collapses
+   *  empty segments, so a target it would rewrite could reach a path these checks never
+   *  saw. A subfolder named directly inside an attached folder still passes here; the
+   *  storage client's deleteFile refuses a collection. */
+  function ownsFile(project, target) {
+    if (!project || typeof target !== 'string' || !target) return false;
+    if (require('../../../server/storage-client.cjs').safeRelativePath(target) !== target) return false;
+    // A file noevia itself stored in one of its type groups, including a folder import's nested path
+    // (#1805: `<group>/docs/api/auth.md`). It must be a recorded source by that exact canonical name;
+    // the canonical check above already refused `.`/`..` segments.
+    if ((project.files || []).some(f => f.name === target && f.attachment && f.source === project.projectFolder && require('../../../server/uploads.cjs').GROUPS.some(g => target.startsWith(`${project.projectFolder}/${g}/`) && target.length > `${project.projectFolder}/${g}/`.length))) return true;
+    const folders = [
+      ...(project.projectFolder ? [project.projectFolder] : []),
+      ...(Array.isArray(project.sourceFolders) ? project.sourceFolders : []),
+    ];
+    return folders.some((folder) => {
+      if (!folder) return false;
+      const prefix = `${folder}/`;
+      if (!target.startsWith(prefix)) return false;
+      const rel = target.slice(prefix.length);
+      return !!rel && !rel.includes('/') && rel !== '.' && rel !== '..';
+    });
+  }
+
+  /** Create this project's folder, returning its path, or null when there is no
+   *  browsable storage to put it in. Never throws: a project must still be
+   *  creatable when storage is down or unconfigured. */
+  async function ensureProjectFolder(project) {
+    return (await ensureProjectFolderDetailed(project)).folder;
+  }
+
+  /** ensureProjectFolder with the reason it failed (#849): `{ folder }` on success, otherwise
+   *  `{ folder: null, loginRejected }` where loginRejected is true when the storage server
+   *  refused the saved login (401/403), so a caller can say that instead of a generic failure.
+   *  Never throws. */
+  async function ensureProjectFolderDetailed(project) {
+    let connection;
+    try {
+      connection = authService.getStorage(currentWorkspace().userId, true);
+    } catch {
+      return { folder: null, loginRejected: false, failure: null };
+    }
+    if (!storageClient.isBrowsable(connection)) return { folder: null, loginRejected: false, failure: null };
+    try {
+      return { folder: await createProjectFolder(storageClient, connection, PROJECT_ROOT_FOLDER, project), loginRejected: false, failure: null };
+    } catch (err) {
+      console.warn(`[projects] could not create folder for project ${project.id}: ${String((err && err.message) || err)}`);
+      // #1428: the failure kind rides along, so the caller says "throttled" or "timed out" rather than
+      // a generic failure; loginRejected stays for callers that only ask about the login.
+      const failure = typeof storageClient.storageFailure === 'function' ? storageClient.storageFailure(err) : null;
+      return { folder: null, loginRejected: typeof storageClient.refusedLogin === 'function' && storageClient.refusedLogin(err), failure };
+    }
+  }
+
+  // Serialize source operations within one authenticated project. Config edits
+  // and deletion can still happen while waiting; recheck ownership before commit.
+  //
+  // Keyed by tenant + project id, not by the project object: the workspace's project list is
+  // rebuilt from disk and by saves, and a lock keyed by object identity would let an upload
+  // holding the old object race one that fetched the new object for the same project (#217).
+  // A nested call for a key this async context already holds runs inline (re-entrant) rather
+  // than queueing behind itself, which would deadlock.
+  const sourceOperations = new Map(); // key -> promise tail
+  const heldSourceLocks = new (require('node:async_hooks').AsyncLocalStorage)();
+  function sourceLockKey(project) {
+    const workspace = currentWorkspace();
+    return JSON.stringify([String(workspace?.userId ?? workspace?.dir ?? ''), String(project?.id ?? '')]);
+  }
+  async function withSourceLock(project, operation) {
+    if (!project || typeof project.id !== 'string' || !project.id) throw new Error('withSourceLock needs a project with an id');
+    const key = sourceLockKey(project);
+    const held = heldSourceLocks.getStore();
+    if (held && held.has(key)) { currentWorkspace().assertActive?.(); return operation(); }
+    const previous = sourceOperations.get(key) || Promise.resolve();
+    const next = previous.catch(() => {}).then(() => heldSourceLocks.run(new Set([...(held || []), key]), () => {
+      currentWorkspace().assertActive?.();
+      return operation();
+    }));
+    sourceOperations.set(key, next);
+    try { return await next; }
+    finally {
+      if (sourceOperations.get(key) === next) {
+        sourceOperations.delete(key);
+        pruneDocuments(project);
+      }
+    }
+  }
+  // #1914: removes files only once the list they are pruned against is on disk (whenSaved).
+  function pruneDocuments(project) {
+    afterSaved(() => pruneDocumentsNow(project), `document cleanup for ${project && project.id}`);
+  }
+  function pruneDocumentsNow(project) {
+    if (sourceOperations.has(sourceLockKey(project))) return;
+    const workspace = currentWorkspace();
+    // The live record for this id, not the (possibly superseded) object the caller held: a
+    // rebuilt project list must not make a stale reference look deleted and prune everything.
+    const live = (workspace.projects || []).find((p) => p && p.id === project.id) || { id: project.id, files: [] };
+    try { documentSources.prune(workspace, live); }
+    catch (err) { console.warn('[documents] cleanup failed:', err.message); }
+    try { require('../../../server/uploads.cjs').prune(workspace, live); }
+    catch (err) { console.warn('[uploads] cleanup failed:', err.message); }
+  }
+  const changedInStorage = (stored) => `"${stored}" changed in storage since noevia last read it (it was edited, moved or deleted there, or storage is now a different account). Nothing was saved. Sync this project's Sources first, then try again.`;
+  // #655: each way the pre-write check can fail says what actually happened. "Changed in storage,
+  // sync first" is only true for a missing file or different bytes; for the rest a sync would not help.
+  const editRefusal = (stored, err) => {
+    const code = err && err.code, upstream = err && err.upstream;
+    if (code === 'unsupported') return `"${stored}" cannot be edited in place: in-place edits are not supported on this storage type (only WebDAV / Nextcloud). Nothing was saved. Use project_create_file to write a new file instead.`;
+    if (code === 'folder') return `"${stored}" is a folder in storage, not a file, so it cannot be edited. Nothing was saved.`;
+    if (upstream === 401 || upstream === 403) return `Storage refused the sign-in while checking "${stored}" (${upstream}), so it was not edited. Nothing was saved. Reconnect storage in Settings → Storage and try again.`;
+    if (upstream === 404 || (err && err.status === 404)) return changedInStorage(stored);
+    return `Storage is unavailable right now, so "${stored}" could not be checked before editing. Nothing was saved. Try again in a moment.`;
+  };
+  /** Before an in-place edit of a stored file (#648): the file must still exist in storage with
+   *  exactly the bytes noevia holds (sha256 === attachment.id), and the server must report an
+   *  ETag, which the write is made conditional on. Without one a change landing between this
+   *  check and the PUT would be overwritten, so the edit is refused (as removeEmptyFolder refuses
+   *  a DELETE without one). Returns the ETag; throws otherwise. */
+  async function confirmStoredVersion(connection, stored, current) {
+    if (!current || !current.attachment || !/^[a-f0-9]{64}$/.test(String(current.attachment.id || ''))) throw new Error(changedInStorage(stored));
+    let version, remoteBytes;
+    try {
+      version = await storageClient.fileVersion(connection, stored);
+      if (!version.exists) throw new Error('missing');
+      remoteBytes = await storageClient.readBinaryFile(connection, stored);
+    } catch (err) {
+      throw new Error(err && err.message === 'missing' ? changedInStorage(stored) : editRefusal(stored, err));
+    }
+    const digest = require('node:crypto').createHash('sha256').update(remoteBytes).digest('hex');
+    if (digest !== current.attachment.id) throw new Error(changedInStorage(stored));
+    if (!version.etag) throw new Error(`"${stored}" cannot be edited in place: this storage server does not report file versions (ETags), so noevia cannot make sure a change made there meanwhile is not overwritten. Nothing was saved. Use project_create_file to write a new file instead.`);
+    return version.etag;
+  }
+  // One write path for server-authored project text files (MCP writes), the
+  // same one a browser upload takes: the file lands in the project's storage folder and is
+  // re-indexed identically.
+  //
+  // An in-place edit (#648) passes `expectName`, the stored name of the file it read, and
+  // `expectContent`, the text it read. The destination is otherwise recomputed from the storage
+  // connection as it is now, so with storage disconnected an upload stored at
+  // `<folder>/Text/notes.md` would be written as a second, local `notes.md` (and the reverse once
+  // storage is connected). So an edit is refused, with nothing written anywhere, unless the
+  // destination is exactly `expectName` and that file still holds `expectContent`.
+  //
+  // `expectAttachment` is the attachment id (the SHA-256 of the stored bytes) of the file the edit
+  // was planned against, or null for a legacy file with no attachment record. The project folder
+  // is a synced source, so noevia's copy can be older than storage: someone may have changed,
+  // moved or deleted the file in Nextcloud since the last sync, or storage may now be another
+  // account's. So for a stored file the edit also reads it back from storage first and refuses
+  // unless it still exists with exactly those bytes, then writes with If-Match on the ETag it saw,
+  // so a change landing in between is refused by the server (412) instead of overwritten.
+  //
+  // `adoptTo` (#687) is set for a plain-named file noevia keeps itself (added in the Create-project
+  // dialog before it stored files, or uploaded while storage was disconnected) in a project whose
+  // storage is connected: the edit moves it into the project folder, at exactly `adoptTo`, the path
+  // the approval card showed. The folder is created then if it does not exist yet (as any first
+  // upload does); the write is refused if the destination is anything but `adoptTo`, if storage is
+  // not connected, or if something already exists at `adoptTo` in storage (checked first, and the
+  // PUT is create-only with If-None-Match, so a file appearing in between is not overwritten).
+  // `adoptAccount` is the storage account (project-edit-target.storageAccount) the move was approved
+  // for; with any other account connected now the write is refused.
+  function writeProjectTextFile(project, name, text, { expectName, expectContent, expectAttachment, adoptTo, adoptAccount } = {}) {
+    return withSourceLock(project, async () => {
+      if (getProject(project.id) !== project) throw new Error('the project changed while writing; nothing was saved');
+      const uploads = require('../../../server/uploads.cjs');
+      const bytes = Buffer.from(text, 'utf8');
+      uploads.validate(name, bytes);
+      const edit = expectName !== undefined;
+      let current = null;
+      if (edit) {
+        if (typeof expectName !== 'string' || !expectName) throw new Error('an edit must name the stored file it changes; nothing was saved');
+        current = (project.files || []).find((f) => f && f.name === expectName);
+        if (!current) throw new Error(`"${expectName}" is no longer in this project; nothing was saved`);
+        if (expectContent !== undefined && String(current.content || '') !== expectContent) throw new Error(`"${expectName}" changed while this edit was being made; nothing was saved. Read it again and retry.`);
+        // Same stored version as planned, and still fully read text: a sync that re-read the file
+        // (new bytes, or now partial) in between means the plan is stale.
+        const currentId = current.attachment ? current.attachment.id : null;
+        if (currentId !== (expectAttachment === undefined ? null : expectAttachment) || (current.attachment && current.attachment.state !== 'ready')) {
+          throw new Error(`"${expectName}" changed since this edit was prepared; nothing was saved. Sync this project's Sources, read it again and retry.`);
+        }
+      }
+      const connection = authService.getStorage(currentWorkspace().userId, true);
+      const remote = storageClient.isBrowsable(connection) ? connection : null;
+      let ifMatch, ifNoneMatch;
+      const adopt = edit && adoptTo !== undefined;
+      if (adopt) {
+        if (typeof adoptTo !== 'string' || !adoptTo || current.source || current.name.includes('/') || current.name !== name) throw new Error(`"${expectName}" cannot be moved into the project folder; nothing was saved`);
+        if (!remote) throw new Error(`"${expectName}" was to be saved as "${adoptTo}" in this project's storage, which is not connected right now, so nothing was saved. Reconnect storage and try again.`);
+        if (typeof adoptAccount !== 'string' || !adoptAccount || require('../../../server/project-edit-target.cjs').storageAccount(remote) !== adoptAccount) {
+          throw new Error(`"${expectName}" was approved to be saved as "${adoptTo}" in a different storage account than the one connected now, so nothing was saved. Ask again to save it in this one.`);
+        }
+        if (!project.projectFolder) {
+          const folder = await ensureProjectFolder(project);
+          if (!folder) throw new Error(`Could not create this project's storage folder, so "${expectName}" was not edited. Nothing was saved. Check the storage connection and try again.`);
+          // Recorded at once, as an upload does: the folder now exists in storage whatever happens next.
+          project.projectFolder = folder;
+          project.sourceFolders = [...new Set([...(project.sourceFolders || []), folder])];
+          saveProjects(PROJECTS);
+        }
+        const destination = uploads.destinationFor(project, name, { connection: remote });
+        if (destination !== adoptTo) throw new Error(`saving now would write "${destination}" instead of "${adoptTo}", the file that was approved; nothing was saved. Ask again to edit it there.`);
+        let version;
+        try { version = await storageClient.fileVersion(remote, adoptTo); }
+        catch (err) { throw new Error(editRefusal(adoptTo, err)); }
+        if (version.exists) throw new Error(`"${adoptTo}" already exists in storage and noevia has not read it, so it was not overwritten. Nothing was saved. Sync this project's Sources, then edit that file.`);
+        ifNoneMatch = '*';
+      } else if (edit) {
+        const destination = remote && project.projectFolder ? uploads.destinationFor(project, name, { connection: remote }) : remote ? null : name;
+        if (destination !== expectName) {
+          throw new Error(remote
+            ? `saving now would write "${destination || name}" instead of editing "${expectName}" in place; nothing was saved`
+            : `"${expectName}" is kept in this project's storage, which is not connected right now, so it cannot be edited in place; nothing was saved. Reconnect storage and try again.`);
+        }
+        if (remote) ifMatch = await confirmStoredVersion(remote, expectName, current);
+      } else if (remote && !project.projectFolder) project.projectFolder = await ensureProjectFolder(project);
+      let file;
+      try {
+        file = await uploads.ingest(currentWorkspace(), project, name, bytes, { connection: remote, storageImpl: storageClient, ...(adopt ? { ifNoneMatch } : edit && remote ? { ifMatch } : {}) });
+      } catch (err) {
+        if (adopt && err && err.code === 'changed') throw new Error(`"${adoptTo}" appeared in storage while this edit was being saved, so it was not overwritten. Nothing was saved. Sync this project's Sources, then edit that file.`);
+        if (err && err.code === 'changed') throw new Error(changedInStorage(expectName));
+        if (edit && err && err.code === 'unknown') throw new Error(`The connection to storage failed while saving "${adopt ? adoptTo : expectName}", so noevia cannot tell whether the edit landed. Outcome unknown: sync this project's Sources to check whether it was saved before trying again.`);
+        throw err;
+      }
+      const stored = adopt ? adoptTo : expectName;
+      if (edit && file.name !== stored) throw new Error(`the edit was stored as "${file.name}", not "${stored}"; the project list was not changed`);
+      if (getProject(project.id) !== project) throw new Error('the project was removed while writing; the project list was not changed');
+      if (remote) project.sourceFolders = [...new Set([...(project.sourceFolders || []), project.projectFolder])];
+      // A moved file (#687) leaves its plain-named copy behind in neither the list nor the index.
+      project.files = [...(project.files || []).filter((f) => f && f.name !== file.name && !(adopt && f === current)), file];
+      project.updatedAt = Date.now();
+      indexSource(project, file);
+      saveProjects(PROJECTS);
+      // #1914: the plain copy's index entries go once the list without it is on disk.
+      if (adopt) {
+        const userId = currentWorkspace().userId;
+        // #1919: only if no source of that name is listed again by then (a re-upload's entries stay).
+        afterSaved(() => { if (!(getProject(project.id)?.files || []).some((f) => f && f.name === expectName)) rag.deleteProjectFile(project.id, expectName, userId); }, 'index cleanup');
+      }
+      return file;
+    });
+  }
+  // D8: runs after the delete is saved; empty-only, tenant-scoped, never recursive.
+  function sweepDeletedProject(project) {
+    const workspace = currentWorkspace();
+    let connection = null;
+    try { connection = project.projectFolder ? authService.getStorage(workspace.userId, true) : null; } catch { connection = null; }
+    projectSweep.afterDelete({
+      projectId: project.id,
+      tenantRoot: workspace.dir,
+      localDirs: [require('../../../server/uploads.cjs').directory(workspace, project.id), documentSources.directory(workspace, project.id), workspace.assetDir(project.id)],
+      connection, folder: project.projectFolder || '', root: PROJECT_ROOT_FOLDER, groups: require('../../../server/uploads.cjs').GROUPS,
+    }).catch(error => console.warn('[projects] sweep failed:', error.message));
+  }
+  function indexSource(project, file) {
+    const workspace = currentWorkspace();
+    workspace.assertActive?.();
+    // #1726: with multimodal RAG on, the project's images (this source's, if it is one, or its figures)
+    // are reconciled by the rate-limited media pass; off, this is a no-op.
+    require('./multimodal-rag.cjs').sourceChanged(workspace.userId, project.id);
+    if (require('../../../server/instruction-skills.cjs').inspect(file, project) || !file.content || require('../../../server/source-readability.cjs').isUnreadable(file)) {
+      if (file.document) file.document.indexing = 'unavailable';
+      // #1726: a source with no text (an image) keeps its image vector; only its text rows go.
+      rag.deleteProjectFile(project.id, file.name, workspace.userId, { keepMedia: true });
+      return;
+    }
+    if (file.document) file.document.indexing = 'pending';
+    // #1917: the indexing outcome is recorded on the live view of the account: the one held, or,
+    // when a failed store save dropped it meanwhile, the one read again from disk (same project
+    // and file, by id and name).
+    const mark = (state) => {
+      let live;
+      // #1919: an account removed meanwhile (410) ends this writer; it never recreates the account.
+      try { live = typeof workspace.current === 'function' ? workspace.current() : workspace; } catch { return; }
+      if (!live || live.revoked) return;
+      const p = live === workspace ? (workspace.projects.includes(project) ? project : null) : (live.projects || []).find((x) => x && x.id === project.id);
+      const f = !p ? null : live === workspace ? (project.files.includes(file) ? file : null) : (p.files || []).find((x) => x && x.name === file.name);
+      if (!f || !f.document) return;
+      f.document.indexing = state;
+      try { const saved = live.saveProjects(); if (saved && typeof saved.catch === 'function') saved.catch(() => { /* logged by the workspace; the next pass retries */ }); }
+      catch (err) { console.warn('[documents] could not save index state:', err.message); }
+    };
+    // #2191 round 2: the run's promise, so the index outbox (rust-index-outbox.cjs) acknowledges a job
+    // only once its run settled. Every other caller ignores it, as before.
+    return rag.indexProjectFile(project.id, file.name, file.content, workspace.userId).then(result => {
+      if (workspace.revoked) return;
+      mark(!result?.ok ? 'unavailable' : result.direct ? 'direct' : result.embedded < result.stored ? 'partial' : 'ready');
+    }).catch((error) => {
+      if (workspace.revoked) return;
+      console.warn(`[documents] indexing ${project.id}/${file.name} failed:`, error?.stack || error);
+      mark('failed');
+    });
+  }
+
+  // #1770: read one existing document again from its stored original so it gains figures (figure-sweep.cjs).
+  // Runs in the owner's scope under the project's source lock. The record is replaced only by a readable
+  // result; a failure keeps the current text and marks this version tried (document.figureSweep), except a
+  // transient one (Docling unreachable: the stored result says retryable), which the next pass tries again.
+  async function refreshDocumentFigures(project, file) {
+    return withSourceLock(project, async () => {
+      const workspace = currentWorkspace();
+      const live = () => getProject(project.id) === project && (project.files || []).includes(file) && !!file.document;
+      if (!live()) return { status: 'changed' };
+      const tried = file.document.version;
+      const mark = () => { file.document.figureSweep = tried; saveProjects(PROJECTS); };
+      // #1871: a large original is read under the process-wide large-document lock, read through extraction.
+      const read = await require('../../../server/large-document-lock.cjs').ifLarge(Number(file.document.bytes), async () => {
+        let bytes;
+        try { bytes = documentSources.readOriginal(workspace, project.id, file); } catch { return null; }
+        return documentSources.ingest(workspace, project.id, file.name, bytes, file);
+      }, file.document.byteHash);
+      if (!read) { mark(); return { status: 'missing' }; }
+      const next = read;
+      if (!live() || file.document.version !== tried) return { status: 'changed' };
+      if (next.document.state === 'failed' || next.document.stale) {
+        if (documentSources.retryable(workspace, project.id, next.document.version)) {
+          return { status: 'retry', unreachable: documentSources.serviceDown(next.document.error), error: next.document.error };
+        }
+        mark();
+        return { status: 'failed', error: next.document.error };
+      }
+      // Review of #116: the new reading replaces the current one only when it is no worse: a state at
+      // least as good (ready > partial), non-empty text, and at least as many readable pages. Otherwise
+      // the current text stays and this version is marked tried, so a worse reading never wins later.
+      if (!documentSources.noWorse(file.document, next.document, next.content)) { mark(); return { status: 'worse' }; }
+      const updated = { ...file, content: next.content, document: next.document };
+      project.files = project.files.map((f) => (f === file ? updated : f));
+      indexSource(project, updated);
+      saveProjects(PROJECTS);
+      return { status: 'refreshed' };
+    });
+  }
+
+  // #1869: the #1864/#1865 completion pass, once, for a document uploaded with no storage connection (it is
+  // never read again otherwise), from its stored original, within `ocrBudget` (the backfill's, the sync path's
+  // size). Runs in the owner's scope under the project's source lock. Only a record without the completion
+  // marker is worked on; `document.completionSweep` = the version that needs nothing more (its record parsed
+  // and finished, or COMPLETION_TRIES passes spent on it), so it is never looked at again. A record the budget
+  // left unfinished keeps no marker and goes on in the next pass.
+  // #1881: a record that cannot be read, or a transient (retryable) one, is skipped, never marked finished; a pass
+  // the OCR or extraction service being unreachable cut short does not count as a try; an original whose size is
+  // not recorded is measured on disk, and one over the upload limit is refused unread.
+  // Returns { status: 'complete' (nothing to do) | 'completed' | 'deferred' | 'retry' | 'failed' | 'missing' |
+  // 'skipped' | 'changed', unreachable? }.
+  const COMPLETION_TRIES = 6;
+  async function completeUploadedDocument(project, file, { ocrBudget } = {}) {
+    return withSourceLock(project, async () => {
+      const workspace = currentWorkspace();
+      const live = () => getProject(project.id) === project && (project.files || []).includes(file) && !!file.document;
+      if (!live() || file.source) return { status: 'changed' };
+      const documents = require('../../../server/documents.cjs');
+      const d = file.document;
+      const version = d.version;
+      const dir = documentSources.directory(workspace, project.id);
+      const readRecord = () => { try { return JSON.parse(fs.readFileSync(path.join(dir, `${version}.json`), 'utf8')); } catch { return null; } };
+      const finished = (r) => r.completion === documents.COMPLETION || !Array.isArray(r.pageTexts) || !r.pageTexts.length;
+      const mark = (extra = {}) => { Object.assign(d, { completionSweep: version }, extra); delete d.completionTries; saveProjects(PROJECTS); };
+      const before = readRecord();
+      if (!before || before.retryable) return { status: 'skipped' }; // unreadable or transient: next pass
+      if (finished(before)) { mark(); return { status: 'complete' }; }
+      if (d.extractor !== documents.EXTRACTOR_VERSION) return { status: 'changed' };
+      // The original's size: as recorded, else measured; never NaN into the lock, never over the upload limit.
+      let size = Number(d.bytes);
+      if (!(Number.isSafeInteger(size) && size > 0)) {
+        try { size = fs.statSync(path.join(dir, `${d.byteHash}.pdf`)).size; } catch { mark(); return { status: 'missing' }; }
+      }
+      if (size > require('../../../server/source-limits.cjs').documentLimits().readBytes) { mark(); return { status: 'failed', error: 'the original is larger than the upload limit' }; }
+      const read = await require('../../../server/large-document-lock.cjs').ifLarge(size, async () => {
+        let bytes;
+        try { bytes = documentSources.readOriginal(workspace, project.id, file); } catch { return null; }
+        return documentSources.ingest(workspace, project.id, file.name, bytes, file, ocrBudget ? { ocrBudget } : undefined);
+      }, d.byteHash);
+      if (!read) { mark(); return { status: 'missing' }; }
+      if (!live() || file.document !== d) return { status: 'changed' };
+      const after = readRecord();
+      const done = !!after && !after.retryable && finished(after);
+      // A stop for a passing reason (a worker busy or unreachable): completeDocument retries it on a later read
+      // (bounded by its own RETRY_ATTEMPTS), and it is not one of this document's tries.
+      const passing = !!after && ((after.pageTexts || []).some((p) => p?.retry?.outcome === 'failed' && p.retry.again === true)
+        || (after.stoppedAt?.limit === 'error' && after.completion !== documents.COMPLETION));
+      const failedRead = read.document.version !== version || (read.document.state === 'failed' && d.state !== 'failed');
+      const unreachable = failedRead ? documentSources.serviceDown(read.document.error) : passing;
+      const tries = (Number(d.completionTries) || 0) + (unreachable ? 0 : 1);
+      const marks = done || tries >= COMPLETION_TRIES ? { completionSweep: version } : (tries ? { completionTries: tries } : {});
+      if (failedRead) {
+        // Not this record (the extractor changed meanwhile) or a failure: the current text stays.
+        Object.assign(d, marks); if (marks.completionSweep) delete d.completionTries; saveProjects(PROJECTS);
+        return { status: documentSources.retryable(workspace, project.id, read.document.version) ? 'retry' : 'failed', unreachable, error: read.document.error };
+      }
+      const keep = {};
+      // The search coverage is not kept: the record changed, so the backfill looks at its tail again.
+      for (const k of ['figureSweep', 'completionTries']) if (d[k] !== undefined) keep[k] = d[k];
+      if (marks.completionSweep) delete keep.completionTries;
+      const updated = { ...file, content: read.content, document: { ...read.document, ...keep, ...marks } };
+      const textChanged = String(read.content || '') !== String(file.content || '');
+      project.files = project.files.map((f) => (f === file ? updated : f));
+      if (textChanged) indexSource(project, updated);
+      saveProjects(PROJECTS);
+      return { status: done ? 'completed' : unreachable ? 'retry' : 'deferred', ...(unreachable ? { unreachable: true } : {}) };
+    });
+  }
+
+  return {
+    refreshDocumentFigures, completeUploadedDocument,
+    saveProjects, whenSaved, getProject, sanitizeChats, loadChats, saveChats, chatIdsElsewhere, deleteChat, purgeProjectChats, saveFreeChats, deleteFreeChat, setChatFlags, setChatTitle, chatAutoNamed, createProject,
+    deleteProject, removeChatAttachments,
+    historyPath, readHistory,
+    ownsFile, ensureProjectFolder, ensureProjectFolderDetailed, withSourceLock, pruneDocuments, writeProjectTextFile, sweepDeletedProject, indexSource,
+  };
+}
+
+module.exports = { createProjectStore };

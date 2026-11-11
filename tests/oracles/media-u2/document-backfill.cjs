@@ -1,3 +1,4 @@
+// Test-only pre-port behavior oracle. Never imported by the server.
 'use strict';
 // #1868 / #1869: the paced background work that finishes long and uploaded documents.
 //
@@ -163,9 +164,9 @@ function tailCandidate(file, headCap, textLength) {
  *   paused()              reason | null (a re-index is under way)
  */
 function createDocumentBackfill({ rag, userIds, workspaceFor, runAs, completeUpload, documentDir, paused = () => null,
-  documents = require('./documents.cjs'), limits = () => require('./source-limits.cjs').documentLimits(), textLength = require('./source-text.cjs').textLength,
+  documents = require('../../../server/documents.cjs'), limits = () => require('../../../server/source-limits.cjs').documentLimits(), textLength = require('../../../server/source-text.cjs').textLength,
   diaryProject = require('./multimodal-rag.cjs').diaryProject, env = process.env, sleep = (ms) => new Promise((r) => setTimeout(r, ms)),
-  now = Date.now, log = (line) => console.info(line), fsImpl = fs, largeLock = require('./large-document-lock.cjs'),
+  now = Date.now, log = (line) => console.info(line), fsImpl = fs, largeLock = require('../../../server/large-document-lock.cjs'),
   busy = () => (typeof rag?.foregroundBusy === 'function' ? rag.foregroundBusy() : false) } = {}) {
   const cfg = settings(env);
   // #1881: documents to leave alone for a while (a record that does not match the text, a window that stored

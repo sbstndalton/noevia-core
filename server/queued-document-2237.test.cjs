@@ -44,7 +44,7 @@ test('the problem line and the figure sweep treat queued as waiting', () => {
 });
 
 test('the figure sweep leaves a queued document alone', () => {
-  const { needsFigures } = require('./figure-sweep.cjs');
+  const { needsFigures } = require('../tests/oracles/media-u2/figure-sweep.cjs');
   const hex = 'a'.repeat(64);
   const doc = (state) => ({ name: 'a.pdf', document: { state, extractor: 'docling', version: hex, byteHash: hex, availableVersion: hex } });
   assert.equal(needsFigures(doc('ready')), true, 'control: a read document is swept');

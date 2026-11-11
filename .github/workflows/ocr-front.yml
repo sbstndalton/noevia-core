@@ -25,11 +25,10 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           repository: sbstndalton/noevia-rs
-          # The front owns the embedding background and the RAG index outbox; its --features advertises
-          # rust-embedding-background-v1 and rust-index-outbox-v3, which this Core's boot pairs with
-          # (server/rust-embedding-background.cjs); acceptance input only. The head of the noevia-rs outbox PR
-          # (sbstndalton/noevia-rs#412, move/rag-index-outbox), which contains the embeddings round.
-          ref: 90f10da5ddbad07a8b9949081c9874f01e6f2a46
+          # Immutable acceptance input for the native embedding/outbox/media owner.
+          # Its compiled features include rust-media-background-v1, required by Core boot.
+          # Acceptance input only; release ancestry and checksum gates are unchanged.
+          ref: d30fb58a09073f6dc081654fd2771c77df9e9380
           path: rs
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
