@@ -36,7 +36,7 @@ function createChatListRoutes() {
 
     // GET and POST /api/chats/:id/history are the Rust front's (sbstndalton/noevia#1071 slices 4
     // and 5): index.cjs refuses both before this mount (rust-projects.cjs refuseOwnedRoute). The
-    // Rust store journals each save and chat-change-journal.cjs schedules the mirror and brain.
+    // Rust store journals each save and the front's chat mirror schedule (rust-chat-mirror-v1) schedules the mirror and brain.
     return PASS;
   }
 
