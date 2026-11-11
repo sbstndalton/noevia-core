@@ -40,8 +40,10 @@ test('index.cjs refuses the routes before authentication and builds the client o
   assert.ok(at > 0 && at < index.indexOf('const preAuth = requestAuth.authenticate(req);'));
   assert.match(index, /createChatGptOAuth\(\{\s*db: authService\.db, broker: PROJECT_STORE,/);
   assert.doesNotMatch(index, /createChatGptOAuth\(\{[^}]*secrets:/, 'the client gets no key: it opens no token');
-  const routes = fs.readFileSync(path.join(__dirname, 'routes', 'providers.cjs'), 'utf8');
-  assert.doesNotMatch(routes, /startDeviceLogin|pollDeviceLogin|cancelDeviceLogin/);
+  // The provider routes mount is retired: the residual methods on the sign-in paths are the front's.
+  assert.equal(fs.existsSync(path.join(__dirname, 'routes', 'providers.cjs')), false);
+  assert.doesNotMatch(index, /routes\/providers\.cjs/);
+  assert.doesNotMatch(index, /startDeviceLogin|pollDeviceLogin|cancelDeviceLogin/);
 });
 
 test('chatgpt_oauth_tokens is refused exempt or not, but for the exact rotation reseal', () => {

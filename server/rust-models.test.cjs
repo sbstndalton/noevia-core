@@ -105,12 +105,14 @@ test('through the router: the owned GETs are refused signed out and signed in; t
       assert.equal(r.headers['strict-transport-security'], 'max-age=15552000', url);
     }
   }
-  // Positive controls: the hardware path's other methods keep Node's gate and 405.
-  assert.equal((await request('/api/models/hardware', { method: 'PUT', body: '{}' })).status, 401, 'signed out');
-  const memberPut = await request('/api/models/hardware', { method: 'PUT', headers: as(member), body: '{}' });
-  assert.deepEqual([memberPut.status, memberPut.json], [403, { error: 'administrator required' }]);
-  const adminPut = await request('/api/models/hardware', { method: 'PUT', headers: as(admin), body: '{}' });
-  assert.deepEqual([adminPut.status, adminPut.json], [405, { error: 'Method not allowed' }]);
+  // The hardware path's other methods are residuals the Rust front answers with Node's former gate,
+  // administrator check and 405 (noevia-rs tests/residual_grid.rs): Node refuses them before
+  // authentication, whoever asks.
+  const residual = require('./rust-residual-fallbacks.cjs').ROUTE_REFUSAL;
+  for (const headers of [{}, as(member), as(admin)]) {
+    const put = await request('/api/models/hardware', { method: 'PUT', headers, body: '{}' });
+    assert.deepEqual([put.status, put.json], [503, residual]);
+  }
   // A kept model read still answers here.
   assert.equal((await request('/api/models/machines')).status, 401);
 });
