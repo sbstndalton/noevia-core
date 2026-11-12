@@ -30,6 +30,7 @@
 const crypto = require('node:crypto');
 const { trustedFront } = require('./trusted-front.cjs');
 const { enterChatInference } = require('./chat-admission.cjs');
+const { readCappedJson } = require('./http.cjs');
 
 const PREFIX = '/internal/inference-admission/lease';
 const SESSION_PATH = '/v1/inference-admission/session';
@@ -146,7 +147,7 @@ function createAuthoritySession({ port, token, fetchImpl = globalThis.fetch, boo
       });
     } catch { return current; /* the latches already held end by their own TTL if the front is gone */ }
     let body = null;
-    try { body = await res.json(); } catch { /* unreadable: no change */ }
+    try { body = await readCappedJson(res, 4096); } catch { /* unreadable or oversize: no change */ }
     if (res.status === 410) {
       retired = true;
       log('[models] a newer start of this server registered with the inference admission authority; this one admits nothing');
