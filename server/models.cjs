@@ -21,7 +21,7 @@ const MODEL_READ_TTL_MS = 2000;
 const { isSidecarModel, sidecarModelNames, isSystemModel, modelPathFromArgs } = require('./model-system.cjs');
 
 // #1840: `roleOnMachine(role)` is true for a chat role served by an Inference machine; it is never warmed here.
-function createModelService({ fetchJson, env, modelManager, currentWorkspace, roleOnMachine = () => false, autoRolesWriter }) {
+function createModelService({ fetchJson, env, modelManager, currentWorkspace, roleOnMachine = () => false, autoRolesWriter, modelStateWriter }) {
   // One call to the model management service, with its token. Same path the proxy route uses.
   function managerFetch(rest, method = 'GET') {
     return fetchJson(`${env.MODEL_LOADER_URL.replace(/\/+$/, '')}/api/v1/${rest}`,
@@ -81,6 +81,22 @@ function createModelService({ fetchJson, env, modelManager, currentWorkspace, ro
   // that happened in between is left alone).
   function clearLastLoadedModel(name) {
     if (LAST_LOADED_MODEL === name) LAST_LOADED_MODEL = null;
+  }
+
+  // R3-0: the Rust front is the one writer of this state. A delete asks it (modelStateWriter, the store's
+  // model-state/forget); it clears its own copy and calls back rust-model-state-bridge.cjs, which lands in
+  // forgetModelStateLocal. Only when the front does not answer (or an older front reports Node uncleared)
+  // does this process clear its own copies, so a delete never fails after the file is gone.
+  function forgetModelStateLocal(name) {
+    clearLastLoadedModel(name);
+    if (typeof modelManager.forgetIdentity === 'function') modelManager.forgetIdentity(name);
+  }
+  async function forgetModelState(name) {
+    let answer = null;
+    if (typeof modelStateWriter === 'function') {
+      try { answer = await modelStateWriter(name); } catch (e) { console.warn(`[models] model-state writer unavailable, clearing locally: ${e?.code || e?.message || 'error'}`); }
+    }
+    if (answer?.nodeCleared !== true) forgetModelStateLocal(name);
   }
 
   // ── Auto model router (feature doc Item 4 / master step 12) ───────────────
@@ -316,7 +332,7 @@ function createModelService({ fetchJson, env, modelManager, currentWorkspace, ro
     modelScanSnapshot: () => modelScanCache.snapshot(),
     publishModelScan: (body,token) => modelScanCache.publish(body,token),
     requestModelScanRefresh: token => modelScanCache.refresh(token),
-    autoRoles, clearRoleReferences,
+    autoRoles, clearRoleReferences, forgetModelState, forgetModelStateLocal,
     ensureModelLoaded: (...args) => require('./rerank-settings.cjs').withSettings(() => ensureModelLoaded(...args)),
     ensureRolesLoaded: (...args) => require('./rerank-settings.cjs').withSettings(() => ensureRolesLoaded(...args)),
     servedCatalogue: (...args) => require('./rerank-settings.cjs').withSettings(() => servedCatalogue(...args)), modelsInstalled: (...args) => require('./rerank-settings.cjs').withSettings(() => modelsInstalled(...args)), modelsInstalledFresh: (...args) => require('./rerank-settings.cjs').withSettings(() => modelsInstalledFresh(...args)), invalidateModelReads, installedFacts: (...args) => require('./rerank-settings.cjs').withSettings(() => installedFacts(...args)), deriveUserModelName,

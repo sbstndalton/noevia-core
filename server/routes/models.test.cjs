@@ -61,6 +61,8 @@ function fixture({ env = {}, enabled = true, kind = 'llamacpp', manager = {}, wo
       lastLoadedModel: () => lastLoaded.current,
       clearLastLoadedModel: (name) => { if (lastLoaded.current === name) lastLoaded.current = null; },
       clearRoleReferences: (name) => roleService.clearRoleReferences(name),
+      // R3-0: the service's own fallback path (no front writer): clear this process's copies.
+      forgetModelState: async (name) => { if (lastLoaded.current === name) lastLoaded.current = null; if (typeof modelManager.forgetIdentity === 'function') modelManager.forgetIdentity(name); },
     },
   });
   const call = (method, path, body, role = 'member', search = '') => {
