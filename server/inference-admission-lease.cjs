@@ -27,6 +27,8 @@ const frontAdmission = require('./rust-chat-admission.cjs');
 const PREFIX = '/internal/inference-admission/lease';
 const TTL_MS = 30000;
 const HARD_MS = 6 * 60 * 60 * 1000;
+// #2495: how long an ended covering lease waits for its call to settle before it gives the count back anyway.
+const SETTLE_MS = 5000;
 const MAX_WAIT_MS = 120000;
 const BUSY = 'The model is busy. Try again shortly.';
 const THROTTLED = 'Please wait before sending another message';
@@ -127,7 +129,7 @@ function createAdmission({ modelManager, admitEngineModel, chatMachines = null, 
   };
 }
 
-function createLeases({ ttlMs = TTL_MS, hardMs = HARD_MS, log = (m) => console.warn(m), now = () => Date.now() } = {}) {
+function createLeases({ ttlMs = TTL_MS, hardMs = HARD_MS, settleMs = SETTLE_MS, log = (m) => console.warn(m), now = () => Date.now() } = {}) {
   const leases = new Map();
   function end(id, why) {
     const lease = leases.get(id);
@@ -136,8 +138,19 @@ function createLeases({ ttlMs = TTL_MS, hardMs = HARD_MS, log = (m) => console.w
     clearTimeout(lease.timer);
     // Exclusion-settle rule: a lease covering a call that is still running (the front gave up, timed out or stopped
     // renewing) keeps its gate count until that call has settled; the covered call's settle() releases it.
-    if (lease.covering && !lease.settled) lease.ended = true;
-    else lease.release();
+    if (lease.covering && !lease.settled) {
+      lease.ended = true;
+      // #2495: bounded, failing closed: a call that never settles (an await ignoring the abort) must not hold the
+      // gate count for ever. Node's own path gives its count back when the response closes; this is that bound.
+      const bound = setTimeout(() => {
+        if (lease.settled) return;
+        lease.settled = true;
+        log('[models] a covered call did not settle after its front lease ended; its gate count is given back');
+        lease.release();
+      }, settleMs);
+      bound.unref?.();
+      lease.settleTimer = bound;
+    } else lease.release();
     if (why) log(`[models] the front's inference lease ${why}; it no longer holds the engine`);
     return true;
   }
@@ -167,6 +180,7 @@ function createLeases({ ttlMs = TTL_MS, hardMs = HARD_MS, log = (m) => console.w
       return () => {
         if (lease.settled) return;
         lease.settled = true;
+        clearTimeout(lease.settleTimer);
         if (lease.ended) lease.release();
       };
     },
