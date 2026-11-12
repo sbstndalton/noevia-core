@@ -5,6 +5,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const { Readable, Writable } = require('node:stream');
+const { frontTurn } = require('../tests/server/front-chat-turn.cjs');
 const test = require('node:test');
 // #2191 round 2: POST /api/projects is the Rust front's; fixtures are written as its create leaves them.
 const { createProjectAs } = require('../tests/server/front-projects.cjs');
@@ -26,11 +27,12 @@ test.after(() => {
   fs.rmSync(testDataDir, { recursive: true, force: true });
 });
 
-async function request(url, { method = 'GET', headers = {}, body = '' } = {}) {
+async function request(url, { method = 'GET', headers = {}, body = '', peer } = {}) {
   const req = Readable.from(body ? [body] : []);
   req.url = url;
   req.method = method;
   req.headers = { host: 'localhost', ...headers };
+  if (peer) req.socket = { remoteAddress: peer };
 
   const chunks = [];
   const responseHeaders = {};
@@ -119,6 +121,30 @@ test('the provider registry\'s other methods are refused too (the Rust front rem
   }
 });
 
+test('chat port S5: only the front\'s relay runs a turn; the relay is bound to its user; the gate probe', async () => {
+  const body = JSON.stringify({ chatId: 'test', message: 'hello' });
+  // Straight at the public path, signed in or not: refused before the gate and authentication.
+  for (const headers of [adminHeaders, {}]) {
+    const direct = await request('/api/chat', { method: 'POST', headers, body });
+    assert.equal(direct.status, 503);
+    assert.deepEqual(JSON.parse(direct.text), require('./rust-chat-turn.cjs').ROUTE_REFUSAL);
+    assert.equal(direct.headers['X-Noevia-API'], '1');
+  }
+  // A relay naming another user than the credentials authenticate is signed out: Node's own 401 bytes.
+  const [url, init] = frontTurn({ method: 'POST', headers: adminHeaders, body }, 'synthetic-someone-else');
+  const wrong = await request(url, init);
+  assert.equal(wrong.status, 401);
+  assert.equal(wrong.text, JSON.stringify({ error: 'unauthorized' }));
+  // Not from the front (no loopback peer): the 404 of an unknown path, nothing run.
+  const stranger = await request(url, { ...init, peer: undefined });
+  assert.equal(stranger.status, 404);
+  // The gate probe: no gate is held here, so a turn would get in; 204 and nothing else.
+  const [, probeInit] = frontTurn({ method: 'POST', headers: {} }, '');
+  const probe = await request(require('./rust-chat-turn.cjs').GATE_PATH, probeInit);
+  assert.equal(probe.status, 204);
+  assert.equal(probe.text, '');
+});
+
 test('startup reranker client retains its private credential after the store removes it from env', async () => {
   assert.equal(process.env.NOEVIA_PROJECT_STORE_TOKEN, undefined, 'the secret must stay out of child environments');
   // Use the actual client installed by index.cjs, not a separately constructed test client.
@@ -131,7 +157,7 @@ test('chat reports upstream errors in SSE without writing headers twice', async 
   const projectId = createProjectAs(testDataDir, adminId, {name:'Failure test', model:'model'}).id;
   for (const fetchStub of [async () => { throw new Error('offline'); }, async () => new Response('unavailable', {status:503})]) {
     t.mock.method(global, 'fetch', fetchStub);
-    const result = await request('/api/chat', {method:'POST', headers:adminHeaders, body:JSON.stringify({projectId, chatId:'test', message:'hello'})});
+    const result = await request(...frontTurn({method:'POST', headers:adminHeaders, body:JSON.stringify({projectId, chatId:'test', message:'hello'})}, adminId));
     assert.equal(result.status, 200);
     assert.match(result.text, /"type":"error"/);
     assert.match(result.text, /"type":"done"/);
@@ -149,7 +175,7 @@ test('empty SSE fallback refuses redirects and reconstructs split SSE lines', as
     calls++;
     return calls === 1 ? new Response('') : Response.json({choices:[{message:{content:'fallback answer'}}]});
   });
-  const result = await request('/api/chat', {method:'POST', headers:adminHeaders, body:JSON.stringify({projectId, chatId:'test', message:'hello'})});
+  const result = await request(...frontTurn({method:'POST', headers:adminHeaders, body:JSON.stringify({projectId, chatId:'test', message:'hello'})}, adminId));
   assert.equal(calls, 2);
   assert.match(result.text, /fallback answer/);
   t.mock.restoreAll();
@@ -158,7 +184,7 @@ test('empty SSE fallback refuses redirects and reconstructs split SSE lines', as
     controller.enqueue(new TextEncoder().encode(line.slice(0, 17)));
     controller.enqueue(new TextEncoder().encode(line.slice(17))); controller.close();
   }})));
-  const split = await request('/api/chat', {method:'POST', headers:adminHeaders, body:JSON.stringify({projectId, chatId:'test', message:'hello'})});
+  const split = await request(...frontTurn({method:'POST', headers:adminHeaders, body:JSON.stringify({projectId, chatId:'test', message:'hello'})}, adminId));
   assert.match(split.text, /split answer/);
 });
 
@@ -189,7 +215,7 @@ test('diary forwards browser date and selected day to the pipeline', async (t) =
     sent = JSON.parse(opts.body);
     return Response.json({ choices:[{message:{content:'Reply',reasoning_content:'Synthetic provider reasoning'}}], diary:{decision:'logged'} });
   });
-  const r = await request('/api/chat', { method:'POST',headers:adminHeaders,body:JSON.stringify({spaceId:'diary',message:'Past day note',history:[],entryTime:'2026-09-07T10:00:00-04:00',entryDay:'2026-07-08'}) });
+  const r = await request(...frontTurn({ method:'POST',headers:adminHeaders,body:JSON.stringify({spaceId:'diary',message:'Past day note',history:[],entryTime:'2026-09-07T10:00:00-04:00',entryDay:'2026-07-08'}) }, adminId));
   assert.equal(r.status,200);assert.equal(sent.entryDay,'2026-07-08');assert.equal(sent.entryTime,'2026-09-07T10:00:00-04:00');
   assert.match(r.text, /"type":"reasoning","text":"Synthetic provider reasoning"/);
 });

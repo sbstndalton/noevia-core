@@ -426,6 +426,9 @@ function freePortSync() {
  *  NOEVIA_PROJECT_STORE_TOKEN in `env` now (index.cjs reads them when it loads, and takes the
  *  secret out of the environment) and starts the store on that port, unref'd so it never keeps
  *  the test process alive. Call it before requiring index.cjs. */
+let lastInstalledToken = '';
+/** The secret the last installProjectStore handed out (index.cjs takes it out of the environment when it loads). */
+const installedToken = () => lastInstalledToken;
 function installProjectStore(dataDir, env = process.env, options = {}) {
   // These tests load Core on the same event loop as their HTTP stand-in. Supply the
   // native projection double directly; real cross-process RPC is covered separately.
@@ -437,6 +440,7 @@ function installProjectStore(dataDir, env = process.env, options = {}) {
   const token = crypto.randomBytes(32).toString('hex');
   env.NOEVIA_PROJECT_STORE_PORT = String(port);
   env.NOEVIA_PROJECT_STORE_TOKEN = token;
+  lastInstalledToken = token;
   const writes = [];
   const failures = [];
   const server = http.createServer(createHandler(dataDir, token, writes, failures, options));
@@ -530,4 +534,4 @@ function rustChatMove(dataDir,user,encodedChat,body) {
   return answer(200,{ok:true,from:out.from.kind==='free'?null:out.from.id,projectId:out.to.kind==='free'?null:out.to.id});
 }
 
-module.exports = { syntheticFrontBin, rustChatMove, chatMoveOp, startProjectStore, installProjectStore, createHandler, freePortSync, localTranscripts, historyOp, rustHistorySave, rustChatDelete };
+module.exports = { syntheticFrontBin, rustChatMove, chatMoveOp, startProjectStore, installProjectStore, installedToken, createHandler, freePortSync, localTranscripts, historyOp, rustHistorySave, rustChatDelete };
