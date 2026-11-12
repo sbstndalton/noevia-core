@@ -13,7 +13,8 @@ function reference(body) {
 function chatProjectId(chatId) {
   return typeof chatId === 'string' && /^[a-zA-Z0-9_-]{1,100}$/.test(chatId) ? 'cowork-chat-context-' + chatId : null;
 }
-function internalProject(project) { return project.id === PROJECT_ID || project.id.startsWith('cowork-chat-context-'); }
+// A coworker's backing project (`specialist-<id>`, sbstndalton/noevia#2446) is made and removed by the Rust front and is never listed.
+function internalProject(project) { return project.id === PROJECT_ID || project.id.startsWith('cowork-chat-context-') || project.id.startsWith('specialist-'); }
 // (The Diary attachments project itself is made by the Rust front, #2206: noevia-rs crates/server-projects
 // `diary_context`, which holds this module's former `newProject()`.)
 module.exports = { PROJECT_ID, REFERENCE_LIMIT, reference, chatProjectId, internalProject };

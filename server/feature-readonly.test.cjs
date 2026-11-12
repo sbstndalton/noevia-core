@@ -1,3 +1,4 @@
+// Historical Node registry fixture; runtime clients are covered by native-machines-client tests.
 'use strict';
 const test = require('node:test');
 const assert = require('node:assert/strict');
@@ -6,7 +7,7 @@ const { createRustAuthGuard } = require('./rust-auth.cjs');
 const { createReadOnlyFeatures, REGISTRY } = require('./features.cjs');
 const { createStore } = require('./feature-setting-source.cjs');
 const { createDecisionSettings } = require('./decision-settings.cjs');
-const { createInferenceMachines } = require('./inference-machines.cjs');
+const { createInferenceMachines } = require('../tests/reference/inference-machines.node.cjs');
 const { createContextCollector, createFeatureRuntime } = require('./feature-runtime.cjs');
 function fixture(t, env = {}) {
   const fs = require('node:fs'), path = require('node:path'), os = require('node:os');

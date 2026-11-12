@@ -29,6 +29,10 @@ const CLIENT_ROUTES = [
   /^\/settings\/[a-z][a-z0-9-]{0,39}\/?$/,
   /^\/(customise|customize|plugins)\/(skills|connectors|plugins|mcp|connected)\/?$/,
   new RegExp(`^/models/${SEG}$`),
+  // #2446: Spaces (/spaces, /spaces/<id>, /spaces/<id>/<pageId>) and Coworkers (/coworkers,
+  // /coworkers/<id>), the web client's pages for the specialists and spaces API.
+  new RegExp(`^/spaces(/${ID}(/${ID})?)?/?$`),
+  new RegExp(`^/coworkers(/${ID})?/?$`),
   // #555: the native-app approval page. routes/device-auth.cjs answers 404 first while the
   // nativeClientAuth feature is off.
   /^\/device\/?$/,

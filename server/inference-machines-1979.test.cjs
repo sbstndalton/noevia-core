@@ -1,9 +1,10 @@
+// Historical Node registry fixture; runtime clients are covered by native-machines-client tests.
 'use strict';
 // #1979: a registered remote machine that the deployment also names as the embeddings address
 // (EMBEDDING_SERVICE_URL) is that machine, not "This machine". Synthetic addresses only.
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { createInferenceMachines } = require('./inference-machines.cjs');
+const { createInferenceMachines } = require('../tests/reference/inference-machines.node.cjs');
 
 function memoryStore() {
   const map = new Map();

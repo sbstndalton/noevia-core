@@ -1,3 +1,4 @@
+// Historical Node registry fixture; runtime clients are covered by native-machines-client tests.
 'use strict';
 // sbstndalton/noevia#1880 review: every path that uses a role's Inference machine counts as a turn there while it runs,
 // so a measurement is refused (409 machineBusy) while it is in flight: the Code relay (per forwarded request), a Deep
@@ -6,10 +7,10 @@
 const test = require('node:test'), assert = require('node:assert/strict');
 const fs = require('node:fs'), path = require('node:path'), os = require('node:os'), http = require('node:http'), crypto = require('node:crypto');
 const { EventEmitter } = require('node:events');
-const { createInferenceMachines } = require('./inference-machines.cjs');
+const { createInferenceMachines } = require('../tests/reference/inference-machines.node.cjs');
 const { createChatMachines } = require('./chat-machines.cjs');
 const { createMachineHealth } = require('./machine-health.cjs');
-const { createMachineTune } = require('./machine-tune.cjs');
+const { createMachineTune } = require('../tests/reference/machine-tune.node.cjs');
 const { codeTargetFrom, createEngineRelay } = require('./code-machine.cjs');
 const { createAdmission } = require('./inference-admission-lease.cjs');
 const { createChatHandler } = require('./chat.cjs');

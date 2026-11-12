@@ -159,6 +159,8 @@ function singleSettingKey(sql, args) {
 // switch are written only by the Rust front (their routes left Node). This connection refuses those
 // keys too, even inside exempt(), with their own codes.
 const FRONT_SETTING_KEYS = Object.freeze({
+  'inference:machines': ['Inference machines are owned by the Rust front.', 'RUST_INFERENCE_MACHINES_OWNED'],
+  'inference:machineTune': ['Machine tuning is owned by the Rust front.', 'RUST_INFERENCE_MACHINES_OWNED'],
   ...Object.fromEntries(require('./feature-catalog.cjs').loadCatalog().features.flatMap(row => [row.id,...(row.legacy?[row.legacy]:[])].map(name => [`feature:${name}`,['Feature settings are owned by the Rust front.','RUST_FEATURES_OWNED']]))),
   'native:feature-runtime:incarnation': ['Feature runtime state is owned by the Rust front.', 'RUST_FEATURE_RUNTIME_OWNED'],
   public_origin_admin: ['Web address changes are owned by the Rust front.', 'RUST_WEB_ADDRESS_WRITE_OWNED'],
@@ -167,6 +169,8 @@ const FRONT_SETTING_KEYS = Object.freeze({
   reasoning_effort_default: ['Reasoning settings are written by the Rust front', 'RUST_REASONING_SETTINGS_OWNED'],
   auto_sampling_presets_enabled: ['Sampling settings are written by the Rust front', 'RUST_SAMPLING_SETTINGS_OWNED'],
   // #2190: Settings -> Models -> Decision service; decision-settings.cjs only re-reads it.
+  'rerank:configuration': ['Reranker settings are owned by the Rust front.', 'RUST_RERANKER_SETTINGS_OWNED'],
+  'rerank:revision': ['Reranker settings are owned by the Rust front.', 'RUST_RERANKER_SETTINGS_OWNED'],
   'decision:configuration': ['Decision settings are owned by the Rust front.', 'RUST_DECISION_SETTINGS_OWNED'],
 });
 // Tables only the Rust front writes, each refused with its own code even inside exempt(); `allowed`

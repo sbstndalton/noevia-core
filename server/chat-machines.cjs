@@ -113,12 +113,14 @@ function createChatMachines({ machines, health = null, fetchImpl = defaultServic
   /** A turn (or classification) starts on `machineId`: counted until the returned release is called (idempotent). */
   function beginTurn(machineId) {
     const id = String(machineId || '');
+    const nativeRelease = machines?.native ? machines.beginTurn(id) : null;
     turns.set(id, (turns.get(id) || 0) + 1);
     for (const fn of [...turnListeners]) { try { fn(id); } catch { /* a listener never fails a turn */ } }
     let done = false;
     return () => {
       if (done) return;
       done = true;
+      nativeRelease?.();
       const n = (turns.get(id) || 1) - 1;
       if (n > 0) turns.set(id, n); else turns.delete(id);
     };
@@ -133,10 +135,10 @@ function createChatMachines({ machines, health = null, fetchImpl = defaultServic
   /** Called with the machine id whenever a turn starts there; returns the unsubscribe. */
   function onTurn(fn) { turnListeners.add(fn); return () => turnListeners.delete(fn); }
 
-  /** The role's machine, or null when it runs here. Never throws. */
+  /** The role's machine, or null when it runs here; native authority failures refuse routing. */
   function target(role) {
     if (!machines || !ROLE_LABEL[role]) return null;
-    try { return machines.chatTarget(role) || null; } catch { return null; }
+    try { return machines.chatTarget(role) || null; } catch (err) { if (machines.native || err?.code === 'machinesUnavailable') throw err; return null; }
   }
 
   /** The roles on another machine: { fast: target, ... } (empty: all here). */
@@ -279,15 +281,6 @@ function createChatMachines({ machines, health = null, fetchImpl = defaultServic
     return modelIds(body);
   }
 
-  /** The models a machine's server lists at `port` (its /v1/models), for the Settings picker and the assign check. */
-  async function listModels(machineId, port) {
-    const m = machines?.machine?.(String(machineId || ''));
-    if (!m) throw fail(404, 'unknownMachine', 'That machine is not on the list.');
-    const n = typeof port === 'string' && /^\d+$/.test(port.trim()) ? Number(port) : port;
-    if (!Number.isInteger(n) || n < 1 || n > 65535) throw fail(400, 'invalidPort', 'Enter the service’s port, a number from 1 to 65535.');
-    return modelsAt(m.address, n, m.name);
-  }
-
   /**
    * #1849: a Manual pick names a model. When a chat role's machine serves exactly that name and this machine's
    * catalogue does not list it, the pick runs on that machine (the same request rules as an Automatic turn). A name
@@ -372,7 +365,7 @@ function createChatMachines({ machines, health = null, fetchImpl = defaultServic
     return visionProbe(`${t.baseUrl}/v1`, headers, t.model);
   }
 
-  return { target, remoteRoles, effectiveRoles, localRoles, ready, provider, measuredProvider, measurements, visionFor, contextTokens, connectError, listModels, modelsAt, visionProbe, manualTarget, machineModels, propsSource, fetchJson, fetch: machineFetch, beginTurn, busy, onTurn, during, label: (role) => ROLE_LABEL[role] || role };
+  return { target, remoteRoles, effectiveRoles, localRoles, ready, provider, measuredProvider, measurements, visionFor, contextTokens, connectError, modelsAt, visionProbe, manualTarget, machineModels, propsSource, fetchJson, fetch: machineFetch, beginTurn, busy, onTurn, during, label: (role) => ROLE_LABEL[role] || role };
 }
 
 module.exports = { createChatMachines, modelIds, propsFactsOf, NOT_MEASURED_ON_MACHINES, ROLE_LABEL, CHAT_ROLES };

@@ -76,8 +76,13 @@ async function readCappedText(response, cap) {
       const piece = value.byteLength > room ? value.subarray(0, room) : value;
       chunks.push(Buffer.from(piece));
       size += piece.byteLength;
+      if (value.byteLength > room) {
+        capped = true;
+        reader.cancel().catch(() => {});
+        break;
+      }
     }
-    if (size >= cap) {
+    if (size >= cap && !capped) {
       const next = await reader.read().catch(() => ({ done: true }));
       // Not awaited: cancelling one branch of a cloned (teed) body settles only once the other
       // branch is cancelled or read too, so awaiting it here would hang.
@@ -111,8 +116,13 @@ async function readCappedBuffer(response, cap) {
       const piece = value.byteLength > room ? value.subarray(0, room) : value;
       chunks.push(Buffer.from(piece));
       size += piece.byteLength;
+      if (value.byteLength > room) {
+        capped = true;
+        reader.cancel().catch(() => {});
+        break;
+      }
     }
-    if (size >= cap) {
+    if (size >= cap && !capped) {
       const next = await reader.read().catch(() => ({ done: true }));
       if (!next.done) { capped = true; reader.cancel().catch(() => {}); }
     }
@@ -244,12 +254,6 @@ function authResult(res, result) {
   return json(res, result.status || 200, result.body ?? result);
 }
 
-// #812: one URL path segment, percent-decoded; null when the escape is malformed, so a route answers
-// 400 instead of letting decodeURIComponent's URIError become a 500.
-function decodePathPart(raw) {
-  try { return decodeURIComponent(raw); } catch { return null; }
-}
-
 /** #1406/#1419: `send` is the caller's json(res, status, body, headers). A save that failed after the request was understood. A 400 means the request was
  *  bad, so it is never used here: the error's own status is kept when it is a 4xx/5xx (a busy store
  *  is 503 PROJECTS_BUSY, a retired account 410), and anything else is a 500 with a fixed message, so
@@ -263,4 +267,4 @@ function saveFailureReply(send, res, err, fallback = 'could not save; nothing wa
   return send(res, status, body, status === 503 ? { 'Retry-After': '1' } : undefined);
 }
 
-module.exports = { json, saveFailureReply, unauthorized, decodePathPart, fetchJson, readBody, readJson, authResult, isJsonObject, requireJsonObject, answerUnhandled, parseRequestUrl, badRequestUrl, errorResponse, DEFAULT_MAX_RESPONSE_BYTES, readCappedText, readCappedJson, readCappedBuffer, discardBody };
+module.exports = { json, saveFailureReply, unauthorized, fetchJson, readBody, readJson, authResult, isJsonObject, requireJsonObject, answerUnhandled, parseRequestUrl, badRequestUrl, errorResponse, DEFAULT_MAX_RESPONSE_BYTES, readCappedText, readCappedJson, readCappedBuffer, discardBody };

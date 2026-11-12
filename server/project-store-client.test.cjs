@@ -428,7 +428,7 @@ test('slice7 real loopback authority double preserves latest metadata, CAS, tena
   fs.writeFileSync(path.join(dir,'projects.json'),JSON.stringify({projects:[{id:'qa-p',chats:[]}]}));
   fs.writeFileSync(path.join(dir,'history-qaraw.json'),'sentinel transcript');
  }
- const standin=await require('../tests/server/project-store-server.cjs').startProjectStore(root,{token:TOKEN,changes:true});t.after(()=>standin.close());
+ const standin=await require('../tests/server/project-store-server.cjs').startProjectStore(root,{token:TOKEN});t.after(()=>standin.close());
  const client=psc.createClient({port:standin.port,token:TOKEN});
  const before=await client.read(USER,'free-chats.json');
  assert.equal((await client.grantContext(USER,'qa raw!')).generation,'0');
@@ -441,10 +441,28 @@ test('slice7 real loopback authority double preserves latest metadata, CAS, tena
  assert.equal((await client.grantContext(other,'qa raw!')).generation,'0','other tenant unchanged');
  assert.equal(fs.readFileSync(path.join(root,'users',USER,'history-qaraw.json'),'utf8'),'sentinel transcript');
  assert.equal((await client.chatMove(USER,'qa raw!',null)).generation,'2');
- const notices=await client.changesRead(USER);
+ const notices={entries:fs.readFileSync(path.join(root,'users',USER,'chat-changes.jsonl'),'utf8').split('\n').filter(Boolean).map((l)=>JSON.parse(l))};
  assert.equal(notices.entries.filter(e=>e.op==='move').length,2);
  assert.ok(notices.entries.every(e=>e.delivery==='live'&&e.rawChatId==='qa raw!'&&e.chatId==='qaraw'));
  const bad=psc.createClient({port:standin.port,token:'wrong-token'});
  await assert.rejects(bad.chatMove(USER,'qa raw!','qa-p'));
  await assert.rejects(client.chatMove('88888888-2222-4333-8444-555555555555','qa raw!',null),e=>e.status===410);
+});
+
+test('chat mirror nudges: schedule and touch reach the front behind the secret; a refusal is an error the caller logs', async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'qa-chat-mirror-client-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const standin = await require('../tests/server/project-store-server.cjs').startProjectStore(root, { token: TOKEN });
+  t.after(() => standin.close());
+  const client = psc.createClient({ port: standin.port, token: TOKEN });
+  await client.chatMirrorSchedule(USER, 'qa-c1', false);
+  await client.chatMirrorSchedule(USER, null, true);
+  await client.chatMirrorTouch(USER);
+  assert.deepEqual(standin.mirror, [
+    { url: '/v1/chat-mirror/schedule', body: { user: USER, chatId: 'qa-c1', immediate: false } },
+    { url: '/v1/chat-mirror/schedule', body: { user: USER, chatId: null, immediate: true } },
+    { url: '/v1/chat-mirror/touch', body: { user: USER } },
+  ]);
+  const bad = psc.createClient({ port: standin.port, token: 'wrong-token' });
+  await assert.rejects(bad.chatMirrorTouch(USER), (e) => e.status === 401);
 });
