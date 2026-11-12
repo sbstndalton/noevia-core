@@ -1,37 +1,52 @@
 'use strict';
-// #2218: the Rust front's model steps enter this process's admission over real loopback HTTP: only the front may ask, a
-// refusal keeps the step's own words, a caller that goes away holds nothing, and an unrenewed lease ends by itself.
+// #2218, port contract row H: the Rust front's authority issues each lease and this process latches its holds for the
+// ticket over real loopback HTTP: only the front may ask, a refusal keeps the step's own words, a caller that goes
+// away holds nothing, an unrenewed latch ends by itself, and nothing is latched outside the current session.
 const assert = require('node:assert/strict');
 const http = require('node:http');
 const test = require('node:test');
-const { createAdmissionRoutes, PREFIX } = require('./inference-admission-lease.cjs');
+const crypto = require('node:crypto');
+const { createAdmissionRoutes, createAuthoritySession, PREFIX } = require('./inference-admission-lease.cjs');
 const { json, readJson } = require('./http.cjs');
 
 const SECRET = 's'.repeat(40);
 
+const EPOCH = 'e'.repeat(32);
+/** A synthetic session with the front's authority: `set(next)` changes it as a re-registration would. */
+function fakeAuthority(initial = { epoch: EPOCH, incarnation: 1 }) {
+  let current = initial;
+  const listeners = [];
+  return { current: () => current, onChange: (fn) => listeners.push(fn), set(next) { current = next; for (const fn of listeners) fn(next); } };
+}
+const fence = (a = { epoch: EPOCH, incarnation: 1 }) => ({ 'x-noevia-admission-epoch': a.epoch, 'x-noevia-admission-incarnation': String(a.incarnation) });
+const ticket = () => crypto.randomBytes(16).toString('hex');
+
 async function serve(t, options) {
-  const routes = createAdmissionRoutes({ secret: SECRET, json, readJson, admitEngineModel: async () => {}, modelManager: {}, log: () => {}, ...options });
+  const authority = options?.authority || fakeAuthority();
+  const routes = createAdmissionRoutes({ secret: SECRET, json, readJson, admitEngineModel: async () => {}, modelManager: {}, log: () => {}, ...options, authority });
   const server = http.createServer(async (req, res) => { if (!await routes.handle(req, res)) { res.statusCode = 418; res.end(); } });
   await new Promise((r) => server.listen(0, '127.0.0.1', r));
   t.after(() => { server.closeAllConnections(); server.close(); });
-  return { routes, base: `http://127.0.0.1:${server.address().port}` };
+  return { routes, authority, base: `http://127.0.0.1:${server.address().port}` };
 }
-const ask = (base, body, headers = { 'x-noevia-store-token': SECRET }, path = PREFIX, method = 'POST', signal) =>
-  fetch(base + path, { method, headers: { 'content-type': 'application/json', ...headers }, body: body && JSON.stringify(body), signal });
+const FRONT = { 'x-noevia-store-token': SECRET, ...fence() };
+// `path` null: a fresh ticket's PUT.
+const ask = (base, body, headers = FRONT, path = null, method = 'PUT', signal) =>
+  fetch(base + (path ?? `${PREFIX}/${ticket()}`), { method, headers: { 'content-type': 'application/json', ...headers }, body: body && JSON.stringify(body), signal });
 const settled = () => new Promise((r) => setTimeout(r, 30));
 
 test('only the front may ask: a wrong secret and a proxied request get an unknown path\'s 404, and hold nothing', async (t) => {
   let entered = 0;
   const { base, routes } = await serve(t, { modelManager: { enterInference: () => { entered++; return () => {}; } } });
   for (const headers of [{}, { 'x-noevia-store-token': 'wrong' }, { 'x-noevia-store-token': SECRET, 'x-noevia-client-ip': '203.0.113.9' }, { 'x-noevia-store-token': SECRET, 'x-forwarded-for': '203.0.113.9' }]) {
-    const r = await ask(base, { model: 'm' }, headers);
+    const r = await ask(base, { model: 'm' }, { ...headers, ...fence() });
     assert.equal(r.status, 404);
     assert.deepEqual(await r.json(), { error: 'Not found' });
   }
   assert.equal(entered, 0);
-  assert.equal(routes.leases.size(), 0);
+  assert.equal(routes.latches.size(), 0);
   const noSecret = await serve(t, { secret: '' });
-  assert.equal((await ask(noSecret.base, { model: 'm' }, { 'x-noevia-store-token': '' })).status, 404);
+  assert.equal((await ask(noSecret.base, { model: 'm' }, { 'x-noevia-store-token': '', ...fence() })).status, 404);
   assert.equal((await ask(base, null, undefined, '/internal/inference-admission/other', 'GET')).status, 418, 'not this route');
 });
 
@@ -47,18 +62,19 @@ test('a lease holds maintenance and the gate; release and the renewal limit give
   const grant = await r.json();
   assert.match(grant.lease, /^[0-9a-f]{32}$/);
   assert.deepEqual(grant.headers, { 'x-noevia-lease': 'abc' });
-  assert.equal((await ask(base, null, undefined, `${PREFIX}/${grant.lease}/renew`)).status, 200);
+  assert.equal(grant.ttlMs, 60);
+  assert.equal((await ask(base, null, undefined, `${PREFIX}/${grant.lease}/renew`, 'POST')).status, 200);
   const del = await ask(base, null, undefined, `${PREFIX}/${grant.lease}`, 'DELETE');
   assert.equal(del.status, 204);
   assert.deepEqual(log, ['enter', 'gate m 120000', 'gate-release', 'leave']);
-  assert.equal((await ask(base, null, undefined, `${PREFIX}/${grant.lease}/renew`)).status, 404);
+  assert.equal((await ask(base, null, undefined, `${PREFIX}/${grant.lease}/renew`, 'POST')).status, 404);
   assert.equal((await ask(base, null, undefined, `${PREFIX}/${grant.lease}`, 'DELETE')).status, 204, 'already ended is still done');
   // A front that died: not renewed, and it ends by itself.
   log.length = 0;
   await ask(base, { model: 'm' });
-  assert.equal(routes.leases.size(), 1);
+  assert.equal(routes.latches.size(), 1);
   await new Promise((res) => setTimeout(res, 120));
-  assert.equal(routes.leases.size(), 0);
+  assert.equal(routes.latches.size(), 0);
   assert.deepEqual(log.slice(-2), ['gate-release', 'leave']);
 });
 
@@ -98,7 +114,7 @@ test('a caller that goes away while queued aborts the wait and holds nothing', a
   };
   const { base, routes } = await serve(t, { modelManager });
   const controller = new AbortController();
-  const pending = ask(base, { model: 'm' }, undefined, PREFIX, 'POST', controller.signal).catch(() => 'gone');
+  const pending = ask(base, { model: 'm' }, undefined, null, 'PUT', controller.signal).catch(() => 'gone');
   await settled();
   controller.abort();
   assert.equal(await pending, 'gone');
@@ -106,7 +122,7 @@ test('a caller that goes away while queued aborts the wait and holds nothing', a
   assert.equal(aborted, true, 'the wait saw the caller go');
   granted();
   await settled();
-  assert.equal(routes.leases.size(), 0, 'a late grant is no lease');
+  assert.equal(routes.latches.size(), 0, 'a late grant is no lease');
   assert.equal(released, 1, 'and the gate gets its lease back');
   assert.equal(left, 1);
 });
@@ -120,14 +136,14 @@ test('a machine turn granted after the caller left is given straight back', asyn
   };
   const { base, routes } = await serve(t, { chatMachines });
   const controller = new AbortController();
-  const pending = ask(base, { role: 'smart', machine: 'm1', model: 'm' }, undefined, PREFIX, 'POST', controller.signal).catch(() => 'gone');
+  const pending = ask(base, { role: 'smart', machine: 'm1', model: 'm' }, undefined, null, 'PUT', controller.signal).catch(() => 'gone');
   await settled();
   controller.abort();
   assert.equal(await pending, 'gone');
   await settled();
   readyNow();
   await settled();
-  assert.equal(routes.leases.size(), 0);
+  assert.equal(routes.latches.size(), 0);
   assert.equal(ended, 1);
 });
 
@@ -148,10 +164,10 @@ test('a Diary exchange lease holds the gate, counts the throttle once and pauses
   assert.match(grant.lease, /^[0-9a-f]{32}$/);
   assert.equal('headers' in grant, false);
   assert.deepEqual(log, ['enter 3000 true', 'throttle u-synthetic', 'pause']);
-  assert.equal((await ask(base, null, undefined, `${PREFIX}/${grant.lease}/renew`)).status, 200);
+  assert.equal((await ask(base, null, undefined, `${PREFIX}/${grant.lease}/renew`, 'POST')).status, 200);
   assert.equal((await ask(base, null, undefined, `${PREFIX}/${grant.lease}`, 'DELETE')).status, 204);
   assert.deepEqual(log.slice(3), ['resume', 'leave']);
-  assert.equal(routes.leases.size(), 0);
+  assert.equal(routes.latches.size(), 0);
 });
 
 test('a Diary exchange refusal: the gate\'s 503 in its words, the throttle\'s 429 (gate given back), a bad ask 400', async (t) => {
@@ -174,7 +190,7 @@ test('a Diary exchange refusal: the gate\'s 503 in its words, the throttle\'s 42
     r = await ask(base, body);
     assert.equal(r.status, 400, JSON.stringify(body));
   }
-  assert.equal(routes.leases.size(), 0);
+  assert.equal(routes.latches.size(), 0);
   // A Core wired without the exchange's throttle refuses rather than admit an uncounted exchange.
   const bare = await serve(t, { modelManager });
   assert.equal((await ask(bare.base, { diaryExchange: { user: 'u1' } })).status, 400);
@@ -188,13 +204,113 @@ test('a Diary exchange whose caller went away while the gate was waited for hold
   const diaryExchange = { rateLimited: () => { counted++; return false; }, foreground: () => () => {} };
   const { base, routes } = await serve(t, { modelManager, diaryExchange });
   const controller = new AbortController();
-  const pending = ask(base, { diaryExchange: { user: 'u1' } }, undefined, PREFIX, 'POST', controller.signal).catch(() => null);
+  const pending = ask(base, { diaryExchange: { user: 'u1' } }, undefined, null, 'PUT', controller.signal).catch(() => null);
   await settled();
   controller.abort();
   await pending;
   await settled();
   release();
   await settled();
-  assert.equal(routes.leases.size(), 0);
+  assert.equal(routes.latches.size(), 0);
   assert.equal(left, counted, 'whatever was entered was given back');
+});
+
+// Port contract row H: this process no longer issues leases; it latches only for the front's current session.
+test('this process issues no lease of its own: the old POST is gone and a bad ticket is an unknown path', async (t) => {
+  let entered = 0;
+  const { base, routes } = await serve(t, { modelManager: { enterInference: () => { entered++; return () => {}; } } });
+  assert.equal((await ask(base, { model: 'm' }, FRONT, PREFIX, 'POST')).status, 404);
+  assert.equal((await ask(base, { model: 'm' }, FRONT, `${PREFIX}/short`)).status, 404);
+  assert.equal((await ask(base, { model: 'm' }, FRONT, `${PREFIX}/${'A'.repeat(32)}`)).status, 404);
+  assert.deepEqual([entered, routes.latches.size()], [0, 0]);
+});
+
+test('without a session nothing is latched (503), and another epoch or incarnation is refused (410)', async (t) => {
+  let entered = 0;
+  const modelManager = { enterInference: () => { entered++; return () => {}; } };
+  const none = await serve(t, { modelManager, authority: fakeAuthority(null) });
+  let r = await ask(none.base, { model: 'm' });
+  assert.deepEqual([r.status, await r.json()], [503, { error: 'The model is busy. Try again shortly.' }]);
+  const { base } = await serve(t, { modelManager });
+  for (const f of [{ epoch: 'f'.repeat(32), incarnation: 1 }, { epoch: EPOCH, incarnation: 2 }]) {
+    r = await ask(base, { model: 'm' }, { 'x-noevia-store-token': SECRET, ...fence(f) });
+    assert.equal(r.status, 410);
+  }
+  r = await ask(base, { model: 'm' }, { 'x-noevia-store-token': SECRET });
+  assert.equal(r.status, 410, 'no fence at all');
+  assert.equal(entered, 0);
+});
+
+test('a front restart (new epoch) or a retirement ends every latch of the old session at once', async (t) => {
+  const log = [];
+  const modelManager = { enterInference: () => { log.push('enter'); return () => log.push('leave'); } };
+  const { base, routes, authority } = await serve(t, { modelManager });
+  const id = ticket();
+  assert.equal((await ask(base, { model: 'm' }, FRONT, `${PREFIX}/${id}`)).status, 201);
+  assert.equal(routes.latches.size(), 1);
+  authority.set({ epoch: 'f'.repeat(32), incarnation: 1 });
+  assert.deepEqual([routes.latches.size(), log], [0, ['enter', 'leave']]);
+  // The old front's renewal is refused as another session's, the new front can latch.
+  assert.equal((await ask(base, null, FRONT, `${PREFIX}/${id}/renew`, 'POST')).status, 410);
+  const next = fence({ epoch: 'f'.repeat(32), incarnation: 1 });
+  assert.equal((await ask(base, { model: 'm' }, { 'x-noevia-store-token': SECRET, ...next })).status, 201);
+  authority.set(null);
+  assert.equal(routes.latches.size(), 0);
+  assert.equal((await ask(base, { model: 'm' }, { 'x-noevia-store-token': SECRET, ...next })).status, 503);
+});
+
+test('a ticket given back while its latch is being taken holds nothing (ticketed give-back), and is not retaken', async (t) => {
+  let grant, released = 0, left = 0;
+  const modelManager = {
+    enterInference: () => () => { left++; },
+    acquireLease: () => new Promise((resolve) => { grant = () => resolve({ headers: () => ({}), release: async () => { released++; } }); }),
+  };
+  const { base, routes } = await serve(t, { modelManager });
+  const id = ticket();
+  const pending = ask(base, { model: 'm' }, FRONT, `${PREFIX}/${id}`).then((r) => r.status);
+  await settled();
+  assert.equal((await ask(base, null, FRONT, `${PREFIX}/${id}`, 'DELETE')).status, 204);
+  grant();
+  assert.equal(await pending, 503);
+  await settled();
+  assert.deepEqual([routes.latches.size(), released, left], [0, 1, 1]);
+  assert.equal((await ask(base, { model: 'm' }, FRONT, `${PREFIX}/${id}`)).status, 404, 'a given-back ticket is never latched again');
+});
+
+test('the same ticket cannot latch twice', async (t) => {
+  const { base, routes } = await serve(t, {});
+  const id = ticket();
+  assert.equal((await ask(base, { model: 'm' }, FRONT, `${PREFIX}/${id}`)).status, 201);
+  assert.equal((await ask(base, { model: 'm' }, FRONT, `${PREFIX}/${id}`)).status, 409);
+  assert.equal(routes.latches.size(), 1);
+});
+
+test('the session registers with the front, keeps its incarnation, follows a new epoch and retires on 410', async () => {
+  const calls = [];
+  let answer = { status: 200, body: { incarnation: 3, epoch: 'a'.repeat(32), ttlMs: 30000 } };
+  const fetchImpl = async (url, init) => { calls.push([url, init.headers['x-noevia-store-token'], JSON.parse(init.body)]); return { status: answer.status, json: async () => answer.body }; };
+  const changes = [];
+  const s = createAuthoritySession({ port: 4321, token: 'tok', fetchImpl, boot: 'b1', startedAt: 7, log: () => {} });
+  s.onChange((n) => changes.push(n));
+  assert.equal(s.current(), null);
+  await s.register();
+  assert.deepEqual(s.current(), { epoch: 'a'.repeat(32), incarnation: 3 });
+  assert.deepEqual(calls[0], ['http://127.0.0.1:4321/v1/inference-admission/session', 'tok', { boot: 'b1', startedAt: 7 }]);
+  await s.register();
+  assert.equal(changes.length, 1, 'the same answer is no change');
+  answer = { status: 500, body: null };
+  await s.register();
+  assert.deepEqual(s.current(), { epoch: 'a'.repeat(32), incarnation: 3 }, 'no answer keeps the session');
+  answer = { status: 200, body: { incarnation: 1, epoch: 'b'.repeat(32) } };
+  await s.register();
+  assert.deepEqual(changes.at(-1), { epoch: 'b'.repeat(32), incarnation: 1 });
+  answer = { status: 410, body: { error: 'newer' } };
+  await s.register();
+  assert.equal(s.current(), null);
+  assert.equal(s.retired(), true);
+  answer = { status: 200, body: { incarnation: 9, epoch: 'c'.repeat(32) } };
+  await s.register();
+  assert.equal(s.current(), null, 'a retired start never registers again');
+  const unconfigured = createAuthoritySession({ port: 0, token: '', fetchImpl: async () => { throw new Error('never'); } });
+  assert.equal(await unconfigured.register(), null);
 });
