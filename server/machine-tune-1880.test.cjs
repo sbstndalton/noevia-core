@@ -1,3 +1,4 @@
+// Historical Node registry fixture; runtime clients are covered by native-machines-client tests.
 'use strict';
 // Needs dav-parse.wasm: provider egress is Rust-only since #1071. Skipped without it unless DAV_PARSE_WASM_REQUIRED=1.
 if (!require('node:fs').existsSync(process.env.DAV_PARSE_WASM || require('./dav-parse-wasm.cjs').DEFAULT_WASM) && process.env.DAV_PARSE_WASM_REQUIRED !== '1') {
@@ -9,11 +10,11 @@ if (!require('node:fs').existsSync(process.env.DAV_PARSE_WASM || require('./dav-
 const test = require('node:test'), assert = require('node:assert/strict');
 const fs = require('node:fs'), path = require('node:path'), os = require('node:os'), http = require('node:http');
 const { EventEmitter } = require('node:events');
-const { createInferenceMachines } = require('./inference-machines.cjs');
+const { createInferenceMachines } = require('../tests/reference/inference-machines.node.cjs');
 const { createChatMachines } = require('./chat-machines.cjs');
 const { createMachineHealth } = require('./machine-health.cjs');
-const { createMachineTune, recommend, STORE_KEY } = require('./machine-tune.cjs');
-const { createInferenceMachineRoutes } = require('./routes/inference-machines.cjs');
+const { createMachineTune, recommend, STORE_KEY } = require('../tests/reference/machine-tune.node.cjs');
+const { createInferenceMachineRoutes } = require('../tests/reference/inference-machines-route.node.cjs');
 
 const MODEL = 'synthetic-remote-1880';
 const LOCAL_KEY = 'synthetic-local-key-1880';

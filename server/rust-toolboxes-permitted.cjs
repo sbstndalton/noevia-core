@@ -3,7 +3,7 @@
 // bins/noevia-server toolbox_routes.rs, capability rust-toolboxes-permitted). The front computes the view
 // from what it owns at the time of the request (the project's toolbox selection, the account's tool
 // permissions, its Drive connection, its MCP sign-ins and keys, the Diary add-on preference, the
-// directory) and from the discovery snapshot this process publishes (mcp-discovery-snapshot.cjs): the
+// directory) and from the discovery snapshot this process publishes (noevia-rs mcp_discovery.rs): the
 // offered boxes with their tools, whether each tool writes, the configured boxes, the coding harness
 // switch and whether a repository is registered. There is no cache here any more (the 30 s one went
 // stale after every write the front made), and none in the front.

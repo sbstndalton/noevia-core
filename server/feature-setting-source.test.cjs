@@ -1,10 +1,11 @@
+// Historical Node registry fixture; runtime clients are covered by native-machines-client tests.
 'use strict';
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const Database = require('better-sqlite3');
 const { createStore, MAX_BYTES } = require('./feature-setting-source.cjs');
 const { createDecisionSettings } = require('./decision-settings.cjs');
-const { createInferenceMachines } = require('./inference-machines.cjs');
+const { createInferenceMachines } = require('../tests/reference/inference-machines.node.cjs');
 const DECISION = 'decision:configuration';
 const MACHINES = 'inference:machines';
 function fixture(t) {
@@ -141,7 +142,7 @@ test('committed machine assignment and failed audit bind cache to the successful
   assert.deepEqual(JSON.parse(store.get(MACHINES)).assignments, {});
 });
 
-test('actual guarded connection accepts only the two exact source-store write shapes', t => {
+test('actual guarded connection refuses native-owned source-store writes', t => {
   const { db } = fixture(t);
   const guard = require('./rust-auth.cjs').createRustAuthGuard();
   guard.install(db);
@@ -152,11 +153,9 @@ test('actual guarded connection accepts only the two exact source-store write sh
   assert.throws(() => store.deleteFact(DECISION), { code: 'RUST_DECISION_SETTINGS_OWNED' });
   assert.equal(decision.runtimeContextSource(), store.readFact(DECISION).source);
   assert.equal(store.get(DECISION), undefined);
-  store.set(MACHINES, JSON.stringify(machineState(8040)));
-  const machines = createInferenceMachines({ store, log: () => {} });
-  machines.assign({ service: 'decision', machine: 'local' }, 'synthetic');
-  assert.equal(machines.runtimeContextSource(), store.readFact(MACHINES).source);
-  assert.equal(machines.urlFor('decision'), null);
+  assert.throws(() => store.set(MACHINES, JSON.stringify(machineState(8040))), { code: 'RUST_INFERENCE_MACHINES_OWNED' });
+  assert.throws(() => store.deleteFact(MACHINES), { code: 'RUST_INFERENCE_MACHINES_OWNED' });
+  assert.equal(store.get(MACHINES), undefined);
   const { WRITE_SQL } = require('./feature-setting-source.cjs');
   for (const key of ['feature:plannerReview', 'native:feature-runtime:incarnation', 'public_origin_admin', 'unknown']) {
     assert.throws(() => guard.exempt(() => db.prepare(WRITE_SQL).get(key, 'forged')), { code: 'RUST_AUTH_OWNED' });
@@ -164,12 +163,12 @@ test('actual guarded connection accepts only the two exact source-store write sh
   assert.throws(() => guard.exempt(() => db.prepare('DELETE FROM settings WHERE key=?').run(DECISION)), { code: 'RUST_AUTH_OWNED' });
   assert.throws(() => db.prepare(`${WRITE_SQL}, 1 AS extra`).get(DECISION, 'forged'), { code: 'RUST_AUTH_OWNED' });
   assert.throws(() => guard.exempt(() => db.prepare('INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)').run('native:feature-runtime:incarnation', 'forged')), { code: 'RUST_FEATURE_RUNTIME_OWNED' });
-  // The bound key is what the guard judges: the machines key Node still owns (#2190: not the decision key).
+  // Bound machines writes are refused even if the caller later changes its argument array.
   const args = [MACHINES, '{"url":"http://192.168.1.20:8040","timeoutMs":1500}'];
   const statement = db.prepare(WRITE_SQL).bind(args);
   args[0] = 'native:feature-runtime:incarnation';
-  statement.get(); // SQLite and the guard both retained the original machines key.
-  assert.equal(JSON.parse(store.get(MACHINES)).timeoutMs, 1500);
+  assert.throws(() => statement.get(), { code: 'RUST_INFERENCE_MACHINES_OWNED' });
+  assert.equal(store.get(MACHINES), undefined);
   const prohibited = db.prepare(WRITE_SQL).bind('native:feature-runtime:incarnation', 'forged').raw();
   assert.throws(() => guard.exempt(() => prohibited.get()), { code: 'RUST_AUTH_OWNED' });
 });

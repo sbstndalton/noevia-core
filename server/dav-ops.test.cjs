@@ -1,9 +1,9 @@
 'use strict';
 const test=require('node:test'),assert=require('node:assert/strict'),http=require('node:http');
 const Database=require('better-sqlite3');
-const {createDavHandler}=require('./dav.cjs');
-const {createDavSettings}=require('./dav-settings.cjs');
-const {destinationPath,destinationTag}=require('./dav-ops.cjs');
+const {createDavHandler}=require('../tests/oracles/dav.cjs');
+const {createDavSettings}=require('../tests/oracles/dav-settings.cjs');
+const {destinationPath,destinationTag}=require('../tests/oracles/dav-ops.cjs');
 const TAG='a'.repeat(64),DEST='b'.repeat(64);
 
 async function setup(t,{ops}={}){

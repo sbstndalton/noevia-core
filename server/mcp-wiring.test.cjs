@@ -4,7 +4,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const { AsyncLocalStorage } = require('node:async_hooks');
-const { createMcpWiring, createDirectoryUrlAllowed, createCredentialOriginCheck, parseNextcloudOrigins } = require('./mcp-wiring.cjs');
+const { createMcpWiring, createDirectoryUrlAllowed, createCredentialOriginCheck, parseNextcloudOrigins } = require('../tests/server/oracle/mcp-wiring-with-reference.cjs');
 
 const rawTool = (name, readOnly) => ({ name, description: name, inputSchema: { type: 'object', properties: {} }, annotations: readOnly === undefined ? undefined : { readOnlyHint: readOnly } });
 

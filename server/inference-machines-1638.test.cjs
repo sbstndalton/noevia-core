@@ -1,14 +1,15 @@
+// Historical Node registry fixture; runtime clients are covered by native-machines-client tests.
 'use strict';
 // #1638: Settings → Inference machines. The registry (inference-machines.cjs), the consumers that read
 // their address from it (decision-settings.cjs, rerank-settings.cjs, llamacpp-manager.cjs keepAlongside),
 // the bounded health probe (machine-health.cjs) and the admin-only route. Synthetic addresses only.
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { createInferenceMachines, normalizeAddress, KEY } = require('./inference-machines.cjs');
+const { createInferenceMachines, normalizeAddress, KEY } = require('../tests/reference/inference-machines.node.cjs');
 const { createDecisionSettings } = require('./decision-settings.cjs');
-const { createRerankSettings } = require('./rerank-settings.cjs');
+const { createRerankSettings } = require('./fixtures/rerank-settings-reference.cjs');
 const { createMachineHealth, machineState } = require('./machine-health.cjs');
-const { createInferenceMachineRoutes } = require('./routes/inference-machines.cjs');
+const { createInferenceMachineRoutes } = require('../tests/reference/inference-machines-route.node.cjs');
 
 function memoryStore(seed = {}) {
   const map = new Map(Object.entries(seed));
@@ -144,7 +145,7 @@ test('reranker: an assignment moves the address and drops the deployment key on 
 test('residency: a reranker on another machine is not kept beside the chat model on this engine', async () => {
   const keys = ['NOEVIA_FEATURE_RAG_RERANK', 'RERANK_BACKEND', 'RERANK_BASE_URL', 'RERANK_MODEL', 'RERANK_SHARED_ENGINE', 'INFERENCE_BASE_URL', 'EMBEDDING_BASE_URL'];
   const before = Object.fromEntries(keys.map((k) => [k, process.env[k]]));
-  const rs = require('./rerank-settings.cjs');
+  const rs = require('./fixtures/rerank-settings-reference.cjs');
   const { keepAlongside } = require('./llamacpp-manager.cjs');
   try {
     Object.assign(process.env, { NOEVIA_FEATURE_RAG_RERANK: 'true', RERANK_BACKEND: 'llamacpp', RERANK_BASE_URL: 'http://engine:8080/v1', RERANK_MODEL: 'bge-reranker', RERANK_SHARED_ENGINE: 'allow', INFERENCE_BASE_URL: 'http://engine:8080/v1', EMBEDDING_BASE_URL: 'http://embed:8080/v1' });

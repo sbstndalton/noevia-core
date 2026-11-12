@@ -45,7 +45,6 @@ function stubVault() {
 
 function setup({ enabled = true, freeChats = [], projects = [], histories = {}, vault = stubVault() } = {}) {
   const state = { freeChats, projects, histories, enabled, index: {}, deleted: new Set() };
-  const timers = [];
   const mirror = createChatVaultMirror({
     enabled: () => state.enabled,
     lists: (userId) => { assert.equal(userId, 'u1', 'lists are read for the scheduled user only'); return { freeChats: state.freeChats, projects: state.projects }; },
@@ -53,12 +52,8 @@ function setup({ enabled = true, freeChats = [], projects = [], histories = {}, 
     readHistory: (_userId, id) => state.histories[id] || [],
     files: vault.client,
     index: { read: () => state.index, write: (_u, value) => { state.index = JSON.parse(JSON.stringify(value)); } },
-    setTimer: (fn, ms) => { const t = { fn, ms, done: false }; timers.push(t); return t; },
-    clearTimer: (t) => { t.done = true; },
-    now: () => 1000,
   });
-  const flush = async () => { while (timers.some((t) => !t.done)) { const t = timers.find((x) => !x.done); t.done = true; await t.fn(); } };
-  return { state, mirror, vault, timers, flush };
+  return { state, mirror, vault };
 }
 const chat = (id, title, extra = {}) => ({ id, title, createdAt: Date.UTC(2026, 9, 1, 9), updatedAt: Date.UTC(2026, 9, 2, 10), ...extra });
 
@@ -223,47 +218,52 @@ test('never overwrites a note noevia did not write; a vault edit is kept in Tras
   assert.match(vault.files.get('Chats/Inbox/Mine (2).md'), /noevia_id: "a"/);
 });
 
-test('opt-in off: scheduling and running make zero Diary calls', async () => {
-  const { mirror, vault, flush } = setup({ enabled: false, freeChats: [chat('a', 'A')] });
-  mirror.schedule('u1', 'a');
-  mirror.schedule('u1', null, { immediate: true });
-  await flush();
+test('opt-in off: a pass makes zero Diary calls and answers off', async () => {
+  const { mirror, vault } = setup({ enabled: false, freeChats: [chat('a', 'A')] });
+  assert.equal(await mirror.pass('u1', ['a']), 'off');
+  assert.equal(await mirror.pass('u1', []), 'off');
   assert.deepEqual(vault.calls, []);
-  assert.equal(mirror.pending('u1'), false);
 });
 
-test('debounce: a burst of saves is one sync, after the quiet period', async () => {
-  const { mirror, vault, timers, flush } = setup({ freeChats: [chat('a', 'A')] });
-  for (let i = 0; i < 5; i++) mirror.schedule('u1', 'a');
-  assert.equal(timers.filter((t) => !t.done).length, 1, 'one pending timer per user');
-  assert.equal(timers.at(-1).ms, 5000);
-  assert.equal(vault.calls.length, 0, 'nothing is written while saves keep coming');
-  await flush();
+test('a pass answers done, writes the dirty chat, and the schedule is not this process\'s', async () => {
+  const { mirror, vault, state } = setup({ freeChats: [chat('a', 'A')] });
+  assert.equal(await mirror.pass('u1', ['a']), 'done');
   assert.equal(vault.calls.filter((c) => c.op === 'write').length, 1);
+  assert.equal(state.index.notes.a.path, 'Chats/Inbox/A.md');
+  assert.equal(mirror.schedule, undefined);
+  assert.equal(mirror.pending, undefined);
 });
 
-test('debounce wait never exceeds maxWait from the first save of a burst', () => {
-  let clock = 0; const seen = [];
-  const m = createChatVaultMirror({ enabled: () => true, lists: () => ({}), readHistory: () => [], files: stubVault().client,
-    index: { read: () => ({}), write: () => {} }, setTimer: (fn, ms) => { seen.push([clock, ms]); return {}; }, clearTimer: () => {}, now: () => clock, delayMs: 5000, maxWaitMs: 30000 });
-  for (const t of [0, 4000, 8000, 27000, 29000]) { clock = t; m.schedule('u1'); }
-  assert.deepEqual(seen, [[0, 5000], [4000, 5000], [8000, 5000], [27000, 3000], [29000, 1000]]);
-});
-
-test('a failed sync keeps the index and retries later with the same dirty chats', async () => {
+test('a failed pass answers failed, keeps the index, and the same dirty chats succeed on the front\'s retry', async () => {
   const vault = stubVault();
   let broken = true;
   const write = vault.client.write;
   vault.client.write = async (...args) => { if (broken) throw Object.assign(Error('storage down'), { status: 503 }); return write(...args); };
-  const { mirror, state, timers, flush } = setup({ vault, freeChats: [chat('a', 'A')] });
-  mirror.schedule('u1', 'a');
-  await timers[0].fn(); timers[0].done = true;
+  const { mirror, state } = setup({ vault, freeChats: [chat('a', 'A')] });
+  assert.equal(await mirror.pass('u1', ['a']), 'failed');
   assert.equal(state.index.notes?.a, undefined, 'nothing recorded for a note that did not save');
-  const retry = timers.find((t) => !t.done);
-  assert.equal(retry.ms, 60000);
   broken = false;
-  await flush();
+  assert.equal(await mirror.pass('u1', ['a']), 'done');
   assert.equal(state.index.notes.a.path, 'Chats/Inbox/A.md');
+});
+
+test('a thrown dependency is a failed pass, never a throw', async () => {
+  const logs = [];
+  const m = createChatVaultMirror({ enabled: () => true, lists: () => { throw new Error('lists unreadable'); }, readHistory: () => [], files: stubVault().client,
+    index: { read: () => ({}), write: () => {} }, log: (...a) => logs.push(a.join(' ')) });
+  assert.equal(await m.pass('u1', []), 'failed');
+  assert.ok(logs.some((l) => l.includes('sync failed')));
+});
+
+test('passes for one account never overlap, even when the front retries one it gave up on', async () => {
+  let running = 0, peak = 0;
+  const vault = stubVault();
+  const read = vault.client.read;
+  vault.client.read = async (...args) => { running++; peak = Math.max(peak, running); await new Promise((r) => setTimeout(r, 15)); try { return await read(...args); } finally { running--; } };
+  const { mirror } = setup({ vault, freeChats: [chat('a', 'A'), chat('b', 'B')] });
+  const results = await Promise.all([mirror.pass('u1', ['a']), mirror.pass('u1', ['b']), mirror.pass('u1', [])]);
+  assert.deepEqual(results, ['done', 'done', 'done']);
+  assert.equal(peak, 1);
 });
 
 test('#757 rename with the old note gone never overwrites a foreign note at the new name', async () => {
@@ -343,42 +343,6 @@ test('#757 an entry with an unknown (null) version is preserved to Trash before 
   assert.match(vault.files.get('Chats/Inbox/A.md'), /^# A$/m);
 });
 
-test('#758 failures back off 1, 2, 4 ... minutes, cap at an hour, log once per step; a nudge resets', async () => {
-  const vault = stubVault();
-  vault.client.write = async () => { throw Object.assign(Error('storage down'), { status: 503 }); };
-  const logs = [];
-  const timers = [];
-  const mirror = createChatVaultMirror({
-    enabled: () => true, lists: () => ({ freeChats: [chat('a', 'A')], projects: [] }), readHistory: () => [],
-    files: vault.client, index: { read: () => ({}), write: () => {} }, log: (...a) => logs.push(a.join(' ')),
-    setTimer: (fn, ms) => { const t = { fn, ms, done: false }; timers.push(t); return t; }, clearTimer: (t) => { t.done = true; }, now: () => 1000,
-  });
-  const step = async () => { const t = timers.find((x) => !x.done); t.done = true; await t.fn(); return timers.find((x) => !x.done)?.ms; };
-  mirror.schedule('u1', 'a');
-  const delays = [];
-  for (let i = 0; i < 10; i++) delays.push(await step());
-  const m = 60000;
-  assert.deepEqual(delays, [m, 2 * m, 4 * m, 8 * m, 16 * m, 32 * m, 60 * m, 60 * m, 60 * m, 60 * m]);
-  assert.equal(logs.filter((l) => l.includes('retrying in')).length, 7, 'one log per backoff step, none at the steady cap');
-  mirror.schedule('u1', 'a');
-  assert.equal(await step(), m, 'a nudge starts the backoff over');
-  assert.ok(mirror.pending('u1'));
-});
-
-test('#758 a success frees the user entry and resets the backoff', async () => {
-  const vault = stubVault();
-  let broken = true;
-  const write = vault.client.write;
-  vault.client.write = async (...args) => { if (broken) throw Object.assign(Error('down'), { status: 503 }); return write(...args); };
-  const { mirror, timers } = setup({ vault, freeChats: [chat('a', 'A')] });
-  mirror.schedule('u1', 'a');
-  for (let i = 0; i < 3; i++) { const t = timers.find((x) => !x.done); t.done = true; await t.fn(); }
-  assert.equal(timers.find((x) => !x.done).ms, 240000);
-  broken = false;
-  const t = timers.find((x) => !x.done); t.done = true; await t.fn();
-  assert.equal(mirror.pending('u1'), false, 'idle users are freed');
-});
-
 test('#758 a taken: entry is pruned once the foreign note is gone', async () => {
   const vault = stubVault();
   vault.files.set('Chats/Inbox/A.md', 'foreign');
@@ -394,7 +358,7 @@ test('#758 a taken: entry is pruned once the foreign note is gone', async () => 
 });
 
 test('mirrorTrigger: only writes to chats, moves, projects and imports', () => {
-  // The transcript save is the Rust front's (#1071 slice 5); the change journal schedules it.
+  // The transcript save is the Rust front's (#1071 slice 5); the Rust front's journal consumer schedules it.
   assert.equal(mirrorTrigger('POST', '/api/chats/c%201/history'), null);
   assert.equal(mirrorTrigger('POST', '/api/chats/c%201/move'), null);
   assert.equal(mirrorTrigger('POST', '/api/chats/c1/move'), null);
