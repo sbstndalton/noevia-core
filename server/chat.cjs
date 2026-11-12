@@ -9,6 +9,7 @@ const CHAT_MOVE_ENFORCEMENT_MARKER = 'noevia-chat-move-enforcement/1';
 const { isChatGenerationModel } = require('./chat-model-kind.cjs');
 const { isInAppBox } = require('./toolbox-flags.cjs');
 const editTargets = require('./project-edit-target.cjs');
+const specialistPageSave = require('./specialist-page-save.cjs');
 const { readCappedText, readCappedJson, discardBody } = require('./http.cjs');
 // A provider's error body is only shown as a short message; a summary reply is a few KB of JSON.
 // Both are capped so a provider streaming an endless body cannot be buffered whole (#903).
@@ -2367,7 +2368,8 @@ function createChatHandler({
               } catch {
                 return 'ERROR: the chat permission context could not be verified; the tool was not run. Nothing was changed. Ask again.';
               }
-              usedGrant = chatWideApproved(userId, grantChat, writeGrantScope, permissionBinding);
+              // #2446: the coworker page save is asked about every time; "Allow for this chat" never covers it.
+              usedGrant = !specialistPageSave.neverStanding(tc.name) && chatWideApproved(userId, grantChat, writeGrantScope, permissionBinding);
             }
             const askedPerCall = permission === 'ask' && (!usedGrant || provenanceHits.length > 0 || automaticOnlyWrites.has(tc.name));
             if (askedPerCall) {
@@ -2386,9 +2388,10 @@ function createChatHandler({
                 // The MCP server this call goes to (#865), so the card can say where it really runs.
                 ...(toolRoutes.has(tc.name) ? { server: toolRoutes.get(tc.name) } : {}),
                 ...(repeat ? { repeatOf: true } : {}),
+                ...(specialistPageSave.neverStanding(tc.name) ? { once: true } : {}),
                 ...(provenanceHits.length ? { provenance: provenanceHits } : {}),
               });
-              const decision = await awaitApproval({ id: approvalId, userId, chatId: grantChat, scope: writeGrantScope, binding: permissionBinding, abortSignal: chatSignal.signal });
+              const decision = await awaitApproval({ id: approvalId, userId, chatId: grantChat, scope: writeGrantScope, binding: permissionBinding, abortSignal: chatSignal.signal, once: specialistPageSave.neverStanding(tc.name) });
               if (decision !== 'approve') {
                 // A refusal is a normal conversational turn: the model is told
                 // plainly so it can offer an alternative, rather than the stream
