@@ -22,8 +22,8 @@ const testDataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'noevia-s8-title-'));
 process.env.DIARY_AUTH_TOKEN = 'test-cowork-token';
 process.env.UI_AUTH_TOKEN = 'test-cowork-token';
 process.env.UI_DATA_DIR = testDataDir;
-// The front's maintenance authority (synthetic): main's boot fence keeps chat closed until this start registers.
-require('../tests/server/project-store-server.cjs').installProjectStore(testDataDir, process.env, { maintenance: true });
+// The front's maintenance authority and reranker settings (synthetic): after main, a turn needs both.
+require('../tests/server/project-store-server.cjs').installProjectStore(testDataDir, process.env, { maintenance: true, reranker: true });
 process.env.LEGACY_AUTH_COMPAT = 'true';
 process.env.PUBLIC_ORIGIN = 'http://localhost';
 // The engine manager with its maintenance gate (engineBusy reads its counts); the engine itself is a stub address.
