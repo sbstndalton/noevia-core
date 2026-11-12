@@ -27,4 +27,6 @@ test('internal contexts have no optional tools by default and free chats remain 
   assert.equal(server.chatProjectId('../other'),null);
   assert.equal(server.internalProject({id:server.PROJECT_ID}),true);
   assert.equal(server.internalProject({id:'normal-project'}),false);
+  assert.equal(server.internalProject({id:'specialist-aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'}),true, 'a coworker\'s backing project is never listed (#2446)');
+  assert.equal(server.internalProject({id:'my-specialist-notes'}),false);
 });
