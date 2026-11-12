@@ -17,7 +17,7 @@ const WRITE = 'space_page_save';
 const COWORKER = 'specialist-aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
 const CONVERSATION = 'specialist-chat-aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
 
-function harness(t, { holder = () => undefined } = {}) {
+function harness(t, { holder = () => undefined, policy = null, notWrite = false, gate: toolGateOverride = null } = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'noevia-grant-917-'));
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
   const user = { id: 'synthetic-user' };
@@ -51,7 +51,7 @@ function harness(t, { holder = () => undefined } = {}) {
       rag: { filesContext: async () => null }, prefill: { recordSample() {} }, reduceToolResult: require('./tool-result-reduce.cjs').reduceToolResult,
       HISTORY_CAP: 20, DEFAULT_PROVIDER_ID: 'default', DIARY_BASE: 'http://fixture.invalid', TOOL_RESULT_CAP: 8000,
       authService: { audit() {} },
-      toolPolicy: { mode: (_user, _tool, write) => (write ? 'ask' : 'allow') },
+      toolPolicy: { mode: policy || ((_user, _tool, write) => (write ? 'ask' : 'allow')) },
       modelManager: { enabled: true, load: async () => ({ ok: true }), health: async () => ({ ok: true, body: { all_models_loaded: [{ model_name: 'synthetic-model', loaded: true, recipe_options: { ctx_size: 32768 } }] } }) },
       requestScope, currentWorkspace: () => ({ userId: user.id, dir }), json() {}, getProject: (id) => projects.get(id) || null,
       getProvider: () => ({ id: 'default', baseUrl: 'http://fixture.invalid', label: 'Mock' }), providerHeaders: () => ({}), saveChats() {}, endpointApproved: () => true,
@@ -59,7 +59,8 @@ function harness(t, { holder = () => undefined } = {}) {
       classifyFastOrSmart: async () => 'fast', servedCatalogue: async () => [], modelsInstalled: async () => [], missingRoles: () => [], staleRolesError: () => null,
       visionProbe: async () => ({ supported: false, reason: 'none' }), visionDescriptions: new Map(), skillsIndexFor: () => [],
       chatSkillRouter: { select: async () => ({ loaded: [] }) }, chatToolRouter: { select: async (ids) => ({ ids, routed: false }) },
-      ...toolbox, oauthServerIds: () => new Set(), accountReady: () => true,
+      ...(toolGateOverride ? { toolGate: toolGateOverride } : {}),
+      ...toolbox, ...(notWrite ? { isWriteTool: (name) => (name === WRITE ? false : toolbox.isWriteTool(name)) } : {}), oauthServerIds: () => new Set(), accountReady: () => true,
       grantContext: async raw => {
         const actual = state.holder(raw);
         const owner = actual === undefined ? (projectId || 'free') : actual;
@@ -125,4 +126,34 @@ test('the front refusing a Space reaches the model as an ERROR result', async (t
   const h = harness(t);
   const r = await h.turn({ projectId: COWORKER, chatId: CONVERSATION, answer: { status: 400, body: { error: 'That Space is not one this coworker may save to; nothing was saved.', code: 'invalid_request' } } });
   assert.ok(JSON.stringify(r.events).includes('ERROR: That Space is not one this coworker may save to; nothing was saved.'));
+});
+
+test('an account policy of allow still shows the card, once, and nothing is saved before approval', async (t) => {
+  const h = harness(t, { policy: () => 'allow' });
+  const r = await h.turn({ projectId: COWORKER, chatId: CONVERSATION, decision: 'deny' });
+  assert.equal(r.carded, true, 'allow does not skip the card');
+  assert.equal(r.pending.once, true);
+  assert.deepEqual(r.saves, [], 'declined: nothing reached the store');
+});
+
+test('a tool the loop does not count as a write still shows the card, once, before any save', async (t) => {
+  const h = harness(t, { policy: (_u, _t, write) => (write ? 'ask' : 'allow'), notWrite: true });
+  const r = await h.turn({ projectId: COWORKER, chatId: CONVERSATION, decision: 'deny' });
+  assert.equal(r.carded, true, 'not-a-write does not skip the card');
+  assert.equal(r.pending.once, true);
+  assert.deepEqual(r.saves, []);
+});
+
+test('a block policy stays a block: no card, no save', async (t) => {
+  const h = harness(t, { policy: () => 'block' });
+  const r = await h.turn({ projectId: COWORKER, chatId: CONVERSATION });
+  assert.equal(r.carded, false);
+  assert.deepEqual(r.saves, []);
+});
+
+test('the tool gate can never pre-run it: a prefetch decision for it sends nothing to the store', async (t) => {
+  const h = harness(t, { policy: () => 'allow', gate: { evaluate: async () => ({ decision: { tool: WRITE, mode: 'prefetch', args: { title: 'QA gate', content: 'x' } } }) } });
+  const r = await h.turn({ projectId: COWORKER, chatId: CONVERSATION, decision: 'deny' });
+  assert.equal(r.saves.length, 0, 'nothing saved without the card being approved');
+  assert.equal(r.events.some((e) => e.type === 'tool' && e.name === WRITE && !r.carded), false);
 });
