@@ -25,7 +25,7 @@ function routes({ manager = {}, loader = async () => ({ ok: true, status: 200, b
     missingRoles: () => null, currentWorkspace: () => ({ userId: 'u1' }),
     service: { modelScanCache: scan, refreshModelScan: () => {}, autoRoles: () => null, setAutoRoles: () => {}, ensureRolesLoaded: () => {},
       servedCatalogue: async () => [], modelsInstalled: async () => { throw Error('ENOENT /secret/path/models.ini'); }, deriveUserModelName: c => c,
-      lastLoadedModel: () => null, clearLastLoadedModel: () => {}, clearRoleReferences: () => [] },
+      lastLoadedModel: () => null, clearLastLoadedModel: () => {}, forgetModelState: async () => {}, clearRoleReferences: () => [] },
   });
   const call = (method, p, body) => {
     const req = Readable.from(body === undefined ? [] : [Buffer.from(JSON.stringify(body))]);

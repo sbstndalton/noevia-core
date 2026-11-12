@@ -69,7 +69,7 @@ const STATS_REFUSAL = Object.freeze({ error: 'Engine statistics are owned by the
 const ROUTING_DEFAULT_REFUSAL = Object.freeze({ error: 'Routing default is owned by the Rust front.' });
 const AUTO_ROLES_REFUSAL = Object.freeze({ error: 'The auto-roles read is owned by the Rust front.', code: 'RUST_AUTO_ROLES_OWNED' });
 function createModelRoutes({ servedEmbeddingModels = (target) => require('../rag.cjs').servedModelsCached(target), json, readBody, readJson, fetchJson, env, modelManager, currentWorkspace, service, inferenceBudget = null, idleUnload = null, sweepGuardOptions = {}, decisionSettings = null, rerankSettings = null }) {
-  const { modelScanCache, refreshModelScan, autoRoles, servedCatalogue, modelsInstalled, deriveUserModelName, lastLoadedModel, clearLastLoadedModel, clearRoleReferences } = service;
+  const { modelScanCache, refreshModelScan, autoRoles, servedCatalogue, modelsInstalled, deriveUserModelName, clearRoleReferences } = service;
   // #1461: the installed list is shared for a moment (service.modelsInstalled). A decision that must confirm
   // the engine's state right now (a delete that checks the model exists, a load that checks it is not missing)
   // asks for a fresh read instead.
@@ -186,8 +186,7 @@ function createModelRoutes({ servedEmbeddingModels = (target) => require('../rag
     if (held.refused) return { ok: false, status: 409, code: 'maintenance_held', error: PRESETS_BUSY, retryable: true };
     for (const name of removed) {
       await clearRoleReferences(name);
-      if (lastLoadedModel() === name) clearLastLoadedModel(name);
-      if (typeof modelManager.forgetIdentity === 'function') modelManager.forgetIdentity(name);
+      await service.forgetModelState(name);
     }
     const { reloaded } = held;
     if (removed.length) { modelScanCache.clear(); if (service.invalidateModelReads) service.invalidateModelReads(); }
@@ -418,8 +417,7 @@ function createModelRoutes({ servedEmbeddingModels = (target) => require('../rag
             if(u?.ok)unloaded=true;
           }
           for(const role of await clearRoleReferences(id))rolesCleared.add(role);
-          if(lastLoadedModel()===id)clearLastLoadedModel(id);
-          if(typeof modelManager.forgetIdentity==='function')modelManager.forgetIdentity(id);
+          await service.forgetModelState(id);
         }
         modelScanCache.clear();
         return json(res,result.status,{...detail,unloaded,rolesCleared:[...rolesCleared]});
@@ -620,8 +618,7 @@ function createModelRoutes({ servedEmbeddingModels = (target) => require('../rag
       // model" default if it was this one, and the cached folder scan, so nothing still
       // served by this route can hand the deleted name back out.
       const rolesCleared = await clearRoleReferences(body.name);
-      if (lastLoadedModel() === body.name) clearLastLoadedModel(body.name);
-      if (typeof modelManager.forgetIdentity === 'function') modelManager.forgetIdentity(body.name);
+      await service.forgetModelState(body.name);
       // #1695: the router still lists a removed section until it re-reads models.ini.
       const reloaded = !!held?.reloaded;
       modelScanCache.clear();
