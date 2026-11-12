@@ -41,7 +41,9 @@ test('client places get index.html, uncached', async () => {
     '/customise/skills', '/models', '/models/org%2Fmodel.gguf', '/diary', '/archived', '/code', '/projects', '/chat', '/settings',
     // #406: a truncated/stripped-id chat or project link — the shell loads and the client's own
     // routing (routes.ts) reads these as a new chat, same as any other unrecognised /c or /p id.
-    '/c', '/c/', '/p', '/p/']) {
+    '/c', '/c/', '/p', '/p/',
+    // #2446: the Spaces and Coworkers pages.
+    '/spaces', '/spaces/', '/spaces/sp-1', '/spaces/sp-1/', '/spaces/sp-1/pg_2', '/coworkers', '/coworkers/cw-1', '/coworkers/cw-1/']) {
     const res = await call(serve, p);
     assert.equal(res.status, 200, p);
     assert.equal(res.body, INDEX, p);
@@ -58,7 +60,8 @@ test('assets, API paths, DAV-looking and unknown paths are untouched', async () 
   assert.match(asset.headers['Cache-Control'], /immutable/);
   assert.equal((await call(serve, '/theme.js')).body, '/* synthetic */');
   for (const p of ['/assets/missing-999.js', '/api/nope', '/api/chats/c-1/history', '/api', '/remote.php/dav/files/x',
-    '/dav/files/x', '/.well-known/caldav', '/nope', '/c/a/b', '/c/<x>', '/p/proj-1/unknown', '/settings/a/b', '/favicon.ico']) {
+    '/dav/files/x', '/.well-known/caldav', '/nope', '/c/a/b', '/c/<x>', '/p/proj-1/unknown', '/settings/a/b', '/favicon.ico',
+    '/spaces/a/b/c', '/coworkers/a/b']) {
     const res = await call(serve, p);
     assert.equal(res.status, 404, p);
     assert.match(res.headers['Content-Type'], /application\/json/, p);
@@ -77,11 +80,15 @@ test('isClientRoute: narrow on purpose', () => {
   for (const p of ['/', '/c/abc', '/c/abc/', '/p/a_b-1', '/p/x/code', '/settings/notifications', '/customize/connectors', '/models/x%20y',
     // #406: bare/truncated /c and /p (and their trailing-slash forms) are a chat/project link
     // with an empty id, not an arbitrary unknown route.
-    '/c', '/c/', '/p', '/p/']) {
+    '/c', '/c/', '/p', '/p/',
+    // #2446: Spaces and Coworkers pages.
+    '/spaces', '/spaces/sp-1', '/spaces/sp-1/pg_2/', '/coworkers', '/coworkers/cw-1']) {
     assert.equal(isClientRoute(p), true, p);
   }
   for (const p of ['/api/', '/api/workspace', '/assets/x.js', '//evil.example', '/\\evil', '/c/' + 'a'.repeat(121), '/models/a/b',
-    '/settings/UPPER', null, undefined, 42, '/' + 'x'.repeat(800), '/c/a/b', '/c/<x>', '/p/proj-1/unknown', '/p/proj-1/new/x']) {
+    '/settings/UPPER', null, undefined, 42, '/' + 'x'.repeat(800), '/c/a/b', '/c/<x>', '/p/proj-1/unknown', '/p/proj-1/new/x',
+    // #2446: an id is [A-Za-z0-9_-], and a space has at most two segments, a coworker one.
+    '/spaces/a.b', '/spaces/a b', '/spaces/a/b/c', '/spaces//a', '/coworkers/a/b', '/coworkers/<x>', '/coworkers/' + 'a'.repeat(121)]) {
     assert.equal(isClientRoute(p), false, String(p));
   }
 });

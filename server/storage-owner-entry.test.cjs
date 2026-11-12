@@ -117,12 +117,13 @@ test('M4_ENTRY/complete_original_index', { concurrency: false }, async t => {
   let auth;
   try {
     Object.assign(process.env, env);
-    // The only permitted exchange is Core's private feature-context registration with the loopback
-    // project store (installProjectStore below); every other request still fails the test.
+    // The only permitted exchanges are Core's private feature-context registration and its native
+    // auto-roles pairing proof with the loopback project store (installProjectStore below); every
+    // other request still fails the test.
     global.fetch = async (input, init) => {
       const target = new URL(String(input?.url ?? input));
       if (target.protocol === 'http:' && target.hostname === '127.0.0.1' && target.port === process.env.NOEVIA_PROJECT_STORE_PORT
-        && target.pathname === '/v1/features/context' && init?.method === 'POST') return realFetch(input, init);
+        && ['/v1/features/context', '/v1/auto-roles/proof'].includes(target.pathname) && init?.method === 'POST') return realFetch(input, init);
       assert.fail('M4_ENTRY/unexpected_network');
     };
     const { createSecretStore } = require('./secrets.cjs');

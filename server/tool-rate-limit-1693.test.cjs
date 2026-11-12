@@ -4,7 +4,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const { AsyncLocalStorage } = require('node:async_hooks');
-const { createMcpWiring } = require('./mcp-wiring.cjs');
+const { createMcpWiring } = require('../tests/server/oracle/mcp-wiring-with-reference.cjs');
 const { createToolRateLimit, isRateLimitedText, parseRetryAfter, BASE_MS, MAX_MS } = require('./tool-rate-limit.cjs');
 
 const rawTool = (name) => ({ name, description: name, inputSchema: { type: 'object', properties: {} }, annotations: { readOnlyHint: true } });

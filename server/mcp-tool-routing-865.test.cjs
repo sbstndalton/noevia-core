@@ -12,8 +12,8 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs'), path = require('node:path'), os = require('node:os');
 const { EventEmitter } = require('node:events');
 const { AsyncLocalStorage } = require('node:async_hooks');
-const { createMcpWiring, createCredentialOriginCheck } = require('./mcp-wiring.cjs');
-const { bindBoxes } = require('./mcp-boxes.cjs');
+const { createMcpWiring, createCredentialOriginCheck } = require('../tests/server/oracle/mcp-wiring-with-reference.cjs');
+const { bindBoxes } = require('../tests/server/oracle/mcp-boxes.cjs');
 const { createToolboxes } = require('./toolboxes.cjs');
 
 const NC_URL = 'http://nc.invalid/mcp';

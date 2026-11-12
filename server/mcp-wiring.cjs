@@ -1,13 +1,19 @@
 'use strict';
 // ── MCP wiring ────────────────────────────────────────────────────────────
 // How noevia talks to MCP servers at runtime: the live server list (operator
-// entries plus directory entries an administrator added), lazy cached
-// discovery with per-server failure, which credential each server mode gets
-// (nextcloud pass-through, a static bearer, a per-account key or sign-in, or
-// a capability token for noevia's own internal server), and the executor
-// that runs one discovered tool. The MCP protocol itself is mcp.cjs; the
-// curated boxes are mcp-boxes.cjs; the directory and OAuth stores are
-// injected, so this module holds no database and tests need no server.
+// entries plus directory entries an administrator added), which credential
+// each server mode gets at call time (nextcloud pass-through, a static bearer,
+// a per-account key or sign-in, or a capability token for noevia's own internal
+// server), and the executor that runs one discovered tool. The MCP protocol
+// itself is mcp.cjs; the directory and OAuth stores are injected, so this
+// module holds no database and tests need no server.
+//
+// DISCOVERY IS THE RUST FRONT'S (sbstndalton/noevia row T, mcp_discovery_actor.rs): connecting to
+// every server, listing and converting its tools, binding the curated boxes, the refresh cadence,
+// failure backoff and the coalescing of callers. This module is a fail-closed client of it
+// (`discovery.discover`, over the internal store): what comes back replaces `mcpState`
+// wholesale, under a generation that never goes backwards, and a front that cannot answer leaves
+// NO tools and no boxes, never the last list.
 
 /** Whether a directory server's address may be used at all. Directory servers
  *  are strangers' metadata, so only a public host is acceptable — except that
@@ -51,9 +57,9 @@ function createCredentialOriginCheck(origins) {
 /**
  * @param {object} deps
  * @param {object[]} deps.servers        the MCP_SERVERS array; mutated in place when directory servers sync
- * @param {object[]} deps.manifest       curated boxes (mcp-toolbox-manifest.cjs)
- * @param {object} deps.mcp              the protocol client: connect, listTools, callTool, disconnect, convertTool, readOnlyHint, resultToText
- * @param {(opts) => object[]} deps.bindBoxes   mcp-boxes.cjs
+ * @param {object} deps.mcp              the protocol client for executing a tool: connect, callTool, disconnect, resultToText
+ * @param {{ discover(opts: { force?: boolean, generation?: number|null }): Promise<object> }} deps.discovery
+ *   the Rust front's discovery (mcp-native-discovery.cjs): the snapshot, or `{ unchanged: true }`; it throws when the front cannot answer
  * @param {object} deps.directoryMcp     asServers, boxFor, headersFor, signal (the Rust front writes the table; this is a re-reader)
  * @param {object} deps.mcpOAuth         the OAuth broker (rust-mcp-credentials.cjs): connected, tokenFor, session, reject
  * @param {object} [deps.mcpKeys]        the keys broker: hasKey (sync, from its published readiness) and headers (async,
@@ -74,30 +80,18 @@ function createCredentialOriginCheck(origins) {
  *   directoryUrlAllowed already requires to be public), so a name that re-resolves between that
  *   check and the request (DNS rebinding, #795) cannot reach the home network. The operator's
  *   MCP_SERVERS — a LAN Nextcloud server, noevia's own loopback server — never use it.
- * @param {number} [deps.discoveryTtlMs]
- * @param {number} [deps.discoveryFailTtlMs]   how long a failed/empty discovery is remembered
- *   before the next unforced request is allowed to retry every server again. Short on purpose:
- *   long enough that a member spamming GET /api/toolboxes cannot re-trigger a full
- *   connect/listTools/disconnect of every server on every request, short enough that a side-car
- *   coming back up is noticed soon. A forced discovery (admin add/remove, OAuth finish) always
- *   bypasses this.
  * @param {{ log, warn }} [deps.logger]
  */
 function createMcpWiring({
-  servers, manifest = [], mcp, bindBoxes, directoryMcp, mcpOAuth, mcpKeys = { hasKey: () => false, headers: async () => null }, directoryUrlAllowed, credentialOriginAllowed,
+  servers, mcp, discovery, directoryMcp, mcpOAuth, mcpKeys = { hasKey: () => false, headers: async () => null }, directoryUrlAllowed, credentialOriginAllowed,
   scope, storageFor, isWriteTool, internal, internalKey, reduceToolResult, resultCap = 8000,
-  env = process.env, fetch = globalThis.fetch, publicFetch = null, discoveryTtlMs = 10 * 60 * 1000,
-  discoveryFailTtlMs = Number(process.env.MCP_DISCOVERY_FAIL_TTL_MS || 30 * 1000), logger = console,
-  isUserDisabled = () => false,
-  // #1081: when a remote server failed discovery (its DNS or network may not be up yet at startup),
-  // it is retried after these steps, one per consecutive failed discovery, instead of after the whole
-  // discoveryTtlMs. The last step holds. Capped at discoveryTtlMs.
-  discoveryRetryMs = [5000, 15000, 45000, 120000],
+  env = process.env, fetch = globalThis.fetch, publicFetch = null, logger = console,
   toolRateLimit = require('./tool-rate-limit.cjs').createToolRateLimit(),
   // How often the Rust front's directory table is looked at on the hot paths (0: every time).
   directoryCheckMs = 250,
 }) {
   const rateLimit = require('./tool-rate-limit.cjs');
+  const REFRESH_ASK_MS = 5000;
   const PER_USER_AUTH = new Set(['nextcloud', 'personal', 'oauth']);
   /** An access token for one call: the broker's session ({ accessToken, generation }), or null. */
   const oauthSessionFor = async (userId, serverId, rejected = null, signal = undefined) => {
@@ -170,37 +164,6 @@ function createMcpWiring({
   if (!MCP_ENABLED) {
     logger.warn('[mcp] disabled: neither MCP_SERVERS nor MCP_SERVER_URL is set, so only the built-in `core` toolbox is offered. Set MCP_SERVERS to `id|url|auth` entries to enable connected tools.');
   }
-
-  // Discovered MCP tools, keyed by name, plus the boxes that survived curation.
-  // Discovery is a network round trip against servers that may be down, so it is
-  // lazy, cached, and failure is non-fatal and PER SERVER: one dead side-car must
-  // not remove the tools of a healthy one. Chat must never break because a
-  // side-car is restarting.
-  //
-  // `tools` maps a tool name to the server that offers it, because a call has to
-  // be routed back to the right one — and because a box may only bind tools from
-  // the server it declares, so a second server cannot quietly take over a
-  // curated box by offering a tool of the same name.
-  //
-  // `tools` keeps one entry per name (the first server's) for status and the read/write hint.
-  // It is NOT what a call is routed by: `offers` holds every server offering each name, and a
-  // call goes to the server whose box offered the tool (#865) — or, when the caller cannot say
-  // which server it means, is refused if more than one server offers that name.
-  const mcpState = {
-    tools: new Map(), // name -> { tool, readOnly, serverId }
-    offers: new Map(), // name -> Map(serverId -> { tool, readOnly, serverId })
-    boxes: [],
-    servers: new Map(), // id -> { id, url, auth, error, discoveredAt, toolCount }
-    discoveredAt: 0,
-    // When the last discovery came back with no boxes at all (every server failed, or none
-    // configured yet), the moment it finished — kept separately from discoveredAt so the
-    // internal-server-down retry-sooner behaviour below cannot also defeat the failure TTL.
-    failedAt: 0,
-    // #1081: consecutive discoveries in which a remote server failed (reset when every server answers).
-    remoteFailStreak: 0,
-    error: null,
-    inflight: null,
-  };
 
   /** A server's own service token, if it was configured with one. Distinct from
    *  mcpAuthHeaders, which forwards the USER's Nextcloud credential — this is a
@@ -279,165 +242,114 @@ function createMcpWiring({
     return { Authorization: `Bearer ${token}` };
   }
 
-  /** Discovery runs with no user in scope, so it gets a token that can list the
-   *  catalogue and can never call anything. The catalogue is static and
-   *  identical for everyone, so this leaks nothing. Longer-lived than a call
-   *  token because listTools paginates, and harmless because it cannot act. */
-  function mcpDiscoveryAuth(server) {
-    if (server && server.auth === 'directory') return directoryMcp.headersFor(server.id);
-    if (server && server.auth === 'internal') {
-      return { Authorization: `Bearer ${internal.mintToken(internalKey, { discovery: true, ttlMs: 120000 })}` };
-    }
-    return mcpStaticAuth(server);
+  // ── Discovery: the Rust front's (mcp_discovery_actor.rs), read here ──────────────────────────────
+  //
+  // `tools` maps a tool name to the server that offers it, because a call has to be routed back to
+  // the right one - and because a box may only bind tools from the server it declares, so a second
+  // server cannot quietly take over a curated box by offering a tool of the same name.
+  //
+  // `tools` keeps one entry per name (the first server's) for status and the read/write hint.
+  // It is NOT what a call is routed by: `offers` holds every server offering each name, and a
+  // call goes to the server whose box offered the tool (#865) - or, when the caller cannot say
+  // which server it means, is refused if more than one server offers that name.
+  /** Nothing is offered: no tool, no box, no server status. What the state is when the front cannot say. */
+  function clearState(error) {
+    mcpState.tools = new Map(); mcpState.offers = new Map(); mcpState.boxes = []; mcpState.servers = new Map(); mcpState.error = error;
+    mcpState.discoveredAt = 0; mcpState.failedAt = 0; mcpState.remoteFailStreak = 0;
   }
-
-  async function discoverOneServer(server) {
-    // Discovery lists the catalogue only. A per-USER credential is attached at
-    // call time instead (see mcpAuthHeaders), but a static service token has to
-    // be present here or the server has nothing to list.
-    // A directory server is someone else's: re-check at every discovery that its name still points
-    // at a public address, so a DNS change cannot turn it into a probe of the home network.
-    if (server.directory && !(await directoryUrlAllowed(server.url))) throw new Error('its address no longer resolves to a public host');
-    let headers = mcpDiscoveryAuth(server);
-    if (server.auth === 'personal') {
-      // The tool list is read with the key of the administrator who added the server. A disabled
-      // administrator's key is not trusted for discovery, even if it is still stored.
-      if (server.addedBy && isUserDisabled(server.addedBy)) throw new Error('waiting for an active administrator to add a key');
-      headers = await mcpKeys.headers(server.addedBy, server.id);
-      if (!headers || !Object.keys(headers).length) throw new Error('waiting for the administrator who added it to enter their key');
-    }
-    if (server.auth === 'oauth') {
-      // The tool list is read with the sign-in of the administrator who added the server. A
-      // disabled administrator's sign-in is not trusted for discovery, even if it is still stored.
-      if (server.addedBy && isUserDisabled(server.addedBy)) throw new Error('waiting for an active administrator to sign in');
-      const token = await mcpOAuth.tokenFor(server.addedBy, server.id);
-      if (!token) throw new Error('waiting for the administrator who added it to sign in');
-      headers = { Authorization: `Bearer ${token}` };
-    }
-    const transport = transportFor(server);
-    const { session } = await transport.connect(server.url, headers);
-    let discovered;
-    try {
-      discovered = await transport.listTools(server.url, session, headers);
-    } finally {
-      await transport.disconnect(server.url, session, headers);
-    }
+  /** The front's snapshot as `mcpState`. Servers keep the order the front reports (the order they finished). */
+  function applySnapshot(snap) {
+    const servers = new Map();
+    for (const sv of snap.servers) servers.set(sv.id, { ...sv });
+    const offers = new Map();
     const byName = new Map();
-    const dropped = [];
-    for (const t of discovered) {
-      const conv = mcp.convertTool(t);
-      if (!conv.ok) { dropped.push(`${(t && t.name) || '(unnamed)'}: ${conv.reason}`); continue; }
-      byName.set(conv.tool.function.name, { tool: conv.tool, readOnly: mcp.readOnlyHint(t), serverId: server.id });
+    for (const o of snap.offers) {
+      const entry = { tool: o.tool, readOnly: o.readOnly === true || o.readOnly === false ? o.readOnly : null, serverId: o.server };
+      if (!offers.has(o.name)) offers.set(o.name, new Map());
+      offers.get(o.name).set(o.server, entry);
+      if (!byName.has(o.name)) byName.set(o.name, entry);
     }
-    if (dropped.length) logger.warn(`[mcp:${server.id}] dropped ${dropped.length} unconvertible tools: ${dropped.join(' | ')}`);
-    return byName;
+    mcpState.tools = byName;
+    mcpState.offers = offers;
+    mcpState.boxes = snap.boxes;
+    mcpState.servers = servers;
+    mcpState.error = typeof snap.error === 'string' ? snap.error : null;
+    mcpState.discoveredAt = snap.discoveredAt;
+    mcpState.failedAt = snap.failedAt;
+    mcpState.remoteFailStreak = snap.remoteFailStreak;
   }
-
-  // Whether the administrator who added each per-account server is ready for it (their sign-in or key,
-  // which discovery reads the tool list with). The Rust front completes the sign-in callback and stores
-  // keys, so this process is not the one to call a forced discovery when they change: it notices here.
-  const credentialKey = () => MCP_SERVERS
-    .filter((sv) => sv.auth === 'oauth' || sv.auth === 'personal')
-    .map((sv) => `${sv.id}:${sv.auth === 'oauth' ? !!mcpOAuth.connected(sv.addedBy, sv.id) : !!mcpKeys.hasKey(sv.addedBy, sv.id)}`)
-    .join('|');
-  let discoveredWith;
+  const mcpState = {
+    tools: new Map(), // name -> { tool, readOnly, serverId }
+    offers: new Map(), // name -> Map(serverId -> { tool, readOnly, serverId })
+    boxes: [],
+    servers: new Map(), // id -> { id, url, auth, error, discoveredAt, toolCount }
+    discoveredAt: 0,
+    failedAt: 0,
+    remoteFailStreak: 0,
+    error: null,
+    /** The front's generation this state is of (never goes backwards), or null while it holds none. */
+    generation: null,
+    incarnation: null,
+  };
+  let applying = Promise.resolve();
+  let requestEpoch = 0;
+  let highWater = -1;
+  let frontIncarnation = null;
+  let askedAt = 0;
+  let refreshing = null;
+  /** A look at the toolboxes asks the front whether discovery moved, in the background and at most every few
+   *  seconds: the front refreshes on its own cadence, but only when asked, and nothing else here asks. */
+  function refreshSoon() {
+    if (refreshing || Date.now() - askedAt < REFRESH_ASK_MS) return;
+    askedAt = Date.now();
+    refreshing = discoverMcpTools().catch(() => undefined).finally(() => { refreshing = null; });
+  }
+  /**
+   * Asks the front what it has discovered (it refreshes on its own cadence; `force` rediscovers now).
+   * Never throws: a front that cannot answer leaves nothing offered, with `error` saying so, and the
+   * next call asks again. An answer older than the state already held is dropped (calls overlap).
+   */
   async function discoverMcpTools(force = false) {
-    // The Rust front adds, re-keys and removes directory servers: a changed table is rediscovered now.
+    // The server list the executor works from follows the directory table; a changed table is
+    // rediscovered now.
     if (refreshDirectory(true)) force = true;
-    // A credential discovery depends on changed since the last discovery: the tool list it was waiting
-    // for (or must no longer offer) is read again now, as a forced discovery after the sign-in was.
-    const credentials = credentialKey();
-    if (!force && discoveredWith !== undefined && credentials !== discoveredWith) force = true;
-    // No servers left (the last directory server was just removed): nothing may stay offered.
-    if (!MCP_ENABLED) { mcpState.tools = new Map(); mcpState.offers = new Map(); mcpState.boxes = []; mcpState.servers = new Map(); mcpState.error = null; return mcpState; }
-    const fresh = Date.now() - mcpState.discoveredAt < discoveryTtlMs;
-    if (!force && fresh && mcpState.boxes.length) return mcpState;
-    // A discovery that found nothing (every server failed, or none are configured yet) is still
-    // worth remembering for a short TTL: otherwise every unauthenticated poll of
-    // GET /api/toolboxes re-triggers a full connect/listTools/disconnect of every server. Forced
-    // discovery (admin add/remove, OAuth finish) always bypasses this — it must see the outcome
-    // of the change it just made, not a stale failure from before it.
-    const recentFailure = !mcpState.boxes.length && Date.now() - mcpState.failedAt < discoveryFailTtlMs;
-    if (!force && recentFailure) return mcpState;
-    // A forced refresh (a server was just added or removed) must not reuse a discovery that
-    // started before the change: wait for it, then discover again with the new list.
-    if (mcpState.inflight && force) { await mcpState.inflight.catch(() => undefined); return discoverMcpTools(true); }
-    if (mcpState.inflight) return mcpState.inflight;
-    mcpState.inflight = (async () => {
-      discoveredWith = credentials;
-      try {
-        const perServer = new Map();
-        const found = new Map();
-        await Promise.all(MCP_SERVERS.map(async (server) => {
-          try {
-            const tools = await discoverOneServer(server);
-            perServer.set(server.id, tools);
-            found.set(server.id, { ...server, error: null, discoveredAt: Date.now(), toolCount: tools.size });
-            logger.log(`[mcp:${server.id}] discovered ${tools.size} tools at ${server.url}`);
-          } catch (err) {
-            const message = String((err && err.message) || err);
-            perServer.set(server.id, new Map());
-            found.set(server.id, { ...server, error: message, discoveredAt: Date.now(), toolCount: 0 });
-            logger.warn(`[mcp:${server.id}] discovery failed for ${server.url}: ${message}`);
-          }
-        }));
-
-        // Flatten into one registry. A name offered by two servers keeps the
-        // first in `tools` — declaration order in MCP_SERVERS is the tie-break, and the
-        // collision is logged rather than silently resolved. `offers` keeps every server
-        // offering the name, which is what a call is routed by (routeMcpTool, below).
-        const byName = new Map();
-        const offers = new Map();
-        for (const server of MCP_SERVERS) {
-          for (const [name, entry] of perServer.get(server.id) || []) {
-            if (!offers.has(name)) offers.set(name, new Map());
-            offers.get(name).set(server.id, entry);
-            const held = byName.get(name);
-            if (held) {
-              logger.warn(`[mcp] "${name}" offered by both "${held.serverId}" and "${server.id}"; keeping "${held.serverId}"`);
-              continue;
-            }
-            byName.set(name, entry);
-          }
-        }
-
-        // A box binds only tools from its own server, so a rogue or merely careless second
-        // server cannot inject a tool into a curated box. See mcp-boxes.cjs.
-        // Each directory server becomes one box holding every tool it offers (and only its own).
-        const directoryBoxes = MCP_SERVERS.filter((sv) => sv.directory).map((sv) => directoryMcp.boxFor(sv, (perServer.get(sv.id) || new Map()).keys()));
-        const boxes = bindBoxes({ manifest: [...manifest, ...directoryBoxes], perServer, servers: found, warn: (line) => logger.warn(line) });
-
-        mcpState.tools = byName;
-        mcpState.offers = offers;
-        mcpState.boxes = boxes;
-        mcpState.servers = found;
-        // The internal server is this process. If it did not answer, something
-        // is starting up or broken here, not on a remote host that needs ten
-        // minutes of backoff — retry on the next request instead of hiding its
-        // boxes for the whole TTL.
-        const internalDown = [...found.values()].some((sv) => sv.auth === 'internal' && sv.error);
-        // #1081: a remote server that failed (fetch failed at startup, before DNS was up) is retried on a
-        // short backoff rather than hidden for the whole TTL. Discovery still runs lazily on the next request.
-        const remoteDown = [...found.values()].some((sv) => sv.auth !== 'internal' && sv.error);
-        mcpState.remoteFailStreak = remoteDown ? mcpState.remoteFailStreak + 1 : 0;
-        const retryMs = remoteDown && discoveryRetryMs.length
-          ? Math.min(discoveryTtlMs, discoveryRetryMs[Math.min(mcpState.remoteFailStreak, discoveryRetryMs.length) - 1])
-          : discoveryTtlMs;
-        // discoveredAt is set so the next unforced request is fresh for exactly `retryMs`.
-        mcpState.discoveredAt = internalDown ? 0 : Date.now() - (discoveryTtlMs - retryMs);
-        // A run that produced no boxes at all (every server failed, including the case above, or
-        // none are configured) is remembered for the short failure TTL regardless — an internal
-        // server that keeps failing must not turn into an unthrottled retry loop either.
-        mcpState.failedAt = boxes.length ? 0 : Date.now();
-        // Kept for the single-server status shape: the first error, if any.
-        mcpState.error = [...found.values()].map((sv) => sv.error).find(Boolean) || null;
-        logger.log(`[mcp] ${byName.size} tools across ${MCP_SERVERS.length} server(s); ${boxes.length} curated boxes available`);
-      } finally {
-        mcpState.inflight = null;
-      }
+    const epoch = ++requestEpoch;
+    const held = mcpState.generation;
+    const incarnation = mcpState.incarnation;
+    let snap;
+    try {
+      snap = await discovery.discover({ force, generation: held, incarnation });
+    } catch {
+      applying = applying.then(() => {
+        if (epoch !== requestEpoch) return;
+        clearState('MCP tool discovery is unavailable right now.');
+        mcpState.generation = null;
+        mcpState.incarnation = null;
+      });
+      await applying;
+      logger.warn('[mcp] discovery unavailable');
       return mcpState;
-    })();
-    return mcpState.inflight;
+    }
+    applying = applying.then(() => {
+      if (epoch !== requestEpoch) return;
+      if (snap.unchanged === true) {
+        if (held !== null && snap.generation === held && snap.incarnation === incarnation
+            && mcpState.generation === held && mcpState.incarnation === incarnation) return;
+        clearState('MCP tool discovery is unavailable right now.');
+        mcpState.generation = null; mcpState.incarnation = null;
+        return;
+      }
+      if (snap.incarnation === frontIncarnation && snap.generation < highWater) return;
+      if (!MCP_ENABLED && snap.enabled) return;
+      if (snap.incarnation !== frontIncarnation) highWater = -1;
+      frontIncarnation = snap.incarnation;
+      highWater = Math.max(highWater, snap.generation);
+      applySnapshot(snap);
+      mcpState.generation = snap.generation;
+      mcpState.incarnation = snap.incarnation;
+    });
+    await applying;
+    return mcpState;
   }
 
   /** Which server's tool a call means (#865). A call is routed by (server, name): `serverId` is
@@ -623,8 +535,8 @@ function createMcpWiring({
     enabled: () => MCP_ENABLED,
     state: mcpState,
     oauthServerIds, accountReady, syncDirectoryServers, refreshDirectory,
-    discoverOneServer, discoverMcpTools,
-    mcpStaticAuth, mcpAuthHeaders, mcpInternalAuth, internalCallProjectId, mcpDiscoveryAuth,
+    discoverMcpTools, refreshSoon,
+    mcpStaticAuth, mcpAuthHeaders, mcpInternalAuth, internalCallProjectId,
     executeMcpToolCall, operatorServerFor, executeOperatorToolCall,
   };
 }

@@ -237,16 +237,8 @@ test('#1806 with the Rust front sharing projects.json: the migration saves throu
   assert.equal(ws.projects[1].files[0].content, 'edited after the front');
 });
 
-test('#1806 the startup sweep migrates only workspaces that still hold inline text', async () => {
-  sourceText._cache.clear();
+test('#1806 the startup sweep is no longer a Node workspace operation', () => {
   const root = tmp();
-  const { file } = seed(root);
-  const clean = '22222222-3333-4444-8555-666666666666';
-  fs.mkdirSync(path.join(root, 'users', clean), { recursive: true });
-  fs.writeFileSync(path.join(root, 'users', clean, 'projects.json'), JSON.stringify({ projects: [{ id: 'p', name: 'P', files: [] }] }));
   const store = createWorkspaceStore(root, DEFAULT, null, { projectStore: createStubStore(root) });
-  assert.deepEqual(store.migrateSourceText([USER, clean, 'not-a-user-id']), [USER]);
-  await store.get(USER).pendingStoreWrites();
-  assert.ok(!fs.readFileSync(file, 'utf8').includes('Alpha beta gamma'));
-  assert.deepEqual(createWorkspaceStore(root, DEFAULT, null, { projectStore: createStubStore(root) }).migrateSourceText([USER, clean]), [], 'nothing left to move');
+  assert.equal(store.migrateSourceText, undefined);
 });

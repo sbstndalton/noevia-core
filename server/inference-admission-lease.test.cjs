@@ -242,3 +242,20 @@ test('exclusion-settle: a covered call keeps the gate count after its lease ends
   leases.release(id2);
   assert.ok(ev.includes('plain:released'));
 });
+
+test('#2495: an ended covering lease whose call never settles gives its count back after the settle bound, once', async () => {
+  const lease = require('./inference-admission-lease.cjs');
+  const ev = [];
+  const logs = [];
+  const leases = lease.createLeases({ settleMs: 40, log: (m) => logs.push(m) });
+  const id = leases.add({ gate: 'chat', release: () => ev.push('released') });
+  const settle = leases.cover(id, 'chat');
+  leases.release(id); // the front gave up; the covered handler hangs and never calls settle()
+  assert.deepEqual(ev, [], 'released before the bound');
+  await new Promise((r) => setTimeout(r, 200));
+  assert.deepEqual(ev, ['released'], 'a hung covered call kept the gate count past the settle bound');
+  assert.ok(logs.some((m) => /did not settle/.test(m)), 'the forced release is logged');
+  settle();
+  assert.deepEqual(ev, ['released'], 'a late settle released the count twice');
+  assert.equal(leases.size(), 0);
+});

@@ -1,0 +1,4 @@
+'use strict';
+const {normalizeAddress}=require('./inference-machines.node.cjs');
+const cases=['','  ','192.168.1.2','HTTP://BOX.lan','http://127.0.0.1:80','https://[::1]:443','192.168.1.2:8080','ftp://192.168.1.2','http://user:password@192.168.1.2','http://192.168.1.2/path','http://192.168.1.2?','http://192.168.1.2#','8.8.8.8','0.0.0.0','169.254.10.10','169.254.169.254','100.100.100.200','224.0.0.1','255.255.255.255','192.0.2.1','198.51.100.1','203.0.113.1','[::]','[::1]','[::2]','[fe80::1]','[ff02::1]','[64:ff9b::1]','[2001:db8::1]','[fd00:ec2::254]','[::ffff:192.168.1.2]','[::ffff:8.8.8.8]','a..b',null,17,false,{},[],['192.168.1.2']];
+process.stdout.write(JSON.stringify(cases.map(raw=>{try{return{raw,status:200,address:normalizeAddress(raw)}}catch(e){return{raw,status:e.status||500,error:e.message,...(e.code?{code:e.code}:{})}}}),null,2)+'\n');

@@ -178,7 +178,7 @@ test('a large but legitimate schema still fits the budget', () => {
 });
 
 test('discovery drops the exponential tool, logs it, and keeps the other tools', async () => {
-  const { createMcpWiring } = require('./mcp-wiring.cjs');
+  const { createMcpWiring } = require('../tests/server/oracle/mcp-wiring-with-reference.cjs');
   const warnings = [];
   const fake = {
     connect: async () => ({ session: { id: null } }),

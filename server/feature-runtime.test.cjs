@@ -1,3 +1,4 @@
+// Historical Node registry fixture; runtime clients are covered by native-machines-client tests.
 'use strict';
 const test = require('node:test');
 const assert = require('node:assert/strict');
@@ -5,7 +6,7 @@ const Database = require('better-sqlite3');
 const { createRustAuthGuard } = require('./rust-auth.cjs');
 const { createStore } = require('./feature-setting-source.cjs');
 const { createDecisionSettings } = require('./decision-settings.cjs');
-const { createInferenceMachines } = require('./inference-machines.cjs');
+const { createInferenceMachines } = require('../tests/reference/inference-machines.node.cjs');
 const { createContextCollector } = require('./feature-runtime.cjs');
 const { rustSavesDecision } = require('../tests/server/rust-decision-row.cjs');
 const D = 'decision:configuration', M = 'inference:machines';
