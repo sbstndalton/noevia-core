@@ -695,8 +695,14 @@ const budgetWatchBridge = require('./rust-budget-watch.cjs').createBudgetWatchBr
 });
 
 // ── Deep research (#2218): the Rust front's (rust-research.cjs); what its jobs still need from this process ──
+// Port contract row H: the front issues every admission lease; this process latches its own holds for them only
+// while it has a session with the front's authority (fails closed without one).
+const inferenceAdmissionSession = require('./inference-admission-lease.cjs').createAuthoritySession({
+  port: Number(process.env.NOEVIA_PROJECT_STORE_PORT), token: FRONT_SECRET,
+});
+inferenceAdmissionSession.start();
 const inferenceAdmission = require('./inference-admission-lease.cjs').createAdmissionRoutes({
-  secret: FRONT_SECRET, modelManager, admitEngineModel, chatMachines, json, readJson,
+  secret: FRONT_SECRET, modelManager, admitEngineModel, chatMachines, json, readJson, authority: inferenceAdmissionSession,
   // The front's Diary local exchange (rust-diary-local-exchange.cjs): the chat throttle and the backfill's pause.
   diaryExchange: { rateLimited: (userId) => llmRateLimited(userId), foreground: () => rag.foreground() },
 });
