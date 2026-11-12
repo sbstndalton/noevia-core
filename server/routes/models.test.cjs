@@ -30,7 +30,7 @@ function fixture({ env = {}, enabled = true, kind = 'llamacpp', manager = {}, wo
   const roleWorkspace = { get autoRoles() { return roles.current; }, set autoRoles(v) { roles.current = v; }, saveAutoRoles() {} };
   const roleService = createModelService({
     fetchJson: async () => ({ ok: false }), env: {}, modelManager: { enabled: false, requireEnabled() { throw new Error('model management is disabled'); } },
-    currentWorkspace: () => roleWorkspace, listWorkspaces: () => [roleWorkspace, ...otherWorkspaces],
+    currentWorkspace: () => roleWorkspace, autoRolesWriter: async (_user,name) => require('../../tests/server/auto-roles-native.cjs').clear([roleWorkspace,...otherWorkspaces],name),
   });
   const modelManager = {
     enabled, kind, capabilities: { routing: true },
@@ -77,8 +77,7 @@ test('every write under /api/models/ is refused for members before anything else
   const f = fixture();
   assert.equal(await f.call('POST', '/api/models/anything-at-all'), true);
   assert.deepEqual(f.sent.pop(), { status: 403, body: { error: 'administrator required' } });
-  assert.equal(await f.call('HEAD', '/api/models/downloads'), true, 'the legacy HEAD stays open to members');
-  assert.deepEqual(f.sent.pop(), { status: 200, body: [{ id: 'j1', model: 'm', progress: 0.4, status: 'running' }] });
+  assert.equal(await f.call('HEAD', '/api/models/downloads'), false, 'the front owns the residual HEAD');
   assert.equal(await f.call('GET', '/api/model'), false);
   assert.equal(await f.call('DELETE', '/api/auto-roles'), false, 'an unhandled method keeps falling through');
 });
@@ -89,86 +88,14 @@ test('the roles round-trip and warm up; the front\'s model reads are not answere
   // before this module); nothing here answers them.
   assert.equal(await f.call('GET', '/api/models/capabilities', undefined, 'admin'), false);
   assert.equal(await f.call('GET', '/api/models/hardware', undefined, 'admin'), false);
-  await f.call('PUT', '/api/models/hardware', {}, 'admin');
-  assert.deepEqual(f.sent.pop(), { status: 405, body: { error: 'Method not allowed' } }, 'the hardware path\'s other methods keep their 405');
+  assert.equal(await f.call('PUT', '/api/models/hardware', {}, 'admin'), false);
   // The GET is the Rust front's (#2190 close-out, rust-auto-roles.cjs); the PUT is still this module's.
   await f.call('GET', '/api/auto-roles');
   assert.deepEqual(f.sent.pop(), { status: 503, body: AUTO_ROLES_REFUSAL });
   assert.equal(f.sent.length, 0);
-  await f.call('PUT', '/api/auto-roles', { fast: ' m ', smart: 'm' }, 'admin');
-  assert.deepEqual(f.sent.pop(), { status: 200, body: { configured: true, roles: { fast: 'm', smart: 'm', vision: '', code: '' } } });
-  assert.equal(f.roles.warmed, true, 'an admin save warms the roles up');
-  await f.call('PUT', '/api/auto-roles', { fast: 'f' });
-  assert.deepEqual(f.sent.pop(), { status: 400, body: { error: 'both fast and smart model names are required' } });
-  await f.call('PUT', '/api/auto-roles', '{');
-  assert.deepEqual(f.sent.pop(), { status: 400, body: { error: 'invalid JSON' } });  for (const body of ['null', '7', '[]']) {
-    await f.call('PUT', '/api/auto-roles', body);
-    assert.deepEqual(f.sent.pop(), { status: 400, body: { error: 'request body must be a JSON object' } }, `a ${body} body is the client's mistake (#796)`);
-  }
-});
-
-test('a member may save their own auto-roles but never warms the shared engine, and unknown names 400', async () => {
-  const f = fixture({ env: { MODEL_LOADER_URL: 'http://loader' } });
-  await f.call('PUT', '/api/auto-roles', { fast: 'm', smart: 'm' }, 'member');
-  assert.deepEqual(f.sent.pop(), { status: 200, body: { configured: true, roles: { fast: 'm', smart: 'm', vision: '', code: '' } } });
-  assert.equal(f.roles.warmed, undefined, 'a member save never calls ensureRolesLoaded / modelManager.load');
-
-  const bad = fixture({ env: { MODEL_LOADER_URL: 'http://loader' } });
-  await bad.call('PUT', '/api/auto-roles', { fast: 'nope', smart: 'm' }, 'admin');
-  assert.deepEqual(bad.sent.pop(), { status: 400, body: { error: 'unknown model(s): nope' } });
-  assert.equal(bad.roles.current, null, 'a bad name is never saved either');
-  assert.equal(bad.roles.warmed, undefined);
-
-  // When the catalogue cannot be read (engine unreachable), saving is still allowed.
-  const unreachable = fixture({ env: { MODEL_LOADER_URL: 'http://loader' }, servedCatalogue: async () => null });
-  await unreachable.call('PUT', '/api/auto-roles', { fast: 'anything', smart: 'goes' }, 'admin');
-  assert.deepEqual(unreachable.sent.pop(), { status: 200, body: { configured: true, roles: { fast: 'anything', smart: 'goes', vision: '', code: '' } } });
-});
-
-test('#343/#442: PUT /api/auto-roles rejects a non-chat model for fast/smart/vision/code alike', async () => {
-  const catalogue = [
-    { name: 'chat-syn', labels: [] },
-    { name: 'vec-syn', labels: ['embeddings'] },
-    { name: 'laya_multilingual_f16', labels: [] },
-  ];
-  for (const role of ['fast', 'smart', 'vision', 'code']) {
-    for (const actor of ['member', 'admin']) {
-      const f = fixture({ env: { MODEL_LOADER_URL: 'http://loader' }, catalogue });
-      const body = { fast: 'chat-syn', smart: 'chat-syn', [role]: 'vec-syn' };
-      await f.call('PUT', '/api/auto-roles', body, actor);
-      assert.deepEqual(f.sent.pop(), { status: 400, body: { error: `The ${role} role needs a chat model; vec-syn is an embedding, reranking or routing model.` } }, `${role}/${actor}`);
-      assert.equal(f.roles.current, null, `${role}/${actor}: a rejected role is never saved`);
-      assert.equal(f.roles.warmed, undefined, `${role}/${actor}: nothing is warmed up either`);
-    }
-  }
-  // #442: Laya (the internal routing model — labels [], flagged by name via isSystemModel) is
-  // rejected for vision the same way it already was for fast/smart/code.
-  const laya = fixture({ env: { MODEL_LOADER_URL: 'http://loader' }, catalogue });
-  await laya.call('PUT', '/api/auto-roles', { fast: 'chat-syn', smart: 'chat-syn', vision: 'laya_multilingual_f16' }, 'admin');
-  assert.deepEqual(laya.sent.pop(), { status: 400, body: { error: 'The vision role needs a chat model; laya_multilingual_f16 is an embedding, reranking or routing model.' } });
-  assert.equal(laya.roles.current, null, 'a rejected vision role is never saved');
-
-  // A chat model in every text role still saves and (for an admin) still warms up.
-  const good = fixture({ env: { MODEL_LOADER_URL: 'http://loader' }, catalogue });
-  await good.call('PUT', '/api/auto-roles', { fast: 'chat-syn', smart: 'chat-syn', code: 'chat-syn' }, 'admin');
-  assert.deepEqual(good.sent.pop(), { status: 200, body: { configured: true, roles: { fast: 'chat-syn', smart: 'chat-syn', vision: '', code: 'chat-syn' } } });
-  assert.equal(good.roles.warmed, true);
-
-  // #442: a vision-capable chat model (labels: ['vision']) is accepted for the vision role.
-  const visionCatalogue = [...catalogue, { name: 'vision-syn', labels: ['vision'] }];
-  const vision = fixture({ env: { MODEL_LOADER_URL: 'http://loader' }, catalogue: visionCatalogue });
-  await vision.call('PUT', '/api/auto-roles', { fast: 'chat-syn', smart: 'chat-syn', vision: 'vision-syn' }, 'admin');
-  assert.deepEqual(vision.sent.pop(), { status: 200, body: { configured: true, roles: { fast: 'chat-syn', smart: 'chat-syn', vision: 'vision-syn', code: '' } } });
-
-  // #442: an empty/absent vision role stays valid (vision remains optional).
-  const empty = fixture({ env: { MODEL_LOADER_URL: 'http://loader' }, catalogue });
-  await empty.call('PUT', '/api/auto-roles', { fast: 'chat-syn', smart: 'chat-syn', vision: '' }, 'admin');
-  assert.deepEqual(empty.sent.pop(), { status: 200, body: { configured: true, roles: { fast: 'chat-syn', smart: 'chat-syn', vision: '', code: '' } } });
-
-  // The guard still catches a name-pattern match even when the catalogue cannot be read.
-  const unreachable = fixture({ env: { MODEL_LOADER_URL: 'http://loader' }, servedCatalogue: async () => null });
-  await unreachable.call('PUT', '/api/auto-roles', { fast: 'nomic-embed-text-v1', smart: 'chat-syn' }, 'admin');
-  assert.deepEqual(unreachable.sent.pop(), { status: 400, body: { error: 'The fast role needs a chat model; nomic-embed-text-v1 is an embedding, reranking or routing model.' } });
+  await f.call('PUT', '/api/auto-roles', { fast: 'm', smart: 'm' }, 'admin');
+  assert.deepEqual(f.sent.pop(), { status:503, body:require('../rust-auto-roles-write.cjs').ROUTE_REFUSAL });
+  assert.equal(f.roles.current,null); assert.equal(f.roles.warmed,undefined);
 });
 
 test('remaining model manager proxy paths preserve administrator/config/path/token and write invalidation',async()=>{
@@ -323,8 +250,7 @@ test('any write under /api/models/ drops the scan, and pull/delete/load keep the
   const off = fixture({ enabled: false });
   await off.call('POST', '/api/models/load', { name: 'm' }, 'admin');
   assert.deepEqual(off.sent.pop(), { status: 404, body: { error: 'model management is disabled' } });
-  await off.call('HEAD', '/api/models/downloads');
-  assert.deepEqual(off.sent.pop(), { status: 200, body: [] });
+  assert.equal(await off.call('HEAD', '/api/models/downloads'), false);
 });
 
 test('engine-specific routes say what is unavailable and guard the method', async () => {
@@ -345,8 +271,7 @@ test('engine-specific routes say what is unavailable and guard the method', asyn
   assert.deepEqual(f.sent.pop(), { status: 403, body: { error: 'Administrator required for shared model profiles' } });
   await f.call('GET', '/api/models/mtp-artifact', undefined, 'member', '?repo=bad');
   assert.deepEqual(f.sent.pop(), { status: 400, body: { error: 'Invalid repository' } });
-  await f.call('POST', '/api/models/installed', undefined, 'admin');
-  assert.equal(f.sent.pop().status, 405, 'only the front lists, and it lists on GET');
+  assert.equal(await f.call('POST', '/api/models/installed', undefined, 'admin'), false, 'the residual method is no longer composed here');
   const native = fixture({ manager: { autotune: { statusFacts: () => assert.fail('Node must not compose public GET status') } } });
   await native.call('GET', '/api/models/autotune', undefined, 'admin', '?model=m');
   assert.deepEqual(native.sent.pop(), { status: 405, body: { error: 'Method not allowed' } });
@@ -583,13 +508,11 @@ test('GET of the estimate and the suggestion is the Rust front\'s; their other m
   const seen = [];
   const f = fixture({ manager: { estimateMemory: async (m) => { seen.push(m); return { ok: true, status: 200, body: {} }; }, suggestPreset: async (m) => { seen.push(m); return { ok: true, status: 200, body: {} }; } } });
   for (const p of ['/api/models/estimate', '/api/models/preset/suggest']) {
-    await f.call('HEAD', p, undefined, 'member', '?model=m');
-    assert.deepEqual(f.sent.pop(), { status: 403, body: { error: 'Administrator required for shared model profiles' } }, p);
+    assert.equal(await f.call('HEAD', p, undefined, 'member', '?model=m'), false);
     await f.call('POST', p, {}, 'member', '?model=m');
     assert.deepEqual(f.sent.pop(), { status: 403, body: { error: 'administrator required' } }, p);
     for (const m of ['POST', 'PUT', 'HEAD']) {
-      await f.call(m, p, {}, 'admin', '?model=m');
-      assert.deepEqual(f.sent.pop(), { status: 405, body: { error: 'Method not allowed' } }, `${m} ${p}`);
+      assert.equal(await f.call(m, p, {}, 'admin', '?model=m'), false, `${m} ${p}`);
     }
   }
   assert.deepEqual(seen, [], 'no manager sizing call is left in the route');
@@ -776,7 +699,7 @@ test('#873: a sweep still running after a web restart takes the gate back at sta
   const timers = [];
   const make = (job, gate = createMaintenanceGate()) => {
     let current = job;
-    const f = fixture({ env: { MODEL_LOADER_URL: 'http://loader' }, manager: { holdMaintenance: (reason) => gate.hold(reason) },
+    const f = fixture({ env: { MODEL_LOADER_URL: 'http://loader' }, manager: { holdMaintenance: (reason, options) => gate.hold(reason, options), maintenanceBarrier: reason=>gate.barrier(reason,{recovery:true}) },
       fetchReply: (url) => (url.endsWith('/benchmark/progress') ? { ok: true, status: 200, body: { job: current } } : { ok: true, status: 200, body: {} }),
       sweepGuardOptions: { setTimer: (fn) => { timers.push(fn); return { unref() {} }; }, clearTimer: () => {} } });
     return { f, gate, finish: () => { current = { active: false, unit: 'models' }; } };
@@ -796,7 +719,10 @@ test('#873: a sweep still running after a web restart takes the gate back at sta
   // A gate already held (requests in flight cannot be at startup, but a calibration can) is not fought over.
   const busyGate = createMaintenanceGate(); const release = busyGate.hold('calibrating');
   const busy = make({ active: true, unit: 'models', total: 1 }, busyGate);
-  assert.equal(await busy.f.ready, false); release();
+  await new Promise(setImmediate); release();
+  timers.shift()();
+  assert.equal(await busy.f.ready, true, 'known sweep is adopted after the earlier writer settles');
+  busy.finish();await timers.shift()();
   assert.equal(timers.length, 0);
 });
 
@@ -878,7 +804,7 @@ test('#1071: GET /api/stats is the Rust front\'s, so Node always refuses it befo
   // A role save still drops the model reads Node keeps (the stats share left with the GET).
   const f = fixture({ env: { MODEL_LOADER_URL: 'http://loader' }, manager });
   await f.call('PUT', '/api/auto-roles', { fast: 'm', smart: 'm' }, 'admin');
-  assert.equal(f.sent.pop().status, 200);
+  assert.equal(f.sent.pop().status, 503);
 });
 
 
@@ -890,7 +816,7 @@ test('#1071: GET /api/stats is the Rust front\'s, so Node always refuses it befo
 test('a model or role write drops the shared reads before it and again once its answer is out, so the front\'s snapshot is rebuilt after the write (#2190 review L2)', async () => {
   const f = fixture({ env: { MODEL_LOADER_URL: 'http://loader' } });
   await f.call('PUT', '/api/auto-roles', { fast: 'm', smart: 'm' }, 'admin');
-  assert.equal(f.invalidations.length, 1, 'dropped before the write');
+  assert.equal(f.invalidations.length, 2, 'dropped before and after the operation');
   f.response().emit('finish');
   assert.equal(f.invalidations.length, 2, 'dropped again when the answer is out');
   f.response().emit('close');
@@ -898,7 +824,7 @@ test('a model or role write drops the shared reads before it and again once its 
   assert.equal(f.invalidations.length, 2, 'once, whichever of finish and close comes first');
   // A client that left first is the same write: close alone drops them again.
   await f.call('PUT', '/api/auto-roles', { fast: 'm', smart: 'm' }, 'admin');
-  assert.equal(f.invalidations.length, 3);
+  assert.equal(f.invalidations.length, 4);
   f.response().emit('close');
   assert.equal(f.invalidations.length, 4);
   // Reads never register the second drop.
@@ -1002,7 +928,7 @@ test('native embedding protection missing or stale refuses all delete entrypoint
 });
 
 test('#2298 stable saved reranker is protected beside the deployment seed in public model actions', async () => {
-  const settings = require('../rerank-settings.cjs');
+  const settings = require('../fixtures/rerank-settings-reference.cjs');
   const prior = settings.current();
   const env = { NOEVIA_FEATURE_RAG_RERANK: 'true', RERANK_BACKEND: 'llamacpp', RERANK_BASE_URL: 'http://synthetic-rerank', RERANK_MODEL: 'rerank-seed-a', MODEL_LOADER_URL: 'http://synthetic-loader' };
   const store = new Map([[settings.KEY, JSON.stringify({ enabled: true, choice: 'llamacpp:rerank-current-b' })]]);
@@ -1030,7 +956,7 @@ test('#2298 stable saved reranker is protected beside the deployment seed in pub
 
 
 test('#2298 unreadable current reranker state refuses unsafe public actions before operations', async () => {
-  const settings = require('../rerank-settings.cjs');
+  const settings = require('../fixtures/rerank-settings-reference.cjs');
   const prior = settings.current();
   const env = { MODEL_LOADER_URL: 'http://synthetic-loader' };
   let operations = 0;
@@ -1138,18 +1064,16 @@ test('download GET pairs an exact refusal with bounded trusted adapter facts', a
   assert.deepEqual(ignored.body, { kind: 'listing', rows: [{ fields: { id: 'small', model_name: 'm', status: 'done', percent: 25 } }] });
   assert.doesNotThrow(() => JSON.stringify(ignored.body));
   const legacy = fixture({ manager: { downloads: async () => ({ ok: true, body: ignoredBody }) } });
-  await legacy.call('HEAD', '/api/models/downloads');
-  assert.equal(JSON.stringify(legacy.sent.pop().body),
-    '[{"id":"small","model":"m","progress":0.25,"status":"done"}]');
+  assert.equal(await legacy.call('HEAD', '/api/models/downloads'), false);
+  assert.equal(legacy.sent.length, 0);
   const unicode = String.fromCodePoint(0x10f800, 0x10ffff);
   assert.equal((await facts([{ id: unicode }])).body.rows[0].fields.id, unicode);
   const selectedDeep = JSON.parse('['.repeat(200) + '0' + ']'.repeat(200));
   assert.equal((await facts([{ id: selectedDeep }])).body.rows[0].fields.id, selectedDeep);
   const selectedBody = [{ id: unicode, model: selectedDeep }];
   const legacySelected = fixture({ manager: { downloads: async () => ({ ok: true, body: selectedBody }) } });
-  await legacySelected.call('HEAD', '/api/models/downloads');
-  assert.equal(JSON.stringify(legacySelected.sent.pop().body),
-    JSON.stringify([{ id: unicode, model: selectedDeep, progress: null, status: '' }]));
+  assert.equal(await legacySelected.call('HEAD', '/api/models/downloads'), false);
+  assert.equal(legacySelected.sent.length, 0);
   assert.equal(JSON.stringify((await facts(selectedBody)).body.rows[0].fields),
     JSON.stringify({ id: unicode, model: selectedDeep }));
   const polled = polls;

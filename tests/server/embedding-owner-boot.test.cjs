@@ -112,7 +112,7 @@ test('a paired real boot becomes ready and its embedding owner trusts only the f
   assert.ok(s.running());
   const owned = await request(s.base, 'GET', OWNER_ROUTE, { 'x-noevia-store-token': s.token });
   assert.equal(owned.status, 200, `${owned.text.slice(0, 300)}\n${s.log().slice(-800)}`);
-  assert.deepEqual(JSON.parse(owned.text), { protocol: PROTOCOL, start: s.start, nodeWorkersStopped: true });
+  assert.deepEqual(JSON.parse(owned.text), { protocol: PROTOCOL, start: s.start, nodeWorkersStopped: true, indexOutboxStopped: true, mediaWorkersStopped: true, foregroundBusy: false });
   for (const [what, headers] of [['no token', {}], ['a wrong token', { 'x-noevia-store-token': `${s.token}x` }], ['an empty token', { 'x-noevia-store-token': '' }],
     ['a forwarded request', { 'x-noevia-store-token': s.token, 'x-forwarded-for': '203.0.113.9' }]]) {
     const r = await request(s.base, 'GET', OWNER_ROUTE, headers);

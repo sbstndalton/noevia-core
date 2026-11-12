@@ -23,7 +23,7 @@ const skipWasm = noSqlite || (!fs.existsSync(process.env.DAV_PARSE_WASM || davPa
 const SERVER = path.join(__dirname, '..', '..', 'server', 'index.cjs');
 const SERVER_DIR = path.dirname(SERVER);
 const BOOT_FAULT = /could not be evaluated at startup/;
-const EXPECTED_RAN = 36;
+const EXPECTED_RAN = 39;
 
 let ran = 0;
 test.after(() => { assert.equal(ran, skipWasm ? 0 : EXPECTED_RAN, 'every guarded step must have run'); });
@@ -108,7 +108,7 @@ async function boot(t, mode) {
   fs.writeFileSync(ini, 'version = 1\n\n[small]\nmodel = /models/q.gguf\nctx-size = 4096\ncache-ram = 0\n');
   const preload = path.join(root, 'fault-preload.cjs');
   fs.writeFileSync(preload, PRELOAD);
-  const router = await fakeRouter(), diary = await fakeDiary(), store = await startProjectStore(dataDir);
+  const router = await fakeRouter(), diary = await fakeDiary(), store = await startProjectStore(dataDir, { maintenance: true, reranker: true });
   const port = await new Promise((resolve) => { const s = http.createServer(); s.listen(0, '127.0.0.1', () => { const p = s.address().port; s.close(() => resolve(p)); }); });
   const base = `http://127.0.0.1:${port}`;
   const env = {
@@ -183,7 +183,7 @@ async function boot(t, mode) {
       assert.deepEqual(reply.json, { available: false }, p);
     }
   };
-  return { call, calibrationClosed, router, log: () => log.join(''), bootFaults: () => log.join('').split('\n').filter((l) => BOOT_FAULT.test(l)).length, running: () => child.exitCode === null };
+  return { call, calibrationClosed, router, maintenanceCalls: () => store.maintenance.calls, log: () => log.join(''), bootFaults: () => log.join('').split('\n').filter((l) => BOOT_FAULT.test(l)).length, running: () => child.exitCode === null };
 }
 
 // What each fault path must do to each request. `refused` means the evaluator-backed answer is withheld.
@@ -245,7 +245,13 @@ for (const mode of Object.keys(EXPECT)) {
     ran++;
     assert.equal(load.status, want.load, load.text.slice(0, 300));
     if (want.load === 502) assert.ok(!s.router.calls.includes('POST /models/load'), `a faulted evaluator never permits a load:\n${s.router.calls.join('\n')}`);
-    else assert.ok(s.router.calls.includes('POST /models/load'), s.router.calls.join('\n'));
+    else {
+      assert.ok(s.router.calls.includes('POST /models/load'), s.router.calls.join('\n'));
+      ran++;
+      assert.ok(s.maintenanceCalls().some(c => c.op === 'session')
+        && s.maintenanceCalls().some(c => c.op === 'held' && Number.isSafeInteger(c.body.incarnation)),
+        'a permitted load passes the registered native maintenance read barrier');
+    }
     assert.ok(s.running(), 'the server is still up after the requests');
   });
 }

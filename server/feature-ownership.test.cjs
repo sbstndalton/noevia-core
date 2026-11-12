@@ -46,10 +46,13 @@ test('all canonical feature keys and legacy fallback remain native even inside e
    const run=()=>db.prepare('INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)').run('decision:configuration','synthetic');
    assert.throws(()=>exempt?guard.exempt(run):run(),e=>e.status===503&&e.code==='RUST_DECISION_SETTINGS_OWNED');
   }
-  for(const key of ['inference:machines','other:setting']) {
-   db.prepare('INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)').run(key,'synthetic');
-   assert.equal(db.prepare('SELECT value FROM settings WHERE key=?').get(key).value,'synthetic');
+  // The machine registry and its measurement results are the Rust front's too (no Node writer).
+  for(const key of ['inference:machines','inference:machineTune'])for(const exempt of [false,true]) {
+   const run=()=>db.prepare('INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)').run(key,'synthetic');
+   assert.throws(()=>exempt?guard.exempt(run):run(),e=>e.status===503&&e.code==='RUST_INFERENCE_MACHINES_OWNED');
   }
+  db.prepare('INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)').run('other:setting','synthetic');
+  assert.equal(db.prepare('SELECT value FROM settings WHERE key=?').get('other:setting').value,'synthetic');
  } finally {db.close();}
 });
 

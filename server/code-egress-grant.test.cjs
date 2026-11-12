@@ -2,8 +2,9 @@
 // noevia-rs verifies. The vectors file is shared with noevia-rs crates/egress (identical copy).
 const test = require('node:test'), assert = require('node:assert/strict');
 const fs = require('node:fs'), os = require('node:os'), path = require('node:path'), crypto = require('node:crypto');
-const { mintGrant, grantHosts, startEgressFromEnv, GRANT_KEY_LABEL } = require('./code-egress.cjs');
-const { createRustEgressClient } = require('../tests/reference/code-egress.cjs'); // frozen legacy behavior only
+// The frozen Node behaviour (row V: native is the only issuer; server/code-egress.cjs no longer mints).
+const { mintGrant, grantHosts, createRustEgressClient } = require('../tests/reference/code-egress.cjs');
+const { startEgressFromEnv } = require('./code-egress.cjs');
 const vectors = require('../contracts/egress-grant.v1.vectors.json');
 const schema = require('../contracts/egress-grant.v1.schema.json');
 
@@ -109,28 +110,36 @@ test('default grant lifetime is 2 h, configurable, capped at 24 h', () => {
   assert.equal(exp({ lifetimeMs: 48 * 3_600_000 }), 24 * 3_600_000);
 });
 
-test('enabled egress publishes a fresh incarnation key and selects only the authenticated native client', async () => {
+test('enabled egress is a fail-closed client of the native issuer: it publishes nothing and holds no key', () => {
   const dir = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), 'egress-control-profile-'));
   try {
     const uid = process.getuid(), gid = process.getgid() || (uid === 0 ? 1 : 0); fs.chownSync(dir, uid, gid); fs.chmodSync(dir, 0o750);
-    const file = path.join(dir, 'control.key'), derived = [], logs = [];
-    const secrets = { derive: (label, bytes) => { derived.push([label, bytes]); return Buffer.alloc(32, 7); } };
-    const env = { CODE_EGRESS_PORT: '8040', CODE_EGRESS_KEY_UID: String(uid), CODE_EGRESS_KEY_GID: String(gid), CODE_EGRESS_CONTROL_KEY_FILE: file };
-    const first = startEgressFromEnv(env, { secrets, log: (v) => logs.push(v) });
+    const file = path.join(dir, 'control.key'), logs = [];
+    const store = { NOEVIA_PROJECT_STORE_PORT: '19021', NOEVIA_PROJECT_STORE_TOKEN: 'synthetic-store-token-0123456789abcdef' };
+    const env = { CODE_EGRESS_PORT: '8040', CODE_EGRESS_KEY_UID: String(uid), CODE_EGRESS_KEY_GID: String(gid), CODE_EGRESS_CONTROL_KEY_FILE: file, ...store };
+    const first = startEgressFromEnv(env, { log: (v) => logs.push(v) });
     assert.equal(first.impl, 'rust-controlled'); assert.equal(first.endpoint, 'egress-rs-code:8040'); assert.equal(first.server, undefined);
-    const a = fs.readFileSync(file); assert.notEqual(a.toString().trim(), '07'.repeat(32));
-    const second = startEgressFromEnv({ ...env, CODE_EGRESS_IMPL: 'rust' }, { secrets }); assert.notDeepEqual(fs.readFileSync(file), a);
-    assert.deepEqual(derived, [[GRANT_KEY_LABEL, 32], [GRANT_KEY_LABEL, 32]]); assert.equal(JSON.stringify(logs).includes(a.toString().trim()), false);
-    assert.throws(() => startEgressFromEnv({ ...env, CODE_EGRESS_IMPL: 'node' }, { secrets }), /unavailable/);
-    assert.throws(() => startEgressFromEnv({ ...env, CODE_EGRESS_KEY_UID: '' }, { secrets }), /unavailable/);
-    assert.throws(() => startEgressFromEnv({ ...env, CODE_EGRESS_CONTROL_KEY_FILE: '' }, { secrets }), /unavailable/);
-    assert.throws(() => startEgressFromEnv({ ...env, CODE_EGRESS_RUST_HOST: 'http://private-secret/' }, { secrets }), (e) => !e.message.includes('private-secret'));
-    for (const port of ['-1', '65536', '1e3', 'invalid']) assert.throws(() => startEgressFromEnv({ ...env, CODE_EGRESS_PORT: port }, { secrets }), /unavailable/);
-    await first.close(); await second.close();
-    fs.chmodSync(file, 0o600); assert.throws(() => startEgressFromEnv(env, { secrets }), /unavailable/); assert.equal(fs.statSync(file).mode & 0o777, 0o600);
+    assert.equal(first.available(), false, 'nothing is available until the front has said so');
+    assert.deepEqual(fs.readdirSync(dir), [], 'the front publishes the key; Node never does');
+    assert.equal(startEgressFromEnv({ ...env, CODE_EGRESS_IMPL: 'rust', CODE_EGRESS_RUST_HOST: 'proxy.internal' }).endpoint, 'proxy.internal:8040');
+    assert.throws(() => startEgressFromEnv({ ...env, CODE_EGRESS_IMPL: 'node' }), /unavailable/);
+    assert.throws(() => startEgressFromEnv({ ...env, CODE_EGRESS_KEY_UID: '' }), /unavailable/);
+    assert.throws(() => startEgressFromEnv({ ...env, CODE_EGRESS_KEY_GID: '0' }), /unavailable/);
+    assert.throws(() => startEgressFromEnv({ ...env, CODE_EGRESS_CONTROL_KEY_FILE: '' }), /unavailable/);
+    assert.throws(() => startEgressFromEnv({ ...env, CODE_EGRESS_CONTROL_KEY_FILE: 'relative.key' }), /unavailable/);
+    assert.throws(() => startEgressFromEnv({ ...env, CODE_EGRESS_RUST_HOST: 'http://private-secret/' }), (e) => !e.message.includes('private-secret'));
+    for (const port of ['-1', '65536', '1e3', 'invalid']) assert.throws(() => startEgressFromEnv({ ...env, CODE_EGRESS_PORT: port }), /unavailable/);
+    for (const name of ['CODE_EGRESS_TOKEN_TTL_MS', 'CODE_EGRESS_GRANT_LIFETIME_MS']) assert.throws(() => startEgressFromEnv({ ...env, [name]: '0' }), /unavailable/);
+    // No front to ask: refused at boot like any bad profile (index.cjs needs the store anyway).
+    assert.throws(() => startEgressFromEnv({ ...env, NOEVIA_PROJECT_STORE_PORT: '' }), /unavailable/);
+    assert.throws(() => startEgressFromEnv({ ...env, NOEVIA_PROJECT_STORE_TOKEN: 'short' }), /unavailable/);
+    // index.cjs removes the secret from process.env at start and hands it over explicitly.
+    const { NOEVIA_PROJECT_STORE_PORT: _p, NOEVIA_PROJECT_STORE_TOKEN: _t, ...bare } = env;
+    assert.equal(startEgressFromEnv(bare, { store: { port: 19021, token: store.NOEVIA_PROJECT_STORE_TOKEN } }).impl, 'rust-controlled');
+    assert.throws(() => startEgressFromEnv(bare), /unavailable/);
+    assert.equal(JSON.stringify(logs).includes('synthetic-store-token'), false);
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
-test('disabled egress has no key publication, listener or native network activity', () => {
-  const secrets = { derive: () => { throw Error('must not derive a disabled key'); } };
-  assert.equal(startEgressFromEnv({}, { secrets }), null); assert.equal(startEgressFromEnv({ CODE_EGRESS_PORT: '0', CODE_EGRESS_IMPL: 'node' }, { secrets }), null);
+test('disabled egress has no client, key publication, listener or native network activity', () => {
+  assert.equal(startEgressFromEnv({}), null); assert.equal(startEgressFromEnv({ CODE_EGRESS_PORT: '0', CODE_EGRESS_IMPL: 'node' }), null);
 });

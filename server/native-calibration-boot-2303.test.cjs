@@ -29,8 +29,11 @@ async function boot(t, mutations = []) {
   const ini = path.join(dir, 'models.ini');
   const state = path.join(dir, `native-calibration-${crypto.createHash('sha256').update(BASE).digest('hex').slice(0, 16)}.json`);
   fs.writeFileSync(ini, INI); fs.writeFileSync(state, RUNNING); fs.writeFileSync(out, '');
+  // Core's readiness asks the paired front's store for the auto-roles proof; a synthetic store answers it.
+  const store = await require('../tests/server/project-store-server.cjs').startProjectStore(dir);
   let child, closed;
   t.after(async () => {
+    await store.close();
     if (child && child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
     if (closed) {
       let timer;
@@ -43,7 +46,7 @@ async function boot(t, mutations = []) {
     env: { ...process.env, UI_DATA_DIR: dir, UI_PORT: '0', PORT: '0', HOST: '127.0.0.1', PUBLIC_ORIGIN: 'http://localhost', DIARY_AUTH_TOKEN: 'test-cowork-token', DAV_PARSE_WASM: wasmFile,
       // The paired front Core probes at boot (rust-embedding-background.cjs); without it Core exits at createOwner.
       NOEVIA_SERVER_BIN: require('../tests/server/project-store-server.cjs').syntheticFrontBin(dir),
-      NOEVIA_PROJECT_STORE_PORT: '9', NOEVIA_PROJECT_STORE_TOKEN: 'synthetic-store-token-'.padEnd(64, 'x'), NOEVIA_START_ID: '0123456789abcdef0123456789abcdef',
+      NOEVIA_PROJECT_STORE_PORT: String(store.port), NOEVIA_PROJECT_STORE_TOKEN: store.token, NOEVIA_START_ID: '0123456789abcdef0123456789abcdef',
       MODEL_MANAGER_KIND: 'llamacpp', MODEL_MANAGER_BASE_URL: BASE, LLAMACPP_PRESET_PATH: ini,
       CALIBRATION_BOOT_PROBE_OUT: out, CALIBRATION_BOOT_PROBE_MUTATE: JSON.stringify(mutations) },
     stdio: ['ignore', 'pipe', 'pipe'],
