@@ -38,6 +38,9 @@ const refusal = (text) => {
   const t = String(text || 'The page was not saved').trim().replace(/\.$/, '');
   return `ERROR: ${t}.${/nothing was saved/i.test(t) ? '' : ' Nothing was saved.'}`;
 };
+/** The front did not answer, or answered something unreadable: the write may have landed, so never say it did not.
+ *  Asking again is safe: the same draft returns the same page. */
+const unknown = (text) => `ERROR: ${text}, so it is not known whether the page was saved. Do not say it failed or that it worked; tell the person, and saving the same draft again returns the same page and never a second one.`;
 
 /**
  * @param {{ specialistPageSave(payload: object): Promise<{status:number, body:any}> }} deps.store  project-store-client.cjs
@@ -55,14 +58,14 @@ function createPageSave({ store }) {
         user: userId, projectId: project.id, chatId: chatKey,
         ...(args.spaceId ? { spaceId: args.spaceId } : {}), title: args.title, content: args.content,
       });
-    } catch { return refusal('The page store is unavailable'); }
+    } catch { return unknown('The page store did not answer in time'); }
     const body = res && res.body;
     if (res && res.status === 200 && body && typeof body.pageId === 'string' && typeof body.link === 'string') {
       return JSON.stringify({ pageId: body.pageId, spaceId: body.spaceId, title: body.title, link: body.link });
     }
     if (res && res.status === 404) return refusal('This conversation is not a coworker\'s');
     if (res && res.status >= 400 && res.status < 500 && body && typeof body.error === 'string') return refusal(body.error);
-    return refusal('The page store could not save it');
+    return unknown('The page store answered something unexpected');
   }
   return Object.freeze({ NAME, TOOL, appliesTo, execute, neverStanding });
 }

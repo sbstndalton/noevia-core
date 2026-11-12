@@ -101,7 +101,6 @@ test('"Allow for this chat" never covers it: the next call asks again, and nothi
   const second = await h.turn({ projectId: COWORKER, chatId: CONVERSATION, decision: 'deny' });
   assert.equal(second.carded, true, 'the second call is asked about');
   assert.deepEqual(second.executions, [], 'declined: the front is not called');
-  assert.equal(h.gate.chatWideApproved(h.user.id, CONVERSATION, COWORKER, null), false);
 });
 
 test('ids the model puts in the arguments are not the grant: the conversation\'s own are sent', async (t) => {

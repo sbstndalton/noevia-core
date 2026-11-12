@@ -384,7 +384,8 @@ function createToolboxes({
     const runMcp = (serverId) => scope.run({ ...scope.getStore(), internalCallProject: project || null, internalEditTarget: typeof editTarget === 'string' ? editTarget : null }, () => executeMcp(name, args, signal, serverId));
     // A name the resolved list took from an MCP box goes to THAT box's server (#865), never to
     // whichever server or built-in first claims the name: the model was shown that server's tool.
-    if (specialistTools && name === specialistTools.NAME) {
+    // Only where it was offered: an MCP tool of the same name that won the name (routes) keeps its own call.
+    if (specialistTools && name === specialistTools.NAME && specialistTools.appliesTo(project) && !(routes instanceof Map && routes.has(name))) {
       return specialistTools.execute(project, args, { user: scope.getStore()?.authn?.user, chatKey: typeof chatKey === 'string' ? chatKey : null });
     }
     const route = routes instanceof Map ? routes.get(name) : undefined;

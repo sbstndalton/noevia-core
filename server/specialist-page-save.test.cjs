@@ -62,9 +62,10 @@ test('every refusal is an ERROR result and nothing partial is reported', async (
     [{ status: 404, body: { error: 'Not found' } }, /^ERROR: This conversation is not a coworker's\. Nothing was saved\.$/],
     [{ status: 400, body: { error: 'That Space is not one this coworker may save to; nothing was saved.' } }, /^ERROR: That Space is not one this coworker may save to; nothing was saved\.$/],
     [{ status: 413, body: { error: 'Page is larger than 512 KiB' } }, /^ERROR: Page is larger than 512 KiB\. Nothing was saved\.$/],
-    [{ status: 500, body: { error: 'Internal error' } }, /^ERROR: The page store could not save it\./],
-    [{ status: 200, body: { pageId: 5 } }, /^ERROR: /],
-    [new Error('busy'), /^ERROR: The page store is unavailable\./],
+    // An answer that cannot be read, a server fault and a timeout may all follow a write that landed: never "nothing was saved".
+    [{ status: 500, body: { error: 'Internal error' } }, /^ERROR: The page store answered something unexpected, so it is not known whether the page was saved\./],
+    [{ status: 200, body: { pageId: 5 } }, /^ERROR: .*not known whether the page was saved/],
+    [new Error('busy'), /^ERROR: The page store did not answer in time, so it is not known whether the page was saved\./],
   ]) {
     const out = await createPageSave({ store: store(answer) }).execute(COWORKER, { title: 'T', content: 'C' }, ctx);
     assert.match(out, want);
@@ -92,4 +93,24 @@ test('appliesTo reads only the project id prefix', () => {
   assert.equal(appliesTo({ id: 'specialist-x' }), true);
   assert.equal(appliesTo({ id: 'xspecialist-x' }), false);
   assert.equal(appliesTo({ id: 5 }), false);
+});
+
+test('an MCP tool of the same name that won the name keeps its own call; the native tool is not offered over it', () => {
+  const s = store();
+  const mcp = { type: 'function', function: { name: NAME, description: 'x', parameters: { type: 'object', properties: {} } } };
+  const calls = [];
+  const tb = createToolboxes({
+    specialistTools: createPageSave({ store: s }), prefill: { budgetFor: () => null, rateFor: () => 0 }, documentSources: { notice: () => '' },
+    mcpBoxes: () => [{ id: 'notes', label: 'n', description: '', source: 'mcp', server: 'srv', tools: [mcp], reads: [] }],
+    mcpTools: () => new Map([[NAME, { serverId: 'srv' }]]),
+    executeMcp: async (name) => { calls.push(name); return 'ran on the MCP server'; },
+  });
+  const project = { ...COWORKER, toolboxes: ['notes'] };
+  const resolved = tb.resolveTools(project, 'm');
+  assert.equal(resolved.tools.filter((t) => t.function.name === NAME).length, 1);
+  assert.equal(resolved.routes.get(NAME), 'srv');
+  return tb.executeToolCall(project, NAME, JSON.stringify({ title: 'T', content: 'C' }), new Set([NAME]), undefined, {}, { routes: resolved.routes, chatKey: 'specialist-chat-x' }).then((out) => {
+    assert.equal(out, 'ran on the MCP server');
+    assert.deepEqual(s.calls, [], 'the native save was not called');
+  });
 });
