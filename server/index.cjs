@@ -392,6 +392,7 @@ const modelService = require('./models.cjs').createModelService({
   fetchJson, env: process.env, modelManager, currentWorkspace,
   roleOnMachine: (role) => !!chatMachines.target(role),
   autoRolesWriter: (user, name) => PROJECT_STORE.clearAutoRoles(user, name),
+  modelStateWriter: (name) => PROJECT_STORE.forgetModelState(name),
 });
 const { autoRoles, ensureRolesLoaded, servedCatalogue, modelsInstalled, lastLoadedModel } = modelService;
 
@@ -1215,11 +1216,13 @@ const autoRolesWriteBridge = require('./rust-auto-roles-write.cjs').createBridge
   secret: FRONT_SECRET, json, readJson, service: modelService,
   asUser: diaryAsUser, user: id => authService.db.prepare('SELECT role FROM users WHERE id=?').get(id),
 });
+const modelStateBridge = require('./rust-model-state-bridge.cjs').createBridge({ secret: FRONT_SECRET, json, readJson, service: modelService });
 async function handleRequestInner(req, res) {
   // The ownership refusals below answer before handleRequestScoped; they carry the same headers.
   publicHeaders(res);
   if (require('./rust-auto-roles-write.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   if (await autoRolesWriteBridge(req, res)) return;
+  if (await modelStateBridge(req, res)) return;
   if (require('./rust-tool-approvals.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   if (require('./rust-idle-unload-read.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   if (await idleUnloadFacts(req, res)) return;

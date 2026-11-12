@@ -146,6 +146,12 @@ function createClient({ port, token, fetchImpl = globalThis.fetch, timeoutMs = T
       if (status !== 200 || !Array.isArray(body?.cleared)) throw failure(status, body);
       return body.cleared;
     },
+    /** R3-0: `{ lastLoadedCleared, nodeCleared }`; the front clears its copies of the last-loaded model and the identity cache, then Node's through the bridge. */
+    async forgetModelState(name) {
+      const { status, body } = await call('model-state/forget', { name });
+      if (status !== 200 || !body || typeof body.nodeCleared !== 'boolean') throw failure(status, body);
+      return body;
+    },
     presetBaseline,
     async grantContext(user, chat) {
       const { status, body } = await call('chat/grant-context', { user, chat });
