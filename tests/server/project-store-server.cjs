@@ -444,6 +444,9 @@ function installProjectStore(dataDir, env = process.env, options = {}) {
   const writes = [];
   const failures = [];
   const server = http.createServer(createHandler(dataDir, token, writes, failures, options));
+  // With the maintenance authority, Core polls this stand-in every few seconds; a kept-alive socket
+  // then never idles out and keeps an in-process test from exiting. Each answer closes its connection.
+  if (options.maintenance) server.on('request', (_req, res) => { res.shouldKeepAlive = false; });
   const failNext = (status, body, { url = '/v1/write', times = 1 } = {}) => { failures.push({ status, body, url, times }); };
   server.on('error', (e) => { console.error(`project store stand-in on ${port}: ${e.message}`); process.exitCode = 1; });
   server.listen(port, '127.0.0.1');
