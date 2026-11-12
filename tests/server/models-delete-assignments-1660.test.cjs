@@ -31,7 +31,7 @@ function routes({ installed = [], env = {}, routerDelete = { ok: true, status: 2
     missingRoles: () => null, currentWorkspace: () => ({ userId: 'u1' }),
     service: { modelScanCache: new Map(), refreshModelScan: () => {}, autoRoles: () => null, setAutoRoles: () => {}, ensureRolesLoaded: () => {},
       servedCatalogue: async () => [], modelsInstalled: async () => installed, modelsInstalledNow: async () => installed, deriveUserModelName: (c) => c,
-      lastLoadedModel: () => null, clearLastLoadedModel: () => {}, clearRoleReferences: (n) => (n === 'plain' ? ['fast'] : []) },
+      lastLoadedModel: () => null, clearLastLoadedModel: () => {}, forgetModelState: async () => {}, clearRoleReferences: (n) => (n === 'plain' ? ['fast'] : []) },
   });
   const call = (method, p, body) => {
     const req = Readable.from(body === undefined ? [] : [Buffer.from(JSON.stringify(body))]);

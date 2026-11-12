@@ -23,7 +23,7 @@ function routes(manager, role = 'admin') {
     missingRoles: () => null, currentWorkspace: () => ({ userId: 'u1' }),
     service: { modelScanCache: new Map(), refreshModelScan: () => {}, autoRoles: () => null, setAutoRoles: () => {}, ensureRolesLoaded: () => {},
       servedCatalogue: async () => [], modelsInstalled: async () => [], modelsInstalledNow: async () => [], deriveUserModelName: (c) => c,
-      lastLoadedModel: () => null, clearLastLoadedModel: () => {}, clearRoleReferences: () => [] },
+      lastLoadedModel: () => null, clearLastLoadedModel: () => {}, forgetModelState: async () => {}, clearRoleReferences: () => [] },
   });
   const call = (p, body, res = { setHeader() {} }) => {
     const req = Readable.from([Buffer.from(JSON.stringify(body))]);

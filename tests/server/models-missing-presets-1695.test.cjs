@@ -37,7 +37,7 @@ function routes({ installed, sections, reload = { ok: true, status: 200, body: {
     missingRoles: () => null, currentWorkspace: () => ({ userId: 'u1' }),
     service: { modelScanCache: cache, refreshModelScan: () => {}, autoRoles: () => null, setAutoRoles: () => {}, ensureRolesLoaded: () => {},
       servedCatalogue: async () => [], modelsInstalled: async () => { listedAt.push(cache.has('models')); return routerRows; }, deriveUserModelName: (c) => c,
-      lastLoadedModel: () => null, clearLastLoadedModel: () => {}, clearRoleReferences: () => [] },
+      lastLoadedModel: () => null, clearLastLoadedModel: () => {}, forgetModelState: async () => {}, clearRoleReferences: () => [] },
   });
   const call = async (method, p, body) => {
     const req = Readable.from(body === undefined ? [] : [Buffer.from(JSON.stringify(body))]);
