@@ -1,3 +1,4 @@
+// Historical Node registry fixture; runtime clients are covered by native-machines-client tests.
 'use strict';
 // Needs dav-parse.wasm: provider egress is Rust-only since #1071. Skipped without it unless DAV_PARSE_WASM_REQUIRED=1.
 if (!require('node:fs').existsSync(process.env.DAV_PARSE_WASM || require('./dav-parse-wasm.cjs').DEFAULT_WASM) && process.env.DAV_PARSE_WASM_REQUIRED !== '1') {
@@ -20,7 +21,7 @@ const { createChatHandler } = require('./chat.cjs');
 const { createToolExchange } = require('./tool-exchange.cjs');
 const { createVisionProbe } = require('./vision.cjs');
 const reasoningEffort = require('./reasoning-effort.cjs');
-const { createInferenceMachines } = require('./inference-machines.cjs');
+const { createInferenceMachines } = require('../tests/reference/inference-machines.node.cjs');
 const { createChatMachines, propsFactsOf, NOT_MEASURED_ON_MACHINES } = require('./chat-machines.cjs');
 const { createMachineHealth } = require('./machine-health.cjs');
 const templateCaps = require('./chat-template-caps.cjs');
@@ -331,7 +332,7 @@ test('#1854 prefill store: a machine scope never feeds this machine\'s rate for 
 });
 
 test('#1854 Settings view: health=1 carries what each chat role\'s machine measured; nothing assigned adds no key', async (t) => {
-  const { createInferenceMachineRoutes } = require('./routes/inference-machines.cjs');
+  const { createInferenceMachineRoutes } = require('../tests/reference/inference-machines-route.node.cjs');
   const fake = await fakeServer(t, { nCtx: 32768, template: THINKING_TEMPLATE, modalities: { vision: false } });
   const call = async (env) => {
     let out = null;

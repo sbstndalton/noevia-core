@@ -8,7 +8,9 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const { Readable } = require('node:stream');
-const { createRerankSettings } = require('../../server/rerank-settings.cjs');
+// Preserve the original policy assertions against the existing frozen differential oracle.
+// The production owner is native; no Node policy implementation is restored here.
+const { createRerankSettings } = require('../../server/fixtures/rerank-settings-reference.cjs');
 const { rerankTarget } = require('../../server/rerank-target.cjs');
 const { createDecisionSettings, describeDecision } = require('../../server/decision-settings.cjs');
 const { rustSavesDecision, rustResetsDecision } = require('./rust-decision-row.cjs');
@@ -134,35 +136,39 @@ function routesFixture({ env = TEI_ENV, rerankSettings = rerankFixture(env).sett
   return { call, sent, roles };
 }
 
-test('#1665 /api/models/reranker is admin-only for every method, including a deep-linked GET', async () => {
-  const r = routesFixture();
-  for (const method of ['GET', 'PUT', 'DELETE']) {
-    const res = await r.call(method, '/api/models/reranker', { role: 'member', body: { enabled: false } });
-    assert.equal(res.status, 403, `member ${method}`);
-  }
-  const got = await r.call('GET', '/api/models/reranker');
-  assert.deepEqual([got.status, got.body.enabled, got.body.choice], [200, true, 'tei']);
-  noAddress(got.body);
-  assert.equal((await r.call('POST', '/api/models/reranker')).status, 405);
-});
-
-test('#1665 the route saves, refuses with an error id, and resets by DELETE or {reset:true}', async () => {
+// Public 401/403/200/400/405, durable writes and audits now run against the
+// actual Rust front in tests/reranker_settings.rs::original_public_*.
+// Direct Node requests must remain retired; these are not external API expectations.
+test('#1665 direct Node reranker methods refuse instead of serving a second owner', async () => {
   const f = rerankFixture();
   const r = routesFixture({ rerankSettings: f.settings });
-  const off = await r.call('PUT', '/api/models/reranker', { body: { enabled: false } });
-  assert.deepEqual([off.status, off.body.enabled, off.body.source], [200, false, 'admin']);
-  assert.deepEqual(f.audits.at(-1).slice(0, 2), ['rerank.configure', 'admin-1']);
-  const bad = await r.call('PUT', '/api/models/reranker', { body: { enabled: true, choice: 'llamacpp:x' } });
-  assert.deepEqual([bad.status, bad.body.errorId], [400, 'unknownReranker']);
-  const junk = await r.call('PUT', '/api/models/reranker', { raw: '{' });
-  assert.deepEqual([junk.status, junk.body.errorId], [400, 'invalidInput']);
-  const reset = await r.call('PUT', '/api/models/reranker', { body: { reset: true } });
-  assert.deepEqual([reset.status, reset.body.source], [200, 'deployment']);
-  await r.call('PUT', '/api/models/reranker', { body: { enabled: false } });
-  const del = await r.call('DELETE', '/api/models/reranker');
-  assert.deepEqual([del.status, del.body.source, del.body.enabled], [200, 'deployment', true]);
+  for (const method of ['GET', 'PUT', 'DELETE', 'POST']) {
+    const got = await r.call(method, '/api/models/reranker', { body: { enabled: false } });
+    assert.deepEqual(got, { status: 503, body: {
+      error: 'Reranker settings are owned by the Rust front.', code: 'RUST_RERANKER_SETTINGS_OWNED',
+    } }, method);
+    noAddress(got.body);
+  }
+  assert.equal(f.store.map.size, 0);
+  assert.equal(f.audits.length, 0);
+  assert.equal(f.changes(), 0);
 });
 
+test('#1665 direct Node retirement never validates or mutates reranker settings', async () => {
+  const forbidden = new Proxy({}, { get() { assert.fail('Node must never invoke retired settings authority'); } });
+  const r = routesFixture({ rerankSettings: forbidden, installed: async () => assert.fail('no catalogue needed for retirement') });
+  for (const [method, input] of [
+    ['PUT', { body: { enabled: false } }],
+    ['PUT', { body: { enabled: true, choice: 'llamacpp:x' } }],
+    ['PUT', { raw: '{' }],
+    ['PUT', { body: { reset: true } }],
+    ['DELETE', {}],
+  ]) {
+    const got = await r.call(method, '/api/models/reranker', input);
+    assert.equal(got.status, 503);
+    assert.equal(got.body.code, 'RUST_RERANKER_SETTINGS_OWNED');
+  }
+});
 
 test('#1665 retrieval follows the saved switch (rag.configureRerank / reloadRerank), fail-open path unchanged', () => {
   const rag = require('../../server/rag.cjs');
@@ -233,29 +239,10 @@ test('#1666 reset forgets the chosen model with the URL; a saved record from bef
 
 // ── #1667 ───────────────────────────────────────────────────────────────────────────────────────
 
-test('#1667 PUT /api/auto-roles saves an optional Creative model, refuses a non-chat one, and an old client keeps it', async () => {
-  const catalogue = async () => [{ name: 'synthetic-fast' }, { name: 'synthetic-smart' }, { name: 'synthetic-creative' }, { name: 'synthetic-reranker-q8', labels: ['reranking'] }];
-  const r = routesFixture({ installed: catalogue });
-  const saved = await r.call('PUT', '/api/auto-roles', { body: { fast: 'synthetic-fast', smart: 'synthetic-smart', creative: 'synthetic-creative' } });
-  assert.equal(saved.status, 200);
-  assert.equal(r.roles.current.creative, 'synthetic-creative');
-  // A client from before #1667 sends no `creative`: the saved one stays.
-  await r.call('PUT', '/api/auto-roles', { body: { fast: 'synthetic-fast', smart: 'synthetic-smart', vision: '', code: '' } });
-  assert.equal(r.roles.current.creative, 'synthetic-creative');
-  // An explicit '' clears it.
-  await r.call('PUT', '/api/auto-roles', { body: { fast: 'synthetic-fast', smart: 'synthetic-smart', creative: '' } });
-  assert.equal(r.roles.current.creative, undefined);
-  const unknown = await r.call('PUT', '/api/auto-roles', { body: { fast: 'synthetic-fast', smart: 'synthetic-smart', creative: 'nope' } });
-  assert.equal(unknown.status, 400);
-  const nonChat = await r.call('PUT', '/api/auto-roles', { body: { fast: 'synthetic-fast', smart: 'synthetic-smart', creative: 'synthetic-reranker-q8' } });
-  assert.deepEqual([nonChat.status, /creative role needs a chat model/.test(nonChat.body.error)], [400, true]);
-});
-
-test('#1667 deleting the Creative model clears only that optional role', () => {
-  const ws = { userId: 'u1', autoRoles: { fast: 'f', smart: 's', creative: 'c' }, saves: 0, saveAutoRoles() { this.saves += 1; } };
-  const service = createModelService({ modelManager: { enabled: false, capabilities: {} }, currentWorkspace: () => ws, listWorkspaces: () => [ws] });
-  assert.deepEqual(service.clearRoleReferences('c'), ['creative']);
-  assert.deepEqual(ws.autoRoles, { fast: 'f', smart: 's' });
+test('#1667 auto-roles PUT is refused in Core; validation and Creative retention are native', async () => {
+  const r = routesFixture();
+  assert.deepEqual(await r.call('PUT','/api/auto-roles',{body:{fast:'a',smart:'b',creative:'c'}}), {status:503,body:require('../../server/rust-auto-roles-write.cjs').ROUTE_REFUSAL});
+  assert.equal(r.roles.current,null);
 });
 
 test('#1817 turning reranking off with a saved choice that is no longer offered succeeds, and keeps the choice', () => {

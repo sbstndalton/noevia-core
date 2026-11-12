@@ -1,3 +1,4 @@
+// Historical Node oracle tests; native worker coverage lives in embedding-worker.
 'use strict';
 // #1770 (sweep existing documents for figures), #1771 (the media pass creates no index for a project
 // without images) and #1772 (how the image preset leaves after a pass is reported). Synthetic
@@ -12,9 +13,9 @@ const crypto = require('node:crypto');
 delete process.env.RAG_DIR;
 for (const k of ['EMBEDDING_BASE_URL', 'EMBEDDING_MODEL', 'EMBED_MODEL', 'EMBEDDING_PROFILE', 'EMBEDDING_NEXT_MODEL', 'EMBEDDING_NEXT_BASE_URL', 'EMBEDDING_NEXT_PROFILE', 'EMBEDDING_IMAGE_MODEL', 'NOEVIA_MULTIMODAL_RAG']) delete process.env[k];
 
-const multimodal = require('./multimodal-rag.cjs');
+const multimodal = require('../tests/oracles/media-u2/multimodal-rag.cjs');
 const { createEmbeddingConfig } = require('./embedding-config.cjs');
-const sweepMod = require('./figure-sweep.cjs');
+const sweepMod = require('../tests/oracles/media-u2/figure-sweep.cjs');
 
 let depsOk = true;
 try { require('better-sqlite3'); require('sqlite-vec'); } catch { depsOk = false; }
@@ -263,7 +264,7 @@ test('#1770: refreshDocumentFigures re-reads the stored original, keeps text on 
   const project = { id: 'proj-doc', files: [] };
   const workspace = { assetDir: (id) => path.join(dir, 'assets', id), dir: path.join(dir, 'ws'), userId: USER, projects: [project], saveProjects: () => {} };
   const indexed = [];
-  const store = require('./projects.cjs').createProjectStore({ fs, path, documentSources, storageClient: {},
+  const store = require('../tests/oracles/media-u2/projects.cjs').createProjectStore({ fs, path, documentSources, storageClient: {},
     rag: { indexProjectFile: async (...a) => { indexed.push(a[1]); return { ok: true, stored: 1, embedded: 1 }; }, deleteProjectFile: () => {} },
     authService: { getStorage: () => ({}) }, currentWorkspace: () => workspace, PROJECTS: [project],
     reasoningEffort: {}, projectAppearance: () => ({}), FREE_CHATS: [], sanitizeToolboxes: () => null, defaultToolboxes: () => [], PROJECT_ROOT_FOLDER: 'fixture-root',

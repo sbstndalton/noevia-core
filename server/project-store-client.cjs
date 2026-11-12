@@ -33,6 +33,9 @@ const RESEAL_WAIT_MS = 120000;
 // sbstndalton/noevia#2202: an MCP session may refresh at the sign-in service (10 s); a start may
 // discover and register (up to five 8 s requests).
 const MCP_WAIT_MS = 45000;
+const SPECIALIST_PAGE_WAIT_MS = 15000; // one small write on the front's own disk
+/** One discovery lists every server together (each listing is bounded at 60 s on the front) and may wait for a place. */
+const MCP_DISCOVERY_WAIT_MS = 90000;
 const MCP_START_WAIT_MS = 120000;
 const REPLY_CAP = 2 * 32 * 1024 * 1024 + 64 * 1024;
 // providers.json (sbstndalton/noevia#2190 round 6) is the account's private provider rows: the Rust
@@ -134,6 +137,15 @@ function createClient({ port, token, fetchImpl = globalThis.fetch, timeoutMs = T
   }
   return {
     featureContext,
+    async autoRolesReady() {
+      const { status, body } = await call('auto-roles/proof', {});
+      if (status !== 200 || body?.capability !== 'rust-auto-roles-write') throw new Error('Native auto-roles write pairing is required');
+    },
+    async clearAutoRoles(user, name) {
+      const { status, body } = await call('auto-roles/clear', { user, name }, RESEAL_WAIT_MS);
+      if (status !== 200 || !Array.isArray(body?.cleared)) throw failure(status, body);
+      return body.cleared;
+    },
     presetBaseline,
     async grantContext(user, chat) {
       const { status, body } = await call('chat/grant-context', { user, chat });
@@ -307,6 +319,21 @@ function createClient({ port, token, fetchImpl = globalThis.fetch, timeoutMs = T
       const { status, body } = await call('mcp/key-set', { user, server, headers }, MCP_WAIT_MS);
       return status === 200 && body?.ok === true ? { ok: true } : mcpRefusal(status, body);
     },
+    /** sbstndalton/noevia row T: what the front's MCP discovery knows (mcp_discovery_actor.rs). `force`
+     *  rediscovers now; `generation` is the one this process holds, answered `{ unchanged: true }` while
+     *  it is current. Throws the store's failure (503 while discovery cannot answer): a caller offers
+     *  no tools then, never the last list. */
+    async mcpDiscovery({ force = false, generation = null, incarnation = null } = {}) {
+      const { status, body } = await call('mcp/discovery', { ...(typeof incarnation === 'string' ? { incarnation } : {}), ...(force ? { force: true } : {}), ...(Number.isSafeInteger(generation) ? { generation } : {}) }, MCP_DISCOVERY_WAIT_MS);
+      if (status === 200 && body && (body.unchanged === true || (body.version === 1 && Array.isArray(body.servers) && Array.isArray(body.offers) && Array.isArray(body.boxes)))) return body;
+      throw failure(status, body);
+    },
+    /** sbstndalton/noevia#2446 slice 4b: a coworker conversation's `space_page_save` (specialist-page-save.cjs). The
+     *  front resolves the chat and project against `user`'s own coworkers and owns every grant and limit; this only
+     *  carries the call and answers `{ status, body }` as it came (it never throws on a refusal). */
+    async specialistPageSave(payload) {
+      return call('specialists/page-save', payload, SPECIALIST_PAGE_WAIT_MS);
+    },
     /** The three credential tables' re-seal for a secrets rotation (rust-mcp-credentials.cjs). */
     async mcpReseal() {
       const { status, body } = await call('mcp/reseal', {}, RESEAL_WAIT_MS);
@@ -343,14 +370,16 @@ function createClient({ port, token, fetchImpl = globalThis.fetch, timeoutMs = T
       }
       return chatgptRefusal(status, body);
     },
-    /** sbstndalton/noevia#2153: the user's chat change journal after `after` (chat-change-journal.cjs):
-     *  { entries, oldestSeq, latestSeq, more, start }, or { unsupported: true } from a store
-     *  without the op (404: an older Rust front). */
-    async changesRead(user, after = 0) {
-      const { status, body } = await call('changes/read', { user, after });
-      if (status === 200 && body && Array.isArray(body.entries)) return body;
-      if (status === 404) return { unsupported: true };
-      throw historyFailure(status, body);
+    /** `rust-chat-mirror-v1`: the account's Diary mirror should look again (a project change, an import):
+     *  at `chatId`, or at everything when null. The front's schedule decides when it runs (rust-chat-mirror.cjs). */
+    async chatMirrorSchedule(user, chatId = null, immediate = false) {
+      const { status } = await call('chat-mirror/schedule', { user, chatId, immediate: immediate === true });
+      if (status !== 200) throw Object.assign(new Error('the chat mirror schedule did not take the request'), { status });
+    },
+    /** A request from `user` started: the front reads their change journal now. */
+    async chatMirrorTouch(user) {
+      const { status } = await call('chat-mirror/touch', { user });
+      if (status !== 200) throw Object.assign(new Error('the chat mirror schedule did not take the request'), { status });
     },
   };
 }

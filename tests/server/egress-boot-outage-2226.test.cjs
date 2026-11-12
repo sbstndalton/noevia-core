@@ -2,6 +2,8 @@
 // #2226: the real server (server/index.cjs) starts and serves with native egress configured and nothing listening.
 // An outage refuses network grants only, and the egress status says so; web used to exit here and rely on its restart
 // policy. A bad profile still stops the boot (code-egress.cjs), which is a configuration error and not an outage.
+// Row V: the front is the only issuer; Node asks it (code-egress-client.cjs). The stand-in front here does not answer
+// /v1/egress/*, which is exactly an issuer that is down: Node must report the outage and still serve.
 // Synthetic data only. Needs better-sqlite3 and server/wasm/dav-parse.wasm, as the other booted-server tests do.
 const test = require('node:test'), assert = require('node:assert/strict'), fs = require('node:fs'), os = require('node:os'), path = require('node:path');
 const http = require('node:http');
@@ -44,9 +46,9 @@ test('web becomes ready with native egress down, and reports the outage', { skip
   for (;;) {
     assert.equal(child.exitCode, null, `the server must not exit on an egress outage:\n${log.slice(-1500)}`);
     assert.ok(Date.now() - started < 60000, `not ready in 60 s:\n${log.slice(-1500)}`);
-    if ((await ask(`http://127.0.0.1:${port}/api/ready`)).includes('"ready":true') && log.includes('egress.control_unavailable')) break;
+    if ((await ask(`http://127.0.0.1:${port}/api/ready`)).includes('"ready":true') && log.includes('egress.client_unavailable')) break;
     await new Promise((resolve) => setTimeout(resolve, 200));
   }
-  assert.ok(!log.includes('egress.control_ready'), 'nothing is listening, so nothing can have proved Ready');
-  assert.equal(fs.statSync(path.join(keyDir, 'current.key')).mode & 0o7777, 0o440, 'the key is published for the proxy to find when it arrives');
+  assert.ok(!log.includes('egress.client_ready'), 'the front issues nothing, so nothing can have proved ready');
+  assert.deepEqual(fs.readdirSync(keyDir), [], 'Node publishes no key: the front is the only issuer');
 });

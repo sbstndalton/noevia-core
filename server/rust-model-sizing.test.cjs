@@ -105,14 +105,15 @@ test('through the router: the owned GETs are refused signed out and signed in; t
       assert.equal(r.headers['x-content-type-options'], 'nosniff', url);
     }
   }
-  // Positive controls: the other methods keep Node's gate, the administrator check and 405
-  // (contracts/http corpus 000174: an administrator's POST /api/models/estimate is 405).
+  // The other methods are residuals the Rust front answers with Node's former gate, administrator
+  // check and 405 (noevia-rs tests/residual_grid.rs; contracts/http corpus 000174): Node refuses them
+  // before authentication, whoever asks.
+  const residual = require('./rust-residual-fallbacks.cjs').ROUTE_REFUSAL;
   for (const p of ['/api/models/estimate', '/api/models/preset/suggest']) {
-    assert.equal((await request(p, { method: 'POST', body: '{}' })).status, 401, `signed out ${p}`);
-    const memberPost = await request(p, { method: 'POST', headers: as(member), body: '{}' });
-    assert.deepEqual([memberPost.status, memberPost.json], [403, { error: 'administrator required' }], p);
-    const adminPost = await request(p, { method: 'POST', headers: as(admin), body: '{}' });
-    assert.deepEqual([adminPost.status, adminPost.json], [405, { error: 'Method not allowed' }], p);
+    for (const headers of [{}, as(member), as(admin)]) {
+      const post = await request(p, { method: 'POST', headers, body: '{}' });
+      assert.deepEqual([post.status, post.json], [503, residual], p);
+    }
   }
   // A kept model read still answers here.
   assert.equal((await request('/api/models/machines')).status, 401);

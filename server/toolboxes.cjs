@@ -131,6 +131,8 @@ function createToolboxes({
   boxes = [], kiwixTools = null, driveTools = null, mcpBoxes = () => [], mcpTools = () => new Map(),
   offered = () => true, prefill, scope = { run: (_s, fn) => fn(), getStore: () => undefined }, getProject = () => null,
   documentSources, workspace = () => null, executeMcp = async (name) => `ERROR: unknown tool "${name}"`,
+  // A coworker conversation's page tool (specialist-page-save.cjs): offered by the PROJECT, never by a box.
+  specialistTools = null,
 } = {}) {
   // ── Toolboxes (master step 14) ────────────────────────────────────────────
   // Tools are no longer one flat global list. A *toolbox* is a named, selectable
@@ -166,6 +168,11 @@ function createToolboxes({
       ...TOOLBOXES.filter((b) => CONNECTOR_BOXES.has(b.id) || offered(b.id)),
       ...mcpBoxes().filter((b) => offered(b.id)),
     ];
+  }
+
+  /** The built-in boxes this deployment offers (what the front adds the MCP boxes to for the picker and the permitted view). */
+  function builtinToolboxes() {
+    return TOOLBOXES.filter((b) => CONNECTOR_BOXES.has(b.id) || offered(b.id));
   }
 
   // A COUNT cap alone is the wrong unit, which only became clear once real MCP
@@ -265,6 +272,12 @@ function createToolboxes({
         candidates.push(tool);
         if (typeof box.server === 'string' && box.server) serverOf.set(name, box.server);
       }
+    }
+    // sbstndalton/noevia#2446: a coworker's conversation (its hidden project) is also offered the page tool.
+    // Not in any box, so no other project or picker can list it; first, so a small budget keeps it.
+    if (specialistTools && specialistTools.appliesTo(project) && !seen.has(specialistTools.NAME) && !skip(specialistTools.NAME)) {
+      seen.add(specialistTools.NAME);
+      candidates.unshift(specialistTools.TOOL);
     }
     // Two independent limits; whichever binds first stops the list. Tools are
     // taken in selection order, so the box a user picked first keeps its tools
@@ -371,6 +384,10 @@ function createToolboxes({
     const runMcp = (serverId) => scope.run({ ...scope.getStore(), internalCallProject: project || null, internalEditTarget: typeof editTarget === 'string' ? editTarget : null }, () => executeMcp(name, args, signal, serverId));
     // A name the resolved list took from an MCP box goes to THAT box's server (#865), never to
     // whichever server or built-in first claims the name: the model was shown that server's tool.
+    // Only where it was offered: an MCP tool of the same name that won the name (routes) keeps its own call.
+    if (specialistTools && name === specialistTools.NAME && specialistTools.appliesTo(project) && !(routes instanceof Map && routes.has(name))) {
+      return specialistTools.execute(project, args, { user: scope.getStore()?.authn?.user, chatKey: typeof chatKey === 'string' ? chatKey : null });
+    }
     const route = routes instanceof Map ? routes.get(name) : undefined;
     if (typeof route === 'string' && route) return runMcp(route);
     if (kiwixTools?.names.has(name)) return kiwixTools.execute(name, args);
@@ -433,7 +450,7 @@ function createToolboxes({
   }
 
   return {
-    TOOLBOXES, CONNECTOR_BOXES, DEFAULT_TOOLBOXES, connectedBoxes, allToolboxes,
+    TOOLBOXES, CONNECTOR_BOXES, DEFAULT_TOOLBOXES, connectedBoxes, allToolboxes, builtinToolboxes,
     toolTokenBudgetFor, resolveTools, readOnlyToolNames, isWriteTool, sanitizeToolboxes,
     executeToolCall,
   };

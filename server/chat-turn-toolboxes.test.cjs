@@ -96,7 +96,7 @@ test('the "Using:" scope carries the box ids beside the joined English text, so 
 });
 
 test('the "Using:" scope marks every in-app box the server ships, MCP-backed or built in, and no third party box (#615)', async (t) => {
-  const { buildInAppBoxes } = require('./toolbox-inapp-fixture.cjs');
+  const { buildInAppBoxes } = require('../tests/server/toolbox-inapp-fixture.cjs');
   const shipped = buildInAppBoxes().allToolboxes().filter((b) => b.id !== 'gdrive');
   const foreign = { id: 'their-box', label: 'Theirs', source: 'mcp', tools: [{ type: 'function', function: { name: 'their_tool' } }] };
   const boxes = [...shipped, foreign];

@@ -57,7 +57,7 @@ test('later rows reread live settings after an earlier async identity instead of
 });
 
 test('stable current reranker is ineligible without reading its identity and unreadable protection fails closed',{skip:skipWasm},async t=>{
- const settings=require('./rerank-settings.cjs'),prior=settings.current();t.after(()=>settings.install(prior));
+ const settings=require('./fixtures/rerank-settings-reference.cjs'),prior=settings.current();t.after(()=>settings.install(prior));
  settings.install({effectiveEnv:()=>({NOEVIA_FEATURE_RAG_RERANK:' true ',RERANK_MODEL:' untuned-current-b-synthetic '})});
  const fixtures=JSON.parse(fs.readFileSync(path.join(__dirname,'fixtures/autotune-untuned-node.json'),'utf8'));
  const base=fixtures.find(c=>c.name==='ordered-scan').input.rows.find(r=>r.id==='new');
