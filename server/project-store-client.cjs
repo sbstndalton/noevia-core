@@ -33,6 +33,7 @@ const RESEAL_WAIT_MS = 120000;
 // sbstndalton/noevia#2202: an MCP session may refresh at the sign-in service (10 s); a start may
 // discover and register (up to five 8 s requests).
 const MCP_WAIT_MS = 45000;
+const SPECIALIST_PAGE_WAIT_MS = 15000; // one small write on the front's own disk
 /** One discovery lists every server together (each listing is bounded at 60 s on the front) and may wait for a place. */
 const MCP_DISCOVERY_WAIT_MS = 90000;
 const MCP_START_WAIT_MS = 120000;
@@ -326,6 +327,12 @@ function createClient({ port, token, fetchImpl = globalThis.fetch, timeoutMs = T
       const { status, body } = await call('mcp/discovery', { ...(typeof incarnation === 'string' ? { incarnation } : {}), ...(force ? { force: true } : {}), ...(Number.isSafeInteger(generation) ? { generation } : {}) }, MCP_DISCOVERY_WAIT_MS);
       if (status === 200 && body && (body.unchanged === true || (body.version === 1 && Array.isArray(body.servers) && Array.isArray(body.offers) && Array.isArray(body.boxes)))) return body;
       throw failure(status, body);
+    },
+    /** sbstndalton/noevia#2446 slice 4b: a coworker conversation's `space_page_save` (specialist-page-save.cjs). The
+     *  front resolves the chat and project against `user`'s own coworkers and owns every grant and limit; this only
+     *  carries the call and answers `{ status, body }` as it came (it never throws on a refusal). */
+    async specialistPageSave(payload) {
+      return call('specialists/page-save', payload, SPECIALIST_PAGE_WAIT_MS);
     },
     /** The three credential tables' re-seal for a secrets rotation (rust-mcp-credentials.cjs). */
     async mcpReseal() {

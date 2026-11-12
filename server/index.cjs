@@ -453,6 +453,7 @@ const {
   // A directory server the Rust front added (or removed) meanwhile is rediscovered in the background and shows from
   // the next look; otherwise the look asks the front, at most every few seconds, whether discovery moved
   // (discovery itself is the front's, mcp_discovery_actor.rs).
+  specialistTools: require('./specialist-page-save.cjs').createPageSave({ store: PROJECT_STORE }), // #2446 slice 4b
   mcpBoxes: () => { if (mcpWiring.refreshDirectory()) discoverMcpTools(true).catch(() => undefined); else mcpWiring.refreshSoon(); return mcpState.boxes; },
   mcpTools: () => mcpState.tools,
   offered: (id) => toolboxOffered(id),
