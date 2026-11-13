@@ -1691,7 +1691,7 @@ function createChatHandler({
           diary: diaryTurn, compactOnly: body.compactOnly === true,
           providerId: provider.id, defaultProviderId: DEFAULT_PROVIDER_ID, machine: !!provider.machine, external: !!externalProvider, chatgpt: !!chatgptProvider, routeTarget: !!routeTarget,
           authorized: !!upstreamHeaders?.Authorization,
-          images: attachedImages.length > 0 || retrievedImages.length > 0, messages: wire,
+          attachedImages: attachedImages.length, retrievedImages: retrievedImages.length > 0, messages: wire,
           skills: loadedSkills.size > 0 || (!!project && instructionSkills.list(project).length > 0),
           provenance: provenanceOn, framingReasoner: !!(framingReasoner && chatFrame),
           narrowed: !!routing.narrowed, gate: !!(gate && gate.decision !== 'none'),
@@ -1733,6 +1733,7 @@ function createChatHandler({
         let text = null;
         try { text = JSON.stringify(frame); } catch { text = null; }
         if (native.reservedText(text)) { why = text === null ? 'refusal-input' : 'reserved-text'; frame = null; }
+        else if (native.frameTooLarge(text)) { why = 'frame-size'; frame = null; }
       }
       if (frame) {
         // The start of the rounds' preparation that only waits (as below): the route pre-load is used or let go here,
