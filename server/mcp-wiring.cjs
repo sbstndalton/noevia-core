@@ -81,6 +81,10 @@ function createCredentialOriginCheck(origins) {
  *   check and the request (DNS rebinding, #795) cannot reach the home network. The operator's
  *   MCP_SERVERS — a LAN Nextcloud server, noevia's own loopback server — never use it.
  * @param {{ log, warn }} [deps.logger]
+ * @param {{ enabled(): boolean, call(payload, opts: { signal }): Promise<{ status, body }> }} [deps.nativeCalls]
+ *   track R5: the Rust front's tool call (`POST /v1/mcp/call`, noevia-rs mcp_call.rs). While `enabled()`
+ *   (NOEVIA_RUST_MCP_CALLS=1), a routed call is the front's: the credential, the transport, the back-off and
+ *   the text are decided there, and this process keeps the routing and the result reducer.
  */
 function createMcpWiring({
   servers, mcp, discovery, directoryMcp, mcpOAuth, mcpKeys = { hasKey: () => false, headers: async () => null }, directoryUrlAllowed, credentialOriginAllowed,
@@ -89,6 +93,7 @@ function createMcpWiring({
   toolRateLimit = require('./tool-rate-limit.cjs').createToolRateLimit(),
   // How often the Rust front's directory table is looked at on the hot paths (0: every time).
   directoryCheckMs = 250,
+  nativeCalls = null,
 }) {
   const rateLimit = require('./tool-rate-limit.cjs');
   const REFRESH_ASK_MS = 5000;
@@ -402,6 +407,10 @@ function createMcpWiring({
     const known = route.known;
     const server = MCP_SERVER_BY_ID.get(known.serverId);
     if (!server) return `ERROR: tool "${name}" belongs to MCP server "${known.serverId}", which is no longer configured`;
+    if (nativeCalls && nativeCalls.enabled()) {
+      const answer = await executeNativeToolCall(name, args, signal, server);
+      if (answer !== NOT_NATIVE) return answer;
+    }
     // An approval for a project file edit names a stored project file, and only noevia's own
     // server edits project files. A call carrying that approval that is routed anywhere else was
     // approved for something it would not do: refused, nothing sent (#865 review).
@@ -527,6 +536,48 @@ function createMcpWiring({
       }
       return `ERROR calling ${name}: ${String((err && err.message) || err).slice(0, 300)}`;
     }
+  }
+
+  /** What a front that runs no tool calls answers (an older front, or its switch off): this process
+   *  runs the call itself, as before. Nothing has been sent anywhere when the front says so. */
+  const NOT_NATIVE = Symbol('not native');
+  const NATIVE_UNAVAILABLE = 'MCP tools are unavailable right now. Try again in a moment.';
+  /** One routed call, run by the Rust front (track R5). The scope's facts travel with it; the Nextcloud
+   *  pass-through is the one credential this process supplies (it holds the storage connection), and only
+   *  where core's own order would have read it (after the project-file-edit refusal). */
+  async function executeNativeToolCall(name, args, signal, server) {
+    const store = scope.getStore();
+    const editTarget = typeof store?.internalEditTarget === 'string' ? store.internalEditTarget : null;
+    const workspace = store && store.workspace;
+    const payload = {
+      server: server.id,
+      name,
+      arguments: args ?? {},
+      user: typeof store?.authn?.user?.id === 'string' ? store.authn.user.id : null,
+      workspaceUser: workspace ? String(workspace.userId ?? '') : null,
+      project: internalCallProjectId(),
+      editTarget,
+      write: !!isWriteTool(name),
+      nextcloud: server.auth === 'nextcloud' && !editTarget ? (mcpAuthHeaders() || null) : null,
+    };
+    let answer;
+    try {
+      answer = await nativeCalls.call(payload, { signal });
+    } catch (err) {
+      if ((err && err.name === 'AbortError') || (signal && signal.aborted)) return `ERROR calling ${name}: This operation was aborted`;
+      logger.warn(`[mcp] ${name}: the front's tool call could not be asked (${err && err.code ? err.code : 'error'})`);
+      return `ERROR calling ${name}: ${NATIVE_UNAVAILABLE}`;
+    }
+    if (answer && answer.status === 404) return NOT_NATIVE;
+    const body = answer && answer.status === 200 ? answer.body : null;
+    if (!body || typeof body.text !== 'string' || typeof body.reduce !== 'boolean') {
+      logger.warn(`[mcp] ${name}: the front's tool call answered ${answer ? answer.status : 'nothing'}`);
+      return `ERROR calling ${name}: ${NATIVE_UNAVAILABLE}`;
+    }
+    if (!body.reduce) return body.text;
+    const reduced = reduceToolResult(body.text, { maxChars: resultCap });
+    if (reduced.reduced) logger.log(`[tool-result] ${name}: ${body.text.length} → ${reduced.text.length} chars`);
+    return reduced.text;
   }
 
   return {

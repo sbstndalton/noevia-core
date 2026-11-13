@@ -760,6 +760,7 @@ const chatgptOAuth = require('./chatgpt-oauth.cjs').createChatGptOAuth({
 const mcpCredentialOriginAllowed = createCredentialOriginCheck(process.env.MCP_NEXTCLOUD_ORIGINS);
 // The live server list, discovery, per-server credentials and the MCP executor: mcp-wiring.cjs.
 // It appends the directory servers to MCP_SERVERS itself and keeps that array current.
+const RUST_MCP_CALLS = process.env.NOEVIA_RUST_MCP_CALLS === '1';
 const mcpWiring = createMcpWiring({
   servers: MCP_SERVERS, mcp, directoryMcp, mcpOAuth, mcpKeys, directoryUrlAllowed,
   // Discovery is the Rust front's (mcp_discovery_actor.rs); this process asks it over the internal store.
@@ -770,6 +771,8 @@ const mcpWiring = createMcpWiring({
   isWriteTool: (name) => isWriteTool(name),
   internal: mcpInternal, internalKey: MCP_INTERNAL_KEY,
   reduceToolResult, resultCap: TOOL_RESULT_CAP,
+  // Track R5: NOEVIA_RUST_MCP_CALLS=1 (off by default) hands each routed tool call to the Rust front.
+  nativeCalls: { enabled: () => RUST_MCP_CALLS, call: (payload, opts) => PROJECT_STORE.mcpCall(payload, opts) },
 });
 const { state: mcpState, oauthServerIds, accountReady, discoverMcpTools, executeMcpToolCall, operatorServerFor, executeOperatorToolCall } = mcpWiring;
 
