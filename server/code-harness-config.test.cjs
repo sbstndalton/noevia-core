@@ -49,15 +49,16 @@ test('the file lands in the task workspace, owned by whoever the harness runs as
   const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'noevia-harness-config-'));
   t.after(() => fs.rmSync(cwd, { recursive: true, force: true }));
   const chowned = [];
-  const realChown = fs.lchownSync;
-  t.mock.method(fs, 'lchownSync', (file, uid, gid) => { chowned.push([path.basename(file), uid, gid]); });
+  // Handed over through the open descriptor (#2527), never by path.
+  const realChown = fs.fchownSync;
+  t.mock.method(fs, 'fchownSync', (fd, uid, gid) => { chowned.push([path.basename(fs.readlinkSync(`/proc/self/fd/${fd}`)), uid, gid]); });
   const record = writeHarnessConfig({ ...base, cwd, owner: { uid: 1000, gid: 1000 } });
   assert.equal(record.file, 'opencode.json');
   assert.deepEqual(record.permission, { edit: 'ask', bash: 'ask', webfetch: 'ask' });
   assert.deepEqual(chowned, [['opencode.json', 1000, 1000]]);
   const written = JSON.parse(fs.readFileSync(path.join(cwd, 'opencode.json'), 'utf8'));
   assert.equal(written.permission.bash, 'ask');
-  assert.equal(realChown === fs.lchownSync, false);
+  assert.equal(realChown === fs.fchownSync, false);
 });
 
 test('an api key is written only when the deployment has one, and never invented', () => {
@@ -150,7 +151,7 @@ test('home-based harnesses need the private home and write everything into it, o
   const cwd = path.join(root, 'tree'), home = path.join(root, 'home'); fs.mkdirSync(cwd); fs.mkdirSync(home);
   assert.throws(() => writeHarnessConfig({ ...base, harness: 'pi', cwd }), (e) => e.status === 409 && /home/.test(e.message));
   const chowned = [];
-  t.mock.method(fs, 'lchownSync', (file) => { chowned.push(path.relative(root, file)); });
+  t.mock.method(fs, 'fchownSync', (fd) => { chowned.push(path.relative(root, fs.readlinkSync(`/proc/self/fd/${fd}`))); });
   const record = writeHarnessConfig({ ...base, harness: 'claude-code', cwd, home, owner: { uid: 1000, gid: 1000 } });
   assert.deepEqual(record.files, ['./.claude/settings.local.json', '~/.claude/settings.json']);
   assert.ok(fs.existsSync(path.join(cwd, '.claude/settings.local.json')) && fs.existsSync(path.join(home, '.claude/settings.json')));
