@@ -147,7 +147,7 @@ test('refusal names the first part of the turn the native executor does not do y
     ['images', { images: true }], ['images', { messages: [{ role: 'user', content: [{ type: 'text', text: 'x' }] }] }], ['skills', { skills: true }],
     ['provenance', { provenance: true }], ['framing-reasoner', { framingReasoner: true }], ['narrowed-tools', { narrowed: true }], ['tool-gate', { gate: true }],
     ['step-supervision', { supervision: true }], ['injected-sources', { injected: true }], ['edit-tools', { editTools: true }],
-    ['deleted', { deleted: true }], ['stream-guard', { streamGuard: true }]];
+    ['deleted', { deleted: true }], ['stream-guard', { streamGuard: true }], ['chat-id', { chatIdNotText: true }]];
   for (const [why, change] of cases) assert.equal(native.refusal({ ...base, ...change }), why, JSON.stringify(change));
 });
 

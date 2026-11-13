@@ -91,6 +91,9 @@ function createHandoff({ secret, supervising = () => false, relayed = (req) => r
  * route, the model and the tools as they were settled.
  */
 function refusal(t) {
+  // A chat id that is not text (a hand-made request): chat.cjs's permission checks throw on it, which the
+  // native gate does not reproduce, so the turn stays here.
+  if (t.chatIdNotText) return 'chat-id';
   if (t.deleted) return 'deleted';
   if (t.diary) return 'diary';
   if (t.compactOnly) return 'compact';

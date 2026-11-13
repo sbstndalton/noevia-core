@@ -1685,6 +1685,7 @@ function createChatHandler({
       const egressRules = require('./provider-egress.cjs');
       const why = native.refusal({
         // A chat deleted while this turn was prepared: the cleanup below runs at the cut, the executor would write it back.
+        chatIdNotText: chatId !== null && typeof chatId !== 'string',
         deleted: !!chatId && !!chatWorkspace?.dir && require('./chat-lists.cjs').readTombstones(chatWorkspace.dir).has(require('./chat-lists.cjs').safeChatId(chatId)),
         diary: diaryTurn, compactOnly: body.compactOnly === true,
         providerId: provider.id, defaultProviderId: DEFAULT_PROVIDER_ID, machine: !!provider.machine, external: !!externalProvider, chatgpt: !!chatgptProvider, routeTarget: !!routeTarget,
