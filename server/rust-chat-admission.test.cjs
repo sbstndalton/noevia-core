@@ -5,6 +5,7 @@
 // the bounded wait, the wait ends when the front goes away) and the cover rule that keeps one gate count per call.
 // Synthetic only.
 const assert = require('node:assert/strict');
+const crypto = require('node:crypto');
 const http = require('node:http');
 const test = require('node:test');
 const { createAdmissionRoutes, createAdmission, PREFIX } = require('./inference-admission-lease.cjs');
@@ -15,15 +16,21 @@ const { json, readJson } = require('./http.cjs');
 const SECRET = 's'.repeat(40);
 const manager = (gate) => ({ enterInference: gate.enter, enterInferenceWithin: gate.enterWithin });
 
+// A synthetic session with the front's authority (port contract row H): every PUT and renewal carries its fence.
+const EPOCH = 'e'.repeat(32);
+const authority = { current: () => ({ epoch: EPOCH, incarnation: 1 }), onChange: () => {} };
+const FENCE = { 'x-noevia-admission-epoch': EPOCH, 'x-noevia-admission-incarnation': '1' };
+
 async function serve(t, options) {
-  const routes = createAdmissionRoutes({ secret: SECRET, json, readJson, admitEngineModel: async () => {}, log: () => {}, ...options });
+  const routes = createAdmissionRoutes({ secret: SECRET, json, readJson, admitEngineModel: async () => {}, log: () => {}, ...options, authority });
   const server = http.createServer(async (req, res) => { if (!await routes.handle(req, res)) { res.statusCode = 418; res.end(); } });
   await new Promise((r) => server.listen(0, '127.0.0.1', r));
   t.after(() => { server.closeAllConnections(); server.close(); });
   return { routes, base: `http://127.0.0.1:${server.address().port}` };
 }
-const ask = (base, body, { path = PREFIX, method = 'POST', signal } = {}) =>
-  fetch(base + path, { method, headers: { 'content-type': 'application/json', 'x-noevia-store-token': SECRET }, body: body && JSON.stringify(body), signal });
+// `path` null: a fresh ticket's PUT; a given path is a renewal (POST) unless `method` says otherwise.
+const ask = (base, body, { path, method = path ? 'POST' : 'PUT', signal } = {}) =>
+  fetch(base + (path ?? `${PREFIX}/${crypto.randomBytes(16).toString('hex')}`), { method, headers: { 'content-type': 'application/json', 'x-noevia-store-token': SECRET, ...FENCE }, body: body && JSON.stringify(body), signal });
 const settled = (ms = 30) => new Promise((r) => setTimeout(r, ms));
 
 test('the capability marker and the names the front pairs with', () => {
@@ -52,7 +59,7 @@ test('a free gate: the lease is one gate count, held until the front deletes it'
     assert.equal((await ask(base, null, { path: `${PREFIX}/${grant.lease}`, method: 'DELETE' })).status, 204);
     assert.equal(gate.active(), 0);
   }
-  assert.equal(routes.leases.size(), 0);
+  assert.equal(routes.latches.size(), 0);
 });
 
 test('#1896 as the front meets it: a gate held for a moment is waited for, and the lease is granted', async (t) => {
@@ -79,7 +86,7 @@ test('#1896 as the front meets it: a longer hold is refused after the bounded wa
   assert.equal(r.status, 503);
   assert.deepEqual(await r.json(), { error: 'Chat is paused while noevia calibrates m.', code: 'inferenceMaintenance' });
   assert.ok(took >= 50 && took < 1000, `waited ${took} ms`);
-  assert.equal(routes.leases.size(), 0);
+  assert.equal(routes.latches.size(), 0);
   release();
 });
 
@@ -108,7 +115,7 @@ test('the front going away during the wait ends it and holds nothing, even when 
   release();
   await settled();
   assert.equal(gate.active(), 0);
-  assert.equal(routes.leases.size(), 0);
+  assert.equal(routes.latches.size(), 0);
 });
 
 test('a manager without a gate admits; an unknown gate or an ask mixing kinds is a 400', async (t) => {
@@ -162,7 +169,7 @@ test('a gate lease the front stops renewing ends by itself and gives the count b
   assert.equal(gate.active(), 1);
   await settled(150);
   assert.equal(gate.active(), 0);
-  assert.equal(routes.leases.size(), 0);
+  assert.equal(routes.latches.size(), 0);
 });
 
 test('review P2-2: the gate opening as the front goes away gives the count back, whatever comes first', async () => {

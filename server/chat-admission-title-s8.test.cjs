@@ -23,7 +23,7 @@ process.env.DIARY_AUTH_TOKEN = 'test-cowork-token';
 process.env.UI_AUTH_TOKEN = 'test-cowork-token';
 process.env.UI_DATA_DIR = testDataDir;
 // The front's maintenance authority and reranker settings (synthetic): after main, a turn needs both.
-require('../tests/server/project-store-server.cjs').installProjectStore(testDataDir, process.env, { maintenance: true, reranker: true });
+require('../tests/server/project-store-server.cjs').installProjectStore(testDataDir, process.env, { maintenance: true, reranker: true, admission: true });
 process.env.LEGACY_AUTH_COMPAT = 'true';
 process.env.PUBLIC_ORIGIN = 'http://localhost';
 // The engine manager with its maintenance gate (engineBusy reads its counts); the engine itself is a stub address.
@@ -33,6 +33,8 @@ process.env.INFERENCE_BASE_URL = 'http://default.invalid';
 const { handleRequest } = require('./index.cjs');
 const { LEASE_HEADER } = require('./rust-chat-admission.cjs');
 const { PREFIX } = require('./inference-admission-lease.cjs');
+const crypto = require('node:crypto');
+const FENCE = { 'x-noevia-admission-epoch': 'e'.repeat(32), 'x-noevia-admission-incarnation': '1' };
 const { TITLE_SYSTEM } = require('./chat-title.cjs');
 
 test.after(() => fs.rmSync(testDataDir, { recursive: true, force: true }));
@@ -64,7 +66,11 @@ test.before(() => {
 /** The front's admission call: loopback, the per-start secret. */
 async function frontLease(route = 'chat') {
   const token = require('../tests/server/project-store-server.cjs').installedToken();
-  const r = await request(PREFIX, { method: 'POST', peer: '127.0.0.1', headers: { 'x-noevia-store-token': token, 'content-type': 'application/json' }, body: JSON.stringify({ gate: route }) });
+  const ticket = crypto.randomBytes(16).toString('hex');
+  const put = () => request(`${PREFIX}/${ticket}`, { method: 'PUT', peer: '127.0.0.1', headers: { 'x-noevia-store-token': token, 'content-type': 'application/json', ...FENCE }, body: JSON.stringify({ gate: route }) });
+  // The session with the stand-in's authority registers just after boot: a 503 until then. Deadline 5 s.
+  let r = await put();
+  for (const end = Date.now() + 5000; r.status === 503 && Date.now() < end;) { await new Promise((ok) => setTimeout(ok, 50)); r = await put(); }
   assert.equal(r.status, 201, r.text);
   return JSON.parse(r.text).lease;
 }
