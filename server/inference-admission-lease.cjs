@@ -10,7 +10,7 @@
 // (createAdmission) and trusted by the front, until their owners (maintenance lease, model budget, machines, chat)
 // move them.
 //
-//   PUT    /internal/inference-admission/lease/<id>        {model} | {role, machine, model} | {diaryExchange: {user}}
+//   PUT    /internal/inference-admission/lease/<id>        {model} | {role, machine, model} | {gate} | {diaryExchange: {user}}
 //          201 {lease: <id>, ttlMs, headers?}; 400/409/429/503 {error, code?}; 410 when the epoch or incarnation
 //          is not this process's current session; 404 when <id> was already given back (its answer was lost)
 //   POST   /internal/inference-admission/lease/<id>/renew  200 {ttlMs}; 404 when it has ended; 410 as above
@@ -26,10 +26,14 @@
 // includes the budget check), else the budget check alone. Machine: the machine's health and served model are
 // checked, and it counts a turn while the latch lasts. Diary exchange (the front's /api/diary/local-exchange): the
 // maintenance gate waited for briefly (chat-admission.cjs), then the model throttle chat shares (429, counted once
-// per exchange), and the long-document backfill's pause (rag.cjs foreground).
+// per exchange), and the long-document backfill's pause (rag.cjs foreground). Gate (chat port S8, rust-chat-admission.cjs):
+// the inference gate as POST /api/chat ({gate:'chat'}) meets it, waiting at most CHAT_GATE_WAIT_MS; the call the front then
+// sends with the lease is covered by it and enters nothing again.
 const crypto = require('node:crypto');
 const { trustedFront } = require('./trusted-front.cjs');
-const { enterChatInference } = require('./chat-admission.cjs');
+const chatAdmission = require('./chat-admission.cjs');
+const { enterChatInference } = chatAdmission;
+const frontAdmission = require('./rust-chat-admission.cjs');
 const { readCappedJson } = require('./http.cjs');
 
 const PREFIX = '/internal/inference-admission/lease';
@@ -39,6 +43,8 @@ const CALL_TIMEOUT_MS = 5000;
 /** The release marker the release assembly pairs with the front's `noevia-inference-admission-authority/1`. */
 const LATCH_MARKER = 'noevia-inference-admission-latch/1';
 const TTL_MS = 30000;
+// #2495: how long an ended covering lease waits for its call to settle before it gives the count back anyway.
+const SETTLE_MS = 5000;
 const MAX_WAIT_MS = 120000;
 const BUSY = 'The model is busy. Try again shortly.';
 const THROTTLED = 'Please wait before sending another message';
@@ -58,7 +64,7 @@ function refusal(status, message, code) {
   return Object.assign(Error(message), { status, publicMessage: message, code });
 }
 
-function createAdmission({ modelManager, admitEngineModel, chatMachines = null, diaryExchange = null }) {
+function createAdmission({ modelManager, admitEngineModel, chatMachines = null, gateWaitMs = chatAdmission.CHAT_GATE_WAIT_MS, diaryExchange = null }) {
   /** What one local step holds, or a refusal in that step's words. */
   async function holdEngine(model, signal) {
     let leave;
@@ -91,6 +97,16 @@ function createAdmission({ modelManager, admitEngineModel, chatMachines = null, 
     const release = typeof chatMachines.beginTurn === 'function' ? chatMachines.beginTurn(machine) : () => {};
     return { headers: null, release };
   }
+  /** Chat port S8: the inference gate alone, as a chat turn (or the Diary local exchange) meets it: <= 3 s, the gate's words. */
+  async function holdGate(route, signal) {
+    let leave;
+    try { leave = await chatAdmission.enterChatInference(modelManager, { waitMs: Math.min(gateWaitMs, chatAdmission.CHAT_GATE_WAIT_MS), signal }); }
+    catch (e) { throw Object.assign(e, { status: e.status || 503, publicMessage: e.message }); }
+    const release = typeof leave === 'function' ? leave : () => {};
+    // The front went away as the gate let it in (review P2-2): give the count back before refusing.
+    if (signal?.aborted) { release(); signal.throwIfAborted(); }
+    return { headers: null, gate: route, release };
+  }
   async function holdExchange(user, signal) {
     let leave;
     try { leave = (await enterChatInference(modelManager, { signal })) || (() => {}); }
@@ -106,6 +122,10 @@ function createAdmission({ modelManager, admitEngineModel, chatMachines = null, 
   }
   return (ask, signal) => {
     const text = (v) => typeof v === 'string' && v.length > 0 && v.length <= 1024;
+    if (ask && ask.gate !== undefined) {
+      if (!frontAdmission.GATE_ROUTES.includes(ask.gate) || Object.keys(ask).length !== 1) throw refusal(400, 'Unknown gate.');
+      return holdGate(ask.gate, signal);
+    }
     if (ask && typeof ask === 'object' && 'diaryExchange' in ask) {
       if (!diaryExchange || typeof diaryExchange !== 'object') throw refusal(400, 'Diary exchanges are not admitted here.');
       if ('model' in ask || 'role' in ask || 'machine' in ask || !text(ask.diaryExchange?.user)) throw refusal(400, 'A user is required.');
@@ -169,7 +189,7 @@ function createAuthoritySession({ port, token, fetchImpl = globalThis.fetch, boo
 }
 
 /** The latches, keyed by the front's ticket. */
-function createLatches({ ttlMs = TTL_MS, log = (m) => console.warn(m) } = {}) {
+function createLatches({ ttlMs = TTL_MS, settleMs = SETTLE_MS, log = (m) => console.warn(m) } = {}) {
   const latches = new Map();
   // Tickets given back before (or while) their latch was taken: a late grant for one is released at once.
   const given = new Set();
@@ -178,7 +198,21 @@ function createLatches({ ttlMs = TTL_MS, log = (m) => console.warn(m) } = {}) {
     if (!latch) return false;
     latches.delete(id);
     clearTimeout(latch.timer);
-    latch.release();
+    // Exclusion-settle rule: a lease covering a call that is still running (the front gave up, timed out or stopped
+    // renewing) keeps its gate count until that call has settled; the covered call's settle() releases it.
+    if (latch.covering && !latch.settled) {
+      latch.ended = true;
+      // #2495: bounded, failing closed: a call that never settles (an await ignoring the abort) must not hold the
+      // gate count for ever. Node's own path gives its count back when the response closes; this is that bound.
+      const bound = setTimeout(() => {
+        if (latch.settled) return;
+        latch.settled = true;
+        log('[models] a covered call did not settle after its front lease ended; its gate count is given back');
+        latch.release();
+      }, settleMs);
+      bound.unref?.();
+      latch.settleTimer = bound;
+    } else latch.release();
     if (why) log(`[models] the front's inference lease ${why}; it no longer holds the engine`);
     return true;
   }
@@ -191,10 +225,25 @@ function createLatches({ ttlMs = TTL_MS, log = (m) => console.warn(m) } = {}) {
   }
   return {
     add(id, held, epoch) {
-      latches.set(id, { release: held.release, timer: null, epoch });
+      latches.set(id, { release: held.release, gate: held.gate || null, covering: false, settled: false, ended: false, timer: null, epoch });
       arm(id);
     },
     has: (id) => latches.has(id),
+    /**
+     * Chat port S8: whether live gate lease `id` covers one call on `route`; each lease covers one call only. Covered,
+     * the answer is that call's settle(): called once the call has settled, it lets an ended lease give its count back.
+     */
+    cover(id, route) {
+      const latch = typeof id === 'string' ? latches.get(id) : undefined;
+      if (!latch || !latch.gate || latch.gate !== route || latch.covering) return false;
+      latch.covering = true;
+      return () => {
+        if (latch.settled) return;
+        latch.settled = true;
+        clearTimeout(latch.settleTimer);
+        if (latch.ended) latch.release();
+      };
+    },
     renew(id) {
       if (!latches.has(id)) return false;
       arm(id);
@@ -214,9 +263,9 @@ function createLatches({ ttlMs = TTL_MS, log = (m) => console.warn(m) } = {}) {
 }
 
 /** The route, answered before authentication and the request gate. True when it was this route's. */
-function createAdmissionRoutes({ secret, modelManager, admitEngineModel, chatMachines, diaryExchange = null, authority, json, readJson, ...options }) {
+function createAdmissionRoutes({ secret, modelManager, admitEngineModel, chatMachines, diaryExchange = null, authority, json, readJson, gateWaitMs, ...options }) {
   const latches = createLatches(options);
-  const admit = createAdmission({ modelManager, admitEngineModel, chatMachines, diaryExchange });
+  const admit = createAdmission({ modelManager, admitEngineModel, chatMachines, diaryExchange, ...(gateWaitMs === undefined ? {} : { gateWaitMs }) });
   // A new front epoch or a retirement: what an earlier front (or this retired start) latched ends now.
   authority?.onChange?.((next) => latches.endOthers(next?.epoch || null, next ? 'belonged to an earlier front' : 'belonged to a retired start'));
   /** Null when the call is for the current session; else the refusal to send. */
@@ -242,8 +291,10 @@ function createAdmissionRoutes({ secret, modelManager, admitEngineModel, chatMac
       if (latches.given(id) || latches.has(id)) { json(res, latches.has(id) ? 409 : 404, { error: BUSY }); return true; }
       const epoch = authority.current().epoch;
       let held = null;
+      let chatGate = false;
       try {
         const ask = await readJson(req);
+        chatGate = ask?.gate === 'chat';
         held = await admit(ask, signal);
         // A wait the caller gave up on, a ticket given back meanwhile, or a session that changed: hold nothing.
         if (signal.aborted || latches.given(id) || authority.current()?.epoch !== epoch) {
@@ -257,6 +308,11 @@ function createAdmissionRoutes({ secret, modelManager, admitEngineModel, chatMac
       } catch (e) {
         if (signal.aborted) { res.destroy?.(); return true; }
         const status = KEPT.includes(e?.status) ? e.status : 503;
+        // Bounded metadata survives a front declining to buffer an oversized refusal body.
+        if (status === 503 || status === 409) {
+          if (typeof e?.code === 'string' && /^[A-Za-z0-9_.:-]{1,128}$/.test(e.code)) res.setHeader('X-Noevia-Admission-Code', e.code);
+          if (status === 503 && chatGate) res.setHeader('Retry-After', '3');
+        }
         json(res, status, { error: e?.publicMessage || BUSY, ...(e?.code ? { code: e.code } : {}) });
       }
       return true;
@@ -276,7 +332,17 @@ function createAdmissionRoutes({ secret, modelManager, admitEngineModel, chatMac
     }
     return notFound();
   }
-  return { handle, latches };
+  /**
+   * Chat port S8: whether `req` is covered by the front's live gate lease for `route` ('chat' or 'diary'), in which case
+   * it must not enter the gate again (one gate count per call, chat.cjs engineBusy). The header is always removed.
+   * Covered, the answer is the call's settle() (createLatches cover), which the caller runs once the call has ended.
+   */
+  function covers(req, route) {
+    const id = req?.headers?.[frontAdmission.LEASE_HEADER];
+    if (req?.headers) delete req.headers[frontAdmission.LEASE_HEADER];
+    return (Boolean(route) && latches.cover(id, route)) || false;
+  }
+  return { handle, latches, covers };
 }
 
 module.exports = { createAdmissionRoutes, createAdmission, createLatches, createAuthoritySession, callerGone, PREFIX, SESSION_PATH, TTL_MS, MAX_WAIT_MS, THROTTLED, LATCH_MARKER };

@@ -327,3 +327,49 @@ test('the session registers with the front, keeps its incarnation, follows a new
   const unconfigured = createAuthoritySession({ port: 0, token: '', fetchImpl: async () => { throw new Error('never'); } });
   assert.equal(await unconfigured.register(), null);
 });
+
+test('exclusion-settle: a covered call keeps the gate count after its lease ends until the call has settled', () => {
+  const lease = require('./inference-admission-lease.cjs');
+  const ev = [];
+  for (const how of ['delete', 'expire']) {
+    const leases = lease.createLatches({ ttlMs: 50, log: () => {} });
+    const id = ticket(); leases.add(id, { gate: 'chat', release: () => ev.push(`${how}:released`) }, EPOCH);
+    const settle = leases.cover(id, 'chat');
+    assert.equal(typeof settle, 'function');
+    if (how === 'delete') leases.giveBack(id);
+    else leases.endOthers('f'.repeat(32), 'belonged to an earlier front');
+    assert.equal(leases.renew(id), false, 'an ended lease is not renewable');
+    assert.deepEqual(ev.filter((e) => e.startsWith(how)), [], `${how}: released while the covered call still ran`);
+    settle();
+    settle();
+    assert.deepEqual(ev.filter((e) => e.startsWith(how)), [`${how}:released`]);
+  }
+  // A call that settles first: the count is the front's until it deletes the lease.
+  const leases = lease.createLatches({ log: () => {} });
+  const id = ticket(); leases.add(id, { gate: 'chat', release: () => ev.push('early:released') }, EPOCH);
+  leases.cover(id, 'chat')();
+  assert.ok(!ev.includes('early:released'));
+  leases.giveBack(id);
+  assert.deepEqual(ev.filter((e) => e.startsWith('early')), ['early:released']);
+  // An uncovered lease still gives its count back at once.
+  const id2 = ticket(); leases.add(id2, { gate: 'chat', release: () => ev.push('plain:released') }, EPOCH);
+  leases.giveBack(id2);
+  assert.ok(ev.includes('plain:released'));
+});
+
+test('#2495: an ended covering lease whose call never settles gives its count back after the settle bound, once', async () => {
+  const lease = require('./inference-admission-lease.cjs');
+  const ev = [];
+  const logs = [];
+  const leases = lease.createLatches({ settleMs: 40, log: (m) => logs.push(m) });
+  const id = ticket(); leases.add(id, { gate: 'chat', release: () => ev.push('released') }, EPOCH);
+  const settle = leases.cover(id, 'chat');
+  leases.giveBack(id); // the front gave up; the covered handler hangs and never calls settle()
+  assert.deepEqual(ev, [], 'released before the bound');
+  await new Promise((r) => setTimeout(r, 200));
+  assert.deepEqual(ev, ['released'], 'a hung covered call kept the gate count past the settle bound');
+  assert.ok(logs.some((m) => /did not settle/.test(m)), 'the forced release is logged');
+  settle();
+  assert.deepEqual(ev, ['released'], 'a late settle released the count twice');
+  assert.equal(leases.size(), 0);
+});
