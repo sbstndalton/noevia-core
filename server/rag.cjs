@@ -893,15 +893,21 @@ function wantedVersions(projectId, userId) {
 }
 async function searchProjectNow(projectId, query, userId) {
   if (!indexExists(projectId, userId)) return []; // #1776: a read never creates an index
-  const native = nativeSearch ? nativeSearch.ask(projectId, query, userId, wantedVersions(projectId, userId)) : null;
-  if (native && nativeSearch.mode === 'on') {
-    const hits = await native;
+  // The front searches an account's own index only (the shared RAG_DIR stays this process's), and only past the guards
+  // openIndex applies here: a removed account and a project the front deleted have no hits.
+  const native = nativeSearch && userId ? nativeSearch : null;
+  if (native && ((userId && !userActive(userId)) || deletedByFront(projectId, userId))) return [];
+  if (native?.mode === 'on') {
+    const hits = await native.ask(projectId, query, userId, wantedVersions(projectId, userId));
     if (hits) return hits;
   }
   const hits = await searchProjectLocal(projectId, query, userId);
-  if (native && nativeSearch.mode === 'shadow') {
-    const theirs = await native;
-    console.warn(`[rag] native search shadow: ${theirs ? require('./rust-retrieval.cjs').compare(hits, theirs) : 'native deferred'}`);
+  if (native?.mode === 'shadow') {
+    // Asked after this process's answer (no two embeds at once) and never waited for.
+    const versions = wantedVersions(projectId, userId);
+    native.ask(projectId, query, userId, versions).then((theirs) => {
+      console.warn(`[rag] native search shadow: ${theirs ? require('./rust-retrieval.cjs').compare(hits, theirs) : 'native deferred'}`);
+    });
   }
   return hits;
 }

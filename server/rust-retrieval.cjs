@@ -15,8 +15,9 @@ const MODES = new Set(['off', 'shadow', 'on']);
 const DEADLINE_MS = 30000;
 const MAX_BYTES = 16 * 1024 * 1024;
 
+// Case does not count, as in the front (noevia-rs native_retrieval Mode::parse).
 function mode(env = process.env) {
-  const raw = String(env.NOEVIA_RUST_RETRIEVAL ?? '').trim();
+  const raw = String(env.NOEVIA_RUST_RETRIEVAL ?? '').trim().toLowerCase();
   if (raw === '') return 'off';
   return MODES.has(raw) ? raw : null;
 }
@@ -47,7 +48,7 @@ function compare(local, native) {
  * listener or secret is missing. `ask` resolves to the hits, or null: the front deferred, failed or lacks the
  * route, so this process searches.
  */
-function createClient({ env = process.env, port = Number(env.NOEVIA_PROJECT_STORE_PORT), token = '', fetchImpl = globalThis.fetch, log = (line) => console.warn(line) } = {}) {
+function createClient({ env = process.env, port = Number(env.NOEVIA_PROJECT_STORE_PORT), token = '', fetchImpl = globalThis.fetch, log = (line) => console.warn(line), deadlineMs = DEADLINE_MS } = {}) {
   const m = mode(env);
   if (m === null) { log('[rag] NOEVIA_RUST_RETRIEVAL must be off, shadow or on; the native search stays off.'); return null; }
   if (m === 'off') return null;
@@ -55,15 +56,22 @@ function createClient({ env = process.env, port = Number(env.NOEVIA_PROJECT_STOR
     log('[rag] NOEVIA_RUST_RETRIEVAL is set but the paired front is not configured; this process searches.');
     return null;
   }
+  // A refusal by the front (401: a wrong secret; 404: a front without the route) is logged once per status: the pair
+  // then falls back on every search, which should not go unnoticed.
+  const refused = new Set();
   async function ask(projectId, query, userId, versions) {
     try {
       const response = await fetchImpl(`http://127.0.0.1:${port}/v1/retrieval/search`, {
         method: 'POST', redirect: 'error',
         headers: { 'content-type': 'application/json', 'x-noevia-store-token': token },
         body: JSON.stringify({ user: userId || null, projectId, query, versions }),
-        signal: AbortSignal.timeout(DEADLINE_MS),
+        signal: AbortSignal.timeout(deadlineMs),
       });
-      if (!response.ok) return null;
+      if (!response.ok) {
+        require('./http.cjs').discardBody(response);
+        if (!refused.has(response.status)) { refused.add(response.status); log(`[rag] the front refused the native search (HTTP ${response.status}); this process searches.`); }
+        return null;
+      }
       const value = await require('./http.cjs').readCappedJson(response, MAX_BYTES);
       return hitsOf(value);
     } catch { return null; }

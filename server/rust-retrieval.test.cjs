@@ -21,14 +21,16 @@ const USER = '44444444-4444-4444-8444-444444444444';
 const TOKEN = 'qa-store-secret-0123456789abcdef0123';
 const SECTION = 'alpha bravo charlie delta. '.repeat(120);
 
-function freshRag(dir) {
+const OTHER = '55555555-5555-4555-8555-555555555555';
+function freshRag(dir, active = () => true) {
   delete require.cache[require.resolve('./rag.cjs')];
   const rag = require('./rag.cjs');
   const config = createEmbeddingConfig({ env: { EMBEDDING_BASE_URL: 'http://127.0.0.1:9', EMBEDDING_MODEL: 'qa-embed', EMBEDDING_PROFILE: 'embeddinggemma-2' }, stateFile: path.join(dir, 'embedding-config.json') });
   rag.init({ dataDir: dir, inferenceUrl: 'http://engine.invalid', embeddingConfig: config,
-    userDataDirFn: (id) => path.join(dir, 'users', id), listUserIds: () => [USER], userActive: () => true });
-  // Every text gets the same 4-wide vector: every chunk scores 1.
-  rag._test.setRagFetch(async (_url, init) => new Response(JSON.stringify({ data: JSON.parse(init.body).input.map((_, index) => ({ index, embedding: [1, 0, 0, 0] })) }), { status: 200 }));
+    userDataDirFn: (id) => path.join(dir, 'users', id), listUserIds: () => [USER, OTHER], userActive: (u) => active(u) });
+  // Every text gets the same 4-wide vector: every chunk scores 1. `rag.embeds` counts the requests.
+  rag.embeds = 0;
+  rag._test.setRagFetch(async (_url, init) => { rag.embeds += 1; return new Response(JSON.stringify({ data: JSON.parse(init.body).input.map((_, index) => ({ index, embedding: [1, 0, 0, 0] })) }), { status: 200 }); });
   return rag;
 }
 
@@ -43,6 +45,22 @@ test('modes: off and unset never build a client; an unknown value is refused wit
   assert.equal(retrieval.createClient({ env: { NOEVIA_RUST_RETRIEVAL: 'on' }, port: 0, token: TOKEN, log }), null);
   assert.equal(lines.length, 3);
   assert.equal(retrieval.createClient({ env: { NOEVIA_RUST_RETRIEVAL: 'shadow' }, port: 9, token: TOKEN, log }).mode, 'shadow');
+  // Case does not count, as in the front.
+  assert.equal(retrieval.createClient({ env: { NOEVIA_RUST_RETRIEVAL: ' On ' }, port: 9, token: TOKEN, log }).mode, 'on');
+  assert.equal(retrieval.createClient({ env: { NOEVIA_RUST_RETRIEVAL: 'OFF' }, port: 9, token: TOKEN, log }), null);
+  assert.equal(lines.length, 3);
+});
+
+test('a front that does not answer in time is a deferral; a refusal is logged once per status', async () => {
+  const lines = [];
+  const hang = (_url, init) => new Promise((_, reject) => init.signal.addEventListener('abort', () => reject(init.signal.reason)));
+  const slow = retrieval.createClient({ env: { NOEVIA_RUST_RETRIEVAL: 'on' }, port: 9, token: TOKEN, fetchImpl: hang, deadlineMs: 30, log: (l) => lines.push(l) });
+  // AbortSignal.timeout does not keep the event loop alive by itself.
+  const alive = setTimeout(() => {}, 5000);
+  try { assert.equal(await slow.ask('qa-proj', 'q', USER, {}), null); } finally { clearTimeout(alive); }
+  const refusing = retrieval.createClient({ env: { NOEVIA_RUST_RETRIEVAL: 'on' }, port: 9, token: TOKEN, fetchImpl: async () => new Response('{}', { status: 404 }), log: (l) => lines.push(l) });
+  for (let i = 0; i < 3; i++) assert.equal(await refusing.ask('qa-proj', 'q', USER, {}), null);
+  assert.deepEqual(lines, ['[rag] the front refused the native search (HTTP 404); this process searches.']);
 });
 
 test('the request goes to the loopback store listener with the secret; only a well-formed hits answer counts', async () => {
@@ -80,16 +98,44 @@ dbTest('on: the front answers and this process does not search; a deferral falls
   const asked = [];
   const front = [{ file: 'qa-front.md', body: 'qa front text', score: 0.9 }];
   rag.configureNativeSearch({ mode: 'on', ask: async (...a) => { asked.push(a); return front; } });
+  const before = rag.embeds;
   assert.deepEqual(await rag.searchProject('qa-proj', 'alpha', USER), front);
+  assert.equal(rag.embeds, before, 'this process embedded nothing');
   assert.deepEqual(asked[0], ['qa-proj', 'alpha', USER, {}]);
   rag.configureNativeSearch({ mode: 'on', ask: async () => null });
   assert.deepEqual(await rag.searchProject('qa-proj', 'alpha', USER), local);
+  assert.equal(rag.embeds, before + 1, 'a deferral searches here');
+  // A project the front deleted (its outbox tombstone) and a removed account: no hits, nothing asked.
+  asked.length = 0;
+  rag.configureNativeSearch({ mode: 'on', ask: async (...a) => { asked.push(a); return front; } });
+  rag.setLifecycleGuard({ generation: () => 0, deletedSince: (p) => p === 'qa-proj' });
+  assert.deepEqual(await rag.searchProject('qa-proj', 'alpha', USER), []);
+  rag.setLifecycleGuard(null);
+  assert.equal(asked.length, 0);
   // No index file: nothing is asked and nothing is created (#1776).
   asked.length = 0;
   rag.configureNativeSearch({ mode: 'on', ask: async (...a) => { asked.push(a); return front; } });
   assert.deepEqual(await rag.searchProject('qa-proj-none', 'alpha', USER), []);
   assert.equal(asked.length, 0);
   rag.configureNativeSearch(null);
+});
+
+dbTest('on: a removed account is not asked; the shared index (no account) is this process\'s', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'qa-r4-removed-'));
+  let active = true;
+  const rag = freshRag(dir, () => active);
+  await rag.indexProjectFile('qa-proj', 'qa-long.md', SECTION, USER);
+  await rag.indexProjectFile('qa-shared', 'qa-long.md', SECTION, null);
+  const asked = [];
+  rag.configureNativeSearch({ mode: 'on', ask: async (...a) => { asked.push(a); return [{ file: 'x', body: 'y', score: 1 }]; } });
+  try {
+    active = false;
+    assert.deepEqual(await rag.searchProject('qa-proj', 'alpha', USER), []);
+    active = true;
+    const shared = await rag.searchProject('qa-shared', 'alpha', null);
+    assert.ok(shared.length > 0 && shared.every((h) => h.file === 'qa-long.md'));
+    assert.equal(asked.length, 0);
+  } finally { rag.configureNativeSearch(null); }
 });
 
 dbTest('shadow: this process answers, the front is asked with the wanted versions of the project\'s files', async () => {
@@ -106,12 +152,19 @@ dbTest('shadow: this process answers, the front is asked with the wanted version
     rag.configureNativeSearch({ mode: 'shadow', ask: async (...a) => { asked.push(a); return []; } });
     const hits = await rag.searchProject('qa-proj', 'alpha', USER);
     assert.deepEqual(hits, local, 'shadow returns this process\'s hits');
+    await new Promise((r) => setImmediate(r));
     assert.equal(asked.length, 1);
     assert.deepEqual(asked[0][3], {}, 'nothing is pending for this project');
     assert.ok(lines.some((l) => l === `[rag] native search shadow: differs (node ${local.length} hits, native 0 hits, first difference at 0)`), lines.join('\n'));
     rag.configureNativeSearch({ mode: 'shadow', ask: async () => null });
     await rag.searchProject('qa-proj', 'alpha', USER);
+    await new Promise((r) => setImmediate(r));
     assert.ok(lines.includes('[rag] native search shadow: native deferred'));
+    // A front that never answers does not hold the answer back.
+    rag.configureNativeSearch({ mode: 'shadow', ask: () => new Promise(() => {}) });
+    const started = Date.now();
+    assert.deepEqual(await rag.searchProject('qa-proj', 'alpha', USER), local);
+    assert.ok(Date.now() - started < 2000);
   } finally { console.warn = warn; rag.configureNativeSearch(null); }
 });
 
@@ -125,6 +178,8 @@ dbTest('the wanted versions are this account\'s and this project\'s only', async
   rag._test.setRagFetch(async (_url, init) => { await gate; return new Response(JSON.stringify({ data: JSON.parse(init.body).input.map((_, index) => ({ index, embedding: [1, 0, 0, 0] })) }), { status: 200 }); });
   const pending = rag.indexProjectFile('qa-proj', 'qa-long.md', SECTION + ' foxtrot.', USER);
   const other = rag.indexProjectFile('qa-other', 'qa-x.md', SECTION + ' golf.', USER);
+  // The same project id and file name of another account: not this account's wanted version.
+  const otherAccount = rag.indexProjectFile('qa-proj', 'qa-long.md', SECTION + ' hotel.', OTHER);
   const asked = [];
   rag.configureNativeSearch({ mode: 'on', ask: async (...a) => { asked.push(a); return []; } });
   try {
@@ -133,7 +188,7 @@ dbTest('the wanted versions are this account\'s and this project\'s only', async
     assert.deepEqual(asked[0][3], { 'qa-long.md': want });
   } finally {
     release();
-    await Promise.all([pending, other]);
+    await Promise.all([pending, other, otherAccount]);
     rag.configureNativeSearch(null);
   }
 });
