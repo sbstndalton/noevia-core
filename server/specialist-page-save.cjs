@@ -10,7 +10,7 @@ const NAME = 'space_page_save';
 // coworker's own, so a made-up id gets nothing.
 const PROJECT_PREFIX = 'specialist-';
 // A write that needs a person to look at it every time: no "Allow for this chat", no account policy
-// that lets it run unasked (chat.cjs and approvals.cjs consult this).
+// that lets it run unasked (chat.cjs consults this).
 const NEVER_STANDING = new Set([NAME]);
 
 const TOOL = Object.freeze({

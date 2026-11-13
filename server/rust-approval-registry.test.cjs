@@ -32,6 +32,20 @@ test('Node can only open, wait for, withdraw and check its own questions; it can
   assert.doesNotMatch(index, /require\('\.\/approvals\.cjs'\)|rust-tool-approval-bridge|\/internal\/tool-approvals/);
 });
 
+test('no production server file loads the test-only approvals reference (it is not in the runtime image)', () => {
+  const offenders = [];
+  const walk = (dir) => {
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      const file = path.join(dir, entry.name);
+      if (entry.isDirectory()) { if (entry.name !== 'node_modules') walk(file); continue; }
+      if (!/\.c?js$/.test(entry.name) || /\.test\.c?js$/.test(entry.name)) continue;
+      if (/require\(\s*['"`][^'"`]*approvals-reference/.test(fs.readFileSync(file, 'utf8'))) offenders.push(path.relative(__dirname, file));
+    }
+  };
+  walk(__dirname);
+  assert.deepEqual(offenders, [], 'tests/server/approvals-reference.cjs is a test double; production code must not require it');
+});
+
 test('a write question is opened (owner, chat, scope, binding) before its wait, and its answer is the outcome', async (t) => {
   const { store, gate } = await fixture(t);
   const ctl = new AbortController();

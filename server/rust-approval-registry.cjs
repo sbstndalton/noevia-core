@@ -94,7 +94,7 @@ function createApprovalRegistry({ approvals, timeoutMs = 5 * 60 * 1000, log = ()
     }
   }
 
-  /** approvals.cjs awaitApproval, for a question openApproval opened (its `once` travels in the open,
+  /** approvals-reference.cjs (tests/server) awaitApproval, for a question openApproval opened (its `once` travels in the open,
    *  where the front decides the grant: an approve_all on a `once` card stores none, #2559):
    *  'approve' | 'deny' | 'timeout' | 'aborted' | 'unavailable'. Never rejects. */
   async function awaitApproval({ id, userId, abortSignal }) {
@@ -103,7 +103,7 @@ function createApprovalRegistry({ approvals, timeoutMs = 5 * 60 * 1000, log = ()
     return ['approve', 'deny', 'timeout'].includes(got.outcome) ? got.outcome : 'unavailable';
   }
 
-  /** approvals.cjs awaitRouteChoice, for a question openRouteChoice opened: { choice, remember } or
+  /** approvals-reference.cjs (tests/server) awaitRouteChoice, for a question openRouteChoice opened: { choice, remember } or
    *  { choice: 'timeout' | 'aborted' }. A front that cannot be asked is a timeout (the turn stays
    *  local, as routing-modes.cjs treats no answer). Never rejects. */
   async function awaitRouteChoice({ id, userId, abortSignal }) {
@@ -211,7 +211,7 @@ function createApprovalRegistry({ approvals, timeoutMs = 5 * 60 * 1000, log = ()
     return !!entry;
   }
 
-  /** approvals.cjs chatWideApproved, asked of the front: false, or (truthy) the front's single-use
+  /** approvals-reference.cjs (tests/server) chatWideApproved, asked of the front: false, or (truthy) the front's single-use
    *  ticket for this grant. A ticket authorises nothing by itself: the write is dispatched only after
    *  redeemChatGrant. A check without a user, a chat id, a scope or a binding never matches, and
    *  neither does one the front cannot answer, one whose revoke the front has not yet confirmed, or
@@ -264,7 +264,7 @@ function createApprovalRegistry({ approvals, timeoutMs = 5 * 60 * 1000, log = ()
     }
   }
 
-  /** approvals.cjs revokeChatGrant, asked of the front. Unconfirmed: recorded and retried (above). */
+  /** approvals-reference.cjs (tests/server) revokeChatGrant, asked of the front. Unconfirmed: recorded and retried (above). */
   async function revokeChatGrant(userId, chatId) {
     if (!text(userId) || !safeId(chatId)) return false;
     const key = revokeKey(userId, chatId);
