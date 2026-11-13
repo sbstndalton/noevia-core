@@ -11,12 +11,14 @@
 // `features.enabled` here keeps Browser mode's Playwright check, which only this process can make. Asking for an
 // administrator's facts opens the workspace's store, which recovers tasks from a previous process exactly as a read
 // here used to, so the front never reads a dead task as running. Approval cards are scoped to that workspace's tasks.
+// When the front runs Code tasks itself (rust-code-executor.cjs, `frontOwns`), a Code answer is the flag only
+// ({enabled: true, owner: 'front'}): the store is not opened here, and the front adds its own facts.
 const { trustedFront } = require('./trusted-front.cjs');
 
 const PATH = '/internal/tasks/facts';
 const FLAGS = Object.freeze({ code: 'codeHarness', browser: 'browserExecutor' });
 
-function createTaskFactsBridge({ secret, asUser, features, services, workspace, json, readJson, log = (m) => console.warn(m) }) {
+function createTaskFactsBridge({ secret, asUser, features, services, workspace, json, readJson, log = (m) => console.warn(m), frontOwns = () => false }) {
   return async function handle(req, res) {
     if (String(req.url || '').split('?')[0] !== PATH) return false;
     if (!trustedFront(req, secret) || req.method !== 'POST') { json(res, 404, { error: 'Not found' }); return true; }
@@ -27,6 +29,7 @@ function createTaskFactsBridge({ secret, asUser, features, services, workspace, 
     try {
       if (!features.enabled(FLAGS[surface])) { json(res, 200, { enabled: false }); return true; }
       if (admin !== true) { json(res, 200, { enabled: true }); return true; }
+      if (surface === 'code' && frontOwns() === true) { json(res, 200, { enabled: true, owner: 'front' }); return true; }
       const facts = await asUser(user, () => services[surface].facts(workspace()));
       json(res, 200, { enabled: true, facts });
     } catch (e) {
