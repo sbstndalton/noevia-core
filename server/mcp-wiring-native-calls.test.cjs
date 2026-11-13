@@ -101,21 +101,76 @@ test('an answer not to reduce is returned as it is', async () => {
   assert.equal(await b.run(signedIn(), 'keys_tool', 'dir-keys'), 'ERROR: keys_tool needs your own key for QA Keys: Plugins → Connected → Add key.');
 });
 
-test('a front that runs no calls (404) leaves the call to this process', async () => {
+test('a front that runs no calls (404) leaves the call to this process, which then stops asking', async () => {
   const b = await build({ answer: () => ({ status: 404, body: { error: 'not found' } }) });
   assert.equal(await b.run(signedIn(), 'open_tool', 'open'), '[8000] node ran open_tool');
   assert.equal(b.transport.length, 1);
+  // This process's own path, refusals included.
+  assert.equal(await b.run(signedIn({ internalEditTarget: 'digest-1' }), 'open_tool', 'open'),
+    'ERROR: open_tool was approved as a project file edit, but "open_tool" was offered by MCP server "open"; it was not run.');
+  assert.equal(b.asked.length, 1, 'asked once, then not again');
 });
 
-test('a front that cannot answer is a neutral, retryable error, and Stop stays a Stop', async () => {
-  for (const answer of [() => ({ status: 503, body: { error: 'unavailable' } }), () => ({ status: 200, body: { text: 5 } }), () => ({ status: 200, body: null }),
-    () => { throw Object.assign(new Error('The project store is busy. Try again shortly.'), { status: 503, code: 'PROJECTS_BUSY' }); }]) {
+const UNAVAILABLE = 'ERROR calling open_tool: MCP tools are unavailable right now. Try again in a moment.';
+const UNKNOWN = 'ERROR calling open_tool: the tool call did not report back, so it may or may not have run. Check before calling it again.';
+const STOPPED = 'ERROR calling open_tool: This operation was aborted';
+
+test('an answer is worded by what is known: not reached, refused, or possibly run', async () => {
+  const busy = () => { throw Object.assign(new Error('The project store is busy. Try again shortly.'), { status: 503, code: 'PROJECTS_BUSY', cause: new TypeError('fetch failed') }); };
+  const late = () => { throw Object.assign(new Error('The project store is busy. Try again shortly.'), { status: 503, code: 'PROJECTS_BUSY', cause: Object.assign(new Error('timed out'), { name: 'TimeoutError' }) }); };
+  const cases = [
+    [busy, UNAVAILABLE],
+    [() => ({ status: 503, body: { error: 'unavailable' } }), UNAVAILABLE],
+    [() => ({ status: 400, body: { error: 'invalid name' } }), UNAVAILABLE],
+    [() => ({ status: 500, body: { error: 'the call failed' } }), UNKNOWN],
+    [() => ({ status: 200, body: { text: 5 } }), UNKNOWN],
+    [() => ({ status: 200, body: null }), UNKNOWN],
+    [late, STOPPED],
+    [() => { throw Object.assign(new Error('The request was stopped.'), { name: 'AbortError' }); }, STOPPED],
+  ];
+  for (const [answer, want] of cases) {
     const b = await build({ answer });
-    assert.equal(await b.run(signedIn(), 'open_tool', 'open'), 'ERROR calling open_tool: MCP tools are unavailable right now. Try again in a moment.');
+    assert.equal(await b.run(signedIn(), 'open_tool', 'open'), want);
     assert.equal(b.transport.length, 0, 'never run here on a guess');
   }
-  const b = await build({ answer: () => { throw Object.assign(new Error('The request was stopped.'), { name: 'AbortError' }); } });
-  assert.equal(await b.run(signedIn(), 'open_tool', 'open'), 'ERROR calling open_tool: This operation was aborted');
+  // A Stop that lands while the answer is read: a Stop, not an outage.
+  const stop = new AbortController();
+  const b = await build({ answer: () => { stop.abort(); return { status: 200, body: null }; } });
+  assert.equal(await b.run(signedIn(), 'open_tool', 'open', { q: 'qa' }, stop.signal), STOPPED);
+});
+
+test('the workspace and target travel as the old path read them', async () => {
+  const b = await build();
+  await b.run({ authn: { user: { id: 'user-1' } } }, 'project_read_file', 'noevia');
+  assert.equal(b.asked[0].payload.workspaceUser, null, 'no workspace: the front refuses the in-process server');
+  await b.run({ workspace: {}, authn: { user: { id: 'user-1' } } }, 'project_read_file', 'noevia');
+  assert.equal(b.asked[1].payload.workspaceUser, '', 'a workspace with no id: the token carries no user');
+  await b.run(signedIn({ internalEditTarget: '' }), 'nc_notes_search_notes', 'nextcloud');
+  assert.equal(b.asked[2].payload.editTarget, '');
+  assert.ok(b.asked[2].payload.nextcloud, 'an empty target refuses nothing, so the pass-through is read');
+  await b.run({ workspace: { userId: 'user-1' }, authn: { user: { id: 42 } } }, 'open_tool', 'open');
+  assert.equal(b.asked[3].payload.user, '42');
+});
+
+test('the store client sends the call to the front and hands back its answer', async () => {
+  const { createClient } = require('./project-store-client.cjs');
+  const seen = [];
+  const fetchImpl = async (url, init) => {
+    seen.push({ url, init });
+    if (JSON.parse(init.body).server === 'slow') {
+      return new Promise((_, reject) => init.signal.addEventListener('abort', () => reject(Object.assign(new Error('aborted'), { name: 'AbortError' }))));
+    }
+    return new Response(JSON.stringify({ text: 'qa', reduce: true }), { status: 200, headers: { 'content-type': 'application/json' } });
+  };
+  const client = createClient({ port: 4567, token: 't'.repeat(32), fetchImpl });
+  assert.deepEqual(await client.mcpCall({ server: 'open', name: 'open_tool' }), { status: 200, body: { text: 'qa', reduce: true } });
+  assert.equal(seen[0].url, 'http://127.0.0.1:4567/v1/mcp/call');
+  assert.equal(seen[0].init.method, 'POST');
+  assert.equal(seen[0].init.headers['x-noevia-store-token'], 't'.repeat(32));
+  const stop = new AbortController();
+  const pending = client.mcpCall({ server: 'slow', name: 'x' }, { signal: stop.signal });
+  stop.abort();
+  await assert.rejects(pending, (err) => err.name === 'AbortError');
 });
 
 test('routing stays here: an unknown tool or server is refused before the front is asked', async () => {
