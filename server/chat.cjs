@@ -1722,6 +1722,7 @@ function createChatHandler({
           messages: wire, tools: activeTools, routes: [...toolRoutes],
           writes: names.filter((n) => isWriteTool(n)), public: names.filter((n) => isPublicTool(n)), automaticOnlyWrites: [...automaticOnlyWrites],
           routeNote: routeNotes(), templateGate: provider.id === DEFAULT_PROVIDER_ID && typeof modelManager?.props === 'function',
+          managerEnabled: !!modelManager?.enabled, modelLease: typeof modelManager?.acquireLease === 'function',
           chatId, contextId: chatId || spaceId, chatKey: chatId || spaceId || null,
           grantScope: writeGrantScope, grantHolder: expectedGrantHolder, recentWrites: [...recentWriteFps],
           title: { chatId: typeof body.chatId === 'string' ? body.chatId : '', listId: body.projectId && project ? project.id : null,

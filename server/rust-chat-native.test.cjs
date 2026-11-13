@@ -108,6 +108,8 @@ test('a turn the native executor can run ends after its preparation with the pre
   assert.deepEqual(last.turn, { message: 'QA hello', spaceId: null, projectId: 'qa-project', declineEndsReply: true, record: true, streamIdleMs: 120000 });
   assert.equal(last.chat.grantScope, 'project:qa-project');
   assert.ok(Number.isFinite(last.startedAt) && last.startedAt <= Date.now());
+  assert.equal(last.managerEnabled, true);
+  assert.equal(last.modelLease, false, 'this test manager grants no lease');
 });
 
 test('a turn it cannot run goes on in Node, exactly as without the request', async (t) => {
@@ -163,14 +165,16 @@ function bridge(overrides = {}) {
     },
     writeTargetFor: async (name, args, { user, chatKey }) => { calls.push(['target', name, args, user, chatKey]); return name === 'qa_write' ? { target: 'QA file', kind: 'drive' } : null; },
     recordToolUse: (ws, name) => calls.push(['recordToolUse', ws, name]), currentWorkspace: () => 'qa-ws', currentUser: () => ({ id: 'qa-user' }),
+    recordUsage: (ws, model, reported) => calls.push(['recordUsage', ws, model, reported]), recordSample: (...a) => calls.push(['recordSample', ...a]),
     ...overrides,
   });
   const call = async (url, body, { trusted = true, method = 'POST' } = {}) => {
     const req = new EventEmitter();
     Object.assign(req, { url, method, body, socket: { remoteAddress: trusted ? '127.0.0.1' : '10.0.0.9' }, headers: { 'x-noevia-store-token': SECRET } });
     const res = new EventEmitter();
+    res.end = () => {};
     const handled = await handle(req, res);
-    return { handled, status: res.status, body: res.body };
+    return { handled, status: res.status ?? res.statusCode, body: res.body };
   };
   return { call, calls };
 }
@@ -203,4 +207,18 @@ test('the target bridge describes a write, and neither bridge answers anyone but
   assert.equal((await call(native.TARGET_PATH, { ...body, chatKey: 'x'.repeat(201) })).status, 400);
   const failing = bridge({ executeToolCall: async () => { throw Error('QA engine down'); } });
   assert.deepEqual((await failing.call(native.EXECUTE_PATH, { user: 'qa-user', name: 'x', args: '{}', allowed: [], routes: [] })), { handled: true, status: 500, body: { error: 'QA engine down' } });
+});
+
+test('the usage and prefill bridges record what a native reply used, in this process', async () => {
+  const { call, calls } = bridge();
+  const reported = { promptTokens: 40, completionTokens: 4, totalTokens: 44, tokensPerSecond: null };
+  assert.deepEqual(await call(native.USAGE_PATH, { user: 'qa-user', model: 'qa-model', reported }), { handled: true, status: 204, body: undefined });
+  assert.deepEqual(calls.at(-1), ['recordUsage', 'qa-ws', 'qa-model', reported]);
+  for (const bad of [{ reported: { ...reported, promptTokens: -1 } }, { reported: { ...reported, tokensPerSecond: 'x' } }, { model: '' }, { reported: [] }]) {
+    assert.equal((await call(native.USAGE_PATH, { user: 'qa-user', model: 'qa-model', reported, ...bad })).status, 400, JSON.stringify(bad));
+  }
+  assert.deepEqual(await call(native.PREFILL_PATH, { model: 'qa-model', promptTokens: 52, firstTokenMs: 310 }), { handled: true, status: 204, body: undefined });
+  assert.deepEqual(calls.at(-1), ['recordSample', 'qa-model', 52, 310]);
+  assert.equal((await call(native.PREFILL_PATH, { model: 'qa-model', promptTokens: 0, firstTokenMs: 310 })).status, 400);
+  assert.equal((await call(native.USAGE_PATH, { user: 'qa-user', model: 'qa-model', reported }, { trusted: false })).status, 404);
 });

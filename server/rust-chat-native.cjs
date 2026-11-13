@@ -23,6 +23,11 @@
 //                                        user, counted as chat.cjs counts it (recordToolUse)
 //   POST /internal/chat/tools/target   {user, name, args, chatKey}
 //        -> 200 {target, kind} | {error} | {}   what a write would change (writeTargetFor, #659), before its card
+//   POST /internal/chat/usage          {user, model, reported}
+//        -> 204                          the reply's token use, recorded by usage.cjs (recordUsage) as the user:
+//                                        this process stays the one writer of the account's usage file
+//   POST /internal/chat/prefill        {model, promptTokens, firstTokenMs}
+//        -> 204                          one prefill observation for the tool budget (prefill.cjs recordSample)
 //
 // Both answer 404 to anything that is not the front (trusted-front.cjs): with file sharing on, this listener is not
 // loopback only, and 404 for an account that does not exist, is disabled or whose workspace was revoked. The
@@ -48,6 +53,8 @@ const HANDOFF_HEADER = 'x-noevia-chat-handoff';
 const PREPARED_VERSION = 1;
 const EXECUTE_PATH = '/internal/chat/tools/execute';
 const TARGET_PATH = '/internal/chat/tools/target';
+const USAGE_PATH = '/internal/chat/usage';
+const PREFILL_PATH = '/internal/chat/prefill';
 const BODY_CAP = 16 * 1024 * 1024;
 const USER_CAP = 200;
 
@@ -106,6 +113,8 @@ function preparedTurn(t) {
     messages: t.messages, tools: t.tools, routes: t.routes,
     writes: t.writes, public: t.public, automaticOnlyWrites: t.automaticOnlyWrites,
     routeNote: t.routeNote || '', templateGate: t.templateGate === true,
+    // The local model manager answers health and load (resolveRuntimeLimit), and grants the model's lease.
+    managerEnabled: t.managerEnabled === true, modelLease: t.modelLease === true,
     chat: {
       id: t.chatId || null, contextId: t.contextId || null, key: t.chatKey || null,
       grantScope: t.grantScope, grantHolder: t.grantHolder, recentWrites: t.recentWrites,
@@ -122,7 +131,8 @@ function preparedTurn(t) {
  * The two tool bridges. `asUser(userId, fn)` runs fn in that user's request scope (index.cjs diaryAsUser), where
  * `currentUser()` is the signed-in user chat.cjs passes as `chatUser` and `currentWorkspace()` theirs.
  */
-function createToolBridge({ secret, json, readJson, asUser, getProject, executeToolCall, writeTargetFor, recordToolUse, currentWorkspace, currentUser }) {
+function createToolBridge({ secret, json, readJson, asUser, getProject, executeToolCall, writeTargetFor, recordToolUse, currentWorkspace, currentUser,
+  recordUsage = () => {}, recordSample = () => {} }) {
   const callerGone = (req, res) => {
     const controller = new AbortController();
     const gone = () => { if (!res.writableEnded) controller.abort(); };
@@ -135,10 +145,27 @@ function createToolBridge({ secret, json, readJson, asUser, getProject, executeT
   const missing = (error) => error?.status === 404;
   return async function handle(req, res) {
     const path = String(req.url || '').split('?')[0];
-    if (path !== EXECUTE_PATH && path !== TARGET_PATH) return false;
+    if (path !== EXECUTE_PATH && path !== TARGET_PATH && path !== USAGE_PATH && path !== PREFILL_PATH) return false;
     if (!trustedFront(req, secret) || req.method !== 'POST') { json(res, 404, { error: 'Not found' }); return true; }
     let body;
     try { body = await readJson(req, BODY_CAP); } catch { json(res, 400, { error: 'invalid JSON' }); return true; }
+    const count = (v) => (v === null || (Number.isSafeInteger(v) && v >= 0) ? v : undefined);
+    if (path === PREFILL_PATH) {
+      const model = text(body?.model, 400), prompt = body?.promptTokens, ms = body?.firstTokenMs;
+      if (!model || !Number.isSafeInteger(prompt) || prompt <= 0 || !Number.isFinite(ms) || ms <= 0) { json(res, 400, { error: 'model, promptTokens and firstTokenMs are required.' }); return true; }
+      recordSample(model, prompt, ms);
+      res.statusCode = 204; res.end(); return true;
+    }
+    if (path === USAGE_PATH) {
+      const who = text(body?.user, USER_CAP), model = text(body?.model, 400), r = body?.reported;
+      const reported = r && typeof r === 'object' && !Array.isArray(r)
+        ? { promptTokens: count(r.promptTokens), completionTokens: count(r.completionTokens), totalTokens: count(r.totalTokens),
+          tokensPerSecond: r.tokensPerSecond === null || (Number.isFinite(r.tokensPerSecond) && r.tokensPerSecond > 0) ? r.tokensPerSecond : undefined } : null;
+      if (!who || !model || !reported || Object.values(reported).some((v) => v === undefined)) { json(res, 400, { error: 'user, model and reported are required.' }); return true; }
+      try { await asUser(who, async () => recordUsage(currentWorkspace(), model, reported)); }
+      catch (error) { if (missing(error)) { json(res, 404, { error: 'no such account' }); return true; } json(res, 500, { error: 'usage not recorded' }); return true; }
+      res.statusCode = 204; res.end(); return true;
+    }
     const user = text(body?.user, USER_CAP);
     const name = text(body?.name, 200);
     const args = text(body?.args, BODY_CAP);
@@ -182,4 +209,4 @@ function createToolBridge({ secret, json, readJson, asUser, getProject, executeT
   };
 }
 
-module.exports = { HANDOFF_HEADER, PREPARED_VERSION, EXECUTE_PATH, TARGET_PATH, createHandoff, refusal, preparedTurn, createToolBridge };
+module.exports = { HANDOFF_HEADER, PREPARED_VERSION, EXECUTE_PATH, TARGET_PATH, USAGE_PATH, PREFILL_PATH, createHandoff, refusal, preparedTurn, createToolBridge };
