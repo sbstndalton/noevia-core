@@ -26,6 +26,7 @@
 // This module decides and records ownership. It is NOT the sandbox: the harness still runs
 // unprivileged, in a container, with no credentials and no egress unless granted.
 const fs = require('node:fs'), path = require('node:path'), { execFileSync } = require('node:child_process');
+const { requireProc, at, openDir, openChild } = require('./dir-fd.cjs');
 
 const TASK_ID = /^[0-9a-f-]{36}$/;
 // A clone has no committer identity of its own, and the harness's is not noevia's to claim.
@@ -50,17 +51,34 @@ function gitReason(error) {
 // A tree the harness has held is hostile input. Its `.git/config`, `.git/hooks` and
 // `.gitattributes` are the harness's to write, and git runs commands named there: an fsmonitor,
 // hooks (`--no-verify` skips only pre-commit and commit-msg; post-commit still runs), clean
-// filters. Running git on it as noevia would hand the harness noevia's user, which is exactly
-// the boundary the separate harness user exists to keep. So: every git call on such a tree
-// switches those off from the command line, and a clone whose config reaches for them anyway is
-// refused outright rather than trusted to the switches alone.
-const HOSTILE_OFF = ['-c', 'core.fsmonitor=false', '-c', 'core.hooksPath=/dev/null', '-c', 'core.attributesFile=/dev/null'];
+// filters, a signing program, auto-maintenance. Running git on it as noevia would hand the
+// harness noevia's user, which is exactly the boundary the separate harness user exists to keep.
+// So: every git call on such a tree switches those off from the command line, and a clone whose
+// config reaches for them anyway is refused outright rather than trusted to the switches alone.
+const HOSTILE_OFF = ['-c', 'core.fsmonitor=false', '-c', 'core.hooksPath=/dev/null', '-c', 'core.attributesFile=/dev/null',
+  '-c', 'commit.gpgSign=false', '-c', 'tag.gpgSign=false'];
+// The release's own status, add and commit in the clone (#2528): no auto-maintenance or gc (a
+// commit starts one, and it reads the clone's config), and no recursion into submodules.
+const CLONE_OFF = [...HOSTILE_OFF, '-c', 'gc.auto=0', '-c', 'maintenance.auto=false', '-c', 'diff.ignoreSubmodules=all',
+  '-c', 'submodule.recurse=false', '-c', 'protocol.ext.allow=never'];
+// Every key git-config(1) documents as naming a program, a hook, a file of more configuration or
+// another repository, whether or not status, add, commit or fetch read it today: a key that is
+// harmless now is one git release away from not being.
 const HOSTILE_KEYS = [
-  /^filter\./, /^diff\..*\.(command|textconv)$/, /^merge\..*\.driver$/, /^core\.fsmonitor$/, /^core\.hookspath$/,
+  /^filter\./, /^diff\..*\.(command|textconv)$/, /^merge\..*\.driver$/, /^core\.fsmonitor/, /^core\.hookspath$/,
   /^core\.sshcommand$/, /^core\.gitproxy$/, /^core\.worktree$/, /^core\.askpass$/, /^core\.editor$/, /^core\.pager$/,
   /^credential\.(.*\.)?helper$/, /^alias\./, /^include\./, /^includeif\./, /^uploadpack\./, /^receive\./,
   /^sendemail\./,
+  // #2528: signing runs gpg.program (or gpg.<format>.program, gpg.ssh.defaultKeyCommand) on commit.
+  /^gpg\./, /^(commit|tag|push)\.gpgsign$/, /^tag\.forcesignannotated$/,
+  // #2528: with this set git also reads .git/config.worktree, which nothing here reads.
+  /^extensions\.worktreeconfig$/,
+  /^core\.alternaterefs(command|prefixes)$/, /^fsmonitor\./, /^sequence\.editor$/, /^diff\.(external|tool|guitool)$/,
+  /^merge\.(tool|guitool)$/, /^(difftool|mergetool|guitool)\./, /^interactive\.difffilter$/, /^pager\./,
+  /^(browser|man|instaweb|gitcvs|trailer|maintenance|submodule|url|protocol)\./, /^(web|help)\.browser$/,
+  /^gc\.(recentobjectshook|repackfilter|repackfilterto)$/, /^remote\..*\.(uploadpack|receivepack|proxy|vcs)$/,
 ];
+const DOT_GIT = Buffer.from('.git'), GITATTRIBUTES = Buffer.from('.gitattributes');
 
 /** Why a released clone must not be touched by git, or null when it looks inert. */
 function hostileReason(tree, run, env) {
@@ -69,14 +87,24 @@ function hostileReason(tree, run, env) {
   try { st = fs.lstatSync(gitDir); } catch { return 'the clone has no .git directory'; }
   // A `.git` file or symlink would point git at a directory the check below never read.
   if (!st.isDirectory()) return 'the clone’s .git is not a plain directory';
+  // #2528: either file makes git read configuration the key check below never sees: the
+  // per-worktree config, or the config of whatever common directory `commondir` names.
+  for (const name of ['config.worktree', 'commondir']) {
+    let there = true;
+    try { fs.lstatSync(path.join(gitDir, name)); } catch { there = false; }
+    if (there) return `the clone has a .git/${name}, which would make git read configuration noevia did not check`;
+  }
+  try { if (!fs.lstatSync(path.join(gitDir, 'config')).isFile()) return 'the clone’s .git/config is not a plain file'; }
+  catch { return 'the clone has no .git/config'; }
   let listing = '';
-  try { listing = run(['config', '--file', path.join(gitDir, 'config'), '--name-only', '--list'], tree, env); }
+  try { listing = run([...HOSTILE_OFF, 'config', '--file', path.join(gitDir, 'config'), '--name-only', '--list'], tree, env); }
   catch (e) { return `its .git/config could not be read: ${String(e.message).split('\n')[0]}`; }
   const bad = listing.split('\n').map((k) => k.trim().toLowerCase()).filter((k) => k && HOSTILE_KEYS.some((re) => re.test(k)));
   if (bad.length) return `its .git/config sets ${[...new Set(bad)].slice(0, 5).join(', ')}, which would make git run a command`;
   const hooks = path.join(gitDir, 'hooks');
   let names = [];
   try { names = fs.readdirSync(hooks); } catch { /* no hooks directory is fine */ }
+  // Advisory only: every git call here also runs with core.hooksPath=/dev/null (HOSTILE_OFF).
   for (const name of names) {
     if (name.endsWith('.sample')) continue;
     try {
@@ -84,25 +112,56 @@ function hostileReason(tree, run, env) {
       if (h.isFile() && (h.mode & 0o111)) return `.git/hooks/${name} is an executable hook`;
     } catch { /* a dangling link runs nothing */ }
   }
-  const attrFiles = [path.join(gitDir, 'info', 'attributes')];
-  const walk = (dir, depth) => {
-    if (depth > 64) return;
-    let entries = [];
-    try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
+  // Names are walked as bytes: a directory whose name is not valid UTF-8 has no string spelling,
+  // and skipping it hid a `.gitattributes` (#2528). Anything the walk cannot finish is refused.
+  const attrFiles = [Buffer.from(path.join(gitDir, 'info', 'attributes'))];
+  let problem = null;
+  const walk = (dir, shown, depth) => {
+    if (problem) return;
+    if (depth > 64) { problem = `${shown} is nested too deeply to check`; return; }
+    let entries;
+    try { entries = fs.readdirSync(dir, { withFileTypes: true, encoding: 'buffer' }); }
+    catch (e) { problem = `${shown || 'the tree'} could not be read (${e.code || 'error'})`; return; }
     for (const e of entries) {
-      if (e.name === '.git') continue;
-      const full = path.join(dir, e.name);
-      if (e.isDirectory()) walk(full, depth + 1);
-      else if (e.name === '.gitattributes') attrFiles.push(full);
+      const full = Buffer.concat([dir, Buffer.from(path.sep), e.name]);
+      const name = path.join(shown, e.name.toString());
+      if (e.name.equals(DOT_GIT)) {
+        // A repository inside the tree has a config of its own, and `git add` runs its filters.
+        if (depth > 0) { problem = `${name} is a nested repository, whose own configuration git would read`; return; }
+        continue;
+      }
+      if (e.isDirectory()) walk(full, name, depth + 1);
+      else if (e.name.equals(GITATTRIBUTES)) attrFiles.push(full);
     }
   };
-  walk(tree, 0);
+  walk(Buffer.from(tree), '', 0);
+  if (problem) return problem;
+  // Attributes only name drivers, and every driver lives in configuration refused above (and the
+  // global attributes file is /dev/null), so this is a second line, not the only one.
   for (const file of attrFiles) {
     let body;
     try { body = fs.readFileSync(file, 'utf8'); } catch { continue; }
-    if (/(^|\s)filter=/m.test(body)) return `${path.relative(tree, file)} names a filter driver`;
+    if (/(^|\s)filter=/m.test(body)) return `${path.relative(tree, file.toString())} names a filter driver`;
   }
   return null;
+}
+
+/**
+ * Replace the clone's `.git/config` with a copy only noevia has open (#2528). A harness process
+ * that opened the old file for writing before the tree was taken back keeps only the old inode,
+ * so the configuration checked next is the one git reads. The tree is sealed by then (see
+ * `defaultChown`), so nothing can put another file in its place.
+ */
+function freezeConfig(tree) {
+  const file = path.join(tree, '.git', 'config');
+  if (!fs.lstatSync(file).isFile()) throw Error('the clone’s .git/config is not a plain file');
+  const body = fs.readFileSync(file);
+  const copy = path.join(tree, '.git', `config.noevia-${process.pid}`);
+  try { fs.unlinkSync(copy); } catch { /* not there */ }
+  const { O_WRONLY, O_CREAT, O_EXCL, O_NOFOLLOW } = fs.constants;
+  const fd = fs.openSync(copy, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0o644);
+  try { fs.writeFileSync(fd, body); } finally { fs.closeSync(fd); }
+  fs.renameSync(copy, file);
 }
 
 /** Relative, plain paths only: they are handed to git and joined onto the tree. */
@@ -148,7 +207,7 @@ function defaultRun(args, cwd, env = {}, { maxBuffer, raw = false } = {}) {
  */
 function createCodeWorkspaces({ dir, treeRoot = null, owner = null, run = defaultRun,
   now = Date.now, epoch = String(process.pid), chown = defaultChown, mode = owner ? 'clone' : 'worktree',
-  rm = (target) => fs.rmSync(target, { recursive: true, force: true }), changeMaxBuffer = CHANGE_MAX_BUFFER } = {}) {
+  rm = removeTree, changeMaxBuffer = CHANGE_MAX_BUFFER } = {}) {
   const root = path.join(dir, 'code-workspaces');
   // git refuses to read a repository owned by another user, and that refusal is only liftable
   // from a config FILE — not `-c safe.directory`, not GIT_CONFIG_*. On a shared volume the
@@ -397,6 +456,12 @@ function createCodeWorkspaces({ dir, treeRoot = null, owner = null, run = defaul
     for (;;) {
       try { probe = fs.realpathSync(probe); break; }
       catch {
+        // Only a path that is not there yet is judged by its parent. One that exists but has no
+        // realpath (a link to a directory whose name is not valid UTF-8, a loop) cannot be placed,
+        // so it is outside (#2529); falling back to the link's parent said "inside" for it.
+        let there = true;
+        try { fs.lstatSync(probe); } catch (e) { there = !(e.code === 'ENOENT' || e.code === 'ENOTDIR'); }
+        if (there) return false;
         const parent = path.dirname(probe);
         // A path whose every ancestor is missing cannot be inside anything that exists.
         if (parent === probe || ++unresolved > 64) return false;
@@ -442,8 +507,11 @@ function createCodeWorkspaces({ dir, treeRoot = null, owner = null, run = defaul
       // that refusal cannot be lifted with `-c safe.directory` or GIT_CONFIG_* — only from a
       // config file — so ownership, not a git escape hatch, is the right lever. Found by running
       // a real harness: without this the fetch fails and every task's work is stranded.
+      // Sealed as it is taken (#2529): owned by noevia and writable by nobody else, so a harness
+      // process still running cannot change what is checked below before git reads it, and the
+      // config is a fresh copy no such process holds open.
       if (record.owner && record.noevia) {
-        try { chown(record.path, record.noevia.uid, record.noevia.gid); }
+        try { chown(record.path, record.noevia.uid, record.noevia.gid, { seal: true }); freezeConfig(record.path); }
         catch (e) {
           return write({ ...record, status: 'stuck', releasedAt: now(), headSha: branchHead(record),
             error: `Could not take the workspace back from the harness user: ${e.message}` });
@@ -468,9 +536,9 @@ function createCodeWorkspaces({ dir, treeRoot = null, owner = null, run = defaul
           error: `Could not remove the harness configuration before saving: ${e.message}` });
       }
       try {
-        if (run([...HOSTILE_OFF, 'status', '--porcelain'], record.path, gitEnv())) {
-          run([...HOSTILE_OFF, 'add', '--all'], record.path, gitEnv());
-          run([...HOSTILE_OFF, '-c', `user.name=${COMMITTER.name}`, '-c', `user.email=${COMMITTER.email}`,
+        if (run([...CLONE_OFF, 'status', '--porcelain'], record.path, gitEnv())) {
+          run([...CLONE_OFF, 'add', '--all'], record.path, gitEnv());
+          run([...CLONE_OFF, '-c', `user.name=${COMMITTER.name}`, '-c', `user.email=${COMMITTER.email}`,
             'commit', '--quiet', '--no-verify', '-m',
             `noevia: work in progress from task ${record.taskId}\n\nCommitted by noevia when the task ended, because the harness left it uncommitted.`,
           ], record.path, gitEnv());
@@ -482,7 +550,7 @@ function createCodeWorkspaces({ dir, treeRoot = null, owner = null, run = defaul
       try {
         // Never forced: a branch that would not fast-forward is a conflict for a human, not
         // something to overwrite. Nothing is fetched if the task never committed.
-        run([...HOSTILE_OFF, 'fetch', '--quiet', record.path, `${record.branch}:${record.branch}`], record.repo, gitEnv());
+        run([...HOSTILE_OFF, '-c', 'protocol.ext.allow=never', 'fetch', '--quiet', record.path, `${record.branch}:${record.branch}`], record.repo, gitEnv());
       } catch (e) {
         // "Couldn't find remote ref" simply means the task made no commits — not a failure.
         if (!/couldn't find remote ref|not found in upstream/i.test(String(e.message))) {
@@ -491,7 +559,7 @@ function createCodeWorkspaces({ dir, treeRoot = null, owner = null, run = defaul
       }
       try { rm(record.path); } catch (e) { removed = false; error = e.message; }
       if (record.home) { try { rm(record.home); } catch { /* nothing of the task's is in there */ } }
-      if (removed && removeBranch) { try { run(['branch', '-D', record.branch], record.repo, gitEnv()); } catch { /* keep going */ } }
+      if (removed && removeBranch) { try { run([...HOSTILE_OFF, 'branch', '-D', record.branch], record.repo, gitEnv()); } catch { /* keep going */ } }
     } else {
       try { dropPinned(record); }
       catch (e) {
@@ -526,7 +594,7 @@ function createCodeWorkspaces({ dir, treeRoot = null, owner = null, run = defaul
         // clone — otherwise git (and dropPinned's own unlink) can refuse a tree the harness user
         // still owns.
         if (interrupted.owner && interrupted.noevia) {
-          try { chown(interrupted.path, interrupted.noevia.uid, interrupted.noevia.gid); }
+          try { chown(interrupted.path, interrupted.noevia.uid, interrupted.noevia.gid, { seal: true }); }
           catch { /* best effort: dropPinned below reports its own failure */ }
         }
         // The pinned config holds the engine key and has no expiry otherwise — an interrupted
@@ -747,15 +815,89 @@ function createCodeWorkspaces({ dir, treeRoot = null, owner = null, run = defaul
   return { claim, reclaim, release, recover, contains, headSha, change, projectSnapshot, mergePreflight, mergeVerified, branchTip, verifyCheckout, get: read, list, root, owner, BRANCH_PREFIX };
 }
 
-/** Recursive chown, so the harness owns the tree and git's own files inside it. */
-function defaultChown(target, uid, gid) {
-  const walk = (entry) => {
-    fs.lchownSync(entry, uid, gid);
-    let stat; try { stat = fs.lstatSync(entry); } catch { return; }
-    if (!stat.isDirectory()) return;
-    for (const name of fs.readdirSync(entry)) walk(path.join(entry, name));
+/**
+ * Recursive chown, so the harness owns the tree and git's own files inside it; with `seal`, so
+ * noevia owns it again and nobody else can change it while noevia reads and commits it.
+ *
+ * Walked through directory descriptors (dir-fd.cjs), never by path and never through a link,
+ * because the harness may still be running (#2529): a directory swapped for a link, or for
+ * another directory, between the look and the open is refused, and the walk stops. Handing over,
+ * a directory is given away only after everything in it, so nothing can be planted ahead of the
+ * walk in a tree noevia made. Taking back (`seal`), a directory is taken and loses group and
+ * other write before it is read, so nothing can be added behind the walk; its regular files lose
+ * them too. A regular file with a second link is left as it is: the other name may be anywhere.
+ */
+function defaultChown(target, uid, gid, { seal = false } = {}) {
+  requireProc();
+  const { O_RDONLY, O_NOFOLLOW, O_NONBLOCK } = fs.constants;
+  // Group and other write go, and so do setuid, setgid and sticky: the kernel clears setuid and
+  // setgid on chown, and putting them back on a file that is now noevia's would make a root-owned
+  // setuid program out of whatever the harness wrote.
+  const strip = (mode) => mode & 0o0755;
+  const walk = (fd, shown, depth) => {
+    if (depth > 256) throw Error(`${shown} is nested too deeply to hand over`);
+    const take = () => { fs.fchownSync(fd, uid, gid); if (seal) fs.fchmodSync(fd, strip(fs.fstatSync(fd).mode)); };
+    if (seal) take();
+    for (const name of fs.readdirSync(at(fd), { encoding: 'buffer' })) {
+      const entry = at(fd, name), where = path.join(shown, name.toString());
+      const st = fs.lstatSync(entry);
+      if (st.isDirectory()) {
+        let child;
+        try { child = openChild(fd, name, st); }
+        catch (e) { throw e.swapped ? Error(`${where}: ${e.message}`) : e; }
+        try { walk(child, where, depth + 1); } finally { fs.closeSync(child); }
+      } else if (st.isFile()) {
+        if (st.nlink > 1) continue;
+        // O_NONBLOCK: an entry swapped for a fifo must not hang the walk; it fails the check below.
+        const file = fs.openSync(entry, O_RDONLY | O_NOFOLLOW | O_NONBLOCK);
+        try {
+          const now = fs.fstatSync(file);
+          if (now.isFile() && now.dev === st.dev && now.ino === st.ino && now.nlink === 1) {
+            fs.fchownSync(file, uid, gid);
+            if (seal) fs.fchmodSync(file, strip(now.mode));
+          }
+        } finally { fs.closeSync(file); }
+      } else {
+        // A link, fifo or socket: the entry itself, never what it names.
+        fs.lchownSync(entry, uid, gid);
+      }
+    }
+    if (!seal) take();
   };
-  walk(target);
+  const top = openDir(target);
+  try { walk(top, path.basename(target), 0); } finally { fs.closeSync(top); }
 }
 
-module.exports = { gitEnv, createCodeWorkspaces, defaultChown, BRANCH_PREFIX };
+/**
+ * Remove a tree the harness may still be changing (#2529). `fs.rmSync` re-reads every directory
+ * by path, so a directory swapped for a link while it runs is followed and the files behind the
+ * link are deleted. This unlinks only entries of directories it holds open, reached without a
+ * link. Without /proc (not Linux) only a same-user deployment is possible, which has no other
+ * user to race, and `fs.rmSync` is used as before.
+ */
+function removeTree(target) {
+  try { requireProc(); } catch { fs.rmSync(target, { recursive: true, force: true }); return; }
+  let top;
+  try { top = openDir(target); }
+  catch (e) {
+    if (e.code === 'ENOENT') return;
+    // A file or a link at the top: remove the entry itself.
+    if (e.code === 'ENOTDIR' || e.code === 'ELOOP') { fs.unlinkSync(target); return; }
+    throw e;
+  }
+  const empty = (fd, depth) => {
+    if (depth > 256) throw Error('the tree is nested too deeply to remove');
+    for (const name of fs.readdirSync(at(fd), { encoding: 'buffer' })) {
+      const entry = at(fd, name);
+      let st; try { st = fs.lstatSync(entry); } catch { continue; }
+      if (!st.isDirectory()) { try { fs.unlinkSync(entry); } catch (e) { if (e.code !== 'ENOENT') throw e; } continue; }
+      const child = openChild(fd, name, st);
+      try { empty(child, depth + 1); } finally { fs.closeSync(child); }
+      fs.rmdirSync(entry);
+    }
+  };
+  try { empty(top, 0); } finally { fs.closeSync(top); }
+  fs.rmdirSync(target);
+}
+
+module.exports = { gitEnv, createCodeWorkspaces, defaultChown, removeTree, BRANCH_PREFIX };
