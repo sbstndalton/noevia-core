@@ -153,6 +153,15 @@ function injectedSources({ injected, placed, readable, reply }) {
   return { reply: Array.isArray(reply) ? reply : [], injected: out };
 }
 
+// js-json's wtf16 (the frame reader) holds a lone surrogate as a character of U+10F800..U+10FFFF, so it refuses
+// those characters themselves: a frame carrying one would fail the hand-off after this process let the turn go.
+// In UTF-16 they are U+DBFE or U+DBFF followed by a low surrogate (JSON.stringify writes them raw).
+const RESERVED = /[\udbfe\udbff][\udc00-\udfff]/;
+/** Whether the prepared frame's JSON text holds a character the native executor cannot read (the turn stays here). */
+function reservedText(json) {
+  return typeof json !== 'string' || RESERVED.test(json);
+}
+
 /** The `prepared` frame: everything the native executor needs from here on. No provider key is in it. */
 function preparedTurn(t) {
   return {
@@ -375,4 +384,4 @@ function createToolBridge({ secret, json, readJson, asUser, getProject, executeT
   };
 }
 
-module.exports = { HANDOFF_HEADER, PREPARED_VERSION, EXECUTE_PATH, TARGET_PATH, USAGE_PATH, PREFILL_PATH, NATIVE_PREFIX, CHAT_BODY_CAP, createHandoff, refusal, injectedSources, preparedTurn, createAsUser, createToolBridge };
+module.exports = { HANDOFF_HEADER, PREPARED_VERSION, EXECUTE_PATH, TARGET_PATH, USAGE_PATH, PREFILL_PATH, NATIVE_PREFIX, CHAT_BODY_CAP, createHandoff, refusal, reservedText, injectedSources, preparedTurn, createAsUser, createToolBridge };

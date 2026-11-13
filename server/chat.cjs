@@ -1706,20 +1706,12 @@ function createChatHandler({
         why = 'refusal-input';
         console.warn(`[chat] native executor refusal inputs could not be read: ${String(error?.message || error).slice(0, 200)}`);
       }
+      // The frame is built before anything below waits or lets go of the pre-load, so a turn whose text the
+      // executor cannot read (reservedText) still goes on here.
+      let frame = null;
       if (!why) {
-        // The start of the rounds' preparation that only waits (as below): the route pre-load is used or let go here,
-        // so nothing in this process is left holding it.
-        if (routePreload && !chatSignal.signal.aborted) routePreload.use();
-        if (routePreload && routePreload.model !== model) routePreload.cancel();
-        else if (routePreload && routePreload.pending()) {
-          const ctx = require('./chat-context.cjs');
-          const seconds = ctx.expectedLoadSeconds(model);
-          send({ type: 'status', text: ctx.loadingStatus(model, routedRole || null, seconds), id: 'loadingModel', detail: { model, ...(routedRole ? { role: routedRole } : {}), ...(seconds ? { expectedSeconds: seconds } : {}) } });
-          await routePreload.settled;
-          if (chatSignal.signal.aborted) return;
-        }
         const names = activeTools.map((t) => t.function?.name).filter((n) => typeof n === 'string');
-        send(native.preparedTurn({
+        frame = native.preparedTurn({
           startedAt: exchangeStartedAt, model, role: routedRole, auto: wantsAuto, effort, thinkingOff: fastThinkingOff, sampling: sampling.params,
           providerId: provider.id, providerLabel: provider.label, upstreamUrl,
           // reasoning-effort.cjs reads these of the row (modeFor, budgetFieldFor, nativeThinking); never the key.
@@ -1736,7 +1728,24 @@ function createChatHandler({
             firstMessage: chatTitleLib.firstUserMessage(history, message), firstReply: chatTitleLib.firstReply(history), enabled: !!chatTitles },
           message, spaceId, projectId: project?.id, declineEndsReply: !spaceId?.startsWith('diary'), record: !!record, streamIdleMs,
           sources: native.injectedSources({ injected: injectedEntries, placed: placedEntries, readable: readableFiles, reply: replySources }),
-        }));
+        });
+        let text = null;
+        try { text = JSON.stringify(frame); } catch { text = null; }
+        if (native.reservedText(text)) { why = text === null ? 'refusal-input' : 'reserved-text'; frame = null; }
+      }
+      if (frame) {
+        // The start of the rounds' preparation that only waits (as below): the route pre-load is used or let go here,
+        // so nothing in this process is left holding it.
+        if (routePreload && !chatSignal.signal.aborted) routePreload.use();
+        if (routePreload && routePreload.model !== model) routePreload.cancel();
+        else if (routePreload && routePreload.pending()) {
+          const ctx = require('./chat-context.cjs');
+          const seconds = ctx.expectedLoadSeconds(model);
+          send({ type: 'status', text: ctx.loadingStatus(model, routedRole || null, seconds), id: 'loadingModel', detail: { model, ...(routedRole ? { role: routedRole } : {}), ...(seconds ? { expectedSeconds: seconds } : {}) } });
+          await routePreload.settled;
+          if (chatSignal.signal.aborted) return;
+        }
+        send(frame);
         res.end();
         return;
       }

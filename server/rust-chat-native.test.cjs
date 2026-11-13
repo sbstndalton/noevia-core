@@ -145,6 +145,27 @@ test('injectedSources keeps the part of a file the attribution reads, and refuse
     chatgpt: false, routeTarget: false, authorized: false, images: false, messages: [], skills: false, provenance: false, framingReasoner: false, narrowed: false, gate: false,
     supervision: false, injected: false, editTools: false };
   assert.equal(native.refusal(base), null);
+  assert.equal(native.refusal({ ...base, injected: true }), 'injected-sources');
+});
+
+test('an injected entry whose name is not text keeps the turn in Node', async (t) => {
+  const rag = { filesContext: async (_id, _r, _q, _u, onPlaced) => { onPlaced([], [{ file: 42, body: 'QA AA-11', kind: 'file' }]); return 'QA block'; } };
+  const handed = await runTurn(t, { requested: true, frames: answer, project: { files: [{ name: 'qa-a.txt', content: 'QA' }] }, deps: { rag } });
+  assert.notEqual(handed.events[handed.events.length - 1].type, 'prepared');
+  assert.equal(handed.requests.length, 1, 'Node ran the turn');
+});
+
+test('a turn whose text holds a character the executor cannot read (U+10F800..U+10FFFF) stays in Node', async (t) => {
+  assert.equal(native.reservedText(JSON.stringify({ a: 'QA \u{10F800}' })), true);
+  assert.equal(native.reservedText(JSON.stringify({ a: 'QA \u{10FFFF}' })), true);
+  assert.equal(native.reservedText(JSON.stringify({ a: 'QA \u{10F7FF} \ud83d\ude00 \udbfe' })), false, 'a lone surrogate is readable');
+  assert.equal(native.reservedText(undefined), true);
+  const rag = { filesContext: async (_id, _r, _q, _u, onPlaced) => { onPlaced([], [{ file: 'qa-a.txt', body: 'QA \u{10FABC} text', kind: 'file' }]); return 'QA block \u{10FABC}'; } };
+  const handed = await runTurn(t, { requested: true, frames: answer, project: { files: [{ name: 'qa-a.txt', content: 'QA' }] }, deps: { rag } });
+  assert.notEqual(handed.events[handed.events.length - 1].type, 'prepared');
+  assert.equal(handed.requests.length, 1, 'Node ran the turn');
+  const plain = await runTurn(t, { requested: true, frames: answer, project: { files: [{ name: 'qa-a.txt', content: 'QA' }] } });
+  assert.equal(plain.events[plain.events.length - 1].type, 'prepared');
 });
 
 test('the prepared frame says the front holds the model lease and runs the title, and Node takes no lease of its own', async (t) => {
