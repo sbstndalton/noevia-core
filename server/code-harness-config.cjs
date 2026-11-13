@@ -330,6 +330,9 @@ function writeHarnessConfig({ cwd, home = null, owner = null, ...options }) {
 // and one moved away keeps receiving the write wherever it went, which is somewhere that user
 // could write anyway. The file is handed over through its own descriptor, and directories noevia
 // made only once the file is in place, innermost first, so nothing can be planted in them first.
+// That needs /proc (Linux) and is needed only when there is a harness user (#2562). Without one
+// the tree is noevia's own, nobody else can change it, and a host without /proc walks it by path
+// with the same checks, as removeTree (code-workspace.cjs) does.
 const refuse = (why) => Object.assign(Error(`Refused to pin the harness configuration: ${why}.`), { status: 409 });
 function writePinned(root, relative, content, owner) {
   const base = nodePath.resolve(root);
@@ -337,29 +340,33 @@ function writePinned(root, relative, content, owner) {
   if (!target.startsWith(base + nodePath.sep)) throw Error('Pinned file outside its root');
   const parts = nodePath.relative(base, target).split(nodePath.sep);
   const leaf = parts.pop();
-  requireProc();
+  let viaFd = true;
+  try { requireProc(); } catch (e) { if (owner) throw e; viaFd = false; }
+  // A directory is its descriptor, or (no /proc, no other user) its path.
+  const here = (dir, name) => (viaFd ? at(dir, name) : nodePath.join(dir, name));
   const open = [], made = [];
   try {
-    let fd = openDir(base), shown = '';
-    open.push(fd);
+    let fd = viaFd ? openDir(base) : base, shown = '';
+    if (viaFd) open.push(fd);
     for (const part of parts) {
       shown = shown ? nodePath.join(shown, part) : part;
       let st = null;
-      try { st = fs.lstatSync(at(fd, part)); } catch (e) { if (e.code !== 'ENOENT') throw e; }
+      try { st = fs.lstatSync(here(fd, part)); } catch (e) { if (e.code !== 'ENOENT') throw e; }
       if (st && st.isSymbolicLink()) throw refuse(`${shown} is a symbolic link`);
       if (st && !st.isDirectory()) throw refuse(`${shown} is not a directory`);
-      if (!st) fs.mkdirSync(at(fd, part), { mode: 0o700 });
+      if (!st) fs.mkdirSync(here(fd, part), { mode: 0o700 });
+      if (!viaFd) { fd = here(fd, part); continue; }
       try { fd = openChild(fd, part, st); } catch (e) { throw e.swapped ? refuse(`${shown} ${e.message}`) : e; }
       open.push(fd);
       if (!st) made.push(fd);
     }
     let st = null;
-    try { st = fs.lstatSync(at(fd, leaf)); } catch (e) { if (e.code !== 'ENOENT') throw e; }
+    try { st = fs.lstatSync(here(fd, leaf)); } catch (e) { if (e.code !== 'ENOENT') throw e; }
     if (st && st.isSymbolicLink()) throw refuse(`${relative} is a symbolic link`);
     if (st && st.isDirectory()) throw refuse(`${relative} is a directory`);
-    if (st) { try { fs.unlinkSync(at(fd, leaf)); } catch (e) { if (e.code !== 'ENOENT') throw e; } }
+    if (st) { try { fs.unlinkSync(here(fd, leaf)); } catch (e) { if (e.code !== 'ENOENT') throw e; } }
     const { O_WRONLY, O_CREAT, O_EXCL, O_TRUNC, O_NOFOLLOW } = fs.constants;
-    const file = fs.openSync(at(fd, leaf), O_WRONLY | O_CREAT | O_EXCL | O_TRUNC | O_NOFOLLOW, 0o600);
+    const file = fs.openSync(here(fd, leaf), O_WRONLY | O_CREAT | O_EXCL | O_TRUNC | O_NOFOLLOW, 0o600);
     try {
       fs.writeFileSync(file, content);
       if (owner) fs.fchownSync(file, owner.uid, owner.gid);
