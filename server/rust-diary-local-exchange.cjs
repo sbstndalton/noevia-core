@@ -6,12 +6,12 @@
 // refused before authentication and before the inference gate, for every method, so a stale route
 // table cannot make two processes answer.
 //
-// What stays in this process is what the exchange holds while it runs: the inference
-// maintenance gate (with the long-document backfill's pause). The front takes them through its admission
-// lease (inference-admission-lease.cjs, ask `{ diaryExchange: { user } }`) before the first byte to the
-// sidecar and gives them back when its response ends, so a preset apply, a calibration or a tune still
-// waits for the exchange. The front counts the one `llm:` budget per account that chat and the Diary
-// share (rust-chat-edge.cjs).
+// What stays in this process is what the exchange holds while it runs: the model throttle chat shares
+// (llmRateLimited) and the inference maintenance gate (with the long-document backfill's pause). The
+// front takes them through its admission lease (inference-admission-lease.cjs, ask
+// `{ diaryExchange: { user } }`) before the first byte to the sidecar and gives them back when its
+// response ends, so a preset apply, a calibration or a tune still waits for the exchange, and one
+// throttle bucket per account still counts both chat and the Diary.
 const PATH = '/api/diary/local-exchange';
 const ROUTE_REFUSAL = Object.freeze({ error: 'The Diary local exchange is owned by the Rust front.', code: 'RUST_DIARY_LOCAL_EXCHANGE_OWNED' });
 
