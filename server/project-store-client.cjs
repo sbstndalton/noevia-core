@@ -37,6 +37,8 @@ const SPECIALIST_PAGE_WAIT_MS = 15000; // one small write on the front's own dis
 /** One discovery lists every server together (each listing is bounded at 60 s on the front) and may wait for a place. */
 const MCP_DISCOVERY_WAIT_MS = 90000;
 const MCP_START_WAIT_MS = 120000;
+/** Track R5: one Drive tool on the front (a token refresh and up to four Drive requests of 300 s at most). */
+const DRIVE_TOOL_WAIT_MS = 330000;
 const REPLY_CAP = 2 * 32 * 1024 * 1024 + 64 * 1024;
 // providers.json (sbstndalton/noevia#2190 round 6) is the account's private provider rows: the Rust
 // front's routes are its writer; Node saves only its seal-on-load migration here.
@@ -360,6 +362,14 @@ function createClient({ port, token, fetchImpl = globalThis.fetch, timeoutMs = T
     async gdriveReject(user, admin, generation) {
       const { status, body } = await call('gdrive/reject', { user, admin: admin === true, generation: String(generation || '') }, CHATGPT_WAIT_MS);
       return status === 200 && body ? { ok: true, dropped: body.dropped === true } : chatgptRefusal(status, body);
+    },
+    /** Track R5: one chat Drive tool, or an approval card's target, run by the front (gdrive_tools.rs):
+     *  `{ status, body }`; 404 means the front runs no Drive tools. */
+    async gdriveTool(payload) {
+      return call('gdrive/tool', payload, DRIVE_TOOL_WAIT_MS);
+    },
+    async gdriveTarget(payload) {
+      return call('gdrive/target', payload, DRIVE_TOOL_WAIT_MS);
     },
     async gdriveDisconnect(user, admin) {
       const { status, body } = await call('gdrive/disconnect', { user, admin: admin === true }, CHATGPT_WAIT_MS);
