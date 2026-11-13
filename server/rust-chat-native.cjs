@@ -24,11 +24,37 @@
 // turn it would run without its checks: `skills` (W5) its instruction skills checks (the skills bridges below).
 // Without it a turn whose project has instruction skills stays here ('skills'). The header is removed either way.
 //
-//   POST /internal/chat/tools/execute  {user, projectId, name, args, allowed, routes, chatKey, exchangeKey, editTarget?}
-//        -> 200 {text, failed}           one tool call through the toolboxes (index.cjs executeToolCall), as the
+//   POST /internal/chat/tools/execute  {user, projectId, name, args, allowed, routes, chatKey, exchangeKey, editTarget?, grant?}
+//        -> 200 {text, failed} | {text, failed, notRun: true} | {redeem: 'refused' | 'unavailable' | 'aborted'}
+//                                        one tool call through the toolboxes (index.cjs executeToolCall), as the
 //                                        user, counted as chat.cjs counts it (recordToolUse). `editTarget`: an
 //                                        approved project file edit's pinned file (targetDigest, 64 hex), passed
-//                                        in the call's options as chat.cjs passes it (#648)
+//                                        in the call's options as chat.cjs passes it (#648). `notRun`: the executor
+//                                        refused at its outbound write (a closed write fence, tool-write-fence.cjs);
+//                                        the call is not counted. `grant` {handle, chat, scope, binding} (with an
+//                                        exchangeKey): the call runs under a chat-wide grant the grant bridge
+//                                        found. The handle is taken out first; then the grant is redeemed at the
+//                                        front (rust-approval-registry.cjs redeemChatGrant, with the call's final
+//                                        `binding`) and the call runs inside the redeemed dispatch fence, as
+//                                        chat.cjs runs it (writeFence; started() when it ends). `refused`: the
+//                                        handle is unknown, expired or not this call's, or the front refused the
+//                                        redeem, or the grant was revoked meanwhile; `unavailable`: the redeem could
+//                                        not be asked, or its window closed before the call; `aborted`: the call's
+//                                        signal was aborted (the abort bridge, or the front's call went away) by
+//                                        the time the redeem answered (chat.cjs: "exchange cancelled; tool was not
+//                                        run."). None of them runs the call; the fence is retired (started()).
+//   POST /internal/chat/tools/grant    {user, chat, scope, binding, exchangeKey}
+//        -> 200 {granted: false} | {granted: true, handle}   whether a chat-wide grant ("Allow for this chat")
+//                                        covers this write (chatWideApproved, asked of the front), as chat.cjs
+//                                        asks it before the card. The registry's ticket stays here; the executor
+//                                        gets a handle (32 hex) to name it in the execute call. A grant handle is
+//                                        single use, bound to user, chat, scope and exchange; an unknown or
+//                                        mismatched handle never runs the call. Handles live 5 minutes, at most
+//                                        64 per account and 1024 in all (when full: granted false, the card asks).
+//   POST /internal/chat/tools/revoke   {user, chat}
+//        -> 200 {revoked} | 503 {error}  revokeChatGrant, as chat.cjs revokes a chat's grant after a target or
+//                                        permission check fails (Node's epoch moves first; an unconfirmed revoke is
+//                                        retried there). 503 when this process has no approval registry.
 //   POST /internal/chat/tools/target   {user, name, args, chatKey}
 //        -> 200 {target, kind} | {error} | {}   what a write would change (writeTargetFor, #659), before its card
 //   POST /internal/chat/tools/abort    {user, exchangeKey}
@@ -85,7 +111,9 @@
 // chatNativeAsUser, createAsUser below), and answers 404 {error:'no such account'} for an account that does not
 // exist, is disabled or whose workspace was revoked or removed. A field that is missing or malformed answers 400;
 // a `model` may not carry control characters. The permission gate around a call (policy, approval card, audit,
-// grants, recent writes) is the native executor's own; these only run what the tool engines do. A tool call that
+// recent writes) is the native executor's own; these only run what the tool engines do. The chat-wide grants are
+// the one exception: their check, redeem and revoke go through this process's approval registry (index.cjs
+// approvalRegistry, the one chat.cjs uses), whose revocation epochs the front's revokes move (frontRevoked). A tool call that
 // throws answers 500 with the error's message, which the executor turns into the call's result as
 // tool-exchange.cjs callError does; a target lookup that throws answers chat.cjs's own refusal ({error}), and so does
 // an edit target lookup that throws (resolveEditTarget never does; reading the project can); a fact that cannot be
@@ -117,7 +145,16 @@ const EXECUTE_PATH = '/internal/chat/tools/execute';
 const TARGET_PATH = '/internal/chat/tools/target';
 const ABORT_PATH = '/internal/chat/tools/abort';
 const EDIT_TARGET_PATH = '/internal/chat/tools/edit-target';
+const GRANT_PATH = '/internal/chat/tools/grant';
+const REVOKE_PATH = '/internal/chat/tools/revoke';
 const DIGEST = /^[0-9a-f]{64}$/;
+const GRANT_HANDLE = /^[0-9a-f]{32}$/;
+// A grant handle's life, and how many may wait to be redeemed (per account and in all).
+const GRANT_HANDLE_TTL_MS = 5 * 60 * 1000;
+const GRANT_HANDLES_PER_USER = 64;
+const GRANT_HANDLES_MAX = 1024;
+// A grant scope (chat.cjs writeGrantScope) and an exchange key.
+const SCOPE_CAP = 200;
 const USAGE_PATH = '/internal/chat/usage';
 const PREFILL_PATH = '/internal/chat/prefill';
 const NATIVE_PREFIX = '/internal/chat/native/';
@@ -315,9 +352,13 @@ function createAsUser({ userRow, runAs, currentWorkspace }) {
  */
 function createToolBridge({ secret, json, readJson, asUser, getProject, executeToolCall, writeTargetFor, recordToolUse, currentWorkspace, currentUser,
   editStorageAccount = () => null, recordUsage = () => {}, recordSample = () => {}, modelManager = null, templateToolsGate = null, chatTitles = null, chatBodyCap = CHAT_BODY_CAP,
-  skillLedger = null, log = (line) => console.warn(line) }) {
+  skillLedger = null, chatWideApproved = null, redeemChatGrant = null, revokeChatGrant = null, now = () => Date.now(),
+  log = (line) => console.warn(line) }) {
   // Execute calls in progress by `${user}\u0000${exchangeKey}`: the abort bridge aborts their signals.
   const running = new Map();
+  // The grant bridge's handles: handle -> {user, chat, scope, exchangeKey, grant, expires}, where `grant` is the
+  // registry's frozen {ticket, epoch} (chatWideApproved). Each is taken out by the first execute call naming it.
+  const grants = new Map();
   const callerGone = (req, res, controller = new AbortController()) => {
     const gone = () => { if (!res.writableEnded) controller.abort(); };
     req.once('close', () => { if (req.destroyed && !req.complete) gone(); });
@@ -334,6 +375,35 @@ function createToolBridge({ secret, json, readJson, asUser, getProject, executeT
   const instructionSkills = () => require('./instruction-skills.cjs');
   const noContent = (res) => { res.statusCode = 204; res.end(); };
   const noAccount = (res) => json(res, 404, { error: 'no such account' });
+  const plain = (v) => !!v && typeof v === 'object' && !Array.isArray(v);
+  // A grant's chat, scope and binding (the chat's permission context, chat-grant-context.cjs), or null.
+  const grantFields = (v) => {
+    const chat = text(v?.chat, CHAT_ID_CAP), scope = text(v?.scope, SCOPE_CAP);
+    return chat && scope && plain(v?.binding) ? { chat, scope, binding: v.binding } : null;
+  };
+  // Whether one more handle fits for `user`, after the expired ones are gone. A live handle is never evicted.
+  function grantRoom(user) {
+    const t = now();
+    for (const [h, e] of grants) if (!(e.expires > t)) grants.delete(h);
+    if (grants.size >= GRANT_HANDLES_MAX) return false;
+    let mine = 0;
+    for (const e of grants.values()) if (e.user === user && (mine += 1) >= GRANT_HANDLES_PER_USER) return false;
+    return true;
+  }
+  // The signed-in workspace is this user's and stands (chat.cjs's check before a grant is used).
+  const ownWorkspace = (user) => { try { const ws = currentWorkspace(); return !!ws && ws.userId === user && !ws.revoked; } catch { return false; } };
+  // The grant bridge, as the user: a handle for the registry's ticket, or null (no grant: the card asks).
+  async function grantHandle(user, chat, scope, binding, exchangeKey) {
+    // Without redeemChatGrant a handle is still handed out, but its execute call answers 'unavailable' (never unfenced).
+    if (typeof chatWideApproved !== 'function' || !ownWorkspace(user) || !grantRoom(user)) return null;
+    const grant = await chatWideApproved(user, chat, scope, binding);
+    if (!grant || typeof grant !== 'object' || typeof grant.ticket !== 'string' || !grant.ticket) return null;
+    // Asked again: other grant checks may have filled the room while the front answered.
+    if (!grantRoom(user)) return null;
+    const handle = crypto.randomBytes(16).toString('hex');
+    grants.set(handle, { user, chat, scope, exchangeKey, grant, expires: now() + GRANT_HANDLE_TTL_MS });
+    return handle;
+  }
   // Every fact runs as the relayed user, so an account that is gone, disabled or revoked reads nothing (404).
   async function nativeFact(op, body, req, res) {
     const who = text(body?.user, USER_CAP);
@@ -436,7 +506,8 @@ function createToolBridge({ secret, json, readJson, asUser, getProject, executeT
     const path = String(req.url || '').split('?')[0];
     const op = path.startsWith(NATIVE_PREFIX) ? path.slice(NATIVE_PREFIX.length) : null;
     const skill = path.startsWith(SKILLS_PREFIX) && SKILL_OPS.has(path.slice(SKILLS_PREFIX.length)) ? path.slice(SKILLS_PREFIX.length) : null;
-    if (path !== EXECUTE_PATH && path !== TARGET_PATH && path !== ABORT_PATH && path !== EDIT_TARGET_PATH && path !== USAGE_PATH && path !== PREFILL_PATH && !NATIVE_OPS.has(op) && !skill) return false;
+    if (path !== EXECUTE_PATH && path !== TARGET_PATH && path !== ABORT_PATH && path !== EDIT_TARGET_PATH && path !== GRANT_PATH && path !== REVOKE_PATH
+      && path !== USAGE_PATH && path !== PREFILL_PATH && !NATIVE_OPS.has(op) && !skill) return false;
     if (!trustedFront(req, secret) || req.method !== 'POST') { json(res, 404, { error: 'Not found' }); return true; }
     let body;
     // A title bridge carries the chat's first message, which may be as long as a chat request; a skill read its tool
@@ -471,6 +542,33 @@ function createToolBridge({ secret, json, readJson, asUser, getProject, executeT
       if (!who || !key) { json(res, 400, { error: 'user and exchangeKey are required.' }); return true; }
       for (const controller of running.get(`${who}\u0000${key}`) || []) controller.abort();
       noContent(res); return true;
+    }
+    if (path === GRANT_PATH || path === REVOKE_PATH) {
+      const who = text(body?.user, USER_CAP), chat = text(body?.chat, CHAT_ID_CAP);
+      if (!who || !chat) { json(res, 400, { error: 'user and chat are required.' }); return true; }
+      if (path === REVOKE_PATH) {
+        if (typeof revokeChatGrant !== 'function') { json(res, 503, { error: 'chat-wide grants are not available' }); return true; }
+        try {
+          const revoked = await asUser(who, async () => (await revokeChatGrant(who, chat)) === true);
+          json(res, 200, { revoked });
+        } catch (error) {
+          if (missing(error)) { noAccount(res); return true; }
+          log(`[chat] native grant revoke bridge failed: ${String(error?.message || error).slice(0, 300)}`);
+          json(res, 500, { error: 'the grant could not be revoked' });
+        }
+        return true;
+      }
+      const fields = grantFields(body), exchangeKey = text(body?.exchangeKey, 200);
+      if (!fields || !exchangeKey) { json(res, 400, { error: 'scope, binding and exchangeKey are required.' }); return true; }
+      try {
+        const handle = await asUser(who, () => grantHandle(who, fields.chat, fields.scope, fields.binding, exchangeKey));
+        json(res, 200, handle ? { granted: true, handle } : { granted: false });
+      } catch (error) {
+        if (missing(error)) { noAccount(res); return true; }
+        log(`[chat] native grant bridge failed: ${String(error?.message || error).slice(0, 300)}`);
+        json(res, 500, { error: 'the grant could not be checked' });
+      }
+      return true;
     }
     if (path === PREFILL_PATH) {
       const who = text(body?.user, USER_CAP), model = modelName(body?.model), prompt = body?.promptTokens, ms = body?.firstTokenMs;
@@ -542,6 +640,25 @@ function createToolBridge({ secret, json, readJson, asUser, getProject, executeT
       if ((body.projectId && !projectId) || (body.exchangeKey && !exchangeKey) || (editTarget !== null && !(typeof editTarget === 'string' && DIGEST.test(editTarget)))) {
         json(res, 400, { error: 'projectId, exchangeKey or editTarget is invalid.' }); return true;
       }
+      let asked = null;
+      if (body.grant !== undefined && body.grant !== null) {
+        const g = body.grant;
+        const fields = plain(g) && typeof g.handle === 'string' && GRANT_HANDLE.test(g.handle) ? grantFields(g) : null;
+        if (!fields || !exchangeKey) { json(res, 400, { error: 'grant is invalid (handle, chat, scope and binding, with an exchangeKey).' }); return true; }
+        asked = { handle: g.handle, ...fields };
+      }
+      // A grant handle is single use: taken out before anything else, whatever happens next. One that is unknown,
+      // expired or not this call's (user, chat, scope, exchange) never runs the call.
+      let entry = null;
+      if (asked) {
+        entry = grants.get(asked.handle) || null;
+        grants.delete(asked.handle);
+        if (!entry || !(entry.expires > now()) || entry.user !== user || entry.chat !== asked.chat || entry.scope !== asked.scope || entry.exchangeKey !== exchangeKey) {
+          json(res, 200, { redeem: 'refused' }); return true;
+        }
+        // A grant is never run unfenced.
+        if (typeof redeemChatGrant !== 'function') { json(res, 200, { redeem: 'unavailable' }); return true; }
+      }
       const controller = new AbortController();
       const signal = callerGone(req, res, controller);
       const runKey = exchangeKey ? `${user}\u0000${exchangeKey}` : null;
@@ -551,10 +668,31 @@ function createToolBridge({ secret, json, readJson, asUser, getProject, executeT
         ran = await asUser(user, async () => {
           const project = projectId ? getProject(projectId) : null;
           if (projectId && !project) return null;
+          let fence = null;
+          if (entry) {
+            // chat.cjs: redeemed at the front after the final checks, with the call's final binding; the fence is
+            // carried to the executor's outbound write.
+            if (!ownWorkspace(user)) return { redeem: 'refused' };
+            const redeemed = await redeemChatGrant(user, entry.chat, entry.scope, asked.binding, entry.grant);
+            if (redeemed === 'unavailable') return { redeem: 'unavailable' };
+            if (!redeemed || typeof redeemed !== 'object' || typeof redeemed.open !== 'function' || typeof redeemed.started !== 'function') return { redeem: 'refused' };
+            fence = redeemed;
+            // chat.cjs: an exchange stopped while the front redeemed (the abort bridge, or the caller gone) runs nothing.
+            if (signal.aborted) { fence.started(); return { redeem: 'aborted' }; }
+            // chat.cjs's early refusal (notChecked): the answer came too late to act on.
+            if (!fence.open()) { fence.started(); return { redeem: 'unavailable' }; }
+          }
           const outcome = { failed: false };
-          const out = await executeToolCall(project, name, args, allowed, signal, outcome, { chatKey, exchangeKey, routes, ...(editTarget !== null ? { editTarget } : {}) });
+          let out;
+          try {
+            out = await executeToolCall(project, name, args, allowed, signal, outcome,
+              { chatKey, exchangeKey, routes, ...(editTarget !== null ? { editTarget } : {}), ...(fence ? { writeFence: fence } : {}) });
+          } finally { fence?.started(); }
+          const reply = { text: String(out ?? ''), failed: outcome.failed === true };
+          // Refused at its outbound write (a closed fence): not run, so not counted (chat.cjs).
+          if (outcome.notRun === true) return { ...reply, notRun: true };
           recordToolUse(currentWorkspace(), name);
-          return { text: String(out ?? ''), failed: outcome.failed === true };
+          return reply;
         });
       } finally {
         const set = runKey && running.get(runKey);
@@ -571,4 +709,4 @@ function createToolBridge({ secret, json, readJson, asUser, getProject, executeT
   };
 }
 
-module.exports = { HANDOFF_HEADER, CAPS_HEADER, PREPARED_VERSION, EXECUTE_PATH, TARGET_PATH, ABORT_PATH, EDIT_TARGET_PATH, USAGE_PATH, PREFILL_PATH, NATIVE_PREFIX, SKILLS_PREFIX, CHAT_BODY_CAP, PREPARED_CAP, createHandoff, refusal, reservedText, frameTooLarge, injectedSources, preparedTurn, createAsUser, createToolBridge };
+module.exports = { HANDOFF_HEADER, CAPS_HEADER, PREPARED_VERSION, EXECUTE_PATH, TARGET_PATH, ABORT_PATH, EDIT_TARGET_PATH, GRANT_PATH, REVOKE_PATH, GRANT_HANDLE_TTL_MS, USAGE_PATH, PREFILL_PATH, NATIVE_PREFIX, SKILLS_PREFIX, CHAT_BODY_CAP, PREPARED_CAP, createHandoff, refusal, reservedText, frameTooLarge, injectedSources, preparedTurn, createAsUser, createToolBridge };
