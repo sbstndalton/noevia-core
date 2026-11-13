@@ -37,6 +37,11 @@ const SPECIALIST_PAGE_WAIT_MS = 15000; // one small write on the front's own dis
 /** One discovery lists every server together (each listing is bounded at 60 s on the front) and may wait for a place. */
 const MCP_DISCOVERY_WAIT_MS = 90000;
 const MCP_START_WAIT_MS = 120000;
+/** Track R5: one tool call on the front (a sign-in refresh, two 30 s handshake requests and a 60 s call,
+ *  possibly twice after a refused token, and the close). */
+const MCP_CALL_WAIT_MS = 330000;
+/** Track R5: one Drive tool on the front, which gives each call 300 s in all and then answers itself. */
+const DRIVE_TOOL_WAIT_MS = 330000;
 const REPLY_CAP = 2 * 32 * 1024 * 1024 + 64 * 1024;
 // providers.json (sbstndalton/noevia#2190 round 6) is the account's private provider rows: the Rust
 // front's routes are its writer; Node saves only its seal-on-load migration here.
@@ -135,6 +140,12 @@ function createClient({ port, token, fetchImpl = globalThis.fetch, timeoutMs = T
     if (!PRESET_BASELINE_OPS.has(op)) throw new Error(`not a preset baseline op: ${op}`);
     return call(`preset-baseline/${op}`, payload, wait);
   }
+  // Port contract S9 (rust-approval-registry.cjs): the front's approval registry. { status, body };
+  // `signal` drops a wait (the turn stopped), which withdraws its question at the front.
+  async function approvals(op, payload, { wait = timeoutMs, signal = null } = {}) {
+    if (!require('./rust-approval-registry.cjs').OPS.has(op)) throw new Error(`not an approval op: ${op}`);
+    return call(`approvals/${op}`, payload, wait, signal);
+  }
   return {
     featureContext,
     async autoRolesReady() {
@@ -153,6 +164,7 @@ function createClient({ port, token, fetchImpl = globalThis.fetch, timeoutMs = T
       return body;
     },
     presetBaseline,
+    approvals,
     async grantContext(user, chat) {
       const { status, body } = await call('chat/grant-context', { user, chat });
       if (status !== 200) throw moveFailure(status, body);
@@ -329,6 +341,11 @@ function createClient({ port, token, fetchImpl = globalThis.fetch, timeoutMs = T
      *  rediscovers now; `generation` is the one this process holds, answered `{ unchanged: true }` while
      *  it is current. Throws the store's failure (503 while discovery cannot answer): a caller offers
      *  no tools then, never the last list. */
+    /** Track R5: one MCP tool call, run by the front (mcp_call.rs, `POST /v1/mcp/call`): `{ status, body }`,
+     *  where 200 is `{ text, reduce }` and 404 means the front runs no calls. `signal` is the chat's Stop. */
+    async mcpCall(payload, { signal = null } = {}) {
+      return call('mcp/call', payload, MCP_CALL_WAIT_MS, signal);
+    },
     async mcpDiscovery({ force = false, generation = null, incarnation = null } = {}) {
       const { status, body } = await call('mcp/discovery', { ...(typeof incarnation === 'string' ? { incarnation } : {}), ...(force ? { force: true } : {}), ...(Number.isSafeInteger(generation) ? { generation } : {}) }, MCP_DISCOVERY_WAIT_MS);
       if (status === 200 && body && (body.unchanged === true || (body.version === 1 && Array.isArray(body.servers) && Array.isArray(body.offers) && Array.isArray(body.boxes)))) return body;
@@ -360,6 +377,14 @@ function createClient({ port, token, fetchImpl = globalThis.fetch, timeoutMs = T
     async gdriveReject(user, admin, generation) {
       const { status, body } = await call('gdrive/reject', { user, admin: admin === true, generation: String(generation || '') }, CHATGPT_WAIT_MS);
       return status === 200 && body ? { ok: true, dropped: body.dropped === true } : chatgptRefusal(status, body);
+    },
+    /** Track R5: one chat Drive tool, or an approval card's target, run by the front (gdrive_tools.rs):
+     *  `{ status, body }`; 404 means the front runs no Drive tools. */
+    async gdriveTool(payload) {
+      return call('gdrive/tool', payload, DRIVE_TOOL_WAIT_MS);
+    },
+    async gdriveTarget(payload) {
+      return call('gdrive/target', payload, DRIVE_TOOL_WAIT_MS);
     },
     async gdriveDisconnect(user, admin) {
       const { status, body } = await call('gdrive/disconnect', { user, admin: admin === true }, CHATGPT_WAIT_MS);
