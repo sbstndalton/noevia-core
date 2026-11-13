@@ -305,7 +305,10 @@ function createMachineReply(dataDir) {
 
 }
 
-function createHandler(dataDir, token, writes = [], failures = [], { mirror = [], maintenance = false, reranker = false } = {}) {
+/** The epoch the stand-in's admission session answers (options.admission). */
+const ADMISSION_EPOCH = 'e'.repeat(32);
+
+function createHandler(dataDir, token, writes = [], failures = [], { mirror = [], maintenance = false, reranker = false, admission = false } = {}) {
   const leaseAuthority = maintenance
     ? require('../../server/synthetic-lease-authority.test-helper.cjs').createAuthority({ token })
     : null;
@@ -330,6 +333,13 @@ function createHandler(dataDir, token, writes = [], failures = [], { mirror = []
   const machineReply = createMachineReply(dataDir);
 
   const handler = (req, res) => {
+    // The front's inference admission authority (port contract row H): the session this process registers with.
+    if (admission && req.method === 'POST' && req.url === '/v1/inference-admission/session') {
+      req.resume();
+      res.setHeader('content-type', 'application/json');
+      res.end(JSON.stringify({ incarnation: 1, epoch: ADMISSION_EPOCH }));
+      return;
+    }
     if (leaseAuthority && req.url.startsWith('/v1/maintenance-lease/')) return leaseAuthority.handler(req, res);
     const chunks = [];
     req.on('data', (c) => chunks.push(c));
@@ -402,11 +412,11 @@ function syntheticFrontBin(dir) {
 }
 
 /** Starts the store on 127.0.0.1 (port 0 by default); resolves { port, token, server, writes, close }. */
-async function startProjectStore(dataDir, { port = 0, token = crypto.randomBytes(32).toString('hex'), maintenance = false, reranker = false } = {}) {
+async function startProjectStore(dataDir, { port = 0, token = crypto.randomBytes(32).toString('hex'), maintenance = false, reranker = false, admission = false } = {}) {
   const writes = [];
   const mirror = [];
   const failures = [];
-  const handler = createHandler(dataDir, token, writes, failures, { mirror, maintenance, reranker });
+  const handler = createHandler(dataDir, token, writes, failures, { mirror, maintenance, reranker, admission });
   const server = http.createServer(handler);
   await new Promise((resolve, reject) => { server.once('error', reject); server.listen(port, '127.0.0.1', resolve); });
   const failNext = (status, body, { url = '/v1/write', times = 1 } = {}) => { failures.push({ status, body, url, times }); };
@@ -444,6 +454,9 @@ function installProjectStore(dataDir, env = process.env, options = {}) {
   const writes = [];
   const failures = [];
   const server = http.createServer(createHandler(dataDir, token, writes, failures, options));
+  // With the maintenance authority, Core polls this stand-in every few seconds; a kept-alive socket
+  // then never idles out and keeps an in-process test from exiting. Each answer closes its connection.
+  if (options.maintenance || options.admission) server.on('request', (_req, res) => { res.shouldKeepAlive = false; });
   const failNext = (status, body, { url = '/v1/write', times = 1 } = {}) => { failures.push({ status, body, url, times }); };
   server.on('error', (e) => { console.error(`project store stand-in on ${port}: ${e.message}`); process.exitCode = 1; });
   server.listen(port, '127.0.0.1');
