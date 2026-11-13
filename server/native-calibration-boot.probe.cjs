@@ -72,7 +72,9 @@ calibration.createCalibrator = (deps = {}) => {
 const managers = require('./model-manager.cjs');
 const createModelManager = managers.createModelManager;
 managers.createModelManager = (options = {}) => {
-  log({ manager: options.kind ?? null, publicCalibrator: options.publicCalibrator ?? null });
+  log({ manager: options.kind ?? null, publicCalibrator: options.publicCalibrator ?? null,
+    // #2516 (rust-autotune-runner-boot.test.cjs): whether Node builds an auto-tuner, and the front facade.
+    autotuneStatePath: options.autotuneStatePath ? 'set' : null, frontAutotune: options.frontAutotune ? 'set' : null });
   const manager = createModelManager(options);
   if (!manager || typeof manager !== 'object') return manager;
   return new Proxy(manager, {
