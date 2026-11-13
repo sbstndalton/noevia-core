@@ -78,7 +78,8 @@ function preparedTurn(t) {
     type: 'prepared', v: PREPARED_VERSION,
     model: t.model, role: t.role || null, auto: t.auto === true,
     effort: t.effort, thinkingOff: t.thinkingOff === true, sampling: t.sampling || {},
-    provider: { id: t.providerId, label: t.providerLabel || t.providerId }, upstreamUrl: t.upstreamUrl,
+    provider: { id: t.providerId, label: t.providerLabel || t.providerId, localEngine: t.providerLocalEngine === true, capabilities: t.providerCapabilities || null },
+    upstreamUrl: t.upstreamUrl,
     // chat.cjs resolveRuntimeLimit's scope (the provider's address and key, hashed there as here).
     limitScope: t.limitScope,
     messages: t.messages, tools: t.tools, routes: t.routes,

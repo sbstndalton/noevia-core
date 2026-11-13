@@ -94,7 +94,7 @@ test('a turn the native executor can run ends after its preparation with the pre
   assert.deepEqual(last.tools, plain.requests[0].tools);
   assert.equal(last.model, 'qa-model');
   assert.equal(last.upstreamUrl, 'http://qa-engine.invalid/v1/chat/completions');
-  assert.deepEqual(last.provider, { id: 'default', label: 'QA engine' });
+  assert.deepEqual(last.provider, { id: 'default', label: 'QA engine', localEngine: false, capabilities: null });
   assert.equal(JSON.stringify(last).includes('apiKey'), false);
   assert.ok(last.writes.includes('drive_trash_file') && !last.writes.includes('drive_read_file'));
   assert.deepEqual(last.chat.title, { chatId: 'qa-chat-1', listId: 'qa-project', firstMessage: 'QA hello', firstReply: true, enabled: false });

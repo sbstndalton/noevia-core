@@ -1709,6 +1709,9 @@ function createChatHandler({
         send(native.preparedTurn({
           model, role: routedRole, auto: wantsAuto, effort, thinkingOff: fastThinkingOff, sampling: sampling.params,
           providerId: provider.id, providerLabel: provider.label, upstreamUrl,
+          // reasoning-effort.cjs reads these of the row (modeFor, budgetFieldFor, nativeThinking); never the key.
+          providerLocalEngine: typeof reasoningEffort.localEngine === 'function' && reasoningEffort.localEngine(provider) === true,
+          providerCapabilities: provider.capabilities && typeof provider.capabilities === 'object' ? provider.capabilities : null,
           limitScope: require('node:crypto').createHash('sha256').update(JSON.stringify([provider.baseUrl, provider.apiKey, modelManager.baseUrl])).digest('hex'),
           messages: wire, tools: activeTools, routes: [...toolRoutes],
           writes: names.filter((n) => isWriteTool(n)), public: names.filter((n) => isPublicTool(n)), automaticOnlyWrites: [...automaticOnlyWrites],
