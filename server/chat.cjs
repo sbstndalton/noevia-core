@@ -1691,7 +1691,7 @@ function createChatHandler({
           diary: diaryTurn, compactOnly: body.compactOnly === true,
           providerId: provider.id, defaultProviderId: DEFAULT_PROVIDER_ID, machine: !!provider.machine, external: !!externalProvider, chatgpt: !!chatgptProvider, routeTarget: !!routeTarget,
           authorized: !!upstreamHeaders?.Authorization,
-          attachedImages: attachedImages.length, retrievedImages: retrievedImages.length > 0, messages: wire,
+          retrievedImages: retrievedImages.length > 0, messages: wire,
           skills: loadedSkills.size > 0 || (!!project && instructionSkills.list(project).length > 0),
           provenance: provenanceOn, framingReasoner: !!(framingReasoner && chatFrame),
           narrowed: !!routing.narrowed, gate: !!(gate && gate.decision !== 'none'),
@@ -1708,7 +1708,7 @@ function createChatHandler({
       }
       // The frame is built before anything below waits or lets go of the pre-load, so a turn whose text the
       // executor cannot read (reservedText) still goes on here.
-      let frame = null;
+      let frame = null, frameText = null;
       if (!why) {
         const names = activeTools.map((t) => t.function?.name).filter((n) => typeof n === 'string');
         frame = native.preparedTurn({
@@ -1734,6 +1734,7 @@ function createChatHandler({
         try { text = JSON.stringify(frame); } catch { text = null; }
         if (native.reservedText(text)) { why = text === null ? 'refusal-input' : 'reserved-text'; frame = null; }
         else if (native.frameTooLarge(text)) { why = 'frame-size'; frame = null; }
+        else frameText = text;
       }
       if (frame) {
         // The start of the rounds' preparation that only waits (as below): the route pre-load is used or let go here,
@@ -1747,7 +1748,10 @@ function createChatHandler({
           await routePreload.settled;
           if (chatSignal.signal.aborted) return;
         }
-        send(frame);
+        // send(frame), with the text its checks already wrote: a large frame is not stringified twice.
+        preparation?.event(frame);
+        record?.observe(frame);
+        if (!res.destroyed && !chatSignal.signal.aborted) res.write(eventWire.kind === 'ndjson' ? `${frameText}\n` : `data: ${frameText}\n\n`);
         res.end();
         return;
       }
