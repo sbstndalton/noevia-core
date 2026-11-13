@@ -1,9 +1,9 @@
 'use strict';
-const { binding: permissionBinding } = require('../tests/server/chat-grant-fixture.cjs');
+const { binding: permissionBinding } = require('./chat-grant-fixture.cjs');
 
 const assert = require('node:assert/strict');
 const test = require('node:test');
-const { createApprovals } = require('./approvals.cjs');
+const { createApprovals } = require('./approvals-reference.cjs');
 
 // The gate's state, exercised without a server: every write blocks on a human
 // answer, a decision is single-use, and "allow for this chat" never leaks to

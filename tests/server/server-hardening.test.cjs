@@ -12,7 +12,7 @@ const path = require('node:path');
 const test = require('node:test');
 
 const { errorResponse, isJsonObject } = require('../../server/http.cjs');
-const { createApprovals } = require('../../server/approvals.cjs');
+const { createApprovals } = require('./approvals-reference.cjs');
 const { binding: permissionBinding } = require('./chat-grant-fixture.cjs');
 const { createChatRoutes } = require('../../server/routes/chat.cjs');
 const { createChatListRoutes } = require('../../server/routes/chat-lists.cjs');

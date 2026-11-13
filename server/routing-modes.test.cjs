@@ -12,7 +12,7 @@ const fs = require('node:fs'), os = require('node:os'), path = require('node:pat
 const { EventEmitter } = require('node:events');
 const rm = require('./routing-modes.cjs');
 const { createDecisions } = require('./decision/index.cjs');
-const { createApprovals } = require('./approvals.cjs');
+const { createApprovals } = require('../tests/server/approvals-reference.cjs');
 
 // #1647: the sensitivity check's mechanics below run against a synthetic model on a test-only qualified
 // list. The shipped list (no model qualified) and the gate itself: sensitivity-qualification-1647.test.cjs.

@@ -15,7 +15,7 @@
 // Grant use (registry-executor-v3): a grant check answers with a single-use ticket, redeemed at the
 // front just before dispatch, and the redeem's answer is a dispatch fence (redeemChatGrant below).
 //
-// The interface is approvals.cjs's (the in-process reference the chat tests still use), made async,
+// The interface is approvals-reference.cjs's (tests/server, the in-process reference the chat tests still use), made async,
 // plus openApproval/openRouteChoice and one more outcome: 'unavailable' when the front could not be
 // asked. It fails closed: an unanswered or unreachable question never approves a write, and a grant
 // that cannot be checked is no grant.

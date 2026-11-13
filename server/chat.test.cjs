@@ -12,7 +12,7 @@ const { createChatHandler } = require('./chat.cjs');
 const { createToolboxes } = require('./toolboxes.cjs');
 const { createDriveTools } = require('./gdrive-tools.cjs');
 const { createToolExchange } = require('./tool-exchange.cjs');
-const { createApprovals } = require('./approvals.cjs');
+const { createApprovals } = require('../tests/server/approvals-reference.cjs');
 
 async function runDriveCall(t, { name, files = [], ragOverride = null, savedMode = null, connected = true, decision = 'approve', policyDuringApproval = null, autoDecision = null, history = [], sampling = undefined, autoSamplingEnabled = undefined, message = 'Synthetic Drive request', codeRoleConfigured = false, beforeChat = null, sourceWaitMs = undefined, projectId = undefined, realRag = false, stepSupervision = null }) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'noevia-drive-chat-'));
