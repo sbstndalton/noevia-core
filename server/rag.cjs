@@ -879,8 +879,33 @@ async function searchProject(projectId, query, userId) {
   const leave = foreground(); // #1881: a running tail backfill yields to this query
   try { return await searchProjectNow(projectId, query, userId); } finally { leave(); }
 }
+// Rust port track R4 (rust-retrieval.cjs): the paired front's native search, when NOEVIA_RUST_RETRIEVAL asks for it.
+let nativeSearch = null;
+function configureNativeSearch(client) { nativeSearch = client || null; }
+// This process's wanted versions for one project's files (fileVersions), as the native search takes them.
+function wantedVersions(projectId, userId) {
+  const out = {};
+  for (const [key, version] of fileVersions) {
+    const [u, p, file] = JSON.parse(key);
+    if (u === (userId || null) && p === projectId) out[file] = version;
+  }
+  return out;
+}
 async function searchProjectNow(projectId, query, userId) {
   if (!indexExists(projectId, userId)) return []; // #1776: a read never creates an index
+  const native = nativeSearch ? nativeSearch.ask(projectId, query, userId, wantedVersions(projectId, userId)) : null;
+  if (native && nativeSearch.mode === 'on') {
+    const hits = await native;
+    if (hits) return hits;
+  }
+  const hits = await searchProjectLocal(projectId, query, userId);
+  if (native && nativeSearch.mode === 'shadow') {
+    const theirs = await native;
+    console.warn(`[rag] native search shadow: ${theirs ? require('./rust-retrieval.cjs').compare(hits, theirs) : 'native deferred'}`);
+  }
+  return hits;
+}
+async function searchProjectLocal(projectId, query, userId) {
   const index = openIndex(projectId, userId);
   if (!index) return [];
   // #1636: only the active model's slot is searched, with a query embedded by that same model.
@@ -1346,4 +1371,4 @@ const trackedFileState = () => ({ queues: fileQueues.size, generations: fileGene
 
 // #1646: the sentence a hybrid cloud route without a grant removes (read_project_file is not offered there).
 const READ_FILE_HINT = ' Use read_project_file with PDF startPage/endPage and offset for pages beyond the summary.';
-module.exports = { ...testSeam, setLifecycleGuard, appendFileTail, foreground, foregroundBusy, searchProjectWithImages, syncProjectMedia, releaseMediaModel, readCaption, writeCaption, mediaModelFor, embeddingOff, READ_FILE_HINT, servedModels, servedModelsCached, init, trackedFileState, indexProjectFile, deleteProjectFile, searchProject, filesContext, chunkText, ragAvailable, retrievalStatus, embed, embedModel, embeddingIdentity, embeddingConfig: getEmbeddingConfig, onIndexed, listIndexes, indexCoverage, fillMissing, dropIndexSlot, rerankPool, configureRerank, reloadRerank };
+module.exports = { ...testSeam, configureNativeSearch, setLifecycleGuard, appendFileTail, foreground, foregroundBusy, searchProjectWithImages, syncProjectMedia, releaseMediaModel, readCaption, writeCaption, mediaModelFor, embeddingOff, READ_FILE_HINT, servedModels, servedModelsCached, init, trackedFileState, indexProjectFile, deleteProjectFile, searchProject, filesContext, chunkText, ragAvailable, retrievalStatus, embed, embedModel, embeddingIdentity, embeddingConfig: getEmbeddingConfig, onIndexed, listIndexes, indexCoverage, fillMissing, dropIndexSlot, rerankPool, configureRerank, reloadRerank };
