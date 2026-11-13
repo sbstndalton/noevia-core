@@ -43,6 +43,14 @@ const line = (f) => `- ${f.name} (id ${f.id}) · ${f.mimeType || 'file'}${f.size
 /** Track R5: what the model is told when the Rust front could not run a Drive tool. */
 const NATIVE_UNAVAILABLE = 'ERROR: Google Drive is unavailable right now. Try again in a moment.';
 const NATIVE_UNKNOWN = 'ERROR: the Google Drive tool did not report back, so it may or may not have run. Check before calling it again.';
+const NATIVE_REFUSED = 'ERROR: this Google Drive call was refused before it ran, so nothing was changed. Do not repeat it unchanged.';
+/** How long a 404 (a front without Drive tools) keeps this process running them itself before it asks again. */
+const NATIVE_RECHECK_MS = 60 * 1000;
+/** Whether a failed store request provably never reached the front (nothing can have run). */
+const neverSent = (err) => {
+  for (let e = err, i = 0; e && i < 4; e = e.cause, i++) if (e.code === 'ECONNREFUSED') return true;
+  return false;
+};
 
 /**
  * @param {object} deps
@@ -52,24 +60,25 @@ const NATIVE_UNKNOWN = 'ERROR: the Google Drive tool did not report back, so it 
  *   a 404 (a front that runs no Drive tools) leaves them to this process.
  */
 function createDriveTools({ accounts, cap = 8000, now = Date.now, native = null, warn = console.warn }) {
-  let nativeOff = false;
-  const nativeOn = () => !!native && !nativeOff && native.enabled();
+  let nativeOffUntil = 0;
+  const nativeOn = () => !!native && now() >= nativeOffUntil && native.enabled();
   const NOT_NATIVE = Symbol('not native');
   const who = (user) => ({ user: user && user.id ? String(user.id) : null, admin: !!user && user.role === 'admin' });
   /** The front's answer, or NOT_NATIVE after a 404 (one warning; this process then stops asking). */
   async function askNative(kind, payload) {
     let answer;
     try { answer = await native[kind](payload); } catch (err) {
-      // The store's deadline: the front may have acted.
-      if (err && err.cause && err.cause.name === 'TimeoutError') return { failed: NATIVE_UNKNOWN };
-      return { failed: NATIVE_UNAVAILABLE };
+      // Only a request that never left can be retried safely; a reset or the deadline after it was sent may
+      // have let the front act.
+      return { failed: neverSent(err) ? NATIVE_UNAVAILABLE : NATIVE_UNKNOWN };
     }
     if (answer && answer.status === 404) {
-      if (!nativeOff) warn('[gdrive] NOEVIA_RUST_DRIVE_TOOLS is on here, but the front runs no Drive tools: this process runs them');
-      nativeOff = true;
+      warn('[gdrive] NOEVIA_RUST_DRIVE_TOOLS is on here, but the front runs no Drive tools: this process runs them for a minute');
+      nativeOffUntil = now() + NATIVE_RECHECK_MS;
       return NOT_NATIVE;
     }
-    if (answer && (answer.status === 400 || answer.status === 503)) return { failed: NATIVE_UNAVAILABLE };
+    if (answer && answer.status === 400) return { failed: NATIVE_REFUSED };
+    if (answer && answer.status === 503) return { failed: NATIVE_UNAVAILABLE };
     if (!answer || answer.status !== 200 || !answer.body || typeof answer.body !== 'object') return { failed: NATIVE_UNKNOWN };
     return { body: answer.body };
   }

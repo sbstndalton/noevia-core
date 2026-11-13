@@ -37,7 +37,7 @@ const SPECIALIST_PAGE_WAIT_MS = 15000; // one small write on the front's own dis
 /** One discovery lists every server together (each listing is bounded at 60 s on the front) and may wait for a place. */
 const MCP_DISCOVERY_WAIT_MS = 90000;
 const MCP_START_WAIT_MS = 120000;
-/** Track R5: one Drive tool on the front (a token refresh and up to four Drive requests of 300 s at most). */
+/** Track R5: one Drive tool on the front, which gives each call 300 s in all and then answers itself. */
 const DRIVE_TOOL_WAIT_MS = 330000;
 const REPLY_CAP = 2 * 32 * 1024 * 1024 + 64 * 1024;
 // providers.json (sbstndalton/noevia#2190 round 6) is the account's private provider rows: the Rust
