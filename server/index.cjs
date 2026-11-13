@@ -433,7 +433,10 @@ const { USAGE_RETENTION_DAYS, usageDayKey, readUsage, recordUsage, recordToolUse
 // D9: read-only offline Wikipedia box, only with features.kiwix and an internal KIWIX_URL.
 const kiwixTools = featureConstruction.kiwix && process.env.KIWIX_URL ? require('./kiwix.cjs').createKiwixTools({ baseUrl: process.env.KIWIX_URL, cap: TOOL_RESULT_CAP }) : null;
 // Offered per request only to accounts with a connected Drive (connectedBoxes).
-const driveTools = require('./gdrive-tools.cjs').createDriveTools({ accounts: driveAccounts, cap: TOOL_RESULT_CAP });
+// Track R5: NOEVIA_RUST_DRIVE_TOOLS=1 (off by default) hands the chat's Drive tools to the Rust front.
+const RUST_DRIVE_TOOLS = process.env.NOEVIA_RUST_DRIVE_TOOLS === '1';
+const driveTools = require('./gdrive-tools.cjs').createDriveTools({ accounts: driveAccounts, cap: TOOL_RESULT_CAP,
+  native: { enabled: () => RUST_DRIVE_TOOLS, tool: (payload) => PROJECT_STORE.gdriveTool(payload), target: (payload) => PROJECT_STORE.gdriveTarget(payload) } });
 // Toolboxes, the resolver, the read/write gate and the built-in executor live in toolboxes.cjs.
 // MCP state and the executor are injected as closures: mcpState and toolboxOffered are declared
 // further down and only read at call time.

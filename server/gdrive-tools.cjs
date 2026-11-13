@@ -40,7 +40,48 @@ const READ_MAX = 2000;
 
 const line = (f) => `- ${f.name} (id ${f.id}) · ${f.mimeType || 'file'}${f.size ? ` · ${f.size} bytes` : ''}${f.modifiedTime ? ` · changed ${f.modifiedTime}` : ''}`;
 
-function createDriveTools({ accounts, cap = 8000, now = Date.now }) {
+/** Track R5: what the model is told when the Rust front could not run a Drive tool. */
+const NATIVE_UNAVAILABLE = 'ERROR: Google Drive is unavailable right now. Try again in a moment.';
+const NATIVE_UNKNOWN = 'ERROR: the Google Drive tool did not report back, so it may or may not have run. Check before calling it again.';
+const NATIVE_REFUSED = 'ERROR: this Google Drive call was refused before it ran, so nothing was changed. Do not repeat it unchanged.';
+/** How long a 404 (a front without Drive tools) keeps this process running them itself before it asks again. */
+const NATIVE_RECHECK_MS = 60 * 1000;
+/** Whether a failed store request provably never reached the front (nothing can have run). */
+const neverSent = (err) => {
+  for (let e = err, i = 0; e && i < 4; e = e.cause, i++) if (e.code === 'ECONNREFUSED') return true;
+  return false;
+};
+
+/**
+ * @param {object} deps
+ * @param {{ enabled(): boolean, tool(payload): Promise<{ status, body }>, target(payload): Promise<{ status, body }> }} [deps.native]
+ *   track R5: the Rust front's Drive tools (`POST /v1/gdrive/tool` and `/target`, noevia-rs gdrive_tools.rs). While
+ *   `enabled()` (NOEVIA_RUST_DRIVE_TOOLS=1) a call and an approval card's target are the front's, read records included;
+ *   a 404 (a front that runs no Drive tools) leaves them to this process.
+ */
+function createDriveTools({ accounts, cap = 8000, now = Date.now, native = null, warn = console.warn }) {
+  let nativeOffUntil = 0;
+  const nativeOn = () => !!native && now() >= nativeOffUntil && native.enabled();
+  const NOT_NATIVE = Symbol('not native');
+  const who = (user) => ({ user: user && user.id ? String(user.id) : null, admin: !!user && user.role === 'admin' });
+  /** The front's answer, or NOT_NATIVE after a 404 (one warning; this process then stops asking). */
+  async function askNative(kind, payload) {
+    let answer;
+    try { answer = await native[kind](payload); } catch (err) {
+      // Only a request that never left can be retried safely; a reset or the deadline after it was sent may
+      // have let the front act.
+      return { failed: neverSent(err) ? NATIVE_UNAVAILABLE : NATIVE_UNKNOWN };
+    }
+    if (answer && answer.status === 404) {
+      warn('[gdrive] NOEVIA_RUST_DRIVE_TOOLS is on here, but the front runs no Drive tools: this process runs them for a minute');
+      nativeOffUntil = now() + NATIVE_RECHECK_MS;
+      return NOT_NATIVE;
+    }
+    if (answer && answer.status === 400) return { failed: NATIVE_REFUSED };
+    if (answer && answer.status === 503) return { failed: NATIVE_UNAVAILABLE };
+    if (!answer || answer.status !== 200 || !answer.body || typeof answer.body !== 'object') return { failed: NATIVE_UNKNOWN };
+    return { body: answer.body };
+  }
   // The box description is what the toolbox picker shows (worded from the catalogue, #615); the
   // model is steered by the tool descriptions above (#659).
   const box = {
@@ -78,6 +119,17 @@ function createDriveTools({ accounts, cap = 8000, now = Date.now }) {
    *  for a tool with no target. `kind` is 'drive' for an existing file, 'drive-new' for a new one. */
   async function describeTarget(user, name, rawArgs) {
     if (!names.has(name) || READS.includes(name)) return null;
+    if (nativeOn()) {
+      const r = await askNative('target', { ...who(user), name, arguments: rawArgs === undefined ? null : rawArgs });
+      if (r !== NOT_NATIVE) {
+        const t = r.body && r.body.target;
+        if (t === null) return null;
+        if (t && typeof t === 'object' && typeof t.error === 'string') return { error: t.error };
+        if (t && typeof t === 'object' && typeof t.target === 'string' && (t.kind === 'drive' || t.kind === 'drive-new')) return { target: t.target, kind: t.kind };
+        // No card can be shown for a target the front could not name: refused, nothing written.
+        return { error: 'Google Drive could not be reached' };
+      }
+    }
     let args;
     try { args = typeof rawArgs === 'string' ? JSON.parse(rawArgs || '{}') : rawArgs; } catch { return null; }
     if (!args || typeof args !== 'object' || Array.isArray(args)) return null;
@@ -100,6 +152,13 @@ function createDriveTools({ accounts, cap = 8000, now = Date.now }) {
   }
 
   async function execute(user, name, args, { chatKey = null, exchangeKey = null } = {}) {
+    if (nativeOn()) {
+      const r = await askNative('tool', { ...who(user), name, arguments: args ?? {}, chatKey, exchangeKey, cap });
+      if (r !== NOT_NATIVE) {
+        if (r.failed) return r.failed;
+        return typeof r.body.text === 'string' ? r.body.text : NATIVE_UNKNOWN;
+      }
+    }
     const scope = { chatKey, exchangeKey };
     let files;
     try {
