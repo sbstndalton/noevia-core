@@ -7,6 +7,6 @@
 # this module ships in the code-sandbox image (build context core/code-sandbox), not the web one.
 # Read by code-sandbox/sandbox-bridge-wasm.cjs, code-sandbox/Dockerfile and noevia-core CI. The ref
 # must be on noevia-rs main before a release pins this core commit.
-NOEVIA_RS_REF=88f50c5c65a166c08bd27c736ce1aef69ba38f32
-NOEVIA_RS_SHA256=05061596a9146b28952182a9e0747c17f4b72ed387feebdde3cb8c2983235fa2
+NOEVIA_RS_REF=f50a3e97fc75ca7e1f34d817da3191d57c188f6f
+NOEVIA_RS_SHA256=dd7c9b0b2056c4a512b9d893de5f9231d7f91d09ba2a887f78c1285320892c2b
 SANDBOX_BRIDGE_WASM_SHA256=70bb8177b4e0345b00d632c2aadc0ed3a462397b8fefeda5a4aa094d9249c5ee
