@@ -25,8 +25,22 @@
 //        -> 200 {target, kind} | {error} | {}   what a write would change (writeTargetFor, #659), before its card
 //
 // Both answer 404 to anything that is not the front (trusted-front.cjs): with file sharing on, this listener is not
-// loopback only. The permission gate around a call (policy, approval card, audit, grants, recent writes) is the
-// native executor's own; these only run what the tool engines do.
+// loopback only, and 404 for an account that does not exist, is disabled or whose workspace was revoked. The
+// permission gate around a call (policy, approval card, audit, grants, recent writes) is the native executor's own;
+// these only run what the tool engines do. A call that throws answers 500 with the error's message, which the
+// executor turns into the call's result as tool-exchange.cjs callError does; a target lookup that throws answers
+// chat.cjs's own refusal ({error}).
+//
+// What the native executor must keep, because this process stops counting the turn at the cut:
+// - the model's lease from the cut to the turn's end (the front's admission lease for the model: the gate's
+//   one-model queue and the maintenance count). The relayed call's own gate hold is given back when this
+//   response ends; the front's S8 admission lease keeps the turn counted for the whole client response.
+// - its own copies of this process's per-process state, which then diverge while both executors run (harmless,
+//   at most one more warning, card flag or attempt): the recent writes for a card's repeat flag (#658), the title
+//   attempts (#1785), the template tools cache (#1002), the rejected effort and budget sets (reasoning-effort.cjs),
+//   the prefill samples (step 17) and turnsInFlight (#1863 D2; the admission lease keeps the engine busy instead).
+// - tools run against the project as stored when the call runs, not this turn's instruction-skills snapshot; a
+//   project with skills is not handed off, so the two differ only by a project change made while the turn runs.
 const crypto = require('node:crypto');
 const { trustedFront } = require('./trusted-front.cjs');
 
@@ -37,13 +51,16 @@ const TARGET_PATH = '/internal/chat/tools/target';
 const BODY_CAP = 16 * 1024 * 1024;
 const USER_CAP = 200;
 
-/** `requested(req)`: whether the front asked for this turn's hand-off. The header is removed either way. */
-function createHandoff({ secret, supervising = () => false }) {
+/**
+ * `requested(req)`: whether the front asked for this turn's hand-off: a turn relayed by the front
+ * (rust-chat-turn.cjs relayedUser) carrying the header with the per-start secret. The header is removed either way.
+ */
+function createHandoff({ secret, supervising = () => false, relayed = (req) => require('./rust-chat-turn.cjs').relayedUser(req) }) {
   const want = Buffer.from(String(secret || ''), 'utf8');
   function requested(req) {
     const raw = req?.headers?.[HANDOFF_HEADER];
     if (req?.headers) delete req.headers[HANDOFF_HEADER];
-    if (typeof raw !== 'string' || !want.length) return false;
+    if (typeof raw !== 'string' || !want.length || !relayed(req)) return false;
     const got = Buffer.from(raw, 'utf8');
     return got.length === want.length && crypto.timingSafeEqual(got, want);
   }
@@ -56,6 +73,7 @@ function createHandoff({ secret, supervising = () => false }) {
  * route, the model and the tools as they were settled.
  */
 function refusal(t) {
+  if (t.deleted) return 'deleted';
   if (t.diary) return 'diary';
   if (t.compactOnly) return 'compact';
   if (t.providerId !== t.defaultProviderId || t.machine || t.external || t.chatgpt || t.routeTarget) return 'provider';
@@ -69,6 +87,7 @@ function refusal(t) {
   if (t.supervision) return 'step-supervision';
   if (t.injected) return 'injected-sources';
   if (t.editTools) return 'edit-tools';
+  if (t.streamGuard) return 'stream-guard';
   return null;
 }
 
@@ -76,6 +95,8 @@ function refusal(t) {
 function preparedTurn(t) {
   return {
     type: 'prepared', v: PREPARED_VERSION,
+    // When this process began the turn (Date.now()): the reply's time to first token counts from it.
+    startedAt: t.startedAt,
     model: t.model, role: t.role || null, auto: t.auto === true,
     effort: t.effort, thinkingOff: t.thinkingOff === true, sampling: t.sampling || {},
     provider: { id: t.providerId, label: t.providerLabel || t.providerId, localEngine: t.providerLocalEngine === true, capabilities: t.providerCapabilities || null },
@@ -110,6 +131,8 @@ function createToolBridge({ secret, json, readJson, asUser, getProject, executeT
     return controller.signal;
   };
   const text = (v, cap) => (typeof v === 'string' && v.length <= cap ? v : null);
+  const names = (v) => (Array.isArray(v) && v.length <= 2000 && v.every((n) => typeof n === 'string' && n.length <= 200) ? v : null);
+  const missing = (error) => error?.status === 404;
   return async function handle(req, res) {
     const path = String(req.url || '').split('?')[0];
     if (path !== EXECUTE_PATH && path !== TARGET_PATH) return false;
@@ -120,18 +143,26 @@ function createToolBridge({ secret, json, readJson, asUser, getProject, executeT
     const name = text(body?.name, 200);
     const args = text(body?.args, BODY_CAP);
     if (!user || !name || args === null) { json(res, 400, { error: 'user, name and args are required.' }); return true; }
-    const chatKey = typeof body.chatKey === 'string' ? body.chatKey : null;
+    const chatKey = body.chatKey === undefined || body.chatKey === null ? null : text(body.chatKey, 200);
+    if (chatKey === null && body.chatKey !== undefined && body.chatKey !== null) { json(res, 400, { error: 'chatKey is invalid.' }); return true; }
     try {
       if (path === TARGET_PATH) {
-        const found = await asUser(user, async () => (typeof writeTargetFor === 'function' ? writeTargetFor(name, args, { user: currentUser(), chatKey }) : null));
+        let found;
+        try { found = await asUser(user, async () => (typeof writeTargetFor === 'function' ? writeTargetFor(name, args, { user: currentUser(), chatKey }) : null)); }
+        catch (error) {
+          if (missing(error)) { json(res, 404, { error: 'no such account' }); return true; }
+          // chat.cjs: a lookup that throws refuses the write before its card, with this sentence.
+          found = { error: 'The file this would change could not be looked up' };
+        }
         json(res, 200, found && typeof found === 'object' ? found : {});
         return true;
       }
-      const allowed = Array.isArray(body.allowed) && body.allowed.every((n) => typeof n === 'string') ? new Set(body.allowed) : null;
-      const routes = Array.isArray(body.routes) && body.routes.every((r) => Array.isArray(r) && r.length === 2 && r.every((x) => typeof x === 'string')) ? new Map(body.routes) : null;
+      const allowed = names(body.allowed) ? new Set(body.allowed) : null;
+      const routes = Array.isArray(body.routes) && body.routes.length <= 2000 && body.routes.every((r) => Array.isArray(r) && r.length === 2 && r.every((x) => typeof x === 'string' && x.length <= 200)) ? new Map(body.routes) : null;
       if (!allowed || !routes) { json(res, 400, { error: 'allowed and routes are required.' }); return true; }
-      const projectId = typeof body.projectId === 'string' && body.projectId ? body.projectId : null;
-      const exchangeKey = typeof body.exchangeKey === 'string' ? body.exchangeKey : null;
+      const projectId = typeof body.projectId === 'string' && body.projectId ? text(body.projectId, 200) : null;
+      const exchangeKey = typeof body.exchangeKey === 'string' ? text(body.exchangeKey, 200) : null;
+      if ((body.projectId && !projectId) || (body.exchangeKey && !exchangeKey)) { json(res, 400, { error: 'projectId or exchangeKey is invalid.' }); return true; }
       const signal = callerGone(req, res);
       const ran = await asUser(user, async () => {
         const project = projectId ? getProject(projectId) : null;
@@ -144,6 +175,7 @@ function createToolBridge({ secret, json, readJson, asUser, getProject, executeT
       if (!ran) { json(res, 404, { error: 'no such project' }); return true; }
       json(res, 200, ran);
     } catch (error) {
+      if (missing(error)) { json(res, 404, { error: 'no such account' }); return true; }
       json(res, 500, { error: String(error?.message || 'the tool bridge failed').slice(0, 300) });
     }
     return true;

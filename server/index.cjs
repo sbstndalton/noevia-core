@@ -932,7 +932,13 @@ const chatMirrorBridge = require('./rust-chat-mirror.cjs').createExecutorBridge(
 // Track R8: the native chat executor's hand-off and tool bridges (rust-chat-native.cjs; only the front's loopback calls).
 const chatWriteTargetFor = (name, rawArgs, { user }) => (driveTools.names.has(name) ? driveTools.describeTarget(user, name, rawArgs) : null);
 const chatNativeHandoff = require('./rust-chat-native.cjs').createHandoff({ secret: FRONT_SECRET, supervising: () => features.enabled('stepSupervision') });
-const chatNativeTools = require('./rust-chat-native.cjs').createToolBridge({ secret: FRONT_SECRET, json, readJson, asUser: (userId, fn) => diaryAsUser(userId, fn),
+// Only an account that exists, is not disabled and whose workspace stands (a 404 refusal otherwise).
+const chatNativeAsUser = (userId, fn) => {
+  const row = authService.db.prepare('SELECT id, disabled_at FROM users WHERE id=?').get(userId);
+  if (!row || row.disabled_at) throw Object.assign(Error('no such account'), { status: 404 });
+  return diaryAsUser(userId, () => { if (currentWorkspace().revoked) throw Object.assign(Error('no such account'), { status: 404 }); return fn(); });
+};
+const chatNativeTools = require('./rust-chat-native.cjs').createToolBridge({ secret: FRONT_SECRET, json, readJson, asUser: chatNativeAsUser,
   getProject: (id) => getProject(id), executeToolCall: (...args) => executeToolCall(...args), writeTargetFor: chatWriteTargetFor,
   recordToolUse: (...args) => recordToolUse(...args), currentWorkspace: () => currentWorkspace(), currentUser: () => requestScope.getStore()?.authn?.user || null });
 // #682: a decision experiment switched on that cannot run (no service, or one without `choice`)

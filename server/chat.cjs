@@ -1682,7 +1682,10 @@ function createChatHandler({
       let provenanceOn = false;
       if (provenancePolicy) { try { provenanceOn = provenancePolicy.enabled() === true; } catch { provenanceOn = true; } }
       const diaryTurn = (typeof spaceId === 'string' && spaceId.startsWith('diary')) || project?.id === diaryExtras?.PROJECT_ID;
+      const egressRules = require('./provider-egress.cjs');
       const why = native.refusal({
+        // A chat deleted while this turn was prepared: the cleanup below runs at the cut, the executor would write it back.
+        deleted: !!chatId && !!chatWorkspace?.dir && require('./chat-lists.cjs').readTombstones(chatWorkspace.dir).has(require('./chat-lists.cjs').safeChatId(chatId)),
         diary: diaryTurn, compactOnly: body.compactOnly === true,
         providerId: provider.id, defaultProviderId: DEFAULT_PROVIDER_ID, machine: !!provider.machine, external: !!externalProvider, chatgpt: !!chatgptProvider, routeTarget: !!routeTarget,
         authorized: !!upstreamHeaders?.Authorization,
@@ -1692,6 +1695,9 @@ function createChatHandler({
         narrowed: !!routing.narrowed, gate: !!(gate && gate.decision !== 'none'),
         supervision: nativeHandoff.supervising(), injected: injectedEntries.length > 0,
         editTools: activeTools.some((t) => projectEditTool(t.function?.name) || specialistPageSave.neverStanding(t.function?.name)),
+        // #516: the stream guard's schema check runs before every call (egressToolRefusal) once it is on; the executor
+        // does not run it yet. It answers for a call that cannot parse only when it is on and the tool has a schema.
+        streamGuard: activeTools.some((t) => egressRules.validateToolArguments(t.function?.name, '\u0000') !== null),
       });
       if (!why) {
         // The start of the rounds' preparation that only waits (as below): the route pre-load is used or let go here,
@@ -1707,7 +1713,7 @@ function createChatHandler({
         }
         const names = activeTools.map((t) => t.function?.name).filter((n) => typeof n === 'string');
         send(native.preparedTurn({
-          model, role: routedRole, auto: wantsAuto, effort, thinkingOff: fastThinkingOff, sampling: sampling.params,
+          startedAt: exchangeStartedAt, model, role: routedRole, auto: wantsAuto, effort, thinkingOff: fastThinkingOff, sampling: sampling.params,
           providerId: provider.id, providerLabel: provider.label, upstreamUrl,
           // reasoning-effort.cjs reads these of the row (modeFor, budgetFieldFor, nativeThinking); never the key.
           providerLocalEngine: typeof reasoningEffort.localEngine === 'function' && reasoningEffort.localEngine(provider) === true,

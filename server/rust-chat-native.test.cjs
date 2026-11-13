@@ -19,8 +19,9 @@ const grantFixture = require('../tests/server/chat-grant-fixture.cjs');
 const SECRET = 'qa-front-secret-0123456789abcdef';
 
 // One synthetic turn through the real handleChat: a manual project, the local default provider, a scripted engine.
-async function runTurn(t, { handoff = null, requested = false, supervising = false, frames, headersFor = () => ({}), project: extra = {} } = {}) {
+async function runTurn(t, { handoff = null, requested = false, supervising = false, frames, headersFor = () => ({}), project: extra = {}, before = () => {}, headers = {} } = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'noevia-native-handoff-'));
+  before(dir);
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
   const user = { id: 'qa-user', role: 'admin' };
   const project = { id: 'qa-project', name: 'QA Project', model: 'qa-model', routing: 'manual', toolboxes: ['core'], files: [], ...extra };
@@ -58,7 +59,7 @@ async function runTurn(t, { handoff = null, requested = false, supervising = fal
     recordUsage() {}, recordToolUse() {}, sourceWaitMs: 0,
     nativeHandoff: handoff || (requested ? { requested: () => true, supervising: () => supervising } : null),
   });
-  const req = { headers: {} };
+  const req = { headers: { ...headers } };
   await handler.handleChat(req, res, { message: 'QA hello', projectId: project.id, chatId: 'qa-chat-1', history: [] }, { user });
   await new Promise((resolve) => setImmediate(resolve));
   return { events, requests, req };
@@ -67,14 +68,20 @@ async function runTurn(t, { handoff = null, requested = false, supervising = fal
 const stable = (events) => events.map(({ updatedAt: _clock, timeToFirstToken: _first, ...rest }) => rest);
 const answer = [{ choices: [{ delta: { content: 'QA answer.' } }] }, { choices: [{ delta: {}, finish_reason: 'stop' }] }];
 
-test('the hand-off header is honoured only with the per-start secret, and removed either way', () => {
-  const handoff = native.createHandoff({ secret: SECRET });
+test('the hand-off header is honoured only on a relayed turn with the per-start secret, and removed either way', () => {
+  const handoff = native.createHandoff({ secret: SECRET, relayed: () => true });
   const asked = (value) => { const req = { headers: value === undefined ? {} : { [native.HANDOFF_HEADER]: value } }; return [handoff.requested(req), native.HANDOFF_HEADER in req.headers]; };
   assert.deepEqual(asked(SECRET), [true, false]);
   assert.deepEqual(asked(`${SECRET}x`), [false, false]);
   assert.deepEqual(asked('1'), [false, false]);
   assert.deepEqual(asked(undefined), [false, false]);
   assert.deepEqual(native.createHandoff({ secret: '' }).requested({ headers: { [native.HANDOFF_HEADER]: '' } }), false);
+  // A request that did not come through the front's relay (rust-chat-turn.cjs) never hands off, whatever it carries.
+  const direct = { headers: { [native.HANDOFF_HEADER]: SECRET } };
+  assert.equal(native.createHandoff({ secret: SECRET }).requested(direct), false);
+  assert.equal(native.HANDOFF_HEADER in direct.headers, false);
+  // A browser's copy joined to the front's ("a, b") is not the secret.
+  assert.equal(handoff.requested({ headers: { [native.HANDOFF_HEADER]: `x, ${SECRET}` } }), false);
   assert.equal(native.createHandoff({ secret: SECRET, supervising: () => { throw Error('unreadable'); } }).supervising(), true, 'an unreadable flag counts as on');
 });
 
@@ -100,23 +107,32 @@ test('a turn the native executor can run ends after its preparation with the pre
   assert.deepEqual(last.chat.title, { chatId: 'qa-chat-1', listId: 'qa-project', firstMessage: 'QA hello', firstReply: true, enabled: false });
   assert.deepEqual(last.turn, { message: 'QA hello', spaceId: null, projectId: 'qa-project', declineEndsReply: true, record: true, streamIdleMs: 120000 });
   assert.equal(last.chat.grantScope, 'project:qa-project');
+  assert.ok(Number.isFinite(last.startedAt) && last.startedAt <= Date.now());
 });
 
 test('a turn it cannot run goes on in Node, exactly as without the request', async (t) => {
   const plain = await runTurn(t, { frames: answer });
-  for (const [why, options] of [['step-supervision', { supervising: true }], ['provider-key', { headersFor: () => ({ Authorization: 'Bearer qa-key' }) }]]) {
+  const egress = require('./provider-egress.cjs');
+  const guarded = { before: () => { egress.__setStreamGuardEnabledForTests(true); egress.setToolArgumentSchema('drive_read_file', { type: 'object' }); } };
+  t.after(() => { egress.setToolArgumentSchema('drive_read_file', null); egress.__setStreamGuardEnabledForTests(false); });
+  for (const [why, options] of [['step-supervision', { supervising: true }], ['provider-key', { headersFor: () => ({ Authorization: 'Bearer qa-key' }) }],
+    ['deleted', { before: (dir) => require('./chat-lists.cjs').addTombstone(dir, 'qa-chat-1') }], ['stream-guard', guarded]]) {
     const logged = [];
     const log = console.log;
     console.log = (line) => logged.push(String(line));
     let kept;
     try { kept = await runTurn(t, { requested: true, frames: answer, ...options }); } finally { console.log = log; }
     assert.deepEqual(stable(kept.events), stable(plain.events), why);
+    if (why === 'stream-guard') { egress.setToolArgumentSchema('drive_read_file', null); egress.__setStreamGuardEnabledForTests(false); }
     assert.equal(kept.requests.length, 1, why);
     assert.ok(logged.includes(`[chat] native executor not used for this turn: ${why}`), why);
   }
-  // Not asked at all: nothing differs either.
-  const header = await runTurn(t, { handoff: native.createHandoff({ secret: SECRET }), frames: answer });
-  assert.deepEqual(stable(header.events), stable(plain.events));
+  // Not asked, or asked with the wrong value: nothing differs either, and the header is gone.
+  for (const headers of [{}, { [native.HANDOFF_HEADER]: 'qa-guess' }]) {
+    const asked = await runTurn(t, { handoff: native.createHandoff({ secret: SECRET, relayed: () => true }), frames: answer, headers });
+    assert.deepEqual(stable(asked.events), stable(plain.events));
+    assert.equal(native.HANDOFF_HEADER in asked.req.headers, false);
+  }
 });
 
 test('refusal names the first part of the turn the native executor does not do yet', () => {
@@ -128,7 +144,8 @@ test('refusal names the first part of the turn the native executor does not do y
     ['provider', { external: true }], ['provider', { chatgpt: true }], ['provider', { routeTarget: true }], ['provider-key', { authorized: true }],
     ['images', { images: true }], ['images', { messages: [{ role: 'user', content: [{ type: 'text', text: 'x' }] }] }], ['skills', { skills: true }],
     ['provenance', { provenance: true }], ['framing-reasoner', { framingReasoner: true }], ['narrowed-tools', { narrowed: true }], ['tool-gate', { gate: true }],
-    ['step-supervision', { supervision: true }], ['injected-sources', { injected: true }], ['edit-tools', { editTools: true }]];
+    ['step-supervision', { supervision: true }], ['injected-sources', { injected: true }], ['edit-tools', { editTools: true }],
+    ['deleted', { deleted: true }], ['stream-guard', { streamGuard: true }]];
   for (const [why, change] of cases) assert.equal(native.refusal({ ...base, ...change }), why, JSON.stringify(change));
 });
 
@@ -178,6 +195,12 @@ test('the target bridge describes a write, and neither bridge answers anyone but
   assert.deepEqual(await call(native.TARGET_PATH, body, { trusted: false }), { handled: true, status: 404, body: { error: 'Not found' } });
   assert.equal((await call(native.EXECUTE_PATH, body, { method: 'GET' })).status, 404);
   assert.deepEqual(await call('/internal/chat/other', body), { handled: false, status: undefined, body: undefined });
+  const thrown = bridge({ writeTargetFor: async () => { throw Error('QA Drive down'); } });
+  assert.deepEqual((await thrown.call(native.TARGET_PATH, body)).body, { error: 'The file this would change could not be looked up' });
+  const gone = bridge({ asUser: async () => { throw Object.assign(Error('no such account'), { status: 404 }); } });
+  assert.deepEqual(await gone.call(native.TARGET_PATH, body), { handled: true, status: 404, body: { error: 'no such account' } });
+  assert.deepEqual((await gone.call(native.EXECUTE_PATH, { ...body, allowed: [], routes: [] })).status, 404);
+  assert.equal((await call(native.TARGET_PATH, { ...body, chatKey: 'x'.repeat(201) })).status, 400);
   const failing = bridge({ executeToolCall: async () => { throw Error('QA engine down'); } });
   assert.deepEqual((await failing.call(native.EXECUTE_PATH, { user: 'qa-user', name: 'x', args: '{}', allowed: [], routes: [] })), { handled: true, status: 500, body: { error: 'QA engine down' } });
 });
