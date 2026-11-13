@@ -592,10 +592,17 @@ function createCodeWorkspaces({ dir, treeRoot = null, owner = null, run = defaul
         const interrupted = { ...r, status: 'interrupted', interruptedAt: now() };
         // Hand the tree back to noevia before touching it, the same way release() does for a
         // clone — otherwise git (and dropPinned's own unlink) can refuse a tree the harness user
-        // still owns.
+        // still owns. A seal that fails leaves the tree with the harness user, whose process may
+        // still be running, and dropPinned works by path: it would unlink through whatever that
+        // process swaps in (#2561). So, as release() marks such a claim stuck, nothing is removed
+        // and the record says why.
         if (interrupted.owner && interrupted.noevia) {
           try { chown(interrupted.path, interrupted.noevia.uid, interrupted.noevia.gid, { seal: true }); }
-          catch { /* best effort: dropPinned below reports its own failure */ }
+          catch (e) {
+            interrupted.pinnedDropped = false;
+            interrupted.pinnedDropError = `Could not take the workspace back from the harness user: ${e.message}`;
+            return write(interrupted);
+          }
         }
         // The pinned config holds the engine key and has no expiry otherwise — an interrupted
         // claim must not leave it on disk indefinitely. The tree itself is kept for inspection;

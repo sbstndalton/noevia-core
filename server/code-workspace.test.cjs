@@ -767,3 +767,47 @@ test('a pinned config under a real directory is still removed, and the tree kept
   assert.equal(fs.existsSync(pin), false);
   assert.equal(fs.existsSync(path.join(claim.path, 'a.txt')), true);
 });
+
+test('#2561: recover() removes nothing when the tree cannot be taken back from the harness user, and says so', (t) => {
+  const repo = repoWith();
+  const dir = temp('noevia-ws-'), treeRoot = temp('noevia-shared-');
+  const self = { uid: process.getuid(), gid: process.getgid() };
+  const opts = { dir, treeRoot, mode: 'clone', owner: self };
+  const claim = createCodeWorkspaces({ ...opts, epoch: 'process-1', chown: () => {} })
+    .claim({ taskId: ids(1), repoPath: repo, pinned: ['opencode.json'] });
+  const pin = path.join(claim.path, 'opencode.json');
+  fs.writeFileSync(pin, '{"key":"synthetic-key"}');
+  const sealed = [];
+  const failing = (target, uid, gid, { seal = false } = {}) => { sealed.push(seal); throw Error('QA: the walk was refused'); };
+  const unlinked = [];
+  const unlink = fs.unlinkSync;
+  t.mock.method(fs, 'unlinkSync', (p, ...rest) => { unlinked.push(String(p)); return unlink(p, ...rest); });
+  const recovered = createCodeWorkspaces({ ...opts, epoch: 'process-2', chown: failing }).recover();
+  assert.deepEqual(sealed, [true]);
+  assert.deepEqual(unlinked, [], 'nothing is unlinked by path in a tree the harness user still holds');
+  assert.equal(recovered.length, 1);
+  assert.equal(recovered[0].status, 'interrupted');
+  assert.equal(recovered[0].pinnedDropped, false);
+  assert.match(recovered[0].pinnedDropError, /Could not take the workspace back from the harness user: QA: the walk was refused/);
+  assert.equal(fs.existsSync(pin), true);
+  // The same record is what a later reader sees.
+  assert.equal(createCodeWorkspaces({ ...opts, epoch: 'process-3' }).get(ids(1)).pinnedDropped, false);
+});
+
+test('#2561: recover() still drops the pinned files once the tree is taken back', () => {
+  const repo = repoWith();
+  const dir = temp('noevia-ws-'), treeRoot = temp('noevia-shared-');
+  const self = { uid: process.getuid(), gid: process.getgid() };
+  const opts = { dir, treeRoot, mode: 'clone', owner: self };
+  const claim = createCodeWorkspaces({ ...opts, epoch: 'process-1', chown: () => {} })
+    .claim({ taskId: ids(1), repoPath: repo, pinned: ['opencode.json'] });
+  const pin = path.join(claim.path, 'opencode.json');
+  fs.writeFileSync(pin, '{"key":"synthetic-key"}');
+  const sealed = [];
+  const recovered = createCodeWorkspaces({ ...opts, epoch: 'process-2', chown: (target, uid, gid, { seal = false } = {}) => { sealed.push(seal); } }).recover();
+  assert.deepEqual(sealed, [true]);
+  assert.equal(recovered[0].pinnedDropped, true, recovered[0].pinnedDropError);
+  assert.equal(recovered[0].pinnedDropError, undefined);
+  assert.equal(fs.existsSync(pin), false);
+  assert.equal(fs.existsSync(path.join(claim.path, 'a.txt')), true);
+});
