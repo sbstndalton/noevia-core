@@ -25,7 +25,7 @@ async function runTurn(t, { handoff = null, requested = false, supervising = fal
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
   const user = { id: 'qa-user', role: 'admin' };
   const project = { id: 'qa-project', name: 'QA Project', model: 'qa-model', routing: 'manual', toolboxes: ['core'], files: [], ...extra };
-  const workspace = { userId: user.id, dir, assertActive() {}, transcripts: { appendIfLast: async () => 'saved' } };
+  const workspace = { userId: user.id, dir, assertActive() {}, assetDir: () => path.join(dir, 'assets'), transcripts: { appendIfLast: async () => 'saved' } };
   const store = { workspace: { userId: user.id }, authn: { user } };
   const requestScope = { getStore: () => store, run: (_s, fn) => fn() };
   const accounts = { forUser: () => ({ drive: { state: () => ({ state: 'connected' }) } }) };
@@ -136,6 +136,55 @@ test('a turn with injected knowledge files hands off with what the attribution a
   assert.deepEqual(handed.events.find((e) => e.type === 'sources')?.sources, last.turn.sources.reply);
 });
 
+// A project image source (chat.cjs projectImages): a synthetic 1x1 PNG in the project's asset directory.
+const QA_PNG = Buffer.from('89504e470d0a1a0a0000000d494844520000000100000001080600000' + '01f15c4890000000d4944415478da63f8ffff3f0005fe02fea7d6a4c10000000049454e44ae426082', 'hex');
+const imageProject = { assets: [{ id: 'qa-asset-1', name: 'qa-image.png', mime: 'image/png' }] };
+const withImage = (bytes = QA_PNG) => (dir) => { fs.mkdirSync(path.join(dir, 'assets'), { recursive: true }); fs.writeFileSync(path.join(dir, 'assets', 'qa-asset-1'), bytes); };
+const statusIds = (events) => events.filter((e) => e.type === 'status').map((e) => e.id);
+
+test('a turn whose attached image the answering model can see hands off with the image parts on its last user message', async (t) => {
+  const deps = { visionProbe: async () => ({ supported: true }) };
+  const plain = await runTurn(t, { frames: answer, project: imageProject, before: withImage(), deps });
+  const handed = await runTurn(t, { requested: true, frames: answer, project: imageProject, before: withImage(), deps });
+  const last = handed.events.at(-1);
+  assert.equal(last.type, 'prepared', 'attached images no longer keep the turn in Node');
+  assert.equal(handed.requests.length, 0);
+  assert.deepEqual(last.messages, plain.requests[0].messages, 'the wire is what the engine got without the hand-off');
+  assert.deepEqual(last.messages.at(-1), { role: 'user', content: [
+    { type: 'text', text: `QA hello\n\n(Attached images: ${require('./quoted-name.cjs').quotedNames(['qa-image.png'])})` },
+    { type: 'image_url', image_url: { url: `data:image/png;base64,${QA_PNG.toString('base64')}` } }] });
+  assert.deepEqual(handed.events.slice(0, -1).map((e) => e.type), ['meta', 'telemetry', 'status', 'status', 'tools_scope']);
+  assert.deepEqual(statusIds(handed.events), ['readingImages', 'generating']);
+});
+
+test('a turn whose attached image the model cannot see hands off without it, with the warning and the note sent before the cut', async (t) => {
+  const deps = { visionProbe: async () => ({ supported: false, reason: 'QA engine has no image input.' }) };
+  const plain = await runTurn(t, { frames: answer, project: imageProject, before: withImage(), deps });
+  const handed = await runTurn(t, { requested: true, frames: answer, project: imageProject, before: withImage(), deps });
+  const last = handed.events.at(-1);
+  assert.equal(last.type, 'prepared');
+  assert.deepEqual(last.messages, plain.requests[0].messages);
+  assert.ok(last.messages.every((m) => typeof m.content === 'string'), 'Node cleared the image');
+  assert.match(last.messages[0].content, /image input is currently unavailable for qa-model: QA engine has no image input\./);
+  assert.deepEqual(handed.events.filter((e) => e.type === 'warning').map((e) => e.text), ['Images were not read. QA engine has no image input.']);
+  assert.deepEqual(handed.events.slice(0, -1).map((e) => e.type), plain.events.slice(0, handed.events.length - 1).map((e) => e.type));
+});
+
+test('a turn whose prepared frame would be longer than the front reads stays in Node (frame-size)', async (t) => {
+  const deps = { visionProbe: async () => ({ supported: true }) };
+  // Base64 makes 3 bytes 4: these bytes alone make the frame longer than PREPARED_CAP.
+  const big = Buffer.alloc(Math.ceil(native.PREPARED_CAP * 0.75) + 64, 0x51);
+  const logged = [];
+  const log = console.log;
+  console.log = (line) => logged.push(String(line));
+  let kept;
+  try { kept = await runTurn(t, { requested: true, frames: answer, project: imageProject, before: withImage(big), deps }); } finally { console.log = log; }
+  assert.notEqual(kept.events.at(-1).type, 'prepared');
+  assert.equal(kept.requests.length, 1, 'Node ran the turn');
+  assert.equal(kept.requests[0].messages.at(-1).content[1].image_url.url.length, 'data:image/png;base64,'.length + Math.ceil(big.length / 3) * 4);
+  assert.ok(logged.includes('[chat] native executor not used for this turn: frame-size'));
+});
+
 test('injectedSources keeps the part of a file the attribution reads, and refuses a name that is not text', () => {
   const long = 'é'.repeat(30000) + '😀';
   const out = native.injectedSources({ injected: [{ file: 'qa-a.txt', body: long, kind: 'file' }], placed: [], readable: [{ name: 'qa-a.txt', content: 'x' }], reply: [] });
@@ -237,16 +286,35 @@ test('a turn it cannot run goes on in Node, exactly as without the request', asy
 
 test('refusal names the first part of the turn the native executor does not do yet', () => {
   const base = { diary: false, compactOnly: false, providerId: 'default', defaultProviderId: 'default', machine: false, external: false, chatgpt: false,
-    routeTarget: false, authorized: false, images: false, messages: [{ role: 'user', content: 'x' }], skills: false, provenance: false,
+    routeTarget: false, authorized: false, attachedImages: 0, retrievedImages: false, messages: [{ role: 'user', content: 'x' }], skills: false, provenance: false,
     framingReasoner: false, narrowed: false, gate: false, supervision: false, injected: false, pageSave: false };
   assert.equal(native.refusal(base), null);
   const cases = [['diary', { diary: true }], ['compact', { compactOnly: true }], ['provider', { providerId: 'qa-cloud' }], ['provider', { machine: true }],
     ['provider', { external: true }], ['provider', { chatgpt: true }], ['provider', { routeTarget: true }], ['provider-key', { authorized: true }],
-    ['images', { images: true }], ['images', { messages: [{ role: 'user', content: [{ type: 'text', text: 'x' }] }] }], ['skills', { skills: true }],
+    ['retrieved-images', { retrievedImages: true }], ['retrieved-images', { retrievedImages: true, attachedImages: 1 }],
+    ['images', { messages: [{ role: 'user', content: [{ type: 'input_audio', input_audio: { data: 'QA' } }] }] }],
+    ['images', { messages: [{ role: 'user', content: [{ type: 'text', text: 'x' }, { type: 'image_url', image_url: 'data:image/png;base64,QQ==' }] }] }],
+    ['images', { messages: [{ role: 'user', content: [{ type: 'image_url', image_url: { url: 42 } }] }] }],
+    ['images', { messages: [{ role: 'user', content: [{ type: 'text', text: null }] }] }],
+    ['images', { messages: [{ role: 'user', content: [null] }] }], ['images', { messages: [{ role: 'user', content: [['x']] }] }],
+    ['images', { messages: [{ role: 'assistant', content: null }] }], ['images', { messages: [{ role: 'user', content: { type: 'text', text: 'x' } }] }],
+    ['skills', { skills: true }],
     ['provenance', { provenance: true }], ['framing-reasoner', { framingReasoner: true }], ['narrowed-tools', { narrowed: true }], ['tool-gate', { gate: true }],
     ['step-supervision', { supervision: true }], ['injected-sources', { injected: true }], ['page-save', { pageSave: true }],
     ['deleted', { deleted: true }], ['stream-guard', { streamGuard: true }], ['chat-id', { chatIdNotText: true }]];
   for (const [why, change] of cases) assert.equal(native.refusal({ ...base, ...change }), why, JSON.stringify(change));
+  // Attached images the answering model is handed (text and image parts on the last user message) are the executor's.
+  const parts = [{ type: 'text', text: 'QA hello\n\n(Attached images: "qa-image.png")' }, { type: 'image_url', image_url: { url: 'data:image/png;base64,QQ==' } }];
+  assert.equal(native.refusal({ ...base, attachedImages: 1, messages: [{ role: 'system', content: 'QA' }, { role: 'user', content: parts }] }), null);
+  assert.equal(native.refusal({ ...base, messages: [{ role: 'user', content: [] }] }), null, 'an empty list carries nothing the executor cannot');
+});
+
+test('frameTooLarge refuses a prepared line longer than the front reads (PREPARED_CAP bytes of UTF-8)', () => {
+  assert.equal(native.PREPARED_CAP, 40 * 1024 * 1024);
+  assert.equal(native.frameTooLarge('x'.repeat(native.PREPARED_CAP)), false);
+  assert.equal(native.frameTooLarge('x'.repeat(native.PREPARED_CAP + 1)), true);
+  assert.equal(native.frameTooLarge('é'.repeat(native.PREPARED_CAP / 2) + 'x'), true, 'counted in bytes, not characters');
+  assert.equal(native.frameTooLarge(null), true);
 });
 
 // The bridges, through a fake loopback request.

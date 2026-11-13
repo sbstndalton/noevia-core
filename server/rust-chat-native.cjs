@@ -123,6 +123,13 @@ function createHandoff({ secret, supervising = () => false, relayed = (req) => r
   return { requested, supervising: () => { try { return supervising() === true; } catch { return true; } } };
 }
 
+/** A message content the executor carries as it is: a list of text parts and image parts (image_url with a url). */
+function wireParts(content) {
+  return Array.isArray(content) && content.every((p) => p && typeof p === 'object' && !Array.isArray(p)
+    && ((p.type === 'text' && typeof p.text === 'string')
+      || (p.type === 'image_url' && p.image_url && typeof p.image_url === 'object' && typeof p.image_url.url === 'string')));
+}
+
 /**
  * Why the native executor cannot run this turn yet, or null when it can. Every condition is a part of chat.cjs
  * the executor does not do yet; each is lifted when it does. Read at the end of the preparation, so it sees the
@@ -137,7 +144,11 @@ function refusal(t) {
   if (t.compactOnly) return 'compact';
   if (t.providerId !== t.defaultProviderId || t.machine || t.external || t.chatgpt || t.routeTarget) return 'provider';
   if (t.authorized) return 'provider-key';
-  if (t.images || t.messages.some((m) => typeof m?.content !== 'string')) return 'images';
+  // #1726's retrieved images (multimodal RAG: their notes, captions and parts) are not the executor's yet. A project's
+  // attached images are: they ride on the last user message as image parts (chat.cjs's vision step), which the
+  // executor carries, measures (context-fit counts each image_url) and sends as they are.
+  if (t.retrievedImages) return 'retrieved-images';
+  if (!t.messages.every((m) => typeof m?.content === 'string' || wireParts(m?.content))) return 'images';
   if (t.skills) return 'skills';
   if (t.provenance) return 'provenance';
   if (t.framingReasoner) return 'framing-reasoner';
@@ -180,6 +191,14 @@ const RESERVED = /[\udbfe\udbff][\udc00-\udfff]/;
 /** Whether the prepared frame's JSON text holds a character the native executor cannot read (the turn stays here). */
 function reservedText(json) {
   return typeof json !== 'string' || RESERVED.test(json);
+}
+// The longest `prepared` line the front reads (noevia-rs crates/chat-turn handoff.rs PREPARED_CAP); a longer one
+// would fail the turn after this process let it go. Attached images are what can make it that long: their bytes are
+// not bounded by the chat body's cap.
+const PREPARED_CAP = 40 * 1024 * 1024;
+/** Whether the prepared frame's JSON text is longer than the front reads (the turn stays here). */
+function frameTooLarge(json) {
+  return typeof json !== 'string' || Buffer.byteLength(json, 'utf8') > PREPARED_CAP;
 }
 
 /** The `prepared` frame: everything the native executor needs from here on. No provider key is in it. */
@@ -445,4 +464,4 @@ function createToolBridge({ secret, json, readJson, asUser, getProject, executeT
   };
 }
 
-module.exports = { HANDOFF_HEADER, PREPARED_VERSION, EXECUTE_PATH, TARGET_PATH, ABORT_PATH, EDIT_TARGET_PATH, USAGE_PATH, PREFILL_PATH, NATIVE_PREFIX, CHAT_BODY_CAP, createHandoff, refusal, reservedText, injectedSources, preparedTurn, createAsUser, createToolBridge };
+module.exports = { HANDOFF_HEADER, PREPARED_VERSION, EXECUTE_PATH, TARGET_PATH, ABORT_PATH, EDIT_TARGET_PATH, USAGE_PATH, PREFILL_PATH, NATIVE_PREFIX, CHAT_BODY_CAP, PREPARED_CAP, createHandoff, refusal, reservedText, frameTooLarge, injectedSources, preparedTurn, createAsUser, createToolBridge };
