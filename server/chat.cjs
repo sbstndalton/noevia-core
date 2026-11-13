@@ -2395,7 +2395,7 @@ function createChatHandler({
                 notRunResults.add(result);
                 return result;
               };
-              if (!(await openApproval({ id: approvalId, userId, chatId: grantChat, scope: writeGrantScope, binding: permissionBinding }))) return notAsked();
+              if (!(await openApproval({ id: approvalId, userId, chatId: grantChat, scope: writeGrantScope, binding: permissionBinding, once: specialistPageSave.neverStanding(tc.name) }))) return notAsked();
               send({
                 type: 'tool_pending',
                 id: approvalId,

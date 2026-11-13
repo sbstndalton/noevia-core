@@ -59,10 +59,10 @@ function createApprovalRegistry({ approvals, timeoutMs = 5 * 60 * 1000, log = ()
   const text = (v) => (typeof v === 'string' && v ? v : null);
   const why = (e) => e?.code || e?.name || 'error';
 
-  async function open(kind, { id, userId, chatId = null, scope = null, binding = null }) {
+  async function open(kind, { id, userId, chatId = null, scope = null, binding = null, once = false }) {
     if (!text(id) || !text(userId)) return false;
     try {
-      const payload = { user: userId, id, kind, chat: text(chatId), scope: kind === 'write' ? text(scope) : null, binding: kind === 'write' && binding ? binding : null };
+      const payload = { user: userId, id, kind, chat: text(chatId), scope: kind === 'write' ? text(scope) : null, binding: kind === 'write' && binding ? binding : null, ...(kind === 'write' && once === true ? { once: true } : {}) };
       const { status, body } = await ask('open', payload);
       if (status === 200 && body?.opened === true) return true;
       log(`[tool-approvals] open refused: ${status}${body?.code ? ` ${body.code}` : ''}`);
@@ -94,7 +94,8 @@ function createApprovalRegistry({ approvals, timeoutMs = 5 * 60 * 1000, log = ()
     }
   }
 
-  /** approvals.cjs awaitApproval, for a question openApproval opened:
+  /** approvals.cjs awaitApproval, for a question openApproval opened (its `once` travels in the open,
+   *  where the front decides the grant: an approve_all on a `once` card stores none, #2559):
    *  'approve' | 'deny' | 'timeout' | 'aborted' | 'unavailable'. Never rejects. */
   async function awaitApproval({ id, userId, abortSignal }) {
     const got = await wait(userId, id, abortSignal);

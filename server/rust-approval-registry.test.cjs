@@ -460,3 +460,24 @@ test('another chat or account revoke does not close an unexpired executor fence'
   f.gate.frontRevoked('owner', 'chat');
   assert.equal(fence.open(), false);
 });
+
+test('#2559: approve_all on a `once` card stores no chat-wide grant; the next write asks (main #2446)', async (t) => {
+  const { store, gate } = await fixture(t);
+  const ctl = new AbortController();
+  const ask = async (id, once) => {
+    assert.equal(await gate.openApproval({ id, userId: 'owner', chatId: 'chat', scope: 'project:p', binding, abortSignal: ctl.signal, once }), true);
+    store.answer('owner', id, { outcome: 'approve', decision: 'approve_all' });
+    return gate.awaitApproval({ id, userId: 'owner', chatId: 'chat', scope: 'project:p', binding, abortSignal: ctl.signal, once });
+  };
+  // The page-save card: the answer still approves that one call, and nothing is granted.
+  assert.equal(await ask('save', true), 'approve');
+  assert.deepEqual(store.seen[0].body, { user: 'owner', id: 'save', kind: 'write', chat: 'chat', scope: 'project:p', binding, once: true });
+  assert.ok(!(await gate.chatWideApproved('owner', 'chat', 'project:p', binding)), 'no grant from a once card');
+  // So the next write tool in the chat still asks.
+  assert.equal(await gate.openApproval({ id: 'next', userId: 'owner', chatId: 'chat', scope: 'project:p', binding }), true);
+  assert.equal(store.seen.at(-1).body.once, undefined, 'missing once = false on the wire');
+  // Control: an ordinary card's approve_all does store the grant.
+  store.questions.delete('next');
+  assert.equal(await ask('plain', false), 'approve');
+  assert.ok(await gate.chatWideApproved('owner', 'chat', 'project:p', binding));
+});

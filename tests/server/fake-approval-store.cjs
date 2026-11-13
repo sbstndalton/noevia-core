@@ -76,6 +76,9 @@ async function startFakeApprovalStore({ token = 'synthetic-store-token-012345678
   function answer(user, id, outcome) {
     const q = questions.get(id);
     if (!q || q.user !== user || q.answer) return false;
+    // The front's rule (approval_registry.rs grant_for): approve_all on a write question stores a
+    // chat-wide grant, unless the question was opened `once` (#2446, #2559).
+    if (outcome.decision === 'approve_all' && q.kind === 'write' && q.chat && q.scope && q.binding && q.once !== true) grants.set(`${user}\n${q.chat}`, q.scope);
     if (q.waiter) q.waiter(outcome); else q.answer = outcome;
     return true;
   }
