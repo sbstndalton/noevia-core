@@ -988,6 +988,8 @@ const chatNativeTools = require('./rust-chat-native.cjs').createToolBridge({ sec
   recordToolUse: (...args) => recordToolUse(...args), currentWorkspace: () => currentWorkspace(), currentUser: () => requestScope.getStore()?.authn?.user || null,
   recordUsage: (...args) => recordUsage(...args), recordSample: (...args) => prefill.recordSample(...args),
   modelManager, templateToolsGate: require('./chat-template-caps.cjs').toolsGate,
+  // The chat-wide grants: the one registry instance chat.cjs uses, whose epochs the front's revokes move.
+  chatWideApproved, redeemChatGrant, revokeChatGrant,
   chatTitles: { save: (projectId, chatId, title, firstMessage) => projectStore.setChatTitle(projectId, chatId, title, firstMessage),
     autoNamed: (projectId, chatId, firstMessage) => projectStore.chatAutoNamed(projectId, chatId, firstMessage) },
   chatBodyCap: STORED_HISTORY_BYTES });
