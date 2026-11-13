@@ -971,7 +971,10 @@ const chatNativeHandoff = require('./rust-chat-native.cjs').createHandoff({ secr
 const chatNativeAsUser = require('./rust-chat-native.cjs').createAsUser({
   userRow: (userId) => authService.db.prepare('SELECT id, disabled_at FROM users WHERE id=?').get(userId),
   runAs: (userId, fn) => diaryAsUser(userId, fn), currentWorkspace: () => currentWorkspace() });
-const chatNativeTools = require('./rust-chat-native.cjs').createToolBridge({ secret: FRONT_SECRET, json, readJson, asUser: chatNativeAsUser,
+// #546: the skill ledger (every skill version put in front of a model, per account), one per process: chat.cjs and the
+// native executor's skill bridges record into and scrub from the same one.
+const chatSkillLedger = require('./skill-history.cjs').createSkillHistory({ fs, path });
+const chatNativeTools = require('./rust-chat-native.cjs').createToolBridge({ secret: FRONT_SECRET, json, readJson, asUser: chatNativeAsUser, skillLedger: chatSkillLedger,
   getProject: (id) => getProject(id), executeToolCall: (...args) => executeToolCall(...args), writeTargetFor: chatWriteTargetFor, editStorageAccount: chatEditStorageAccount,
   recordToolUse: (...args) => recordToolUse(...args), currentWorkspace: () => currentWorkspace(), currentUser: () => requestScope.getStore()?.authn?.user || null,
   recordUsage: (...args) => recordUsage(...args), recordSample: (...args) => prefill.recordSample(...args),
@@ -1058,7 +1061,7 @@ const { handleChat } = require('./chat.cjs').createChatHandler({
   oauthServerIds, accountReady, chatWideApproved, redeemChatGrant, openApproval, awaitApproval, revokeChatGrant, recordUsage, recordToolUse, automaticToolsReady,
   // #917: which of the signed-in workspace's lists holds a chat id ('free', a project id, or null).
   chatListHolder,
-  chatgptOAuth, chatgptEnabled: () => features.enabled('chatgptOAuth'),
+  chatgptOAuth, chatgptEnabled: () => features.enabled('chatgptOAuth'), skillHistory: chatSkillLedger,
   projectEditTool: (name) => require('./project-edit-target.cjs').EDIT_TOOLS.has(name) && !!MCP_INTERNAL_SERVER && mcpState.tools.get(name)?.serverId === MCP_INTERNAL_SERVER.id,
   // #687: a plain-named project file is edited by moving it into the project folder when storage is connected.
   editStorageAccount: chatEditStorageAccount,

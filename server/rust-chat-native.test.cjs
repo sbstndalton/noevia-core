@@ -19,7 +19,7 @@ const grantFixture = require('../tests/server/chat-grant-fixture.cjs');
 const SECRET = 'qa-front-secret-0123456789abcdef';
 
 // One synthetic turn through the real handleChat: a manual project, the local default provider, a scripted engine.
-async function runTurn(t, { handoff = null, requested = false, supervising = false, frames, headersFor = () => ({}), project: extra = {}, before = () => {}, headers = {}, deps = {}, history = [], boxes = {}, body: extraBody = {} } = {}) {
+async function runTurn(t, { handoff = null, requested = false, caps = [], supervising = false, frames, headersFor = () => ({}), project: extra = {}, before = () => {}, headers = {}, deps = {}, history = [], boxes = {}, body: extraBody = {} } = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'noevia-native-handoff-'));
   before(dir);
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
@@ -57,7 +57,7 @@ async function runTurn(t, { handoff = null, requested = false, supervising = fal
     ...toolbox, oauthServerIds: () => new Set(), accountReady: () => true,
     grantContext: async (raw) => grantFixture.context(raw, { holder: { kind: 'absent' } }), chatWideApproved: () => false, awaitApproval: async () => 'approve',
     recordUsage() {}, recordToolUse() {}, sourceWaitMs: 0,
-    nativeHandoff: handoff || (requested ? { requested: () => true, supervising: () => supervising } : null),
+    nativeHandoff: handoff || (requested ? { requested: () => true, capabilities: () => new Set(caps), supervising: () => supervising } : null),
     ...deps,
   });
   const req = { headers: { ...headers } };
@@ -296,7 +296,7 @@ test('a turn it cannot run goes on in Node, exactly as without the request', asy
 
 test('refusal names the first part of the turn the native executor does not do yet', () => {
   const base = { diary: false, compactOnly: false, providerId: 'default', defaultProviderId: 'default', machine: false, external: false, chatgpt: false,
-    routeTarget: false, authorized: false, attachedImages: 0, retrievedImages: false, messages: [{ role: 'user', content: 'x' }], skills: false, provenance: false,
+    routeTarget: false, authorized: false, attachedImages: 0, retrievedImages: false, messages: [{ role: 'user', content: 'x' }], provenance: false,
     framingReasoner: false, narrowed: false, gate: false, supervision: false, injected: false, pageSave: false };
   assert.equal(native.refusal(base), null);
   const cases = [['diary', { diary: true }], ['provider', { providerId: 'qa-cloud' }], ['provider', { machine: true }],
@@ -640,4 +640,133 @@ test('the execute bridge passes an approved edit\'s pinned file in the call\'s o
   assert.deepEqual(seen, [digest, 'none', 'none'], 'no key at all without one');
   for (const bad of ['qa-notes.txt', digest.toUpperCase(), digest.slice(1), 7, '']) assert.equal((await call(native.EXECUTE_PATH, { ...body, editTarget: bad })).status, 400, String(bad));
   assert.equal(seen.length, 3);
+});
+
+// Instruction skills (#272, #546): synthetic QA skills, one reviewed and enabled, one enabled beside it.
+const skills = require('./instruction-skills.cjs');
+const SKILL = 'qa-skill/SKILL.md', OTHER = 'qa-other/SKILL.md';
+const skillBody = (name, line) => `---\nname: ${name}\ndescription: A synthetic QA skill.\n---\n${line}\nQA second line of the synthetic skill body.\n`;
+const skillFiles = [{ name: SKILL, content: skillBody('QA Skill', 'QA first line that names the synthetic check steps.') },
+  { name: OTHER, content: skillBody('QA Other', 'QA other line about a second synthetic procedure.') }];
+const H = skills.hash(skillFiles[0].content), H2 = skills.hash(skillFiles[1].content);
+const skillProject = (enabled = { [SKILL]: true, [OTHER]: true }) => ({ id: 'qa-project', files: skillFiles,
+  instructionSkills: Object.fromEntries(skillFiles.map((f) => [f.name, { enabled: enabled[f.name] === true, reviewedHash: skills.hash(f.content) }])) });
+
+test('a project turn with instruction skills hands off with the loaded and enabled skills; a pinned one is loaded (#571)', async (t) => {
+  const project = { files: skillFiles, instructionSkills: skillProject().instructionSkills };
+  const pin = `${skills.skillId({ id: 'qa-project' }, SKILL)}@${H}`;
+  const handed = await runTurn(t, { requested: true, caps: ['skills'], frames: answer, project, body: { skill: pin } });
+  const last = handed.events.at(-1);
+  assert.equal(last.type, 'prepared', 'a project with skills no longer stays in Node');
+  assert.deepEqual(last.skills, { loaded: [{ file: SKILL, hash: H, name: 'QA Skill' }],
+    enabled: [{ file: SKILL, hash: H, name: 'QA Skill' }, { file: OTHER, hash: H2, name: 'QA Other' }], revokedInHistory: [], imageWarning: '', coverageWarning: '' });
+  assert.ok(handed.events.some((e) => e.type === 'skills_scope' && e.text === 'QA Skill'), 'the pin is shown before the cut');
+  const unpinned = await runTurn(t, { requested: true, caps: ['skills'], frames: answer, project });
+  assert.deepEqual(unpinned.events.at(-1).skills.loaded, []);
+  // A skill an earlier turn used and that is disabled now is taken out of the history before the cut, and named.
+  const off = { ...project, instructionSkills: skillProject({ [OTHER]: true }).instructionSkills };
+  const history = [{ role: 'user', content: 'QA earlier' }, { role: 'assistant', content: `QA earlier reply.\nIt followed SHA-256 ${H} closely.` }];
+  const scrubbed = (await runTurn(t, { requested: true, caps: ['skills'], frames: answer, project: off, history })).events;
+  assert.deepEqual(scrubbed.at(-1).skills.revokedInHistory, ['QA Skill']);
+  assert.ok(!JSON.stringify(scrubbed.at(-1).messages).includes(H));
+  assert.ok(scrubbed.some((e) => e.type === 'warning' && e.text.startsWith('Earlier replies in this chat used Skill "QA Skill"')));
+  // A project with no skills carries empty lists.
+  const none = (await runTurn(t, { requested: true, frames: answer })).events.at(-1).skills;
+  assert.deepEqual(none, { loaded: [], enabled: [], revokedInHistory: [], imageWarning: '', coverageWarning: '' });
+});
+
+test('the skill bridges check, note and scrub a turn\'s skills as the user, against the project as stored now', async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'noevia-native-skills-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const ledger = require('./skill-history.cjs').createSkillHistory({ fs, path });
+  let stored = skillProject();
+  const { call, calls } = bridge({ getProject: (id) => (id === 'qa-project' ? stored : null), currentWorkspace: () => ({ dir, assertActive() {} }), skillLedger: ledger });
+  const at = (op) => `${native.SKILLS_PREFIX}${op}`;
+  const loaded = [{ file: SKILL, hash: H, name: 'QA Skill' }];
+  const base = { user: 'qa-user', projectId: 'qa-project', chatId: 'qa-chat-1' };
+  // revoked: what chat.cjs revokedSkills finds, against the project as stored when asked.
+  assert.deepEqual(await call(at('revoked'), { ...base, loaded }), { handled: true, status: 200, body: { gone: [] } });
+  assert.deepEqual(calls, [['asUser', 'qa-user']]);
+  // read: a call naming the skill file loads it, and the version is recorded in the ledger for the chat.
+  const candidates = [{ file: SKILL, hash: H, name: 'QA Skill' }, { file: OTHER, hash: H2, name: 'QA Other' }];
+  const read = await call(at('read'), { ...base, candidates, args: '{"name":"qa-skill/SKILL.md"}', result: 'QA unrelated text' });
+  assert.deepEqual(read.body, { loaded: [{ file: SKILL, hash: H, name: 'QA Skill' }] });
+  const entry = JSON.parse(fs.readFileSync(path.join(dir, 'skill-history.json'), 'utf8')).projects['qa-project'];
+  assert.deepEqual(entry.map((e) => [e.file, e.hash, e.name, e.chats]), [[SKILL, H, 'QA Skill', ['qa-chat-1']]]);
+  assert.ok(entry[0].lines.length > 0, 'recorded with the version\'s text');
+  // A result carrying a skill's SHA-256 (the reader's heading) loads it too; one naming none loads nothing.
+  assert.deepEqual((await call(at('read'), { ...base, candidates: candidates.slice(1), args: '{}', result: `Loaded instruction skill "QA Other" (SHA-256 ${H2}).` })).body, { loaded: [candidates[1]] });
+  assert.deepEqual((await call(at('read'), { ...base, candidates, args: 'not json', result: 'QA nothing' })).body, { loaded: [] });
+  // The same decision as chat.cjs noteSkillRead: skill-reads.cjs.
+  assert.deepEqual(require('./skill-reads.cjs').matchedReads(stored, candidates, '{"name":"SKILL.md"}', ''), [], 'an ambiguous bare name resolves to nothing');
+  // Disabled now: the loaded skill is gone; a project that is gone revokes them all.
+  stored = skillProject({ [OTHER]: true });
+  assert.deepEqual((await call(at('revoked'), { ...base, loaded })).body, { gone: [{ file: SKILL, name: 'QA Skill' }] });
+  assert.deepEqual((await call(at('revoked'), { ...base, projectId: 'qa-gone', loaded })).body, { gone: [{ file: SKILL, name: 'QA Skill' }] });
+  // scrub: the revoked version's text out of the round's messages (the ledger knows it from the read above).
+  const messages = [null, { role: 'assistant', content: `QA reply.\nIt used SHA-256 ${H} here.` }, { role: 'assistant', content: 'QA unrelated reply.' }];
+  const scrub = await call(at('scrub'), { ...base, messages });
+  assert.equal(scrub.status, 200);
+  assert.deepEqual(scrub.body.removed, ['QA Skill']);
+  assert.deepEqual(scrub.body.changed, [[1, 'QA reply.\n[Skill "QA Skill" was disabled or changed, and its instructions were removed]']]);
+  stored = skillProject();
+  assert.deepEqual((await call(at('scrub'), { ...base, messages })).body, { changed: [], removed: [] }, 'enabled again: nothing to take out');
+  assert.deepEqual((await call(at('scrub'), { ...base, projectId: 'qa-gone', messages })).body, { changed: [], removed: [] });
+  // Refusals: not the front, not POST, a gone account, bad input; a failure's detail is logged, never sent.
+  assert.deepEqual(await call(at('revoked'), { ...base, loaded }, { trusted: false }), { handled: true, status: 404, body: { error: 'Not found' } });
+  assert.equal((await call(at('scrub'), { ...base, messages }, { method: 'GET' })).status, 404);
+  assert.equal((await call(`${native.SKILLS_PREFIX}other`, base)).handled, false);
+  const before = calls.length;
+  for (const [op, bad] of [['revoked', { loaded: [{ file: SKILL, hash: 'x', name: 'QA' }] }], ['revoked', { loaded: null }], ['revoked', { projectId: '' }], ['revoked', { user: '' }],
+    ['read', { candidates, args: '{}' }], ['read', { candidates: [{ file: '', hash: H, name: 'QA' }], args: '{}', result: '' }], ['read', { chatId: 7, candidates, args: '{}', result: '' }],
+    ['scrub', { messages: [{ role: 'assistant', content: null }] }], ['scrub', { messages: 'x' }], ['scrub', { chatId: 'x'.repeat(401), messages }]]) {
+    assert.equal((await call(at(op), { ...base, loaded, ...bad })).status, 400, `${op} ${JSON.stringify(bad)}`);
+  }
+  assert.equal(calls.filter(([c]) => c === 'asUser').length - before, 9, 'every request naming a user runs as that user before its body is read');
+  const gone = bridge({ asUser: async () => { throw Object.assign(Error('no such account'), { status: 404 }); } });
+  assert.deepEqual(await gone.call(at('read'), { ...base, candidates, args: '{}', result: '' }), { handled: true, status: 404, body: { error: 'no such account' } });
+  const logged = [];
+  const failing = bridge({ log: (line) => logged.push(line), getProject: () => { throw Error('QA store down'); } });
+  assert.deepEqual(await failing.call(at('revoked'), { ...base, loaded }), { handled: true, status: 500, body: { error: 'the skills could not be checked' } });
+  assert.deepEqual(logged, ['[chat] native skills revoked bridge failed: QA store down']);
+});
+
+test('the capabilities header is read only with the secret, and removed either way', () => {
+  const handoff = native.createHandoff({ secret: SECRET, relayed: () => true });
+  const ask = (headers) => { const req = { headers }; const ok = handoff.requested(req); return [ok, [...handoff.capabilities(req)], native.CAPS_HEADER in req.headers]; };
+  assert.deepEqual(ask({ [native.HANDOFF_HEADER]: SECRET, [native.CAPS_HEADER]: 'skills, qa-later ,' }), [true, ['skills', 'qa-later'], false]);
+  assert.deepEqual(ask({ [native.HANDOFF_HEADER]: SECRET }), [true, [], false]);
+  // A client's own header without the secret (or with a wrong one) names nothing and does not reach the turn.
+  assert.deepEqual(ask({ [native.CAPS_HEADER]: 'skills' }), [false, [], false]);
+  assert.deepEqual(ask({ [native.HANDOFF_HEADER]: 'qa-guess', [native.CAPS_HEADER]: 'skills' }), [false, [], false]);
+  const direct = native.createHandoff({ secret: SECRET });
+  const req = { headers: { [native.HANDOFF_HEADER]: SECRET, [native.CAPS_HEADER]: 'skills' } };
+  assert.equal(direct.requested(req), false, 'not relayed by the front');
+  assert.deepEqual([...direct.capabilities(req)], []);
+  assert.deepEqual([...handoff.capabilities(null)], []);
+});
+
+test('a project with instruction skills stays in Node unless the front names the skills capability', async (t) => {
+  const project = { files: skillFiles, instructionSkills: skillProject().instructionSkills };
+  const logged = [];
+  const log = console.log;
+  console.log = (line) => logged.push(String(line));
+  let kept, enabledOnly;
+  try {
+    kept = await runTurn(t, { requested: true, frames: answer, project });
+    enabledOnly = await runTurn(t, { requested: true, caps: ['qa-other'], frames: answer, project });
+  } finally { console.log = log; }
+  for (const turn of [kept, enabledOnly]) {
+    assert.notEqual(turn.events.at(-1).type, 'prepared');
+    assert.equal(turn.requests.length, 1, 'Node ran the turn');
+  }
+  assert.equal(logged.filter((l) => l === '[chat] native executor not used for this turn: skills').length, 2);
+  assert.equal((await runTurn(t, { requested: true, caps: ['skills'], frames: answer, project })).events.at(-1).type, 'prepared');
+  // Through the real hand-off: the header from the front, with the secret.
+  const handoff = native.createHandoff({ secret: SECRET, relayed: () => true });
+  const real = await runTurn(t, { handoff, frames: answer, project, headers: { [native.HANDOFF_HEADER]: SECRET, [native.CAPS_HEADER]: 'skills' } });
+  assert.equal(real.events.at(-1).type, 'prepared');
+  assert.equal(native.CAPS_HEADER in real.req.headers, false);
+  // A project with no skills needs no capability.
+  assert.equal((await runTurn(t, { requested: true, frames: answer })).events.at(-1).type, 'prepared');
 });

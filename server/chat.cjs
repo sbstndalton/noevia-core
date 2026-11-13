@@ -388,6 +388,8 @@ function createChatHandler({
   async function handleChatInner(req, res, body, authn, preparation, execution = {}) {
     // Read (and its header removed) before anything else, so no later code sees the front's secret.
     const handoff = !!nativeHandoff?.requested?.(req);
+    // What the front's executor runs beyond the first step (rust-chat-native.cjs CAPS_HEADER), read with the request.
+    const handoffCaps = handoff && typeof nativeHandoff?.capabilities === 'function' ? nativeHandoff.capabilities(req) : new Set();
     // #778: once the routing question has opened the event stream, a later refusal is sent as an
     // error event on it rather than as a second set of headers. Before that, exactly as it was.
     let earlyStream = false;
@@ -1695,7 +1697,7 @@ function createChatHandler({
           providerId: provider.id, defaultProviderId: DEFAULT_PROVIDER_ID, machine: !!provider.machine, external: !!externalProvider, chatgpt: !!chatgptProvider, routeTarget: !!routeTarget,
           authorized: !!upstreamHeaders?.Authorization,
           retrievedImages: retrievedImages.length > 0, messages: wire,
-          skills: loadedSkills.size > 0 || (!!project && instructionSkills.list(project).length > 0),
+          skills: (loadedSkills.size > 0 || (!!project && instructionSkills.list(project).length > 0)) && !handoffCaps.has('skills'),
           provenance: provenanceOn, framingReasoner: !!(framingReasoner && chatFrame),
           narrowed: !!routing.narrowed, gate: !!(gate && gate.decision !== 'none'),
           supervision: nativeHandoff.supervising(),
@@ -1732,6 +1734,10 @@ function createChatHandler({
             firstMessage: chatTitleLib.firstUserMessage(history, message), firstReply: chatTitleLib.firstReply(history), enabled: !!chatTitles },
           message, spaceId, projectId: project?.id, declineEndsReply: !spaceId?.startsWith('diary'), record: !!record, streamIdleMs, compactOnly: body.compactOnly === true,
           sources: native.injectedSources({ injected: injectedEntries, placed: placedEntries, readable: readableFiles, reply: replySources }),
+          // #272/#546: the skill state the executor's checks start from; the checks themselves are core's bridges.
+          skills: project ? { loaded: [...loadedSkills].map(([file, s]) => ({ file, hash: s.hash, name: s.name })),
+            enabled: instructionSkills.list(project).filter((s) => s.status === 'enabled').map((s) => ({ file: s.file, hash: s.hash, name: s.name })),
+            revokedInHistory: [...revokedInHistory], imageWarning, coverageWarning: require('./source-coverage.cjs').coverageWarning(partialReads) } : null,
         });
         let text = null;
         try { text = JSON.stringify(frame); } catch { text = null; }
@@ -1769,22 +1775,13 @@ function createChatHandler({
       }
       return skillRevocation;
     };
-    // A skill body the model fetched itself is loaded too, at the version read. Tracked by WHAT was
-    // read, not by which tool read it: read_project_file, the Project documents box's
-    // project_read_file (same reader through MCP) or anything else. A successful call that names a
-    // skill file, or whose result carries a skill's SHA-256 (the reader's heading), counts. Tracking
-    // too much only makes revocation stricter, which is the safe direction.
+    // A skill body the model fetched itself is loaded too, at the version read (skill-reads.cjs, which the native
+    // executor's skills/read bridge uses too): only enabled skills of this exchange's snapshot not loaded yet.
     const noteSkillRead = (rawArgs, result) => {
       if (!project) return;
-      let name = null;
-      try { const args = JSON.parse(rawArgs || '{}'); if (args && typeof args.name === 'string') name = args.name; } catch { /* no usable args */ }
-      // The readers accept a unique bare name for a file stored under a path (#642), so the name
-      // is resolved the same way before it is compared with a skill's stored name.
-      const resolvedName = name ? require('./project-file-names.cjs').resolveProjectFile(project, name).file?.name ?? null : null;
-      const text = String(result ?? '');
-      for (const skill of instructionSkills.list(project)) {
-        if (skill.status !== 'enabled' || loadedSkills.has(skill.file)) continue;
-        if (skill.file === name || skill.file === resolvedName || text.includes(skill.hash)) { loadedSkills.set(skill.file, { hash: skill.hash, name: skill.name }); rememberSkill(skill.file, skill.hash, skill.name, skill.content); }
+      const candidates = instructionSkills.list(project).filter((skill) => skill.status === 'enabled' && !loadedSkills.has(skill.file));
+      for (const skill of require('./skill-reads.cjs').matchedReads(project, candidates, rawArgs, result)) {
+        loadedSkills.set(skill.file, { hash: skill.hash, name: skill.name }); rememberSkill(skill.file, skill.hash, skill.name, skill.content);
       }
     };
     const revocationText = () => `Skill ${skillRevocation.map((s) => JSON.stringify(s.name)).join(', ')} was disabled or changed during this reply, so no further steps were run.`;

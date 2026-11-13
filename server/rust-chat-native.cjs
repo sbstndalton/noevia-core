@@ -18,6 +18,12 @@
 // before the front writes a byte of its own and nothing runs twice. Without the header, or with the wrong value
 // (a browser's header rides along on the relay), nothing here changes the turn.
 //
+//   x-noevia-chat-handoff-caps: skills      (comma-separated tokens; with the secret only, else ignored)
+//
+// names what the front's executor runs beyond the first hand-off step, so a front older than core never gets a
+// turn it would run without its checks: `skills` (W5) its instruction skills checks (the skills bridges below).
+// Without it a turn whose project has instruction skills stays here ('skills'). The header is removed either way.
+//
 //   POST /internal/chat/tools/execute  {user, projectId, name, args, allowed, routes, chatKey, exchangeKey, editTarget?}
 //        -> 200 {text, failed}           one tool call through the toolboxes (index.cjs executeToolCall), as the
 //                                        user, counted as chat.cjs counts it (recordToolUse). `editTarget`: an
@@ -58,6 +64,21 @@
 //        the same functions chat.cjs calls, while those still live here. health and load answer 409 {enabled:false}
 //        when the local model manager is off; the executor never calls them then (the prepared frame's
 //        managerEnabled is false).
+//   POST /internal/chat/skills/revoked  {user, projectId, loaded: [{file, hash, name}]}
+//        -> 200 {gone: [{file, name}]}   the loaded skills that are gone, disabled, changed or no longer reviewed in
+//                                        the project as stored now (#272: instruction-skills.cjs revoked, as chat.cjs
+//                                        revokedSkills asks it); a project that is gone revokes them all
+//   POST /internal/chat/skills/read     {user, projectId, chatId, candidates: [{file, hash, name}], args, result}
+//        -> 200 {loaded: [{file, hash, name}]}   which candidates (the prepared frame's enabled skills the turn has
+//                                        not loaded yet) one successful tool call read (skill-reads.cjs, as chat.cjs
+//                                        noteSkillRead), each recorded in the account's skill ledger for the chat
+//                                        (skill-history.cjs record, chat.cjs rememberSkill)
+//   POST /internal/chat/skills/scrub    {user, projectId, chatId, messages: [{role, content} | null]}
+//        -> 200 {changed: [[index, content]], removed: [names]}   #546's scrub of the round-0 messages against the
+//                                        project as stored now (skill-history.cjs scrub, as chat.cjs runs it before its
+//                                        first round). `messages` holds what the scrub reads (null for a user or
+//                                        system message and for one whose content is not text); `changed` the new
+//                                        content of each message it replaced, `removed` the skill names it took out.
 //
 // Every bridge answers 404 to anything that is not the front (trusted-front.cjs): with file sharing on, this
 // listener is not loopback only. Every one names the relayed user (`user`) and runs as that user (index.cjs
@@ -80,12 +101,17 @@
 //   the prefill samples (step 17) and turnsInFlight (#1863 D2; the admission lease keeps the engine busy instead).
 //   The template tools cache (#1002) is not among them: the tools-allowed and tools-unsupported bridges read and
 //   write this process's shared gate (chat-template-caps.cjs toolsGate), the one chat.cjs uses.
-// - tools run against the project as stored when the call runs, not this turn's instruction-skills snapshot; a
-//   project with skills is not handed off, so the two differ only by a project change made while the turn runs.
+// - tools run against the project as stored when the call runs, not this turn's instruction-skills snapshot, and
+//   the skills/read bridge resolves a read's file name against it too; the two differ only by a project change
+//   made while the turn runs. A skill read whose version is no longer stored is recorded in the ledger without
+//   its text (its SHA-256 still scrubs it from later turns), and the next revocation check stops the turn anyway.
+// - the skill ledger: one per process (index.cjs), shared with chat.cjs, so a version a native turn recorded is
+//   scrubbed from the next turn whichever executor runs it.
 const crypto = require('node:crypto');
 const { trustedFront } = require('./trusted-front.cjs');
 
 const HANDOFF_HEADER = 'x-noevia-chat-handoff';
+const CAPS_HEADER = 'x-noevia-chat-handoff-caps';
 const PREPARED_VERSION = 1;
 const EXECUTE_PATH = '/internal/chat/tools/execute';
 const TARGET_PATH = '/internal/chat/tools/target';
@@ -96,6 +122,13 @@ const USAGE_PATH = '/internal/chat/usage';
 const PREFILL_PATH = '/internal/chat/prefill';
 const NATIVE_PREFIX = '/internal/chat/native/';
 const NATIVE_OPS = new Set(['health', 'load', 'tools-allowed', 'tools-unsupported', 'busy', 'title-auto-named', 'title-save']);
+const SKILLS_PREFIX = '/internal/chat/skills/';
+const SKILL_OPS = new Set(['revoked', 'read', 'scrub']);
+const SHA256 = /^[a-f0-9]{64}$/;
+// A skill's stored file name and its name (instruction-skills.cjs keeps names to 160; a file name is a storage path).
+const SKILL_FILE_CAP = 4096;
+const SKILL_LIST_CAP = 2000;
+const MESSAGE_LIST_CAP = 100000;
 const BODY_CAP = 16 * 1024 * 1024;
 // POST /api/chat's body cap (index.cjs STORED_HISTORY_BYTES, rust-chat-turn.cjs): a chat's first message fits in it.
 const CHAT_BODY_CAP = 32 * 1024 * 1024;
@@ -109,18 +142,25 @@ const LEASE_HEADER = 'X-Noevia-Lease';
 
 /**
  * `requested(req)`: whether the front asked for this turn's hand-off: a turn relayed by the front
- * (rust-chat-turn.cjs relayedUser) carrying the header with the per-start secret. The header is removed either way.
+ * (rust-chat-turn.cjs relayedUser) carrying the header with the per-start secret. The header is removed either way,
+ * and so is the capabilities header. `capabilities(req)`: the tokens that header named (a Set), read by
+ * `requested` and only for a request it accepted; empty otherwise.
  */
 function createHandoff({ secret, supervising = () => false, relayed = (req) => require('./rust-chat-turn.cjs').relayedUser(req) }) {
   const want = Buffer.from(String(secret || ''), 'utf8');
+  const caps = new WeakMap();
   function requested(req) {
     const raw = req?.headers?.[HANDOFF_HEADER];
-    if (req?.headers) delete req.headers[HANDOFF_HEADER];
+    const named = req?.headers?.[CAPS_HEADER];
+    if (req?.headers) { delete req.headers[HANDOFF_HEADER]; delete req.headers[CAPS_HEADER]; }
     if (typeof raw !== 'string' || !want.length || !relayed(req)) return false;
     const got = Buffer.from(raw, 'utf8');
-    return got.length === want.length && crypto.timingSafeEqual(got, want);
+    const ok = got.length === want.length && crypto.timingSafeEqual(got, want);
+    if (ok && typeof named === 'string' && named.length <= 1000) caps.set(req, new Set(named.split(',').map((t) => t.trim()).filter(Boolean)));
+    return ok;
   }
-  return { requested, supervising: () => { try { return supervising() === true; } catch { return true; } } };
+  const capabilities = (req) => (req && typeof req === 'object' && caps.get(req)) || new Set();
+  return { requested, capabilities, supervising: () => { try { return supervising() === true; } catch { return true; } } };
 }
 
 /** A message content the executor carries as it is: a list of text parts and image parts (image_url with a url). */
@@ -148,6 +188,7 @@ function refusal(t) {
   // executor carries, measures (context-fit counts each image_url) and sends as they are.
   if (t.retrievedImages) return 'retrieved-images';
   if (!t.messages.every((m) => typeof m?.content === 'string' || wireParts(m?.content))) return 'images';
+  // A project with instruction skills, for a front that does not say it runs their checks (CAPS_HEADER).
   if (t.skills) return 'skills';
   if (t.provenance) return 'provenance';
   if (t.framingReasoner) return 'framing-reasoner';
@@ -232,6 +273,13 @@ function preparedTurn(t) {
       compactOnly: t.compactOnly === true,
       sources: t.sources || { reply: [], injected: [] },
     },
+    // A project turn's instruction skills (#272/#546), null without a project: `loaded` the skills the prompt carries
+    // (pinned or picked automatically), `enabled` the snapshot's enabled skills a tool call may still load, in list
+    // order; `revokedInHistory` the names already taken out of the history, and the reply warning's other parts.
+    skills: t.skills ? {
+      loaded: t.skills.loaded, enabled: t.skills.enabled, revokedInHistory: t.skills.revokedInHistory,
+      imageWarning: t.skills.imageWarning || '', coverageWarning: t.skills.coverageWarning || '',
+    } : null,
   };
 }
 
@@ -267,7 +315,7 @@ function createAsUser({ userRow, runAs, currentWorkspace }) {
  */
 function createToolBridge({ secret, json, readJson, asUser, getProject, executeToolCall, writeTargetFor, recordToolUse, currentWorkspace, currentUser,
   editStorageAccount = () => null, recordUsage = () => {}, recordSample = () => {}, modelManager = null, templateToolsGate = null, chatTitles = null, chatBodyCap = CHAT_BODY_CAP,
-  log = (line) => console.warn(line) }) {
+  skillLedger = null, log = (line) => console.warn(line) }) {
   // Execute calls in progress by `${user}\u0000${exchangeKey}`: the abort bridge aborts their signals.
   const running = new Map();
   const callerGone = (req, res, controller = new AbortController()) => {
@@ -283,6 +331,7 @@ function createToolBridge({ secret, json, readJson, asUser, getProject, executeT
   const modelName = (v) => (typeof v === 'string' && v.length > 0 && v.length <= MODEL_CAP && !control(v) ? v : null);
   const names = (v) => (Array.isArray(v) && v.length <= 2000 && v.every((n) => typeof n === 'string' && n.length <= 200) ? v : null);
   const missing = (error) => error?.status === 404;
+  const instructionSkills = () => require('./instruction-skills.cjs');
   const noContent = (res) => { res.statusCode = 204; res.end(); };
   const noAccount = (res) => json(res, 404, { error: 'no such account' });
   // Every fact runs as the relayed user, so an account that is gone, disabled or revoked reads nothing (404).
@@ -340,16 +389,73 @@ function createToolBridge({ secret, json, readJson, asUser, getProject, executeT
     try { chatTitles.save(list, chat, title, first); } catch { /* the client saves it too */ }
     return noContent(res);
   }
+  // The skill bridges: a list of {file, hash, name} as the prepared frame carries them, or null.
+  const skillList = (v) => (Array.isArray(v) && v.length <= SKILL_LIST_CAP && v.every((k) => k && typeof k === 'object' && !Array.isArray(k)
+    && text(k.file, SKILL_FILE_CAP) && typeof k.hash === 'string' && SHA256.test(k.hash) && text(k.name, SKILL_FILE_CAP) !== null) ? v.map((k) => ({ file: k.file, hash: k.hash, name: k.name })) : null);
+  const pick = (k) => ({ file: k.file, hash: k.hash, name: k.name });
+  function skillOp(op, who, body, res) {
+    const projectId = text(body?.projectId, 200);
+    if (!projectId) return json(res, 400, { error: 'projectId is required.' });
+    const chatId = body?.chatId === undefined || body?.chatId === null ? null : text(body.chatId, CHAT_ID_CAP);
+    if (op !== 'revoked' && chatId === null && body?.chatId != null) return json(res, 400, { error: 'chatId is invalid.' });
+    if (op === 'revoked') {
+      const loaded = skillList(body?.loaded);
+      if (!loaded) return json(res, 400, { error: 'loaded is required.' });
+      // chat.cjs revokedSkills: the loaded skills against the project as stored now.
+      const gone = instructionSkills().revoked(getProject(projectId), new Map(loaded.map((k) => [k.file, { hash: k.hash, name: k.name }])));
+      return json(res, 200, { gone: gone.map((g) => ({ file: g.file, name: g.name })) });
+    }
+    const workspace = currentWorkspace();
+    const dir = workspace?.dir || null;
+    const assertActive = () => workspace?.assertActive?.();
+    if (op === 'read') {
+      const candidates = skillList(body?.candidates), args = text(body?.args, chatBodyCap), result = text(body?.result, chatBodyCap);
+      if (!candidates || args === null || result === null) return json(res, 400, { error: 'candidates, args and result are required.' });
+      const project = getProject(projectId);
+      const matched = require('./skill-reads.cjs').matchedReads(project, candidates, args, result);
+      // chat.cjs rememberSkill, with the version's text as stored now (the turn's snapshot is chat.cjs's own).
+      const stored = matched.length && project ? instructionSkills().list(project) : [];
+      for (const k of matched) {
+        const content = stored.find((s) => s.file === k.file && s.hash === k.hash)?.content || '';
+        if (dir && skillLedger) skillLedger.record(dir, project || { id: projectId, files: [] }, { file: k.file, hash: k.hash, name: k.name, content }, { chatId, assertActive });
+      }
+      return json(res, 200, { loaded: matched.map(pick) });
+    }
+    const raw = body?.messages;
+    const messages = Array.isArray(raw) && raw.length <= MESSAGE_LIST_CAP && raw.every((m) => m === null || (m && typeof m === 'object' && !Array.isArray(m)
+      && text(m.role, 40) && typeof m.content === 'string')) ? raw.map((m) => (m ? { role: m.role, content: m.content } : null)) : null;
+    if (!messages) return json(res, 400, { error: 'messages is required.' });
+    // chat.cjs before its first round: against the project as stored now, when it still exists.
+    const current = getProject(projectId);
+    const scrubbed = current && dir && skillLedger ? skillLedger.scrub({ dir, project: current, messages, chatId }) : null;
+    const changed = [];
+    if (scrubbed?.removed.length) scrubbed.messages.forEach((m, i) => { if (m !== messages[i]) changed.push([i, m.content]); });
+    return json(res, 200, { changed, removed: scrubbed?.removed.length ? scrubbed.removed : [] });
+  }
   return async function handle(req, res) {
     const path = String(req.url || '').split('?')[0];
     const op = path.startsWith(NATIVE_PREFIX) ? path.slice(NATIVE_PREFIX.length) : null;
-    if (path !== EXECUTE_PATH && path !== TARGET_PATH && path !== ABORT_PATH && path !== EDIT_TARGET_PATH && path !== USAGE_PATH && path !== PREFILL_PATH && !NATIVE_OPS.has(op)) return false;
+    const skill = path.startsWith(SKILLS_PREFIX) && SKILL_OPS.has(path.slice(SKILLS_PREFIX.length)) ? path.slice(SKILLS_PREFIX.length) : null;
+    if (path !== EXECUTE_PATH && path !== TARGET_PATH && path !== ABORT_PATH && path !== EDIT_TARGET_PATH && path !== USAGE_PATH && path !== PREFILL_PATH && !NATIVE_OPS.has(op) && !skill) return false;
     if (!trustedFront(req, secret) || req.method !== 'POST') { json(res, 404, { error: 'Not found' }); return true; }
     let body;
-    // A title bridge carries the chat's first message, which may be as long as a chat request.
-    const cap = op === 'title-auto-named' || op === 'title-save' ? Math.max(BODY_CAP, chatBodyCap + 1024 * 1024) : BODY_CAP;
+    // A title bridge carries the chat's first message, which may be as long as a chat request; a skill read its tool
+    // result and a scrub the turn's messages.
+    const cap = op === 'title-auto-named' || op === 'title-save' || skill === 'read' || skill === 'scrub' ? Math.max(BODY_CAP, chatBodyCap + 1024 * 1024) : BODY_CAP;
     try { body = await readJson(req, cap); } catch { json(res, 400, { error: 'invalid JSON' }); return true; }
     const count = (v) => (v === null || (Number.isSafeInteger(v) && v >= 0) ? v : undefined);
+    if (skill) {
+      const who = text(body?.user, USER_CAP);
+      if (!who) { json(res, 400, { error: 'user is required.' }); return true; }
+      try { await asUser(who, async () => skillOp(skill, who, body, res)); }
+      catch (error) {
+        if (missing(error)) { noAccount(res); return true; }
+        // The detail can name a stored path: logged here, never sent.
+        log(`[chat] native skills ${skill} bridge failed: ${String(error?.message || error).slice(0, 300)}`);
+        json(res, 500, { error: 'the skills could not be checked' });
+      }
+      return true;
+    }
     if (op) {
       try { await nativeFact(op, body, req, res); }
       catch (error) {
@@ -465,4 +571,4 @@ function createToolBridge({ secret, json, readJson, asUser, getProject, executeT
   };
 }
 
-module.exports = { HANDOFF_HEADER, PREPARED_VERSION, EXECUTE_PATH, TARGET_PATH, ABORT_PATH, EDIT_TARGET_PATH, USAGE_PATH, PREFILL_PATH, NATIVE_PREFIX, CHAT_BODY_CAP, PREPARED_CAP, createHandoff, refusal, reservedText, frameTooLarge, injectedSources, preparedTurn, createAsUser, createToolBridge };
+module.exports = { HANDOFF_HEADER, CAPS_HEADER, PREPARED_VERSION, EXECUTE_PATH, TARGET_PATH, ABORT_PATH, EDIT_TARGET_PATH, USAGE_PATH, PREFILL_PATH, NATIVE_PREFIX, SKILLS_PREFIX, CHAT_BODY_CAP, PREPARED_CAP, createHandoff, refusal, reservedText, frameTooLarge, injectedSources, preparedTurn, createAsUser, createToolBridge };
