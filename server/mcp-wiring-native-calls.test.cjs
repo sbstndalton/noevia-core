@@ -108,7 +108,13 @@ test('a front that runs no calls (404) leaves the call to this process, which th
   // This process's own path, refusals included.
   assert.equal(await b.run(signedIn({ internalEditTarget: 'digest-1' }), 'open_tool', 'open'),
     'ERROR: open_tool was approved as a project file edit, but "open_tool" was offered by MCP server "open"; it was not run.');
-  assert.equal(b.asked.length, 1, 'asked once, then not again');
+  assert.equal(b.asked.length, 1, 'asked once, then not again for a minute');
+  const realNow = Date.now;
+  try {
+    Date.now = () => realNow() + 61 * 1000;
+    await b.run(signedIn(), 'open_tool', 'open');
+    assert.equal(b.asked.length, 2, 'asked again after a minute');
+  } finally { Date.now = realNow; }
 });
 
 const UNAVAILABLE = 'ERROR calling open_tool: MCP tools are unavailable right now. Try again in a moment.';
@@ -116,12 +122,15 @@ const UNKNOWN = 'ERROR calling open_tool: the tool call did not report back, so 
 const STOPPED = 'ERROR calling open_tool: This operation was aborted';
 
 test('an answer is worded by what is known: not reached, refused, or possibly run', async () => {
-  const busy = () => { throw Object.assign(new Error('The project store is busy. Try again shortly.'), { status: 503, code: 'PROJECTS_BUSY', cause: new TypeError('fetch failed') }); };
+  const refusedConnect = Object.assign(new Error('connect ECONNREFUSED'), { code: 'ECONNREFUSED' });
+  const busy = () => { throw Object.assign(new Error('The project store is busy. Try again shortly.'), { status: 503, code: 'PROJECTS_BUSY', cause: Object.assign(new TypeError('fetch failed'), { cause: refusedConnect }) }); };
+  const reset = () => { throw Object.assign(new Error('The project store is busy. Try again shortly.'), { status: 503, code: 'PROJECTS_BUSY', cause: Object.assign(new TypeError('fetch failed'), { cause: Object.assign(new Error('other side closed'), { code: 'UND_ERR_SOCKET' }) }) }); };
   const late = () => { throw Object.assign(new Error('The project store is busy. Try again shortly.'), { status: 503, code: 'PROJECTS_BUSY', cause: Object.assign(new Error('timed out'), { name: 'TimeoutError' }) }); };
   const cases = [
     [busy, UNAVAILABLE],
+    [reset, UNKNOWN],
     [() => ({ status: 503, body: { error: 'unavailable' } }), UNAVAILABLE],
-    [() => ({ status: 400, body: { error: 'invalid name' } }), UNAVAILABLE],
+    [() => ({ status: 400, body: { error: 'invalid name' } }), 'ERROR calling open_tool: the tool call was refused before it ran, so nothing was changed. Do not repeat it unchanged.'],
     [() => ({ status: 500, body: { error: 'the call failed' } }), UNKNOWN],
     [() => ({ status: 200, body: { text: 5 } }), UNKNOWN],
     [() => ({ status: 200, body: null }), UNKNOWN],

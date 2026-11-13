@@ -407,7 +407,7 @@ function createMcpWiring({
     const known = route.known;
     const server = MCP_SERVER_BY_ID.get(known.serverId);
     if (!server) return `ERROR: tool "${name}" belongs to MCP server "${known.serverId}", which is no longer configured`;
-    if (nativeCalls && !nativeOff && nativeCalls.enabled()) {
+    if (nativeCalls && Date.now() >= nativeOffUntil && nativeCalls.enabled()) {
       const answer = await executeNativeToolCall(name, args, signal, server);
       if (answer !== NOT_NATIVE) return answer;
     }
@@ -545,7 +545,16 @@ function createMcpWiring({
   const NATIVE_UNAVAILABLE = 'MCP tools are unavailable right now. Try again in a moment.';
   /** The front may have sent the call and then failed to report: a write may have happened. */
   const NATIVE_UNKNOWN = 'the tool call did not report back, so it may or may not have run. Check before calling it again.';
-  let nativeOff = false;
+  /** A body the front would not take: nothing ran, and the same call would be refused again. */
+  const NATIVE_REFUSED = 'the tool call was refused before it ran, so nothing was changed. Do not repeat it unchanged.';
+  /** How long a 404 (a front without tool calls) keeps this process running them itself before it asks again. */
+  const NATIVE_RECHECK_MS = 60 * 1000;
+  let nativeOffUntil = 0;
+  /** Whether a failed store request provably never reached the front (nothing can have run). */
+  const neverSent = (err) => {
+    for (let e = err, i = 0; e && i < 4; e = e.cause, i++) if (e.code === 'ECONNREFUSED') return true;
+    return false;
+  };
   const text = (v) => (v === null || v === undefined ? null : String(v));
   /** One routed call, run by the Rust front (track R5). The scope's facts travel with it; the Nextcloud
    *  pass-through is the one credential this process supplies (it holds the storage connection), and only
@@ -575,18 +584,20 @@ function createMcpWiring({
       // The store's deadline passed: the front may have sent the call (core's own timeout said this).
       if (err && err.cause && err.cause.name === 'TimeoutError') return stopped();
       logger.warn(`[mcp] ${name}: the front's tool call could not be asked (${err && err.code ? err.code : 'error'})`);
-      return `ERROR calling ${name}: ${NATIVE_UNAVAILABLE}`;
+      // Only a request that never left can be retried safely; a reset after it was sent may have let the
+      // front act.
+      return `ERROR calling ${name}: ${neverSent(err) ? NATIVE_UNAVAILABLE : NATIVE_UNKNOWN}`;
     }
     if (answer && answer.status === 404) {
-      if (!nativeOff) logger.warn('[mcp] NOEVIA_RUST_MCP_CALLS is on here, but the front runs no tool calls: this process runs them');
-      nativeOff = true;
+      logger.warn('[mcp] NOEVIA_RUST_MCP_CALLS is on here, but the front runs no tool calls: this process runs them for a minute');
+      nativeOffUntil = Date.now() + NATIVE_RECHECK_MS;
       return NOT_NATIVE;
     }
     if (signal && signal.aborted) return stopped();
-    // Refused before anything was sent (a body it would not take, or no clients): safe to retry.
+    // Refused before anything was sent: a body it would not take (400), or no clients (503).
     if (answer && (answer.status === 400 || answer.status === 503)) {
       logger.warn(`[mcp] ${name}: the front's tool call answered ${answer.status}`);
-      return `ERROR calling ${name}: ${NATIVE_UNAVAILABLE}`;
+      return `ERROR calling ${name}: ${answer.status === 400 ? NATIVE_REFUSED : NATIVE_UNAVAILABLE}`;
     }
     const body = answer && answer.status === 200 ? answer.body : null;
     if (!body || typeof body.text !== 'string' || typeof body.reduce !== 'boolean') {
