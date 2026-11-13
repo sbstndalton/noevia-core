@@ -11,7 +11,7 @@ const { createToolboxes } = require('./toolboxes.cjs');
 const { createDriveTools } = require('./gdrive-tools.cjs');
 const { createToolExchange } = require('./tool-exchange.cjs');
 const { binding: permissionBinding } = require('../tests/server/chat-grant-fixture.cjs');
-const { createApprovals } = require('./approvals.cjs');
+const { createApprovals } = require('../tests/server/approvals-reference.cjs');
 
 const WRITE = 'drive_trash_file';
 

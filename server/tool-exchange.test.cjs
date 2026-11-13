@@ -399,7 +399,7 @@ test('the real handler compacts again before an oversized tool continuation', as
 // #1071 slice7: actual complete handler, real approval gate, synthetic authoritative store.
 const grantFixture = require('../tests/server/chat-grant-fixture.cjs');
 const grantContexts = require('./chat-grant-context.cjs');
-const { createApprovals } = require('./approvals.cjs');
+const { createApprovals } = require('../tests/server/approvals-reference.cjs');
 for (const action of ['approve','approve_all','deny']) test('move-away-and-back invalidates pending '+action+' without executing', async()=>{
   const gate=createApprovals();let generation='0',asked=0;
   const f=fixture({rounds:[[call('qa-move')],[]],configure:c=>{

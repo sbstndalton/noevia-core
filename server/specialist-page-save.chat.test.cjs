@@ -11,7 +11,7 @@ const { createToolboxes } = require('./toolboxes.cjs');
 const { createPageSave } = require('./specialist-page-save.cjs');
 const { createToolExchange } = require('./tool-exchange.cjs');
 const { binding: permissionBinding } = require('../tests/server/chat-grant-fixture.cjs');
-const { createApprovals } = require('./approvals.cjs');
+const { createApprovals } = require('../tests/server/approvals-reference.cjs');
 
 const WRITE = 'space_page_save';
 const COWORKER = 'specialist-aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';

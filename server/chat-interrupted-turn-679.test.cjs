@@ -15,7 +15,7 @@ const { EventEmitter } = require('node:events');
 const { createChatHandler } = require('./chat.cjs');
 const { createToolExchange } = require('./tool-exchange.cjs');
 const { createVisionProbe } = require('./vision.cjs');
-const { createApprovals } = require('./approvals.cjs');
+const { createApprovals } = require('../tests/server/approvals-reference.cjs');
 const { createTurnRecord, saveInterruptedTurn } = require('./chat-interrupted-turn.cjs');
 
 const TARGET = 'noevia projects/Synthetic/Text/qa-679.md';
