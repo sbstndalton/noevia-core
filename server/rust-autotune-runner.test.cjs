@@ -53,6 +53,9 @@ test('#2516: a front that cannot re-read, or cannot be reached, refuses the load
   assert.equal(refused.tuningActive(), false, 'an unreachable front is no active run');
   const gone = createFrontAutotune({ client: fakeFront({ flush: new Error('timeout') }).client, log: () => {} });
   await assert.rejects(gone.flushReload('m'), (e) => e.publicMessage === says);
+  // A front without the routes runs no auto-tune: nothing is owed.
+  const older = createFrontAutotune({ client: fakeFront({ flush: { status: 404, body: { error: 'Not found' } } }).client });
+  await older.flushReload('m');
 });
 
 test('#2516: the manager asks the front facade before a load and counts its run as tuning', async t => {

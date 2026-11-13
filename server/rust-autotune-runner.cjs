@@ -33,6 +33,8 @@ function createFrontAutotune({ client, intervalMs = 1000, log = (m) => console.w
       try { answer = await client.autotune('flush', model ? { model } : {}, { timeoutMs: 125000 }); }
       catch { log('[autotune] the front did not answer the re-read'); throw Object.assign(new Error(NOT_REREAD), { publicMessage: NOT_REREAD }); }
       if (answer.status === 200 && answer.body?.flushed === true) return;
+      // A front without these routes runs no auto-tune, so nothing can be owed (Node's flush is then a no-op).
+      if (answer.status === 404) return;
       const message = typeof answer.body?.error === 'string' && answer.body.error ? answer.body.error : NOT_REREAD;
       throw Object.assign(new Error(message), { publicMessage: message });
     },
