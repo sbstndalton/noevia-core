@@ -153,6 +153,13 @@ function createClient({ port, token, fetchImpl = globalThis.fetch, timeoutMs = T
       return body;
     },
     presetBaseline,
+    /** #2516: the front's native auto-tune runner (rust-autotune-runner.cjs): `{ running }` for
+     *  `state`, its `flushReload(model)` for `flush`. `{ status, body }`; throws when the front does not
+     *  answer in time. */
+    async autotune(op, payload, { timeoutMs: wait = 5000 } = {}) {
+      if (op !== 'state' && op !== 'flush') throw new Error(`not an auto-tune op: ${op}`);
+      return call(`autotune/${op}`, payload, wait);
+    },
     async grantContext(user, chat) {
       const { status, body } = await call('chat/grant-context', { user, chat });
       if (status !== 200) throw moveFailure(status, body);
