@@ -44,6 +44,7 @@ const GRANTABLE = Object.freeze([ACTIONS.READ, ACTIONS.EDIT, ACTIONS.EXECUTE, AC
   ACTIONS.NETWORK, ACTIONS.DELETE, ACTIONS.GIT_PUSH]);
 const DEFAULT_CAPABILITIES = Object.freeze([ACTIONS.READ, ACTIONS.EDIT, ACTIONS.EXECUTE]);
 
+const FRONT_OWNED = require('./rust-code-executor.cjs').REFUSED;
 const fail = (status, message) => Object.assign(Error(message), { status, publicMessage: message });
 
 /** `CODE_REPOS=name|/path,other|/path2` — the only repositories a task can ever be given. */
@@ -100,7 +101,10 @@ function createCodeService({ repos, connect, egress = null, engine = undefined, 
   harnessUser = parseUser(process.env.CODE_HARNESS_USER), sharedContext = () => '', review = null, pipeline = null,
   // #1062: `{ enter(): release, paused(): boolean }`, the model manager's maintenance gate; null
   // where there is no gate (a provider other than the native engine).
-  inference = null }) {
+  inference = null,
+  // Rust port R7 (rust-code-executor.cjs): the Rust front runs Code tasks. This process then never recovers a
+  // tenant's code journals (the front's live tasks would read as interrupted) and starts, answers and cancels none.
+  frontOwned = false }) {
   // The pipeline (#705): `{ enabled(), create({ jobs, workspaces, harness, askApproval }) }`. It needs
   // the sandbox as well as its flag; anything less and the Planner preparation is simply not offered.
   const pipelineOn = () => {
@@ -147,12 +151,12 @@ function createCodeService({ repos, connect, egress = null, engine = undefined, 
     let store = stores.get(workspace.dir);
     if (!store) {
       store = leased(createJobs({ dir: workspace.dir, kinds: ['code'], maxJobs: 50, retainMs: 14 * 86400000, now }));
-      store.recover();
+      if (!frontOwned) store.recover();
       // With a sandbox the worktrees live on a volume mounted at the same path in both
       // containers, and are handed to the uid the harness runs as (noevia runs as root; the
       // sandbox deliberately does not).
       const workspaces = createCodeWorkspaces({ dir: workspace.dir, treeRoot, owner: harnessUser, now });
-      workspaces.recover();
+      if (!frontOwned) workspaces.recover();
       const harness = createCodeHarness({ jobs: store, workspaces, egress, log, now, askApproval,
         ...(engine ? { engine } : {}), ...(review ? { review } : {}) });
       store = { jobs: store, workspaces, harness, pipeline: null };
@@ -238,6 +242,7 @@ function createCodeService({ repos, connect, egress = null, engine = undefined, 
       return view(owned(workspace, project, taskId), pendingFor(taskId));
     },
     async start(workspace, project, body = {}) {
+      if (frontOwned) throw fail(409, FRONT_OWNED);
       const repo = repositories.find((r) => r.id === String(body.repository || ''));
       if (!repo) throw fail(400, 'Choose a repository the operator registered on this server.');
       const prompt = String(body.prompt || '').trim();
@@ -286,6 +291,7 @@ function createCodeService({ repos, connect, egress = null, engine = undefined, 
         sharedContext: require('./shared-context.cjs').read(project).code };
     },
     decide(workspace, project, taskId, decision, approvalId) {
+      if (frontOwned) throw fail(409, FRONT_OWNED);
       owned(workspace, project, taskId);
       if (!['approve', 'approve_all', 'deny'].includes(decision)) throw fail(400, 'Unknown decision');
       // The answer is for the card the person saw, named by its id — never "whatever this task
@@ -303,6 +309,7 @@ function createCodeService({ repos, connect, egress = null, engine = undefined, 
       return { ok: true };
     },
     cancel(workspace, project, taskId) {
+      if (frontOwned) throw fail(409, FRONT_OWNED);
       owned(workspace, project, taskId);
       // Refuse anything still waiting first, so a cancelled task never leaves a card that
       // could later be answered into an action.
