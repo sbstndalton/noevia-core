@@ -19,7 +19,7 @@ const grantFixture = require('../tests/server/chat-grant-fixture.cjs');
 const SECRET = 'qa-front-secret-0123456789abcdef';
 
 // One synthetic turn through the real handleChat: a manual project, the local default provider, a scripted engine.
-async function runTurn(t, { handoff = null, requested = false, supervising = false, frames, headersFor = () => ({}), project: extra = {}, before = () => {}, headers = {} } = {}) {
+async function runTurn(t, { handoff = null, requested = false, supervising = false, frames, headersFor = () => ({}), project: extra = {}, before = () => {}, headers = {}, deps = {}, history = [] } = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'noevia-native-handoff-'));
   before(dir);
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
@@ -58,9 +58,10 @@ async function runTurn(t, { handoff = null, requested = false, supervising = fal
     grantContext: async (raw) => grantFixture.context(raw, { holder: { kind: 'absent' } }), chatWideApproved: () => false, awaitApproval: async () => 'approve',
     recordUsage() {}, recordToolUse() {}, sourceWaitMs: 0,
     nativeHandoff: handoff || (requested ? { requested: () => true, supervising: () => supervising } : null),
+    ...deps,
   });
   const req = { headers: { ...headers } };
-  await handler.handleChat(req, res, { message: 'QA hello', projectId: project.id, chatId: 'qa-chat-1', history: [] }, { user });
+  await handler.handleChat(req, res, { message: 'QA hello', projectId: project.id, chatId: 'qa-chat-1', history }, { user });
   await new Promise((resolve) => setImmediate(resolve));
   return { events, requests, req };
 }
@@ -110,6 +111,48 @@ test('a turn the native executor can run ends after its preparation with the pre
   assert.ok(Number.isFinite(last.startedAt) && last.startedAt <= Date.now());
   assert.equal(last.managerEnabled, true);
   assert.equal(last.modelLease, false, 'this test manager grants no lease');
+});
+
+test('the prepared frame says the front holds the model lease and runs the title, and Node takes no lease of its own', async (t) => {
+  const leases = [];
+  const manager = { enabled: true, load: async () => ({ ok: true }), acquireLease: async (model) => { leases.push(model); return null; },
+    health: async () => ({ ok: true, body: { all_models_loaded: [{ model_name: 'qa-model', loaded: true, recipe_options: { ctx_size: 32768 } }] } }) };
+  const titles = { save() { throw Error('Node must not save the title of a handed-off turn'); }, autoNamed: () => true };
+  const history = [{ role: 'user', content: 'QA first question' }, { role: 'assistant', content: 'QA first answer' }];
+  const handed = await runTurn(t, { requested: true, frames: answer, history, deps: { modelManager: manager, chatTitles: titles } });
+  const last = handed.events.at(-1);
+  assert.equal(last.type, 'prepared');
+  assert.equal(last.modelLease, true);
+  assert.equal(last.managerEnabled, true);
+  assert.deepEqual(last.chat.title, { chatId: 'qa-chat-1', listId: 'qa-project', firstMessage: 'QA first question', firstReply: false, enabled: true });
+  assert.deepEqual(leases, [], 'the lease is the front\'s from the cut: this process asked the gate for none');
+  assert.equal(handed.requests.length, 0);
+  // The same turn without the hand-off takes the lease here, as always.
+  await runTurn(t, { frames: answer, history, deps: { modelManager: manager } });
+  assert.deepEqual(leases, ['qa-model']);
+});
+
+test('a refusal input that throws keeps the turn in Node instead of failing it', async (t) => {
+  const plain = await runTurn(t, { frames: answer });
+  const egress = require('./provider-egress.cjs');
+  const validate = egress.validateToolArguments;
+  t.after(() => { egress.validateToolArguments = validate; });
+  const throwing = [
+    ['supervising', { handoff: { requested: () => true, supervising: () => { throw Error('QA flag store down'); } } }],
+    ['stream guard', { requested: true, before: () => { egress.validateToolArguments = () => { throw Error('QA schema broken'); }; } }],
+  ];
+  for (const [what, options] of throwing) {
+    const logged = [], warned = [];
+    const log = console.log, warn = console.warn;
+    console.log = (line) => logged.push(String(line));
+    console.warn = (...a) => warned.push(a.join(' '));
+    let kept;
+    try { kept = await runTurn(t, { frames: answer, ...options }); } finally { console.log = log; console.warn = warn; egress.validateToolArguments = validate; }
+    assert.deepEqual(stable(kept.events), stable(plain.events), what);
+    assert.equal(kept.requests.length, 1, what);
+    assert.ok(logged.includes('[chat] native executor not used for this turn: refusal-input'), what);
+    assert.ok(warned.some((line) => line.startsWith('[chat] native executor refusal inputs could not be read: QA ')), what);
+  }
 });
 
 test('a turn it cannot run goes on in Node, exactly as without the request', async (t) => {
@@ -204,7 +247,8 @@ test('the target bridge describes a write, and neither bridge answers anyone but
   const gone = bridge({ asUser: async () => { throw Object.assign(Error('no such account'), { status: 404 }); } });
   assert.deepEqual(await gone.call(native.TARGET_PATH, body), { handled: true, status: 404, body: { error: 'no such account' } });
   assert.deepEqual((await gone.call(native.EXECUTE_PATH, { ...body, allowed: [], routes: [] })).status, 404);
-  assert.equal((await call(native.TARGET_PATH, { ...body, chatKey: 'x'.repeat(201) })).status, 400);
+  assert.equal((await call(native.TARGET_PATH, { ...body, chatKey: 'x'.repeat(401) })).status, 400);
+  assert.equal((await call(native.TARGET_PATH, { ...body, chatKey: 'x'.repeat(400) })).status, 200, 'the chat id cap of the title bridges');
   const failing = bridge({ executeToolCall: async () => { throw Error('QA engine down'); } });
   assert.deepEqual((await failing.call(native.EXECUTE_PATH, { user: 'qa-user', name: 'x', args: '{}', allowed: [], routes: [] })), { handled: true, status: 500, body: { error: 'QA engine down' } });
 });
@@ -217,35 +261,130 @@ test('the usage and prefill bridges record what a native reply used, in this pro
   for (const bad of [{ reported: { ...reported, promptTokens: -1 } }, { reported: { ...reported, tokensPerSecond: 'x' } }, { model: '' }, { reported: [] }]) {
     assert.equal((await call(native.USAGE_PATH, { user: 'qa-user', model: 'qa-model', reported, ...bad })).status, 400, JSON.stringify(bad));
   }
-  assert.deepEqual(await call(native.PREFILL_PATH, { model: 'qa-model', promptTokens: 52, firstTokenMs: 310 }), { handled: true, status: 204, body: undefined });
+  assert.deepEqual(await call(native.PREFILL_PATH, { user: 'qa-user', model: 'qa-model', promptTokens: 52, firstTokenMs: 310 }), { handled: true, status: 204, body: undefined });
+  assert.deepEqual(calls.at(-2), ['asUser', 'qa-user']);
   assert.deepEqual(calls.at(-1), ['recordSample', 'qa-model', 52, 310]);
-  assert.equal((await call(native.PREFILL_PATH, { model: 'qa-model', promptTokens: 0, firstTokenMs: 310 })).status, 400);
+  for (const bad of [{ promptTokens: 0 }, { user: undefined }, { model: 'qa\u0000model' }]) {
+    assert.equal((await call(native.PREFILL_PATH, { user: 'qa-user', model: 'qa-model', promptTokens: 52, firstTokenMs: 310, ...bad })).status, 400, JSON.stringify(bad));
+  }
+  assert.equal((await call(native.USAGE_PATH, { user: 'qa-user', model: 'qa\nmodel', reported })).status, 400, 'a control character in model');
+  const gone = bridge({ asUser: async () => { throw Object.assign(Error('no such account'), { status: 404 }); } });
+  assert.deepEqual(await gone.call(native.PREFILL_PATH, { user: 'qa-gone', model: 'qa-model', promptTokens: 52, firstTokenMs: 310 }), { handled: true, status: 404, body: { error: 'no such account' } });
+  assert.deepEqual(await gone.call(native.USAGE_PATH, { user: 'qa-gone', model: 'qa-model', reported }), { handled: true, status: 404, body: { error: 'no such account' } });
   assert.equal((await call(native.USAGE_PATH, { user: 'qa-user', model: 'qa-model', reported }, { trusted: false })).status, 404);
 });
 
-test('the native fact bridges answer through the functions chat.cjs calls', async () => {
+test('the native fact bridges answer through the functions chat.cjs calls, as the user', async () => {
   const seen = [];
-  const { call } = bridge({
+  const { call, calls } = bridge({
     modelManager: { enabled: true, health: async () => ({ ok: true, body: { all_models_loaded: [{ model_name: 'qa-model', loaded: true }] } }),
-      load: async (model, options) => { seen.push(['load', model, options]); return { ok: true }; }, inferenceBusy: (n) => { seen.push(['busy', n]); return true; } },
+      load: async (...a) => { seen.push(['load', ...a]); return { ok: true }; }, inferenceBusy: (n) => { seen.push(['busy', n]); return true; } },
     templateToolsGate: { allowsTools: async (manager, model) => { seen.push(['allows', model]); return model !== 'qa-no-tools'; }, markUnsupported: (model) => seen.push(['unsupported', model]) },
     chatTitles: { autoNamed: (list, chat, first) => { seen.push(['autoNamed', list, chat, first]); return true; }, save: (...a) => seen.push(['save', ...a]) },
   });
   const p = (op) => `${native.NATIVE_PREFIX}${op}`;
-  assert.deepEqual((await call(p('health'), {})).body, { ok: true, body: { all_models_loaded: [{ model_name: 'qa-model', loaded: true }] } });
-  assert.deepEqual((await call(p('load'), { model: 'qa-model' })).body, { ok: true });
-  assert.deepEqual((await call(p('tools-allowed'), { model: 'qa-model' })).body, { allowed: true });
-  assert.deepEqual((await call(p('tools-allowed'), { model: 'qa-no-tools' })).body, { allowed: false });
-  assert.equal((await call(p('tools-unsupported'), { model: 'qa-model' })).status, 204);
-  assert.deepEqual((await call(p('busy'), {})).body, { busy: true });
-  const title = { user: 'qa-user', listId: 'qa-project', chatId: 'qa-chat-1', firstMessage: 'QA hello' };
+  const user = 'qa-user', token = '0123456789abcdef0123456789abcdef';
+  assert.deepEqual((await call(p('health'), { user })).body, { ok: true, body: { all_models_loaded: [{ model_name: 'qa-model', loaded: true }] } });
+  assert.deepEqual((await call(p('load'), { user, model: 'qa-model', lease: token })).body, { ok: true });
+  assert.deepEqual((await call(p('tools-allowed'), { user, model: 'qa-model' })).body, { allowed: true });
+  assert.deepEqual((await call(p('tools-allowed'), { user, model: 'qa-no-tools' })).body, { allowed: false });
+  assert.equal((await call(p('tools-unsupported'), { user, model: 'qa-model' })).status, 204);
+  assert.deepEqual((await call(p('busy'), { user })).body, { busy: true });
+  const title = { user, listId: 'qa-project', chatId: 'qa-chat-1', firstMessage: 'QA hello' };
   assert.deepEqual((await call(p('title-auto-named'), title)).body, { autoNamed: true });
   assert.equal((await call(p('title-save'), { ...title, title: 'QA Title' })).status, 204);
-  assert.deepEqual(seen, [['load', 'qa-model', {}], ['allows', 'qa-model'], ['allows', 'qa-no-tools'], ['unsupported', 'qa-model'], ['busy', 1],
+  assert.equal(calls.filter(([what, who]) => what === 'asUser' && who === user).length, 8, 'every fact ran as the user');
+  // The load runs inside the front's lease (no second lease from the gate), with the caller's abort signal.
+  const [, model, options, signal, extra] = seen[0];
+  assert.deepEqual([seen[0][0], model, options], ['load', 'qa-model', {}]);
+  assert.ok(signal instanceof AbortSignal && !signal.aborted);
+  assert.deepEqual(Object.keys(extra), ['lease']);
+  assert.deepEqual(extra.lease.headers(), { 'X-Noevia-Lease': token });
+  assert.deepEqual(seen.slice(1), [['allows', 'qa-model'], ['allows', 'qa-no-tools'], ['unsupported', 'qa-model'], ['busy', 1],
     ['autoNamed', 'qa-project', 'qa-chat-1', 'QA hello'], ['save', 'qa-project', 'qa-chat-1', 'QA Title', 'QA hello']]);
-  for (const [op, b] of [['load', {}], ['title-save', title], ['title-auto-named', { ...title, chatId: '' }]]) assert.equal((await call(p(op), b)).status, 400, op);
-  assert.equal((await call(p('health'), {}, { trusted: false })).status, 404);
-  assert.deepEqual(await call(`${native.NATIVE_PREFIX}other`, {}), { handled: false, status: undefined, body: undefined });
-  const off = bridge({ modelManager: { enabled: false } });
-  assert.deepEqual((await off.call(p('health'), {})).body, { ok: false, body: null });
+  // With no gate the front holds no lease (null): chat.cjs's load without one.
+  seen.length = 0;
+  assert.deepEqual((await call(p('load'), { user, model: 'qa-model', lease: null })).body, { ok: true });
+  assert.equal(seen[0].length, 4, 'no lease argument');
+  assert.ok(seen[0][3] instanceof AbortSignal);
+  const bad = [['load', { user, model: 'qa-model' }], ['load', { user, model: 'qa-model', lease: '' }], ['load', { user, model: 'qa-model', lease: 'a b' }],
+    ['load', { user, model: 'qa-model', lease: 'x'.repeat(201) }], ['load', { user, model: 'qa-model', lease: 7 }], ['load', { user, lease: token }],
+    ['tools-allowed', { user, model: 'qa\u0000model' }], ['tools-unsupported', { user, model: 'qa\u001fmodel' }], ['load', { user, model: 'qa\u007fmodel', lease: token }],
+    ['title-save', title], ['title-auto-named', { ...title, chatId: '' }], ['title-auto-named', { ...title, chatId: 'x'.repeat(401) }]];
+  for (const op of ['health', 'load', 'tools-allowed', 'tools-unsupported', 'busy', 'title-auto-named', 'title-save']) bad.push([op, { model: 'qa-model', lease: token, ...title, title: 'QA', user: undefined }]);
+  seen.length = 0;
+  for (const [op, b] of bad) assert.equal((await call(p(op), b)).status, 400, `${op} ${JSON.stringify(b)}`);
+  assert.deepEqual(seen, [], 'nothing ran for a refused request');
+  assert.equal((await call(p('title-auto-named'), { ...title, chatId: 'x'.repeat(400), firstMessage: 'x'.repeat(2 * 1024 * 1024) })).status, 200, 'the caps of a chat request');
+  assert.equal((await call(p('health'), { user }, { trusted: false })).status, 404);
+  assert.deepEqual(await call(`${native.NATIVE_PREFIX}other`, { user }), { handled: false, status: undefined, body: undefined });
+});
+
+test('a fact bridge refuses a gone account, says when the manager is off, and never sends a failure\'s detail', async () => {
+  const p = (op) => `${native.NATIVE_PREFIX}${op}`;
+  const user = 'qa-user', token = '0123456789abcdef0123456789abcdef';
+  const gone = bridge({ asUser: async () => { throw Object.assign(Error('no such account'), { status: 404 }); }, modelManager: { enabled: true, load: async () => ({ ok: true }) } });
+  for (const [op, b] of [['health', { user }], ['load', { user, model: 'qa-model', lease: token }], ['tools-allowed', { user, model: 'qa-model' }],
+    ['tools-unsupported', { user, model: 'qa-model' }], ['busy', { user }], ['title-auto-named', { user, chatId: 'qa-chat-1', firstMessage: 'QA' }]]) {
+    assert.deepEqual(await gone.call(p(op), b), { handled: true, status: 404, body: { error: 'no such account' } }, op);
+  }
+  const off = bridge({ modelManager: { enabled: false, load: async () => { throw Error('must not load'); } } });
+  assert.deepEqual(await off.call(p('health'), { user }), { handled: true, status: 409, body: { enabled: false } });
+  assert.deepEqual(await off.call(p('load'), { user, model: 'qa-model', lease: token }), { handled: true, status: 409, body: { enabled: false } });
+  const none = bridge({ modelManager: null });
+  assert.deepEqual(await none.call(p('load'), { user, model: 'qa-model', lease: null }), { handled: true, status: 409, body: { enabled: false } });
+  const logged = [];
+  const failing = bridge({ log: (line) => logged.push(line),
+    modelManager: { enabled: true, health: async () => { throw Error('fetch failed http://qa-manager.invalid:13305/health'); }, load: async () => { throw Error('QA load detail'); } } });
+  assert.deepEqual(await failing.call(p('health'), { user }), { handled: true, status: 500, body: { error: 'the fact could not be read' } });
+  assert.deepEqual(await failing.call(p('load'), { user, model: 'qa-model', lease: token }), { handled: true, status: 500, body: { error: 'the fact could not be read' } });
+  assert.deepEqual(logged, ['[chat] native health bridge failed: fetch failed http://qa-manager.invalid:13305/health', '[chat] native load bridge failed: QA load detail']);
+});
+
+test('the load bridge stops the load when the front goes away', async () => {
+  let signal;
+  const handle = native.createToolBridge({ secret: SECRET, json: (res, status, body) => { res.status = status; res.body = body; }, readJson: async (req) => req.body,
+    asUser: async (_u, fn) => fn(), log() {},
+    modelManager: { enabled: true, load: (_m, _o, s) => { signal = s; return new Promise((_resolve, reject) => s.addEventListener('abort', () => reject(s.reason), { once: true })); } } });
+  const req = new EventEmitter();
+  Object.assign(req, { url: `${native.NATIVE_PREFIX}load`, method: 'POST', body: { user: 'qa-user', model: 'qa-model', lease: null }, socket: { remoteAddress: '127.0.0.1' }, headers: { 'x-noevia-store-token': SECRET } });
+  const res = new EventEmitter();
+  res.end = () => {};
+  const done = handle(req, res);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(signal.aborted, false);
+  res.emit('close');
+  await done;
+  assert.equal(signal.aborted, true);
+});
+
+test('chatNativeAsUser (createAsUser) refuses a missing, disabled or removed account and runs a standing one', async (t) => {
+  const { AsyncLocalStorage } = require('node:async_hooks');
+  const { createWorkspaceStore } = require('./workspace.cjs');
+  const { createStubStore } = require('../tests/server/project-store-stub.cjs');
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'noevia-native-asuser-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const QA = '11111111-2222-4333-8444-000000000001', DISABLED = '11111111-2222-4333-8444-000000000002', REMOVED = '11111111-2222-4333-8444-000000000003';
+  // The users table as index.cjs reads it, and the rows the workspace store believes in (the front removed REMOVED's).
+  const rows = new Map([[QA, { id: QA, disabled_at: null }], [DISABLED, { id: DISABLED, disabled_at: '2026-11-01T00:00:00Z' }], [REMOVED, { id: REMOVED, disabled_at: null }]]);
+  const live = new Set([QA, DISABLED]);
+  const workspaceStore = createWorkspaceStore(root, { id: 'local', label: 'Local', baseUrl: '', apiKey: '' }, null, { projectStore: createStubStore(root), userExists: (id) => live.has(id) });
+  const scope = new AsyncLocalStorage();
+  // index.cjs diaryAsUser and currentWorkspace, over the real workspace store.
+  const runAs = (userId, fn) => scope.run({ workspace: workspaceStore.get(userId) }, fn);
+  const currentWorkspace = () => { const ws = scope.getStore()?.workspace; if (!ws) throw Error('authenticated workspace context required'); return ws; };
+  const asUser = native.createAsUser({ userRow: (id) => rows.get(id), runAs, currentWorkspace });
+  assert.equal(await asUser(QA, async () => currentWorkspace().userId), QA);
+  const refused = (e) => e.status === 404 && e.message === 'no such account';
+  for (const who of ['qa-nobody', DISABLED, REMOVED]) await assert.rejects(async () => asUser(who, async () => 'ran'), refused, who);
+  assert.throws(() => workspaceStore.get(REMOVED), (e) => e.status === 410, 'the store\'s own answer is 410');
+  // A workspace revoked while held.
+  const revoked = native.createAsUser({ userRow: (id) => rows.get(id), runAs: (_id, fn) => scope.run({ workspace: { revoked: true } }, fn), currentWorkspace });
+  await assert.rejects(async () => revoked(QA, async () => 'ran'), refused);
+  // A 410 from the call itself (a tool's own answer) is not the account's.
+  await assert.rejects(async () => asUser(QA, async () => { throw Object.assign(Error('QA upstream gone'), { status: 410 }); }), (e) => e.status === 410 && e.message === 'QA upstream gone');
+  // Through the bridge: the refusal is the 404, not a 500.
+  const { call } = bridge({ asUser, recordSample() {} });
+  assert.deepEqual(await call(native.PREFILL_PATH, { user: REMOVED, model: 'qa-model', promptTokens: 52, firstTokenMs: 310 }), { handled: true, status: 404, body: { error: 'no such account' } });
+  assert.equal((await call(native.PREFILL_PATH, { user: QA, model: 'qa-model', promptTokens: 52, firstTokenMs: 310 })).status, 204);
 });

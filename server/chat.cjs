@@ -1679,27 +1679,34 @@ function createChatHandler({
     // on below exactly as without the request (the reason is logged).
     if (handoff) {
       const native = require('./rust-chat-native.cjs');
-      let provenanceOn = false;
-      if (provenancePolicy) { try { provenanceOn = provenancePolicy.enabled() === true; } catch { provenanceOn = true; } }
-      const diaryTurn = (typeof spaceId === 'string' && spaceId.startsWith('diary')) || project?.id === diaryExtras?.PROJECT_ID;
-      const egressRules = require('./provider-egress.cjs');
-      const why = native.refusal({
-        // A chat deleted while this turn was prepared: the cleanup below runs at the cut, the executor would write it back.
-        chatIdNotText: chatId !== null && typeof chatId !== 'string',
-        deleted: !!chatId && !!chatWorkspace?.dir && require('./chat-lists.cjs').readTombstones(chatWorkspace.dir).has(require('./chat-lists.cjs').safeChatId(chatId)),
-        diary: diaryTurn, compactOnly: body.compactOnly === true,
-        providerId: provider.id, defaultProviderId: DEFAULT_PROVIDER_ID, machine: !!provider.machine, external: !!externalProvider, chatgpt: !!chatgptProvider, routeTarget: !!routeTarget,
-        authorized: !!upstreamHeaders?.Authorization,
-        images: attachedImages.length > 0 || retrievedImages.length > 0, messages: wire,
-        skills: loadedSkills.size > 0 || (!!project && instructionSkills.list(project).length > 0),
-        provenance: provenanceOn, framingReasoner: !!(framingReasoner && chatFrame),
-        narrowed: !!routing.narrowed, gate: !!(gate && gate.decision !== 'none'),
-        supervision: nativeHandoff.supervising(), injected: injectedEntries.length > 0,
-        editTools: activeTools.some((t) => projectEditTool(t.function?.name) || specialistPageSave.neverStanding(t.function?.name)),
-        // #516: the stream guard's schema check runs before every call (egressToolRefusal) once it is on; the executor
-        // does not run it yet. It answers for a call that cannot parse only when it is on and the tool has a schema.
-        streamGuard: activeTools.some((t) => egressRules.validateToolArguments(t.function?.name, '\u0000') !== null),
-      });
+      // Reading what the refusal looks at must never fail the turn: an input that throws keeps the turn here.
+      let why;
+      try {
+        let provenanceOn = false;
+        if (provenancePolicy) { try { provenanceOn = provenancePolicy.enabled() === true; } catch { provenanceOn = true; } }
+        const diaryTurn = (typeof spaceId === 'string' && spaceId.startsWith('diary')) || project?.id === diaryExtras?.PROJECT_ID;
+        const egressRules = require('./provider-egress.cjs');
+        why = native.refusal({
+          // A chat deleted while this turn was prepared: the cleanup below runs at the cut, the executor would write it back.
+          chatIdNotText: chatId !== null && typeof chatId !== 'string',
+          deleted: !!chatId && !!chatWorkspace?.dir && require('./chat-lists.cjs').readTombstones(chatWorkspace.dir).has(require('./chat-lists.cjs').safeChatId(chatId)),
+          diary: diaryTurn, compactOnly: body.compactOnly === true,
+          providerId: provider.id, defaultProviderId: DEFAULT_PROVIDER_ID, machine: !!provider.machine, external: !!externalProvider, chatgpt: !!chatgptProvider, routeTarget: !!routeTarget,
+          authorized: !!upstreamHeaders?.Authorization,
+          images: attachedImages.length > 0 || retrievedImages.length > 0, messages: wire,
+          skills: loadedSkills.size > 0 || (!!project && instructionSkills.list(project).length > 0),
+          provenance: provenanceOn, framingReasoner: !!(framingReasoner && chatFrame),
+          narrowed: !!routing.narrowed, gate: !!(gate && gate.decision !== 'none'),
+          supervision: nativeHandoff.supervising(), injected: injectedEntries.length > 0,
+          editTools: activeTools.some((t) => projectEditTool(t.function?.name) || specialistPageSave.neverStanding(t.function?.name)),
+          // #516: the stream guard's schema check runs before every call (egressToolRefusal) once it is on; the executor
+          // does not run it yet. It answers for a call that cannot parse only when it is on and the tool has a schema.
+          streamGuard: activeTools.some((t) => egressRules.validateToolArguments(t.function?.name, '\u0000') !== null),
+        });
+      } catch (error) {
+        why = 'refusal-input';
+        console.warn(`[chat] native executor refusal inputs could not be read: ${String(error?.message || error).slice(0, 200)}`);
+      }
       if (!why) {
         // The start of the rounds' preparation that only waits (as below): the route pre-load is used or let go here,
         // so nothing in this process is left holding it.

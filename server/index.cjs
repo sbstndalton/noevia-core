@@ -932,19 +932,19 @@ const chatMirrorBridge = require('./rust-chat-mirror.cjs').createExecutorBridge(
 // Track R8: the native chat executor's hand-off and tool bridges (rust-chat-native.cjs; only the front's loopback calls).
 const chatWriteTargetFor = (name, rawArgs, { user }) => (driveTools.names.has(name) ? driveTools.describeTarget(user, name, rawArgs) : null);
 const chatNativeHandoff = require('./rust-chat-native.cjs').createHandoff({ secret: FRONT_SECRET, supervising: () => features.enabled('stepSupervision') });
-// Only an account that exists, is not disabled and whose workspace stands (a 404 refusal otherwise).
-const chatNativeAsUser = (userId, fn) => {
-  const row = authService.db.prepare('SELECT id, disabled_at FROM users WHERE id=?').get(userId);
-  if (!row || row.disabled_at) throw Object.assign(Error('no such account'), { status: 404 });
-  return diaryAsUser(userId, () => { if (currentWorkspace().revoked) throw Object.assign(Error('no such account'), { status: 404 }); return fn(); });
-};
+// Only an account that exists, is not disabled and whose workspace stands (a 404 refusal otherwise, also for the
+// 410 workspaceStore.get throws for a removed account or a folder that is gone).
+const chatNativeAsUser = require('./rust-chat-native.cjs').createAsUser({
+  userRow: (userId) => authService.db.prepare('SELECT id, disabled_at FROM users WHERE id=?').get(userId),
+  runAs: (userId, fn) => diaryAsUser(userId, fn), currentWorkspace: () => currentWorkspace() });
 const chatNativeTools = require('./rust-chat-native.cjs').createToolBridge({ secret: FRONT_SECRET, json, readJson, asUser: chatNativeAsUser,
   getProject: (id) => getProject(id), executeToolCall: (...args) => executeToolCall(...args), writeTargetFor: chatWriteTargetFor,
   recordToolUse: (...args) => recordToolUse(...args), currentWorkspace: () => currentWorkspace(), currentUser: () => requestScope.getStore()?.authn?.user || null,
   recordUsage: (...args) => recordUsage(...args), recordSample: (...args) => prefill.recordSample(...args),
   modelManager, templateToolsGate: require('./chat-template-caps.cjs').toolsGate,
   chatTitles: { save: (projectId, chatId, title, firstMessage) => projectStore.setChatTitle(projectId, chatId, title, firstMessage),
-    autoNamed: (projectId, chatId, firstMessage) => projectStore.chatAutoNamed(projectId, chatId, firstMessage) } });
+    autoNamed: (projectId, chatId, firstMessage) => projectStore.chatAutoNamed(projectId, chatId, firstMessage) },
+  chatBodyCap: STORED_HISTORY_BYTES });
 // #682: a decision experiment switched on that cannot run (no service, or one without `choice`)
 // says so once at startup; Settings shows the same reason, and the chat path skips it silently.
 for (const [key, id] of [['COWORK_DECISION_MODEL', process.env.COWORK_DECISION_MODEL], ['COWORK_SENSITIVITY_DECISION_MODEL', process.env.COWORK_SENSITIVITY_DECISION_MODEL]]) {
