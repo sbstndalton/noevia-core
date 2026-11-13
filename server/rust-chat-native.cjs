@@ -28,6 +28,15 @@
 //                                        this process stays the one writer of the account's usage file
 //   POST /internal/chat/prefill        {model, promptTokens, firstTokenMs}
 //        -> 204                          one prefill observation for the tool budget (prefill.cjs recordSample)
+//   POST /internal/chat/native/health            {}                    -> 200 {ok, body}   modelManager.health()
+//   POST /internal/chat/native/load              {model}               -> 200 {ok}         modelManager.load(model)
+//   POST /internal/chat/native/tools-allowed     {model}               -> 200 {allowed}    the template tools gate
+//   POST /internal/chat/native/tools-unsupported {model}               -> 204              its markUnsupported (#1015)
+//   POST /internal/chat/native/busy              {}                    -> 200 {busy}       modelManager.inferenceBusy(1)
+//   POST /internal/chat/native/title-auto-named  {user, listId, chatId, firstMessage} -> 200 {autoNamed}
+//   POST /internal/chat/native/title-save        {user, listId, chatId, title, firstMessage} -> 204
+//        the facts the turn reads of the local model manager, the engine's template and the chat lists, through
+//        the same functions chat.cjs calls, while those still live here.
 //
 // Both answer 404 to anything that is not the front (trusted-front.cjs): with file sharing on, this listener is not
 // loopback only, and 404 for an account that does not exist, is disabled or whose workspace was revoked. The
@@ -55,6 +64,8 @@ const EXECUTE_PATH = '/internal/chat/tools/execute';
 const TARGET_PATH = '/internal/chat/tools/target';
 const USAGE_PATH = '/internal/chat/usage';
 const PREFILL_PATH = '/internal/chat/prefill';
+const NATIVE_PREFIX = '/internal/chat/native/';
+const NATIVE_OPS = new Set(['health', 'load', 'tools-allowed', 'tools-unsupported', 'busy', 'title-auto-named', 'title-save']);
 const BODY_CAP = 16 * 1024 * 1024;
 const USER_CAP = 200;
 
@@ -132,7 +143,7 @@ function preparedTurn(t) {
  * `currentUser()` is the signed-in user chat.cjs passes as `chatUser` and `currentWorkspace()` theirs.
  */
 function createToolBridge({ secret, json, readJson, asUser, getProject, executeToolCall, writeTargetFor, recordToolUse, currentWorkspace, currentUser,
-  recordUsage = () => {}, recordSample = () => {} }) {
+  recordUsage = () => {}, recordSample = () => {}, modelManager = null, templateToolsGate = null, chatTitles = null }) {
   const callerGone = (req, res) => {
     const controller = new AbortController();
     const gone = () => { if (!res.writableEnded) controller.abort(); };
@@ -143,13 +154,61 @@ function createToolBridge({ secret, json, readJson, asUser, getProject, executeT
   const text = (v, cap) => (typeof v === 'string' && v.length <= cap ? v : null);
   const names = (v) => (Array.isArray(v) && v.length <= 2000 && v.every((n) => typeof n === 'string' && n.length <= 200) ? v : null);
   const missing = (error) => error?.status === 404;
+  const noContent = (res) => { res.statusCode = 204; res.end(); };
+  async function nativeFact(op, body, res) {
+    const model = text(body?.model, 400);
+    const needModel = () => { if (!model) { json(res, 400, { error: 'model is required.' }); return true; } return false; };
+    if (op === 'health') {
+      const r = modelManager?.enabled ? await modelManager.health() : { ok: false };
+      return json(res, 200, { ok: r?.ok === true, body: r?.ok ? r.body ?? null : null });
+    }
+    if (op === 'load') {
+      if (needModel()) return;
+      const r = await modelManager.load(model, {});
+      return json(res, 200, { ok: r?.ok === true });
+    }
+    if (op === 'tools-allowed') {
+      if (needModel()) return;
+      return json(res, 200, { allowed: (await templateToolsGate.allowsTools(modelManager, model)) !== false });
+    }
+    if (op === 'tools-unsupported') {
+      if (needModel()) return;
+      templateToolsGate.markUnsupported(model);
+      return noContent(res);
+    }
+    if (op === 'busy') {
+      let busy = false;
+      try { busy = typeof modelManager?.inferenceBusy === 'function' && modelManager.inferenceBusy(1) === true; } catch { busy = false; }
+      return json(res, 200, { busy });
+    }
+    const who = text(body?.user, USER_CAP), chat = text(body?.chatId, 400), first = text(body?.firstMessage, 1024 * 1024);
+    const list = body?.listId === null || body?.listId === undefined ? null : text(body.listId, 400);
+    if (!who || !chat || first === null || (body?.listId != null && !list)) return json(res, 400, { error: 'user, chatId and firstMessage are required.' });
+    if (op === 'title-auto-named') {
+      const autoNamed = await asUser(who, async () => { try { return chatTitles.autoNamed(list, chat, first) === true; } catch { return false; } });
+      return json(res, 200, { autoNamed });
+    }
+    const title = text(body?.title, 400);
+    if (!title) return json(res, 400, { error: 'title is required.' });
+    await asUser(who, async () => { try { chatTitles.save(list, chat, title, first); } catch { /* the client saves it too */ } });
+    return noContent(res);
+  }
   return async function handle(req, res) {
     const path = String(req.url || '').split('?')[0];
-    if (path !== EXECUTE_PATH && path !== TARGET_PATH && path !== USAGE_PATH && path !== PREFILL_PATH) return false;
+    const op = path.startsWith(NATIVE_PREFIX) ? path.slice(NATIVE_PREFIX.length) : null;
+    if (path !== EXECUTE_PATH && path !== TARGET_PATH && path !== USAGE_PATH && path !== PREFILL_PATH && !NATIVE_OPS.has(op)) return false;
     if (!trustedFront(req, secret) || req.method !== 'POST') { json(res, 404, { error: 'Not found' }); return true; }
     let body;
     try { body = await readJson(req, BODY_CAP); } catch { json(res, 400, { error: 'invalid JSON' }); return true; }
     const count = (v) => (v === null || (Number.isSafeInteger(v) && v >= 0) ? v : undefined);
+    if (op) {
+      try { await nativeFact(op, body, res); }
+      catch (error) {
+        if (missing(error)) { json(res, 404, { error: 'no such account' }); return true; }
+        json(res, 500, { error: String(error?.message || 'the fact could not be read').slice(0, 300) });
+      }
+      return true;
+    }
     if (path === PREFILL_PATH) {
       const model = text(body?.model, 400), prompt = body?.promptTokens, ms = body?.firstTokenMs;
       if (!model || !Number.isSafeInteger(prompt) || prompt <= 0 || !Number.isFinite(ms) || ms <= 0) { json(res, 400, { error: 'model, promptTokens and firstTokenMs are required.' }); return true; }
@@ -209,4 +268,4 @@ function createToolBridge({ secret, json, readJson, asUser, getProject, executeT
   };
 }
 
-module.exports = { HANDOFF_HEADER, PREPARED_VERSION, EXECUTE_PATH, TARGET_PATH, USAGE_PATH, PREFILL_PATH, createHandoff, refusal, preparedTurn, createToolBridge };
+module.exports = { HANDOFF_HEADER, PREPARED_VERSION, EXECUTE_PATH, TARGET_PATH, USAGE_PATH, PREFILL_PATH, NATIVE_PREFIX, createHandoff, refusal, preparedTurn, createToolBridge };

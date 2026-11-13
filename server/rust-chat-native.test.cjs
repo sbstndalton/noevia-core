@@ -222,3 +222,30 @@ test('the usage and prefill bridges record what a native reply used, in this pro
   assert.equal((await call(native.PREFILL_PATH, { model: 'qa-model', promptTokens: 0, firstTokenMs: 310 })).status, 400);
   assert.equal((await call(native.USAGE_PATH, { user: 'qa-user', model: 'qa-model', reported }, { trusted: false })).status, 404);
 });
+
+test('the native fact bridges answer through the functions chat.cjs calls', async () => {
+  const seen = [];
+  const { call } = bridge({
+    modelManager: { enabled: true, health: async () => ({ ok: true, body: { all_models_loaded: [{ model_name: 'qa-model', loaded: true }] } }),
+      load: async (model, options) => { seen.push(['load', model, options]); return { ok: true }; }, inferenceBusy: (n) => { seen.push(['busy', n]); return true; } },
+    templateToolsGate: { allowsTools: async (manager, model) => { seen.push(['allows', model]); return model !== 'qa-no-tools'; }, markUnsupported: (model) => seen.push(['unsupported', model]) },
+    chatTitles: { autoNamed: (list, chat, first) => { seen.push(['autoNamed', list, chat, first]); return true; }, save: (...a) => seen.push(['save', ...a]) },
+  });
+  const p = (op) => `${native.NATIVE_PREFIX}${op}`;
+  assert.deepEqual((await call(p('health'), {})).body, { ok: true, body: { all_models_loaded: [{ model_name: 'qa-model', loaded: true }] } });
+  assert.deepEqual((await call(p('load'), { model: 'qa-model' })).body, { ok: true });
+  assert.deepEqual((await call(p('tools-allowed'), { model: 'qa-model' })).body, { allowed: true });
+  assert.deepEqual((await call(p('tools-allowed'), { model: 'qa-no-tools' })).body, { allowed: false });
+  assert.equal((await call(p('tools-unsupported'), { model: 'qa-model' })).status, 204);
+  assert.deepEqual((await call(p('busy'), {})).body, { busy: true });
+  const title = { user: 'qa-user', listId: 'qa-project', chatId: 'qa-chat-1', firstMessage: 'QA hello' };
+  assert.deepEqual((await call(p('title-auto-named'), title)).body, { autoNamed: true });
+  assert.equal((await call(p('title-save'), { ...title, title: 'QA Title' })).status, 204);
+  assert.deepEqual(seen, [['load', 'qa-model', {}], ['allows', 'qa-model'], ['allows', 'qa-no-tools'], ['unsupported', 'qa-model'], ['busy', 1],
+    ['autoNamed', 'qa-project', 'qa-chat-1', 'QA hello'], ['save', 'qa-project', 'qa-chat-1', 'QA Title', 'QA hello']]);
+  for (const [op, b] of [['load', {}], ['title-save', title], ['title-auto-named', { ...title, chatId: '' }]]) assert.equal((await call(p(op), b)).status, 400, op);
+  assert.equal((await call(p('health'), {}, { trusted: false })).status, 404);
+  assert.deepEqual(await call(`${native.NATIVE_PREFIX}other`, {}), { handled: false, status: undefined, body: undefined });
+  const off = bridge({ modelManager: { enabled: false } });
+  assert.deepEqual((await off.call(p('health'), {})).body, { ok: false, body: null });
+});
