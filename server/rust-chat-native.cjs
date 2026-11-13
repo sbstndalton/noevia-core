@@ -18,6 +18,12 @@
 // before the front writes a byte of its own and nothing runs twice. Without the header, or with the wrong value
 // (a browser's header rides along on the relay), nothing here changes the turn.
 //
+//   x-noevia-chat-handoff-caps: skills      (comma-separated tokens; with the secret only, else ignored)
+//
+// names what the front's executor runs beyond the first hand-off step, so a front older than core never gets a
+// turn it would run without its checks: `skills` (W5) its instruction skills checks (the skills bridges below).
+// Without it a turn whose project has instruction skills stays here ('skills'). The header is removed either way.
+//
 //   POST /internal/chat/tools/execute  {user, projectId, name, args, allowed, routes, chatKey, exchangeKey, editTarget?}
 //        -> 200 {text, failed}           one tool call through the toolboxes (index.cjs executeToolCall), as the
 //                                        user, counted as chat.cjs counts it (recordToolUse). `editTarget`: an
@@ -105,6 +111,7 @@ const crypto = require('node:crypto');
 const { trustedFront } = require('./trusted-front.cjs');
 
 const HANDOFF_HEADER = 'x-noevia-chat-handoff';
+const CAPS_HEADER = 'x-noevia-chat-handoff-caps';
 const PREPARED_VERSION = 1;
 const EXECUTE_PATH = '/internal/chat/tools/execute';
 const TARGET_PATH = '/internal/chat/tools/target';
@@ -135,18 +142,25 @@ const LEASE_HEADER = 'X-Noevia-Lease';
 
 /**
  * `requested(req)`: whether the front asked for this turn's hand-off: a turn relayed by the front
- * (rust-chat-turn.cjs relayedUser) carrying the header with the per-start secret. The header is removed either way.
+ * (rust-chat-turn.cjs relayedUser) carrying the header with the per-start secret. The header is removed either way,
+ * and so is the capabilities header. `capabilities(req)`: the tokens that header named (a Set), read by
+ * `requested` and only for a request it accepted; empty otherwise.
  */
 function createHandoff({ secret, supervising = () => false, relayed = (req) => require('./rust-chat-turn.cjs').relayedUser(req) }) {
   const want = Buffer.from(String(secret || ''), 'utf8');
+  const caps = new WeakMap();
   function requested(req) {
     const raw = req?.headers?.[HANDOFF_HEADER];
-    if (req?.headers) delete req.headers[HANDOFF_HEADER];
+    const named = req?.headers?.[CAPS_HEADER];
+    if (req?.headers) { delete req.headers[HANDOFF_HEADER]; delete req.headers[CAPS_HEADER]; }
     if (typeof raw !== 'string' || !want.length || !relayed(req)) return false;
     const got = Buffer.from(raw, 'utf8');
-    return got.length === want.length && crypto.timingSafeEqual(got, want);
+    const ok = got.length === want.length && crypto.timingSafeEqual(got, want);
+    if (ok && typeof named === 'string' && named.length <= 1000) caps.set(req, new Set(named.split(',').map((t) => t.trim()).filter(Boolean)));
+    return ok;
   }
-  return { requested, supervising: () => { try { return supervising() === true; } catch { return true; } } };
+  const capabilities = (req) => (req && typeof req === 'object' && caps.get(req)) || new Set();
+  return { requested, capabilities, supervising: () => { try { return supervising() === true; } catch { return true; } } };
 }
 
 /** A message content the executor carries as it is: a list of text parts and image parts (image_url with a url). */
@@ -174,6 +188,8 @@ function refusal(t) {
   // executor carries, measures (context-fit counts each image_url) and sends as they are.
   if (t.retrievedImages) return 'retrieved-images';
   if (!t.messages.every((m) => typeof m?.content === 'string' || wireParts(m?.content))) return 'images';
+  // A project with instruction skills, for a front that does not say it runs their checks (CAPS_HEADER).
+  if (t.skills) return 'skills';
   if (t.provenance) return 'provenance';
   if (t.framingReasoner) return 'framing-reasoner';
   if (t.narrowed) return 'narrowed-tools';
@@ -555,4 +571,4 @@ function createToolBridge({ secret, json, readJson, asUser, getProject, executeT
   };
 }
 
-module.exports = { HANDOFF_HEADER, PREPARED_VERSION, EXECUTE_PATH, TARGET_PATH, ABORT_PATH, EDIT_TARGET_PATH, USAGE_PATH, PREFILL_PATH, NATIVE_PREFIX, SKILLS_PREFIX, CHAT_BODY_CAP, PREPARED_CAP, createHandoff, refusal, reservedText, frameTooLarge, injectedSources, preparedTurn, createAsUser, createToolBridge };
+module.exports = { HANDOFF_HEADER, CAPS_HEADER, PREPARED_VERSION, EXECUTE_PATH, TARGET_PATH, ABORT_PATH, EDIT_TARGET_PATH, USAGE_PATH, PREFILL_PATH, NATIVE_PREFIX, SKILLS_PREFIX, CHAT_BODY_CAP, PREPARED_CAP, createHandoff, refusal, reservedText, frameTooLarge, injectedSources, preparedTurn, createAsUser, createToolBridge };

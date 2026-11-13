@@ -387,6 +387,8 @@ function createChatHandler({
   async function handleChatInner(req, res, body, authn, preparation, execution = {}) {
     // Read (and its header removed) before anything else, so no later code sees the front's secret.
     const handoff = !!nativeHandoff?.requested?.(req);
+    // What the front's executor runs beyond the first step (rust-chat-native.cjs CAPS_HEADER), read with the request.
+    const handoffCaps = handoff && typeof nativeHandoff?.capabilities === 'function' ? nativeHandoff.capabilities(req) : new Set();
     // #778: once the routing question has opened the event stream, a later refusal is sent as an
     // error event on it rather than as a second set of headers. Before that, exactly as it was.
     let earlyStream = false;
@@ -1692,6 +1694,7 @@ function createChatHandler({
           providerId: provider.id, defaultProviderId: DEFAULT_PROVIDER_ID, machine: !!provider.machine, external: !!externalProvider, chatgpt: !!chatgptProvider, routeTarget: !!routeTarget,
           authorized: !!upstreamHeaders?.Authorization,
           retrievedImages: retrievedImages.length > 0, messages: wire,
+          skills: (loadedSkills.size > 0 || (!!project && instructionSkills.list(project).length > 0)) && !handoffCaps.has('skills'),
           provenance: provenanceOn, framingReasoner: !!(framingReasoner && chatFrame),
           narrowed: !!routing.narrowed, gate: !!(gate && gate.decision !== 'none'),
           supervision: nativeHandoff.supervising(),
