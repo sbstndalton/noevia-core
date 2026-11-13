@@ -243,6 +243,8 @@ rag.init({ dataDir: DATA_DIR, inferenceUrl: INFERENCE_BASE, headersFn: () => inf
   userActive: (userId) => !workspaceStore.isRemoved(userId), inferenceGuard: () => modelManager.enterInference?.() || (() => {}),
   embeddingConfig, listUserIds: () => authService.db.prepare('SELECT id FROM users').all().map((r) => r.id) });
 rag.configureRerank(() => rerankSettings.effectiveEnv());
+// Rust port track R4: the paired front's native project search, off unless NOEVIA_RUST_RETRIEVAL asks (rust-retrieval.cjs).
+rag.configureNativeSearch(require('./rust-retrieval.cjs').createClient({ env: process.env, token: FRONT_SECRET }));
 // An address the environment seeded must be on this network (embedding-address.cjs); one that is not
 // is logged and not used. Asynchronous (DNS), so it settles just after start-up, before the first re-index pass.
 require('./embedding-address.cjs').guardSeededAddresses(embeddingConfig);
@@ -601,8 +603,25 @@ const { createCodePipeline } = require('./code-pipeline.cjs');
 const codeVerify = require('./code-pipeline-verify.cjs').createVerifyAdapter(require('./code-verify.cjs').createCodeVerify({ log: codeRoleLog }));
 const codePlanner = require('./planner-plan.cjs').createPlannerPlan({ enabled: () => features.enabled('constrainedPlanDecoding'), engine: codeRoleEndpoint, log: codeRoleLog,
   admit: (model, signal) => admitEngineModel(model, signal), machines: chatMachines });
+// Rust port R7: NOEVIA_CODE_EXECUTOR=rust hands Code tasks to the Rust front (rust-code-executor.cjs).
+const codeExecutor = require('./rust-code-executor.cjs');
+const codeEngine = () => {
+  // #1853: on a machine, the harness is given the relay (its URL now, its per-run token at start).
+  const remote = codeMachineTarget();
+  if (remote) return { baseUrl: codeEngineRelay.url, apiKey: null, model: remote.model, relay: codeEngineRelay.relay };
+  const provider = getProvider(DEFAULT_PROVIDER_ID);
+  const base = (process.env.CODE_ENGINE_URL || provider?.baseUrl || '').replace(/\/+$/, '');
+  return {
+    baseUrl: base ? (/\/v1$/.test(base) ? base : `${base}/v1`) : null,
+    apiKey: process.env.CODE_ENGINE_API_KEY || provider?.apiKey || null,
+    model: autoRoles()?.code || autoRoles()?.smart || lastLoadedModel() || null,
+    contextTokens: Number(process.env.CODE_CONTEXT_TOKENS) || undefined,
+  };
+};
+const codeSharedContext = (workspace, project) => require('./shared-context.cjs').forCode(project, loadChats(project.id));
 const codeService = require('./code-service.cjs').createCodeService({
   repos: process.env.CODE_REPOS,
+  frontOwned: codeExecutor.frontOwnsCode(),
   // The egress proxy (D15) is the only way a task reaches the internet, and only to the domains
   // its grant names. Unconfigured, network and installs stay unavailable.
   egress: codeEgress,
@@ -612,24 +631,12 @@ const codeService = require('./code-service.cjs').createCodeService({
   // configuration of its own and would otherwise have nothing to run on. `CODE_ENGINE_URL`
   // exists because the sandbox may reach the engine by a different name than the web
   // container does — it is on an internal network of its own.
-  engine: () => {
-    // #1853: on a machine, the harness is given the relay (its URL now, its per-run token at start).
-    const remote = codeMachineTarget();
-    if (remote) return { baseUrl: codeEngineRelay.url, apiKey: null, model: remote.model, relay: codeEngineRelay.relay };
-    const provider = getProvider(DEFAULT_PROVIDER_ID);
-    const base = (process.env.CODE_ENGINE_URL || provider?.baseUrl || '').replace(/\/+$/, '');
-    return {
-      baseUrl: base ? (/\/v1$/.test(base) ? base : `${base}/v1`) : null,
-      apiKey: process.env.CODE_ENGINE_API_KEY || provider?.apiKey || null,
-      model: autoRoles()?.code || autoRoles()?.smart || lastLoadedModel() || null,
-      contextTokens: Number(process.env.CODE_CONTEXT_TOKENS) || undefined,
-    };
-  },
+  engine: codeEngine,
   // `CODE_HARNESS_COMMAND` is the ACP agent to run (for example `opencode acp`). Unset, a
   // task cannot start and says so.
   connect: require('./code-acp.cjs').createAcpTransport({ log: (entry) => console.log('[code]', JSON.stringify(entry)) }),
   // Shared context (shared-context.cjs): off unless the project turns on sharing into Code.
-  sharedContext: (workspace, project) => require('./shared-context.cjs').forCode(project, loadChats(project.id)),
+  sharedContext: codeSharedContext,
   // Planner review (#519): see codeReview above.
   review: codeReview,
   // #1062: the agent reaches the engine from the sandbox, outside the gate; a task holds the gate's
@@ -678,7 +685,13 @@ const usageRoutes = require('./routes/usage.cjs').createUsageRoutes({ json });
 // #2257: the Code and Browser task reads are the Rust front's; this is what they cannot read from disk.
 const taskFactsBridge = require('./rust-task-facts.cjs').createTaskFactsBridge({
   secret: FRONT_SECRET, json, readJson, features, services: { code: codeService, browser: browserService },
-  workspace: () => currentWorkspace(), asUser: (userId, fn) => diaryAsUser(userId, fn),
+  workspace: () => currentWorkspace(), asUser: (userId, fn) => diaryAsUser(userId, fn), frontOwns: () => codeExecutor.frontOwnsCode(),
+});
+// Rust port R7: what the front's Code start needs from this process (only while the front owns Code tasks).
+const codeEngineBridge = codeExecutor.createCodeEngineBridge({
+  secret: FRONT_SECRET, json, readJson, asUser: (userId, fn) => diaryAsUser(userId, fn), getProject, engine: codeEngine,
+  machine: () => !!codeMachineTarget(), paused: () => modelManager.tuningActive?.() === true,
+  context: (project) => codeSharedContext(currentWorkspace(), project),
 });
 
 // #2262: GET inference-budget and GET installed are the Rust front's; this is what they cannot read for themselves.
@@ -1320,6 +1333,7 @@ async function handleRequestInner(req, res) {
   // And the Code and Browser task reads, and the front's loopback call for what only this process knows (#2257).
   if (require('./rust-task-reads.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   if (await taskFactsBridge(req, res)) return;
+  if (codeExecutor.frontOwnsCode() && await codeEngineBridge(req, res)) return;
   if (await modelFactsBridge(req, res)) return;
   if (await budgetWatchBridge(req, res)) return;
   // And a project's configuration, its instruction skills and a published skill's install (#2191 round 9).
