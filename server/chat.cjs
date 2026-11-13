@@ -1727,7 +1727,7 @@ function createChatHandler({
           grantScope: writeGrantScope, grantHolder: expectedGrantHolder, recentWrites: [...recentWriteFps],
           title: { chatId: typeof body.chatId === 'string' ? body.chatId : '', listId: body.projectId && project ? project.id : null,
             firstMessage: chatTitleLib.firstUserMessage(history, message), firstReply: chatTitleLib.firstReply(history), enabled: !!chatTitles },
-          message, spaceId, projectId: project?.id, declineEndsReply: !spaceId?.startsWith('diary'), record: !!record, streamIdleMs,
+          message, spaceId, projectId: project?.id, declineEndsReply: !spaceId?.startsWith('diary'), record: !!record, streamIdleMs, compactOnly: body.compactOnly === true,
           sources: native.injectedSources({ injected: injectedEntries, placed: placedEntries, readable: readableFiles, reply: replySources }),
         });
         let text = null;

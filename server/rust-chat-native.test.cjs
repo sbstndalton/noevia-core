@@ -19,7 +19,7 @@ const grantFixture = require('../tests/server/chat-grant-fixture.cjs');
 const SECRET = 'qa-front-secret-0123456789abcdef';
 
 // One synthetic turn through the real handleChat: a manual project, the local default provider, a scripted engine.
-async function runTurn(t, { handoff = null, requested = false, supervising = false, frames, headersFor = () => ({}), project: extra = {}, before = () => {}, headers = {}, deps = {}, history = [], boxes = {} } = {}) {
+async function runTurn(t, { handoff = null, requested = false, supervising = false, frames, headersFor = () => ({}), project: extra = {}, before = () => {}, headers = {}, deps = {}, history = [], boxes = {}, body: extraBody = {} } = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'noevia-native-handoff-'));
   before(dir);
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
@@ -61,7 +61,7 @@ async function runTurn(t, { handoff = null, requested = false, supervising = fal
     ...deps,
   });
   const req = { headers: { ...headers } };
-  await handler.handleChat(req, res, { message: 'QA hello', projectId: project.id, chatId: 'qa-chat-1', history }, { user });
+  await handler.handleChat(req, res, { message: 'QA hello', projectId: project.id, chatId: 'qa-chat-1', history, ...extraBody }, { user });
   await new Promise((resolve) => setImmediate(resolve));
   return { events, requests, req };
 }
@@ -107,7 +107,7 @@ test('a turn the native executor can run ends after its preparation with the pre
   assert.ok(last.writes.includes('drive_trash_file') && !last.writes.includes('drive_read_file'));
   assert.deepEqual(last.chat.title, { chatId: 'qa-chat-1', listId: 'qa-project', firstMessage: 'QA hello', firstReply: true, enabled: false });
   assert.deepEqual(last.turn, { message: 'QA hello', spaceId: null, projectId: 'qa-project', declineEndsReply: true, record: true, streamIdleMs: 120000,
-    sources: { reply: [], injected: [] } });
+    sources: { reply: [], injected: [] }, compactOnly: false });
   assert.equal(last.chat.grantScope, 'project:qa-project');
   assert.ok(Number.isFinite(last.startedAt) && last.startedAt <= Date.now());
   assert.equal(last.managerEnabled, true);
@@ -217,6 +217,16 @@ test('a turn whose text holds a character the executor cannot read (U+10F800..U+
   assert.equal(plain.events[plain.events.length - 1].type, 'prepared');
 });
 
+test('a compaction-only turn (the Compact action) is handed off with its flag and no turn record', async (t) => {
+  const history = [{ role: 'user', content: 'QA earlier question' }, { role: 'assistant', content: 'QA earlier answer' }];
+  const handed = await runTurn(t, { requested: true, frames: answer, history, body: { compactOnly: true } });
+  const last = handed.events[handed.events.length - 1];
+  assert.equal(last.type, 'prepared');
+  assert.equal(last.turn.compactOnly, true);
+  assert.equal(last.turn.record, false, 'chat.cjs keeps no turn record for a compaction');
+  assert.equal(handed.requests.length, 0);
+});
+
 test('the prepared frame says the front holds the model lease and runs the title, and Node takes no lease of its own', async (t) => {
   const leases = [];
   const manager = { enabled: true, load: async () => ({ ok: true }), acquireLease: async (model) => { leases.push(model); return null; },
@@ -289,7 +299,7 @@ test('refusal names the first part of the turn the native executor does not do y
     routeTarget: false, authorized: false, attachedImages: 0, retrievedImages: false, messages: [{ role: 'user', content: 'x' }], skills: false, provenance: false,
     framingReasoner: false, narrowed: false, gate: false, supervision: false, injected: false, pageSave: false };
   assert.equal(native.refusal(base), null);
-  const cases = [['diary', { diary: true }], ['compact', { compactOnly: true }], ['provider', { providerId: 'qa-cloud' }], ['provider', { machine: true }],
+  const cases = [['diary', { diary: true }], ['provider', { providerId: 'qa-cloud' }], ['provider', { machine: true }],
     ['provider', { external: true }], ['provider', { chatgpt: true }], ['provider', { routeTarget: true }], ['provider-key', { authorized: true }],
     ['retrieved-images', { retrievedImages: true }], ['retrieved-images', { retrievedImages: true, attachedImages: 1 }],
     ['images', { messages: [{ role: 'user', content: [{ type: 'input_audio', input_audio: { data: 'QA' } }] }] }],

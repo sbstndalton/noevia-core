@@ -141,7 +141,6 @@ function refusal(t) {
   if (t.chatIdNotText) return 'chat-id';
   if (t.deleted) return 'deleted';
   if (t.diary) return 'diary';
-  if (t.compactOnly) return 'compact';
   if (t.providerId !== t.defaultProviderId || t.machine || t.external || t.chatgpt || t.routeTarget) return 'provider';
   if (t.authorized) return 'provider-key';
   // #1726's retrieved images (multimodal RAG: their notes, captions and parts) are not the executor's yet. A project's
@@ -229,6 +228,8 @@ function preparedTurn(t) {
     turn: {
       message: t.message, spaceId: t.spaceId || null, projectId: t.projectId || null,
       declineEndsReply: t.declineEndsReply === true, record: t.record === true, streamIdleMs: t.streamIdleMs,
+      // The Compact action: the context fit is forced, then the turn ends with `done` (no round, no title).
+      compactOnly: t.compactOnly === true,
       sources: t.sources || { reply: [], injected: [] },
     },
   };
