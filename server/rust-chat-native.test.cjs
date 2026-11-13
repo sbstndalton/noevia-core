@@ -563,7 +563,7 @@ const DOCS_BOX = { id: 'qa-docs', label: 'QA documents', source: 'mcp', server: 
   tools: ['project_read_file', 'project_append_file', 'project_replace_text'].map(DOCS_TOOL), reads: ['project_read_file'] };
 const docsBoxes = { mcpBoxes: () => [DOCS_BOX], mcpTools: () => new Map(DOCS_BOX.tools.map((t) => [t.function.name, { readOnly: t.function.name === 'project_read_file', serverId: 'qa-internal' }])) };
 
-test('a turn offering the project edit tools hands off and names them; one offering the coworker page save stays in Node', async (t) => {
+test('a turn offering the project edit tools hands off and names them; one offering the coworker page save hands off only to a front naming once', async (t) => {
   const handed = await runTurn(t, { requested: true, frames: answer, project: { toolboxes: ['core', 'qa-docs'] }, boxes: docsBoxes });
   const last = handed.events.at(-1);
   assert.equal(last.type, 'prepared', 'the edit tools no longer keep the turn in Node');
@@ -586,6 +586,13 @@ test('a turn offering the project edit tools hands off and names them; one offer
   assert.equal(kept.requests.length, 1, 'Node ran the turn');
   assert.ok(kept.requests[0].tools.some((tool) => tool.function.name === 'space_page_save'));
   assert.ok(logged.includes('[chat] native executor not used for this turn: page-save'));
+  // A front that runs the page save's card (#2446: asked every time, `once`) gets the turn, the tool named in onceTools.
+  const once = await runTurn(t, { requested: true, caps: ['once'], frames: answer, project: { id: 'specialist-qa' }, boxes: { specialistTools: pageSave } });
+  const frame = once.events.at(-1);
+  assert.equal(frame.type, 'prepared');
+  assert.deepEqual(frame.onceTools, ['space_page_save']);
+  assert.ok(frame.writes.includes('space_page_save'), 'the page save is always a write');
+  assert.equal('onceTools' in plain.events.at(-1), false, 'a frame without such tools has no onceTools');
 });
 
 test('the edit-target bridge resolves a project edit as the user, with its storage account and the digest the call is pinned to', async () => {
@@ -860,6 +867,15 @@ test('a handle named by another user, chat, scope or exchange is refused, and is
   assert.deepEqual(g.writes, []);
   assert.equal(g.asked.filter(([op]) => op === 'redeem').length, 0);
   assert.deepEqual(g.recorded(), []);
+});
+
+test('a once-only tool (the coworker page save) never runs under a grant handle, and the handle is spent', async () => {
+  const g = grantBridge();
+  const { handle } = await g.grant();
+  assert.deepEqual((await g.call(native.EXECUTE_PATH, grantCall(handle, { name: 'space_page_save', allowed: ['space_page_save'] }))).body, { redeem: 'refused' });
+  assert.deepEqual((await g.call(native.EXECUTE_PATH, grantCall(handle))).body, { redeem: 'refused' }, 'single use');
+  assert.deepEqual(g.writes, []);
+  assert.equal(g.asked.filter(([op]) => op === 'redeem').length, 0);
 });
 
 test('a grant handle expires after five minutes', async () => {

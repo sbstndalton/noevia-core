@@ -21,8 +21,11 @@
 //   x-noevia-chat-handoff-caps: skills      (comma-separated tokens; with the secret only, else ignored)
 //
 // names what the front's executor runs beyond the first hand-off step, so a front older than core never gets a
-// turn it would run without its checks: `skills` (W5) its instruction skills checks (the skills bridges below).
-// Without it a turn whose project has instruction skills stays here ('skills'). The header is removed either way.
+// turn it would run without its checks: `skills` (W5) its instruction skills checks (the skills bridges below);
+// `once` (#2446) the coworker page save's per-call card (never under a chat-wide grant, `once` on the card and its
+// question, an `allow` policy read as `ask`; the prepared frame names those tools in `onceTools`).
+// Without it a turn whose project has instruction skills stays here ('skills'), and a coworker turn offering the page
+// save too ('page-save'). The header is removed either way.
 //
 //   POST /internal/chat/tools/execute  {user, projectId, name, args, allowed, routes, chatKey, exchangeKey, editTarget?, grant?}
 //        -> 200 {text, failed} | {text, failed, notRun: true} | {redeem: 'refused' | 'unavailable' | 'aborted'}
@@ -234,8 +237,9 @@ function refusal(t) {
   if (t.supervision) return 'step-supervision';
   // An injected whole file whose name is not text (retrieval never makes one): its attribution keys on the value.
   if (t.injected) return 'injected-sources';
-  // The coworker page save (#2446): asked about every time, never under a chat-wide grant. The project edit tools
-  // (#648) are the executor's: the prepared frame names them (`editTools`).
+  // The coworker page save (#2446): asked about every time, never under a chat-wide grant; for a front that does not
+  // say it runs that card (CAPS_HEADER `once`). The project edit tools (#648) are the executor's: the prepared frame
+  // names them (`editTools`).
   if (t.pageSave) return 'page-save';
   if (t.streamGuard) return 'stream-guard';
   return null;
@@ -295,6 +299,9 @@ function preparedTurn(t) {
     // The offered tools that are noevia's own project file edits (chat.cjs projectEditTool): resolved through the
     // edit-target bridge before their card, and pinned to that file.
     editTools: Array.isArray(t.editTools) ? t.editTools : [],
+    // #2446: the offered tools asked about on every call and never under a chat-wide grant (the coworker page save).
+    // Only present when there are any, so a frame without them is the one the earlier executors read.
+    ...(Array.isArray(t.onceTools) && t.onceTools.length ? { onceTools: t.onceTools } : {}),
     routeNote: t.routeNote || '', templateGate: t.templateGate === true,
     // The local model manager answers health and load (resolveRuntimeLimit), and grants the model's lease.
     managerEnabled: t.managerEnabled === true, modelLease: t.modelLease === true,
@@ -656,6 +663,8 @@ function createToolBridge({ secret, json, readJson, asUser, getProject, executeT
         if (!entry || !(entry.expires > now()) || entry.user !== user || entry.chat !== asked.chat || entry.scope !== asked.scope || entry.exchangeKey !== exchangeKey) {
           json(res, 200, { redeem: 'refused' }); return true;
         }
+        // #2446: a once-only tool (the coworker page save) never runs under a chat-wide grant, whatever the caller sends.
+        if (require('./specialist-page-save.cjs').neverStanding(name)) { json(res, 200, { redeem: 'refused' }); return true; }
         // A grant is never run unfenced.
         if (typeof redeemChatGrant !== 'function') { json(res, 200, { redeem: 'unavailable' }); return true; }
       }
