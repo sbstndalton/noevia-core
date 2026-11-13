@@ -290,6 +290,11 @@ const autoconfigBudget = (() => {
 
 // Row J: the Rust front is the one maintenance lease authority; this process's gate asks it.
 const maintenanceAuthority = require('./model-maintenance-lease.cjs').createNativeLeaseClient({ port: Number(process.env.NOEVIA_PROJECT_STORE_PORT), token: FRONT_SECRET });
+// #2516: AUTOTUNE_RUNNER_IMPL=rust: the front runs auto-tune; this process only asks it what prepareLoad and
+// tuningActive need (rust-autotune-runner.cjs).
+const frontAutotune = require('./rust-autotune-runner.cjs').frontOwnsRunner(process.env) && PROJECT_STORE
+  ? require('./rust-autotune-runner.cjs').createFrontAutotune({ client: PROJECT_STORE }) : null;
+frontAutotune?.start();
 const modelManager = createModelManager({
   maintenanceAuthority,
   kind: MODEL_MANAGER_KIND,
@@ -312,10 +317,14 @@ const modelManager = createModelManager({
   budgetWatchDir: path.join(DATA_DIR,'budget-watch-'+require('node:crypto').createHash('sha256').update(MODEL_MANAGER_BASE).digest('hex').slice(0,16)),
   evidenceDir: path.join(DATA_DIR,'evidence-'+require('node:crypto').createHash('sha256').update(MODEL_MANAGER_BASE).digest('hex').slice(0,16)),
   calibrationStatePath: path.join(DATA_DIR,'native-calibration-'+require('node:crypto').createHash('sha256').update(MODEL_MANAGER_BASE).digest('hex').slice(0,16)+'.json'),
-  autotuneStatePath: path.join(DATA_DIR,'native-autotune-'+require('node:crypto').createHash('sha256').update(MODEL_MANAGER_BASE).digest('hex').slice(0,16)+'.json'),
+  // #2516: with AUTOTUNE_RUNNER_IMPL=rust the front owns the auto-tune job and file; no Node auto-tuner is built.
+  autotuneStatePath: require('./rust-autotune-runner.cjs').frontOwnsRunner(process.env) ? null
+    : path.join(DATA_DIR,'native-autotune-'+require('node:crypto').createHash('sha256').update(MODEL_MANAGER_BASE).digest('hex').slice(0,16)+'.json'),
   // #1012: the models.ini text the router last read after a reload noevia made.
   // noevia-rs model_maint/reload.rs: the front holds that baseline when it serves it (preset-reload.cjs).
   presetBaselineClient: PROJECT_STORE,
+  // #2516: a front-owned run's re-read and "tuning" flag (null while Node owns auto-tune).
+  frontAutotune: frontAutotune,
   reloadStatePath: path.join(DATA_DIR,'native-preset-reload-'+require('node:crypto').createHash('sha256').update(MODEL_MANAGER_BASE).digest('hex').slice(0,16)+'.json'),
   downloadStatePath: path.join(DATA_DIR,'native-downloads-'+require('node:crypto').createHash('sha256').update(MODEL_MANAGER_BASE).digest('hex').slice(0,16)+'.json'),
   baseUrl: MODEL_MANAGER_BASE,
@@ -1649,6 +1658,7 @@ if (require.main === module) {
     discoverMcpTools().catch(() => undefined);
     // #2303: a calibration interrupted by a restart is the Rust front's to recover (it owns the job and
     // its state file); recovering it here too would interrupt a job the front is still running.
+    // #2516: so is an auto-tune run when the front owns the runner (no Node auto-tuner is built then).
     modelManager.autotune?.recover().catch(() => undefined);
     // A GGUF that appears in the models folder becomes usable without anyone opening a page.
     folderSync?.start();
