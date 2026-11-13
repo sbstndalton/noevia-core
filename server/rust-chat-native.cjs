@@ -663,6 +663,8 @@ function createToolBridge({ secret, json, readJson, asUser, getProject, executeT
         if (!entry || !(entry.expires > now()) || entry.user !== user || entry.chat !== asked.chat || entry.scope !== asked.scope || entry.exchangeKey !== exchangeKey) {
           json(res, 200, { redeem: 'refused' }); return true;
         }
+        // #2446: a once-only tool (the coworker page save) never runs under a chat-wide grant, whatever the caller sends.
+        if (require('./specialist-page-save.cjs').neverStanding(name)) { json(res, 200, { redeem: 'refused' }); return true; }
         // A grant is never run unfenced.
         if (typeof redeemChatGrant !== 'function') { json(res, 200, { redeem: 'unavailable' }); return true; }
       }

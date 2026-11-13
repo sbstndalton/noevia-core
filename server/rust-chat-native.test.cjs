@@ -563,7 +563,7 @@ const DOCS_BOX = { id: 'qa-docs', label: 'QA documents', source: 'mcp', server: 
   tools: ['project_read_file', 'project_append_file', 'project_replace_text'].map(DOCS_TOOL), reads: ['project_read_file'] };
 const docsBoxes = { mcpBoxes: () => [DOCS_BOX], mcpTools: () => new Map(DOCS_BOX.tools.map((t) => [t.function.name, { readOnly: t.function.name === 'project_read_file', serverId: 'qa-internal' }])) };
 
-test('a turn offering the project edit tools hands off and names them; one offering the coworker page save stays in Node', async (t) => {
+test('a turn offering the project edit tools hands off and names them; one offering the coworker page save hands off only to a front naming once', async (t) => {
   const handed = await runTurn(t, { requested: true, frames: answer, project: { toolboxes: ['core', 'qa-docs'] }, boxes: docsBoxes });
   const last = handed.events.at(-1);
   assert.equal(last.type, 'prepared', 'the edit tools no longer keep the turn in Node');
@@ -867,6 +867,15 @@ test('a handle named by another user, chat, scope or exchange is refused, and is
   assert.deepEqual(g.writes, []);
   assert.equal(g.asked.filter(([op]) => op === 'redeem').length, 0);
   assert.deepEqual(g.recorded(), []);
+});
+
+test('a once-only tool (the coworker page save) never runs under a grant handle, and the handle is spent', async () => {
+  const g = grantBridge();
+  const { handle } = await g.grant();
+  assert.deepEqual((await g.call(native.EXECUTE_PATH, grantCall(handle, { name: 'space_page_save', allowed: ['space_page_save'] }))).body, { redeem: 'refused' });
+  assert.deepEqual((await g.call(native.EXECUTE_PATH, grantCall(handle))).body, { redeem: 'refused' }, 'single use');
+  assert.deepEqual(g.writes, []);
+  assert.equal(g.asked.filter(([op]) => op === 'redeem').length, 0);
 });
 
 test('a grant handle expires after five minutes', async () => {
