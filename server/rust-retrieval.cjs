@@ -33,6 +33,21 @@ function hitsOf(value) {
   return out;
 }
 
+// An image result as searchProjectWithImages returns it: { file, kind: 'image', meta, ... }, meta an object or array.
+const isRow = (r) => !!r && typeof r.file === 'string' && r.kind === 'image' && !!r.meta && typeof r.meta === 'object';
+const isImage = (r) => isRow(r) && typeof r.label === 'string' && typeof r.hash === 'string' && typeof r.score === 'number' && Number.isFinite(r.score);
+
+/** `{ text, images, indexed }` of a well-formed image search answer, or null. */
+function withImagesOf(value) {
+  const text = value && hitsOf({ hits: value.text });
+  if (!text || !Array.isArray(value.images) || !Array.isArray(value.indexed) || !value.images.every(isImage) || !value.indexed.every(isRow)) return null;
+  return {
+    text,
+    images: value.images.map((r) => ({ file: r.file, kind: 'image', meta: r.meta, label: r.label, hash: r.hash, score: r.score })),
+    indexed: value.indexed.map((r) => ({ file: r.file, kind: 'image', meta: r.meta })),
+  };
+}
+
 /** The shadow log line: agreement by count and the first differing position (file, body and score). */
 function compare(local, native) {
   const same = (a, b) => a.file === b.file && a.body === b.body && a.score === b.score;
@@ -43,8 +58,15 @@ function compare(local, native) {
   return `differs (node ${local.length} hits, native ${native.length} hits, first difference at ${i})`;
 }
 
+/** The image search's shadow line: the text as `compare`, then images and indexed by file, hash and score. */
+function compareImages(local, native) {
+  const key = (r) => JSON.stringify([r.file, r.hash ?? null, r.score ?? null, r.meta]);
+  const same = (a, b) => a.length === b.length && a.every((r, i) => key(r) === key(b[i]));
+  return `text ${compare(local.text, native.text)}; images ${same(local.images, native.images) ? 'match' : 'differ'} (${local.images.length}/${native.images.length}); indexed ${same(local.indexed, native.indexed) ? 'match' : 'differ'} (${local.indexed.length}/${native.indexed.length})`;
+}
+
 /**
- * `{ mode, ask(projectId, query, userId, versions) }`, or null when the switch is off or invalid, or the front's
+ * `{ mode, ask(projectId, query, userId, versions), askImages(...) }`, or null when the switch is off or invalid, or the front's
  * listener or secret is missing. `ask` resolves to the hits, or null: the front deferred, failed or lacks the
  * route, so this process searches.
  */
@@ -59,12 +81,12 @@ function createClient({ env = process.env, port = Number(env.NOEVIA_PROJECT_STOR
   // A refusal by the front (401: a wrong secret; 404: a front without the route) is logged once per status: the pair
   // then falls back on every search, which should not go unnoticed.
   const refused = new Set();
-  async function ask(projectId, query, userId, versions) {
+  async function post(body, read) {
     try {
       const response = await fetchImpl(`http://127.0.0.1:${port}/v1/retrieval/search`, {
         method: 'POST', redirect: 'error',
         headers: { 'content-type': 'application/json', 'x-noevia-store-token': token },
-        body: JSON.stringify({ user: userId || null, projectId, query, versions }),
+        body: JSON.stringify(body),
         signal: AbortSignal.timeout(deadlineMs),
       });
       if (!response.ok) {
@@ -73,10 +95,13 @@ function createClient({ env = process.env, port = Number(env.NOEVIA_PROJECT_STOR
         return null;
       }
       const value = await require('./http.cjs').readCappedJson(response, MAX_BYTES);
-      return hitsOf(value);
+      return read(value);
     } catch { return null; }
   }
-  return { mode: m, ask };
+  const ask = (projectId, query, userId, versions) => post({ user: userId || null, projectId, query, versions }, hitsOf);
+  // searchProjectWithImages: `{ text, images, indexed }`, or null.
+  const askImages = (projectId, query, userId, versions) => post({ user: userId || null, projectId, query, versions, images: true }, withImagesOf);
+  return { mode: m, ask, askImages };
 }
 
-module.exports = { createClient, mode, compare, hitsOf };
+module.exports = { createClient, mode, compare, compareImages, hitsOf, withImagesOf };
