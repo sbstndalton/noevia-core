@@ -25,7 +25,7 @@
 // Without it a turn whose project has instruction skills stays here ('skills'). The header is removed either way.
 //
 //   POST /internal/chat/tools/execute  {user, projectId, name, args, allowed, routes, chatKey, exchangeKey, editTarget?, grant?}
-//        -> 200 {text, failed} | {text, failed, notRun: true} | {redeem: 'refused' | 'unavailable'}
+//        -> 200 {text, failed} | {text, failed, notRun: true} | {redeem: 'refused' | 'unavailable' | 'aborted'}
 //                                        one tool call through the toolboxes (index.cjs executeToolCall), as the
 //                                        user, counted as chat.cjs counts it (recordToolUse). `editTarget`: an
 //                                        approved project file edit's pinned file (targetDigest, 64 hex), passed
@@ -39,7 +39,10 @@
 //                                        chat.cjs runs it (writeFence; started() when it ends). `refused`: the
 //                                        handle is unknown, expired or not this call's, or the front refused the
 //                                        redeem, or the grant was revoked meanwhile; `unavailable`: the redeem could
-//                                        not be asked, or its window closed before the call. Neither runs the call.
+//                                        not be asked, or its window closed before the call; `aborted`: the call's
+//                                        signal was aborted (the abort bridge, or the front's call went away) by
+//                                        the time the redeem answered (chat.cjs: "exchange cancelled; tool was not
+//                                        run."). None of them runs the call; the fence is retired (started()).
 //   POST /internal/chat/tools/grant    {user, chat, scope, binding, exchangeKey}
 //        -> 200 {granted: false} | {granted: true, handle}   whether a chat-wide grant ("Allow for this chat")
 //                                        covers this write (chatWideApproved, asked of the front), as chat.cjs
@@ -674,6 +677,8 @@ function createToolBridge({ secret, json, readJson, asUser, getProject, executeT
             if (redeemed === 'unavailable') return { redeem: 'unavailable' };
             if (!redeemed || typeof redeemed !== 'object' || typeof redeemed.open !== 'function' || typeof redeemed.started !== 'function') return { redeem: 'refused' };
             fence = redeemed;
+            // chat.cjs: an exchange stopped while the front redeemed (the abort bridge, or the caller gone) runs nothing.
+            if (signal.aborted) { fence.started(); return { redeem: 'aborted' }; }
             // chat.cjs's early refusal (notChecked): the answer came too late to act on.
             if (!fence.open()) { fence.started(); return { redeem: 'unavailable' }; }
           }

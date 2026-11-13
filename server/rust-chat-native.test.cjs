@@ -776,7 +776,9 @@ test('a project with instruction skills stays in Node unless the front names the
 // outbound write through tool-write-fence.cjs send.
 const { createApprovalRegistry, REGISTRY_PROTOCOL } = require('./rust-approval-registry.cjs');
 const writeFence = require('./tool-write-fence.cjs');
-const QA_BINDING = Object.freeze({ canonicalChatId: 'qa-chat-1', holder: { kind: 'free' }, generation: '1', start: 'a'.repeat(32), tombstoned: false });
+// As chat.cjs permissionContext sends it: chat-grant-context.cjs binding over the chat's context from this start.
+const QA_BINDING = require('./chat-grant-context.cjs').binding('qa-user', 'qa-chat-1', 'qa-scope',
+  { canonicalChatId: 'qa-chat-1', holder: { kind: 'free' }, generation: '1', start: require('./chat-partial.cjs').START_ID, tombstoned: false });
 const grantAsk = { user: 'qa-user', chat: 'qa-chat-1', scope: 'qa-scope', binding: QA_BINDING, exchangeKey: 'qa-x' };
 const grantCall = (handle, extra = {}, grant = {}) => ({ user: 'qa-user', projectId: 'qa-project', name: 'qa_write', args: '{"name":"qa"}', allowed: ['qa_write'], routes: [],
   chatKey: 'qa-chat-1', exchangeKey: 'qa-x', grant: { handle, chat: 'qa-chat-1', scope: 'qa-scope', binding: QA_BINDING, ...grant }, ...extra });
@@ -829,12 +831,14 @@ test('a grant handle is redeemed by its execute call, which writes inside the op
   const got = await g.grant();
   assert.equal(got.granted, true);
   assert.match(got.handle, /^[0-9a-f]{32}$/);
+  assert.deepEqual(Object.keys(QA_BINDING).sort(), ['canonicalChatId', 'context', 'scope', 'user']);
   assert.deepEqual(g.asked, [['granted', { user: 'qa-user', chat: 'qa-chat-1', scope: 'qa-scope', binding: QA_BINDING, protocol: REGISTRY_PROTOCOL }]]);
-  assert.deepEqual(await g.call(native.EXECUTE_PATH, grantCall(got.handle, {}, { binding: { ...QA_BINDING, generation: '1' } })),
+  assert.deepEqual(await g.call(native.EXECUTE_PATH, grantCall(got.handle, {}, { binding: JSON.parse(JSON.stringify(QA_BINDING)) })),
     { handled: true, status: 200, body: { text: 'QA qa_write wrote', failed: false } });
   assert.deepEqual(g.writes, [['qa_write', '{"name":"qa"}', true]], 'the write ran with the fence open');
   assert.deepEqual(g.asked.map(([op]) => op), ['granted', 'redeem']);
   assert.equal(g.asked[1][1].ticket, 'qa-ticket-1');
+  assert.deepEqual(g.asked[1][1].binding, JSON.parse(JSON.stringify(QA_BINDING)), 'redeemed with the call\'s final binding');
   assert.deepEqual(g.recorded(), [['recordToolUse', 'qa-user', 'qa_write']]);
   assert.equal(g.fences[0].open(), false, 'the fence is retired when the call ends');
   // Single use: the same handle again runs nothing and asks the front nothing.
@@ -1000,4 +1004,61 @@ test('the grant bridges refuse malformed requests (400) and anyone but the front
   assert.equal((await g.call(native.EXECUTE_PATH, call, { trusted: false })).status, 404);
   // A malformed request leaves the handle in place.
   assert.deepEqual((await g.call(native.EXECUTE_PATH, call)).body, { text: 'QA qa_write wrote', failed: false });
+});
+
+test('an exchange stopped while the front redeems runs nothing (aborted), and the fence is retired', async () => {
+  let release, askedRedeem;
+  const redeemAsked = new Promise((resolve) => { askedRedeem = resolve; });
+  const held = new Promise((resolve) => { release = resolve; });
+  const fences = [];
+  const g = grantBridge({ redeem: async () => { askedRedeem(); await held; return redeemed(); },
+    registryParts: (r) => ({ chatWideApproved: r.chatWideApproved, revokeChatGrant: r.revokeChatGrant,
+      redeemChatGrant: async (...a) => { const f = await r.redeemChatGrant(...a); fences.push(f); return f; } }) });
+  const { handle } = await g.grant();
+  const running = g.call(native.EXECUTE_PATH, grantCall(handle));
+  await redeemAsked;
+  assert.equal((await g.call(native.ABORT_PATH, { user: 'qa-user', exchangeKey: 'qa-x' })).status, 204);
+  release();
+  assert.deepEqual(await running, { handled: true, status: 200, body: { redeem: 'aborted' } });
+  assert.deepEqual(g.writes, []);
+  assert.deepEqual(g.fences, [], 'the executor was never called');
+  assert.deepEqual(g.recorded(), []);
+  assert.equal(fences.length, 1);
+  assert.equal(typeof fences[0].open, 'function', 'the front redeemed it');
+  assert.equal(fences[0].open(), false, 'the fence is retired (started)');
+});
+
+test('a redeemed fence already closed is retired once (unavailable); a workspace no longer the user\'s is refused before the redeem', async () => {
+  let started = 0;
+  const closed = grantBridge({ registryParts: (r) => ({ chatWideApproved: r.chatWideApproved, redeemChatGrant: async () => ({ open: () => false, started: () => { started += 1; } }) }) });
+  assert.deepEqual((await closed.call(native.EXECUTE_PATH, grantCall((await closed.grant()).handle))).body, { redeem: 'unavailable' });
+  assert.equal(started, 1);
+  assert.deepEqual(closed.writes, []);
+  assert.deepEqual(closed.fences, []);
+  const g = grantBridge();
+  const { handle } = await g.grant();
+  g.ctl.workspaceUser = 'qa-other';
+  assert.deepEqual((await g.call(native.EXECUTE_PATH, grantCall(handle))).body, { redeem: 'refused' });
+  assert.deepEqual(g.asked.map(([op]) => op), ['granted'], 'the front was not asked to redeem');
+  assert.deepEqual(g.writes, []);
+  assert.deepEqual(g.recorded(), []);
+});
+
+// Requiring index.cjs starts the whole server, so this reads its source: the bridge gets the grant functions of the
+// one approval registry chat.cjs gets (the epochs frontRevoked moves), not another registry or a wrapper.
+test('index.cjs hands the tool bridge the approval registry\'s own grant functions', () => {
+  const src = fs.readFileSync(path.join(__dirname, 'index.cjs'), 'utf8');
+  assert.equal(src.match(/createApprovalRegistry\(/g).length, 1, 'one registry');
+  const destructured = src.match(/^const \{([^}]*)\} = approvalRegistry;$/m);
+  assert.ok(destructured, 'the registry functions are destructured from approvalRegistry');
+  const names = destructured[1].split(',').map((n) => n.trim());
+  const start = src.indexOf("require('./rust-chat-native.cjs').createToolBridge({");
+  assert.ok(start > src.indexOf('const approvalRegistry = '), 'the bridge is made after the registry');
+  const call = src.slice(start, src.indexOf('});', start));
+  for (const fn of ['chatWideApproved', 'redeemChatGrant', 'revokeChatGrant']) {
+    assert.ok(names.includes(fn), `${fn} is the registry's`);
+    assert.match(call, new RegExp(`[{,\\s]${fn}\\s*,`), `${fn} is passed to createToolBridge as is`);
+    assert.doesNotMatch(call, new RegExp(`${fn}\\s*:`), `${fn} is not replaced in the call`);
+    assert.equal(src.match(new RegExp(`(?:const|let|var|function)\\s+${fn}\\b`, 'g')), null, `${fn} is declared nowhere else`);
+  }
 });
