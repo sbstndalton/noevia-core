@@ -3,10 +3,10 @@
 // crates/engine-admission authority.rs). The front issues every lease, owns its renewal, hard cap and expiry, orders
 // this process's starts and decides when a lease no longer covers its holder. What a lease holds here are this
 // process's own counts, which its synchronous chat and workers read: the maintenance gate's inference count, the
-// inference budget (#697) and the gate's one-model queue, a machine's turn (#1849, #1880), the Diary exchange's
-// throttle and the backfill's pause. This module takes them for a ticket the front issued and holds them until the
+// inference budget (#697) and the gate's one-model queue, a machine's turn (#1849, #1880) and the Diary exchange's
+// backfill pause. This module takes them for a ticket the front issued and holds them until the
 // front gives the ticket back; it never issues a lease of its own. Partial port: the admission decisions themselves
-// (maintenance permit, budget/quarantine, machine assignment and readiness, the Diary throttle) are still made here
+// (maintenance permit, budget/quarantine, machine assignment and readiness) are still made here
 // (createAdmission) and trusted by the front, until their owners (maintenance lease, model budget, machines, chat)
 // move them.
 //
@@ -25,8 +25,8 @@
 // while waiting holds nothing. Engine: maintenance enter, then the gate's lease when a gate is configured (which
 // includes the budget check), else the budget check alone. Machine: the machine's health and served model are
 // checked, and it counts a turn while the latch lasts. Diary exchange (the front's /api/diary/local-exchange): the
-// maintenance gate waited for briefly (chat-admission.cjs), then the model throttle chat shares (429, counted once
-// per exchange), and the long-document backfill's pause (rag.cjs foreground). Gate (chat port S8, rust-chat-admission.cjs):
+// maintenance gate waited for briefly (chat-admission.cjs), then the long-document backfill's pause (rag.cjs
+// foreground); the front counts the `llm:` budget itself (rust-chat-edge.cjs). Gate (chat port S8, rust-chat-admission.cjs):
 // the inference gate as POST /api/chat ({gate:'chat'}) meets it, waiting at most CHAT_GATE_WAIT_MS; the call the front then
 // sends with the lease is covered by it and enters nothing again.
 const crypto = require('node:crypto');
@@ -47,7 +47,6 @@ const TTL_MS = 30000;
 const SETTLE_MS = 5000;
 const MAX_WAIT_MS = 120000;
 const BUSY = 'The model is busy. Try again shortly.';
-const THROTTLED = 'Please wait before sending another message';
 /** The statuses a refusal keeps; anything else is the 503 BUSY. */
 const KEPT = [400, 409, 429, 503];
 
@@ -107,15 +106,10 @@ function createAdmission({ modelManager, admitEngineModel, chatMachines = null, 
     if (signal?.aborted) { release(); signal.throwIfAborted(); }
     return { headers: null, gate: route, release };
   }
-  async function holdExchange(user, signal) {
+  async function holdExchange(signal) {
     let leave;
     try { leave = (await enterChatInference(modelManager, { signal })) || (() => {}); }
     catch (e) { throw Object.assign(e, { status: e.status || 503, publicMessage: e.publicMessage || e.message || BUSY }); }
-    let throttled = true;
-    // Chat port S6: the front counts the shared `llm:` budget; a Core without a limiter passes none.
-    try { throttled = typeof diaryExchange.rateLimited === 'function' ? diaryExchange.rateLimited(user) : false; }
-    finally { if (throttled) leave(); }
-    if (throttled) throw refusal(429, THROTTLED);
     let resume = () => {};
     try { resume = diaryExchange.foreground?.() || resume; } catch { /* the pause is advisory, the gate is not */ }
     return { headers: null, release() { try { resume(); } finally { leave(); } } };
@@ -129,7 +123,7 @@ function createAdmission({ modelManager, admitEngineModel, chatMachines = null, 
     if (ask && typeof ask === 'object' && 'diaryExchange' in ask) {
       if (!diaryExchange || typeof diaryExchange !== 'object') throw refusal(400, 'Diary exchanges are not admitted here.');
       if ('model' in ask || 'role' in ask || 'machine' in ask || !text(ask.diaryExchange?.user)) throw refusal(400, 'A user is required.');
-      return holdExchange(ask.diaryExchange.user, signal);
+      return holdExchange(signal);
     }
     if (!text(ask?.model)) throw refusal(400, 'A model is required.');
     if (ask.embedding !== undefined) {
@@ -345,4 +339,4 @@ function createAdmissionRoutes({ secret, modelManager, admitEngineModel, chatMac
   return { handle, latches, covers };
 }
 
-module.exports = { createAdmissionRoutes, createAdmission, createLatches, createAuthoritySession, callerGone, PREFIX, SESSION_PATH, TTL_MS, MAX_WAIT_MS, THROTTLED, LATCH_MARKER };
+module.exports = { createAdmissionRoutes, createAdmission, createLatches, createAuthoritySession, callerGone, PREFIX, SESSION_PATH, TTL_MS, MAX_WAIT_MS, LATCH_MARKER };
