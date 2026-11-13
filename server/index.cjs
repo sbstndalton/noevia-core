@@ -306,7 +306,9 @@ const modelManager = createModelManager({
   budgetWatchDir: path.join(DATA_DIR,'budget-watch-'+require('node:crypto').createHash('sha256').update(MODEL_MANAGER_BASE).digest('hex').slice(0,16)),
   evidenceDir: path.join(DATA_DIR,'evidence-'+require('node:crypto').createHash('sha256').update(MODEL_MANAGER_BASE).digest('hex').slice(0,16)),
   calibrationStatePath: path.join(DATA_DIR,'native-calibration-'+require('node:crypto').createHash('sha256').update(MODEL_MANAGER_BASE).digest('hex').slice(0,16)+'.json'),
-  autotuneStatePath: path.join(DATA_DIR,'native-autotune-'+require('node:crypto').createHash('sha256').update(MODEL_MANAGER_BASE).digest('hex').slice(0,16)+'.json'),
+  // #2516: with AUTOTUNE_RUNNER_IMPL=rust the front owns the auto-tune job and file; no Node auto-tuner is built.
+  autotuneStatePath: require('./rust-autotune-runner.cjs').frontOwnsRunner(process.env) ? null
+    : path.join(DATA_DIR,'native-autotune-'+require('node:crypto').createHash('sha256').update(MODEL_MANAGER_BASE).digest('hex').slice(0,16)+'.json'),
   // #1012: the models.ini text the router last read after a reload noevia made.
   // noevia-rs model_maint/reload.rs: the front holds that baseline when it serves it (preset-reload.cjs).
   presetBaselineClient: PROJECT_STORE,
