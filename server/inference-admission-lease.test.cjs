@@ -215,6 +215,19 @@ test('a Diary exchange whose caller went away while the gate was waited for hold
   assert.equal(left, counted, 'whatever was entered was given back');
 });
 
+test('chat port S6: a Diary exchange wired without a throttle (the front counts the llm: budget) is admitted and counts nothing here', async (t) => {
+  let entered = 0, left = 0, paused = 0;
+  const modelManager = { enterInferenceWithin: async () => { entered++; return () => left++; } };
+  const { base, routes } = await serve(t, { modelManager, diaryExchange: { foreground: () => { paused++; return () => {}; } } });
+  for (let i = 0; i < 3; i++) {
+    const id = ticket();
+    assert.equal((await ask(base, { diaryExchange: { user: 'u-synthetic' } }, FRONT, `${PREFIX}/${id}`)).status, 201);
+    assert.equal((await ask(base, null, FRONT, `${PREFIX}/${id}`, 'DELETE')).status, 204);
+  }
+  assert.deepEqual([entered, left, paused], [3, 3, 3]);
+  assert.equal(routes.latches.size(), 0);
+});
+
 // Port contract row H: this process no longer issues leases; it latches only for the front's current session.
 test('this process issues no lease of its own: the old POST is gone and a bad ticket is an unknown path', async (t) => {
   let entered = 0;

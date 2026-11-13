@@ -96,7 +96,8 @@ function createAdmission({ modelManager, admitEngineModel, chatMachines = null, 
     try { leave = (await enterChatInference(modelManager, { signal })) || (() => {}); }
     catch (e) { throw Object.assign(e, { status: e.status || 503, publicMessage: e.publicMessage || e.message || BUSY }); }
     let throttled = true;
-    try { throttled = diaryExchange.rateLimited(user); }
+    // Chat port S6: the front counts the shared `llm:` budget; a Core without a limiter passes none.
+    try { throttled = typeof diaryExchange.rateLimited === 'function' ? diaryExchange.rateLimited(user) : false; }
     finally { if (throttled) leave(); }
     if (throttled) throw refusal(429, THROTTLED);
     let resume = () => {};
@@ -106,7 +107,7 @@ function createAdmission({ modelManager, admitEngineModel, chatMachines = null, 
   return (ask, signal) => {
     const text = (v) => typeof v === 'string' && v.length > 0 && v.length <= 1024;
     if (ask && typeof ask === 'object' && 'diaryExchange' in ask) {
-      if (typeof diaryExchange?.rateLimited !== 'function') throw refusal(400, 'Diary exchanges are not admitted here.');
+      if (!diaryExchange || typeof diaryExchange !== 'object') throw refusal(400, 'Diary exchanges are not admitted here.');
       if ('model' in ask || 'role' in ask || 'machine' in ask || !text(ask.diaryExchange?.user)) throw refusal(400, 'A user is required.');
       return holdExchange(ask.diaryExchange.user, signal);
     }

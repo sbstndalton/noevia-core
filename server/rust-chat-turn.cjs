@@ -6,8 +6,10 @@
 //   POST /internal/chat/turn   x-noevia-store-token: <per-start secret>, x-noevia-chat-user: <the front's user>
 //
 // which runs the unchanged pipeline as if the request had come straight here: the inference gate (index.cjs
-// handleRequest, 503 + Retry-After: 3), authentication of the same credentials, CSRF, the `llm:` budget, the body
-// cap (STORED_HISTORY_BYTES, 413), routes/chat.cjs and handleChat. The answer (JSON or the SSE stream, keep-alive
+// handleRequest, 503 + Retry-After: 3), authentication of the same credentials, CSRF, the body cap
+// (STORED_HISTORY_BYTES, 413), routes/chat.cjs and handleChat. Since chat port S6 the front answers the `llm:` budget
+// and routes/chat.cjs's checks first, and sends a Cowork start that passed them to POST /internal/chat/cowork, which is
+// accepted here as a relayed turn too (rust-chat-edge.cjs). The answer (JSON or the SSE stream, keep-alive
 // comments included) goes back byte for byte, and the front closing this socket is the client leaving (#679).
 // The credentials must authenticate as the user the front named, or the request is the 401 of a signed-out one.
 //
@@ -16,6 +18,8 @@
 //
 //   POST /internal/chat/gate   -> 204 when the gate would let a turn in (the hold is given back at once), or the
 //                                 gate's own refusal (503 + Retry-After: 3 + body, one `[chat] 503` line)
+//   POST /internal/chat/gate?hold=1   -> chat port S6: the same, but a 200 keeps the gate for the front's call (its
+//                                        lease, rust-chat-edge.cjs), which the relayed turn then adopts
 //
 // and the front answers its refusal only after a 204. The precedence a client sees is Node's.
 //
@@ -28,6 +32,7 @@
 // The public POST is refused here before the gate and authentication, whoever asks, so a stale route table cannot
 // make two processes answer a turn. Other methods are not chat turns and keep Node's answers.
 const { trustedFront } = require('./trusted-front.cjs');
+const edge = require('./rust-chat-edge.cjs');
 
 // The route in routes.toml's spelling, for noevia's deploy/tools/assemble-release.sh.
 const OWNED_ROUTES = Object.freeze(new Set(['POST /api/chat']));
@@ -53,6 +58,12 @@ function refuseOwned(req, res, { parseRequestUrl, json }) {
   return true;
 }
 
+/** A trusted gate probe's ask: `{ hold, route }` ('chat' or 'diary'), or null for any other request. */
+function relayedGate(req) {
+  const r = req && req[RELAYED];
+  return r && !r.user ? { hold: r.hold === true, route: r.route } : null;
+}
+
 /** The user the front authenticated this relayed turn as, or null for any other request. */
 function relayedUser(req) {
   return (req && req[RELAYED] && req[RELAYED].user) || null;
@@ -68,10 +79,11 @@ function relayedUser(req) {
  */
 function createTurnBridge({ secret, json }) {
   function accept(req, res) {
-    const pathname = String(req.url || '').split('?')[0];
-    if (pathname !== TURN_PATH && pathname !== GATE_PATH) return null;
+    const [pathname, query = ''] = String(req.url || '').split('?');
+    if (pathname !== TURN_PATH && pathname !== GATE_PATH && pathname !== edge.COWORK_PATH) return null;
     if (!trustedFront(req, secret) || req.method !== 'POST') { json(res, 404, { error: 'Not found' }); return 'done'; }
-    const turn = pathname === TURN_PATH;
+    // Chat port S6 (rust-chat-edge.cjs): a Cowork start the front's checks passed is a relayed turn too.
+    const turn = pathname !== GATE_PATH;
     const user = req.headers[USER_HEADER];
     if (turn && (typeof user !== 'string' || !user)) { json(res, 400, { error: 'A user is required.' }); return 'done'; }
     const client = req.headers[RELAY_CLIENT_HEADER];
@@ -79,8 +91,13 @@ function createTurnBridge({ secret, json }) {
     for (const name of [TOKEN_HEADER, USER_HEADER, RELAY_CLIENT_HEADER, RELAY_FORWARDED_HEADER]) delete req.headers[name];
     if (typeof client === 'string' && client) req.headers['x-noevia-client-ip'] = client;
     if (typeof forwarded === 'string' && forwarded) req.headers['x-forwarded-for'] = forwarded;
-    req.url = PATH;
-    req[RELAYED] = { user: turn ? user : null };
+    // The gate probe for the Diary local exchange meets the gate as that route does (rust-chat-edge.cjs).
+    // and a probe with hold=1 keeps the gate it entered for the front's call (rust-chat-edge.cjs leases).
+    const params = new URLSearchParams(query);
+    const diaryGate = !turn && params.get('route') === edge.DIARY_GATE_ROUTE;
+    req.url = diaryGate ? edge.LOCAL_EXCHANGE : PATH;
+    req[RELAYED] = { user: turn ? user : null, cowork: pathname === edge.COWORK_PATH,
+      hold: !turn && params.get('hold') === '1', route: diaryGate ? 'diary' : 'chat' };
     return turn ? 'turn' : 'gate';
   }
   return { accept };
@@ -88,5 +105,5 @@ function createTurnBridge({ secret, json }) {
 
 module.exports = {
   OWNED_ROUTES, ROUTE_REFUSAL, PATH, TURN_PATH, GATE_PATH, TOKEN_HEADER, USER_HEADER, RELAY_CLIENT_HEADER, RELAY_FORWARDED_HEADER,
-  owned, refuseOwned, relayedUser, createTurnBridge,
+  owned, refuseOwned, relayedUser, relayedGate, createTurnBridge,
 };

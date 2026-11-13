@@ -2,9 +2,10 @@
 // POST /api/chat -> one streamed reply (chat.cjs), or, for a Cowork session, one code task.
 //
 // Returns true when it handled the request. Auth and CSRF run before routes are mounted.
-// This file owns only what happens before the loop starts: the shared-endpoint rate limit,
-// the request-size cap, JSON parsing, the request shape (`mode`, `turnToolboxes`), the Diary
-// add-on gate, and the Cowork guard (chat-mode.cjs).
+// This file owns only what happens before the loop starts: the request-size cap, JSON parsing,
+// the request shape (`mode`, `turnToolboxes`), the Diary add-on gate, and the Cowork guard
+// (chat-mode.cjs). Chat port S6: the Rust front answers all of these first, and the shared-endpoint
+// rate limit is the front's alone (rust-chat-edge.cjs).
 
 const { isJsonObject } = require('../http.cjs');
 const { requestShapeError, coworkRefusal } = require('../chat-mode.cjs');
@@ -14,17 +15,15 @@ const { requestShapeError, coworkRefusal } = require('../chat-mode.cjs');
  * @param {(res, status, body) => any} deps.json
  * @param {(req, cap:number) => Promise<string>} deps.readBody   rejects with { status: 413 } over the cap
  * @param {number} deps.bodyCap
- * @param {(userId:string) => boolean} deps.rateLimited
  * @param {(userId:string) => boolean} deps.diaryEnabled
  * @param {(req, res, body, authn) => Promise<any>} deps.handleChat
  * @param {() => boolean} [deps.harnessEnabled]  features.codeHarness, read per request
  * @param {(body, authn) => Promise<object>} [deps.startCoworkTask]  the existing code task start;
  *        throws { status, publicMessage } like code-service.cjs does
  */
-function createChatRoutes({ json, readBody, bodyCap, rateLimited, diaryEnabled, handleChat, harnessEnabled = () => false, startCoworkTask = null }) {
+function createChatRoutes({ json, readBody, bodyCap, diaryEnabled, handleChat, harnessEnabled = () => false, startCoworkTask = null }) {
   return async function chatRoutes(req, res, { path, authn }) {
     if (path !== '/api/chat' || req.method !== 'POST') return false;
-    if (rateLimited(authn.user.id)) return json(res, 429, { error: 'Too many requests — the model endpoint is shared; wait a moment and try again' }), true;
     let raw;
     try { raw = await readBody(req, bodyCap); }
     catch (e) { return json(res, e.status || 400, { error: e.status === 413 ? 'This chat is too large to continue; start a new chat.' : 'could not read the request' }), true; }
