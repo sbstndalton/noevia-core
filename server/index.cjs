@@ -796,9 +796,18 @@ const mcpWiring = createMcpWiring({
 });
 const { state: mcpState, oauthServerIds, accountReady, discoverMcpTools, executeMcpToolCall, operatorServerFor, executeOperatorToolCall } = mcpWiring;
 
-// The approval gate's state lives in approvals.cjs; the chat loop below and the
-// /api/tool-approvals route are its only callers.
-const { pendingApprovals, chatWideApproved, revokeChatGrant, awaitApproval, awaitRouteChoice } = require('./approvals.cjs').createApprovals();
+// Port contract S9: the approval gate's state (pending write approvals, routing questions and chat-wide
+// grants) is the Rust front's approval registry (rust-approval-registry.cjs); the chat loop below asks
+// it through the private store. Node holds none of it.
+const approvalRegistry = require('./rust-approval-registry.cjs').createApprovalRegistry({
+  approvals: (op, payload, options) => PROJECT_STORE.approvals(op, payload, options),
+  log: (message) => console.warn(message),
+});
+const { openApproval, openRouteChoice, chatWideApproved, redeemChatGrant, revokeChatGrant, awaitApproval, awaitRouteChoice } = approvalRegistry;
+const approvalRevocation = require('./approval-revocation.cjs').createRevocationRoute({
+  secret: FRONT_SECRET, registry: approvalRegistry, json, readJson,
+});
+
 // #917: which of the signed-in workspace's lists holds a chat id ('free', a project id, or null).
 // Outside an authenticated request it throws, which the chat gate treats as "no chat-wide grant".
 const chatListHolder = (chatId) => require('./chat-lists.cjs').listHolding(chatId, Array.from(FREE_CHATS), Array.from(PROJECTS));
@@ -1033,6 +1042,7 @@ const { handleChat } = require('./chat.cjs').createChatHandler({
     // Router calls per turn: 1 by default (Laya is single-worker), NOEVIA_ROUTER_CHUNKS 1-4.
     maxChunks: () => require('./routing-modes.cjs').routerMaxChunks(),
     awaitChoice: awaitRouteChoice,
+    openChoice: openRouteChoice,
     log: (entry) => recordDecision('routing', entry),
     // projects.cjs: reads the lists again first (sbstndalton/noevia#1426).
     setChatFlags: (projectId, chatId, patch) => projectStore.setChatFlags(projectId, chatId, patch),
@@ -1045,7 +1055,7 @@ const { handleChat } = require('./chat.cjs').createChatHandler({
     chats: () => [...Array.from(FREE_CHATS), ...PROJECTS.filter((proj) => !diaryExtras.internalProject(proj)).flatMap((proj) => proj.chats || [])],
     read: (chatId) => chatBrainLib.readBrain(currentWorkspace().dir, chatId) },
   DEFAULT_TOOLBOXES, CONNECTOR_BOXES, connectedBoxes, allToolboxes, resolveTools, isWriteTool, executeToolCall,
-  oauthServerIds, accountReady, chatWideApproved, awaitApproval, revokeChatGrant, recordUsage, recordToolUse, automaticToolsReady,
+  oauthServerIds, accountReady, chatWideApproved, redeemChatGrant, openApproval, awaitApproval, revokeChatGrant, recordUsage, recordToolUse, automaticToolsReady,
   // #917: which of the signed-in workspace's lists holds a chat id ('free', a project id, or null).
   chatListHolder,
   chatgptOAuth, chatgptEnabled: () => features.enabled('chatgptOAuth'),
@@ -1156,7 +1166,7 @@ const authRoutes = require('./routes/auth.cjs').createAuthRoutes({
 // the test, the Nextcloud sign-in and the save, #1071/sbstndalton/noevia#2190): routes/storage.cjs
 // only refuses a request that bypassed it.
 const storageRoutes = require('./routes/storage.cjs').createStorageRoutes({ json });
-// Public approval policy is Rust's; only pending chat Promise resolution remains here (#2282).
+// Approval decisions and their pending state are the Rust front's (#2282, port contract S9: rust-approval-registry.cjs).
 const idleUnloadFacts = require('./rust-idle-unload-read-facts.cjs').createIdleUnloadFacts({
   secret: FRONT_SECRET, json, effectiveSeconds: () => idleUnload?.effectiveSeconds(),
 });
@@ -1174,12 +1184,6 @@ const autotuneResumeBridge = require('./rust-autotune-resume-bridge.cjs').create
 });
 const autotuneClearBridge = require('./rust-autotune-clear-bridge.cjs').createAutotuneClearBridge({ secret: FRONT_SECRET, json, readJson, autotune: () => modelManager.autotune });
 const autotuneUntunedFacts = require('./rust-autotune-untuned-facts.cjs').createAutotuneUntunedFacts({ secret: FRONT_SECRET, json, readJson, autotune: () => modelManager.autotune });
-const toolApprovals = require('./rust-tool-approval-bridge.cjs');
-const toolApprovalBridge = toolApprovals.createToolApprovalBridge({
-  secret: FRONT_SECRET, pendingApprovals, json, readJson,
-  withActiveUser: (id, fn) => toolApprovals.withActiveUser(authService.db, id, fn),
-  log: message => console.warn(message),
-});
 // The workspace view, free-chat metas, context meters and transcripts (routes/chat-lists.cjs).
 // The native workspace owns the hourly old-chat sweep.
 const chatListRoutes = require('./routes/chat-lists.cjs').createChatListRoutes({
@@ -1285,7 +1289,6 @@ async function handleRequestInner(req, res) {
   if (await autotuneClearBridge(req, res)) return;
   if (require('./rust-autotune-untuned.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   if (await autotuneUntunedFacts(req, res)) return;
-  if (await toolApprovalBridge(req, res)) return;
   // The Rust front's maintenance lease on this process's gate (#2210): before everything, and only the front's.
   if (await maintenanceLeases.handle(req, res)) return;
   // ... and the load decision its calibration asks before each load (#2303).
@@ -1334,6 +1337,7 @@ async function handleRequestInner(req, res) {
   if (require('./rust-project-source-work.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   // And deep research, every method, and the front's loopback calls for its jobs (#2218).
   if (require('./rust-research.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
+  if (await approvalRevocation(req, res)) return;
   if (await inferenceAdmission.handle(req, res)) return;
   if (await researchBridge(req, res)) return;
   // And the Code and Browser task reads, and the front's loopback call for what only this process knows (#2257).
@@ -1649,4 +1653,4 @@ if (require.main === module) {
   })().catch(() => { console.error('[startup] readiness or initialisation failed'); process.exitCode = 1; });
 }
 
-module.exports = { readyFeatures, handleRequest, chatListHolder, sanitizeChats, MCP_SERVERS, toolboxOffered, ownsFile, projectFolderName, prefill, TOOL_PREFILL_TARGET_MS, isWriteTool, chatWideApproved, pendingApprovals, resolveTools, allToolboxes, mcpCredentialOriginAllowed, toolTokenBudgetFor, MCP_TOOLBOX_MANIFEST, estimateToolTokens, toolCapFor, sanitizeToolboxes, executeToolCall, TOOLBOXES, classifierVerdict, heuristicWantsSmart, heuristicWantsCode, CLASSIFIER_MAX_TOKENS, recordUsage, recordToolUse, readUsage, usageDayKey, USAGE_RETENTION_DAYS };
+module.exports = { readyFeatures, handleRequest, chatListHolder, sanitizeChats, MCP_SERVERS, toolboxOffered, ownsFile, projectFolderName, prefill, TOOL_PREFILL_TARGET_MS, isWriteTool, chatWideApproved, resolveTools, allToolboxes, mcpCredentialOriginAllowed, toolTokenBudgetFor, MCP_TOOLBOX_MANIFEST, estimateToolTokens, toolCapFor, sanitizeToolboxes, executeToolCall, TOOLBOXES, classifierVerdict, heuristicWantsSmart, heuristicWantsCode, CLASSIFIER_MAX_TOKENS, recordUsage, recordToolUse, readUsage, usageDayKey, USAGE_RETENTION_DAYS };

@@ -201,6 +201,7 @@ function createDriveTools({ accounts, cap = 8000, now = Date.now, native = null,
         default: return `ERROR: unknown Drive tool ${name}`;
       }
     } catch (error) {
+      if (error?.code === require('./tool-write-fence.cjs').CODE) throw error;
       return `ERROR: ${error.publicMessage || 'Google Drive could not be reached.'}`;
     }
   }
