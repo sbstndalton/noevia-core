@@ -40,7 +40,7 @@ const AVAILABLE_STATES = new Set(['loaded', 'sleeping']);
 const isAvailable = model => AVAILABLE_STATES.has(model.status?.value);
 const alreadyRunning = result => result?.status === 400 && /already running/i.test(JSON.stringify(result?.body ?? ''));
 
-function createLlamaCppManager({ budgetWatchDir = null, baseUrl, apiKey, fetchJson, presetPath, downloadStatePath, fetchStream, autoconfig = {}, calibrationStatePath, calibrationOptions = {}, publicCalibrator = false, evidenceDir, autotuneStatePath, autotuneOptions = {}, presetWriter = null, inferenceBudget = null, reloadStatePath = null, reloadGuard: reloadGuardOption = null, presetBaselineClient = null, gate = null, gateAdminToken = null, maintenanceAuthority = null, maintenanceGateOptions = {} }) {
+function createLlamaCppManager({ budgetWatchDir = null, baseUrl, apiKey, fetchJson, presetPath, downloadStatePath, fetchStream, autoconfig = {}, calibrationStatePath, calibrationOptions = {}, publicCalibrator = false, evidenceDir, autotuneStatePath, autotuneOptions = {}, presetWriter = null, inferenceBudget = null, reloadStatePath = null, reloadGuard: reloadGuardOption = null, presetBaselineClient = null, frontAutotune = null, gate = null, gateAdminToken = null, maintenanceAuthority = null, maintenanceGateOptions = {} }) {
   const base = String(baseUrl || '').replace(/\/+$/, '').replace(/\/v1$/, '');
   const url = new URL(base);
   if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password || url.search || url.hash) throw Error('Invalid llama.cpp router URL');
@@ -217,7 +217,8 @@ function createLlamaCppManager({ budgetWatchDir = null, baseUrl, apiKey, fetchJs
   // 409 with a publicMessage and a code. Switching models is the gate's: it unloads the previous
   // model only once no request and no lease is using it.
   async function prepareLoad(model) {
-    await autotuner?.flushReload?.(model);
+    // #2516: a front-owned run's owed re-read is the front's (rust-autotune-runner.cjs createFrontAutotune).
+    await (autotuner || frontAutotune)?.flushReload?.(model);
     const refusal = await overBudget(model);
     if (refusal) throw Object.assign(Error(refusal.body.error), { status: 409, publicMessage: refusal.body.error, code: refusal.body.code });
   }
@@ -822,7 +823,7 @@ function createLlamaCppManager({ budgetWatchDir = null, baseUrl, apiKey, fetchJs
     chatBarrier: reason => maintenance.barrier(reason),
     requireMaintenanceRecovery: (key, repair, message) => maintenance.requireRecovery(key, repair, message),
     maintenanceRecoveryPending: () => maintenance.recoveryPending(),
-    tuningActive: () => maintenance.held() || calibrator?.stateFacts().job?.status === 'running' || autotuner?.statusFacts().job?.status === 'running',
+    tuningActive: () => maintenance.held() || calibrator?.stateFacts().job?.status === 'running' || autotuner?.statusFacts().job?.status === 'running' || frontAutotune?.tuningActive?.() === true,
     presetFacts: model => presets?.get(model) ?? null,
     applyPreset,
     // #697: the load guard and the budget, for the proxied benchmark start and the watchdog.
