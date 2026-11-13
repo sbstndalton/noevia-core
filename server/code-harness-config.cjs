@@ -14,6 +14,7 @@
 //     credentials of its own, so the endpoint and the model name are stated here or the agent
 //     has nothing to run on.
 const fs = require('node:fs'), nodePath = require('node:path');
+const { requireProc, at, openDir, openChild } = require('./dir-fd.cjs');
 
 /** Every action class asks. There is no "never ask" here either. */
 const PERMISSION = Object.freeze({ edit: 'ask', bash: 'ask', webfetch: 'ask' });
@@ -322,30 +323,51 @@ function writeHarnessConfig({ cwd, home = null, owner = null, ...options }) {
 // land wherever the repository pointed and then be handed to the harness uid. So nothing on the
 // way down may be a link, the target is replaced rather than written in place, and the final
 // open refuses to follow one even if it appeared in between.
+//
+// The tree (and the home) already belong to the harness user here, and a process of that user
+// may be running (#2527). So every step works through the descriptor of the directory it checked
+// (dir-fd.cjs), never by path again: a directory swapped for a link after the check is refused,
+// and one moved away keeps receiving the write wherever it went, which is somewhere that user
+// could write anyway. The file is handed over through its own descriptor, and directories noevia
+// made only once the file is in place, innermost first, so nothing can be planted in them first.
 const refuse = (why) => Object.assign(Error(`Refused to pin the harness configuration: ${why}.`), { status: 409 });
 function writePinned(root, relative, content, owner) {
   const base = nodePath.resolve(root);
   const target = nodePath.join(base, relative);
   if (!target.startsWith(base + nodePath.sep)) throw Error('Pinned file outside its root');
   const parts = nodePath.relative(base, target).split(nodePath.sep);
-  let dir = base;
-  for (const part of parts.slice(0, -1)) {
-    dir = nodePath.join(dir, part);
+  const leaf = parts.pop();
+  requireProc();
+  const open = [], made = [];
+  try {
+    let fd = openDir(base), shown = '';
+    open.push(fd);
+    for (const part of parts) {
+      shown = shown ? nodePath.join(shown, part) : part;
+      let st = null;
+      try { st = fs.lstatSync(at(fd, part)); } catch (e) { if (e.code !== 'ENOENT') throw e; }
+      if (st && st.isSymbolicLink()) throw refuse(`${shown} is a symbolic link`);
+      if (st && !st.isDirectory()) throw refuse(`${shown} is not a directory`);
+      if (!st) fs.mkdirSync(at(fd, part), { mode: 0o700 });
+      try { fd = openChild(fd, part, st); } catch (e) { throw e.swapped ? refuse(`${shown} ${e.message}`) : e; }
+      open.push(fd);
+      if (!st) made.push(fd);
+    }
     let st = null;
-    try { st = fs.lstatSync(dir); } catch (e) { if (e.code !== 'ENOENT') throw e; }
-    if (st && st.isSymbolicLink()) throw refuse(`${nodePath.relative(base, dir)} is a symbolic link`);
-    if (st && !st.isDirectory()) throw refuse(`${nodePath.relative(base, dir)} is not a directory`);
-    if (!st) { fs.mkdirSync(dir, { mode: 0o700 }); if (owner) fs.lchownSync(dir, owner.uid, owner.gid); }
+    try { st = fs.lstatSync(at(fd, leaf)); } catch (e) { if (e.code !== 'ENOENT') throw e; }
+    if (st && st.isSymbolicLink()) throw refuse(`${relative} is a symbolic link`);
+    if (st && st.isDirectory()) throw refuse(`${relative} is a directory`);
+    if (st) { try { fs.unlinkSync(at(fd, leaf)); } catch (e) { if (e.code !== 'ENOENT') throw e; } }
+    const { O_WRONLY, O_CREAT, O_EXCL, O_TRUNC, O_NOFOLLOW } = fs.constants;
+    const file = fs.openSync(at(fd, leaf), O_WRONLY | O_CREAT | O_EXCL | O_TRUNC | O_NOFOLLOW, 0o600);
+    try {
+      fs.writeFileSync(file, content);
+      if (owner) fs.fchownSync(file, owner.uid, owner.gid);
+    } finally { fs.closeSync(file); }
+    if (owner) for (const dir of made.reverse()) fs.fchownSync(dir, owner.uid, owner.gid);
+  } finally {
+    for (const fd of open) { try { fs.closeSync(fd); } catch { /* already closed */ } }
   }
-  let st = null;
-  try { st = fs.lstatSync(target); } catch (e) { if (e.code !== 'ENOENT') throw e; }
-  if (st && st.isSymbolicLink()) throw refuse(`${relative} is a symbolic link`);
-  if (st && st.isDirectory()) throw refuse(`${relative} is a directory`);
-  if (st) fs.unlinkSync(target);
-  const { O_WRONLY, O_CREAT, O_EXCL, O_TRUNC, O_NOFOLLOW } = fs.constants;
-  const fd = fs.openSync(target, O_WRONLY | O_CREAT | O_EXCL | O_TRUNC | O_NOFOLLOW, 0o600);
-  try { fs.writeFileSync(fd, content); } finally { fs.closeSync(fd); }
-  if (owner) fs.lchownSync(target, owner.uid, owner.gid);
 }
 
 /** The pinned files a harness writes into the working tree, which must never be committed. */
