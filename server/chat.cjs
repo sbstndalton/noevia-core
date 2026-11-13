@@ -1697,7 +1697,7 @@ function createChatHandler({
           narrowed: !!routing.narrowed, gate: !!(gate && gate.decision !== 'none'),
           supervision: nativeHandoff.supervising(),
           injected: injectedEntries.some((e) => e && e.kind === 'file' && typeof e.file !== 'string'),
-          editTools: activeTools.some((t) => projectEditTool(t.function?.name) || specialistPageSave.neverStanding(t.function?.name)),
+          pageSave: activeTools.some((t) => specialistPageSave.neverStanding(t.function?.name)),
           // #516: the stream guard's schema check runs before every call (egressToolRefusal) once it is on; the executor
           // does not run it yet. It answers for a call that cannot parse only when it is on and the tool has a schema.
           streamGuard: activeTools.some((t) => egressRules.validateToolArguments(t.function?.name, '\u0000') !== null),
@@ -1720,6 +1720,7 @@ function createChatHandler({
           limitScope: require('node:crypto').createHash('sha256').update(JSON.stringify([provider.baseUrl, provider.apiKey, modelManager.baseUrl])).digest('hex'),
           messages: wire, tools: activeTools, routes: [...toolRoutes],
           writes: names.filter((n) => isWriteTool(n)), public: names.filter((n) => isPublicTool(n)), automaticOnlyWrites: [...automaticOnlyWrites],
+          editTools: names.filter((n) => projectEditTool(n)),
           routeNote: routeNotes(), templateGate: provider.id === DEFAULT_PROVIDER_ID && typeof modelManager?.props === 'function',
           managerEnabled: !!modelManager?.enabled, modelLease: typeof modelManager?.acquireLease === 'function',
           chatId, contextId: chatId || spaceId, chatKey: chatId || spaceId || null,

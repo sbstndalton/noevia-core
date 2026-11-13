@@ -1,6 +1,6 @@
 'use strict';
 // Track R8, the native chat turn: the hand-off from this process's turn preparation to the Rust front's executor,
-// and the two tool bridges that executor calls while the tool engines are still this process's.
+// and the tool bridges that executor calls while the tool engines are still this process's.
 //
 // The front's native executor (noevia-rs bins/noevia-server, behind a per-account switch that is off by default)
 // sends a turn to the usual loopback POST /internal/chat/turn (rust-chat-turn.cjs) with one more header,
@@ -18,15 +18,23 @@
 // before the front writes a byte of its own and nothing runs twice. Without the header, or with the wrong value
 // (a browser's header rides along on the relay), nothing here changes the turn.
 //
-//   POST /internal/chat/tools/execute  {user, projectId, name, args, allowed, routes, chatKey, exchangeKey}
+//   POST /internal/chat/tools/execute  {user, projectId, name, args, allowed, routes, chatKey, exchangeKey, editTarget?}
 //        -> 200 {text, failed}           one tool call through the toolboxes (index.cjs executeToolCall), as the
-//                                        user, counted as chat.cjs counts it (recordToolUse)
+//                                        user, counted as chat.cjs counts it (recordToolUse). `editTarget`: an
+//                                        approved project file edit's pinned file (targetDigest, 64 hex), passed
+//                                        in the call's options as chat.cjs passes it (#648)
 //   POST /internal/chat/tools/target   {user, name, args, chatKey}
 //        -> 200 {target, kind} | {error} | {}   what a write would change (writeTargetFor, #659), before its card
 //   POST /internal/chat/tools/abort    {user, exchangeKey}
 //        -> 204                          aborts the signal of every execute call of that exchange still running (the
 //                                        native turn's client left: chat.cjs's tools get the turn's signal then); each
 //                                        call still answers with what its tool returned
+//   POST /internal/chat/tools/edit-target {user, projectId, name, args}
+//        -> 200 {path, account, digest} | {error}   the stored file a project edit tool (EDIT_TOOLS) would change
+//                                        (#648/#687: project-edit-target.cjs resolveEditTarget against the project as
+//                                        stored now, with the user's storage account), and the digest the call is
+//                                        pinned to (targetDigest(path, account)). chat.cjs resolves it before the
+//                                        card, after the answer and right before the run; so does the executor.
 //   POST /internal/chat/usage          {user, model, reported}
 //        -> 204                          the reply's token use, recorded by usage.cjs (recordUsage) as the user:
 //                                        this process stays the one writer of the account's usage file
@@ -58,8 +66,9 @@
 // a `model` may not carry control characters. The permission gate around a call (policy, approval card, audit,
 // grants, recent writes) is the native executor's own; these only run what the tool engines do. A tool call that
 // throws answers 500 with the error's message, which the executor turns into the call's result as
-// tool-exchange.cjs callError does; a target lookup that throws answers chat.cjs's own refusal ({error}); a fact
-// that cannot be read answers 500 with a fixed text (the detail is logged here, never sent).
+// tool-exchange.cjs callError does; a target lookup that throws answers chat.cjs's own refusal ({error}), and so does
+// an edit target lookup that throws (resolveEditTarget never does; reading the project can); a fact that cannot be
+// read answers 500 with a fixed text (the detail is logged here, never sent).
 //
 // What the native executor must keep, because this process stops counting the turn at the cut:
 // - the model's lease from the cut to the turn's end (the front's admission lease for the model: the gate's
@@ -81,6 +90,8 @@ const PREPARED_VERSION = 1;
 const EXECUTE_PATH = '/internal/chat/tools/execute';
 const TARGET_PATH = '/internal/chat/tools/target';
 const ABORT_PATH = '/internal/chat/tools/abort';
+const EDIT_TARGET_PATH = '/internal/chat/tools/edit-target';
+const DIGEST = /^[0-9a-f]{64}$/;
 const USAGE_PATH = '/internal/chat/usage';
 const PREFILL_PATH = '/internal/chat/prefill';
 const NATIVE_PREFIX = '/internal/chat/native/';
@@ -135,7 +146,9 @@ function refusal(t) {
   if (t.supervision) return 'step-supervision';
   // An injected whole file whose name is not text (retrieval never makes one): its attribution keys on the value.
   if (t.injected) return 'injected-sources';
-  if (t.editTools) return 'edit-tools';
+  // The coworker page save (#2446): asked about every time, never under a chat-wide grant. The project edit tools
+  // (#648) are the executor's: the prepared frame names them (`editTools`).
+  if (t.pageSave) return 'page-save';
   if (t.streamGuard) return 'stream-guard';
   return null;
 }
@@ -183,6 +196,9 @@ function preparedTurn(t) {
     limitScope: t.limitScope,
     messages: t.messages, tools: t.tools, routes: t.routes,
     writes: t.writes, public: t.public, automaticOnlyWrites: t.automaticOnlyWrites,
+    // The offered tools that are noevia's own project file edits (chat.cjs projectEditTool): resolved through the
+    // edit-target bridge before their card, and pinned to that file.
+    editTools: Array.isArray(t.editTools) ? t.editTools : [],
     routeNote: t.routeNote || '', templateGate: t.templateGate === true,
     // The local model manager answers health and load (resolveRuntimeLimit), and grants the model's lease.
     managerEnabled: t.managerEnabled === true, modelLease: t.modelLease === true,
@@ -230,7 +246,7 @@ function createAsUser({ userRow, runAs, currentWorkspace }) {
  * is the signed-in user chat.cjs passes as `chatUser` and `currentWorkspace()` theirs.
  */
 function createToolBridge({ secret, json, readJson, asUser, getProject, executeToolCall, writeTargetFor, recordToolUse, currentWorkspace, currentUser,
-  recordUsage = () => {}, recordSample = () => {}, modelManager = null, templateToolsGate = null, chatTitles = null, chatBodyCap = CHAT_BODY_CAP,
+  editStorageAccount = () => null, recordUsage = () => {}, recordSample = () => {}, modelManager = null, templateToolsGate = null, chatTitles = null, chatBodyCap = CHAT_BODY_CAP,
   log = (line) => console.warn(line) }) {
   // Execute calls in progress by `${user}\u0000${exchangeKey}`: the abort bridge aborts their signals.
   const running = new Map();
@@ -307,7 +323,7 @@ function createToolBridge({ secret, json, readJson, asUser, getProject, executeT
   return async function handle(req, res) {
     const path = String(req.url || '').split('?')[0];
     const op = path.startsWith(NATIVE_PREFIX) ? path.slice(NATIVE_PREFIX.length) : null;
-    if (path !== EXECUTE_PATH && path !== TARGET_PATH && path !== ABORT_PATH && path !== USAGE_PATH && path !== PREFILL_PATH && !NATIVE_OPS.has(op)) return false;
+    if (path !== EXECUTE_PATH && path !== TARGET_PATH && path !== ABORT_PATH && path !== EDIT_TARGET_PATH && path !== USAGE_PATH && path !== PREFILL_PATH && !NATIVE_OPS.has(op)) return false;
     if (!trustedFront(req, secret) || req.method !== 'POST') { json(res, 404, { error: 'Not found' }); return true; }
     let body;
     // A title bridge carries the chat's first message, which may be as long as a chat request.
@@ -359,6 +375,24 @@ function createToolBridge({ secret, json, readJson, asUser, getProject, executeT
     const name = text(body?.name, 200);
     const args = text(body?.args, BODY_CAP);
     if (!user || !name || args === null) { json(res, 400, { error: 'user, name and args are required.' }); return true; }
+    if (path === EDIT_TARGET_PATH) {
+      const edits = require('./project-edit-target.cjs');
+      const projectId = body.projectId === undefined || body.projectId === null ? null : text(body.projectId, 200);
+      if ((projectId === null && body.projectId != null) || projectId === '' || !edits.EDIT_TOOLS.has(name)) { json(res, 400, { error: 'projectId or name is invalid.' }); return true; }
+      let found;
+      try {
+        // chat.cjs: resolveEditTarget(project ? getProject(project.id) : null, tc.args, { storageAccount: editStorageAccount(userId) }),
+        // as the user (their workspace's project and storage connection).
+        found = await asUser(user, async () => edits.resolveEditTarget(projectId ? getProject(projectId) : null, args, { storageAccount: editStorageAccount(user) }));
+      } catch (error) {
+        if (missing(error)) { noAccount(res); return true; }
+        log(`[chat] native edit-target bridge failed: ${String(error?.message || error).slice(0, 300)}`);
+        found = { error: 'The file this would change could not be looked up' };
+      }
+      if (found?.error) json(res, 200, { error: String(found.error) });
+      else json(res, 200, { path: found.path, account: found.account || null, digest: edits.targetDigest(found.path, found.account || null) });
+      return true;
+    }
     const chatKey = body.chatKey === undefined || body.chatKey === null ? null : text(body.chatKey, CHAT_ID_CAP);
     if (chatKey === null && body.chatKey !== undefined && body.chatKey !== null) { json(res, 400, { error: 'chatKey is invalid.' }); return true; }
     try {
@@ -378,7 +412,10 @@ function createToolBridge({ secret, json, readJson, asUser, getProject, executeT
       if (!allowed || !routes) { json(res, 400, { error: 'allowed and routes are required.' }); return true; }
       const projectId = typeof body.projectId === 'string' && body.projectId ? text(body.projectId, 200) : null;
       const exchangeKey = typeof body.exchangeKey === 'string' ? text(body.exchangeKey, 200) : null;
-      if ((body.projectId && !projectId) || (body.exchangeKey && !exchangeKey)) { json(res, 400, { error: 'projectId or exchangeKey is invalid.' }); return true; }
+      const editTarget = body.editTarget === undefined || body.editTarget === null ? null : body.editTarget;
+      if ((body.projectId && !projectId) || (body.exchangeKey && !exchangeKey) || (editTarget !== null && !(typeof editTarget === 'string' && DIGEST.test(editTarget)))) {
+        json(res, 400, { error: 'projectId, exchangeKey or editTarget is invalid.' }); return true;
+      }
       const controller = new AbortController();
       const signal = callerGone(req, res, controller);
       const runKey = exchangeKey ? `${user}\u0000${exchangeKey}` : null;
@@ -389,7 +426,7 @@ function createToolBridge({ secret, json, readJson, asUser, getProject, executeT
           const project = projectId ? getProject(projectId) : null;
           if (projectId && !project) return null;
           const outcome = { failed: false };
-          const out = await executeToolCall(project, name, args, allowed, signal, outcome, { chatKey, exchangeKey, routes });
+          const out = await executeToolCall(project, name, args, allowed, signal, outcome, { chatKey, exchangeKey, routes, ...(editTarget !== null ? { editTarget } : {}) });
           recordToolUse(currentWorkspace(), name);
           return { text: String(out ?? ''), failed: outcome.failed === true };
         });
@@ -408,4 +445,4 @@ function createToolBridge({ secret, json, readJson, asUser, getProject, executeT
   };
 }
 
-module.exports = { HANDOFF_HEADER, PREPARED_VERSION, EXECUTE_PATH, TARGET_PATH, ABORT_PATH, USAGE_PATH, PREFILL_PATH, NATIVE_PREFIX, CHAT_BODY_CAP, createHandoff, refusal, reservedText, injectedSources, preparedTurn, createAsUser, createToolBridge };
+module.exports = { HANDOFF_HEADER, PREPARED_VERSION, EXECUTE_PATH, TARGET_PATH, ABORT_PATH, EDIT_TARGET_PATH, USAGE_PATH, PREFILL_PATH, NATIVE_PREFIX, CHAT_BODY_CAP, createHandoff, refusal, reservedText, injectedSources, preparedTurn, createAsUser, createToolBridge };
