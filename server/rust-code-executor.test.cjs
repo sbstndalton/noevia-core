@@ -36,14 +36,17 @@ async function serve(handle) {
 
 function engineBridge(over = {}) {
   const seen = [];
+  // The lookups answer only inside the caller's scope, as currentWorkspace() does: run outside it, they throw.
+  let current = null;
+  const scoped = () => { if (!current) throw Error('no request scope'); return current; };
   const handle = createCodeEngineBridge({
     secret: SECRET, json, readJson, log: () => {},
-    asUser: (user, fn) => { seen.push(['user', user]); return fn(); },
-    getProject: (id) => (id === 'qa-project' ? { id, name: 'QA project' } : null),
-    engine: over.engine ?? (() => ({ baseUrl: 'http://qa-engine.invalid:8080/v1', apiKey: 'qa-key', model: 'qa-model', contextTokens: 8192 })),
+    asUser: async (user, fn) => { seen.push(['user', user]); current = user; try { return await fn(); } finally { current = null; } },
+    getProject: (id) => (id === `${scoped()}-project` || (scoped() === 'qa-user' && id === 'qa-project') ? { id, name: 'QA project' } : null),
+    engine: over.engine ?? (() => ({ baseUrl: 'http://qa-engine.invalid:8080/v1', apiKey: `${scoped()}-key`, model: 'qa-model', contextTokens: 8192 })),
     machine: over.machine ?? (() => false),
     paused: over.paused ?? (() => false),
-    context: over.context ?? ((project) => `QA context for ${project.id}`),
+    context: over.context ?? ((project) => `QA context for ${project.id} as ${scoped()}`),
   });
   return { seen, handle };
 }
@@ -53,15 +56,18 @@ test('the engine bridge answers one start\'s facts, as that user, for that user\
   const s = await serve(handle);
   try {
     assert.deepEqual(await s.call({ user: 'qa-user', projectId: 'qa-project' }), { status: 200, body: {
-      engine: { baseUrl: 'http://qa-engine.invalid:8080/v1', apiKey: 'qa-key', model: 'qa-model', contextTokens: 8192 },
-      machine: false, paused: false, context: 'QA context for qa-project' } });
+      engine: { baseUrl: 'http://qa-engine.invalid:8080/v1', apiKey: 'qa-user-key', model: 'qa-model', contextTokens: 8192 },
+      machine: false, paused: false, context: 'QA context for qa-project as qa-user' } });
     assert.deepEqual(seen, [['user', 'qa-user']]);
     assert.deepEqual(await s.call({ user: 'qa-user', projectId: 'elsewhere' }), { status: 404, body: { error: 'project not found' } });
+    // Another user's project is not this user's, and that user's own lookups answer as that user.
+    assert.deepEqual(await s.call({ user: 'qa-other', projectId: 'qa-project' }), { status: 404, body: { error: 'project not found' } });
+    assert.equal((await s.call({ user: 'qa-other', projectId: 'qa-other-project' })).body.context, 'QA context for qa-other-project as qa-other');
   } finally { await s.close(); }
   // On a machine there is no engine here and no pause; unset values are nulls.
   const remote = await serve(engineBridge({ machine: () => true, paused: () => true }).handle);
   try {
-    assert.deepEqual((await remote.call({ user: 'qa-user', projectId: 'qa-project' })).body, { engine: null, machine: true, paused: false, context: 'QA context for qa-project' });
+    assert.deepEqual((await remote.call({ user: 'qa-user', projectId: 'qa-project' })).body, { engine: null, machine: true, paused: false, context: 'QA context for qa-project as qa-user' });
   } finally { await remote.close(); }
   const bare = await serve(engineBridge({ engine: () => ({ baseUrl: null, model: undefined }), paused: () => true, context: () => undefined }).handle);
   try {
@@ -112,8 +118,15 @@ function tenant() {
   const jobs = createJobs({ dir, kinds: ['code'] });
   const id = jobs.create({ kind: 'code', projectId: 'qa-project', capabilities: ['read_repository'] });
   jobs.append(id, 'job.started');
+  // ...and its workspace, held by the front (an epoch that is not this process's).
+  const tree = path.join(dir, 'qa-tree');
+  fs.mkdirSync(tree);
+  fs.mkdirSync(path.join(dir, 'code-workspaces'));
+  fs.writeFileSync(path.join(dir, 'code-workspaces', `${id}.json`), JSON.stringify({ taskId: id, repo: tree, branch: 'qa/front', path: tree,
+    status: 'held', mode: 'worktree', baseSha: null, capabilities: ['read_repository'], domains: [], pinned: [], epoch: 'front-qa', claimedAt: 1 }));
   return { dir, id };
 }
+const recordOf = (dir, id) => JSON.parse(fs.readFileSync(path.join(dir, 'code-workspaces', `${id}.json`), 'utf8'));
 
 test('a service the front owns recovers nothing and refuses every task action; reads still answer', async () => {
   const { dir, id } = tenant();
@@ -123,6 +136,7 @@ test('a service the front owns recovers nothing and refuses every task action; r
     const project = { id: 'qa-project' };
     assert.equal(service.get(workspace, project, id).status, 'running', 'the front\'s live task is not marked interrupted');
     assert.equal(service.list(workspace, project)[0].status, 'running');
+    assert.equal(recordOf(dir, id).status, 'held', 'the front\'s workspace is not recovered');
     for (const act of [() => service.start(workspace, project, { repository: 'x', prompt: 'QA' }), () => service.decide(workspace, project, id, 'approve', 'x'), () => service.cancel(workspace, project, id)]) {
       await assert.rejects(async () => act(), (e) => e.status === 409 && e.publicMessage === REFUSED);
     }
@@ -133,6 +147,7 @@ test('a service the front owns recovers nothing and refuses every task action; r
   try {
     const service = createCodeService({ repos: [], connect: () => { throw Error('no harness in this test'); } });
     assert.equal(service.get({ dir: other.dir, userId: 'qa-user' }, { id: 'qa-project' }, other.id).status, 'interrupted');
+    assert.equal(recordOf(other.dir, other.id).status, 'interrupted');
   } finally { fs.rmSync(other.dir, { recursive: true, force: true }); }
 });
 
