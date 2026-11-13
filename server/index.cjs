@@ -704,6 +704,7 @@ const codeEngineBridge = codeExecutor.createCodeEngineBridge({
   secret: FRONT_SECRET, json, readJson, asUser: (userId, fn) => diaryAsUser(userId, fn), getProject, engine: codeEngine,
   machine: () => !!codeMachineTarget(), paused: () => modelManager.tuningActive?.() === true,
   context: (project) => codeSharedContext(currentWorkspace(), project), role: codeRoleEndpoint,
+  roleWanted: () => features.enabled('codePipeline') || features.enabled('plannerReview'),
 });
 
 // #2262: GET inference-budget and GET installed are the Rust front's; this is what they cannot read for themselves.

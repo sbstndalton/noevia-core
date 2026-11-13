@@ -48,6 +48,7 @@ function engineBridge(over = {}) {
     paused: over.paused ?? (() => false),
     context: over.context ?? ((project) => `QA context for ${project.id} as ${scoped()}`),
     ...(over.role ? { role: over.role } : {}),
+    ...(over.roleWanted ? { roleWanted: over.roleWanted } : {}),
   });
   return { seen, handle };
 }
@@ -84,17 +85,35 @@ test('the engine bridge answers one start\'s facts, as that user, for that user\
 test('with `role` the engine bridge also answers the role engine\'s endpoint, and nothing of the provider but its schema capability', async () => {
   const role = () => ({ baseUrl: 'http://qa-provider.invalid:8080/v1', apiKey: 'qa-provider-key', model: 'qa-model', external: false,
     provider: { id: 'qa-provider', apiKey: 'qa-provider-key', capabilities: { jsonSchemaParam: true } } });
-  const s = await serve(engineBridge({ role }).handle);
+  const wanted = () => true;
+  const s = await serve(engineBridge({ role, roleWanted: wanted }).handle);
   try {
     assert.deepEqual((await s.call({ user: 'qa-user', projectId: 'qa-project' })).body.role,
       { baseUrl: 'http://qa-provider.invalid:8080/v1', apiKey: 'qa-provider-key', model: 'qa-model', external: false, jsonSchema: true });
   } finally { await s.close(); }
-  const bare = await serve(engineBridge({ role: () => ({ external: 'yes' }) }).handle);
+  // An external provider's key stays here.
+  const external = await serve(engineBridge({ role: () => ({ ...role(), external: true }), roleWanted: wanted }).handle);
+  try {
+    assert.deepEqual((await external.call({ user: 'qa-user', projectId: 'qa-project' })).body.role,
+      { baseUrl: 'http://qa-provider.invalid:8080/v1', apiKey: null, model: 'qa-model', external: true, jsonSchema: true });
+  } finally { await external.close(); }
+  // With the pipeline and the Planner review off (or unsaid), no role at all, and the role is never read.
+  let read = 0;
+  for (const roleWanted of [() => false, undefined]) {
+    const off = await serve(engineBridge({ role: () => { read++; return role(); }, roleWanted }).handle);
+    try {
+      const body = (await off.call({ user: 'qa-user', projectId: 'qa-project' })).body;
+      assert.equal('role' in body, false);
+      assert.equal(body.machine, false);
+    } finally { await off.close(); }
+  }
+  assert.equal(read, 0);
+  const bare = await serve(engineBridge({ role: () => ({ external: 'yes' }), roleWanted: wanted }).handle);
   try {
     assert.deepEqual((await bare.call({ user: 'qa-user', projectId: 'qa-project' })).body.role,
       { baseUrl: null, apiKey: null, model: null, external: false, jsonSchema: false });
   } finally { await bare.close(); }
-  const remote = await serve(engineBridge({ role, machine: () => true }).handle);
+  const remote = await serve(engineBridge({ role, roleWanted: wanted, machine: () => true }).handle);
   try { assert.equal((await remote.call({ user: 'qa-user', projectId: 'qa-project' })).body.role, null); } finally { await remote.close(); }
 });
 
@@ -174,5 +193,5 @@ test('index.cjs reads the switch once for the service, the facts bridge and the 
   assert.match(index, /frontOwned: codeExecutor\.frontOwnsCode\(\)/);
   assert.match(index, /frontOwns: \(\) => codeExecutor\.frontOwnsCode\(\)/);
   assert.match(index, /if \(codeExecutor\.frontOwnsCode\(\) && await codeEngineBridge\(req, res\)\) return;/);
-  assert.match(index, /context: \(project\) => codeSharedContext\(currentWorkspace\(\), project\), role: codeRoleEndpoint,/);
+  assert.match(index, /context: \(project\) => codeSharedContext\(currentWorkspace\(\), project\), role: codeRoleEndpoint,\n  roleWanted: \(\) => features\.enabled\('codePipeline'\) \|\| features\.enabled\('plannerReview'\),\n\}\);/);
 });

@@ -12,10 +12,12 @@
 //     -> {engine: {baseUrl, apiKey, model, contextTokens}|null, machine, paused, context}
 //        `machine`: the Code role runs on an inference machine (the relay is not the front's yet, so it refuses);
 //        `paused`: auto-tune or calibration is active; `context`: the project's shared context for Code ('' off).
-//        With `role` given (R7 P4, the front's Code pipeline), also
+//        With `role` given (R7 P4, the front's Code pipeline) and `roleWanted()` true (index.cjs: features.codePipeline
+//        or features.plannerReview on; off, the key is not there at all), also
 //        `role: {baseUrl, apiKey, model, external, jsonSchema}|null`: the role engine's endpoint (index.cjs
 //        `codeRoleEndpoint`: the provider as this process reaches it, not CODE_ENGINE_URL), whose key is also the
 //        leak guard's `engineKey`; `jsonSchema` is the provider's `capabilities.jsonSchemaParam`. `null` on a machine.
+//        An external provider's key never leaves this process: `apiKey` is null when `external` is true.
 //     -> 404 when the project is not that user's.
 //
 // Reached only by the front's own loopback calls (trusted-front.cjs); anything else gets the 404 of an unknown path.
@@ -30,11 +32,12 @@ function frontOwnsCode(env = process.env) { return env.NOEVIA_CODE_EXECUTOR === 
 /** The role engine's endpoint, without the provider record itself (only its JSON-schema capability). */
 function roleFacts(endpoint) {
   if (!endpoint) return null;
-  return { baseUrl: endpoint.baseUrl ?? null, apiKey: endpoint.apiKey ?? null, model: endpoint.model ?? null,
-    external: endpoint.external === true, jsonSchema: endpoint.provider?.capabilities?.jsonSchemaParam === true };
+  const external = endpoint.external === true;
+  return { baseUrl: endpoint.baseUrl ?? null, apiKey: external ? null : endpoint.apiKey ?? null, model: endpoint.model ?? null,
+    external, jsonSchema: endpoint.provider?.capabilities?.jsonSchemaParam === true };
 }
 
-function createCodeEngineBridge({ secret, json, readJson, asUser, getProject, engine, machine, paused, context, role = null, log = (m) => console.warn(m) }) {
+function createCodeEngineBridge({ secret, json, readJson, asUser, getProject, engine, machine, paused, context, role = null, roleWanted = () => false, log = (m) => console.warn(m) }) {
   return async function handle(req, res) {
     if (String(req.url || '').split('?')[0] !== PATH) return false;
     if (!trustedFront(req, secret) || req.method !== 'POST') { json(res, 404, { error: 'Not found' }); return true; }
@@ -52,7 +55,7 @@ function createCodeEngineBridge({ secret, json, readJson, asUser, getProject, en
           engine: endpoint ? { baseUrl: endpoint.baseUrl ?? null, apiKey: endpoint.apiKey ?? null, model: endpoint.model ?? null,
             contextTokens: endpoint.contextTokens ?? null } : null,
           machine: remote, paused: !remote && paused() === true, context: String(context(project) || ''),
-          ...(role ? { role: roleFacts(remote ? null : role()) } : {}),
+          ...(role && roleWanted() === true ? { role: roleFacts(remote ? null : role()) } : {}),
         };
       });
       if (!answer) { json(res, 404, { error: 'project not found' }); return true; }
