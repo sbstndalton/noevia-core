@@ -19,7 +19,7 @@ const grantFixture = require('../tests/server/chat-grant-fixture.cjs');
 const SECRET = 'qa-front-secret-0123456789abcdef';
 
 // One synthetic turn through the real handleChat: a manual project, the local default provider, a scripted engine.
-async function runTurn(t, { handoff = null, requested = false, supervising = false, frames, headersFor = () => ({}), project: extra = {}, before = () => {}, headers = {}, deps = {}, history = [], boxes = {}, body: extraBody = {} } = {}) {
+async function runTurn(t, { handoff = null, requested = false, caps = [], supervising = false, frames, headersFor = () => ({}), project: extra = {}, before = () => {}, headers = {}, deps = {}, history = [], boxes = {}, body: extraBody = {} } = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'noevia-native-handoff-'));
   before(dir);
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
@@ -57,7 +57,7 @@ async function runTurn(t, { handoff = null, requested = false, supervising = fal
     ...toolbox, oauthServerIds: () => new Set(), accountReady: () => true,
     grantContext: async (raw) => grantFixture.context(raw, { holder: { kind: 'absent' } }), chatWideApproved: () => false, awaitApproval: async () => 'approve',
     recordUsage() {}, recordToolUse() {}, sourceWaitMs: 0,
-    nativeHandoff: handoff || (requested ? { requested: () => true, supervising: () => supervising } : null),
+    nativeHandoff: handoff || (requested ? { requested: () => true, capabilities: () => new Set(caps), supervising: () => supervising } : null),
     ...deps,
   });
   const req = { headers: { ...headers } };
@@ -296,7 +296,7 @@ test('a turn it cannot run goes on in Node, exactly as without the request', asy
 
 test('refusal names the first part of the turn the native executor does not do yet', () => {
   const base = { diary: false, compactOnly: false, providerId: 'default', defaultProviderId: 'default', machine: false, external: false, chatgpt: false,
-    routeTarget: false, authorized: false, attachedImages: 0, retrievedImages: false, messages: [{ role: 'user', content: 'x' }], skills: false, provenance: false,
+    routeTarget: false, authorized: false, attachedImages: 0, retrievedImages: false, messages: [{ role: 'user', content: 'x' }], provenance: false,
     framingReasoner: false, narrowed: false, gate: false, supervision: false, injected: false, pageSave: false };
   assert.equal(native.refusal(base), null);
   const cases = [['diary', { diary: true }], ['provider', { providerId: 'qa-cloud' }], ['provider', { machine: true }],
@@ -563,7 +563,7 @@ const DOCS_BOX = { id: 'qa-docs', label: 'QA documents', source: 'mcp', server: 
   tools: ['project_read_file', 'project_append_file', 'project_replace_text'].map(DOCS_TOOL), reads: ['project_read_file'] };
 const docsBoxes = { mcpBoxes: () => [DOCS_BOX], mcpTools: () => new Map(DOCS_BOX.tools.map((t) => [t.function.name, { readOnly: t.function.name === 'project_read_file', serverId: 'qa-internal' }])) };
 
-test('a turn offering the project edit tools hands off and names them; one offering the coworker page save stays in Node', async (t) => {
+test('a turn offering the project edit tools hands off and names them; one offering the coworker page save hands off only to a front naming once', async (t) => {
   const handed = await runTurn(t, { requested: true, frames: answer, project: { toolboxes: ['core', 'qa-docs'] }, boxes: docsBoxes });
   const last = handed.events.at(-1);
   assert.equal(last.type, 'prepared', 'the edit tools no longer keep the turn in Node');
@@ -586,6 +586,13 @@ test('a turn offering the project edit tools hands off and names them; one offer
   assert.equal(kept.requests.length, 1, 'Node ran the turn');
   assert.ok(kept.requests[0].tools.some((tool) => tool.function.name === 'space_page_save'));
   assert.ok(logged.includes('[chat] native executor not used for this turn: page-save'));
+  // A front that runs the page save's card (#2446: asked every time, `once`) gets the turn, the tool named in onceTools.
+  const once = await runTurn(t, { requested: true, caps: ['once'], frames: answer, project: { id: 'specialist-qa' }, boxes: { specialistTools: pageSave } });
+  const frame = once.events.at(-1);
+  assert.equal(frame.type, 'prepared');
+  assert.deepEqual(frame.onceTools, ['space_page_save']);
+  assert.ok(frame.writes.includes('space_page_save'), 'the page save is always a write');
+  assert.equal('onceTools' in plain.events.at(-1), false, 'a frame without such tools has no onceTools');
 });
 
 test('the edit-target bridge resolves a project edit as the user, with its storage account and the digest the call is pinned to', async () => {
@@ -640,4 +647,434 @@ test('the execute bridge passes an approved edit\'s pinned file in the call\'s o
   assert.deepEqual(seen, [digest, 'none', 'none'], 'no key at all without one');
   for (const bad of ['qa-notes.txt', digest.toUpperCase(), digest.slice(1), 7, '']) assert.equal((await call(native.EXECUTE_PATH, { ...body, editTarget: bad })).status, 400, String(bad));
   assert.equal(seen.length, 3);
+});
+
+// Instruction skills (#272, #546): synthetic QA skills, one reviewed and enabled, one enabled beside it.
+const skills = require('./instruction-skills.cjs');
+const SKILL = 'qa-skill/SKILL.md', OTHER = 'qa-other/SKILL.md';
+const skillBody = (name, line) => `---\nname: ${name}\ndescription: A synthetic QA skill.\n---\n${line}\nQA second line of the synthetic skill body.\n`;
+const skillFiles = [{ name: SKILL, content: skillBody('QA Skill', 'QA first line that names the synthetic check steps.') },
+  { name: OTHER, content: skillBody('QA Other', 'QA other line about a second synthetic procedure.') }];
+const H = skills.hash(skillFiles[0].content), H2 = skills.hash(skillFiles[1].content);
+const skillProject = (enabled = { [SKILL]: true, [OTHER]: true }) => ({ id: 'qa-project', files: skillFiles,
+  instructionSkills: Object.fromEntries(skillFiles.map((f) => [f.name, { enabled: enabled[f.name] === true, reviewedHash: skills.hash(f.content) }])) });
+
+test('a project turn with instruction skills hands off with the loaded and enabled skills; a pinned one is loaded (#571)', async (t) => {
+  const project = { files: skillFiles, instructionSkills: skillProject().instructionSkills };
+  const pin = `${skills.skillId({ id: 'qa-project' }, SKILL)}@${H}`;
+  const handed = await runTurn(t, { requested: true, caps: ['skills'], frames: answer, project, body: { skill: pin } });
+  const last = handed.events.at(-1);
+  assert.equal(last.type, 'prepared', 'a project with skills no longer stays in Node');
+  assert.deepEqual(last.skills, { loaded: [{ file: SKILL, hash: H, name: 'QA Skill' }],
+    enabled: [{ file: SKILL, hash: H, name: 'QA Skill' }, { file: OTHER, hash: H2, name: 'QA Other' }], revokedInHistory: [], imageWarning: '', coverageWarning: '' });
+  assert.ok(handed.events.some((e) => e.type === 'skills_scope' && e.text === 'QA Skill'), 'the pin is shown before the cut');
+  const unpinned = await runTurn(t, { requested: true, caps: ['skills'], frames: answer, project });
+  assert.deepEqual(unpinned.events.at(-1).skills.loaded, []);
+  // A skill an earlier turn used and that is disabled now is taken out of the history before the cut, and named.
+  const off = { ...project, instructionSkills: skillProject({ [OTHER]: true }).instructionSkills };
+  const history = [{ role: 'user', content: 'QA earlier' }, { role: 'assistant', content: `QA earlier reply.\nIt followed SHA-256 ${H} closely.` }];
+  const scrubbed = (await runTurn(t, { requested: true, caps: ['skills'], frames: answer, project: off, history })).events;
+  assert.deepEqual(scrubbed.at(-1).skills.revokedInHistory, ['QA Skill']);
+  assert.ok(!JSON.stringify(scrubbed.at(-1).messages).includes(H));
+  assert.ok(scrubbed.some((e) => e.type === 'warning' && e.text.startsWith('Earlier replies in this chat used Skill "QA Skill"')));
+  // A project with no skills carries empty lists.
+  const none = (await runTurn(t, { requested: true, frames: answer })).events.at(-1).skills;
+  assert.deepEqual(none, { loaded: [], enabled: [], revokedInHistory: [], imageWarning: '', coverageWarning: '' });
+});
+
+test('the skill bridges check, note and scrub a turn\'s skills as the user, against the project as stored now', async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'noevia-native-skills-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const ledger = require('./skill-history.cjs').createSkillHistory({ fs, path });
+  let stored = skillProject();
+  const { call, calls } = bridge({ getProject: (id) => (id === 'qa-project' ? stored : null), currentWorkspace: () => ({ dir, assertActive() {} }), skillLedger: ledger });
+  const at = (op) => `${native.SKILLS_PREFIX}${op}`;
+  const loaded = [{ file: SKILL, hash: H, name: 'QA Skill' }];
+  const base = { user: 'qa-user', projectId: 'qa-project', chatId: 'qa-chat-1' };
+  // revoked: what chat.cjs revokedSkills finds, against the project as stored when asked.
+  assert.deepEqual(await call(at('revoked'), { ...base, loaded }), { handled: true, status: 200, body: { gone: [] } });
+  assert.deepEqual(calls, [['asUser', 'qa-user']]);
+  // read: a call naming the skill file loads it, and the version is recorded in the ledger for the chat.
+  const candidates = [{ file: SKILL, hash: H, name: 'QA Skill' }, { file: OTHER, hash: H2, name: 'QA Other' }];
+  const read = await call(at('read'), { ...base, candidates, args: '{"name":"qa-skill/SKILL.md"}', result: 'QA unrelated text' });
+  assert.deepEqual(read.body, { loaded: [{ file: SKILL, hash: H, name: 'QA Skill' }] });
+  const entry = JSON.parse(fs.readFileSync(path.join(dir, 'skill-history.json'), 'utf8')).projects['qa-project'];
+  assert.deepEqual(entry.map((e) => [e.file, e.hash, e.name, e.chats]), [[SKILL, H, 'QA Skill', ['qa-chat-1']]]);
+  assert.ok(entry[0].lines.length > 0, 'recorded with the version\'s text');
+  // A result carrying a skill's SHA-256 (the reader's heading) loads it too; one naming none loads nothing.
+  assert.deepEqual((await call(at('read'), { ...base, candidates: candidates.slice(1), args: '{}', result: `Loaded instruction skill "QA Other" (SHA-256 ${H2}).` })).body, { loaded: [candidates[1]] });
+  assert.deepEqual((await call(at('read'), { ...base, candidates, args: 'not json', result: 'QA nothing' })).body, { loaded: [] });
+  // The same decision as chat.cjs noteSkillRead: skill-reads.cjs.
+  assert.deepEqual(require('./skill-reads.cjs').matchedReads(stored, candidates, '{"name":"SKILL.md"}', ''), [], 'an ambiguous bare name resolves to nothing');
+  // Disabled now: the loaded skill is gone; a project that is gone revokes them all.
+  stored = skillProject({ [OTHER]: true });
+  assert.deepEqual((await call(at('revoked'), { ...base, loaded })).body, { gone: [{ file: SKILL, name: 'QA Skill' }] });
+  assert.deepEqual((await call(at('revoked'), { ...base, projectId: 'qa-gone', loaded })).body, { gone: [{ file: SKILL, name: 'QA Skill' }] });
+  // scrub: the revoked version's text out of the round's messages (the ledger knows it from the read above).
+  const messages = [null, { role: 'assistant', content: `QA reply.\nIt used SHA-256 ${H} here.` }, { role: 'assistant', content: 'QA unrelated reply.' }];
+  const scrub = await call(at('scrub'), { ...base, messages });
+  assert.equal(scrub.status, 200);
+  assert.deepEqual(scrub.body.removed, ['QA Skill']);
+  assert.deepEqual(scrub.body.changed, [[1, 'QA reply.\n[Skill "QA Skill" was disabled or changed, and its instructions were removed]']]);
+  stored = skillProject();
+  assert.deepEqual((await call(at('scrub'), { ...base, messages })).body, { changed: [], removed: [] }, 'enabled again: nothing to take out');
+  assert.deepEqual((await call(at('scrub'), { ...base, projectId: 'qa-gone', messages })).body, { changed: [], removed: [] });
+  // Refusals: not the front, not POST, a gone account, bad input; a failure's detail is logged, never sent.
+  assert.deepEqual(await call(at('revoked'), { ...base, loaded }, { trusted: false }), { handled: true, status: 404, body: { error: 'Not found' } });
+  assert.equal((await call(at('scrub'), { ...base, messages }, { method: 'GET' })).status, 404);
+  assert.equal((await call(`${native.SKILLS_PREFIX}other`, base)).handled, false);
+  const before = calls.length;
+  for (const [op, bad] of [['revoked', { loaded: [{ file: SKILL, hash: 'x', name: 'QA' }] }], ['revoked', { loaded: null }], ['revoked', { projectId: '' }], ['revoked', { user: '' }],
+    ['read', { candidates, args: '{}' }], ['read', { candidates: [{ file: '', hash: H, name: 'QA' }], args: '{}', result: '' }], ['read', { chatId: 7, candidates, args: '{}', result: '' }],
+    ['scrub', { messages: [{ role: 'assistant', content: null }] }], ['scrub', { messages: 'x' }], ['scrub', { chatId: 'x'.repeat(401), messages }]]) {
+    assert.equal((await call(at(op), { ...base, loaded, ...bad })).status, 400, `${op} ${JSON.stringify(bad)}`);
+  }
+  assert.equal(calls.filter(([c]) => c === 'asUser').length - before, 9, 'every request naming a user runs as that user before its body is read');
+  const gone = bridge({ asUser: async () => { throw Object.assign(Error('no such account'), { status: 404 }); } });
+  assert.deepEqual(await gone.call(at('read'), { ...base, candidates, args: '{}', result: '' }), { handled: true, status: 404, body: { error: 'no such account' } });
+  const logged = [];
+  const failing = bridge({ log: (line) => logged.push(line), getProject: () => { throw Error('QA store down'); } });
+  assert.deepEqual(await failing.call(at('revoked'), { ...base, loaded }), { handled: true, status: 500, body: { error: 'the skills could not be checked' } });
+  assert.deepEqual(logged, ['[chat] native skills revoked bridge failed: QA store down']);
+});
+
+test('the capabilities header is read only with the secret, and removed either way', () => {
+  const handoff = native.createHandoff({ secret: SECRET, relayed: () => true });
+  const ask = (headers) => { const req = { headers }; const ok = handoff.requested(req); return [ok, [...handoff.capabilities(req)], native.CAPS_HEADER in req.headers]; };
+  assert.deepEqual(ask({ [native.HANDOFF_HEADER]: SECRET, [native.CAPS_HEADER]: 'skills, qa-later ,' }), [true, ['skills', 'qa-later'], false]);
+  assert.deepEqual(ask({ [native.HANDOFF_HEADER]: SECRET }), [true, [], false]);
+  // A client's own header without the secret (or with a wrong one) names nothing and does not reach the turn.
+  assert.deepEqual(ask({ [native.CAPS_HEADER]: 'skills' }), [false, [], false]);
+  assert.deepEqual(ask({ [native.HANDOFF_HEADER]: 'qa-guess', [native.CAPS_HEADER]: 'skills' }), [false, [], false]);
+  const direct = native.createHandoff({ secret: SECRET });
+  const req = { headers: { [native.HANDOFF_HEADER]: SECRET, [native.CAPS_HEADER]: 'skills' } };
+  assert.equal(direct.requested(req), false, 'not relayed by the front');
+  assert.deepEqual([...direct.capabilities(req)], []);
+  assert.deepEqual([...handoff.capabilities(null)], []);
+});
+
+test('a project with instruction skills stays in Node unless the front names the skills capability', async (t) => {
+  const project = { files: skillFiles, instructionSkills: skillProject().instructionSkills };
+  const logged = [];
+  const log = console.log;
+  console.log = (line) => logged.push(String(line));
+  let kept, enabledOnly;
+  try {
+    kept = await runTurn(t, { requested: true, frames: answer, project });
+    enabledOnly = await runTurn(t, { requested: true, caps: ['qa-other'], frames: answer, project });
+  } finally { console.log = log; }
+  for (const turn of [kept, enabledOnly]) {
+    assert.notEqual(turn.events.at(-1).type, 'prepared');
+    assert.equal(turn.requests.length, 1, 'Node ran the turn');
+  }
+  assert.equal(logged.filter((l) => l === '[chat] native executor not used for this turn: skills').length, 2);
+  assert.equal((await runTurn(t, { requested: true, caps: ['skills'], frames: answer, project })).events.at(-1).type, 'prepared');
+  // Through the real hand-off: the header from the front, with the secret.
+  const handoff = native.createHandoff({ secret: SECRET, relayed: () => true });
+  const real = await runTurn(t, { handoff, frames: answer, project, headers: { [native.HANDOFF_HEADER]: SECRET, [native.CAPS_HEADER]: 'skills' } });
+  assert.equal(real.events.at(-1).type, 'prepared');
+  assert.equal(native.CAPS_HEADER in real.req.headers, false);
+  // A project with no skills needs no capability.
+  assert.equal((await runTurn(t, { requested: true, frames: answer })).events.at(-1).type, 'prepared');
+});
+
+// The chat-wide grants (R8): the grant, redeem and revoke bridges over the real approval registry (S9) and a scripted
+// front. The executor below is a write executor as toolboxes.cjs runs one: inside the call's write fence, sending its
+// outbound write through tool-write-fence.cjs send.
+const { createApprovalRegistry, REGISTRY_PROTOCOL } = require('./rust-approval-registry.cjs');
+const writeFence = require('./tool-write-fence.cjs');
+// As chat.cjs permissionContext sends it: chat-grant-context.cjs binding over the chat's context from this start.
+const QA_BINDING = require('./chat-grant-context.cjs').binding('qa-user', 'qa-chat-1', 'qa-scope',
+  { canonicalChatId: 'qa-chat-1', holder: { kind: 'free' }, generation: '1', start: require('./chat-partial.cjs').START_ID, tombstoned: false });
+const grantAsk = { user: 'qa-user', chat: 'qa-chat-1', scope: 'qa-scope', binding: QA_BINDING, exchangeKey: 'qa-x' };
+const grantCall = (handle, extra = {}, grant = {}) => ({ user: 'qa-user', projectId: 'qa-project', name: 'qa_write', args: '{"name":"qa"}', allowed: ['qa_write'], routes: [],
+  chatKey: 'qa-chat-1', exchangeKey: 'qa-x', grant: { handle, chat: 'qa-chat-1', scope: 'qa-scope', binding: QA_BINDING, ...grant }, ...extra });
+const redeemed = () => ({ status: 200, body: { redeemed: true, protocol: REGISTRY_PROTOCOL, window_ms: 2000 } });
+
+function grantBridge({ redeem = redeemed, registryParts = null, overrides = {} } = {}) {
+  const { AsyncLocalStorage } = require('node:async_hooks');
+  const as = new AsyncLocalStorage();
+  const asked = [];
+  let tickets = 0;
+  const registry = createApprovalRegistry({ approvals: async (op, payload) => {
+    asked.push([op, payload]);
+    if (op === 'granted') return { status: 200, body: { granted: true, ticket: `qa-ticket-${tickets += 1}` } };
+    if (op === 'redeem') return redeem(payload);
+    if (op === 'revoke') return { status: 200, body: { revoked: true } };
+    return { status: 404, body: {} };
+  } });
+  const clock = { t: 1_800_000_000_000 };
+  const ctl = { hold: null, entered: null, workspaceUser: null };
+  const writes = [], fences = [];
+  const b = bridge({
+    asUser: async (userId, fn) => as.run(userId, fn),
+    currentWorkspace: () => ({ userId: ctl.workspaceUser || as.getStore(), revoked: false }),
+    recordToolUse: (ws, name) => b.calls.push(['recordToolUse', ws.userId, name]),
+    executeToolCall: async (project, name, args, allowed, signal, outcome, options) => {
+      fences.push(options.writeFence || null);
+      ctl.signal = signal;
+      try {
+        return await writeFence.run(options.writeFence, async () => {
+          ctl.entered?.();
+          if (ctl.hold) await ctl.hold;
+          return writeFence.send(() => { writes.push([name, args, options.writeFence ? options.writeFence.open() : null]); return `QA ${name} wrote`; });
+        });
+      } catch (e) {
+        if (e?.code !== writeFence.CODE) throw e;
+        outcome.notRun = true; outcome.failed = true;
+        return `ERROR: ${e.message}`;
+      }
+    },
+    ...(registryParts ? registryParts(registry) : { chatWideApproved: registry.chatWideApproved, redeemChatGrant: registry.redeemChatGrant, revokeChatGrant: registry.revokeChatGrant }),
+    now: () => clock.t,
+    ...overrides,
+  });
+  const grant = async (extra = {}) => (await b.call(native.GRANT_PATH, { ...grantAsk, ...extra })).body;
+  return { ...b, registry, asked, clock, ctl, writes, fences, grant, recorded: () => b.calls.filter(([k]) => k === 'recordToolUse') };
+}
+
+test('a grant handle is redeemed by its execute call, which writes inside the open fence and is counted once', async () => {
+  const g = grantBridge();
+  const got = await g.grant();
+  assert.equal(got.granted, true);
+  assert.match(got.handle, /^[0-9a-f]{32}$/);
+  assert.deepEqual(Object.keys(QA_BINDING).sort(), ['canonicalChatId', 'context', 'scope', 'user']);
+  assert.deepEqual(g.asked, [['granted', { user: 'qa-user', chat: 'qa-chat-1', scope: 'qa-scope', binding: QA_BINDING, protocol: REGISTRY_PROTOCOL }]]);
+  assert.deepEqual(await g.call(native.EXECUTE_PATH, grantCall(got.handle, {}, { binding: JSON.parse(JSON.stringify(QA_BINDING)) })),
+    { handled: true, status: 200, body: { text: 'QA qa_write wrote', failed: false } });
+  assert.deepEqual(g.writes, [['qa_write', '{"name":"qa"}', true]], 'the write ran with the fence open');
+  assert.deepEqual(g.asked.map(([op]) => op), ['granted', 'redeem']);
+  assert.equal(g.asked[1][1].ticket, 'qa-ticket-1');
+  assert.deepEqual(g.asked[1][1].binding, JSON.parse(JSON.stringify(QA_BINDING)), 'redeemed with the call\'s final binding');
+  assert.deepEqual(g.recorded(), [['recordToolUse', 'qa-user', 'qa_write']]);
+  assert.equal(g.fences[0].open(), false, 'the fence is retired when the call ends');
+  // Single use: the same handle again runs nothing and asks the front nothing.
+  assert.deepEqual((await g.call(native.EXECUTE_PATH, grantCall(got.handle))).body, { redeem: 'refused' });
+  assert.equal(g.writes.length, 1);
+  assert.equal(g.asked.length, 2);
+  assert.equal(g.recorded().length, 1);
+  // A well-formed handle nobody was given.
+  assert.deepEqual((await g.call(native.EXECUTE_PATH, grantCall('0'.repeat(32)))).body, { redeem: 'refused' });
+});
+
+test('a handle named by another user, chat, scope or exchange is refused, and is gone afterwards', async () => {
+  const g = grantBridge();
+  for (const [extra, grant] of [[{ user: 'qa-other' }, {}], [{}, { chat: 'qa-chat-2' }], [{}, { scope: 'qa-scope-2' }], [{ exchangeKey: 'qa-y' }, {}]]) {
+    const { handle } = await g.grant();
+    assert.deepEqual((await g.call(native.EXECUTE_PATH, grantCall(handle, extra, grant))).body, { redeem: 'refused' }, JSON.stringify([extra, grant]));
+    assert.deepEqual((await g.call(native.EXECUTE_PATH, grantCall(handle))).body, { redeem: 'refused' }, 'single use, whatever happened');
+  }
+  assert.deepEqual(g.writes, []);
+  assert.equal(g.asked.filter(([op]) => op === 'redeem').length, 0);
+  assert.deepEqual(g.recorded(), []);
+});
+
+test('a once-only tool (the coworker page save) never runs under a grant handle, and the handle is spent', async () => {
+  const g = grantBridge();
+  const { handle } = await g.grant();
+  assert.deepEqual((await g.call(native.EXECUTE_PATH, grantCall(handle, { name: 'space_page_save', allowed: ['space_page_save'] }))).body, { redeem: 'refused' });
+  assert.deepEqual((await g.call(native.EXECUTE_PATH, grantCall(handle))).body, { redeem: 'refused' }, 'single use');
+  assert.deepEqual(g.writes, []);
+  assert.equal(g.asked.filter(([op]) => op === 'redeem').length, 0);
+});
+
+test('a grant handle expires after five minutes', async () => {
+  const g = grantBridge();
+  const late = (await g.grant()).handle, inTime = (await g.grant()).handle;
+  g.clock.t += native.GRANT_HANDLE_TTL_MS - 1;
+  assert.deepEqual((await g.call(native.EXECUTE_PATH, grantCall(inTime))).body, { text: 'QA qa_write wrote', failed: false });
+  g.clock.t += 1;
+  assert.deepEqual((await g.call(native.EXECUTE_PATH, grantCall(late))).body, { redeem: 'refused' });
+  assert.equal(g.writes.length, 1);
+});
+
+test('grant handles are bounded per account and in all; a live one is never evicted, an expired one is swept', async () => {
+  const g = grantBridge();
+  const mine = [];
+  for (let i = 0; i < 64; i += 1) { const got = await g.grant(); assert.equal(got.granted, true); mine.push(got.handle); }
+  assert.deepEqual(await g.grant(), { granted: false });
+  assert.equal(g.asked.length, 64, 'a full account does not ask the front');
+  assert.equal((await g.grant({ user: 'qa-other' })).granted, true, 'other accounts are unaffected');
+  // The oldest is still there.
+  assert.deepEqual((await g.call(native.EXECUTE_PATH, grantCall(mine[0]))).body, { text: 'QA qa_write wrote', failed: false });
+  assert.equal((await g.grant()).granted, true, 'a redeemed handle frees its place');
+  // 1024 in all: fill with more accounts.
+  for (let u = 0; u < 15; u += 1) for (let i = 0; i < (u === 14 ? 63 : 64); i += 1) assert.equal((await g.grant({ user: `qa-user-${u}` })).granted, true);
+  assert.deepEqual(await g.grant({ user: 'qa-third' }), { granted: false }, 'the whole map is full');
+  g.clock.t += native.GRANT_HANDLE_TTL_MS;
+  assert.equal((await g.grant({ user: 'qa-third' })).granted, true, 'expired handles are swept first');
+  assert.equal((await g.grant()).granted, true);
+});
+
+test('a redeem the front refuses runs nothing (refused); one it cannot answer runs nothing (unavailable)', async () => {
+  let answer = () => ({ status: 200, body: { redeemed: false, protocol: REGISTRY_PROTOCOL, window_ms: 2000 } });
+  const g = grantBridge({ redeem: () => answer() });
+  assert.deepEqual((await g.call(native.EXECUTE_PATH, grantCall((await g.grant()).handle))).body, { redeem: 'refused' });
+  answer = () => ({ status: 503, body: { error: 'QA front unavailable' } });
+  assert.deepEqual((await g.call(native.EXECUTE_PATH, grantCall((await g.grant()).handle))).body, { redeem: 'unavailable' });
+  answer = () => { throw Object.assign(Error('QA connection refused'), { code: 'ECONNREFUSED' }); };
+  assert.deepEqual((await g.call(native.EXECUTE_PATH, grantCall((await g.grant()).handle))).body, { redeem: 'unavailable' });
+  assert.deepEqual(g.writes, []);
+  assert.deepEqual(g.fences, [], 'the executor was never called');
+  assert.deepEqual(g.recorded(), []);
+});
+
+test('a revoke at the front between the grant and the call refuses it before the redeem', async () => {
+  const g = grantBridge();
+  const { handle } = await g.grant();
+  assert.equal(g.registry.frontRevoked('qa-user', 'qa-chat-1'), true);
+  assert.deepEqual((await g.call(native.EXECUTE_PATH, grantCall(handle))).body, { redeem: 'refused' });
+  assert.deepEqual(g.asked.map(([op]) => op), ['granted']);
+  assert.deepEqual(g.writes, []);
+});
+
+test('a revoke while the call runs, before its outbound write, stops the write: notRun, not counted', async () => {
+  const g = grantBridge();
+  const { handle } = await g.grant();
+  let release;
+  g.ctl.hold = new Promise((resolve) => { release = resolve; });
+  const entered = new Promise((resolve) => { g.ctl.entered = resolve; });
+  const running = g.call(native.EXECUTE_PATH, grantCall(handle));
+  await entered;
+  assert.equal(g.fences[0].open(), true);
+  g.registry.frontRevoked('qa-user', 'qa-chat-1');
+  release();
+  const { status, body } = await running;
+  assert.equal(status, 200);
+  assert.equal(body.notRun, true);
+  assert.equal(body.failed, true);
+  assert.match(body.text, /^ERROR: The permission changed before the write was sent/);
+  assert.deepEqual(g.writes, []);
+  assert.deepEqual(g.recorded(), [], 'a call that did not run is not counted');
+});
+
+test('the abort bridge reaches a call running under a grant', async () => {
+  const g = grantBridge();
+  const { handle } = await g.grant();
+  let release;
+  g.ctl.hold = new Promise((resolve) => { release = resolve; });
+  const entered = new Promise((resolve) => { g.ctl.entered = resolve; });
+  const running = g.call(native.EXECUTE_PATH, grantCall(handle));
+  await entered;
+  assert.equal(g.ctl.signal.aborted, false);
+  assert.equal((await g.call(native.ABORT_PATH, { user: 'qa-user', exchangeKey: 'qa-x' })).status, 204);
+  assert.equal(g.ctl.signal.aborted, true);
+  release();
+  assert.equal((await running).status, 200);
+});
+
+test('without a grant, a call the executor reports as not run answers notRun and is not counted', async () => {
+  const { call, calls } = bridge({ executeToolCall: async (_p, name, _a, _al, _s, outcome) => { outcome.notRun = true; outcome.failed = true; return `ERROR: QA ${name} not sent`; } });
+  const body = { user: 'qa-user', projectId: 'qa-project', name: 'qa_write', args: '{}', allowed: ['qa_write'], routes: [], chatKey: 'qa-chat-1', exchangeKey: 'qa-x' };
+  assert.deepEqual((await call(native.EXECUTE_PATH, body)).body, { text: 'ERROR: QA qa_write not sent', failed: true, notRun: true });
+  assert.deepEqual(calls.filter(([k]) => k === 'recordToolUse'), []);
+});
+
+test('without the registry no grant is found, and a grant is never run unfenced', async () => {
+  const none = grantBridge({ registryParts: () => ({}) });
+  assert.deepEqual(await none.grant(), { granted: false });
+  assert.equal((await none.call(native.REVOKE_PATH, { user: 'qa-user', chat: 'qa-chat-1' })).status, 503);
+  const noRedeem = grantBridge({ registryParts: (r) => ({ chatWideApproved: r.chatWideApproved }) });
+  const { handle } = await noRedeem.grant();
+  assert.deepEqual((await noRedeem.call(native.EXECUTE_PATH, grantCall(handle))).body, { redeem: 'unavailable' });
+  assert.deepEqual((await noRedeem.call(native.EXECUTE_PATH, grantCall(handle))).body, { redeem: 'refused' }, 'the handle was used up');
+  assert.deepEqual(noRedeem.writes, []);
+  // The front says no grant; and a workspace that is not the user's never gets one.
+  const g = grantBridge({ registryParts: (r) => ({ chatWideApproved: async () => false, redeemChatGrant: r.redeemChatGrant }) });
+  assert.deepEqual(await g.grant(), { granted: false });
+  const other = grantBridge();
+  other.ctl.workspaceUser = 'qa-other';
+  assert.deepEqual(await other.grant(), { granted: false });
+  assert.deepEqual(other.asked, []);
+});
+
+test('the revoke bridge revokes the chat\'s grant at the front, as the user', async () => {
+  const g = grantBridge();
+  const { handle } = await g.grant();
+  assert.deepEqual(await g.call(native.REVOKE_PATH, { user: 'qa-user', chat: 'qa-chat-1' }), { handled: true, status: 200, body: { revoked: true } });
+  assert.deepEqual(g.asked.at(-1), ['revoke', { user: 'qa-user', chat: 'qa-chat-1' }]);
+  // Node's epoch moved first: the handle found before it no longer redeems.
+  assert.deepEqual((await g.call(native.EXECUTE_PATH, grantCall(handle))).body, { redeem: 'refused' });
+  const gone = grantBridge({ overrides: { asUser: async () => { throw Object.assign(Error('no such account'), { status: 404 }); } } });
+  assert.deepEqual(await gone.call(native.REVOKE_PATH, { user: 'qa-user', chat: 'qa-chat-1' }), { handled: true, status: 404, body: { error: 'no such account' } });
+  assert.deepEqual(await gone.call(native.GRANT_PATH, grantAsk), { handled: true, status: 404, body: { error: 'no such account' } });
+});
+
+test('the grant bridges refuse malformed requests (400) and anyone but the front (404)', async () => {
+  const g = grantBridge();
+  for (const bad of [{ user: '' }, { user: 7 }, { chat: '' }, { chat: 'x'.repeat(401) }, { scope: '' }, { scope: 'x'.repeat(201) }, { scope: 3 },
+    { binding: null }, { binding: [] }, { binding: 'qa' }, { exchangeKey: '' }, { exchangeKey: undefined }, { exchangeKey: 'x'.repeat(201) }]) {
+    assert.equal((await g.call(native.GRANT_PATH, { ...grantAsk, ...bad })).status, 400, JSON.stringify(bad));
+  }
+  for (const bad of [{ user: '' }, { chat: '' }, { chat: 3 }]) assert.equal((await g.call(native.REVOKE_PATH, { user: 'qa-user', chat: 'qa-chat-1', ...bad })).status, 400, JSON.stringify(bad));
+  assert.equal(g.asked.length, 0);
+  const { handle } = await g.grant();
+  const call = grantCall(handle);
+  for (const grant of [handle.toUpperCase(), 7, [], 'qa', { ...call.grant, handle: handle.toUpperCase() }, { ...call.grant, handle: handle.slice(1) }, { ...call.grant, handle: 1 },
+    { ...call.grant, chat: '' }, { ...call.grant, scope: undefined }, { ...call.grant, binding: [] }, { ...call.grant, binding: null }]) {
+    assert.equal((await g.call(native.EXECUTE_PATH, { ...call, grant })).status, 400, JSON.stringify(grant));
+  }
+  assert.equal((await g.call(native.EXECUTE_PATH, { ...call, exchangeKey: undefined })).status, 400, 'a grant call names its exchange');
+  assert.equal((await g.call(native.GRANT_PATH, grantAsk, { trusted: false })).status, 404);
+  assert.equal((await g.call(native.REVOKE_PATH, { user: 'qa-user', chat: 'qa-chat-1' }, { trusted: false })).status, 404);
+  assert.equal((await g.call(native.EXECUTE_PATH, call, { trusted: false })).status, 404);
+  // A malformed request leaves the handle in place.
+  assert.deepEqual((await g.call(native.EXECUTE_PATH, call)).body, { text: 'QA qa_write wrote', failed: false });
+});
+
+test('an exchange stopped while the front redeems runs nothing (aborted), and the fence is retired', async () => {
+  let release, askedRedeem;
+  const redeemAsked = new Promise((resolve) => { askedRedeem = resolve; });
+  const held = new Promise((resolve) => { release = resolve; });
+  const fences = [];
+  const g = grantBridge({ redeem: async () => { askedRedeem(); await held; return redeemed(); },
+    registryParts: (r) => ({ chatWideApproved: r.chatWideApproved, revokeChatGrant: r.revokeChatGrant,
+      redeemChatGrant: async (...a) => { const f = await r.redeemChatGrant(...a); fences.push(f); return f; } }) });
+  const { handle } = await g.grant();
+  const running = g.call(native.EXECUTE_PATH, grantCall(handle));
+  await redeemAsked;
+  assert.equal((await g.call(native.ABORT_PATH, { user: 'qa-user', exchangeKey: 'qa-x' })).status, 204);
+  release();
+  assert.deepEqual(await running, { handled: true, status: 200, body: { redeem: 'aborted' } });
+  assert.deepEqual(g.writes, []);
+  assert.deepEqual(g.fences, [], 'the executor was never called');
+  assert.deepEqual(g.recorded(), []);
+  assert.equal(fences.length, 1);
+  assert.equal(typeof fences[0].open, 'function', 'the front redeemed it');
+  assert.equal(fences[0].open(), false, 'the fence is retired (started)');
+});
+
+test('a redeemed fence already closed is retired once (unavailable); a workspace no longer the user\'s is refused before the redeem', async () => {
+  let started = 0;
+  const closed = grantBridge({ registryParts: (r) => ({ chatWideApproved: r.chatWideApproved, redeemChatGrant: async () => ({ open: () => false, started: () => { started += 1; } }) }) });
+  assert.deepEqual((await closed.call(native.EXECUTE_PATH, grantCall((await closed.grant()).handle))).body, { redeem: 'unavailable' });
+  assert.equal(started, 1);
+  assert.deepEqual(closed.writes, []);
+  assert.deepEqual(closed.fences, []);
+  const g = grantBridge();
+  const { handle } = await g.grant();
+  g.ctl.workspaceUser = 'qa-other';
+  assert.deepEqual((await g.call(native.EXECUTE_PATH, grantCall(handle))).body, { redeem: 'refused' });
+  assert.deepEqual(g.asked.map(([op]) => op), ['granted'], 'the front was not asked to redeem');
+  assert.deepEqual(g.writes, []);
+  assert.deepEqual(g.recorded(), []);
+});
+
+// Requiring index.cjs starts the whole server, so this reads its source: the bridge gets the grant functions of the
+// one approval registry chat.cjs gets (the epochs frontRevoked moves), not another registry or a wrapper.
+test('index.cjs hands the tool bridge the approval registry\'s own grant functions', () => {
+  const src = fs.readFileSync(path.join(__dirname, 'index.cjs'), 'utf8');
+  assert.equal(src.match(/createApprovalRegistry\(/g).length, 1, 'one registry');
+  const destructured = src.match(/^const \{([^}]*)\} = approvalRegistry;$/m);
+  assert.ok(destructured, 'the registry functions are destructured from approvalRegistry');
+  const names = destructured[1].split(',').map((n) => n.trim());
+  const start = src.indexOf("require('./rust-chat-native.cjs').createToolBridge({");
+  assert.ok(start > src.indexOf('const approvalRegistry = '), 'the bridge is made after the registry');
+  const call = src.slice(start, src.indexOf('});', start));
+  for (const fn of ['chatWideApproved', 'redeemChatGrant', 'revokeChatGrant']) {
+    assert.ok(names.includes(fn), `${fn} is the registry's`);
+    assert.match(call, new RegExp(`[{,\\s]${fn}\\s*,`), `${fn} is passed to createToolBridge as is`);
+    assert.doesNotMatch(call, new RegExp(`${fn}\\s*:`), `${fn} is not replaced in the call`);
+    assert.equal(src.match(new RegExp(`(?:const|let|var|function)\\s+${fn}\\b`, 'g')), null, `${fn} is declared nowhere else`);
+  }
 });

@@ -270,3 +270,45 @@ test('pi gate: a read outside the task directory asks instead of passing (#113)'
   assert.ok(asked.every((p) => p.outsideWorkspace === true));
   assert.equal((await handler({ toolName: 'read', input: { path: '/etc/passwd' } }, { hasUI: false })).block, true);
 });
+
+// #2562: the descriptor walk needs /proc only because another user may change the tree. These
+// pretend the host has no /proc: every path under it is missing, as on a host that has none.
+function withoutProc(t) {
+  const hidden = (p) => (Buffer.isBuffer(p) ? p.toString() : String(p)).startsWith('/proc');
+  const missing = () => Object.assign(Error('ENOENT: no /proc on this QA host'), { code: 'ENOENT' });
+  for (const name of ['statSync', 'lstatSync', 'openSync', 'mkdirSync', 'unlinkSync']) {
+    const real = fs[name];
+    t.mock.method(fs, name, (p, ...rest) => { if (hidden(p)) throw missing(); return real(p, ...rest); });
+  }
+}
+function pinDirs(t) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'noevia-qa-noproc-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const cwd = path.join(root, 'tree'), home = path.join(root, 'home');
+  fs.mkdirSync(cwd); fs.mkdirSync(home);
+  return { root, cwd, home };
+}
+const claude = { harness: 'claude-code', model: 'QA-model', engine: 'http://engine.invalid/v1', apiKey: 'synthetic-key' };
+
+test('#2562: without a harness user, pinning works on a host without /proc, with the same link checks', (t) => {
+  const { root, cwd, home } = pinDirs(t);
+  withoutProc(t);
+  writeHarnessConfig({ ...claude, cwd, home });
+  const written = JSON.parse(fs.readFileSync(path.join(cwd, '.claude', 'settings.local.json'), 'utf8'));
+  assert.equal(written.env.ANTHROPIC_API_KEY, 'synthetic-key');
+  // An existing file is replaced, and a directory that is a link is still refused.
+  writeHarnessConfig({ ...claude, cwd, home });
+  const other = path.join(root, 'tree2'), outside = path.join(root, 'outside');
+  fs.mkdirSync(other); fs.mkdirSync(outside);
+  fs.symlinkSync(outside, path.join(other, '.claude'));
+  assert.throws(() => writeHarnessConfig({ ...claude, cwd: other, home }), (e) => e.status === 409 && /\.claude is a symbolic link/.test(e.message));
+  assert.deepEqual(fs.readdirSync(outside), []);
+});
+
+test('#2562: with a harness user, a host without /proc is refused and nothing is written', (t) => {
+  const { cwd, home } = pinDirs(t);
+  withoutProc(t);
+  assert.throws(() => writeHarnessConfig({ ...claude, cwd, home, owner: { uid: 1000, gid: 1000 } }), /no \/proc\/self\/fd/);
+  assert.equal(fs.existsSync(path.join(cwd, '.claude')), false);
+  assert.deepEqual(fs.readdirSync(home), []);
+});

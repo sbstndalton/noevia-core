@@ -129,7 +129,10 @@ function createDriveAccounts({ broker, dataDir, apiBase = DEFAULT_API, uploadBas
     /** An authorized fetch that hands back the raw response, for downloads (alt=media, export). */
     async function request(url, init = {}) {
       let t = await token(user);
-      const send = (accessToken) => fetchImpl(url, { ...init, headers: { ...(init.headers || {}), Authorization: `Bearer ${accessToken}` } });
+      const send = (accessToken) => {
+        const outbound = () => fetchImpl(url, { ...init, headers: { ...(init.headers || {}), Authorization: `Bearer ${accessToken}` } });
+        return ['GET', 'HEAD'].includes(String(init.method || 'GET').toUpperCase()) ? outbound() : require('./tool-write-fence.cjs').send(outbound);
+      };
       let r = await send(t.accessToken);
       if (r.status !== 401) return r;
       // The cached token may have been revoked or aged out: ask once more, naming the rejected one.

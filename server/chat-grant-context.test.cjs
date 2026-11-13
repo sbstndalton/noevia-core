@@ -1,7 +1,7 @@
 'use strict';
 const test = require('node:test'), assert = require('node:assert/strict');
 const g = require('./chat-grant-context.cjs'), { context, binding } = require('../tests/server/chat-grant-fixture.cjs');
-const { createApprovals } = require('./approvals.cjs');
+const { createApprovals } = require('../tests/server/approvals-reference.cjs');
 const { createClient } = require('./project-store-client.cjs');
 test('strict canonical identity/start/u64/tagged holder fail closed; aliases share key', () => {
   assert.equal(g.key('qa:u','c!'), g.key('qa:u','c'));

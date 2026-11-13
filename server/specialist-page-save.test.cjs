@@ -6,7 +6,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const { createToolboxes } = require('./toolboxes.cjs');
 const { createPageSave, NAME, appliesTo, neverStanding } = require('./specialist-page-save.cjs');
-const { createApprovals } = require('./approvals.cjs');
+const { createApprovals } = require('../tests/server/approvals-reference.cjs');
 
 const COWORKER = { id: 'specialist-aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', toolboxes: [] };
 const store = (answer = { status: 200, body: { pageId: 'p1', spaceId: 's1', title: 'T', link: '/spaces/s1/p1' } }) => {

@@ -1,10 +1,15 @@
 'use strict';
 
-// The write-approval gate's state: pending single-use approvals and the per-chat
-// "allow for this chat" grants. Both live in memory on purpose (see below). The HTTP
-// decision route and the chat loop in index.cjs call in; nothing here touches a request.
+// TEST REFERENCE ONLY (moved out of server/, so it is not part of the image): production does not load this file (index.cjs uses rust-approval-registry.cjs).
+// It is the in-process test reference for the chat-loop tests.
+//
+// The write-approval gate's reference behaviour: pending single-use approvals and the per-chat
+// "allow for this chat" grants, in memory. Port contract S9: the running server no longer uses it;
+// the state is the Rust front's approval registry (rust-approval-registry.cjs, noevia-rs
+// approval_registry.rs), which ports these rules. It stays as the in-process gate the chat-loop
+// tests drive, and as the oracle those rules were ported from.
 
-const contexts = require('./chat-grant-context.cjs');
+const contexts = require('../../server/chat-grant-context.cjs');
 
 function createApprovals({ now = Date.now, timeoutMs = 5 * 60 * 1000, ttlMs = 60 * 60 * 1000 } = {}) {
 // Pending approvals, keyed by a single-use id. In memory on purpose: an

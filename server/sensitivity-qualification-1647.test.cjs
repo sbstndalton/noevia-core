@@ -23,7 +23,7 @@ const { createDecisions } = require('./decision/index.cjs');
 const { createDecisionSettings } = require('./decision-settings.cjs');
 const { rustSavesDecision } = require('../tests/server/rust-decision-row.cjs');
 const { createDecisionEndpoint } = require('./decision-endpoint.cjs');
-const { createApprovals } = require('./approvals.cjs');
+const { createApprovals } = require('../tests/server/approvals-reference.cjs');
 
 // The live service's reported name and the Hugging Face revision noevia-services pins for it.
 const LAYA_EN = { model: 'convaiinnovations/laya', revision: '1c5edc17a7acd8701df6fc341c0d179f1c62c982' };

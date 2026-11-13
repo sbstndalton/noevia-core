@@ -192,3 +192,56 @@ dbTest('the wanted versions are this account\'s and this project\'s only', async
     rag.configureNativeSearch(null);
   }
 });
+
+test('image search: the request says images; only a well-formed {text, images, indexed} counts', async () => {
+  const seen = [];
+  const good = {
+    text: [{ file: 'qa-a.md', body: 'qa text', score: 0.5 }],
+    images: [{ file: 'qa-fig.png', kind: 'image', meta: { source: 'qa-fig.png' }, label: 'qa figure', hash: 'img:' + 'a'.repeat(64), score: 0.9 }],
+    indexed: [{ file: 'qa-fig.png', kind: 'image', meta: { source: 'qa-fig.png' } }],
+  };
+  let answer = good;
+  const client = retrieval.createClient({ env: { NOEVIA_RUST_RETRIEVAL: 'on' }, port: 4567, token: TOKEN, fetchImpl: async (url, init) => { seen.push(JSON.parse(init.body)); return new Response(JSON.stringify(answer), { status: 200 }); } });
+  assert.deepEqual(await client.askImages('qa-proj', 'qa q', USER, {}), good);
+  assert.equal(seen[0].images, true);
+  for (const bad of [{ hits: [] }, { ...good, images: [{ ...good.images[0], kind: 'text' }] }, { ...good, images: [{ ...good.images[0], meta: 'x' }] }, { ...good, indexed: null }, { ...good, text: [{ file: 1 }] }, { defer: 'reranker on' }]) {
+    answer = bad;
+    assert.equal(await client.askImages('qa-proj', 'qa q', USER, {}), null, JSON.stringify(bad));
+  }
+  assert.equal(retrieval.compareImages(good, good), 'text match (1 hits); images match (1/1); indexed match (1/1)');
+  assert.equal(retrieval.compareImages(good, { ...good, images: [] }), 'text match (1 hits); images differ (1/0); indexed match (1/1)');
+});
+
+dbTest('image search: on answers from the front, a deferral searches here, shadow answers here', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'qa-r4-images-'));
+  const rag = freshRag(dir);
+  await rag.indexProjectFile('qa-proj', 'qa-long.md', SECTION, USER);
+  const local = await rag.searchProjectWithImages('qa-proj', 'alpha', USER);
+  assert.ok(local.text.length > 0);
+  const front = { text: [{ file: 'qa-front.md', body: 'qa', score: 1 }], images: [], indexed: [] };
+  const asked = [];
+  rag.configureNativeSearch({ mode: 'on', ask: async () => null, askImages: async (...a) => { asked.push(a); return front; } });
+  try {
+    const before = rag.embeds;
+    assert.deepEqual(await rag.searchProjectWithImages('qa-proj', 'alpha', USER), front);
+    assert.equal(rag.embeds, before);
+    assert.deepEqual(asked[0], ['qa-proj', 'alpha', USER, {}]);
+    rag.configureNativeSearch({ mode: 'on', ask: async () => null, askImages: async () => null });
+    assert.deepEqual(await rag.searchProjectWithImages('qa-proj', 'alpha', USER), local);
+    const lines = [];
+    const warn = console.warn;
+    console.warn = (l) => lines.push(String(l));
+    try {
+      rag.configureNativeSearch({ mode: 'shadow', ask: async () => null, askImages: async () => front });
+      assert.deepEqual(await rag.searchProjectWithImages('qa-proj', 'alpha', USER), local);
+      await new Promise((r) => setImmediate(r));
+      assert.ok(lines.some((l) => l.startsWith('[rag] native image search shadow: text differs')), lines.join('\n'));
+    } finally { console.warn = warn; }
+    // A project the front deleted: nothing asked, nothing found.
+    asked.length = 0;
+    rag.configureNativeSearch({ mode: 'on', ask: async () => null, askImages: async (...a) => { asked.push(a); return front; } });
+    rag.setLifecycleGuard({ generation: () => 0, deletedSince: () => true });
+    assert.deepEqual(await rag.searchProjectWithImages('qa-proj', 'alpha', USER), { text: [], images: [], indexed: [] });
+    assert.equal(asked.length, 0);
+  } finally { rag.setLifecycleGuard(null); rag.configureNativeSearch(null); }
+});

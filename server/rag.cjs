@@ -969,6 +969,24 @@ async function searchProjectWithImages(projectId, query, userId) {
 async function searchProjectWithImagesNow(projectId, query, userId) {
   const empty = { text: [], images: [], indexed: [] };
   if (!indexExists(projectId, userId)) return empty; // #1776: a read never creates an index
+  // As searchProjectNow: the front's native search, for an account's own index past openIndex's guards.
+  const native = nativeSearch?.askImages && userId ? nativeSearch : null;
+  if (native && ((userId && !userActive(userId)) || deletedByFront(projectId, userId))) return empty;
+  if (native?.mode === 'on') {
+    const found = await native.askImages(projectId, query, userId, wantedVersions(projectId, userId));
+    if (found) return found;
+  }
+  const found = await searchProjectWithImagesLocal(projectId, query, userId);
+  if (native?.mode === 'shadow') {
+    const versions = wantedVersions(projectId, userId);
+    native.askImages(projectId, query, userId, versions).then((theirs) => {
+      console.warn(`[rag] native image search shadow: ${theirs ? require('./rust-retrieval.cjs').compareImages(found, theirs) : 'native deferred'}`);
+    });
+  }
+  return found;
+}
+async function searchProjectWithImagesLocal(projectId, query, userId) {
+  const empty = { text: [], images: [], indexed: [] };
   const index = openIndex(projectId, userId);
   if (!index) return empty;
   if (!index.slot) { index.db.close(); return empty; }
