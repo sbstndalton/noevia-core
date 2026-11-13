@@ -205,8 +205,12 @@ const workspaceStore = createWorkspaceStore(DATA_DIR, { id: DEFAULT_PROVIDER_ID,
   userExists: (userId) => !!authService.db.prepare('SELECT 1 FROM users WHERE id=?').get(userId) });
 
 // Chat port S6: the per-user `llm:` budget that chat and the Diary local exchange share (LLM_RATE_LIMIT a minute) is
-// the Rust front's (rust-chat-edge.cjs); this process keeps no limiter for it.
+// the Rust front's (rust-chat-edge.cjs); this process keeps no limiter for it. This require is also the edge's pairing
+// marker for the launch supervisor and assemble-release.
+// eslint-disable-next-line no-unused-vars
 const chatEdge = require('./rust-chat-edge.cjs');
+// Chat port S7: a relayed turn's failure after the headers is written on the wire its front reads.
+const chatWire = require('./rust-chat-wire.cjs');
 const requestScope = new AsyncLocalStorage();
 function currentWorkspace() {
   const workspace = requestScope.getStore()?.workspace;
@@ -1443,7 +1447,7 @@ async function handleRequestScoped(req, res) {
   } catch (err) {
     if (res.destroyed || res.writableEnded) return;
     if (res.headersSent) {
-      res.end(`data: ${JSON.stringify({ type: 'error', text: 'The request could not be completed. Please retry.' })}\n\n`);
+      res.end(chatWire.failedFrame(require('./rust-chat-turn.cjs').relayedWire(req)));
     } else {
       const failure = errorResponse(err);
       if (failure.status >= 500) console.error('[request] unhandled error:', err);
@@ -1457,7 +1461,7 @@ async function handleRequest(req,res) {
   // An unparseable request target (e.g. `//[`) is the client's error: 400, no stack logged.
   let parsed=parseRequestUrl(req);
   if(!parsed)return badRequestUrl(res);
-  // Chat port S5: the Rust front's relayed turn (and its gate probe) becomes POST /api/chat here, before the gate,
+  // Chat port S5: the Rust front's relayed turn becomes POST /api/chat here, before the gate,
   // so the turn runs exactly the pipeline below; anything else on those paths is answered by the bridge.
   const relay=chatTurnBridge.accept(req,res);
   if(relay==='done')return;
@@ -1475,20 +1479,20 @@ async function handleRequest(req,res) {
   // #1896: a chat turn waits a moment (<= 3 s) for a briefly held gate, then answers a retryable 503 and logs its reason.
   const chatAdmission=require('./chat-admission.cjs');
   const aborted=new AbortController();res.once('close',()=>aborted.abort());
-  // Chat port S6: a call the front already took the gate for adopts that hold (rust-chat-edge.cjs leases).
-  const adopted=inference&&relay!=='gate'?chatEdge.leases.adopt(req,relay==='turn'?'chat':pathname===chatEdge.LOCAL_EXCHANGE?'diary':''):null;
-  try {if(adopted)leave=adopted;else if(inference)leave=await chatAdmission.enterChatInference(modelManager,{signal:aborted.signal});}
+  // Chat port S8: a call the front already took the gate for (its admission lease, rust-chat-admission.cjs) does not
+  // enter it again: the front's lease is its one gate count, and the front gives it back when the answer has ended.
+  const frontAdmitted=inference&&inferenceAdmission.covers(req,require('./rust-chat-admission.cjs').gateRoute(relay,pathname));
+  try {if(inference&&!frontAdmitted)leave=await chatAdmission.enterChatInference(modelManager,{signal:aborted.signal});}
   catch(error){
     const status=error.status||503;
     if(pathname==='/api/chat'&&status===503){chatAdmission.log503('maintenance');res.setHeader('Retry-After','3');return json(res,503,chatAdmission.refusalBody(error));}
     return json(res,status,{error:error.message});
   }
-  // The front's probe of the gate alone, for a request it refuses (401/403): Node's gate answers first.
-  if(relay==='gate'){const ask=require('./rust-chat-turn.cjs').relayedGate(req);if(ask&&ask.hold)return chatEdge.leases.hold(res,ask.route,leave);if(leave)leave();res.statusCode=204;res.end();return;}
   if(leave){res.once('finish',leave);res.once('close',leave);}
   // #1881: while a chat or Diary turn runs, the long-document backfill makes no embed request (rag.cjs foreground).
   if(inference){const fg=rag.foreground();res.once('finish',fg);res.once('close',fg);}
-  try {return await handleRequestInner(req,res);}finally{if(leave && (res.writableEnded||res.destroyed))leave();}
+  // Exclusion-settle rule: the front's lease gives its count back only after the covered call has settled.
+  try {return await handleRequestInner(req,res);}finally{if(leave && (res.writableEnded||res.destroyed))leave();if(typeof frontAdmitted==='function')frontAdmitted();}
 }
 
 // #2191 round 2: the catalogue is on disk as soon as this module is loaded (the front's project create
