@@ -55,7 +55,7 @@ const ROLE_NAMES = Object.freeze({ planner: 'Planner', executor: 'Executor', aud
 // one on demand through the same allowlist, caps and leak guard.
 const REVIEW_ROLE = 'reviewer';
 
-// The three write-approval decisions (the old approvals.cjs `decide`, kept as tests/server/approvals-reference.cjs). Counts only.
+// The three write-approval decisions (approvals.cjs `decide`). Counts only.
 const APPROVAL_DECISIONS = Object.freeze(['approve', 'deny', 'approve_all']);
 
 // Snippet source classes a sub-role may see. Diary, private collections and anything unknown are
