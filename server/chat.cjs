@@ -301,6 +301,9 @@ function createChatHandler({
   // #1726: multimodal RAG (NOEVIA_MULTIMODAL_RAG). Off: nothing below changes.
   multimodalEnabled = () => require('./multimodal-rag.cjs').enabled(),
   documentDir = (workspace, projectId) => require('./document-sources.cjs').directory(workspace, projectId),
+  // Track R8 (rust-chat-native.cjs): { requested(req), supervising() }. A turn the front's native executor asked for
+  // ends after its preparation with the prepared state when that executor can run it. Not wired: nothing changes.
+  nativeHandoff = null,
 }) {
   // #2446: the coworker page save is always a write here and always asked about, whatever the injected
   // classifier or the account's policy says (an `allow` answer becomes `ask`; `block` stays `block`).
@@ -382,6 +385,8 @@ function createChatHandler({
   }
 
   async function handleChatInner(req, res, body, authn, preparation, execution = {}) {
+    // Read (and its header removed) before anything else, so no later code sees the front's secret.
+    const handoff = !!nativeHandoff?.requested?.(req);
     // #778: once the routing question has opened the event stream, a later refusal is sent as an
     // error event on it rather than as a second set of headers. Before that, exactly as it was.
     let earlyStream = false;
@@ -1655,6 +1660,97 @@ function createChatHandler({
       // may be the one that bit.
       console.warn(`[tools] ${model}: ${resolved.tools.length} tools ~${resolved.estTokens} tok (cap ${resolved.cap}, budget ${resolved.budget}); dropped ${resolved.dropped.length}: ${resolved.dropped.join(', ')}`);
     }
+    // The notes for the tools this request really carries (#1520/#1521, below); also handed to the native executor.
+    const routeNotes = () => {
+      const names = new Set(activeTools.map((tool) => tool.function?.name));
+      const boxes = allToolboxes();
+      const offered = (routing.routed ? routing.ids : selectedBoxes).filter((id) => {
+        const tools = boxes.find((b) => b.id === id)?.tools;
+        return !Array.isArray(tools) || tools.some((tool) => names.has(tool.function?.name));
+      });
+      return require('./tool-route-notes.cjs').toolRouteNotes({ message, offered, onServer: boxes.map((b) => b.id), automatic: automaticTools, localModel: automaticLocal,
+        // #1786: the gate ran on these tools and picked none.
+        gateNone: !!gate && gate.decision === 'none' });
+    };
+    // Track R8 (rust-chat-native.cjs): the front's native executor asked for this turn. One it can run ends here, after
+    // the preparation and the stream's first events, with the prepared state; the front runs the rest. Any other goes
+    // on below exactly as without the request (the reason is logged).
+    if (handoff) {
+      const native = require('./rust-chat-native.cjs');
+      // Reading what the refusal looks at must never fail the turn: an input that throws keeps the turn here.
+      let why;
+      try {
+        let provenanceOn = false;
+        if (provenancePolicy) { try { provenanceOn = provenancePolicy.enabled() === true; } catch { provenanceOn = true; } }
+        const diaryTurn = (typeof spaceId === 'string' && spaceId.startsWith('diary')) || project?.id === diaryExtras?.PROJECT_ID;
+        const egressRules = require('./provider-egress.cjs');
+        why = native.refusal({
+          // A chat deleted while this turn was prepared: the cleanup below runs at the cut, the executor would write it back.
+          chatIdNotText: chatId !== null && typeof chatId !== 'string',
+          deleted: !!chatId && !!chatWorkspace?.dir && require('./chat-lists.cjs').readTombstones(chatWorkspace.dir).has(require('./chat-lists.cjs').safeChatId(chatId)),
+          diary: diaryTurn, compactOnly: body.compactOnly === true,
+          providerId: provider.id, defaultProviderId: DEFAULT_PROVIDER_ID, machine: !!provider.machine, external: !!externalProvider, chatgpt: !!chatgptProvider, routeTarget: !!routeTarget,
+          authorized: !!upstreamHeaders?.Authorization,
+          images: attachedImages.length > 0 || retrievedImages.length > 0, messages: wire,
+          skills: loadedSkills.size > 0 || (!!project && instructionSkills.list(project).length > 0),
+          provenance: provenanceOn, framingReasoner: !!(framingReasoner && chatFrame),
+          narrowed: !!routing.narrowed, gate: !!(gate && gate.decision !== 'none'),
+          supervision: nativeHandoff.supervising(),
+          injected: injectedEntries.some((e) => e && e.kind === 'file' && typeof e.file !== 'string'),
+          editTools: activeTools.some((t) => projectEditTool(t.function?.name) || specialistPageSave.neverStanding(t.function?.name)),
+          // #516: the stream guard's schema check runs before every call (egressToolRefusal) once it is on; the executor
+          // does not run it yet. It answers for a call that cannot parse only when it is on and the tool has a schema.
+          streamGuard: activeTools.some((t) => egressRules.validateToolArguments(t.function?.name, '\u0000') !== null),
+        });
+      } catch (error) {
+        why = 'refusal-input';
+        console.warn(`[chat] native executor refusal inputs could not be read: ${String(error?.message || error).slice(0, 200)}`);
+      }
+      // The frame is built before anything below waits or lets go of the pre-load, so a turn whose text the
+      // executor cannot read (reservedText) still goes on here.
+      let frame = null;
+      if (!why) {
+        const names = activeTools.map((t) => t.function?.name).filter((n) => typeof n === 'string');
+        frame = native.preparedTurn({
+          startedAt: exchangeStartedAt, model, role: routedRole, auto: wantsAuto, effort, thinkingOff: fastThinkingOff, sampling: sampling.params,
+          providerId: provider.id, providerLabel: provider.label, upstreamUrl,
+          // reasoning-effort.cjs reads these of the row (modeFor, budgetFieldFor, nativeThinking); never the key.
+          providerLocalEngine: typeof reasoningEffort.localEngine === 'function' && reasoningEffort.localEngine(provider) === true,
+          providerCapabilities: provider.capabilities && typeof provider.capabilities === 'object' ? provider.capabilities : null,
+          limitScope: require('node:crypto').createHash('sha256').update(JSON.stringify([provider.baseUrl, provider.apiKey, modelManager.baseUrl])).digest('hex'),
+          messages: wire, tools: activeTools, routes: [...toolRoutes],
+          writes: names.filter((n) => isWriteTool(n)), public: names.filter((n) => isPublicTool(n)), automaticOnlyWrites: [...automaticOnlyWrites],
+          routeNote: routeNotes(), templateGate: provider.id === DEFAULT_PROVIDER_ID && typeof modelManager?.props === 'function',
+          managerEnabled: !!modelManager?.enabled, modelLease: typeof modelManager?.acquireLease === 'function',
+          chatId, contextId: chatId || spaceId, chatKey: chatId || spaceId || null,
+          grantScope: writeGrantScope, grantHolder: expectedGrantHolder, recentWrites: [...recentWriteFps],
+          title: { chatId: typeof body.chatId === 'string' ? body.chatId : '', listId: body.projectId && project ? project.id : null,
+            firstMessage: chatTitleLib.firstUserMessage(history, message), firstReply: chatTitleLib.firstReply(history), enabled: !!chatTitles },
+          message, spaceId, projectId: project?.id, declineEndsReply: !spaceId?.startsWith('diary'), record: !!record, streamIdleMs,
+          sources: native.injectedSources({ injected: injectedEntries, placed: placedEntries, readable: readableFiles, reply: replySources }),
+        });
+        let text = null;
+        try { text = JSON.stringify(frame); } catch { text = null; }
+        if (native.reservedText(text)) { why = text === null ? 'refusal-input' : 'reserved-text'; frame = null; }
+      }
+      if (frame) {
+        // The start of the rounds' preparation that only waits (as below): the route pre-load is used or let go here,
+        // so nothing in this process is left holding it.
+        if (routePreload && !chatSignal.signal.aborted) routePreload.use();
+        if (routePreload && routePreload.model !== model) routePreload.cancel();
+        else if (routePreload && routePreload.pending()) {
+          const ctx = require('./chat-context.cjs');
+          const seconds = ctx.expectedLoadSeconds(model);
+          send({ type: 'status', text: ctx.loadingStatus(model, routedRole || null, seconds), id: 'loadingModel', detail: { model, ...(routedRole ? { role: routedRole } : {}), ...(seconds ? { expectedSeconds: seconds } : {}) } });
+          await routePreload.settled;
+          if (chatSignal.signal.aborted) return;
+        }
+        send(frame);
+        res.end();
+        return;
+      }
+      console.log(`[chat] native executor not used for this turn: ${why}`);
+    }
     const runTool = createToolExchange({ allowed: allowedToolNames, isWrite: isWriteTool, signal: chatSignal.signal });
     // In-flight revocation (#272): the loaded skills against the project as stored now. Once revoked
     // it stays revoked for the rest of the exchange: no further tool runs and no further model round
@@ -1948,15 +2044,7 @@ function createChatHandler({
     // #1646: the cloud model is told, so it does not invent file contents it was never given.
     if (cloudUngranted() && privateStripped) roundMessages = withSystemNote(roundMessages, "Tools that read the person's own files, Nextcloud or Google Drive are not available in this reply. If the task needs them, say so and suggest switching this chat to a local model. Do not guess at file contents.");
     if (!templateToolsOff) {
-      const names = new Set(activeTools.map((tool) => tool.function?.name));
-      const boxes = allToolboxes();
-      const offered = (routing.routed ? routing.ids : selectedBoxes).filter((id) => {
-        const tools = boxes.find((b) => b.id === id)?.tools;
-        return !Array.isArray(tools) || tools.some((tool) => names.has(tool.function?.name));
-      });
-      routeNoteText = require('./tool-route-notes.cjs').toolRouteNotes({ message, offered, onServer: boxes.map((b) => b.id), automatic: automaticTools, localModel: automaticLocal,
-        // #1786: the gate ran on these tools and picked none.
-        gateNone: !!gate && gate.decision === 'none' });
+      routeNoteText = routeNotes();
       if (routeNoteText) roundMessages = withSystemNote(roundMessages, routeNoteText);
     }
     const requestTools = () => (!templateToolsOff && activeTools.length ? { tools: activeTools } : {});

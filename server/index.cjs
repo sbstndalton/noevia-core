@@ -946,6 +946,22 @@ const chatBrains = chatBrainLib.createBrainRunner({
 // #2153: transcripts are written by the Rust store alone; the front tails its per-user change journal and runs
 // the mirror and brain schedules (rust-chat-mirror-v1). It calls these two executors on loopback.
 const chatMirrorBridge = require('./rust-chat-mirror.cjs').createExecutorBridge({ secret: FRONT_SECRET, json, readJson, mirror: chatVaultMirror, brains: chatBrains });
+// Track R8: the native chat executor's hand-off and tool bridges (rust-chat-native.cjs; only the front's loopback calls).
+const chatWriteTargetFor = (name, rawArgs, { user }) => (driveTools.names.has(name) ? driveTools.describeTarget(user, name, rawArgs) : null);
+const chatNativeHandoff = require('./rust-chat-native.cjs').createHandoff({ secret: FRONT_SECRET, supervising: () => features.enabled('stepSupervision') });
+// Only an account that exists, is not disabled and whose workspace stands (a 404 refusal otherwise, also for the
+// 410 workspaceStore.get throws for a removed account or a folder that is gone).
+const chatNativeAsUser = require('./rust-chat-native.cjs').createAsUser({
+  userRow: (userId) => authService.db.prepare('SELECT id, disabled_at FROM users WHERE id=?').get(userId),
+  runAs: (userId, fn) => diaryAsUser(userId, fn), currentWorkspace: () => currentWorkspace() });
+const chatNativeTools = require('./rust-chat-native.cjs').createToolBridge({ secret: FRONT_SECRET, json, readJson, asUser: chatNativeAsUser,
+  getProject: (id) => getProject(id), executeToolCall: (...args) => executeToolCall(...args), writeTargetFor: chatWriteTargetFor,
+  recordToolUse: (...args) => recordToolUse(...args), currentWorkspace: () => currentWorkspace(), currentUser: () => requestScope.getStore()?.authn?.user || null,
+  recordUsage: (...args) => recordUsage(...args), recordSample: (...args) => prefill.recordSample(...args),
+  modelManager, templateToolsGate: require('./chat-template-caps.cjs').toolsGate,
+  chatTitles: { save: (projectId, chatId, title, firstMessage) => projectStore.setChatTitle(projectId, chatId, title, firstMessage),
+    autoNamed: (projectId, chatId, firstMessage) => projectStore.chatAutoNamed(projectId, chatId, firstMessage) },
+  chatBodyCap: STORED_HISTORY_BYTES });
 // #682: a decision experiment switched on that cannot run (no service, or one without `choice`)
 // says so once at startup; Settings shows the same reason, and the chat path skips it silently.
 for (const [key, id] of [['COWORK_DECISION_MODEL', process.env.COWORK_DECISION_MODEL], ['COWORK_SENSITIVITY_DECISION_MODEL', process.env.COWORK_SENSITIVITY_DECISION_MODEL]]) {
@@ -1029,7 +1045,8 @@ const { handleChat } = require('./chat.cjs').createChatHandler({
   // #687: a plain-named project file is edited by moving it into the project folder when storage is connected.
   editStorageAccount: (userId) => { try { const c = userId ? authService.getStorage(userId, true) : null; return c && storageClient.isBrowsable(c) ? require('./project-edit-target.cjs').storageAccount(c) : null; } catch { return null; } },
   // #659: the Google Drive writes name the Drive file they change on the approval card.
-  writeTargetFor: (name, rawArgs, { user }) => (driveTools.names.has(name) ? driveTools.describeTarget(user, name, rawArgs) : null),
+  writeTargetFor: chatWriteTargetFor,
+  nativeHandoff: chatNativeHandoff,
 });
 // POST /api/chat: body cap and the Diary gate, then the loop (routes/chat.cjs); the front answered them first (S6).
 const chatRoutes = require('./routes/chat.cjs').createChatRoutes({
@@ -1276,6 +1293,7 @@ async function handleRequestInner(req, res) {
   if (require('./rust-chat-framing-suggest.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   if (await chatFramingSuggestBridge(req, res)) return;
   if (await chatMirrorBridge(req, res)) return;
+  if (await chatNativeTools(req, res)) return;
   // And the chat turn itself (chat port S5): only the front's relay reaches the pipeline below (rust-chat-turn.cjs).
   if (require('./rust-chat-turn.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   if (require('./routes/features.cjs').refuseOwnedFeatures(req, res, { parseRequestUrl, json })) return;
