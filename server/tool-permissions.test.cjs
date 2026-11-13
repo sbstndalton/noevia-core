@@ -7,7 +7,8 @@ const test = require('node:test');
 process.env.UI_DATA_DIR = require('node:fs').mkdtempSync(require('node:path').join(require('node:os').tmpdir(), 'cowork-toolperm-test-'));
 // #1071: Node saves projects.json / free-chats.json only through the Rust project store.
 require('../tests/server/project-store-server.cjs').installProjectStore(process.env.UI_DATA_DIR);
-const { isWriteTool, chatWideApproved, pendingApprovals, MCP_TOOLBOX_MANIFEST, allToolboxes } = require('./index.cjs');
+const { isWriteTool, chatWideApproved, MCP_TOOLBOX_MANIFEST, allToolboxes } = require('./index.cjs');
+const indexExports = require('./index.cjs');
 
 // The stakes here are different from the rest of the tool code. Everywhere
 // else a bug means a worse answer; here it means the model deleted a calendar
@@ -133,36 +134,19 @@ test('a box is never entirely writes without saying so in its name', () => {
 
 // ── the escape hatch ─────────────────────────────────────────────────────
 
-test('chat-wide approval is off by default and scoped to one chat and user', () => {
+test('chat-wide approval is off by default and scoped to one chat and user', async () => {
   // There is deliberately no global "never ask", so the default must be false
-  // for every combination.
-  assert.equal(chatWideApproved('user-a', 'chat-1', 'project:p1'), false);
-  assert.equal(chatWideApproved(null, null, 'project:p1'), false);
-  assert.equal(chatWideApproved('user-a', undefined, 'project:p1'), false);
+  // for every combination. Port contract S9: the grant is the front's; without a reachable front
+  // (none here) no check ever passes.
+  assert.equal(await chatWideApproved('user-a', 'chat-1', 'project:p1'), false);
+  assert.equal(await chatWideApproved(null, null, 'project:p1'), false);
+  assert.equal(await chatWideApproved('user-a', undefined, 'project:p1'), false);
 });
 
-test('no approval is pending in a fresh process', () => {
-  // Pending approvals are in-memory on purpose: a restart must re-ask rather
-  // than honour a decision made against a conversation that no longer exists.
-  assert.equal(pendingApprovals.size, 0);
-});
-
-test('an approval can only be decided by the user it belongs to', () => {
-  // Simulates the map the route consults. Without the owner check, any
-  // signed-in member could approve another member's write.
-  let decided = null;
-  pendingApprovals.set('ap-test', { userId: 'owner', chatId: 'c1', decide: (d) => { decided = d; return true; } });
-  try {
-    const pending = pendingApprovals.get('ap-test');
-    assert.equal(pending.userId === 'someone-else', false);
-    // The route compares pending.userId against the caller before calling
-    // decide(), so a mismatched caller never reaches this.
-    assert.equal(decided, null);
-    pending.decide('approve');
-    assert.equal(decided, 'approve');
-  } finally {
-    pendingApprovals.delete('ap-test');
-  }
+test('Node holds no pending approval at all', () => {
+  // Port contract S9: pending approvals live in the Rust front's registry (owner-checked there);
+  // a restart of both re-asks rather than honouring a decision for a conversation that is gone.
+  assert.equal('pendingApprovals' in indexExports, false);
 });
 
 test('only the three valid decisions are accepted', () => {
