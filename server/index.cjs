@@ -243,6 +243,8 @@ rag.init({ dataDir: DATA_DIR, inferenceUrl: INFERENCE_BASE, headersFn: () => inf
   userActive: (userId) => !workspaceStore.isRemoved(userId), inferenceGuard: () => modelManager.enterInference?.() || (() => {}),
   embeddingConfig, listUserIds: () => authService.db.prepare('SELECT id FROM users').all().map((r) => r.id) });
 rag.configureRerank(() => rerankSettings.effectiveEnv());
+// Rust port track R4: the paired front's native project search, off unless NOEVIA_RUST_RETRIEVAL asks (rust-retrieval.cjs).
+rag.configureNativeSearch(require('./rust-retrieval.cjs').createClient({ env: process.env, token: FRONT_SECRET }));
 // An address the environment seeded must be on this network (embedding-address.cjs); one that is not
 // is logged and not used. Asynchronous (DNS), so it settles just after start-up, before the first re-index pass.
 require('./embedding-address.cjs').guardSeededAddresses(embeddingConfig);
