@@ -47,6 +47,7 @@ function engineBridge(over = {}) {
     machine: over.machine ?? (() => false),
     paused: over.paused ?? (() => false),
     context: over.context ?? ((project) => `QA context for ${project.id} as ${scoped()}`),
+    ...(over.role ? { role: over.role } : {}),
   });
   return { seen, handle };
 }
@@ -78,6 +79,23 @@ test('the engine bridge answers one start\'s facts, as that user, for that user\
   try {
     assert.deepEqual(await broken.call({ user: 'qa-user', projectId: 'qa-project' }), { status: 503, body: { error: 'Code engine facts are unavailable.' } });
   } finally { await broken.close(); }
+});
+
+test('with `role` the engine bridge also answers the role engine\'s endpoint, and nothing of the provider but its schema capability', async () => {
+  const role = () => ({ baseUrl: 'http://qa-provider.invalid:8080/v1', apiKey: 'qa-provider-key', model: 'qa-model', external: false,
+    provider: { id: 'qa-provider', apiKey: 'qa-provider-key', capabilities: { jsonSchemaParam: true } } });
+  const s = await serve(engineBridge({ role }).handle);
+  try {
+    assert.deepEqual((await s.call({ user: 'qa-user', projectId: 'qa-project' })).body.role,
+      { baseUrl: 'http://qa-provider.invalid:8080/v1', apiKey: 'qa-provider-key', model: 'qa-model', external: false, jsonSchema: true });
+  } finally { await s.close(); }
+  const bare = await serve(engineBridge({ role: () => ({ external: 'yes' }) }).handle);
+  try {
+    assert.deepEqual((await bare.call({ user: 'qa-user', projectId: 'qa-project' })).body.role,
+      { baseUrl: null, apiKey: null, model: null, external: false, jsonSchema: false });
+  } finally { await bare.close(); }
+  const remote = await serve(engineBridge({ role, machine: () => true }).handle);
+  try { assert.equal((await remote.call({ user: 'qa-user', projectId: 'qa-project' })).body.role, null); } finally { await remote.close(); }
 });
 
 test('the engine bridge is an unknown path to anyone else, and refuses a malformed call', async () => {
@@ -156,4 +174,5 @@ test('index.cjs reads the switch once for the service, the facts bridge and the 
   assert.match(index, /frontOwned: codeExecutor\.frontOwnsCode\(\)/);
   assert.match(index, /frontOwns: \(\) => codeExecutor\.frontOwnsCode\(\)/);
   assert.match(index, /if \(codeExecutor\.frontOwnsCode\(\) && await codeEngineBridge\(req, res\)\) return;/);
+  assert.match(index, /context: \(project\) => codeSharedContext\(currentWorkspace\(\), project\), role: codeRoleEndpoint,/);
 });

@@ -703,7 +703,7 @@ const taskFactsBridge = require('./rust-task-facts.cjs').createTaskFactsBridge({
 const codeEngineBridge = codeExecutor.createCodeEngineBridge({
   secret: FRONT_SECRET, json, readJson, asUser: (userId, fn) => diaryAsUser(userId, fn), getProject, engine: codeEngine,
   machine: () => !!codeMachineTarget(), paused: () => modelManager.tuningActive?.() === true,
-  context: (project) => codeSharedContext(currentWorkspace(), project),
+  context: (project) => codeSharedContext(currentWorkspace(), project), role: codeRoleEndpoint,
 });
 
 // #2262: GET inference-budget and GET installed are the Rust front's; this is what they cannot read for themselves.
