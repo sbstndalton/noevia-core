@@ -259,7 +259,7 @@ async function* withIdleLimit(iterable, ms, onIdle = null) {
 }
 
 function createChatHandler({
-  stepSupervision = null, chatMachines = null, fs, path, crypto, fetch, codeTasksFor = () => [], heuristicWantsCode = require('./auto-router.cjs').createAutoRouter({}).heuristicWantsCode, reasoningEffort, diaryExtras, createToolExchange, rag, prefill, reduceToolResult, HISTORY_CAP, DEFAULT_PROVIDER_ID, DIARY_BASE, TOOL_RESULT_CAP, authService, toolPolicy, modelManager, requestScope, currentWorkspace, json, getProject, getProvider, providerHeaders, saveChats, endpointApproved, diaryHeaders, diaryStorageRetry = (send) => send(true), autoRoles, lastLoadedModel, classifyFastOrSmart, servedCatalogue, modelsInstalled, missingRoles, staleRolesError, visionProbe, visionDescriptions, skillsIndexFor, chatSkillRouter, chatToolRouter, toolGate = null, chatFramingEnabled = () => false, freeChats = () => [], framingReasoner = null, reasoningTraces = null, brainContext = null, DEFAULT_TOOLBOXES, CONNECTOR_BOXES, connectedBoxes, allToolboxes, resolveTools, isWriteTool: injectedIsWriteTool, executeToolCall, oauthServerIds, accountReady, chatWideApproved, awaitApproval, recordUsage, recordToolUse, chatListHolder = () => undefined, revokeChatGrant = () => {}, grantContext = (chat) => currentWorkspace().chatPermissions.context(chat),
+  stepSupervision = null, chatMachines = null, fs, path, crypto, fetch, codeTasksFor = () => [], heuristicWantsCode = require('./auto-router.cjs').createAutoRouter({}).heuristicWantsCode, reasoningEffort, diaryExtras, createToolExchange, rag, prefill, reduceToolResult, HISTORY_CAP, DEFAULT_PROVIDER_ID, DIARY_BASE, TOOL_RESULT_CAP, authService, toolPolicy, modelManager, requestScope, currentWorkspace, json, getProject, getProvider, providerHeaders, saveChats, endpointApproved, diaryHeaders, diaryStorageRetry = (send) => send(true), autoRoles, lastLoadedModel, classifyFastOrSmart, servedCatalogue, modelsInstalled, missingRoles, staleRolesError, visionProbe, visionDescriptions, skillsIndexFor, chatSkillRouter, chatToolRouter, toolGate = null, chatFramingEnabled = () => false, freeChats = () => [], framingReasoner = null, reasoningTraces = null, brainContext = null, DEFAULT_TOOLBOXES, CONNECTOR_BOXES, connectedBoxes, allToolboxes, resolveTools, isWriteTool: injectedIsWriteTool, executeToolCall, oauthServerIds, accountReady, chatWideApproved, redeemChatGrant = null, awaitApproval, openApproval = async () => true, recordUsage, recordToolUse, chatListHolder = () => undefined, revokeChatGrant = () => {}, grantContext = (chat) => currentWorkspace().chatPermissions.context(chat),
   // #1550: per request, whether a box Automatic may add is usable by this account (its Nextcloud connection, for one).
   automaticToolsReady = () => () => true,
   chatgptOAuth = null, chatgptEnabled = () => false, skillHistory = null,
@@ -289,6 +289,7 @@ function createChatHandler({
   // #1079: a chat or project with Context: High is served by its model's `<model>-long` profile.
   longProfiles = require('./long-profile.cjs').createLongProfiles(),
   // #778 (features.routingModes): { enabled(), settings(), sensitivity(digest), awaitChoice(...),
+  // openChoice(...) (port contract S9: opens the question at the front first; optional),
   // setChatFlags(projectId, chatId, patch), log(entry) }. Not wired or flag off: nothing changes.
   routingModes = null,
   // #1441: how a turn waits for the project's file jobs still running; the wait is bounded.
@@ -301,6 +302,9 @@ function createChatHandler({
   // #1726: multimodal RAG (NOEVIA_MULTIMODAL_RAG). Off: nothing below changes.
   multimodalEnabled = () => require('./multimodal-rag.cjs').enabled(),
   documentDir = (workspace, projectId) => require('./document-sources.cjs').directory(workspace, projectId),
+  // Track R8 (rust-chat-native.cjs): { requested(req), supervising() }. A turn the front's native executor asked for
+  // ends after its preparation with the prepared state when that executor can run it. Not wired: nothing changes.
+  nativeHandoff = null,
 }) {
   // #2446: the coworker page save is always a write here and always asked about, whatever the injected
   // classifier or the account's policy says (an `allow` answer becomes `ask`; `block` stays `block`).
@@ -382,6 +386,10 @@ function createChatHandler({
   }
 
   async function handleChatInner(req, res, body, authn, preparation, execution = {}) {
+    // Read (and its header removed) before anything else, so no later code sees the front's secret.
+    const handoff = !!nativeHandoff?.requested?.(req);
+    // What the front's executor runs beyond the first step (rust-chat-native.cjs CAPS_HEADER), read with the request.
+    const handoffCaps = handoff && typeof nativeHandoff?.capabilities === 'function' ? nativeHandoff.capabilities(req) : new Set();
     // #778: once the routing question has opened the event stream, a later refusal is sent as an
     // error event on it rather than as a second set of headers. Before that, exactly as it was.
     let earlyStream = false;
@@ -958,6 +966,8 @@ function createChatHandler({
               eventWire.open();
             }
             const id = crypto.randomUUID();
+            // Port contract S9: opened at the front's registry before the card is shown.
+            if (typeof routingModes.openChoice === 'function' && !(await routingModes.openChoice({ id, userId: routeUserId, chatId }))) return { choice: 'timeout' };
             send({ type: 'route_pending', id, flag });
             return routingModes.awaitChoice({ id, userId: routeUserId, chatId, abortSignal: chatSignal.signal });
           },
@@ -1655,6 +1665,103 @@ function createChatHandler({
       // may be the one that bit.
       console.warn(`[tools] ${model}: ${resolved.tools.length} tools ~${resolved.estTokens} tok (cap ${resolved.cap}, budget ${resolved.budget}); dropped ${resolved.dropped.length}: ${resolved.dropped.join(', ')}`);
     }
+    // The notes for the tools this request really carries (#1520/#1521, below); also handed to the native executor.
+    const routeNotes = () => {
+      const names = new Set(activeTools.map((tool) => tool.function?.name));
+      const boxes = allToolboxes();
+      const offered = (routing.routed ? routing.ids : selectedBoxes).filter((id) => {
+        const tools = boxes.find((b) => b.id === id)?.tools;
+        return !Array.isArray(tools) || tools.some((tool) => names.has(tool.function?.name));
+      });
+      return require('./tool-route-notes.cjs').toolRouteNotes({ message, offered, onServer: boxes.map((b) => b.id), automatic: automaticTools, localModel: automaticLocal,
+        // #1786: the gate ran on these tools and picked none.
+        gateNone: !!gate && gate.decision === 'none' });
+    };
+    // Track R8 (rust-chat-native.cjs): the front's native executor asked for this turn. One it can run ends here, after
+    // the preparation and the stream's first events, with the prepared state; the front runs the rest. Any other goes
+    // on below exactly as without the request (the reason is logged).
+    if (handoff) {
+      const native = require('./rust-chat-native.cjs');
+      // Reading what the refusal looks at must never fail the turn: an input that throws keeps the turn here.
+      let why;
+      try {
+        let provenanceOn = false;
+        if (provenancePolicy) { try { provenanceOn = provenancePolicy.enabled() === true; } catch { provenanceOn = true; } }
+        const diaryTurn = (typeof spaceId === 'string' && spaceId.startsWith('diary')) || project?.id === diaryExtras?.PROJECT_ID;
+        const egressRules = require('./provider-egress.cjs');
+        why = native.refusal({
+          // A chat deleted while this turn was prepared: the cleanup below runs at the cut, the executor would write it back.
+          chatIdNotText: chatId !== null && typeof chatId !== 'string',
+          deleted: !!chatId && !!chatWorkspace?.dir && require('./chat-lists.cjs').readTombstones(chatWorkspace.dir).has(require('./chat-lists.cjs').safeChatId(chatId)),
+          diary: diaryTurn, compactOnly: body.compactOnly === true,
+          providerId: provider.id, defaultProviderId: DEFAULT_PROVIDER_ID, machine: !!provider.machine, external: !!externalProvider, chatgpt: !!chatgptProvider, routeTarget: !!routeTarget,
+          authorized: !!upstreamHeaders?.Authorization,
+          retrievedImages: retrievedImages.length > 0, messages: wire,
+          skills: (loadedSkills.size > 0 || (!!project && instructionSkills.list(project).length > 0)) && !handoffCaps.has('skills'),
+          provenance: provenanceOn, framingReasoner: !!(framingReasoner && chatFrame),
+          narrowed: !!routing.narrowed, gate: !!(gate && gate.decision !== 'none'),
+          supervision: nativeHandoff.supervising(),
+          injected: injectedEntries.some((e) => e && e.kind === 'file' && typeof e.file !== 'string'),
+          pageSave: activeTools.some((t) => specialistPageSave.neverStanding(t.function?.name)),
+          // #516: the stream guard's schema check runs before every call (egressToolRefusal) once it is on; the executor
+          // does not run it yet. It answers for a call that cannot parse only when it is on and the tool has a schema.
+          streamGuard: activeTools.some((t) => egressRules.validateToolArguments(t.function?.name, '\u0000') !== null),
+        });
+      } catch (error) {
+        why = 'refusal-input';
+        console.warn(`[chat] native executor refusal inputs could not be read: ${String(error?.message || error).slice(0, 200)}`);
+      }
+      // The frame is built before anything below waits or lets go of the pre-load, so a turn whose text the
+      // executor cannot read (reservedText) still goes on here.
+      let frame = null;
+      if (!why) {
+        const names = activeTools.map((t) => t.function?.name).filter((n) => typeof n === 'string');
+        frame = native.preparedTurn({
+          startedAt: exchangeStartedAt, model, role: routedRole, auto: wantsAuto, effort, thinkingOff: fastThinkingOff, sampling: sampling.params,
+          providerId: provider.id, providerLabel: provider.label, upstreamUrl,
+          // reasoning-effort.cjs reads these of the row (modeFor, budgetFieldFor, nativeThinking); never the key.
+          providerLocalEngine: typeof reasoningEffort.localEngine === 'function' && reasoningEffort.localEngine(provider) === true,
+          providerCapabilities: provider.capabilities && typeof provider.capabilities === 'object' ? provider.capabilities : null,
+          limitScope: require('node:crypto').createHash('sha256').update(JSON.stringify([provider.baseUrl, provider.apiKey, modelManager.baseUrl])).digest('hex'),
+          messages: wire, tools: activeTools, routes: [...toolRoutes],
+          writes: names.filter((n) => isWriteTool(n)), public: names.filter((n) => isPublicTool(n)), automaticOnlyWrites: [...automaticOnlyWrites],
+          editTools: names.filter((n) => projectEditTool(n)),
+          routeNote: routeNotes(), templateGate: provider.id === DEFAULT_PROVIDER_ID && typeof modelManager?.props === 'function',
+          managerEnabled: !!modelManager?.enabled, modelLease: typeof modelManager?.acquireLease === 'function',
+          chatId, contextId: chatId || spaceId, chatKey: chatId || spaceId || null,
+          grantScope: writeGrantScope, grantHolder: expectedGrantHolder, recentWrites: [...recentWriteFps],
+          title: { chatId: typeof body.chatId === 'string' ? body.chatId : '', listId: body.projectId && project ? project.id : null,
+            firstMessage: chatTitleLib.firstUserMessage(history, message), firstReply: chatTitleLib.firstReply(history), enabled: !!chatTitles },
+          message, spaceId, projectId: project?.id, declineEndsReply: !spaceId?.startsWith('diary'), record: !!record, streamIdleMs, compactOnly: body.compactOnly === true,
+          sources: native.injectedSources({ injected: injectedEntries, placed: placedEntries, readable: readableFiles, reply: replySources }),
+          // #272/#546: the skill state the executor's checks start from; the checks themselves are core's bridges.
+          skills: project ? { loaded: [...loadedSkills].map(([file, s]) => ({ file, hash: s.hash, name: s.name })),
+            enabled: instructionSkills.list(project).filter((s) => s.status === 'enabled').map((s) => ({ file: s.file, hash: s.hash, name: s.name })),
+            revokedInHistory: [...revokedInHistory], imageWarning, coverageWarning: require('./source-coverage.cjs').coverageWarning(partialReads) } : null,
+        });
+        let text = null;
+        try { text = JSON.stringify(frame); } catch { text = null; }
+        if (native.reservedText(text)) { why = text === null ? 'refusal-input' : 'reserved-text'; frame = null; }
+        else if (native.frameTooLarge(text)) { why = 'frame-size'; frame = null; }
+      }
+      if (frame) {
+        // The start of the rounds' preparation that only waits (as below): the route pre-load is used or let go here,
+        // so nothing in this process is left holding it.
+        if (routePreload && !chatSignal.signal.aborted) routePreload.use();
+        if (routePreload && routePreload.model !== model) routePreload.cancel();
+        else if (routePreload && routePreload.pending()) {
+          const ctx = require('./chat-context.cjs');
+          const seconds = ctx.expectedLoadSeconds(model);
+          send({ type: 'status', text: ctx.loadingStatus(model, routedRole || null, seconds), id: 'loadingModel', detail: { model, ...(routedRole ? { role: routedRole } : {}), ...(seconds ? { expectedSeconds: seconds } : {}) } });
+          await routePreload.settled;
+          if (chatSignal.signal.aborted) return;
+        }
+        send(frame);
+        res.end();
+        return;
+      }
+      console.log(`[chat] native executor not used for this turn: ${why}`);
+    }
     const runTool = createToolExchange({ allowed: allowedToolNames, isWrite: isWriteTool, signal: chatSignal.signal });
     // In-flight revocation (#272): the loaded skills against the project as stored now. Once revoked
     // it stays revoked for the rest of the exchange: no further tool runs and no further model round
@@ -1668,22 +1775,13 @@ function createChatHandler({
       }
       return skillRevocation;
     };
-    // A skill body the model fetched itself is loaded too, at the version read. Tracked by WHAT was
-    // read, not by which tool read it: read_project_file, the Project documents box's
-    // project_read_file (same reader through MCP) or anything else. A successful call that names a
-    // skill file, or whose result carries a skill's SHA-256 (the reader's heading), counts. Tracking
-    // too much only makes revocation stricter, which is the safe direction.
+    // A skill body the model fetched itself is loaded too, at the version read (skill-reads.cjs, which the native
+    // executor's skills/read bridge uses too): only enabled skills of this exchange's snapshot not loaded yet.
     const noteSkillRead = (rawArgs, result) => {
       if (!project) return;
-      let name = null;
-      try { const args = JSON.parse(rawArgs || '{}'); if (args && typeof args.name === 'string') name = args.name; } catch { /* no usable args */ }
-      // The readers accept a unique bare name for a file stored under a path (#642), so the name
-      // is resolved the same way before it is compared with a skill's stored name.
-      const resolvedName = name ? require('./project-file-names.cjs').resolveProjectFile(project, name).file?.name ?? null : null;
-      const text = String(result ?? '');
-      for (const skill of instructionSkills.list(project)) {
-        if (skill.status !== 'enabled' || loadedSkills.has(skill.file)) continue;
-        if (skill.file === name || skill.file === resolvedName || text.includes(skill.hash)) { loadedSkills.set(skill.file, { hash: skill.hash, name: skill.name }); rememberSkill(skill.file, skill.hash, skill.name, skill.content); }
+      const candidates = instructionSkills.list(project).filter((skill) => skill.status === 'enabled' && !loadedSkills.has(skill.file));
+      for (const skill of require('./skill-reads.cjs').matchedReads(project, candidates, rawArgs, result)) {
+        loadedSkills.set(skill.file, { hash: skill.hash, name: skill.name }); rememberSkill(skill.file, skill.hash, skill.name, skill.content);
       }
     };
     const revocationText = () => `Skill ${skillRevocation.map((s) => JSON.stringify(s.name)).join(', ')} was disabled or changed during this reply, so no further steps were run.`;
@@ -1948,15 +2046,7 @@ function createChatHandler({
     // #1646: the cloud model is told, so it does not invent file contents it was never given.
     if (cloudUngranted() && privateStripped) roundMessages = withSystemNote(roundMessages, "Tools that read the person's own files, Nextcloud or Google Drive are not available in this reply. If the task needs them, say so and suggest switching this chat to a local model. Do not guess at file contents.");
     if (!templateToolsOff) {
-      const names = new Set(activeTools.map((tool) => tool.function?.name));
-      const boxes = allToolboxes();
-      const offered = (routing.routed ? routing.ids : selectedBoxes).filter((id) => {
-        const tools = boxes.find((b) => b.id === id)?.tools;
-        return !Array.isArray(tools) || tools.some((tool) => names.has(tool.function?.name));
-      });
-      routeNoteText = require('./tool-route-notes.cjs').toolRouteNotes({ message, offered, onServer: boxes.map((b) => b.id), automatic: automaticTools, localModel: automaticLocal,
-        // #1786: the gate ran on these tools and picked none.
-        gateNone: !!gate && gate.decision === 'none' });
+      routeNoteText = routeNotes();
       if (routeNoteText) roundMessages = withSystemNote(roundMessages, routeNoteText);
     }
     const requestTools = () => (!templateToolsOff && activeTools.length ? { tools: activeTools } : {});
@@ -2376,7 +2466,7 @@ function createChatHandler({
                 return 'ERROR: the chat permission context could not be verified; the tool was not run. Nothing was changed. Ask again.';
               }
               // #2446: the coworker page save is asked about every time; "Allow for this chat" never covers it.
-              usedGrant = !specialistPageSave.neverStanding(tc.name) && chatWideApproved(userId, grantChat, writeGrantScope, permissionBinding);
+              usedGrant = !specialistPageSave.neverStanding(tc.name) && await chatWideApproved(userId, grantChat, writeGrantScope, permissionBinding);
             }
             const askedPerCall = permission === 'ask' && (!usedGrant || provenanceHits.length > 0 || automaticOnlyWrites.has(tc.name));
             if (askedPerCall) {
@@ -2384,6 +2474,15 @@ function createChatHandler({
               // #658: the same tool, target and arguments as a write that already succeeded in this
               // chat. Only a flag on the card: the person still decides, with all three actions.
               const repeat = writePrint !== null && (writesDone.has(userId, chatId, writePrint) || recentWriteFps.has(writePrint));
+              // Port contract S9: the question is opened at the front's approval registry before
+              // the card is shown, so the person's answer always finds it.
+              const notAsked = () => {
+                result = `ERROR: the approval for ${tc.name} could not be asked, so it was not run. Nothing was changed. Ask again.`;
+                authService.audit('tool.denied', userId, userId, { tool: tc.name, reason: 'unavailable' });
+                notRunResults.add(result);
+                return result;
+              };
+              if (!(await openApproval({ id: approvalId, userId, chatId: grantChat, scope: writeGrantScope, binding: permissionBinding, once: specialistPageSave.neverStanding(tc.name) }))) return notAsked();
               send({
                 type: 'tool_pending',
                 id: approvalId,
@@ -2405,6 +2504,7 @@ function createChatHandler({
                 // dying or the chip hanging with no result.
                 // #679: the client went away while the card was open. Nobody declined, and the
                 // write did not run; the kept reply shows the call as stopped, not declined.
+                if (decision === 'unavailable') return notAsked();
                 if (decision === 'aborted') {
                   result = `ERROR: the reply was stopped before ${tc.name} was approved, so it was not run. Nothing was changed.`;
                   authService.audit('tool.denied', userId, userId, { tool: tc.name, reason: decision });
@@ -2446,37 +2546,70 @@ function createChatHandler({
               const target = typeof targetNow?.target === 'string' && targetNow.target ? targetNow.target : null;
               const kind = typeof targetNow?.kind === 'string' ? targetNow.kind : null;
               if (targetNow?.error || target !== cardTarget || kind !== (targetKind || null)) {
-                revokeChatGrant(userId, grantChat);
+                await revokeChatGrant(userId, grantChat);
                 return 'ERROR: the write target changed after approval; the tool was not run. Ask again.';
               }
             }
+            let redeemUnavailable = false;
+            // Redeemed grant fence: carried through every executor await to its outbound boundary.
+            let dispatchFence = null;
             if (permission === 'ask') {
               try {
-                const finalBinding = await permissionContext(); // LAST await before dispatch.
+                const finalBinding = await permissionContext();
                 if ((chatId && !grantContexts.matches(permissionBinding, finalBinding)) ||
-                    (usedGrant && !askedPerCall && !chatWideApproved(userId, grantChat, writeGrantScope, finalBinding)) ||
                     approvalTarget() !== shownTarget || currentWorkspace().userId !== userId || currentWorkspace().revoked) throw grantContexts.invalid();
+                if (usedGrant && !askedPerCall) {
+                  // Port contract S9 (re-reviews 1ed3a14, 689d17a): the chat-wide grant is redeemed at
+                  // the front, ordered there against every revocation. The executor checks the fence
+                  // after its own awaits, immediately before the outbound write.
+                  // (In-process gates without redeem check the grant again instead.)
+                  if (redeemChatGrant) {
+                    const redeemed = await redeemChatGrant(userId, grantChat, writeGrantScope, finalBinding, usedGrant);
+                    if (redeemed === 'unavailable') redeemUnavailable = true;
+                    else if (redeemed && typeof redeemed.open === 'function' && typeof redeemed.started === 'function') dispatchFence = redeemed;
+                    else throw grantContexts.invalid();
+                  } else if ((await chatWideApproved(userId, grantChat, writeGrantScope, finalBinding)) !== true) throw grantContexts.invalid();
+                }
               } catch {
                 // Even Allow once refuses a move-away-and-back, restart, deletion or failed read.
-                revokeChatGrant(userId, grantChat);
+                await revokeChatGrant(userId, grantChat);
                 return 'ERROR: the chat or permission target changed after approval; the tool was not run. Nothing was changed. Ask again.';
               }
             }
+            const notChecked = () => {
+              // The grant could not be checked at the front (or its answer came too late to act on):
+              // not run, and not a decline.
+              dispatchFence?.started();
+              result = `ERROR: the permission for ${tc.name} could not be checked, so it was not run. Nothing was changed. Ask again.`;
+              authService.audit('tool.denied', userId, userId, { tool: tc.name, reason: 'unavailable' });
+              notRunResults.add(result);
+              return result;
+            };
+            if (redeemUnavailable) return notChecked();
             // Synchronous targets may change during the final store await too.
             if (editTarget !== null) {
               const nowTarget = editTargets.resolveEditTarget(project ? getProject(project.id) : null, tc.args, { storageAccount: editStorageAccount(userId) });
               if (nowTarget.path !== editTarget || (nowTarget.account || null) !== editAccount) {
-                revokeChatGrant(userId, grantChat);
+                dispatchFence?.started();
+                await revokeChatGrant(userId, grantChat);
                 return 'ERROR: the project target changed before dispatch; tool was not run. Ask again.';
               }
             }
-            if (chatSignal.signal.aborted) return 'ERROR: exchange cancelled; tool was not run.';
-            if (policyMode(userId, tc.name) === 'block' || (permission !== 'ask' && policyMode(userId, tc.name) === 'ask') || revokedSkills()) return 'ERROR: permission changed before dispatch; tool was not run.';
+            if (chatSignal.signal.aborted) { dispatchFence?.started(); return 'ERROR: exchange cancelled; tool was not run.'; }
+            if (policyMode(userId, tc.name) === 'block' || (permission !== 'ask' && policyMode(userId, tc.name) === 'ask') || revokedSkills()) { dispatchFence?.started(); return 'ERROR: permission changed before dispatch; tool was not run.'; }
+            const options = { chatKey, exchangeKey, routes: toolRoutes, writeFence: dispatchFence, ...(editTarget !== null ? { editTarget: editTargets.targetDigest(editTarget, editAccount) } : {}) };
+            // Early refusal only. The executor rechecks at its actual outbound write after all awaits.
+            if (dispatchFence && !dispatchFence.open()) return notChecked();
             markWriteAttempt();
             // Set before the call, so a write that throws still counts as a round that wrote (#1456).
             if (isWriteTool(tc.name)) roundWrote = true;
-            const options = { chatKey, exchangeKey, routes: toolRoutes, ...(editTarget !== null ? { editTarget: editTargets.targetDigest(editTarget, editAccount) } : {}) };
-            result = await executeToolCall(project, tc.name, tc.args, allowedToolNames, chatSignal.signal, outcome, options);
+            try { result = await executeToolCall(project, tc.name, tc.args, allowedToolNames, chatSignal.signal, outcome, options); }
+            finally { dispatchFence?.started(); }
+            if (outcome.notRun) {
+              notRunResults.add(result);
+              authService.audit('tool.denied', userId, userId, { tool: tc.name, reason: 'unavailable' });
+              return result;
+            }
             ran = true;
             recordToolUse(chatWorkspace, tc.name);
             // Audit AFTER the fact and only for writes: "what did the model
