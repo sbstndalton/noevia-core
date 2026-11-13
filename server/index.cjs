@@ -948,6 +948,8 @@ const chatBrains = chatBrainLib.createBrainRunner({
 const chatMirrorBridge = require('./rust-chat-mirror.cjs').createExecutorBridge({ secret: FRONT_SECRET, json, readJson, mirror: chatVaultMirror, brains: chatBrains });
 // Track R8: the native chat executor's hand-off and tool bridges (rust-chat-native.cjs; only the front's loopback calls).
 const chatWriteTargetFor = (name, rawArgs, { user }) => (driveTools.names.has(name) ? driveTools.describeTarget(user, name, rawArgs) : null);
+// #687: the storage account a project file edit is bound to (the chat loop and the native executor's edit-target bridge).
+const chatEditStorageAccount = (userId) => { try { const c = userId ? authService.getStorage(userId, true) : null; return c && storageClient.isBrowsable(c) ? require('./project-edit-target.cjs').storageAccount(c) : null; } catch { return null; } };
 const chatNativeHandoff = require('./rust-chat-native.cjs').createHandoff({ secret: FRONT_SECRET, supervising: () => features.enabled('stepSupervision') });
 // Only an account that exists, is not disabled and whose workspace stands (a 404 refusal otherwise, also for the
 // 410 workspaceStore.get throws for a removed account or a folder that is gone).
@@ -955,7 +957,7 @@ const chatNativeAsUser = require('./rust-chat-native.cjs').createAsUser({
   userRow: (userId) => authService.db.prepare('SELECT id, disabled_at FROM users WHERE id=?').get(userId),
   runAs: (userId, fn) => diaryAsUser(userId, fn), currentWorkspace: () => currentWorkspace() });
 const chatNativeTools = require('./rust-chat-native.cjs').createToolBridge({ secret: FRONT_SECRET, json, readJson, asUser: chatNativeAsUser,
-  getProject: (id) => getProject(id), executeToolCall: (...args) => executeToolCall(...args), writeTargetFor: chatWriteTargetFor,
+  getProject: (id) => getProject(id), executeToolCall: (...args) => executeToolCall(...args), writeTargetFor: chatWriteTargetFor, editStorageAccount: chatEditStorageAccount,
   recordToolUse: (...args) => recordToolUse(...args), currentWorkspace: () => currentWorkspace(), currentUser: () => requestScope.getStore()?.authn?.user || null,
   recordUsage: (...args) => recordUsage(...args), recordSample: (...args) => prefill.recordSample(...args),
   modelManager, templateToolsGate: require('./chat-template-caps.cjs').toolsGate,
@@ -1043,7 +1045,7 @@ const { handleChat } = require('./chat.cjs').createChatHandler({
   chatgptOAuth, chatgptEnabled: () => features.enabled('chatgptOAuth'),
   projectEditTool: (name) => require('./project-edit-target.cjs').EDIT_TOOLS.has(name) && !!MCP_INTERNAL_SERVER && mcpState.tools.get(name)?.serverId === MCP_INTERNAL_SERVER.id,
   // #687: a plain-named project file is edited by moving it into the project folder when storage is connected.
-  editStorageAccount: (userId) => { try { const c = userId ? authService.getStorage(userId, true) : null; return c && storageClient.isBrowsable(c) ? require('./project-edit-target.cjs').storageAccount(c) : null; } catch { return null; } },
+  editStorageAccount: chatEditStorageAccount,
   // #659: the Google Drive writes name the Drive file they change on the approval card.
   writeTargetFor: chatWriteTargetFor,
   nativeHandoff: chatNativeHandoff,

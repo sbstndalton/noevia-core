@@ -1,6 +1,6 @@
 'use strict';
 // Track R8, the native chat turn: the hand-off from this process's turn preparation to the Rust front's executor,
-// and the two tool bridges that executor calls while the tool engines are still this process's.
+// and the tool bridges that executor calls while the tool engines are still this process's.
 //
 // The front's native executor (noevia-rs bins/noevia-server, behind a per-account switch that is off by default)
 // sends a turn to the usual loopback POST /internal/chat/turn (rust-chat-turn.cjs) with one more header,
@@ -18,11 +18,23 @@
 // before the front writes a byte of its own and nothing runs twice. Without the header, or with the wrong value
 // (a browser's header rides along on the relay), nothing here changes the turn.
 //
-//   POST /internal/chat/tools/execute  {user, projectId, name, args, allowed, routes, chatKey, exchangeKey}
+//   POST /internal/chat/tools/execute  {user, projectId, name, args, allowed, routes, chatKey, exchangeKey, editTarget?}
 //        -> 200 {text, failed}           one tool call through the toolboxes (index.cjs executeToolCall), as the
-//                                        user, counted as chat.cjs counts it (recordToolUse)
+//                                        user, counted as chat.cjs counts it (recordToolUse). `editTarget`: an
+//                                        approved project file edit's pinned file (targetDigest, 64 hex), passed
+//                                        in the call's options as chat.cjs passes it (#648)
 //   POST /internal/chat/tools/target   {user, name, args, chatKey}
 //        -> 200 {target, kind} | {error} | {}   what a write would change (writeTargetFor, #659), before its card
+//   POST /internal/chat/tools/abort    {user, exchangeKey}
+//        -> 204                          aborts the signal of every execute call of that exchange still running (the
+//                                        native turn's client left: chat.cjs's tools get the turn's signal then); each
+//                                        call still answers with what its tool returned
+//   POST /internal/chat/tools/edit-target {user, projectId, name, args}
+//        -> 200 {path, account, digest} | {error}   the stored file a project edit tool (EDIT_TOOLS) would change
+//                                        (#648/#687: project-edit-target.cjs resolveEditTarget against the project as
+//                                        stored now, with the user's storage account), and the digest the call is
+//                                        pinned to (targetDigest(path, account)). chat.cjs resolves it before the
+//                                        card, after the answer and right before the run; so does the executor.
 //   POST /internal/chat/usage          {user, model, reported}
 //        -> 204                          the reply's token use, recorded by usage.cjs (recordUsage) as the user:
 //                                        this process stays the one writer of the account's usage file
@@ -37,7 +49,9 @@
 //        goes away.
 //   POST /internal/chat/native/tools-allowed     {user, model}         -> 200 {allowed}    the template tools gate
 //   POST /internal/chat/native/tools-unsupported {user, model}         -> 204              its markUnsupported (#1015)
-//   POST /internal/chat/native/busy              {user}                -> 200 {busy}       modelManager.inferenceBusy(1)
+//   POST /internal/chat/native/busy              {user, own}           -> 200 {busy}       modelManager.inferenceBusy(own)
+//        `own`: the counts the asking turn holds in this process's gate (1..8, default 1). chat.cjs's turn holds one;
+//        a native turn holds the route's admission lease and, while it lasts, the model's lease.
 //   POST /internal/chat/native/title-auto-named  {user, listId, chatId, firstMessage} -> 200 {autoNamed}
 //   POST /internal/chat/native/title-save        {user, listId, chatId, title, firstMessage} -> 204
 //        the facts the turn reads of the local model manager, the engine's template and the chat lists, through
@@ -52,8 +66,9 @@
 // a `model` may not carry control characters. The permission gate around a call (policy, approval card, audit,
 // grants, recent writes) is the native executor's own; these only run what the tool engines do. A tool call that
 // throws answers 500 with the error's message, which the executor turns into the call's result as
-// tool-exchange.cjs callError does; a target lookup that throws answers chat.cjs's own refusal ({error}); a fact
-// that cannot be read answers 500 with a fixed text (the detail is logged here, never sent).
+// tool-exchange.cjs callError does; a target lookup that throws answers chat.cjs's own refusal ({error}), and so does
+// an edit target lookup that throws (resolveEditTarget never does; reading the project can); a fact that cannot be
+// read answers 500 with a fixed text (the detail is logged here, never sent).
 //
 // What the native executor must keep, because this process stops counting the turn at the cut:
 // - the model's lease from the cut to the turn's end (the front's admission lease for the model: the gate's
@@ -74,6 +89,9 @@ const HANDOFF_HEADER = 'x-noevia-chat-handoff';
 const PREPARED_VERSION = 1;
 const EXECUTE_PATH = '/internal/chat/tools/execute';
 const TARGET_PATH = '/internal/chat/tools/target';
+const ABORT_PATH = '/internal/chat/tools/abort';
+const EDIT_TARGET_PATH = '/internal/chat/tools/edit-target';
+const DIGEST = /^[0-9a-f]{64}$/;
 const USAGE_PATH = '/internal/chat/usage';
 const PREFILL_PATH = '/internal/chat/prefill';
 const NATIVE_PREFIX = '/internal/chat/native/';
@@ -105,6 +123,13 @@ function createHandoff({ secret, supervising = () => false, relayed = (req) => r
   return { requested, supervising: () => { try { return supervising() === true; } catch { return true; } } };
 }
 
+/** A message content the executor carries as it is: a list of text parts and image parts (image_url with a url). */
+function wireParts(content) {
+  return Array.isArray(content) && content.every((p) => p && typeof p === 'object' && !Array.isArray(p)
+    && ((p.type === 'text' && typeof p.text === 'string')
+      || (p.type === 'image_url' && p.image_url && typeof p.image_url === 'object' && typeof p.image_url.url === 'string')));
+}
+
 /**
  * Why the native executor cannot run this turn yet, or null when it can. Every condition is a part of chat.cjs
  * the executor does not do yet; each is lifted when it does. Read at the end of the preparation, so it sees the
@@ -116,10 +141,13 @@ function refusal(t) {
   if (t.chatIdNotText) return 'chat-id';
   if (t.deleted) return 'deleted';
   if (t.diary) return 'diary';
-  if (t.compactOnly) return 'compact';
   if (t.providerId !== t.defaultProviderId || t.machine || t.external || t.chatgpt || t.routeTarget) return 'provider';
   if (t.authorized) return 'provider-key';
-  if (t.images || t.messages.some((m) => typeof m?.content !== 'string')) return 'images';
+  // #1726's retrieved images (multimodal RAG: their notes, captions and parts) are not the executor's yet. A project's
+  // attached images are: they ride on the last user message as image parts (chat.cjs's vision step), which the
+  // executor carries, measures (context-fit counts each image_url) and sends as they are.
+  if (t.retrievedImages) return 'retrieved-images';
+  if (!t.messages.every((m) => typeof m?.content === 'string' || wireParts(m?.content))) return 'images';
   if (t.skills) return 'skills';
   if (t.provenance) return 'provenance';
   if (t.framingReasoner) return 'framing-reasoner';
@@ -128,7 +156,9 @@ function refusal(t) {
   if (t.supervision) return 'step-supervision';
   // An injected whole file whose name is not text (retrieval never makes one): its attribution keys on the value.
   if (t.injected) return 'injected-sources';
-  if (t.editTools) return 'edit-tools';
+  // The coworker page save (#2446): asked about every time, never under a chat-wide grant. The project edit tools
+  // (#648) are the executor's: the prepared frame names them (`editTools`).
+  if (t.pageSave) return 'page-save';
   if (t.streamGuard) return 'stream-guard';
   return null;
 }
@@ -161,6 +191,14 @@ const RESERVED = /[\udbfe\udbff][\udc00-\udfff]/;
 function reservedText(json) {
   return typeof json !== 'string' || RESERVED.test(json);
 }
+// The longest `prepared` line the front reads (noevia-rs crates/chat-turn handoff.rs PREPARED_CAP); a longer one
+// would fail the turn after this process let it go. Attached images are what can make it that long: their bytes are
+// not bounded by the chat body's cap.
+const PREPARED_CAP = 40 * 1024 * 1024;
+/** Whether the prepared frame's JSON text is longer than the front reads (the turn stays here). */
+function frameTooLarge(json) {
+  return typeof json !== 'string' || Buffer.byteLength(json, 'utf8') > PREPARED_CAP;
+}
 
 /** The `prepared` frame: everything the native executor needs from here on. No provider key is in it. */
 function preparedTurn(t) {
@@ -176,6 +214,9 @@ function preparedTurn(t) {
     limitScope: t.limitScope,
     messages: t.messages, tools: t.tools, routes: t.routes,
     writes: t.writes, public: t.public, automaticOnlyWrites: t.automaticOnlyWrites,
+    // The offered tools that are noevia's own project file edits (chat.cjs projectEditTool): resolved through the
+    // edit-target bridge before their card, and pinned to that file.
+    editTools: Array.isArray(t.editTools) ? t.editTools : [],
     routeNote: t.routeNote || '', templateGate: t.templateGate === true,
     // The local model manager answers health and load (resolveRuntimeLimit), and grants the model's lease.
     managerEnabled: t.managerEnabled === true, modelLease: t.modelLease === true,
@@ -187,6 +228,8 @@ function preparedTurn(t) {
     turn: {
       message: t.message, spaceId: t.spaceId || null, projectId: t.projectId || null,
       declineEndsReply: t.declineEndsReply === true, record: t.record === true, streamIdleMs: t.streamIdleMs,
+      // The Compact action: the context fit is forced, then the turn ends with `done` (no round, no title).
+      compactOnly: t.compactOnly === true,
       sources: t.sources || { reply: [], injected: [] },
     },
   };
@@ -223,10 +266,11 @@ function createAsUser({ userRow, runAs, currentWorkspace }) {
  * is the signed-in user chat.cjs passes as `chatUser` and `currentWorkspace()` theirs.
  */
 function createToolBridge({ secret, json, readJson, asUser, getProject, executeToolCall, writeTargetFor, recordToolUse, currentWorkspace, currentUser,
-  recordUsage = () => {}, recordSample = () => {}, modelManager = null, templateToolsGate = null, chatTitles = null, chatBodyCap = CHAT_BODY_CAP,
+  editStorageAccount = () => null, recordUsage = () => {}, recordSample = () => {}, modelManager = null, templateToolsGate = null, chatTitles = null, chatBodyCap = CHAT_BODY_CAP,
   log = (line) => console.warn(line) }) {
-  const callerGone = (req, res) => {
-    const controller = new AbortController();
+  // Execute calls in progress by `${user}\u0000${exchangeKey}`: the abort bridge aborts their signals.
+  const running = new Map();
+  const callerGone = (req, res, controller = new AbortController()) => {
     const gone = () => { if (!res.writableEnded) controller.abort(); };
     req.once('close', () => { if (req.destroyed && !req.complete) gone(); });
     res.once('close', gone);
@@ -279,7 +323,8 @@ function createToolBridge({ secret, json, readJson, asUser, getProject, executeT
     }
     if (op === 'busy') {
       let busy = false;
-      try { busy = typeof modelManager?.inferenceBusy === 'function' && modelManager.inferenceBusy(1) === true; } catch { busy = false; }
+      const own = Number.isSafeInteger(body?.own) && body.own >= 1 && body.own <= 8 ? body.own : 1;
+      try { busy = typeof modelManager?.inferenceBusy === 'function' && modelManager.inferenceBusy(own) === true; } catch { busy = false; }
       return json(res, 200, { busy });
     }
     const chat = text(body?.chatId, CHAT_ID_CAP), first = text(body?.firstMessage, chatBodyCap);
@@ -298,7 +343,7 @@ function createToolBridge({ secret, json, readJson, asUser, getProject, executeT
   return async function handle(req, res) {
     const path = String(req.url || '').split('?')[0];
     const op = path.startsWith(NATIVE_PREFIX) ? path.slice(NATIVE_PREFIX.length) : null;
-    if (path !== EXECUTE_PATH && path !== TARGET_PATH && path !== USAGE_PATH && path !== PREFILL_PATH && !NATIVE_OPS.has(op)) return false;
+    if (path !== EXECUTE_PATH && path !== TARGET_PATH && path !== ABORT_PATH && path !== EDIT_TARGET_PATH && path !== USAGE_PATH && path !== PREFILL_PATH && !NATIVE_OPS.has(op)) return false;
     if (!trustedFront(req, secret) || req.method !== 'POST') { json(res, 404, { error: 'Not found' }); return true; }
     let body;
     // A title bridge carries the chat's first message, which may be as long as a chat request.
@@ -314,6 +359,12 @@ function createToolBridge({ secret, json, readJson, asUser, getProject, executeT
         json(res, 500, { error: 'the fact could not be read' });
       }
       return true;
+    }
+    if (path === ABORT_PATH) {
+      const who = text(body?.user, USER_CAP), key = text(body?.exchangeKey, 200);
+      if (!who || !key) { json(res, 400, { error: 'user and exchangeKey are required.' }); return true; }
+      for (const controller of running.get(`${who}\u0000${key}`) || []) controller.abort();
+      noContent(res); return true;
     }
     if (path === PREFILL_PATH) {
       const who = text(body?.user, USER_CAP), model = modelName(body?.model), prompt = body?.promptTokens, ms = body?.firstTokenMs;
@@ -344,6 +395,24 @@ function createToolBridge({ secret, json, readJson, asUser, getProject, executeT
     const name = text(body?.name, 200);
     const args = text(body?.args, BODY_CAP);
     if (!user || !name || args === null) { json(res, 400, { error: 'user, name and args are required.' }); return true; }
+    if (path === EDIT_TARGET_PATH) {
+      const edits = require('./project-edit-target.cjs');
+      const projectId = body.projectId === undefined || body.projectId === null ? null : text(body.projectId, 200);
+      if ((projectId === null && body.projectId != null) || projectId === '' || !edits.EDIT_TOOLS.has(name)) { json(res, 400, { error: 'projectId or name is invalid.' }); return true; }
+      let found;
+      try {
+        // chat.cjs: resolveEditTarget(project ? getProject(project.id) : null, tc.args, { storageAccount: editStorageAccount(userId) }),
+        // as the user (their workspace's project and storage connection).
+        found = await asUser(user, async () => edits.resolveEditTarget(projectId ? getProject(projectId) : null, args, { storageAccount: editStorageAccount(user) }));
+      } catch (error) {
+        if (missing(error)) { noAccount(res); return true; }
+        log(`[chat] native edit-target bridge failed: ${String(error?.message || error).slice(0, 300)}`);
+        found = { error: 'The file this would change could not be looked up' };
+      }
+      if (found?.error) json(res, 200, { error: String(found.error) });
+      else json(res, 200, { path: found.path, account: found.account || null, digest: edits.targetDigest(found.path, found.account || null) });
+      return true;
+    }
     const chatKey = body.chatKey === undefined || body.chatKey === null ? null : text(body.chatKey, CHAT_ID_CAP);
     if (chatKey === null && body.chatKey !== undefined && body.chatKey !== null) { json(res, 400, { error: 'chatKey is invalid.' }); return true; }
     try {
@@ -363,16 +432,28 @@ function createToolBridge({ secret, json, readJson, asUser, getProject, executeT
       if (!allowed || !routes) { json(res, 400, { error: 'allowed and routes are required.' }); return true; }
       const projectId = typeof body.projectId === 'string' && body.projectId ? text(body.projectId, 200) : null;
       const exchangeKey = typeof body.exchangeKey === 'string' ? text(body.exchangeKey, 200) : null;
-      if ((body.projectId && !projectId) || (body.exchangeKey && !exchangeKey)) { json(res, 400, { error: 'projectId or exchangeKey is invalid.' }); return true; }
-      const signal = callerGone(req, res);
-      const ran = await asUser(user, async () => {
-        const project = projectId ? getProject(projectId) : null;
-        if (projectId && !project) return null;
-        const outcome = { failed: false };
-        const out = await executeToolCall(project, name, args, allowed, signal, outcome, { chatKey, exchangeKey, routes });
-        recordToolUse(currentWorkspace(), name);
-        return { text: String(out ?? ''), failed: outcome.failed === true };
-      });
+      const editTarget = body.editTarget === undefined || body.editTarget === null ? null : body.editTarget;
+      if ((body.projectId && !projectId) || (body.exchangeKey && !exchangeKey) || (editTarget !== null && !(typeof editTarget === 'string' && DIGEST.test(editTarget)))) {
+        json(res, 400, { error: 'projectId, exchangeKey or editTarget is invalid.' }); return true;
+      }
+      const controller = new AbortController();
+      const signal = callerGone(req, res, controller);
+      const runKey = exchangeKey ? `${user}\u0000${exchangeKey}` : null;
+      if (runKey) { if (!running.has(runKey)) running.set(runKey, new Set()); running.get(runKey).add(controller); }
+      let ran;
+      try {
+        ran = await asUser(user, async () => {
+          const project = projectId ? getProject(projectId) : null;
+          if (projectId && !project) return null;
+          const outcome = { failed: false };
+          const out = await executeToolCall(project, name, args, allowed, signal, outcome, { chatKey, exchangeKey, routes, ...(editTarget !== null ? { editTarget } : {}) });
+          recordToolUse(currentWorkspace(), name);
+          return { text: String(out ?? ''), failed: outcome.failed === true };
+        });
+      } finally {
+        const set = runKey && running.get(runKey);
+        if (set) { set.delete(controller); if (!set.size) running.delete(runKey); }
+      }
       if (!ran) { json(res, 404, { error: 'no such project' }); return true; }
       json(res, 200, ran);
     } catch (error) {
@@ -384,4 +465,4 @@ function createToolBridge({ secret, json, readJson, asUser, getProject, executeT
   };
 }
 
-module.exports = { HANDOFF_HEADER, PREPARED_VERSION, EXECUTE_PATH, TARGET_PATH, USAGE_PATH, PREFILL_PATH, NATIVE_PREFIX, CHAT_BODY_CAP, createHandoff, refusal, reservedText, injectedSources, preparedTurn, createAsUser, createToolBridge };
+module.exports = { HANDOFF_HEADER, PREPARED_VERSION, EXECUTE_PATH, TARGET_PATH, ABORT_PATH, EDIT_TARGET_PATH, USAGE_PATH, PREFILL_PATH, NATIVE_PREFIX, CHAT_BODY_CAP, PREPARED_CAP, createHandoff, refusal, reservedText, frameTooLarge, injectedSources, preparedTurn, createAsUser, createToolBridge };

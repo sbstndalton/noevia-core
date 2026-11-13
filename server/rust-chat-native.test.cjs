@@ -19,19 +19,19 @@ const grantFixture = require('../tests/server/chat-grant-fixture.cjs');
 const SECRET = 'qa-front-secret-0123456789abcdef';
 
 // One synthetic turn through the real handleChat: a manual project, the local default provider, a scripted engine.
-async function runTurn(t, { handoff = null, requested = false, supervising = false, frames, headersFor = () => ({}), project: extra = {}, before = () => {}, headers = {}, deps = {}, history = [] } = {}) {
+async function runTurn(t, { handoff = null, requested = false, supervising = false, frames, headersFor = () => ({}), project: extra = {}, before = () => {}, headers = {}, deps = {}, history = [], boxes = {}, body: extraBody = {} } = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'noevia-native-handoff-'));
   before(dir);
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
   const user = { id: 'qa-user', role: 'admin' };
   const project = { id: 'qa-project', name: 'QA Project', model: 'qa-model', routing: 'manual', toolboxes: ['core'], files: [], ...extra };
-  const workspace = { userId: user.id, dir, assertActive() {}, transcripts: { appendIfLast: async () => 'saved' } };
+  const workspace = { userId: user.id, dir, assertActive() {}, assetDir: () => path.join(dir, 'assets'), transcripts: { appendIfLast: async () => 'saved' } };
   const store = { workspace: { userId: user.id }, authn: { user } };
   const requestScope = { getStore: () => store, run: (_s, fn) => fn() };
   const accounts = { forUser: () => ({ drive: { state: () => ({ state: 'connected' }) } }) };
   const driveTools = { ...createDriveTools({ accounts }), execute: async () => 'QA Drive result' };
   const toolbox = createToolboxes({ boxes: [driveTools.box], driveTools, offered: (id) => id !== 'gdrive', mcpBoxes: () => [], mcpTools: () => new Map(),
-    prefill: { budgetFor: () => null, rateFor: () => 0 }, requestScope, scope: requestScope, documentSources: { notice: () => '' }, workspace: () => ({ dir }) });
+    prefill: { budgetFor: () => null, rateFor: () => 0 }, requestScope, scope: requestScope, documentSources: { notice: () => '' }, workspace: () => ({ dir }), ...boxes });
   const events = [], requests = [];
   const res = new EventEmitter();
   res.writeHead = () => {};
@@ -61,7 +61,7 @@ async function runTurn(t, { handoff = null, requested = false, supervising = fal
     ...deps,
   });
   const req = { headers: { ...headers } };
-  await handler.handleChat(req, res, { message: 'QA hello', projectId: project.id, chatId: 'qa-chat-1', history }, { user });
+  await handler.handleChat(req, res, { message: 'QA hello', projectId: project.id, chatId: 'qa-chat-1', history, ...extraBody }, { user });
   await new Promise((resolve) => setImmediate(resolve));
   return { events, requests, req };
 }
@@ -107,7 +107,7 @@ test('a turn the native executor can run ends after its preparation with the pre
   assert.ok(last.writes.includes('drive_trash_file') && !last.writes.includes('drive_read_file'));
   assert.deepEqual(last.chat.title, { chatId: 'qa-chat-1', listId: 'qa-project', firstMessage: 'QA hello', firstReply: true, enabled: false });
   assert.deepEqual(last.turn, { message: 'QA hello', spaceId: null, projectId: 'qa-project', declineEndsReply: true, record: true, streamIdleMs: 120000,
-    sources: { reply: [], injected: [] } });
+    sources: { reply: [], injected: [] }, compactOnly: false });
   assert.equal(last.chat.grantScope, 'project:qa-project');
   assert.ok(Number.isFinite(last.startedAt) && last.startedAt <= Date.now());
   assert.equal(last.managerEnabled, true);
@@ -136,6 +136,55 @@ test('a turn with injected knowledge files hands off with what the attribution a
   assert.deepEqual(handed.events.find((e) => e.type === 'sources')?.sources, last.turn.sources.reply);
 });
 
+// A project image source (chat.cjs projectImages): a synthetic 1x1 PNG in the project's asset directory.
+const QA_PNG = Buffer.from('89504e470d0a1a0a0000000d494844520000000100000001080600000' + '01f15c4890000000d4944415478da63f8ffff3f0005fe02fea7d6a4c10000000049454e44ae426082', 'hex');
+const imageProject = { assets: [{ id: 'qa-asset-1', name: 'qa-image.png', mime: 'image/png' }] };
+const withImage = (bytes = QA_PNG) => (dir) => { fs.mkdirSync(path.join(dir, 'assets'), { recursive: true }); fs.writeFileSync(path.join(dir, 'assets', 'qa-asset-1'), bytes); };
+const statusIds = (events) => events.filter((e) => e.type === 'status').map((e) => e.id);
+
+test('a turn whose attached image the answering model can see hands off with the image parts on its last user message', async (t) => {
+  const deps = { visionProbe: async () => ({ supported: true }) };
+  const plain = await runTurn(t, { frames: answer, project: imageProject, before: withImage(), deps });
+  const handed = await runTurn(t, { requested: true, frames: answer, project: imageProject, before: withImage(), deps });
+  const last = handed.events.at(-1);
+  assert.equal(last.type, 'prepared', 'attached images no longer keep the turn in Node');
+  assert.equal(handed.requests.length, 0);
+  assert.deepEqual(last.messages, plain.requests[0].messages, 'the wire is what the engine got without the hand-off');
+  assert.deepEqual(last.messages.at(-1), { role: 'user', content: [
+    { type: 'text', text: `QA hello\n\n(Attached images: ${require('./quoted-name.cjs').quotedNames(['qa-image.png'])})` },
+    { type: 'image_url', image_url: { url: `data:image/png;base64,${QA_PNG.toString('base64')}` } }] });
+  assert.deepEqual(handed.events.slice(0, -1).map((e) => e.type), ['meta', 'telemetry', 'status', 'status', 'tools_scope']);
+  assert.deepEqual(statusIds(handed.events), ['readingImages', 'generating']);
+});
+
+test('a turn whose attached image the model cannot see hands off without it, with the warning and the note sent before the cut', async (t) => {
+  const deps = { visionProbe: async () => ({ supported: false, reason: 'QA engine has no image input.' }) };
+  const plain = await runTurn(t, { frames: answer, project: imageProject, before: withImage(), deps });
+  const handed = await runTurn(t, { requested: true, frames: answer, project: imageProject, before: withImage(), deps });
+  const last = handed.events.at(-1);
+  assert.equal(last.type, 'prepared');
+  assert.deepEqual(last.messages, plain.requests[0].messages);
+  assert.ok(last.messages.every((m) => typeof m.content === 'string'), 'Node cleared the image');
+  assert.match(last.messages[0].content, /image input is currently unavailable for qa-model: QA engine has no image input\./);
+  assert.deepEqual(handed.events.filter((e) => e.type === 'warning').map((e) => e.text), ['Images were not read. QA engine has no image input.']);
+  assert.deepEqual(handed.events.slice(0, -1).map((e) => e.type), plain.events.slice(0, handed.events.length - 1).map((e) => e.type));
+});
+
+test('a turn whose prepared frame would be longer than the front reads stays in Node (frame-size)', async (t) => {
+  const deps = { visionProbe: async () => ({ supported: true }) };
+  // Base64 makes 3 bytes 4: these bytes alone make the frame longer than PREPARED_CAP.
+  const big = Buffer.alloc(Math.ceil(native.PREPARED_CAP * 0.75) + 64, 0x51);
+  const logged = [];
+  const log = console.log;
+  console.log = (line) => logged.push(String(line));
+  let kept;
+  try { kept = await runTurn(t, { requested: true, frames: answer, project: imageProject, before: withImage(big), deps }); } finally { console.log = log; }
+  assert.notEqual(kept.events.at(-1).type, 'prepared');
+  assert.equal(kept.requests.length, 1, 'Node ran the turn');
+  assert.equal(kept.requests[0].messages.at(-1).content[1].image_url.url.length, 'data:image/png;base64,'.length + Math.ceil(big.length / 3) * 4);
+  assert.ok(logged.includes('[chat] native executor not used for this turn: frame-size'));
+});
+
 test('injectedSources keeps the part of a file the attribution reads, and refuses a name that is not text', () => {
   const long = 'é'.repeat(30000) + '😀';
   const out = native.injectedSources({ injected: [{ file: 'qa-a.txt', body: long, kind: 'file' }], placed: [], readable: [{ name: 'qa-a.txt', content: 'x' }], reply: [] });
@@ -143,7 +192,7 @@ test('injectedSources keeps the part of a file the attribution reads, and refuse
   assert.deepEqual(native.injectedSources({}), { reply: [], injected: [] });
   const base = { chatIdNotText: false, deleted: false, diary: false, compactOnly: false, providerId: 'default', defaultProviderId: 'default', machine: false, external: false,
     chatgpt: false, routeTarget: false, authorized: false, images: false, messages: [], skills: false, provenance: false, framingReasoner: false, narrowed: false, gate: false,
-    supervision: false, injected: false, editTools: false };
+    supervision: false, injected: false, pageSave: false };
   assert.equal(native.refusal(base), null);
   assert.equal(native.refusal({ ...base, injected: true }), 'injected-sources');
 });
@@ -166,6 +215,16 @@ test('a turn whose text holds a character the executor cannot read (U+10F800..U+
   assert.equal(handed.requests.length, 1, 'Node ran the turn');
   const plain = await runTurn(t, { requested: true, frames: answer, project: { files: [{ name: 'qa-a.txt', content: 'QA' }] } });
   assert.equal(plain.events[plain.events.length - 1].type, 'prepared');
+});
+
+test('a compaction-only turn (the Compact action) is handed off with its flag and no turn record', async (t) => {
+  const history = [{ role: 'user', content: 'QA earlier question' }, { role: 'assistant', content: 'QA earlier answer' }];
+  const handed = await runTurn(t, { requested: true, frames: answer, history, body: { compactOnly: true } });
+  const last = handed.events[handed.events.length - 1];
+  assert.equal(last.type, 'prepared');
+  assert.equal(last.turn.compactOnly, true);
+  assert.equal(last.turn.record, false, 'chat.cjs keeps no turn record for a compaction');
+  assert.equal(handed.requests.length, 0);
 });
 
 test('the prepared frame says the front holds the model lease and runs the title, and Node takes no lease of its own', async (t) => {
@@ -237,16 +296,35 @@ test('a turn it cannot run goes on in Node, exactly as without the request', asy
 
 test('refusal names the first part of the turn the native executor does not do yet', () => {
   const base = { diary: false, compactOnly: false, providerId: 'default', defaultProviderId: 'default', machine: false, external: false, chatgpt: false,
-    routeTarget: false, authorized: false, images: false, messages: [{ role: 'user', content: 'x' }], skills: false, provenance: false,
-    framingReasoner: false, narrowed: false, gate: false, supervision: false, injected: false, editTools: false };
+    routeTarget: false, authorized: false, attachedImages: 0, retrievedImages: false, messages: [{ role: 'user', content: 'x' }], skills: false, provenance: false,
+    framingReasoner: false, narrowed: false, gate: false, supervision: false, injected: false, pageSave: false };
   assert.equal(native.refusal(base), null);
-  const cases = [['diary', { diary: true }], ['compact', { compactOnly: true }], ['provider', { providerId: 'qa-cloud' }], ['provider', { machine: true }],
+  const cases = [['diary', { diary: true }], ['provider', { providerId: 'qa-cloud' }], ['provider', { machine: true }],
     ['provider', { external: true }], ['provider', { chatgpt: true }], ['provider', { routeTarget: true }], ['provider-key', { authorized: true }],
-    ['images', { images: true }], ['images', { messages: [{ role: 'user', content: [{ type: 'text', text: 'x' }] }] }], ['skills', { skills: true }],
+    ['retrieved-images', { retrievedImages: true }], ['retrieved-images', { retrievedImages: true, attachedImages: 1 }],
+    ['images', { messages: [{ role: 'user', content: [{ type: 'input_audio', input_audio: { data: 'QA' } }] }] }],
+    ['images', { messages: [{ role: 'user', content: [{ type: 'text', text: 'x' }, { type: 'image_url', image_url: 'data:image/png;base64,QQ==' }] }] }],
+    ['images', { messages: [{ role: 'user', content: [{ type: 'image_url', image_url: { url: 42 } }] }] }],
+    ['images', { messages: [{ role: 'user', content: [{ type: 'text', text: null }] }] }],
+    ['images', { messages: [{ role: 'user', content: [null] }] }], ['images', { messages: [{ role: 'user', content: [['x']] }] }],
+    ['images', { messages: [{ role: 'assistant', content: null }] }], ['images', { messages: [{ role: 'user', content: { type: 'text', text: 'x' } }] }],
+    ['skills', { skills: true }],
     ['provenance', { provenance: true }], ['framing-reasoner', { framingReasoner: true }], ['narrowed-tools', { narrowed: true }], ['tool-gate', { gate: true }],
-    ['step-supervision', { supervision: true }], ['injected-sources', { injected: true }], ['edit-tools', { editTools: true }],
+    ['step-supervision', { supervision: true }], ['injected-sources', { injected: true }], ['page-save', { pageSave: true }],
     ['deleted', { deleted: true }], ['stream-guard', { streamGuard: true }], ['chat-id', { chatIdNotText: true }]];
   for (const [why, change] of cases) assert.equal(native.refusal({ ...base, ...change }), why, JSON.stringify(change));
+  // Attached images the answering model is handed (text and image parts on the last user message) are the executor's.
+  const parts = [{ type: 'text', text: 'QA hello\n\n(Attached images: "qa-image.png")' }, { type: 'image_url', image_url: { url: 'data:image/png;base64,QQ==' } }];
+  assert.equal(native.refusal({ ...base, attachedImages: 1, messages: [{ role: 'system', content: 'QA' }, { role: 'user', content: parts }] }), null);
+  assert.equal(native.refusal({ ...base, messages: [{ role: 'user', content: [] }] }), null, 'an empty list carries nothing the executor cannot');
+});
+
+test('frameTooLarge refuses a prepared line longer than the front reads (PREPARED_CAP bytes of UTF-8)', () => {
+  assert.equal(native.PREPARED_CAP, 40 * 1024 * 1024);
+  assert.equal(native.frameTooLarge('x'.repeat(native.PREPARED_CAP)), false);
+  assert.equal(native.frameTooLarge('x'.repeat(native.PREPARED_CAP + 1)), true);
+  assert.equal(native.frameTooLarge('é'.repeat(native.PREPARED_CAP / 2) + 'x'), true, 'counted in bytes, not characters');
+  assert.equal(native.frameTooLarge(null), true);
 });
 
 // The bridges, through a fake loopback request.
@@ -276,6 +354,41 @@ function bridge(overrides = {}) {
   };
   return { call, calls };
 }
+
+test('the busy bridge counts what the asking turn holds; a bad count is one', async () => {
+  const seen = [];
+  const { call } = bridge({ modelManager: { enabled: true, inferenceBusy: (n) => { seen.push(n); return n < 2; } } });
+  const p = `${native.NATIVE_PREFIX}busy`;
+  assert.deepEqual((await call(p, { user: 'qa-user', own: 2 })).body, { busy: false });
+  for (const own of [0, 9, 1.5, '2', null]) assert.deepEqual((await call(p, { user: 'qa-user', own })).body, { busy: true });
+  assert.deepEqual(seen, [2, 1, 1, 1, 1, 1]);
+});
+
+test('the abort bridge aborts the running calls of an exchange, which still answer', async () => {
+  const started = [];
+  const { call } = bridge({
+    executeToolCall: async (project, name, args, allowed, signal) => {
+      started.push(name);
+      await new Promise((resolve) => (signal.aborted ? resolve() : signal.addEventListener('abort', resolve, { once: true })));
+      return `QA ${name} stopped`;
+    },
+  });
+  const body = { user: 'qa-user', projectId: 'qa-project', name: 'drive_read_file', args: '{}', allowed: ['drive_read_file'], routes: [], chatKey: 'qa-chat-1', exchangeKey: 'qa-x' };
+  const running = call(native.EXECUTE_PATH, body);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(started, ['drive_read_file']);
+  // Another user's or another exchange's abort reaches nothing.
+  assert.equal((await call(native.ABORT_PATH, { user: 'qa-other', exchangeKey: 'qa-x' })).status, 204);
+  assert.equal((await call(native.ABORT_PATH, { user: 'qa-user', exchangeKey: 'qa-y' })).status, 204);
+  let done = false;
+  running.then(() => { done = true; });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(done, false);
+  assert.equal((await call(native.ABORT_PATH, { user: 'qa-user', exchangeKey: 'qa-x' })).status, 204);
+  assert.deepEqual((await running).body, { text: 'QA drive_read_file stopped', failed: false });
+  assert.equal((await call(native.ABORT_PATH, { user: 'qa-user' })).status, 400);
+  assert.equal((await call(native.ABORT_PATH, { user: 'qa-user', exchangeKey: 'qa-x' }, { trusted: false })).status, 404);
+});
 
 test('the execute bridge runs one call as the user and says whether it failed', async () => {
   const { call, calls } = bridge();
@@ -442,4 +555,89 @@ test('chatNativeAsUser (createAsUser) refuses a missing, disabled or removed acc
   const { call } = bridge({ asUser, recordSample() {} });
   assert.deepEqual(await call(native.PREFILL_PATH, { user: REMOVED, model: 'qa-model', promptTokens: 52, firstTokenMs: 310 }), { handled: true, status: 404, body: { error: 'no such account' } });
   assert.equal((await call(native.PREFILL_PATH, { user: QA, model: 'qa-model', promptTokens: 52, firstTokenMs: 310 })).status, 204);
+});
+
+// A Project documents box as MCP discovery offers it (noevia's own server): the two edit tools and a read.
+const DOCS_TOOL = (name) => ({ type: 'function', function: { name, description: `QA ${name}`, parameters: { type: 'object', properties: { name: { type: 'string' } }, required: ['name'] } } });
+const DOCS_BOX = { id: 'qa-docs', label: 'QA documents', source: 'mcp', server: 'qa-internal',
+  tools: ['project_read_file', 'project_append_file', 'project_replace_text'].map(DOCS_TOOL), reads: ['project_read_file'] };
+const docsBoxes = { mcpBoxes: () => [DOCS_BOX], mcpTools: () => new Map(DOCS_BOX.tools.map((t) => [t.function.name, { readOnly: t.function.name === 'project_read_file', serverId: 'qa-internal' }])) };
+
+test('a turn offering the project edit tools hands off and names them; one offering the coworker page save stays in Node', async (t) => {
+  const handed = await runTurn(t, { requested: true, frames: answer, project: { toolboxes: ['core', 'qa-docs'] }, boxes: docsBoxes });
+  const last = handed.events.at(-1);
+  assert.equal(last.type, 'prepared', 'the edit tools no longer keep the turn in Node');
+  assert.deepEqual(last.editTools, ['project_append_file', 'project_replace_text']);
+  assert.ok(last.writes.includes('project_append_file') && last.writes.includes('project_replace_text') && !last.writes.includes('project_read_file'));
+  assert.deepEqual(last.routes.filter(([n]) => n.startsWith('project_')).map(([, s]) => s), ['qa-internal', 'qa-internal', 'qa-internal']);
+  // As chat.cjs decides (index.cjs wires projectEditTool to noevia's own server): a name it does not count is not listed.
+  const narrowed = await runTurn(t, { requested: true, frames: answer, project: { toolboxes: ['core', 'qa-docs'] }, boxes: docsBoxes, deps: { projectEditTool: (n) => n === 'project_replace_text' } });
+  assert.deepEqual(narrowed.events.at(-1).editTools, ['project_replace_text']);
+  const plain = await runTurn(t, { requested: true, frames: answer });
+  assert.deepEqual(plain.events.at(-1).editTools, []);
+  // The coworker page save: still Node's.
+  const pageSave = require('./specialist-page-save.cjs').createPageSave({ store: { specialistPageSave: async () => ({ status: 500 }) } });
+  const logged = [];
+  const log = console.log;
+  console.log = (line) => logged.push(String(line));
+  let kept;
+  try { kept = await runTurn(t, { requested: true, frames: answer, project: { id: 'specialist-qa' }, boxes: { specialistTools: pageSave } }); } finally { console.log = log; }
+  assert.notEqual(kept.events.at(-1).type, 'prepared');
+  assert.equal(kept.requests.length, 1, 'Node ran the turn');
+  assert.ok(kept.requests[0].tools.some((tool) => tool.function.name === 'space_page_save'));
+  assert.ok(logged.includes('[chat] native executor not used for this turn: page-save'));
+});
+
+test('the edit-target bridge resolves a project edit as the user, with its storage account and the digest the call is pinned to', async () => {
+  const edits = require('./project-edit-target.cjs');
+  const project = { id: 'qa-project', reservedFolder: 'QA Folder', files: [{ name: 'qa-notes.txt', content: 'QA notes' }, { name: 'qa-doc.pdf', content: 'x', document: { state: 'ready' } }] };
+  const accounts = [];
+  const { call, calls } = bridge({ getProject: (id) => (id === 'qa-project' ? project : null), editStorageAccount: (who) => { accounts.push(who); return null; } });
+  const body = { user: 'qa-user', projectId: 'qa-project', name: 'project_append_file', args: '{"name":"qa-notes.txt","text":"QA more"}' };
+  assert.deepEqual(await call(native.EDIT_TARGET_PATH, body), { handled: true, status: 200, body: { path: 'qa-notes.txt', account: null, digest: edits.targetDigest('qa-notes.txt', null) } });
+  assert.deepEqual(calls, [['asUser', 'qa-user']]);
+  assert.deepEqual(accounts, ['qa-user']);
+  // Connected storage: a plain-named file is moved into the project folder, and the move is bound to the account.
+  const account = 'a'.repeat(64);
+  const connected = bridge({ getProject: () => project, editStorageAccount: () => account });
+  assert.deepEqual((await connected.call(native.EDIT_TARGET_PATH, { ...body, name: 'project_replace_text' })).body,
+    { path: 'QA Folder/Text/qa-notes.txt', account, digest: edits.targetDigest('QA Folder/Text/qa-notes.txt', account) });
+  assert.notEqual(edits.targetDigest('QA Folder/Text/qa-notes.txt', account), edits.targetDigest('QA Folder/Text/qa-notes.txt', null));
+  // resolveEditTarget's own refusals, as chat.cjs gets them (it adds the final period and the tool's sentence).
+  const answered = async (b) => (await call(native.EDIT_TARGET_PATH, { ...body, ...b })).body;
+  assert.deepEqual(await answered({ args: '{"name":"qa-doc.pdf"}' }), { error: '"qa-doc.pdf" is an extracted document, not an editable text file.' });
+  assert.deepEqual(await answered({ args: '{"name":"qa-gone.txt"}' }), edits.resolveEditTarget(project, '{"name":"qa-gone.txt"}'));
+  assert.deepEqual(await answered({ args: 'not json' }), { error: 'the tool arguments were not valid JSON.' });
+  assert.deepEqual(await answered({ args: '[]' }), { error: 'the tool arguments must be a JSON object.' });
+  // No project, or one that is gone: chat.cjs's getProject answers nothing either.
+  for (const b of [{ projectId: null }, { projectId: undefined }, { projectId: 'qa-gone' }]) {
+    assert.deepEqual(await answered(b), { error: 'this chat is not in a project, so there are no project files to edit.' }, JSON.stringify(b));
+  }
+  // A project that cannot be read: refused as a target lookup that throws; the detail is logged, never sent.
+  const logged = [];
+  const failing = bridge({ log: (line) => logged.push(line), getProject: () => { throw Error('QA store down'); } });
+  assert.deepEqual((await failing.call(native.EDIT_TARGET_PATH, body)).body, { error: 'The file this would change could not be looked up' });
+  assert.deepEqual(logged, ['[chat] native edit-target bridge failed: QA store down']);
+  const gone = bridge({ asUser: async () => { throw Object.assign(Error('no such account'), { status: 404 }); } });
+  assert.deepEqual(await gone.call(native.EDIT_TARGET_PATH, body), { handled: true, status: 404, body: { error: 'no such account' } });
+  assert.deepEqual(await call(native.EDIT_TARGET_PATH, body, { trusted: false }), { handled: true, status: 404, body: { error: 'Not found' } });
+  assert.equal((await call(native.EDIT_TARGET_PATH, body, { method: 'GET' })).status, 404);
+  const before = calls.length;
+  for (const bad of [{ name: 'drive_trash_file' }, { name: 'space_page_save' }, { projectId: '' }, { projectId: 7 }, { user: '' }, { args: null }, { projectId: 'x'.repeat(201) }]) {
+    assert.equal((await call(native.EDIT_TARGET_PATH, { ...body, ...bad })).status, 400, JSON.stringify(bad));
+  }
+  assert.equal(calls.length, before, 'nothing ran for a refused request');
+});
+
+test('the execute bridge passes an approved edit\'s pinned file in the call\'s options, as chat.cjs does', async () => {
+  const seen = [];
+  const { call } = bridge({ executeToolCall: async (_p, name, _a, _al, _s, _o, options) => { seen.push(Object.keys(options).includes('editTarget') ? options.editTarget : 'none'); return `QA ${name}`; } });
+  const digest = require('./project-edit-target.cjs').targetDigest('qa-notes.txt', null);
+  const body = { user: 'qa-user', projectId: 'qa-project', name: 'project_append_file', args: '{}', allowed: ['project_append_file'], routes: [], chatKey: 'qa-chat-1', exchangeKey: 'qa-x' };
+  assert.equal((await call(native.EXECUTE_PATH, { ...body, editTarget: digest })).status, 200);
+  assert.equal((await call(native.EXECUTE_PATH, body)).status, 200);
+  assert.equal((await call(native.EXECUTE_PATH, { ...body, editTarget: null })).status, 200);
+  assert.deepEqual(seen, [digest, 'none', 'none'], 'no key at all without one');
+  for (const bad of ['qa-notes.txt', digest.toUpperCase(), digest.slice(1), 7, '']) assert.equal((await call(native.EXECUTE_PATH, { ...body, editTarget: bad })).status, 400, String(bad));
+  assert.equal(seen.length, 3);
 });

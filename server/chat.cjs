@@ -1691,13 +1691,13 @@ function createChatHandler({
           diary: diaryTurn, compactOnly: body.compactOnly === true,
           providerId: provider.id, defaultProviderId: DEFAULT_PROVIDER_ID, machine: !!provider.machine, external: !!externalProvider, chatgpt: !!chatgptProvider, routeTarget: !!routeTarget,
           authorized: !!upstreamHeaders?.Authorization,
-          images: attachedImages.length > 0 || retrievedImages.length > 0, messages: wire,
+          retrievedImages: retrievedImages.length > 0, messages: wire,
           skills: loadedSkills.size > 0 || (!!project && instructionSkills.list(project).length > 0),
           provenance: provenanceOn, framingReasoner: !!(framingReasoner && chatFrame),
           narrowed: !!routing.narrowed, gate: !!(gate && gate.decision !== 'none'),
           supervision: nativeHandoff.supervising(),
           injected: injectedEntries.some((e) => e && e.kind === 'file' && typeof e.file !== 'string'),
-          editTools: activeTools.some((t) => projectEditTool(t.function?.name) || specialistPageSave.neverStanding(t.function?.name)),
+          pageSave: activeTools.some((t) => specialistPageSave.neverStanding(t.function?.name)),
           // #516: the stream guard's schema check runs before every call (egressToolRefusal) once it is on; the executor
           // does not run it yet. It answers for a call that cannot parse only when it is on and the tool has a schema.
           streamGuard: activeTools.some((t) => egressRules.validateToolArguments(t.function?.name, '\u0000') !== null),
@@ -1720,18 +1720,20 @@ function createChatHandler({
           limitScope: require('node:crypto').createHash('sha256').update(JSON.stringify([provider.baseUrl, provider.apiKey, modelManager.baseUrl])).digest('hex'),
           messages: wire, tools: activeTools, routes: [...toolRoutes],
           writes: names.filter((n) => isWriteTool(n)), public: names.filter((n) => isPublicTool(n)), automaticOnlyWrites: [...automaticOnlyWrites],
+          editTools: names.filter((n) => projectEditTool(n)),
           routeNote: routeNotes(), templateGate: provider.id === DEFAULT_PROVIDER_ID && typeof modelManager?.props === 'function',
           managerEnabled: !!modelManager?.enabled, modelLease: typeof modelManager?.acquireLease === 'function',
           chatId, contextId: chatId || spaceId, chatKey: chatId || spaceId || null,
           grantScope: writeGrantScope, grantHolder: expectedGrantHolder, recentWrites: [...recentWriteFps],
           title: { chatId: typeof body.chatId === 'string' ? body.chatId : '', listId: body.projectId && project ? project.id : null,
             firstMessage: chatTitleLib.firstUserMessage(history, message), firstReply: chatTitleLib.firstReply(history), enabled: !!chatTitles },
-          message, spaceId, projectId: project?.id, declineEndsReply: !spaceId?.startsWith('diary'), record: !!record, streamIdleMs,
+          message, spaceId, projectId: project?.id, declineEndsReply: !spaceId?.startsWith('diary'), record: !!record, streamIdleMs, compactOnly: body.compactOnly === true,
           sources: native.injectedSources({ injected: injectedEntries, placed: placedEntries, readable: readableFiles, reply: replySources }),
         });
         let text = null;
         try { text = JSON.stringify(frame); } catch { text = null; }
         if (native.reservedText(text)) { why = text === null ? 'refusal-input' : 'reserved-text'; frame = null; }
+        else if (native.frameTooLarge(text)) { why = 'frame-size'; frame = null; }
       }
       if (frame) {
         // The start of the rounds' preparation that only waits (as below): the route pre-load is used or let go here,
