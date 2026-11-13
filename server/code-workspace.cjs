@@ -104,6 +104,7 @@ function hostileReason(tree, run, env) {
   const hooks = path.join(gitDir, 'hooks');
   let names = [];
   try { names = fs.readdirSync(hooks); } catch { /* no hooks directory is fine */ }
+  // Advisory only: every git call here also runs with core.hooksPath=/dev/null (HOSTILE_OFF).
   for (const name of names) {
     if (name.endsWith('.sample')) continue;
     try {
@@ -135,6 +136,8 @@ function hostileReason(tree, run, env) {
   };
   walk(Buffer.from(tree), '', 0);
   if (problem) return problem;
+  // Attributes only name drivers, and every driver lives in configuration refused above (and the
+  // global attributes file is /dev/null), so this is a second line, not the only one.
   for (const file of attrFiles) {
     let body;
     try { body = fs.readFileSync(file, 'utf8'); } catch { continue; }
@@ -827,7 +830,10 @@ function createCodeWorkspaces({ dir, treeRoot = null, owner = null, run = defaul
 function defaultChown(target, uid, gid, { seal = false } = {}) {
   requireProc();
   const { O_RDONLY, O_NOFOLLOW, O_NONBLOCK } = fs.constants;
-  const strip = (mode) => mode & 0o7755;
+  // Group and other write go, and so do setuid, setgid and sticky: the kernel clears setuid and
+  // setgid on chown, and putting them back on a file that is now noevia's would make a root-owned
+  // setuid program out of whatever the harness wrote.
+  const strip = (mode) => mode & 0o0755;
   const walk = (fd, shown, depth) => {
     if (depth > 256) throw Error(`${shown} is nested too deeply to hand over`);
     const take = () => { fs.fchownSync(fd, uid, gid); if (seal) fs.fchmodSync(fd, strip(fs.fstatSync(fd).mode)); };

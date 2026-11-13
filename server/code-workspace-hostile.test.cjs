@@ -266,6 +266,18 @@ test('#2529: taking a tree back seals it: owned by noevia, and no group or other
   assert.equal(fs.statSync(path.join(tree, 'src')).mode & 0o777, 0o775);
 });
 
+test('#2529: taking a tree back never leaves a setuid or setgid file or directory behind', () => {
+  // The kernel clears setuid/setgid on chown; the seal must not put them back on what is then
+  // noevia's (review finding: a root-owned setuid program made of the harness's bytes).
+  const tree = temp('noevia-qa-tree-');
+  const payload = path.join(tree, 'payload'), dir = path.join(tree, 'shared');
+  fs.writeFileSync(payload, '#!/bin/sh\n'); fs.chmodSync(payload, 0o6755);
+  fs.mkdirSync(dir); fs.chmodSync(dir, 0o3777);
+  defaultChown(tree, process.getuid(), process.getgid(), { seal: true });
+  assert.equal(fs.statSync(payload).mode & 0o7777, 0o755);
+  assert.equal(fs.statSync(dir).mode & 0o7777, 0o755);
+});
+
 test('#2529: removing a tree never deletes through a directory swapped for a link', (t) => {
   const tree = temp('noevia-qa-tree-'), outside = temp('noevia-qa-outside-');
   fs.mkdirSync(path.join(tree, 'cache'));
