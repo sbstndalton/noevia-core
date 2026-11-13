@@ -131,4 +131,4 @@ function sanitizeHistory(history) {
   });
 }
 
-module.exports = { MAX_SOURCES, SNIPPET_MAX, STORED_PIN, STORED_FAILURE_MAX, buildSources, usedInjected, sanitizeStored, sanitizePin, sanitizeFailure, isFailedTurn, sanitizeHistory };
+module.exports = { MAX_SOURCES, SNIPPET_MAX, ATTRIBUTE_MAX, STORED_PIN, STORED_FAILURE_MAX, buildSources, usedInjected, sanitizeStored, sanitizePin, sanitizeFailure, isFailedTurn, sanitizeHistory };

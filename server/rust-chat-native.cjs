@@ -126,10 +126,31 @@ function refusal(t) {
   if (t.narrowed) return 'narrowed-tools';
   if (t.gate) return 'tool-gate';
   if (t.supervision) return 'step-supervision';
+  // An injected whole file whose name is not text (retrieval never makes one): its attribution keys on the value.
   if (t.injected) return 'injected-sources';
   if (t.editTools) return 'edit-tools';
   if (t.streamGuard) return 'stream-guard';
   return null;
+}
+
+/**
+ * #1793's attribution after the reply (chat.cjs's close: chat-sources.cjs usedInjected, then buildSources), with
+ * everything that does not depend on the answer done here: `reply` the sources the reply already showed
+ * (buildSources(placed, readable)); `injected` the injected whole files not among the placed ones, in prompt
+ * order, each with the part of its text the attribution reads (marks: the first ATTRIBUTE_MAX units of
+ * String(body || '')) and the source item buildSources would add for it, or null when its file is not readable.
+ * The executor keeps the rest: which of them the answer drew on, then reply + their items, at most MAX_SOURCES.
+ */
+function injectedSources({ injected, placed, readable, reply }) {
+  const sources = require('./chat-sources.cjs');
+  const placedList = Array.isArray(placed) ? placed : [];
+  const already = new Set(placedList.map((e) => e && e.file));
+  const out = [];
+  for (const e of Array.isArray(injected) ? injected : []) {
+    if (!e || e.kind !== 'file' || already.has(e.file)) continue;
+    out.push({ file: e.file, text: String(e.body || '').slice(0, sources.ATTRIBUTE_MAX), item: sources.buildSources([e], readable)[0] || null });
+  }
+  return { reply: Array.isArray(reply) ? reply : [], injected: out };
 }
 
 /** The `prepared` frame: everything the native executor needs from here on. No provider key is in it. */
@@ -157,6 +178,7 @@ function preparedTurn(t) {
     turn: {
       message: t.message, spaceId: t.spaceId || null, projectId: t.projectId || null,
       declineEndsReply: t.declineEndsReply === true, record: t.record === true, streamIdleMs: t.streamIdleMs,
+      sources: t.sources || { reply: [], injected: [] },
     },
   };
 }
@@ -353,4 +375,4 @@ function createToolBridge({ secret, json, readJson, asUser, getProject, executeT
   };
 }
 
-module.exports = { HANDOFF_HEADER, PREPARED_VERSION, EXECUTE_PATH, TARGET_PATH, USAGE_PATH, PREFILL_PATH, NATIVE_PREFIX, CHAT_BODY_CAP, createHandoff, refusal, preparedTurn, createAsUser, createToolBridge };
+module.exports = { HANDOFF_HEADER, PREPARED_VERSION, EXECUTE_PATH, TARGET_PATH, USAGE_PATH, PREFILL_PATH, NATIVE_PREFIX, CHAT_BODY_CAP, createHandoff, refusal, injectedSources, preparedTurn, createAsUser, createToolBridge };

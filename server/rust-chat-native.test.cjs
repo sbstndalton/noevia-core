@@ -106,11 +106,45 @@ test('a turn the native executor can run ends after its preparation with the pre
   assert.equal(JSON.stringify(last).includes('apiKey'), false);
   assert.ok(last.writes.includes('drive_trash_file') && !last.writes.includes('drive_read_file'));
   assert.deepEqual(last.chat.title, { chatId: 'qa-chat-1', listId: 'qa-project', firstMessage: 'QA hello', firstReply: true, enabled: false });
-  assert.deepEqual(last.turn, { message: 'QA hello', spaceId: null, projectId: 'qa-project', declineEndsReply: true, record: true, streamIdleMs: 120000 });
+  assert.deepEqual(last.turn, { message: 'QA hello', spaceId: null, projectId: 'qa-project', declineEndsReply: true, record: true, streamIdleMs: 120000,
+    sources: { reply: [], injected: [] } });
   assert.equal(last.chat.grantScope, 'project:qa-project');
   assert.ok(Number.isFinite(last.startedAt) && last.startedAt <= Date.now());
   assert.equal(last.managerEnabled, true);
   assert.equal(last.modelLease, false, 'this test manager grants no lease');
+});
+
+test('a turn with injected knowledge files hands off with what the attribution after the reply needs (#1793)', async (t) => {
+  const files = [{ name: 'qa-notes.txt', content: 'QA ORCHID-42 notes', attachment: { id: 'qa-att-1' } }, { name: 'qa-placed.txt', content: 'QA placed' },
+    { name: 'qa-unread.txt', content: '', document: { state: 'failed' } }];
+  const placed = [{ file: 'qa-placed.txt', body: '[Page 3]\nQA placed text', kind: 'excerpt', score: 0.51234 }];
+  const injected = [{ file: 'qa-placed.txt', body: 'QA placed text', kind: 'file' }, { file: 'qa-notes.txt', body: 'QA ORCHID-42 notes', kind: 'file' },
+    { file: 'qa-unread.txt', body: 'QA unread', kind: 'file' }, { file: 'qa-notes.txt', body: 'QA excerpt', kind: 'excerpt' }, { file: 'qa-notes.txt', body: null, kind: 'file' }];
+  const rag = { filesContext: async (_id, _readable, _q, _u, onPlaced) => { onPlaced(placed, injected); return 'QA files block'; } };
+  const handed = await runTurn(t, { requested: true, frames: answer, project: { files }, deps: { rag } });
+  const last = handed.events[handed.events.length - 1];
+  assert.equal(last.type, 'prepared', 'injected sources no longer keep the turn in Node');
+  const sources = require('./chat-sources.cjs');
+  assert.deepEqual(last.turn.sources.reply, sources.buildSources(placed, files));
+  assert.equal(last.turn.sources.reply[0].page, 3);
+  assert.deepEqual(last.turn.sources.injected, [
+    { file: 'qa-notes.txt', text: 'QA ORCHID-42 notes', item: sources.buildSources([injected[1]], files)[0] },
+    { file: 'qa-unread.txt', text: 'QA unread', item: null },
+    { file: 'qa-notes.txt', text: '', item: sources.buildSources([injected[4]], files)[0] },
+  ]);
+  // The reply's first `sources` event went out before the cut, as without the hand-off.
+  assert.deepEqual(handed.events.find((e) => e.type === 'sources')?.sources, last.turn.sources.reply);
+});
+
+test('injectedSources keeps the part of a file the attribution reads, and refuses a name that is not text', () => {
+  const long = 'é'.repeat(30000) + '😀';
+  const out = native.injectedSources({ injected: [{ file: 'qa-a.txt', body: long, kind: 'file' }], placed: [], readable: [{ name: 'qa-a.txt', content: 'x' }], reply: [] });
+  assert.equal(out.injected[0].text.length, require('./chat-sources.cjs').ATTRIBUTE_MAX);
+  assert.deepEqual(native.injectedSources({}), { reply: [], injected: [] });
+  const base = { chatIdNotText: false, deleted: false, diary: false, compactOnly: false, providerId: 'default', defaultProviderId: 'default', machine: false, external: false,
+    chatgpt: false, routeTarget: false, authorized: false, images: false, messages: [], skills: false, provenance: false, framingReasoner: false, narrowed: false, gate: false,
+    supervision: false, injected: false, editTools: false };
+  assert.equal(native.refusal(base), null);
 });
 
 test('the prepared frame says the front holds the model lease and runs the title, and Node takes no lease of its own', async (t) => {

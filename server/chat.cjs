@@ -1697,7 +1697,8 @@ function createChatHandler({
           skills: loadedSkills.size > 0 || (!!project && instructionSkills.list(project).length > 0),
           provenance: provenanceOn, framingReasoner: !!(framingReasoner && chatFrame),
           narrowed: !!routing.narrowed, gate: !!(gate && gate.decision !== 'none'),
-          supervision: nativeHandoff.supervising(), injected: injectedEntries.length > 0,
+          supervision: nativeHandoff.supervising(),
+          injected: injectedEntries.some((e) => e && e.kind === 'file' && typeof e.file !== 'string'),
           editTools: activeTools.some((t) => projectEditTool(t.function?.name) || specialistPageSave.neverStanding(t.function?.name)),
           // #516: the stream guard's schema check runs before every call (egressToolRefusal) once it is on; the executor
           // does not run it yet. It answers for a call that cannot parse only when it is on and the tool has a schema.
@@ -1736,6 +1737,7 @@ function createChatHandler({
           title: { chatId: typeof body.chatId === 'string' ? body.chatId : '', listId: body.projectId && project ? project.id : null,
             firstMessage: chatTitleLib.firstUserMessage(history, message), firstReply: chatTitleLib.firstReply(history), enabled: !!chatTitles },
           message, spaceId, projectId: project?.id, declineEndsReply: !spaceId?.startsWith('diary'), record: !!record, streamIdleMs,
+          sources: native.injectedSources({ injected: injectedEntries, placed: placedEntries, readable: readableFiles, reply: replySources }),
         }));
         res.end();
         return;
