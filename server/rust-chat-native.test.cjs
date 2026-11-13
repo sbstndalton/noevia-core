@@ -277,6 +277,41 @@ function bridge(overrides = {}) {
   return { call, calls };
 }
 
+test('the busy bridge counts what the asking turn holds; a bad count is one', async () => {
+  const seen = [];
+  const { call } = bridge({ modelManager: { enabled: true, inferenceBusy: (n) => { seen.push(n); return n < 2; } } });
+  const p = `${native.NATIVE_PREFIX}busy`;
+  assert.deepEqual((await call(p, { user: 'qa-user', own: 2 })).body, { busy: false });
+  for (const own of [0, 9, 1.5, '2', null]) assert.deepEqual((await call(p, { user: 'qa-user', own })).body, { busy: true });
+  assert.deepEqual(seen, [2, 1, 1, 1, 1, 1]);
+});
+
+test('the abort bridge aborts the running calls of an exchange, which still answer', async () => {
+  const started = [];
+  const { call } = bridge({
+    executeToolCall: async (project, name, args, allowed, signal) => {
+      started.push(name);
+      await new Promise((resolve) => (signal.aborted ? resolve() : signal.addEventListener('abort', resolve, { once: true })));
+      return `QA ${name} stopped`;
+    },
+  });
+  const body = { user: 'qa-user', projectId: 'qa-project', name: 'drive_read_file', args: '{}', allowed: ['drive_read_file'], routes: [], chatKey: 'qa-chat-1', exchangeKey: 'qa-x' };
+  const running = call(native.EXECUTE_PATH, body);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(started, ['drive_read_file']);
+  // Another user's or another exchange's abort reaches nothing.
+  assert.equal((await call(native.ABORT_PATH, { user: 'qa-other', exchangeKey: 'qa-x' })).status, 204);
+  assert.equal((await call(native.ABORT_PATH, { user: 'qa-user', exchangeKey: 'qa-y' })).status, 204);
+  let done = false;
+  running.then(() => { done = true; });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(done, false);
+  assert.equal((await call(native.ABORT_PATH, { user: 'qa-user', exchangeKey: 'qa-x' })).status, 204);
+  assert.deepEqual((await running).body, { text: 'QA drive_read_file stopped', failed: false });
+  assert.equal((await call(native.ABORT_PATH, { user: 'qa-user' })).status, 400);
+  assert.equal((await call(native.ABORT_PATH, { user: 'qa-user', exchangeKey: 'qa-x' }, { trusted: false })).status, 404);
+});
+
 test('the execute bridge runs one call as the user and says whether it failed', async () => {
   const { call, calls } = bridge();
   const body = { user: 'qa-user', projectId: 'qa-project', name: 'drive_read_file', args: '{"fileId":"qa"}', allowed: ['drive_read_file'], routes: [['qa_mcp', 'qa-server']], chatKey: 'qa-chat-1', exchangeKey: 'qa-x' };

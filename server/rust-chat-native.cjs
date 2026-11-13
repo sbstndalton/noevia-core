@@ -23,6 +23,10 @@
 //                                        user, counted as chat.cjs counts it (recordToolUse)
 //   POST /internal/chat/tools/target   {user, name, args, chatKey}
 //        -> 200 {target, kind} | {error} | {}   what a write would change (writeTargetFor, #659), before its card
+//   POST /internal/chat/tools/abort    {user, exchangeKey}
+//        -> 204                          aborts the signal of every execute call of that exchange still running (the
+//                                        native turn's client left: chat.cjs's tools get the turn's signal then); each
+//                                        call still answers with what its tool returned
 //   POST /internal/chat/usage          {user, model, reported}
 //        -> 204                          the reply's token use, recorded by usage.cjs (recordUsage) as the user:
 //                                        this process stays the one writer of the account's usage file
@@ -37,7 +41,9 @@
 //        goes away.
 //   POST /internal/chat/native/tools-allowed     {user, model}         -> 200 {allowed}    the template tools gate
 //   POST /internal/chat/native/tools-unsupported {user, model}         -> 204              its markUnsupported (#1015)
-//   POST /internal/chat/native/busy              {user}                -> 200 {busy}       modelManager.inferenceBusy(1)
+//   POST /internal/chat/native/busy              {user, own}           -> 200 {busy}       modelManager.inferenceBusy(own)
+//        `own`: the counts the asking turn holds in this process's gate (1..8, default 1). chat.cjs's turn holds one;
+//        a native turn holds the route's admission lease and, while it lasts, the model's lease.
 //   POST /internal/chat/native/title-auto-named  {user, listId, chatId, firstMessage} -> 200 {autoNamed}
 //   POST /internal/chat/native/title-save        {user, listId, chatId, title, firstMessage} -> 204
 //        the facts the turn reads of the local model manager, the engine's template and the chat lists, through
@@ -74,6 +80,7 @@ const HANDOFF_HEADER = 'x-noevia-chat-handoff';
 const PREPARED_VERSION = 1;
 const EXECUTE_PATH = '/internal/chat/tools/execute';
 const TARGET_PATH = '/internal/chat/tools/target';
+const ABORT_PATH = '/internal/chat/tools/abort';
 const USAGE_PATH = '/internal/chat/usage';
 const PREFILL_PATH = '/internal/chat/prefill';
 const NATIVE_PREFIX = '/internal/chat/native/';
@@ -225,8 +232,9 @@ function createAsUser({ userRow, runAs, currentWorkspace }) {
 function createToolBridge({ secret, json, readJson, asUser, getProject, executeToolCall, writeTargetFor, recordToolUse, currentWorkspace, currentUser,
   recordUsage = () => {}, recordSample = () => {}, modelManager = null, templateToolsGate = null, chatTitles = null, chatBodyCap = CHAT_BODY_CAP,
   log = (line) => console.warn(line) }) {
-  const callerGone = (req, res) => {
-    const controller = new AbortController();
+  // Execute calls in progress by `${user}\u0000${exchangeKey}`: the abort bridge aborts their signals.
+  const running = new Map();
+  const callerGone = (req, res, controller = new AbortController()) => {
     const gone = () => { if (!res.writableEnded) controller.abort(); };
     req.once('close', () => { if (req.destroyed && !req.complete) gone(); });
     res.once('close', gone);
@@ -279,7 +287,8 @@ function createToolBridge({ secret, json, readJson, asUser, getProject, executeT
     }
     if (op === 'busy') {
       let busy = false;
-      try { busy = typeof modelManager?.inferenceBusy === 'function' && modelManager.inferenceBusy(1) === true; } catch { busy = false; }
+      const own = Number.isSafeInteger(body?.own) && body.own >= 1 && body.own <= 8 ? body.own : 1;
+      try { busy = typeof modelManager?.inferenceBusy === 'function' && modelManager.inferenceBusy(own) === true; } catch { busy = false; }
       return json(res, 200, { busy });
     }
     const chat = text(body?.chatId, CHAT_ID_CAP), first = text(body?.firstMessage, chatBodyCap);
@@ -298,7 +307,7 @@ function createToolBridge({ secret, json, readJson, asUser, getProject, executeT
   return async function handle(req, res) {
     const path = String(req.url || '').split('?')[0];
     const op = path.startsWith(NATIVE_PREFIX) ? path.slice(NATIVE_PREFIX.length) : null;
-    if (path !== EXECUTE_PATH && path !== TARGET_PATH && path !== USAGE_PATH && path !== PREFILL_PATH && !NATIVE_OPS.has(op)) return false;
+    if (path !== EXECUTE_PATH && path !== TARGET_PATH && path !== ABORT_PATH && path !== USAGE_PATH && path !== PREFILL_PATH && !NATIVE_OPS.has(op)) return false;
     if (!trustedFront(req, secret) || req.method !== 'POST') { json(res, 404, { error: 'Not found' }); return true; }
     let body;
     // A title bridge carries the chat's first message, which may be as long as a chat request.
@@ -314,6 +323,12 @@ function createToolBridge({ secret, json, readJson, asUser, getProject, executeT
         json(res, 500, { error: 'the fact could not be read' });
       }
       return true;
+    }
+    if (path === ABORT_PATH) {
+      const who = text(body?.user, USER_CAP), key = text(body?.exchangeKey, 200);
+      if (!who || !key) { json(res, 400, { error: 'user and exchangeKey are required.' }); return true; }
+      for (const controller of running.get(`${who}\u0000${key}`) || []) controller.abort();
+      noContent(res); return true;
     }
     if (path === PREFILL_PATH) {
       const who = text(body?.user, USER_CAP), model = modelName(body?.model), prompt = body?.promptTokens, ms = body?.firstTokenMs;
@@ -364,15 +379,24 @@ function createToolBridge({ secret, json, readJson, asUser, getProject, executeT
       const projectId = typeof body.projectId === 'string' && body.projectId ? text(body.projectId, 200) : null;
       const exchangeKey = typeof body.exchangeKey === 'string' ? text(body.exchangeKey, 200) : null;
       if ((body.projectId && !projectId) || (body.exchangeKey && !exchangeKey)) { json(res, 400, { error: 'projectId or exchangeKey is invalid.' }); return true; }
-      const signal = callerGone(req, res);
-      const ran = await asUser(user, async () => {
-        const project = projectId ? getProject(projectId) : null;
-        if (projectId && !project) return null;
-        const outcome = { failed: false };
-        const out = await executeToolCall(project, name, args, allowed, signal, outcome, { chatKey, exchangeKey, routes });
-        recordToolUse(currentWorkspace(), name);
-        return { text: String(out ?? ''), failed: outcome.failed === true };
-      });
+      const controller = new AbortController();
+      const signal = callerGone(req, res, controller);
+      const runKey = exchangeKey ? `${user}\u0000${exchangeKey}` : null;
+      if (runKey) { if (!running.has(runKey)) running.set(runKey, new Set()); running.get(runKey).add(controller); }
+      let ran;
+      try {
+        ran = await asUser(user, async () => {
+          const project = projectId ? getProject(projectId) : null;
+          if (projectId && !project) return null;
+          const outcome = { failed: false };
+          const out = await executeToolCall(project, name, args, allowed, signal, outcome, { chatKey, exchangeKey, routes });
+          recordToolUse(currentWorkspace(), name);
+          return { text: String(out ?? ''), failed: outcome.failed === true };
+        });
+      } finally {
+        const set = runKey && running.get(runKey);
+        if (set) { set.delete(controller); if (!set.size) running.delete(runKey); }
+      }
       if (!ran) { json(res, 404, { error: 'no such project' }); return true; }
       json(res, 200, ran);
     } catch (error) {
@@ -384,4 +408,4 @@ function createToolBridge({ secret, json, readJson, asUser, getProject, executeT
   };
 }
 
-module.exports = { HANDOFF_HEADER, PREPARED_VERSION, EXECUTE_PATH, TARGET_PATH, USAGE_PATH, PREFILL_PATH, NATIVE_PREFIX, CHAT_BODY_CAP, createHandoff, refusal, reservedText, injectedSources, preparedTurn, createAsUser, createToolBridge };
+module.exports = { HANDOFF_HEADER, PREPARED_VERSION, EXECUTE_PATH, TARGET_PATH, ABORT_PATH, USAGE_PATH, PREFILL_PATH, NATIVE_PREFIX, CHAT_BODY_CAP, createHandoff, refusal, reservedText, injectedSources, preparedTurn, createAsUser, createToolBridge };
