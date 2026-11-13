@@ -388,6 +388,7 @@ const modelService = require('./models.cjs').createModelService({
   fetchJson, env: process.env, modelManager, currentWorkspace,
   roleOnMachine: (role) => !!chatMachines.target(role),
   autoRolesWriter: (user, name) => PROJECT_STORE.clearAutoRoles(user, name),
+  modelStateWriter: (name) => PROJECT_STORE.forgetModelState(name),
 });
 const { autoRoles, ensureRolesLoaded, servedCatalogue, modelsInstalled, lastLoadedModel } = modelService;
 
@@ -449,6 +450,7 @@ const {
   // A directory server the Rust front added (or removed) meanwhile is rediscovered in the background and shows from
   // the next look; otherwise the look asks the front, at most every few seconds, whether discovery moved
   // (discovery itself is the front's, mcp_discovery_actor.rs).
+  specialistTools: require('./specialist-page-save.cjs').createPageSave({ store: PROJECT_STORE }), // #2446 slice 4b
   mcpBoxes: () => { if (mcpWiring.refreshDirectory()) discoverMcpTools(true).catch(() => undefined); else mcpWiring.refreshSoon(); return mcpState.boxes; },
   mcpTools: () => mcpState.tools,
   offered: (id) => toolboxOffered(id),
@@ -689,8 +691,14 @@ const budgetWatchBridge = require('./rust-budget-watch.cjs').createBudgetWatchBr
 });
 
 // ── Deep research (#2218): the Rust front's (rust-research.cjs); what its jobs still need from this process ──
+// Port contract row H: the front issues every admission lease; this process latches its own holds for them only
+// while it has a session with the front's authority (fails closed without one).
+const inferenceAdmissionSession = require('./inference-admission-lease.cjs').createAuthoritySession({
+  port: Number(process.env.NOEVIA_PROJECT_STORE_PORT), token: FRONT_SECRET,
+});
+inferenceAdmissionSession.start();
 const inferenceAdmission = require('./inference-admission-lease.cjs').createAdmissionRoutes({
-  secret: FRONT_SECRET, modelManager, admitEngineModel, chatMachines, json, readJson,
+  secret: FRONT_SECRET, modelManager, admitEngineModel, chatMachines, json, readJson, authority: inferenceAdmissionSession,
   // The front's Diary local exchange (rust-diary-local-exchange.cjs): the backfill's pause. Its share of the `llm:`
   // budget is counted by the front (chat port S6, rust-chat-edge.cjs), so the lease charges nothing here.
   diaryExchange: { foreground: () => rag.foreground() },
@@ -1219,11 +1227,13 @@ const autoRolesWriteBridge = require('./rust-auto-roles-write.cjs').createBridge
   secret: FRONT_SECRET, json, readJson, service: modelService,
   asUser: diaryAsUser, user: id => authService.db.prepare('SELECT role FROM users WHERE id=?').get(id),
 });
+const modelStateBridge = require('./rust-model-state-bridge.cjs').createBridge({ secret: FRONT_SECRET, json, readJson, service: modelService });
 async function handleRequestInner(req, res) {
   // The ownership refusals below answer before handleRequestScoped; they carry the same headers.
   publicHeaders(res);
   if (require('./rust-auto-roles-write.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   if (await autoRolesWriteBridge(req, res)) return;
+  if (await modelStateBridge(req, res)) return;
   if (require('./rust-tool-approvals.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   if (require('./rust-idle-unload-read.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   if (await idleUnloadFacts(req, res)) return;

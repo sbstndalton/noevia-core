@@ -9,6 +9,7 @@ const CHAT_MOVE_ENFORCEMENT_MARKER = 'noevia-chat-move-enforcement/1';
 const { isChatGenerationModel } = require('./chat-model-kind.cjs');
 const { isInAppBox } = require('./toolbox-flags.cjs');
 const editTargets = require('./project-edit-target.cjs');
+const specialistPageSave = require('./specialist-page-save.cjs');
 const { readCappedText, readCappedJson, discardBody } = require('./http.cjs');
 // A provider's error body is only shown as a short message; a summary reply is a few KB of JSON.
 // Both are capped so a provider streaming an endless body cannot be buffered whole (#903).
@@ -258,7 +259,7 @@ async function* withIdleLimit(iterable, ms, onIdle = null) {
 }
 
 function createChatHandler({
-  stepSupervision = null, chatMachines = null, fs, path, crypto, fetch, codeTasksFor = () => [], heuristicWantsCode = require('./auto-router.cjs').createAutoRouter({}).heuristicWantsCode, reasoningEffort, diaryExtras, createToolExchange, rag, prefill, reduceToolResult, HISTORY_CAP, DEFAULT_PROVIDER_ID, DIARY_BASE, TOOL_RESULT_CAP, authService, toolPolicy, modelManager, requestScope, currentWorkspace, json, getProject, getProvider, providerHeaders, saveChats, endpointApproved, diaryHeaders, diaryStorageRetry = (send) => send(true), autoRoles, lastLoadedModel, classifyFastOrSmart, servedCatalogue, modelsInstalled, missingRoles, staleRolesError, visionProbe, visionDescriptions, skillsIndexFor, chatSkillRouter, chatToolRouter, toolGate = null, chatFramingEnabled = () => false, freeChats = () => [], framingReasoner = null, reasoningTraces = null, brainContext = null, DEFAULT_TOOLBOXES, CONNECTOR_BOXES, connectedBoxes, allToolboxes, resolveTools, isWriteTool, executeToolCall, oauthServerIds, accountReady, chatWideApproved, redeemChatGrant = null, awaitApproval, openApproval = async () => true, recordUsage, recordToolUse, chatListHolder = () => undefined, revokeChatGrant = () => {}, grantContext = (chat) => currentWorkspace().chatPermissions.context(chat),
+  stepSupervision = null, chatMachines = null, fs, path, crypto, fetch, codeTasksFor = () => [], heuristicWantsCode = require('./auto-router.cjs').createAutoRouter({}).heuristicWantsCode, reasoningEffort, diaryExtras, createToolExchange, rag, prefill, reduceToolResult, HISTORY_CAP, DEFAULT_PROVIDER_ID, DIARY_BASE, TOOL_RESULT_CAP, authService, toolPolicy, modelManager, requestScope, currentWorkspace, json, getProject, getProvider, providerHeaders, saveChats, endpointApproved, diaryHeaders, diaryStorageRetry = (send) => send(true), autoRoles, lastLoadedModel, classifyFastOrSmart, servedCatalogue, modelsInstalled, missingRoles, staleRolesError, visionProbe, visionDescriptions, skillsIndexFor, chatSkillRouter, chatToolRouter, toolGate = null, chatFramingEnabled = () => false, freeChats = () => [], framingReasoner = null, reasoningTraces = null, brainContext = null, DEFAULT_TOOLBOXES, CONNECTOR_BOXES, connectedBoxes, allToolboxes, resolveTools, isWriteTool: injectedIsWriteTool, executeToolCall, oauthServerIds, accountReady, chatWideApproved, redeemChatGrant = null, awaitApproval, openApproval = async () => true, recordUsage, recordToolUse, chatListHolder = () => undefined, revokeChatGrant = () => {}, grantContext = (chat) => currentWorkspace().chatPermissions.context(chat),
   // #1550: per request, whether a box Automatic may add is usable by this account (its Nextcloud connection, for one).
   automaticToolsReady = () => () => true,
   chatgptOAuth = null, chatgptEnabled = () => false, skillHistory = null,
@@ -302,6 +303,13 @@ function createChatHandler({
   multimodalEnabled = () => require('./multimodal-rag.cjs').enabled(),
   documentDir = (workspace, projectId) => require('./document-sources.cjs').directory(workspace, projectId),
 }) {
+  // #2446: the coworker page save is always a write here and always asked about, whatever the injected
+  // classifier or the account's policy says (an `allow` answer becomes `ask`; `block` stays `block`).
+  const isWriteTool = (name) => specialistPageSave.neverStanding(name) || injectedIsWriteTool(name);
+  const policyMode = (userId, name) => {
+    const mode = toolPolicy.mode(userId, name, isWriteTool(name));
+    return mode === 'allow' && specialistPageSave.neverStanding(name) ? 'ask' : mode;
+  };
   const jsonOut = json;
   // #1863: a project that shares Code context into chat, or holds Code tasks (read defensively: never fails a turn).
   const codeProject = (project) => {
@@ -1200,7 +1208,7 @@ function createChatHandler({
           isWriteTool, ready: automaticToolsReady(chatUser), privateData: true }).filter(toolModes.isPrivateDataBox);
       }
       if (!wanted.length && toolGate && carriedIds.some(toolModes.isPrivateDataBox)) {
-        const everything = resolveTools({ ...project, toolsMode: 'manual', toolboxes: carriedIds }, model, (name) => toolPolicy.mode(chatUser?.id, name, isWriteTool(name)) === 'block');
+        const everything = resolveTools({ ...project, toolsMode: 'manual', toolboxes: carriedIds }, model, (name) => policyMode(chatUser?.id, name) === 'block');
         const wouldUse = await toolGate.evaluate(message, everything.tools, ...(chatFrame ? [steering.gateBias(chatFrame)] : []));
         if (wouldUse && wouldUse.decision !== 'none' && isPrivateTool(wouldUse.decision.tool)) wanted = [wouldUse.decision.tool];
       }
@@ -1299,7 +1307,7 @@ function createChatHandler({
     }
     if (routing.routed) console.log(`[tools] routed ${selectedBoxes.length} toolboxes to ${routing.ids.join(', ')}`);
     // A tool the account blocked is never offered, so the model cannot even ask for it.
-    const blocked = (name) => toolPolicy.mode(chatUser?.id, name, isWriteTool(name)) === 'block' || (cloudUngranted() && toolModes.PRIVATE_CORE_TOOLS.has(name));
+    const blocked = (name) => policyMode(chatUser?.id, name) === 'block' || (cloudUngranted() && toolModes.PRIVATE_CORE_TOOLS.has(name));
     // The ids are already this request's selection (Automatic included), so resolve exactly them: resolveTools reads
     // an Automatic project's list as the default set and would otherwise drop connectors, turn boxes and additions.
     const asSelection = (ids) => ({ ...project, toolsMode: 'manual', toolboxes: ids });
@@ -1696,7 +1704,9 @@ function createChatHandler({
       const workspaceUserId = requestScope.getStore()?.workspace?.userId || null;
       if (!userId || (workspaceUserId && workspaceUserId !== userId)) return null;
       if (revokedSkills()) return null;
-      if (chatSignal.signal.aborted || toolPolicy.mode(userId, tool, isWriteTool(tool)) !== 'allow') return null;
+      // #2446: the coworker page save is never pre-run; only its approval card runs it.
+      if (specialistPageSave.neverStanding(tool)) return null;
+      if (chatSignal.signal.aborted || policyMode(userId, tool) !== 'allow') return null;
       if (egressToolRefusal(chatUser?.id || userId, tool, JSON.stringify(args))) return null;
       const call = { id: `gate-${crypto.randomUUID()}`, name: tool, args: JSON.stringify(args) };
       const index = toolOffset;
@@ -2310,7 +2320,7 @@ function createChatHandler({
               authService.audit('tool.denied', userId, userId, { tool: tc.name, reason: 'external-provider-diary' });
               return refusedForEgress;
             }
-            const permission = toolPolicy.mode(userId, tc.name, isWriteTool(tc.name));
+            const permission = policyMode(userId, tc.name);
             if (permission === 'block') {
               authService.audit('tool.denied', userId, userId, { tool: tc.name, reason: 'blocked' });
               return `ERROR: ${tc.name} is blocked in this account's settings, so it was not run. Do not retry it; tell the user they can change it in Settings → Connectors.`;
@@ -2368,7 +2378,8 @@ function createChatHandler({
               } catch {
                 return 'ERROR: the chat permission context could not be verified; the tool was not run. Nothing was changed. Ask again.';
               }
-              usedGrant = await chatWideApproved(userId, grantChat, writeGrantScope, permissionBinding);
+              // #2446: the coworker page save is asked about every time; "Allow for this chat" never covers it.
+              usedGrant = !specialistPageSave.neverStanding(tc.name) && await chatWideApproved(userId, grantChat, writeGrantScope, permissionBinding);
             }
             const askedPerCall = permission === 'ask' && (!usedGrant || provenanceHits.length > 0 || automaticOnlyWrites.has(tc.name));
             if (askedPerCall) {
@@ -2396,9 +2407,10 @@ function createChatHandler({
                 // The MCP server this call goes to (#865), so the card can say where it really runs.
                 ...(toolRoutes.has(tc.name) ? { server: toolRoutes.get(tc.name) } : {}),
                 ...(repeat ? { repeatOf: true } : {}),
+                ...(specialistPageSave.neverStanding(tc.name) ? { once: true } : {}),
                 ...(provenanceHits.length ? { provenance: provenanceHits } : {}),
               });
-              const decision = await awaitApproval({ id: approvalId, userId, chatId: grantChat, scope: writeGrantScope, binding: permissionBinding, abortSignal: chatSignal.signal });
+              const decision = await awaitApproval({ id: approvalId, userId, chatId: grantChat, scope: writeGrantScope, binding: permissionBinding, abortSignal: chatSignal.signal, once: specialistPageSave.neverStanding(tc.name) });
               if (decision !== 'approve') {
                 // A refusal is a normal conversational turn: the model is told
                 // plainly so it can offer an alternative, rather than the stream
@@ -2425,7 +2437,7 @@ function createChatHandler({
             // Settings may change while the approval card is pending. The mode at
             // dispatch, rather than the mode when the question was asked, controls
             // whether this call can run.
-            if (toolPolicy.mode(userId, tc.name, isWriteTool(tc.name)) === 'block') {
+            if (policyMode(userId, tc.name) === 'block') {
               authService.audit('tool.denied', userId, userId, { tool: tc.name, reason: 'blocked' });
               return `ERROR: ${tc.name} is blocked in this account's settings, so it was not run. Do not retry it; tell the user they can change it in Settings → Connectors.`;
             }
@@ -2497,7 +2509,7 @@ function createChatHandler({
               }
             }
             if (chatSignal.signal.aborted) { dispatchFence?.started(); return 'ERROR: exchange cancelled; tool was not run.'; }
-            if (toolPolicy.mode(userId, tc.name, isWriteTool(tc.name)) === 'block' || (permission !== 'ask' && toolPolicy.mode(userId, tc.name, isWriteTool(tc.name)) === 'ask') || revokedSkills()) { dispatchFence?.started(); return 'ERROR: permission changed before dispatch; tool was not run.'; }
+            if (policyMode(userId, tc.name) === 'block' || (permission !== 'ask' && policyMode(userId, tc.name) === 'ask') || revokedSkills()) { dispatchFence?.started(); return 'ERROR: permission changed before dispatch; tool was not run.'; }
             const options = { chatKey, exchangeKey, routes: toolRoutes, writeFence: dispatchFence, ...(editTarget !== null ? { editTarget: editTargets.targetDigest(editTarget, editAccount) } : {}) };
             // Early refusal only. The executor rechecks at its actual outbound write after all awaits.
             if (dispatchFence && !dispatchFence.open()) return notChecked();

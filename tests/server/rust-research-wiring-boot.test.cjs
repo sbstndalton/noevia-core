@@ -152,8 +152,9 @@ test('a booted server answers the front\'s lease and research bridge calls, and 
   assert.ok('reason' in avail.json && 'lastLoaded' in avail.json, avail.text);
   assert.match(avail.json.reason, /web-search toolbox/, 'no search tools in this synthetic server, said plainly');
 
-  // The lease route: the front's token gets past the check (this ask is invalid, so 400/409/503, never the 404).
-  const lease = await s.front('/internal/inference-admission/lease', { not: 'a lease ask' });
+  // The lease route: the front's token gets past the check (this ask is invalid, so 400/409/410/503, never the 404).
+  const leasePath = `/internal/inference-admission/lease/${'0123456789abcdef'.repeat(2)}`;
+  const lease = await s.front(leasePath, { not: 'a lease ask' }, { method: 'PUT' });
   ran++;
   assert.notEqual(lease.status, 404, `${lease.text.slice(0, 300)}\n${s.log().slice(-800)}`);
   assert.notEqual(lease.json?.error, 'Not found');
@@ -165,7 +166,7 @@ test('a booted server answers the front\'s lease and research bridge calls, and 
   for (const [what, opts] of [['no token', { token: null }], ['a wrong token', { token: `${s.token}x` }], ['an empty token', { token: '' }],
     ['a forwarded request', { headers: { 'x-forwarded-for': '203.0.113.9' } }], ['a client-address header', { headers: { 'x-noevia-client-ip': '203.0.113.9' } }]]) {
     const a = await s.front('/internal/research/availability', { user: s.userId }, opts);
-    const b = await s.front('/internal/inference-admission/lease', { not: 'a lease ask' }, opts);
+    const b = await s.front(leasePath, { not: 'a lease ask' }, { ...opts, method: 'PUT' });
     assert.equal(a.status, 404, `${what}: bridge`);
     assert.equal(b.status, 404, `${what}: lease`);
   }

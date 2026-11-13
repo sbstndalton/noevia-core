@@ -57,7 +57,9 @@ function revokeChatGrant(userId, chatId) {
 // Ask the human. Resolves to 'approve' | 'deny', never rejects: the caller
 // turns a denial into a tool result the model can read, so a refused call is
 // a normal conversational turn rather than a broken stream.
-function awaitApproval({ id, userId, chatId, scope, binding = null, abortSignal, onDecision = () => {} }) {
+// `once`: a tool that is never approved for more than the call on the card (specialist-page-save.cjs). "approve_all"
+// then approves this one call only and stores no chat grant, whoever sends it.
+function awaitApproval({ id, userId, chatId, scope, binding = null, abortSignal, onDecision = () => {}, once = false }) {
   return new Promise((resolve) => {
     // Already stopped before the question was asked: nothing to wait for, nothing approved.
     if (abortSignal.aborted) { resolve('aborted'); return; }
@@ -85,7 +87,7 @@ function awaitApproval({ id, userId, chatId, scope, binding = null, abortSignal,
           // Without a chat id or a scope (#917) this approves this one call only; the grant has
           // nowhere safe to live, so the next write asks again.
           const key = chatApprovalKey(userId, chatId);
-          if (key && grantScope(scope) && binding?.user === userId && binding?.scope === grantScope(scope) &&
+          if (!once && key && grantScope(scope) && binding?.user === userId && binding?.scope === grantScope(scope) &&
               binding?.canonicalChatId === contexts.safeId(chatId) && binding.context?.holder?.kind !== 'absent' &&
               contexts.matches(binding, binding)) chatWideApprovals.set(key, { until: now() + CHAT_APPROVAL_TTL_MS, scope: grantScope(scope), binding });
           finish('approve');
