@@ -586,6 +586,13 @@ test('a turn offering the project edit tools hands off and names them; one offer
   assert.equal(kept.requests.length, 1, 'Node ran the turn');
   assert.ok(kept.requests[0].tools.some((tool) => tool.function.name === 'space_page_save'));
   assert.ok(logged.includes('[chat] native executor not used for this turn: page-save'));
+  // A front that runs the page save's card (#2446: asked every time, `once`) gets the turn, the tool named in onceTools.
+  const once = await runTurn(t, { requested: true, caps: ['once'], frames: answer, project: { id: 'specialist-qa' }, boxes: { specialistTools: pageSave } });
+  const frame = once.events.at(-1);
+  assert.equal(frame.type, 'prepared');
+  assert.deepEqual(frame.onceTools, ['space_page_save']);
+  assert.ok(frame.writes.includes('space_page_save'), 'the page save is always a write');
+  assert.equal('onceTools' in plain.events.at(-1), false, 'a frame without such tools has no onceTools');
 });
 
 test('the edit-target bridge resolves a project edit as the user, with its storage account and the digest the call is pinned to', async () => {
