@@ -38,7 +38,9 @@ function cleanSearchArgs(name, rawArgs) {
   if (!args || typeof args !== 'object' || Array.isArray(args) || typeof args.query !== 'string') return rawArgs;
   const query = cleanSearchQuery(args.query);
   if (query === args.query) return rawArgs;
-  return JSON.stringify({ ...args, query });
+  // #2545: arguments nested past the stack (about 5,000 levels) cannot be written back; they go on unchanged, as
+  // arguments that are not JSON do, instead of failing the turn.
+  try { return JSON.stringify({ ...args, query }); } catch { return rawArgs; }
 }
 
 module.exports = { cleanSearchQuery, cleanSearchArgs };

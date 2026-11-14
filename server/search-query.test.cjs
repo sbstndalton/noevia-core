@@ -29,3 +29,11 @@ test('#1523: only a search tool\'s string query is cleaned; other arguments and 
   assert.equal(cleanSearchArgs('tavily_search', '{"query":["a"]}'), '{"query":["a"]}', 'a non-string query is left alone');
   assert.equal(cleanSearchArgs('tavily_search', '{"query":"clean query"}'), '{"query":"clean query"}', 'an unchanged query keeps the original bytes');
 });
+
+test('#2545: arguments nested past the stack go on unchanged instead of throwing', () => {
+  const deep = (n) => `${'['.repeat(n)}1${']'.repeat(n)}`;
+  const raw = `{"query":"Search the web: QA stack","x":${deep(10000)}}`;
+  assert.equal(cleanSearchArgs('qa_web_search', raw), raw);
+  const shallow = `{"query":"Search the web: QA nested","x":${deep(50)}}`;
+  assert.notEqual(cleanSearchArgs('qa_web_search', shallow), shallow, 'a nesting that fits is still cleaned');
+});
