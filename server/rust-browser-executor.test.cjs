@@ -35,6 +35,21 @@ test('owned by the front, Browser mode is available exactly when the front has a
   assert.equal(probe({ NOEVIA_BROWSER_ENGINE: 'ws://qa-chromium.invalid:9222' }), require('./features.cjs').browserRuntimeReason());
 });
 
+test('the feature runtime\'s boot facts read the native engine when the front owns Browser mode', () => {
+  // createReadOnlyFeatures maps the exact reason texts to its boot facts and refuses any other: the switch's reason
+  // must stay one it knows (review of noevia-core#383).
+  const Database = require('better-sqlite3');
+  const { createReadOnlyFeatures } = require('./features.cjs');
+  const db = new Database(':memory:');
+  db.exec('CREATE TABLE settings(key TEXT PRIMARY KEY,value)');
+  const availability = Object.fromEntries(['stepSupervision', 'toolGate', 'systemOneRouting', 'chatFraming', 'framingReasoner'].map((n) => [n, () => null]));
+  try {
+    const boot = (env) => createReadOnlyFeatures({ db, env, availability, runtime: () => null }).bootFacts.browser;
+    assert.equal(boot({ NOEVIA_RUST_BROWSER: '1' }), 'chromium');
+    assert.equal(boot({ NOEVIA_RUST_BROWSER: '1', NOEVIA_BROWSER_ENGINE: 'ws://qa-chromium.invalid:9222' }), 'available');
+  } finally { db.close(); }
+});
+
 async function serve(handle) {
   const server = http.createServer(async (req, res) => { if (!await handle(req, res)) { res.statusCode = 599; res.end(); } });
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
