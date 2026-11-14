@@ -1711,11 +1711,14 @@ function createChatHandler({
         };
         why = native.refusal(refusalInput);
         // What more_tools would widen to (below, in the round loop): the project's whole selection, resolved now.
+        // `asked`: each name the resolution read the account's policy for (`blocked`), in order, with its answer,
+        // so the executor reads the same policies again when the model widens and sees whether one changed.
         if (!why && routing.narrowed) {
-          const full = resolveTools(asSelection(selectedBoxes), model, blocked, ...measuredOn());
+          const asked = [];
+          const full = resolveTools(asSelection(selectedBoxes), model, (n) => { const b = blocked(n) === true; asked.push([n, isWriteTool(n) === true, b]); return b; }, ...measuredOn());
           const fullNames = full.tools.map((t) => t.function?.name).filter((n) => typeof n === 'string');
           widen = { tools: full.tools, routes: [...(full.routes || [])], writes: fullNames.filter((n) => isWriteTool(n)), public: fullNames.filter((n) => isPublicTool(n)),
-            editTools: fullNames.filter((n) => projectEditTool(n)), onceTools: fullNames.filter((n) => specialistPageSave.neverStanding(n)) };
+            editTools: fullNames.filter((n) => projectEditTool(n)), onceTools: fullNames.filter((n) => specialistPageSave.neverStanding(n)), asked };
         }
       } catch (error) {
         why = 'refusal-input';

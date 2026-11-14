@@ -336,7 +336,10 @@ function preparedTurn(t) {
     // tools, their MCP routes, and which of them are writes, public, project edits or once-only, as for `tools`.
     ...(t.widen && typeof t.widen === 'object' ? { widen: {
       tools: t.widen.tools, routes: t.widen.routes, writes: t.widen.writes, public: t.widen.public,
-      editTools: t.widen.editTools, onceTools: t.widen.onceTools } } : {}),
+      editTools: t.widen.editTools, onceTools: t.widen.onceTools,
+      // [name, write, blocked]: the policy reads the resolution made (chat.cjs `blocked`), in order; the executor
+      // makes the same reads when it widens.
+      asked: t.widen.asked } } : {}),
     routeNote: t.routeNote || '', templateGate: t.templateGate === true,
     // The local model manager answers health and load (resolveRuntimeLimit), and grants the model's lease.
     managerEnabled: t.managerEnabled === true, modelLease: t.modelLease === true,

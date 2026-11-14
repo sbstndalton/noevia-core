@@ -385,7 +385,10 @@ test('a turn whose routed tools were narrowed hands off only to a front naming m
   const widened = frame.widen.tools.map((tool) => tool.function.name);
   assert.ok(widened.includes('drive_read_file') && widened.includes('drive_create_file') && !widened.includes('more_tools'));
   assert.deepEqual(frame.widen.writes, widened.filter((n) => ['drive_create_file', 'drive_update_file', 'drive_trash_file'].includes(n)));
-  assert.deepEqual(Object.keys(frame.widen), ['tools', 'routes', 'writes', 'public', 'editTools', 'onceTools']);
+  assert.deepEqual(Object.keys(frame.widen), ['tools', 'routes', 'writes', 'public', 'editTools', 'onceTools', 'asked']);
+  // Every name the resolution read the policy for, in order, with its write class and answer (none blocked here).
+  assert.deepEqual(frame.widen.asked.map(([n]) => n), widened);
+  assert.ok(frame.widen.asked.every(([n, write, blocked]) => write === frame.widen.writes.includes(n) && blocked === false));
   assert.deepEqual(frame.widen.routes, []);
   // Not narrowed (or the router off): no `widen` key, the frame earlier executors read.
   const plain = await runTurn(t, { requested: true, caps: ['more-tools'], frames: answer });
