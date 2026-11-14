@@ -23,9 +23,13 @@
 // names what the front's executor runs beyond the first hand-off step, so a front older than core never gets a
 // turn it would run without its checks: `skills` (W5) its instruction skills checks (the skills bridges below);
 // `once` (#2446) the coworker page save's per-call card (never under a chat-wide grant, `once` on the card and its
-// question, an `allow` policy read as `ask`; the prepared frame names those tools in `onceTools`).
-// Without it a turn whose project has instruction skills stays here ('skills'), and a coworker turn offering the page
-// save too ('page-save'). The header is removed either way.
+// question, an `allow` policy read as `ask`; the prepared frame names those tools in `onceTools`); `provenance` (#769,
+// track R15) the provenance policy's write checks (provenance-policy.cjs: each round's untrusted text taken in, a write
+// whose sensitive arguments hold some asked about on its own card even under "Allow for this chat", audited
+// `tool.provenance`; the prepared frame says `provenance: true` when the policy is on for the turn).
+// Without it a turn whose project has instruction skills stays here ('skills'), a coworker turn offering the page
+// save too ('page-save'), and every turn while the provenance policy is on ('provenance'). The header is removed
+// either way.
 //
 //   POST /internal/chat/tools/execute  {user, projectId, name, args, allowed, routes, chatKey, exchangeKey, editTarget?, grant?}
 //        -> 200 {text, failed} | {text, failed, notRun: true} | {redeem: 'refused' | 'unavailable' | 'aborted'}
@@ -221,34 +225,48 @@ function wireParts(content) {
  * route, the model and the tools as they were settled.
  */
 function refusal(t) {
+  for (const check of REFUSALS) { const why = check(t); if (why) return why; }
+  return null;
+}
+
+/**
+ * Every reason refusal() would name for this turn, in its order (the first is refusal()'s), so the log can say what
+ * else keeps a turn here once the first is lifted (track R15). Only for that log: a check that throws is skipped.
+ */
+function refusals(t) {
+  const out = [];
+  for (const check of REFUSALS) { try { const why = check(t); if (why) out.push(why); } catch { /* the log only */ } }
+  return out;
+}
+
+const REFUSALS = [
   // A chat id that is not text (a hand-made request): chat.cjs's permission checks throw on it, which the
   // native gate does not reproduce, so the turn stays here.
-  if (t.chatIdNotText) return 'chat-id';
-  if (t.deleted) return 'deleted';
-  if (t.diary) return 'diary';
-  if (t.providerId !== t.defaultProviderId || t.machine || t.external || t.chatgpt || t.routeTarget) return 'provider';
-  if (t.authorized) return 'provider-key';
+  (t) => (t.chatIdNotText ? 'chat-id' : null),
+  (t) => (t.deleted ? 'deleted' : null),
+  (t) => (t.diary ? 'diary' : null),
+  (t) => (t.providerId !== t.defaultProviderId || t.machine || t.external || t.chatgpt || t.routeTarget ? 'provider' : null),
+  (t) => (t.authorized ? 'provider-key' : null),
   // #1726's retrieved images (multimodal RAG: their notes, captions and parts) are not the executor's yet. A project's
   // attached images are: they ride on the last user message as image parts (chat.cjs's vision step), which the
   // executor carries, measures (context-fit counts each image_url) and sends as they are.
-  if (t.retrievedImages) return 'retrieved-images';
-  if (!t.messages.every((m) => typeof m?.content === 'string' || wireParts(m?.content))) return 'images';
+  (t) => (t.retrievedImages ? 'retrieved-images' : null),
+  (t) => (!t.messages.every((m) => typeof m?.content === 'string' || wireParts(m?.content)) ? 'images' : null),
   // A project with instruction skills, for a front that does not say it runs their checks (CAPS_HEADER).
-  if (t.skills) return 'skills';
-  if (t.provenance) return 'provenance';
-  if (t.framingReasoner) return 'framing-reasoner';
-  if (t.narrowed) return 'narrowed-tools';
-  if (t.gate) return 'tool-gate';
-  if (t.supervision) return 'step-supervision';
+  (t) => (t.skills ? 'skills' : null),
+  (t) => (t.provenance ? 'provenance' : null),
+  (t) => (t.framingReasoner ? 'framing-reasoner' : null),
+  (t) => (t.narrowed ? 'narrowed-tools' : null),
+  (t) => (t.gate ? 'tool-gate' : null),
+  (t) => (t.supervision ? 'step-supervision' : null),
   // An injected whole file whose name is not text (retrieval never makes one): its attribution keys on the value.
-  if (t.injected) return 'injected-sources';
+  (t) => (t.injected ? 'injected-sources' : null),
   // The coworker page save (#2446): asked about every time, never under a chat-wide grant; for a front that does not
   // say it runs that card (CAPS_HEADER `once`). The project edit tools (#648) are the executor's: the prepared frame
   // names them (`editTools`).
-  if (t.pageSave) return 'page-save';
-  if (t.streamGuard) return 'stream-guard';
-  return null;
-}
+  (t) => (t.pageSave ? 'page-save' : null),
+  (t) => (t.streamGuard ? 'stream-guard' : null),
+];
 
 /**
  * #1793's attribution after the reply (chat.cjs's close: chat-sources.cjs usedInjected, then buildSources), with
@@ -307,6 +325,10 @@ function preparedTurn(t) {
     // #2446: the offered tools asked about on every call and never under a chat-wide grant (the coworker page save).
     // Only present when there are any, so a frame without them is the one the earlier executors read.
     ...(Array.isArray(t.onceTools) && t.onceTools.length ? { onceTools: t.onceTools } : {}),
+    // #769 (track R15): the provenance policy is on for this turn (provenance-policy.cjs; a flag read that threw counts
+    // as on): the executor takes each round's untrusted text in and checks every write's arguments against it. Only
+    // present when on, and only for a front naming the `provenance` capability (else the turn stays here).
+    ...(t.provenance === true ? { provenance: true } : {}),
     routeNote: t.routeNote || '', templateGate: t.templateGate === true,
     // The local model manager answers health and load (resolveRuntimeLimit), and grants the model's lease.
     managerEnabled: t.managerEnabled === true, modelLease: t.modelLease === true,
@@ -729,4 +751,4 @@ function createToolBridge({ secret, json, readJson, asUser, getProject, executeT
   };
 }
 
-module.exports = { HANDOFF_HEADER, CAPS_HEADER, PREPARED_VERSION, EXECUTE_PATH, TARGET_PATH, ABORT_PATH, EDIT_TARGET_PATH, GRANT_PATH, REVOKE_PATH, GRANT_HANDLE_TTL_MS, USAGE_PATH, PREFILL_PATH, NATIVE_PREFIX, SKILLS_PREFIX, CHAT_BODY_CAP, PREPARED_CAP, createHandoff, refusal, reservedText, frameTooLarge, injectedSources, preparedTurn, createAsUser, createToolBridge };
+module.exports = { HANDOFF_HEADER, CAPS_HEADER, PREPARED_VERSION, EXECUTE_PATH, TARGET_PATH, ABORT_PATH, EDIT_TARGET_PATH, GRANT_PATH, REVOKE_PATH, GRANT_HANDLE_TTL_MS, USAGE_PATH, PREFILL_PATH, NATIVE_PREFIX, SKILLS_PREFIX, CHAT_BODY_CAP, PREPARED_CAP, createHandoff, refusal, refusals, reservedText, frameTooLarge, injectedSources, preparedTurn, createAsUser, createToolBridge };
