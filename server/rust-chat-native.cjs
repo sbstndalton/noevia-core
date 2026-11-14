@@ -113,6 +113,10 @@
 //        budget, deadline and log stay here. `trace` is what the reply's trace records ({kind, tool, packet, timings}).
 //   POST /internal/chat/native/reasoner-trace    {user, trace, answerChars, answerMs} -> 204   the person's opt-in
 //        reasoning trace after the reply (chat.cjs: reasoningTraces.append, in their own workspace dir).
+//   POST /internal/chat/native/runtime           {user}                -> 200 {node, icu, tz, zone} this
+//        process's process.versions and its resolved zone (Intl.DateTimeFormat().resolvedOptions().timeZone, ''
+//        when none) (track R5): the front answers get_current_time itself (NOEVIA_RUST_CURRENT_TIME) only while
+//        this Node's ICU and tz data are the ones its recording was made with, in the zone this process uses.
 //        the facts the turn reads of the local model manager, the engine's template and the chat lists, through
 //        the same functions chat.cjs calls, while those still live here. health and load answer 409 {enabled:false}
 //        when the local model manager is off; the executor never calls them then (the prepared frame's
@@ -185,7 +189,7 @@ const SCOPE_CAP = 200;
 const USAGE_PATH = '/internal/chat/usage';
 const PREFILL_PATH = '/internal/chat/prefill';
 const NATIVE_PREFIX = '/internal/chat/native/';
-const NATIVE_OPS = new Set(['health', 'load', 'tools-allowed', 'tools-unsupported', 'busy', 'title-auto-named', 'title-save', 'tool-used', 'supervise', 'gate-record', 'condense', 'reasoner-trace']);
+const NATIVE_OPS = new Set(['health', 'load', 'tools-allowed', 'tools-unsupported', 'busy', 'title-auto-named', 'title-save', 'tool-used', 'supervise', 'gate-record', 'condense', 'reasoner-trace', 'runtime']);
 const SKILLS_PREFIX = '/internal/chat/skills/';
 const SKILL_OPS = new Set(['revoked', 'read', 'scrub']);
 const SHA256 = /^[a-f0-9]{64}$/;
@@ -510,6 +514,12 @@ function createToolBridge({ secret, json, readJson, asUser, getProject, executeT
       if (needModel()) return;
       templateToolsGate.markUnsupported(model);
       return noContent(res);
+    }
+    if (op === 'runtime') {
+      const v = (k) => (typeof process.versions[k] === 'string' ? process.versions[k] : null);
+      let zone = '';
+      try { zone = String(Intl.DateTimeFormat().resolvedOptions().timeZone ?? ''); } catch { zone = ''; }
+      return json(res, 200, { node: v('node'), icu: v('icu'), tz: v('tz'), zone });
     }
     if (op === 'tool-used') {
       const name = text(body?.name, TOOL_NAME_CAP);
