@@ -677,7 +677,10 @@ const codeRoutes = require('./routes/code.cjs').createCodeRoutes({
 // `playwright` is an operator-installed dependency, never a hard one: a deployment without it
 // simply cannot start a browser task, and says so, rather than falling back to something
 // unsandboxed.
+// Rust port R5: NOEVIA_RUST_BROWSER=1 hands Browser tasks to the Rust front (rust-browser-executor.cjs).
+const browserExecutor = require('./rust-browser-executor.cjs');
 const browserService = require('./browser-service.cjs').createBrowserService({
+  frontOwned: browserExecutor.frontOwnsBrowser(),
   launch: async () => {
     let playwright;
     try { playwright = require('playwright'); }
@@ -698,6 +701,7 @@ const usageRoutes = require('./routes/usage.cjs').createUsageRoutes({ json });
 const taskFactsBridge = require('./rust-task-facts.cjs').createTaskFactsBridge({
   secret: FRONT_SECRET, json, readJson, features, services: { code: codeService, browser: browserService },
   workspace: () => currentWorkspace(), asUser: (userId, fn) => diaryAsUser(userId, fn), frontOwns: () => codeExecutor.frontOwnsCode(),
+  browserOwns: () => browserExecutor.frontOwnsBrowser(),
 });
 // Rust port R7: what the front's Code start needs from this process (only while the front owns Code tasks).
 const codeEngineBridge = codeExecutor.createCodeEngineBridge({
