@@ -800,6 +800,9 @@ function createLlamaCppManager({ budgetWatchDir = null, baseUrl, apiKey, fetchJs
     // lease's requests (inference-gate-client.cjs).
     prepareLoad, acquireLease,
     close:tracker.close,
+    // Track R11: the Rust front's native pull (NOEVIA_RUST_MODEL_WRITES=rust) records its download here, so the
+    // downloads list and its event stream stay this tracker's (rust-model-downloads-bridge.cjs).
+    trackDownload: Object.freeze({ requested: model => tracker.requested(model), rejected: model => tracker.rejected(model) }),
     enterInference: maintenance.enter,
     enterInferenceWithin: maintenance.enterWithin,
     // #1785: read-only. Busy when the maintenance gate is held, more inference requests than the caller's own `own`

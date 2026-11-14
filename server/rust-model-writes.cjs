@@ -14,21 +14,24 @@ const SWITCH = 'NOEVIA_RUST_MODEL_WRITES';
 const OWNED_PATHS = Object.freeze(['/api/models/inference-budget', '/api/models/idle-unload', '/api/models/preset']);
 // The MTP artifact check (a read the front answers under the same switch, for administrators only).
 const OWNED_GETS = Object.freeze(['/api/models/mtp-artifact']);
+// The pull (the front records its download in this process's tracker: rust-model-downloads-bridge.cjs).
+const OWNED_POSTS = Object.freeze(['/api/models/pull']);
 const ROUTE_REFUSAL = Object.freeze({ error: 'The inference budget, idle unload and preset writes are owned by the Rust front.', code: 'RUST_MODEL_WRITES_OWNED' });
 
 /** Whether the front answers the two PUTs (the switch is exactly `rust`). */
 const frontOwns = (env = process.env) => env[SWITCH] === 'rust';
 
 /** True for the exact pathnames the front answers (routes/models.cjs compares `p === '/api/models/...'`). */
-const owned = (method, pathname) => (method === 'PUT' && OWNED_PATHS.includes(pathname)) || (method === 'GET' && OWNED_GETS.includes(pathname));
+const owned = (method, pathname) => (method === 'PUT' && OWNED_PATHS.includes(pathname)) || (method === 'GET' && OWNED_GETS.includes(pathname))
+  || (method === 'POST' && OWNED_POSTS.includes(pathname));
 
 /** Runs before authentication (index.cjs). An unparseable target falls through. */
 function refuseOwned(req, res, { parseRequestUrl, json, env = process.env }) {
-  if ((req.method !== 'PUT' && req.method !== 'GET') || !frontOwns(env)) return false;
+  if (!['PUT', 'GET', 'POST'].includes(req.method) || !frontOwns(env)) return false;
   const url = parseRequestUrl(req, `http://${req.headers.host || 'localhost'}`) || parseRequestUrl(req);
   if (!url || !owned(req.method, url.pathname)) return false;
   json(res, 503, ROUTE_REFUSAL);
   return true;
 }
 
-module.exports = { SWITCH, OWNED_PATHS, OWNED_GETS, ROUTE_REFUSAL, frontOwns, owned, refuseOwned };
+module.exports = { SWITCH, OWNED_PATHS, OWNED_GETS, OWNED_POSTS, ROUTE_REFUSAL, frontOwns, owned, refuseOwned };

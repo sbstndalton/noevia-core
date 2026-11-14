@@ -1195,6 +1195,8 @@ const storageRoutes = require('./routes/storage.cjs').createStorageRoutes({ json
 const idleUnloadFacts = require('./rust-idle-unload-read-facts.cjs').createIdleUnloadFacts({
   secret: FRONT_SECRET, json, effectiveSeconds: () => idleUnload?.effectiveSeconds(),
 });
+// Track R11: the front's native pull records its download in this process's tracker (rust-model-downloads-bridge.cjs).
+const modelDownloadsBridge = require('./rust-model-downloads-bridge.cjs').createDownloadsBridge({ secret: FRONT_SECRET, json, readJson, modelManager });
 const modelDownloadsFacts = require('./rust-model-downloads-read-facts.cjs').createModelDownloadsFacts({
   secret: FRONT_SECRET, json, manager: () => modelManager,
 });
@@ -1304,6 +1306,7 @@ async function handleRequestInner(req, res) {
   if (await idleUnloadFacts(req, res)) return;
   if (require('./rust-model-downloads-read.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   if (await modelDownloadsFacts(req, res)) return;
+  if (await modelDownloadsBridge(req, res)) return;
   if (require('./rust-autotune-read.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   if (await embeddingOwner.handleSourceChanged(req, res, json)) return;
   if (embeddingOwner.handle(req, res, json)) return;
