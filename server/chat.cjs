@@ -1683,7 +1683,7 @@ function createChatHandler({
     if (handoff) {
       const native = require('./rust-chat-native.cjs');
       // Reading what the refusal looks at must never fail the turn: an input that throws keeps the turn here.
-      let why, refusalInput = null, provenanceOn = false;
+      let why, refusalInput = null, provenanceOn = false, widen = null;
       try {
         if (provenancePolicy) { try { provenanceOn = provenancePolicy.enabled() === true; } catch { provenanceOn = true; } }
         const diaryTurn = (typeof spaceId === 'string' && spaceId.startsWith('diary')) || project?.id === diaryExtras?.PROJECT_ID;
@@ -1699,7 +1699,9 @@ function createChatHandler({
           skills: (loadedSkills.size > 0 || (!!project && instructionSkills.list(project).length > 0)) && !handoffCaps.has('skills'),
           // #769: the front's executor runs the policy's write checks when it names the `provenance` capability (R15).
           provenance: provenanceOn && !handoffCaps.has('provenance'), framingReasoner: !!(framingReasoner && chatFrame),
-          narrowed: !!routing.narrowed, gate: !!(gate && gate.decision !== 'none'),
+          // The routed list's more_tools (Roadmap E): the front's executor widens with the list below when it names
+          // the `more-tools` capability (R15).
+          narrowed: !!routing.narrowed && !handoffCaps.has('more-tools'), gate: !!(gate && gate.decision !== 'none'),
           supervision: nativeHandoff.supervising(),
           injected: injectedEntries.some((e) => e && e.kind === 'file' && typeof e.file !== 'string'),
           pageSave: activeTools.some((t) => specialistPageSave.neverStanding(t.function?.name)) && !handoffCaps.has('once'),
@@ -1708,6 +1710,13 @@ function createChatHandler({
           streamGuard: activeTools.some((t) => egressRules.validateToolArguments(t.function?.name, '\u0000') !== null),
         };
         why = native.refusal(refusalInput);
+        // What more_tools would widen to (below, in the round loop): the project's whole selection, resolved now.
+        if (!why && routing.narrowed) {
+          const full = resolveTools(asSelection(selectedBoxes), model, blocked, ...measuredOn());
+          const fullNames = full.tools.map((t) => t.function?.name).filter((n) => typeof n === 'string');
+          widen = { tools: full.tools, routes: [...(full.routes || [])], writes: fullNames.filter((n) => isWriteTool(n)), public: fullNames.filter((n) => isPublicTool(n)),
+            editTools: fullNames.filter((n) => projectEditTool(n)), onceTools: fullNames.filter((n) => specialistPageSave.neverStanding(n)) };
+        }
       } catch (error) {
         why = 'refusal-input';
         console.warn(`[chat] native executor refusal inputs could not be read: ${String(error?.message || error).slice(0, 200)}`);
@@ -1735,7 +1744,7 @@ function createChatHandler({
             firstMessage: chatTitleLib.firstUserMessage(history, message), firstReply: chatTitleLib.firstReply(history), enabled: !!chatTitles },
           message, spaceId, projectId: project?.id, declineEndsReply: !spaceId?.startsWith('diary'), record: !!record, streamIdleMs, compactOnly: body.compactOnly === true,
           sources: native.injectedSources({ injected: injectedEntries, placed: placedEntries, readable: readableFiles, reply: replySources }),
-          provenance: provenanceOn,
+          provenance: provenanceOn, widen,
           // #272/#546: the skill state the executor's checks start from; the checks themselves are core's bridges.
           skills: project ? { loaded: [...loadedSkills].map(([file, s]) => ({ file, hash: s.hash, name: s.name })),
             enabled: instructionSkills.list(project).filter((s) => s.status === 'enabled').map((s) => ({ file: s.file, hash: s.hash, name: s.name })),

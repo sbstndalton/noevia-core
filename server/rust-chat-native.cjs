@@ -26,10 +26,13 @@
 // question, an `allow` policy read as `ask`; the prepared frame names those tools in `onceTools`); `provenance` (#769,
 // track R15) the provenance policy's write checks (provenance-policy.cjs: each round's untrusted text taken in, a write
 // whose sensitive arguments hold some asked about on its own card even under "Allow for this chat", audited
-// `tool.provenance`; the prepared frame says `provenance: true` when the policy is on for the turn).
+// `tool.provenance`; the prepared frame says `provenance: true` when the policy is on for the turn); `more-tools`
+// (Roadmap E, R15) the routed list's more_tools call: the prepared frame's `widen` (only on a routed turn whose list
+// was narrowed) is the project's whole selection as the round loop would resolve it, and the executor answers
+// more_tools from it as chat.cjs does.
 // Without it a turn whose project has instruction skills stays here ('skills'), a coworker turn offering the page
-// save too ('page-save'), and every turn while the provenance policy is on ('provenance'). The header is removed
-// either way.
+// save too ('page-save'), every turn while the provenance policy is on ('provenance'), and a turn whose tools were
+// narrowed by routing ('narrowed-tools'). The header is removed either way.
 //
 //   POST /internal/chat/tools/execute  {user, projectId, name, args, allowed, routes, chatKey, exchangeKey, editTarget?, grant?}
 //        -> 200 {text, failed} | {text, failed, notRun: true} | {redeem: 'refused' | 'unavailable' | 'aborted'}
@@ -329,6 +332,11 @@ function preparedTurn(t) {
     // as on): the executor takes each round's untrusted text in and checks every write's arguments against it. Only
     // present when on, and only for a front naming the `provenance` capability (else the turn stays here).
     ...(t.provenance === true ? { provenance: true } : {}),
+    // Roadmap E (R15): what more_tools widens to, on a turn whose routed list was narrowed (absent otherwise): the
+    // tools, their MCP routes, and which of them are writes, public, project edits or once-only, as for `tools`.
+    ...(t.widen && typeof t.widen === 'object' ? { widen: {
+      tools: t.widen.tools, routes: t.widen.routes, writes: t.widen.writes, public: t.widen.public,
+      editTools: t.widen.editTools, onceTools: t.widen.onceTools } } : {}),
     routeNote: t.routeNote || '', templateGate: t.templateGate === true,
     // The local model manager answers health and load (resolveRuntimeLimit), and grants the model's lease.
     managerEnabled: t.managerEnabled === true, modelLease: t.modelLease === true,

@@ -365,6 +365,34 @@ test('a provenance policy turn hands off only to a front naming provenance, and 
   assert.equal(supervised.requests.length, 1);
 });
 
+test('a turn whose routed tools were narrowed hands off only to a front naming more-tools, with what more_tools widens to (R15)', async (t) => {
+  // The router keeps the first selected box only (chat-tool-routing.cjs answers narrowed when it drops some).
+  const narrow = { chatToolRouter: { select: async (ids) => ({ ids: ids.slice(0, 1), routed: true, narrowed: ids.length > 1 }) } };
+  const logged = [];
+  const log = console.log;
+  console.log = (line) => logged.push(String(line));
+  let kept;
+  try { kept = await runTurn(t, { requested: true, caps: ['skills', 'once', 'provenance'], frames: answer, deps: narrow }); } finally { console.log = log; }
+  assert.equal(kept.requests.length, 1, 'Node ran the turn');
+  assert.ok(logged.includes('[chat] native executor not used for this turn: narrowed-tools'));
+  assert.ok(kept.requests[0].tools.some((tool) => tool.function.name === 'more_tools'));
+  const handed = await runTurn(t, { requested: true, caps: ['more-tools'], frames: answer, deps: narrow });
+  const frame = handed.events.at(-1);
+  assert.equal(frame.type, 'prepared');
+  const offered = frame.tools.map((tool) => tool.function.name);
+  assert.ok(offered.includes('more_tools'), 'the narrowed list carries more_tools');
+  assert.ok(!offered.some((n) => n.startsWith('drive_')), 'the Drive box was routed away');
+  const widened = frame.widen.tools.map((tool) => tool.function.name);
+  assert.ok(widened.includes('drive_read_file') && widened.includes('drive_create_file') && !widened.includes('more_tools'));
+  assert.deepEqual(frame.widen.writes, widened.filter((n) => ['drive_create_file', 'drive_update_file', 'drive_trash_file'].includes(n)));
+  assert.deepEqual(Object.keys(frame.widen), ['tools', 'routes', 'writes', 'public', 'editTools', 'onceTools']);
+  assert.deepEqual(frame.widen.routes, []);
+  // Not narrowed (or the router off): no `widen` key, the frame earlier executors read.
+  const plain = await runTurn(t, { requested: true, caps: ['more-tools'], frames: answer });
+  assert.equal(plain.events.at(-1).type, 'prepared');
+  assert.equal('widen' in plain.events.at(-1), false);
+});
+
 test('frameTooLarge refuses a prepared line longer than the front reads (PREPARED_CAP bytes of UTF-8)', () => {
   assert.equal(native.PREPARED_CAP, 40 * 1024 * 1024);
   assert.equal(native.frameTooLarge('x'.repeat(native.PREPARED_CAP)), false);
