@@ -446,7 +446,10 @@ const FREE_CHATS = arrayProxy('freeChats');
 const { USAGE_RETENTION_DAYS, usageDayKey, readUsage, recordUsage, recordToolUse } = require('./usage.cjs');
 
 // D9: read-only offline Wikipedia box, only with features.kiwix and an internal KIWIX_URL.
-const kiwixTools = featureConstruction.kiwix && process.env.KIWIX_URL ? require('./kiwix.cjs').createKiwixTools({ baseUrl: process.env.KIWIX_URL, cap: TOOL_RESULT_CAP }) : null;
+// Track R5: NOEVIA_RUST_KIWIX_TOOLS=1 (off by default) hands the Offline Wikipedia tools to the Rust front.
+const RUST_KIWIX_TOOLS = process.env.NOEVIA_RUST_KIWIX_TOOLS === '1';
+const kiwixTools = featureConstruction.kiwix && process.env.KIWIX_URL ? require('./kiwix.cjs').createKiwixTools({ baseUrl: process.env.KIWIX_URL, cap: TOOL_RESULT_CAP,
+  native: { enabled: () => RUST_KIWIX_TOOLS, tool: (payload) => PROJECT_STORE.kiwixTool(payload) } }) : null;
 // Offered per request only to accounts with a connected Drive (connectedBoxes).
 // Track R5: NOEVIA_RUST_DRIVE_TOOLS=1 (off by default) hands the chat's Drive tools to the Rust front.
 const RUST_DRIVE_TOOLS = process.env.NOEVIA_RUST_DRIVE_TOOLS === '1';
@@ -677,7 +680,10 @@ const codeRoutes = require('./routes/code.cjs').createCodeRoutes({
 // `playwright` is an operator-installed dependency, never a hard one: a deployment without it
 // simply cannot start a browser task, and says so, rather than falling back to something
 // unsandboxed.
+// Rust port R5: NOEVIA_RUST_BROWSER=1 hands Browser tasks to the Rust front (rust-browser-executor.cjs).
+const browserExecutor = require('./rust-browser-executor.cjs');
 const browserService = require('./browser-service.cjs').createBrowserService({
+  frontOwned: browserExecutor.frontOwnsBrowser(),
   launch: async () => {
     let playwright;
     try { playwright = require('playwright'); }
@@ -698,6 +704,7 @@ const usageRoutes = require('./routes/usage.cjs').createUsageRoutes({ json });
 const taskFactsBridge = require('./rust-task-facts.cjs').createTaskFactsBridge({
   secret: FRONT_SECRET, json, readJson, features, services: { code: codeService, browser: browserService },
   workspace: () => currentWorkspace(), asUser: (userId, fn) => diaryAsUser(userId, fn), frontOwns: () => codeExecutor.frontOwnsCode(),
+  browserOwns: () => browserExecutor.frontOwnsBrowser(),
 });
 // Rust port R7: what the front's Code start needs from this process (only while the front owns Code tasks).
 const codeEngineBridge = codeExecutor.createCodeEngineBridge({
@@ -1393,6 +1400,8 @@ async function handleRequestInner(req, res) {
   if (req.url?.startsWith('/internal/inference-machines/') && await inferenceMachineRoutes(req, res)) return;
   if (require('./rust-calibration-routes.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   if (await calibrationRoutesBridge(req, res)) return;
+  // Track R11: the model manager proxy is the front's under NOEVIA_RUST_MODEL_MANAGER=rust (rust-model-manager-proxy.cjs).
+  if (require('./rust-model-manager-proxy.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   if (require('./rust-model-manager-scan.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   if (await modelManagerScanCache(req, res)) return;
   if (require('./rust-autotune-cancel.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;

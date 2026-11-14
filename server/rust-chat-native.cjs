@@ -89,6 +89,9 @@
 //        a native turn holds the route's admission lease and, while it lasts, the model's lease.
 //   POST /internal/chat/native/title-auto-named  {user, listId, chatId, firstMessage} -> 200 {autoNamed}
 //   POST /internal/chat/native/title-save        {user, listId, chatId, title, firstMessage} -> 204
+//   POST /internal/chat/native/tool-used         {user, name}          -> 204              recordToolUse (track R13): a
+//        tool call the front answered itself (read_project_file behind NOEVIA_RUST_READ_FILE) is counted here, as the
+//        execute bridge counts a call it runs; core stays the usage store's single writer.
 //        the facts the turn reads of the local model manager, the engine's template and the chat lists, through
 //        the same functions chat.cjs calls, while those still live here. health and load answer 409 {enabled:false}
 //        when the local model manager is off; the executor never calls them then (the prepared frame's
@@ -161,7 +164,7 @@ const SCOPE_CAP = 200;
 const USAGE_PATH = '/internal/chat/usage';
 const PREFILL_PATH = '/internal/chat/prefill';
 const NATIVE_PREFIX = '/internal/chat/native/';
-const NATIVE_OPS = new Set(['health', 'load', 'tools-allowed', 'tools-unsupported', 'busy', 'title-auto-named', 'title-save']);
+const NATIVE_OPS = new Set(['health', 'load', 'tools-allowed', 'tools-unsupported', 'busy', 'title-auto-named', 'title-save', 'tool-used']);
 const SKILLS_PREFIX = '/internal/chat/skills/';
 const SKILL_OPS = new Set(['revoked', 'read', 'scrub']);
 const SHA256 = /^[a-f0-9]{64}$/;
@@ -173,6 +176,8 @@ const BODY_CAP = 16 * 1024 * 1024;
 // POST /api/chat's body cap (index.cjs STORED_HISTORY_BYTES, rust-chat-turn.cjs): a chat's first message fits in it.
 const CHAT_BODY_CAP = 32 * 1024 * 1024;
 const USER_CAP = 200;
+// A tool name the front counts (usage.cjs keeps 80 characters of it).
+const TOOL_NAME_CAP = 200;
 // A chat id (and the chat key a tool call names, chatId || spaceId): chat.cjs sets no length of its own.
 const CHAT_ID_CAP = 400;
 const MODEL_CAP = 400;
@@ -445,6 +450,12 @@ function createToolBridge({ secret, json, readJson, asUser, getProject, executeT
     if (op === 'tools-unsupported') {
       if (needModel()) return;
       templateToolsGate.markUnsupported(model);
+      return noContent(res);
+    }
+    if (op === 'tool-used') {
+      const name = text(body?.name, TOOL_NAME_CAP);
+      if (!name) return json(res, 400, { error: 'name is required.' });
+      recordToolUse(currentWorkspace(), name);
       return noContent(res);
     }
     if (op === 'busy') {

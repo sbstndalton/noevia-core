@@ -14,6 +14,7 @@ const path = require('node:path');
 const crypto = require('node:crypto');
 const { createJobs } = require('./jobs.cjs');
 const { createBrowserExecutor } = require('./browser-executor.cjs');
+const FRONT_OWNED = require('./rust-browser-executor.cjs').REFUSED;
 
 const APPROVAL_TIMEOUT_MS = 5 * 60 * 1000;
 // No action arrives (act or finish) for this long: the task is not making progress and is timed
@@ -49,10 +50,12 @@ function view(job, pending = null) {
 
 /**
  * @param {{ launch: () => Promise<object>, egress?: object, log?: Function, now?: ()=>number,
- *           timeoutMs?: number, idleTimeoutMs?: number, direct?: boolean }} deps
+ *           timeoutMs?: number, idleTimeoutMs?: number, direct?: boolean, frontOwned?: boolean }} deps
+ *   `frontOwned` (rust-browser-executor.cjs, NOEVIA_RUST_BROWSER=1): the Rust front runs Browser tasks. This process
+ *   then never recovers a tenant's browser journals and starts, runs, answers, finishes and cancels none.
  */
 function createBrowserService({ launch, egress = null, log = () => {}, now = Date.now,
-  timeoutMs = APPROVAL_TIMEOUT_MS, idleTimeoutMs = IDLE_TIMEOUT_MS, direct = false }) {
+  timeoutMs = APPROVAL_TIMEOUT_MS, idleTimeoutMs = IDLE_TIMEOUT_MS, direct = false, frontOwned = false }) {
   if (typeof launch !== 'function') throw Error('A browser service needs a browser to launch.');
   // Keyed on the directory, not the workspace object (#2261): see code-service.cjs; a new object over the same
   // directory must not recover() this process's own running tasks as interrupted.
@@ -75,7 +78,7 @@ function createBrowserService({ launch, egress = null, log = () => {}, now = Dat
       // for this tenant was running under a process that no longer exists. It is marked
       // interrupted, never resumed and never left silently "running".
       const jobs = createJobs({ dir: workspace.dir, kinds: ['browser'], maxJobs: 50, retainMs: 7 * 86400000, now });
-      jobs.recover();
+      if (!frontOwned) jobs.recover();
       store = { jobs };
       stores.set(workspace.dir, store);
     }
@@ -149,6 +152,7 @@ function createBrowserService({ launch, egress = null, log = () => {}, now = Dat
       return view(owned(workspace, project, taskId), pendingFor(taskId));
     },
     async start(workspace, project, body = {}) {
+      if (frontOwned) throw fail(409, FRONT_OWNED);
       const domains = parseDomains(body.domains);
       if (!domains.length) throw fail(400, 'A browser task needs at least one domain it may reach.');
       const { jobs } = storeFor(workspace);
@@ -355,6 +359,7 @@ function createBrowserService({ launch, egress = null, log = () => {}, now = Dat
     },
     /** Runs one browser action against the task's open session and waits for its outcome. */
     async act(workspace, project, taskId, action = {}) {
+      if (frontOwned) throw fail(409, FRONT_OWNED);
       const job = owned(workspace, project, taskId);
       if (job.status !== 'running' && job.status !== 'waiting_approval') throw fail(409, 'This task is not running.');
       if (!action || typeof action.type !== 'string' || !action.type) throw fail(400, 'Name an action to run.');
@@ -363,6 +368,7 @@ function createBrowserService({ launch, egress = null, log = () => {}, now = Dat
       return new Promise((resolve, reject) => s.enqueue({ action, resolve, reject }));
     },
     decide(workspace, project, taskId, decision, approvalId) {
+      if (frontOwned) throw fail(409, FRONT_OWNED);
       owned(workspace, project, taskId);
       if (!['approve', 'approve_all', 'deny'].includes(decision)) throw fail(400, 'Unknown decision');
       if (typeof approvalId !== 'string' || !approvalId) throw fail(400, 'Which approval is this answer for?');
@@ -378,6 +384,7 @@ function createBrowserService({ launch, egress = null, log = () => {}, now = Dat
     },
     /** Ends the task cleanly, with whatever result the caller has to report. */
     finish(workspace, project, taskId, result = null) {
+      if (frontOwned) throw fail(409, FRONT_OWNED);
       const job = owned(workspace, project, taskId);
       if (job.status !== 'running' && job.status !== 'waiting_approval') throw fail(409, 'This task is not running.');
       if (result !== null && result !== undefined && Buffer.byteLength(JSON.stringify(result)) > MAX_RESULT_BYTES) {
@@ -389,6 +396,7 @@ function createBrowserService({ launch, egress = null, log = () => {}, now = Dat
       return { ok: true };
     },
     cancel(workspace, project, taskId) {
+      if (frontOwned) throw fail(409, FRONT_OWNED);
       owned(workspace, project, taskId);
       // Refuse anything still waiting first, so a cancelled task never leaves a card that could
       // later be answered into an action.
