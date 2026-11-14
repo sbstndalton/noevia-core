@@ -14,7 +14,8 @@ const ask = (method, url, env) => {
   return { refused, seen };
 };
 
-test('only the switch set to rust hands the two PUTs to the front', () => {
+test('only the switch set to rust hands the three PUTs to the front', () => {
+  assert.deepEqual([...OWNED_PATHS], ['/api/models/inference-budget', '/api/models/idle-unload', '/api/models/preset']);
   assert.equal(SWITCH, 'NOEVIA_RUST_MODEL_WRITES');
   for (const env of [{}, { [SWITCH]: '' }, { [SWITCH]: 'on' }, { [SWITCH]: 'Rust' }, { [SWITCH]: 'node' }]) {
     assert.equal(frontOwns(env), false, JSON.stringify(env));
@@ -26,9 +27,9 @@ test('only the switch set to rust hands the two PUTs to the front', () => {
   assert.equal(ROUTE_REFUSAL.code, 'RUST_MODEL_WRITES_OWNED');
 });
 
-test('everything beside the two PUTs stays where it was', () => {
+test('everything beside the three PUTs stays where it was', () => {
   const env = { [SWITCH]: 'rust' };
-  for (const [m, p] of [['GET', '/api/models/inference-budget'], ['POST', '/api/models/idle-unload'], ['PUT', '/api/models/preset'],
+  for (const [m, p] of [['GET', '/api/models/inference-budget'], ['POST', '/api/models/idle-unload'], ['GET', '/api/models/preset'], ['PUT', '/api/models/presets/reload'],
     ['PUT', '/api/models/inference-budget/'], ['PUT', '/api/model-manager/idle-unload'], ['DELETE', '/api/models/idle-unload']]) {
     assert.equal(owned(m, p), false, `${m} ${p}`);
     assert.deepEqual(ask(m, p, env), { refused: false, seen: [] }, `${m} ${p}`);
