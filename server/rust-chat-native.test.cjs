@@ -319,6 +319,52 @@ test('refusal names the first part of the turn the native executor does not do y
   assert.equal(native.refusal({ ...base, messages: [{ role: 'user', content: [] }] }), null, 'an empty list carries nothing the executor cannot');
 });
 
+test('refusals lists every reason in refusal\'s order; refusal is its first', () => {
+  const base = { providerId: 'default', defaultProviderId: 'default', messages: [{ role: 'user', content: 'x' }] };
+  assert.deepEqual(native.refusals(base), []);
+  const all = { ...base, provenance: true, narrowed: true, supervision: true, skills: true };
+  assert.deepEqual(native.refusals(all), ['skills', 'provenance', 'narrowed-tools', 'step-supervision']);
+  assert.equal(native.refusal(all), 'skills');
+  // A check that throws (no messages list) is left out of the log's list; refusal() still answers as before.
+  assert.deepEqual(native.refusals({ providerId: 'default', defaultProviderId: 'default', chatIdNotText: true }), ['chat-id']);
+  assert.equal(native.refusal({ chatIdNotText: true }), 'chat-id');
+});
+
+test('a provenance policy turn hands off only to a front naming provenance, and its frame says so (#769, R15)', async (t) => {
+  const on = { provenancePolicy: { enabled: () => true } };
+  const logged = [];
+  const log = console.log;
+  console.log = (line) => logged.push(String(line));
+  let kept, both;
+  try {
+    kept = await runTurn(t, { requested: true, caps: ['skills', 'once'], frames: answer, deps: on });
+    both = await runTurn(t, { requested: true, caps: ['skills', 'once'], supervising: true, frames: answer, deps: on });
+  } finally { console.log = log; }
+  assert.notEqual(kept.events.at(-1).type, 'prepared');
+  assert.equal(kept.requests.length, 1, 'Node ran the turn');
+  assert.ok(logged.includes('[chat] native executor not used for this turn: provenance'));
+  // What else would keep it here is logged on its own line (names only); nothing else for a plain turn.
+  assert.equal(logged.filter((l) => l.startsWith('[chat] native executor would also need:')).length, 1);
+  assert.ok(logged.includes('[chat] native executor would also need: step-supervision'));
+  assert.equal(both.requests.length, 1);
+  const handed = await runTurn(t, { requested: true, caps: ['skills', 'once', 'provenance'], frames: answer, deps: on });
+  assert.equal(handed.events.at(-1).type, 'prepared');
+  assert.equal(handed.events.at(-1).provenance, true);
+  assert.equal(handed.requests.length, 0, 'the front runs the rounds');
+  // A flag read that throws counts as on (as chat.cjs's own taint store reads it).
+  const threw = await runTurn(t, { requested: true, caps: ['provenance'], frames: answer, deps: { provenancePolicy: { enabled: () => { throw new Error('QA flag'); } } } });
+  assert.equal(threw.events.at(-1).provenance, true);
+  // Off (or no policy): no key, so the frame is the one earlier executors read; the capability alone changes nothing.
+  for (const deps of [{}, { provenancePolicy: { enabled: () => false } }]) {
+    const off = await runTurn(t, { requested: true, caps: ['provenance'], frames: answer, deps });
+    assert.equal(off.events.at(-1).type, 'prepared');
+    assert.equal('provenance' in off.events.at(-1), false);
+  }
+  // Still in Node with a step supervisor even for a front naming provenance (the next reason, R15's table).
+  const supervised = await runTurn(t, { requested: true, caps: ['provenance'], supervising: true, frames: answer, deps: on });
+  assert.equal(supervised.requests.length, 1);
+});
+
 test('frameTooLarge refuses a prepared line longer than the front reads (PREPARED_CAP bytes of UTF-8)', () => {
   assert.equal(native.PREPARED_CAP, 40 * 1024 * 1024);
   assert.equal(native.frameTooLarge('x'.repeat(native.PREPARED_CAP)), false);
