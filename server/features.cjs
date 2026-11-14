@@ -34,7 +34,9 @@ const UNAVAILABLE = Object.freeze({
   stepSupervision: env => require('./decision-endpoint.cjs').configuration(env).reason,
   systemOneRouting: env => require('./system-one-router.cjs').configuration(env).reason,
   toolGate: env => require('./decision-endpoint.cjs').configuration(env).reason,
-  browserExecutor: () => browserRuntimeReason(),
+  // Rust port R5: with NOEVIA_RUST_BROWSER=1 the front runs Browser tasks, so its engine decides (rust-browser-executor.cjs).
+  browserExecutor: env => (require('./rust-browser-executor.cjs').frontOwnsBrowser(env)
+    ? require('./rust-browser-executor.cjs').nativeBrowserReason(env) : browserRuntimeReason()),
   codePipeline: env => codeSandboxReason(env),
   codeMerge: env => codeSandboxReason(env),
   chatFraming: env => require('./decision-endpoint.cjs').configuration(env).reason,

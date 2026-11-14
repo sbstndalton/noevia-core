@@ -488,6 +488,21 @@ test('the native fact bridges answer through the functions chat.cjs calls, as th
   assert.deepEqual(await call(`${native.NATIVE_PREFIX}other`, { user }), { handled: false, status: undefined, body: undefined });
 });
 
+test('the tool-used bridge counts a call the front answered, as the user (track R13)', async () => {
+  const p = `${native.NATIVE_PREFIX}tool-used`;
+  const { call, calls } = bridge();
+  assert.equal((await call(p, { user: 'qa-user', name: 'read_project_file' })).status, 204);
+  assert.deepEqual(calls, [['asUser', 'qa-user'], ['recordToolUse', 'qa-ws', 'read_project_file']]);
+  calls.length = 0;
+  for (const b of [{ user: 'qa-user' }, { user: 'qa-user', name: '' }, { user: 'qa-user', name: 7 }, { user: 'qa-user', name: 'x'.repeat(201) }, { name: 'read_project_file' }]) {
+    assert.equal((await call(p, b)).status, 400, JSON.stringify(b));
+  }
+  assert.deepEqual(calls.filter(([what]) => what === 'recordToolUse'), [], 'nothing counted for a refused request');
+  assert.equal((await call(p, { user: 'qa-user', name: 'read_project_file' }, { trusted: false })).status, 404);
+  const gone = bridge({ asUser: async () => { throw Object.assign(Error('no such account'), { status: 404 }); } });
+  assert.deepEqual(await gone.call(p, { user: 'qa-gone', name: 'read_project_file' }), { handled: true, status: 404, body: { error: 'no such account' } });
+});
+
 test('a fact bridge refuses a gone account, says when the manager is off, and never sends a failure\'s detail', async () => {
   const p = (op) => `${native.NATIVE_PREFIX}${op}`;
   const user = 'qa-user', token = '0123456789abcdef0123456789abcdef';

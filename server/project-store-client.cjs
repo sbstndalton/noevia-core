@@ -44,6 +44,8 @@ const MCP_CALL_WAIT_MS = 330000;
 const DRIVE_TOOL_WAIT_MS = 330000;
 /** Track R14: one project text write on the front, which may wait 30 s for the project's source lock and then write to storage. */
 const TEXT_WRITE_WAIT_MS = 330000;
+// Track R5: the front's Offline Wikipedia fetch stops at 10 s; this waits a little longer than that.
+const KIWIX_TOOL_WAIT_MS = 30000;
 const REPLY_CAP = 2 * 32 * 1024 * 1024 + 64 * 1024;
 const TEXT_WRITE_OPTIONS = ['expectName', 'expectContent', 'expectAttachment', 'adoptTo', 'adoptAccount'];
 // providers.json (sbstndalton/noevia#2190 round 6) is the account's private provider rows: the Rust
@@ -416,6 +418,11 @@ function createClient({ port, token, fetchImpl = globalThis.fetch, timeoutMs = T
      *  `{ status, body }`; 404 means the front runs no Drive tools. */
     async gdriveTool(payload) {
       return call('gdrive/tool', payload, DRIVE_TOOL_WAIT_MS);
+    },
+    /** Track R5: one Offline Wikipedia tool run by the front (kiwix_tools.rs): `{ status, body }`; 404 means the
+     *  front runs none. */
+    async kiwixTool(payload) {
+      return call('kiwix/tool', payload, KIWIX_TOOL_WAIT_MS);
     },
     async gdriveTarget(payload) {
       return call('gdrive/target', payload, DRIVE_TOOL_WAIT_MS);
