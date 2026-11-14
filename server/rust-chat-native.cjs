@@ -33,8 +33,8 @@
 // chat.cjs does with them happens before the cut (the system note, captions or the images' own text, the image
 // parts and their label on the last user message, the warning), so the frame's messages carry them and the
 // executor sends them as it sends attached images; `supervise` (R15) step supervision after a tool round (the
-// supervise op below; the frame says `supervise: true`); `tool-gate` (R15) the tool gate's `require` decision (the frame
-// names the tool in `gate`; its log through the gate-record op), a `prefetch` decision stays here.
+// supervise op below; the frame says `supervise: true`); `tool-gate` (R15) the tool gate's decision (the frame names the
+// tool in `gate`, with `prefetch` arguments for a prefetch; its log through the gate-record op).
 // Without it a turn whose project has instruction skills stays here ('skills'), a coworker turn offering the page
 // save too ('page-save'), every turn while the provenance policy is on ('provenance'), a turn whose tools were
 // narrowed by routing ('narrowed-tools'), one with retrieved images ('retrieved-images'), every turn while step
@@ -343,7 +343,8 @@ function preparedTurn(t) {
     ...(t.supervise === true ? { supervise: true } : {}),
     // The tool gate required this read (features.toolGate, `require` mode, R15): the executor names it in tool_choice
     // on the first model turn and retries once on a miss. Only present then, and only for a front naming `tool-gate`.
-    ...(typeof t.gateTool === 'string' && t.gateTool ? { gate: { tool: t.gateTool } } : {}),
+    // `prefetch`: the arguments of a prefetch decision (the executor runs the read before the model, as prefetchTool).
+    ...(typeof t.gateTool === 'string' && t.gateTool ? { gate: { tool: t.gateTool, ...(t.gatePrefetch ? { prefetch: t.gatePrefetch } : {}) } } : {}),
     // Roadmap E (R15): what more_tools widens to, on a turn whose routed list was narrowed (absent otherwise): the
     // tools, their MCP routes, and which of them are writes, public, project edits or once-only, as for `tools`.
     ...(t.widen && typeof t.widen === 'object' ? { widen: {
@@ -505,9 +506,9 @@ function createToolBridge({ secret, json, readJson, asUser, getProject, executeT
     }
     if (op === 'gate-record') {
       // The tool gate's log for a native turn's required tool (chat.cjs toolGate.record: a retry or a miss).
-      const event = body?.event === 'gate.retry' || body?.event === 'gate.miss' ? body.event : null;
+      const event = ['gate.retry', 'gate.miss', 'prefetch.failed'].includes(body?.event) ? body.event : null;
       const name = text(body?.tool, TOOL_NAME_CAP);
-      if (!event || !name) return json(res, 400, { error: 'event (gate.retry or gate.miss) and tool are required.' });
+      if (!event || !name) return json(res, 400, { error: 'event (gate.retry, gate.miss or prefetch.failed) and tool are required.' });
       try { if (typeof toolGate?.record === 'function') toolGate.record(event, { tool: name }); } catch { /* a log only */ }
       return noContent(res);
     }

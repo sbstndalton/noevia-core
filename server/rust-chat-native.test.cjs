@@ -508,7 +508,7 @@ test('a framed chat with the framing reasoner on hands off unless the tool gate 
   assert.ok(logged.includes('[chat] native executor would also need: tool-gate'), logged.join('|'));
 });
 
-test('a tool gate require decision hands off to a front naming tool-gate with the tool; prefetch stays here (R15)', async (t) => {
+test('a tool gate decision hands off to a front naming tool-gate with the tool (and a prefetch its arguments) (R15)', async (t) => {
   const gated = (decision) => ({ toolGate: { evaluate: async () => ({ decision }), record() {} } });
   const require1 = gated({ tool: 'drive_read_file', mode: 'require' });
   const kept = await runTurn(t, { requested: true, caps: ['supervise'], frames: answer, deps: require1 });
@@ -524,17 +524,19 @@ test('a tool gate require decision hands off to a front naming tool-gate with th
   // No decision: no key.
   const none = await runTurn(t, { requested: true, caps: ['tool-gate'], frames: answer, deps: gated('none') });
   assert.equal('gate' in none.events.at(-1), false);
-  // Prefetch: Node runs the read before the model; the turn stays here.
+  // Prefetch: the executor runs the read before the model, with the decision's arguments.
   const prefetch = await runTurn(t, { requested: true, caps: ['tool-gate'], frames: answer, deps: gated({ tool: 'drive_read_file', mode: 'prefetch', args: { fileId: 'qa-file' } }) });
-  assert.notEqual(prefetch.events.at(-1).type, 'prepared');
+  assert.deepEqual(prefetch.events.at(-1).gate, { tool: 'drive_read_file', prefetch: { fileId: 'qa-file' } });
+  assert.equal(prefetch.requests.length, 0);
   // The op: the gate's log, a retry or a miss only.
   const recorded = [];
   const { call } = bridge({ toolGate: { record: (event, entry) => recorded.push([event, entry]) } });
   const p = `${native.NATIVE_PREFIX}gate-record`;
   assert.equal((await call(p, { user: 'qa-user', event: 'gate.retry', tool: 'drive_read_file' })).status, 204);
   assert.equal((await call(p, { user: 'qa-user', event: 'gate.miss', tool: 'drive_read_file' })).status, 204);
+  assert.equal((await call(p, { user: 'qa-user', event: 'prefetch.failed', tool: 'drive_read_file' })).status, 204);
   for (const bad of [{ event: 'decision', tool: 'x' }, { event: 'gate.miss' }, { event: 'gate.miss', tool: 7 }]) assert.equal((await call(p, { user: 'qa-user', ...bad })).status, 400);
-  assert.deepEqual(recorded, [['gate.retry', { tool: 'drive_read_file' }], ['gate.miss', { tool: 'drive_read_file' }]]);
+  assert.deepEqual(recorded, [['gate.retry', { tool: 'drive_read_file' }], ['gate.miss', { tool: 'drive_read_file' }], ['prefetch.failed', { tool: 'drive_read_file' }]]);
 });
 
 test('frameTooLarge refuses a prepared line longer than the front reads (PREPARED_CAP bytes of UTF-8)', () => {

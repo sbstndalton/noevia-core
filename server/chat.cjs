@@ -1724,9 +1724,10 @@ function createChatHandler({
           // The routed list's more_tools (Roadmap E): the front's executor widens with the list below when it names
           // the `more-tools` capability (R15).
           narrowed: !!routing.narrowed && !handoffCaps.has('more-tools'),
-          // The tool gate: a `require` decision is the executor's (tool_choice, one retry) for a front naming `tool-gate`
-          // (R15); a `prefetch` decision (the read run before the model) stays here.
-          gate: !!(gate && gate.decision !== 'none') && !(handoffCaps.has('tool-gate') && gate.decision.mode === 'require'),
+          // The tool gate's decision is the executor's (tool_choice and one retry; a prefetch runs the read before the
+          // model) for a front naming `tool-gate` (R15). A prefetch the framing reasoner would condense stays here
+          // ('framing-reasoner' above).
+          gate: !!(gate && gate.decision !== 'none') && !handoffCaps.has('tool-gate'),
           // Step supervision: the front's executor asks the supervisor through the bridge when it names `supervise` (R15).
           supervision: supervisingNow && !handoffCaps.has('supervise'),
           injected: injectedEntries.some((e) => e && e.kind === 'file' && typeof e.file !== 'string'),
@@ -1764,8 +1765,10 @@ function createChatHandler({
           message, spaceId, projectId: project?.id, declineEndsReply: !spaceId?.startsWith('diary'), record: !!record, streamIdleMs, compactOnly: body.compactOnly === true,
           sources: native.injectedSources({ injected: injectedEntries, placed: placedEntries, readable: readableFiles, reply: replySources }),
           provenance: provenanceOn, widen, supervise: supervisingNow,
-          // The tool chat.cjs would force below (forcedTool): an offered read the gate required.
-          gateTool: gate && gate.decision !== 'none' && gate.decision.mode === 'require' && allowedToolNames.has(gate.decision.tool) && !isWriteTool(gate.decision.tool) ? gate.decision.tool : null,
+          // The tool chat.cjs would force below (forcedTool: an offered read the gate decided on), and the arguments
+          // it would prefetch it with (a prefetch decision with arguments).
+          gateTool: gate && gate.decision !== 'none' && allowedToolNames.has(gate.decision.tool) && !isWriteTool(gate.decision.tool) ? gate.decision.tool : null,
+          gatePrefetch: gate && gate.decision !== 'none' && gate.decision.mode === 'prefetch' && gate.decision.args ? gate.decision.args : null,
           // #272/#546: the skill state the executor's checks start from; the checks themselves are core's bridges.
           skills: project ? { loaded: [...loadedSkills].map(([file, s]) => ({ file, hash: s.hash, name: s.name })),
             enabled: instructionSkills.list(project).filter((s) => s.status === 'enabled').map((s) => ({ file: s.file, hash: s.hash, name: s.name })),
