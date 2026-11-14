@@ -18,6 +18,7 @@
 // When the model manager does not manage the service (no EMBED_CONTAINER there, or an older image),
 // `managed()` stays false and every caller keeps the pre-#1668 behaviour.
 
+const fs = require('node:fs');
 const POLL_MS = 2000;
 
 /** Two embeddings addresses name the same server: trailing slashes and a trailing /v1 do not count. */
@@ -26,8 +27,14 @@ function sameAddress(a, b) {
   return n(a) === n(b);
 }
 const STALE_MS = 15000;
+// Track R11 (NOEVIA_RUST_EMBEDDING_ADMIN=rust): the Rust front changes the service itself and says so in this file
+// before its PUT (done: false) and after it (done: true); see observeNative(). A change still under way after this
+// long (the PUT's own deadline is 60 s) is no longer taken as one.
+const INTENT_PROTOCOL = 'rust-embedding-service-intent-v1';
+const INTENT_PENDING_MS = 120000;
+const INTENT_MAX_BYTES = 65536;
 
-function createEmbeddingService({ nativeOwner = null, env = process.env, fetchJson, now = Date.now, sleep = (ms) => new Promise((r) => setTimeout(r, ms)), log = (line) => console.info(line) } = {}) {
+function createEmbeddingService({ nativeOwner = null, env = process.env, fetchJson, now = Date.now, sleep = (ms) => new Promise((r) => setTimeout(r, ms)), log = (line) => console.info(line), intentFile = null } = {}) {
   const loaderUrl = String(env.MODEL_LOADER_URL || '').replace(/\/+$/, '');
   const baseUrl = String(env.EMBEDDING_SERVICE_URL || '').trim().replace(/\/+$/, '') || null;
   let last = null; // { at, body }
@@ -42,12 +49,37 @@ function createEmbeddingService({ nativeOwner = null, env = process.env, fetchJs
     }
     for (const name of body?.running?.loaded || []) protection.add(name);
   };
+  // Track R11: the front's change, as this process's own serve() would hold it: the models it asks for are protected
+  // and the status is stale while the PUT runs; once it is done, a native GET from before it (6 s bound, as below)
+  // cannot clear that protection. Only an intent of this start counts; an unreadable or foreign file is none.
+  const start = String(env.NOEVIA_START_ID || '');
+  let intentPending = false;
+  function readIntent() {
+    if (!nativeOwner || !intentFile || !start) return null;
+    try {
+      if (fs.statSync(intentFile).size > INTENT_MAX_BYTES) return null;
+      const i = JSON.parse(fs.readFileSync(intentFile, 'utf8'));
+      if (i?.protocol !== INTENT_PROTOCOL || i.start !== start || !Number.isFinite(i.at) || i.at > now() + 1000 || !Array.isArray(i.models) || typeof i.done !== 'boolean') return null;
+      return i;
+    } catch { return null; }
+  }
+  function observeIntent(s) {
+    const i = readIntent();
+    intentPending = !!i && !i.done && now() - i.at <= INTENT_PENDING_MS;
+    if (!i) return;
+    const models = i.models.filter((e) => e && typeof e === 'object');
+    if (intentPending) { remember({ models }); return; }
+    if (!i.done) return;
+    if (i.at > mutationAt) mutationAt = i.at;
+    if (!(s && Number.isFinite(s.serviceAt) && s.serviceAt > i.at + 6000)) remember({ models });
+  }
   function observeNative() {
     if (!nativeOwner) return;
     const s = nativeOwner.snapshot();
+    observeIntent(s);
     if (!s?.service || !Number.isFinite(s.serviceAt) || s.serviceAt > now()) return;
     // Native timestamps the completed GET. Its 6s bound fences a GET started before PUT.
-    if (mutations || s.serviceAt <= mutationAt + 6000 || (last && s.serviceAt < last.at)) { remember(s.service); return; }
+    if (mutations || intentPending || s.serviceAt <= mutationAt + 6000 || (last && s.serviceAt < last.at)) { remember(s.service); return; }
     last = { at: s.serviceAt, body: s.service };
     if (!s.service.stale && now() - s.serviceAt <= STALE_MS) { protection.clear(); remember(s.service); }
   }
@@ -78,7 +110,7 @@ function createEmbeddingService({ nativeOwner = null, env = process.env, fetchJs
     isAt: (address) => !!baseUrl && sameAddress(address, baseUrl),
     /** True once the model manager has said it manages the service. Sticky for this process. */
     managed: () => { observeNative(); return !!last; },
-    status: () => { observeNative(); return last ? { ...last.body, stale: !!last.body.stale || now() - last.at > STALE_MS || !!mutations, ...(lastError ? { lastError } : {}) } : null; },
+    status: () => { observeNative(); return last ? { ...last.body, stale: !!last.body.stale || now() - last.at > STALE_MS || !!mutations || intentPending, ...(lastError ? { lastError } : {}) } : null; },
     enabled: () => { const s = api.status(); return s ? (s.stale ? null : s.enabled === true) : (nativeOwner ? null : false); },
     protectionKnown: () => !nativeOwner || !!api.status() && !api.status().stale,
     refresh,

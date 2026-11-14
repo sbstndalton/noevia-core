@@ -184,3 +184,76 @@ test('reread: a file damaged at start-up starts embedding off and recovers once 
   frontWrites(f.file, { active: target('qa-embed-c'), next: null, previous: null });
   assert.equal(old.active().model, 'unavailable');
 });
+
+// Track R11: the front's service change, announced in embedding-service-intent.json, protects what it asks for.
+const { createEmbeddingService } = require('./embedding-service.cjs');
+function serviceFixture(t, { intent = true } = {}) {
+  const f = fixture(); t.after(f.cleanup);
+  let clock = 1_000_000, snapshot = null;
+  const intentFile = path.join(f.dir, 'embedding-service-intent.json');
+  const service = createEmbeddingService({ env: { NOEVIA_START_ID: 'qa-start', MODEL_LOADER_URL: 'http://qa-loader.invalid' }, now: () => clock, log() {},
+    nativeOwner: { snapshot: () => snapshot, kick() {} }, fetchJson: async () => { throw Error('no network in tests'); }, intentFile: intent ? intentFile : null });
+  const write = (body) => { fs.writeFileSync(`${intentFile}.tmp`, JSON.stringify(body)); fs.renameSync(`${intentFile}.tmp`, intentFile); };
+  const announce = (models, done, at = clock) => write({ protocol: 'rust-embedding-service-intent-v1', start: 'qa-start', at, models, done });
+  return { service, intentFile, write, announce, now: () => clock, advance: (ms) => { clock += ms; }, seen: (models) => { snapshot = { serviceAt: clock, service: { managed: true, enabled: true, models, running: { loaded: models.map((m) => m.model) } } }; } };
+}
+const OLD = { model: 'qa-embed-old', file: '/models/qa-embed-old.gguf' }, NEW = { model: 'qa-embed-new', file: '/models/qa-embed-new.gguf' };
+
+test('intent: while the front\'s change runs its models are protected and the status is stale', (t) => {
+  const s = serviceFixture(t);
+  s.seen([OLD]);
+  assert.deepEqual([...s.service.protectedNames()].sort(), ['/models/qa-embed-old.gguf', 'qa-embed-old']);
+  assert.equal(s.service.protectionKnown(), true);
+  s.announce([OLD, NEW], false);
+  assert.ok(s.service.protectedNames().has('qa-embed-new'));
+  assert.ok(s.service.protectedNames().has('/models/qa-embed-new.gguf'));
+  assert.equal(s.service.protectionKnown(), false);
+  assert.equal(s.service.enabled(), null);
+  s.advance(1000); s.seen([OLD]); // a native GET during the change cannot clear it
+  assert.ok(s.service.protectedNames().has('qa-embed-new'));
+  assert.equal(s.service.protectionKnown(), false);
+});
+
+test('intent: once done, a native GET from before the change cannot clear its protection; a later one can', (t) => {
+  const s = serviceFixture(t);
+  s.seen([OLD]);
+  s.announce([NEW], false); s.service.protectedNames();
+  s.advance(2000); s.announce([NEW], true);
+  const done = s.now();
+  s.advance(3000); s.seen([OLD]); // started before the PUT ended: within the 6 s bound
+  assert.ok(s.service.protectedNames().has('qa-embed-new'));
+  assert.ok(s.service.protectedNames().has('qa-embed-old'));
+  s.advance(4000); s.seen([NEW]); // past done + 6 s: the service's own answer decides
+  assert.ok(s.now() > done + 6000);
+  assert.deepEqual([...s.service.protectedNames()].sort(), ['/models/qa-embed-new.gguf', 'qa-embed-new']);
+  assert.equal(s.service.protectionKnown(), true);
+  s.advance(1000); s.seen([]); // later answers are not overridden by the old intent
+  assert.deepEqual([...s.service.protectedNames()], []);
+});
+
+test('intent: a change still open after its deadline, another start, a bad file or no switch count for nothing', (t) => {
+  const s = serviceFixture(t);
+  s.seen([OLD]);
+  s.announce([NEW], false, s.now() - 120_001);
+  assert.equal(s.service.protectionKnown(), true);
+  assert.equal(s.service.protectedNames().has('qa-embed-new'), false);
+  for (const body of [{ protocol: 'rust-embedding-service-intent-v1', start: 'other-start', at: s.now(), models: [NEW], done: false },
+    { protocol: 'v0', start: 'qa-start', at: s.now(), models: [NEW], done: false },
+    { protocol: 'rust-embedding-service-intent-v1', start: 'qa-start', at: s.now() + 60_000, models: [NEW], done: false },
+    { protocol: 'rust-embedding-service-intent-v1', start: 'qa-start', at: s.now(), models: 'x', done: false }]) {
+    s.write(body);
+    assert.equal(s.service.protectedNames().has('qa-embed-new'), false, JSON.stringify(body));
+    assert.equal(s.service.protectionKnown(), true, JSON.stringify(body));
+  }
+  fs.writeFileSync(s.intentFile, '{not json');
+  assert.equal(s.service.protectionKnown(), true);
+  const u = serviceFixture(t, { intent: false });
+  u.seen([OLD]); u.announce([NEW], false);
+  assert.equal(u.service.protectedNames().has('qa-embed-new'), false);
+  assert.equal(u.service.protectionKnown(), true);
+});
+
+test('index.cjs hands the intent file to the service only under the switch', () => {
+  const index = fs.readFileSync(path.join(__dirname, 'index.cjs'), 'utf8');
+  assert.match(index, /intentFile: require\('\.\/rust-embedding-admin\.cjs'\)\.frontOwns\(\) \? path\.join\(DATA_DIR, 'embedding-service-intent\.json'\) : null/);
+});

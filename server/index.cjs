@@ -255,7 +255,9 @@ require('./embedding-address.cjs').warnPublicEmbeddingUrl({ inferenceBase: INFER
 const embeddingMigration = require('./embedding-migration.cjs').createEmbeddingMigration({ config: embeddingConfig, rag, nativeOwner: embeddingOwner });
 // #1668: the embedding service as the model manager runs it (which models cowork-embed serves, or
 // off). Refreshed in the background so the delete guard (model-system.cjs) follows it.
-const embeddingService = require('./embedding-service.cjs').install(require('./embedding-service.cjs').createEmbeddingService({ env: process.env, fetchJson, nativeOwner: embeddingOwner }));
+const embeddingService = require('./embedding-service.cjs').install(require('./embedding-service.cjs').createEmbeddingService({ env: process.env, fetchJson, nativeOwner: embeddingOwner,
+  // Track R11: under NOEVIA_RUST_EMBEDDING_ADMIN=rust the front changes the service and announces it here.
+  intentFile: require('./rust-embedding-admin.cjs').frontOwns() ? path.join(DATA_DIR, 'embedding-service-intent.json') : null }));
 // A re-index under way also covers files indexed meanwhile; with none under way nothing runs.
 rag.onIndexed(() => { if (embeddingConfig.next()) embeddingMigration.kick(); });
 
