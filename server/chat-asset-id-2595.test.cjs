@@ -2,7 +2,7 @@
 // #2595: a project image is read from the project's asset directory by its id. An id that is not a plain file name
 // (a path, `..`, `.`, empty, a NUL, a lone surrogate) used to be joined onto that directory, so a hand-edited
 // project record could make a turn read a file outside it and send its bytes to the model. Such an image is now a
-// missing image: never read, named as missing. Synthetic QA data only.
+// missing image, exactly as a file that is gone: never read, logged and named as missing. Synthetic QA data only.
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs'), os = require('node:os'), path = require('node:path');
@@ -62,7 +62,12 @@ test('#2595: an asset id that is not a plain file name is a missing image, never
   const sent = requests.map((r) => r.body).join('\n');
   assert.ok(sent.includes(b64(IMAGE)), 'the plain asset is attached');
   assert.ok(!sent.includes(b64(SECRET)), 'no file outside the asset directory is sent');
-  assert.equal(warned.filter((l) => l.includes('has an id that is not a file name')).length, bad.length, 'each id that is not a file name is refused');
+  // Each refused id is a missing image, exactly as a file that is gone: logged so, and named to the model as missing.
+  assert.equal(warned.filter((l) => l.includes('is listed on project qa-project but its bytes are missing')).length, bad.length, 'each id that is not a file name is refused');
+  const texts = JSON.parse(requests[0].body).messages.filter((m) => typeof m.content === 'string').map((m) => m.content);
+  const missingNote = texts.find((c) => c.startsWith('Images were not read because their stored files are missing: ')) || '';
+  for (let i = 0; i < bad.length; i += 1) assert.ok(missingNote.includes(`qa-bad-${i}.png`), `qa-bad-${i}.png is named as missing`);
+  assert.ok(!missingNote.includes('qa-plain.png'), 'the plain image is not named as missing');
   assert.ok(events.some((e) => e.type === 'done'), 'the turn completes');
 });
 

@@ -903,14 +903,11 @@ function createChatHandler({
     if (projectImages.length) {
       const dir = currentWorkspace().assetDir(project.id);
       for (const asset of projectImages.filter((a) => !namedImageIds || namedImageIds.has(a.id))) {
-        // #2595: only a plain file name of the asset directory is read (uploads.cjs mints `img-<hex>`); any other
-        // id (empty, `.`, `..`, a path, a NUL, a lone surrogate) is a missing image, never a file elsewhere.
-        if (!plainAssetName(asset.id)) {
-          missingImages.push(asset.name);
-          console.warn(`[assets] an image on project ${project.id} has an id that is not a file name; not read`);
-          continue;
-        }
         try {
+          // #2595: only a plain file name of the asset directory is read (uploads.cjs mints `img-<hex>`); any other
+          // id (empty, `.`, `..`, a path, a NUL, a lone surrogate, not text) is a missing image, exactly as a file
+          // that is gone, and never a file elsewhere.
+          if (!plainAssetName(asset.id)) throw new Error('not a file name');
           const bytes = fs.readFileSync(path.join(dir, asset.id));
           loadedImageNames.push(asset.name);
           attachedImages.push({
