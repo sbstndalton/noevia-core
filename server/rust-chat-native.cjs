@@ -502,8 +502,8 @@ function createToolBridge({ secret, json, readJson, asUser, getProject, executeT
     if (op === 'supervise') {
       // chat.cjs's step supervision after a tool round (step-supervision.cjs superviseNextStep), for a native turn:
       // `outputs` the round's last tool and assistant messages as the supervisor reads them ({role, content}: at
-      // most 8, each at most 1500 units), `goal` the turn's message, `wrote` whether a write was about to run in
-      // the round, `goal` the turn's message as the supervisor reads it (its first 1500 units). Answers the
+      // most 8, each at most 1500 units), `wrote` whether a write was about to run in the round, `goal` the turn's
+      // message as the supervisor reads it (its first 1500 units). Answers the
       // supervisor's action: continue, verify (the executor adds the check note) or escalate (the executor pauses
       // the reply). Its log and the decision service stay here.
       const round = Number.isSafeInteger(body?.round) && body.round >= 0 && body.round <= 3 ? body.round : null;
