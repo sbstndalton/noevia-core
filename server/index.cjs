@@ -1403,6 +1403,8 @@ async function handleRequestInner(req, res) {
   if (req.url?.startsWith('/internal/inference-machines/') && await inferenceMachineRoutes(req, res)) return;
   if (require('./rust-calibration-routes.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   if (await calibrationRoutesBridge(req, res)) return;
+  // Track R11: the model manager proxy is the front's under NOEVIA_RUST_MODEL_MANAGER=rust (rust-model-manager-proxy.cjs).
+  if (require('./rust-model-manager-proxy.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   if (require('./rust-model-manager-scan.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   if (await modelManagerScanCache(req, res)) return;
   if (require('./rust-autotune-cancel.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
