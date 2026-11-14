@@ -34,11 +34,14 @@
 // parts and their label on the last user message, the warning), so the frame's messages carry them and the
 // executor sends them as it sends attached images; `supervise` (R15) step supervision after a tool round (the
 // supervise op below; the frame says `supervise: true`); `tool-gate` (R15) the tool gate's decision (the frame names the
-// tool in `gate`, with `prefetch` arguments for a prefetch; its log through the gate-record op).
+// tool in `gate`, with `prefetch` arguments for a prefetch; its log through the gate-record op); `reasoner` (#740, R15)
+// the framing reasoner's packet for the gate's prefetched read on a framed chat (the condense op below; the frame
+// says `reasoner: {kind}`; the opt-in trace through the reasoner-trace op).
 // Without it a turn whose project has instruction skills stays here ('skills'), a coworker turn offering the page
 // save too ('page-save'), every turn while the provenance policy is on ('provenance'), a turn whose tools were
 // narrowed by routing ('narrowed-tools'), one with retrieved images ('retrieved-images'), every turn while step
-// supervision is on ('step-supervision'), and one whose tool gate decided ('tool-gate'). The header is removed either way.
+// supervision is on ('step-supervision'), one whose tool gate decided ('tool-gate'), and a framed chat's prefetch the
+// framing reasoner would condense ('framing-reasoner'). The header is removed either way.
 //
 //   POST /internal/chat/tools/execute  {user, projectId, name, args, allowed, routes, chatKey, exchangeKey, editTarget?, grant?}
 //        -> 200 {text, failed} | {text, failed, notRun: true} | {redeem: 'refused' | 'unavailable' | 'aborted'}
@@ -105,6 +108,11 @@
 //   POST /internal/chat/native/tool-used         {user, name}          -> 204              recordToolUse (track R13): a
 //        tool call the front answered itself (read_project_file behind NOEVIA_RUST_READ_FILE) is counted here, as the
 //        execute bridge counts a call it runs; core stays the usage store's single writer.
+//   POST /internal/chat/native/condense          {user, kind, message, tool, resultText, model} -> 200 {rendered, trace} | {rendered: null}
+//        #740 (R15): the framing reasoner on the gate's prefetched read (chat.cjs prefetchTool's condense); its model,
+//        budget, deadline and log stay here. `trace` is what the reply's trace records ({kind, tool, packet, timings}).
+//   POST /internal/chat/native/reasoner-trace    {user, trace, answerChars, answerMs} -> 204   the person's opt-in
+//        reasoning trace after the reply (chat.cjs: reasoningTraces.append, in their own workspace dir).
 //        the facts the turn reads of the local model manager, the engine's template and the chat lists, through
 //        the same functions chat.cjs calls, while those still live here. health and load answer 409 {enabled:false}
 //        when the local model manager is off; the executor never calls them then (the prepared frame's
@@ -177,7 +185,7 @@ const SCOPE_CAP = 200;
 const USAGE_PATH = '/internal/chat/usage';
 const PREFILL_PATH = '/internal/chat/prefill';
 const NATIVE_PREFIX = '/internal/chat/native/';
-const NATIVE_OPS = new Set(['health', 'load', 'tools-allowed', 'tools-unsupported', 'busy', 'title-auto-named', 'title-save', 'tool-used', 'supervise', 'gate-record']);
+const NATIVE_OPS = new Set(['health', 'load', 'tools-allowed', 'tools-unsupported', 'busy', 'title-auto-named', 'title-save', 'tool-used', 'supervise', 'gate-record', 'condense', 'reasoner-trace']);
 const SKILLS_PREFIX = '/internal/chat/skills/';
 const SKILL_OPS = new Set(['revoked', 'read', 'scrub']);
 const SHA256 = /^[a-f0-9]{64}$/;
@@ -345,6 +353,10 @@ function preparedTurn(t) {
     // on the first model turn and retries once on a miss. Only present then, and only for a front naming `tool-gate`.
     // `prefetch`: the arguments of a prefetch decision (the executor runs the read before the model, as prefetchTool).
     ...(typeof t.gateTool === 'string' && t.gateTool ? { gate: { tool: t.gateTool, ...(t.gatePrefetch ? { prefetch: t.gatePrefetch } : {}) } } : {}),
+    // #740 (R15): the chat's confirmed frame kind, on a turn whose gate prefetch the framing reasoner may condense
+    // (prefetchTool: the condense op, then the packet in place of the raw result). Only present then, and only for a
+    // front naming `reasoner`.
+    ...(typeof t.reasonerKind === 'string' && t.reasonerKind ? { reasoner: { kind: t.reasonerKind } } : {}),
     // Roadmap E (R15): what more_tools widens to, on a turn whose routed list was narrowed (absent otherwise): the
     // tools, their MCP routes, and which of them are writes, public, project edits or once-only, as for `tools`.
     ...(t.widen && typeof t.widen === 'object' ? { widen: {
@@ -410,7 +422,8 @@ function createAsUser({ userRow, runAs, currentWorkspace }) {
  */
 function createToolBridge({ secret, json, readJson, asUser, getProject, executeToolCall, writeTargetFor, recordToolUse, currentWorkspace, currentUser,
   editStorageAccount = () => null, recordUsage = () => {}, recordSample = () => {}, modelManager = null, templateToolsGate = null, chatTitles = null, chatBodyCap = CHAT_BODY_CAP,
-  skillLedger = null, chatWideApproved = null, redeemChatGrant = null, revokeChatGrant = null, stepSupervision = null, toolGate = null, now = () => Date.now(),
+  skillLedger = null, chatWideApproved = null, redeemChatGrant = null, revokeChatGrant = null, stepSupervision = null, toolGate = null,
+  framingReasoner = null, reasoningTraces = null, isWriteTool = () => true, now = () => Date.now(),
   log = (line) => console.warn(line) }) {
   // Execute calls in progress by `${user}\u0000${exchangeKey}`: the abort bridge aborts their signals.
   const running = new Map();
@@ -510,6 +523,36 @@ function createToolBridge({ secret, json, readJson, asUser, getProject, executeT
       const name = text(body?.tool, TOOL_NAME_CAP);
       if (!event || !name) return json(res, 400, { error: 'event (gate.retry, gate.miss or prefetch.failed) and tool are required.' });
       try { if (typeof toolGate?.record === 'function') toolGate.record(event, { tool: name }); } catch { /* a log only */ }
+      return noContent(res);
+    }
+    if (op === 'condense') {
+      // chat.cjs prefetchTool's framing reasoner (#740) for a native turn: the read's reduced result condensed into a
+      // task packet, or null (any skip: off, the frame kind, a write, no model, the budget, the deadline, a bad packet),
+      // when the executor hands on the raw framed result exactly as before. The frame is the chat's confirmed one
+      // (storedFrame only returns confirmed frames); the answer model is the turn's local one.
+      const kind = text(body?.kind, 40), tool = text(body?.tool, TOOL_NAME_CAP), model = text(body?.model, MODEL_CAP);
+      const message = text(body?.message, CHAT_BODY_CAP), resultText = text(body?.resultText, CHAT_BODY_CAP);
+      if (!kind || !tool || model === null || message === null || resultText === null) return json(res, 400, { error: 'kind, tool, model, message and resultText are required.' });
+      if (!framingReasoner || typeof framingReasoner.condense !== 'function') return json(res, 200, { rendered: null });
+      const signal = callerGone(req, res);
+      const r = await framingReasoner.condense({ frame: { kind, confirmed: true }, message, tool, resultText, isWriteTool,
+        answerModel: model, answerIsLocal: true, signal });
+      if (!r?.ok || typeof r.rendered !== 'string') return json(res, 200, { rendered: null });
+      return json(res, 200, { rendered: r.rendered, trace: { kind, tool, packet: r.packet, timings: { ...r.timings } } });
+    }
+    if (op === 'reasoner-trace') {
+      // chat.cjs after the reply (#740): the person's own opt-in trace of a handed-on packet, in their workspace dir.
+      // Packet, answer length, timings only; a trace never changes the reply.
+      const trace = body?.trace;
+      const ok = plain(trace) && text(trace.kind, 40) && text(trace.tool, TOOL_NAME_CAP) && plain(trace.timings)
+        && Number.isSafeInteger(body?.answerChars) && body.answerChars >= 0 && Number.isFinite(body?.answerMs) && body.answerMs >= 0;
+      if (!ok) return json(res, 400, { error: 'trace, answerChars and answerMs are required.' });
+      try {
+        const dir = currentWorkspace()?.dir;
+        if (reasoningTraces && dir && reasoningTraces.enabled(dir)) {
+          reasoningTraces.append(dir, { kind: trace.kind, tool: trace.tool, packet: trace.packet, timings: { ...trace.timings, answerMs: body.answerMs }, answerChars: body.answerChars });
+        }
+      } catch { /* a trace never changes the reply */ }
       return noContent(res);
     }
     if (op === 'supervise') {

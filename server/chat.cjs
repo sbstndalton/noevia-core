@@ -1684,6 +1684,8 @@ function createChatHandler({
       const native = require('./rust-chat-native.cjs');
       // Reading what the refusal looks at must never fail the turn: an input that throws keeps the turn here.
       let why, refusalInput = null, provenanceOn = false, widen = null, supervisingNow = false;
+      // #740: a framed chat whose gate decided to prefetch: prefetchTool hands the read to the framing reasoner.
+      const reasonerOnPrefetch = !!(framingReasoner && chatFrame && gate && gate.decision !== 'none' && gate.decision.mode === 'prefetch');
       try {
         supervisingNow = nativeHandoff.supervising() === true;
         if (provenancePolicy) { try { provenanceOn = provenancePolicy.enabled() === true; } catch { provenanceOn = true; } }
@@ -1719,8 +1721,8 @@ function createChatHandler({
           // #769: the front's executor runs the policy's write checks when it names the `provenance` capability (R15).
           provenance: provenanceOn && !handoffCaps.has('provenance'),
           // #740: the framing reasoner acts after the cut only on the tool gate's prefetch (prefetchTool's condense and
-          // its trace), so it keeps a turn here only when the gate decided to prefetch (which keeps it here anyway).
-          framingReasoner: !!(framingReasoner && chatFrame && gate && gate.decision !== 'none' && gate.decision.mode === 'prefetch'),
+          // its trace): the front's executor asks it through the condense op when it names `reasoner` (R15).
+          framingReasoner: reasonerOnPrefetch && !handoffCaps.has('reasoner'),
           // The routed list's more_tools (Roadmap E): the front's executor widens with the list below when it names
           // the `more-tools` capability (R15).
           narrowed: !!routing.narrowed && !handoffCaps.has('more-tools'),
@@ -1769,6 +1771,8 @@ function createChatHandler({
           // it would prefetch it with (a prefetch decision with arguments).
           gateTool: gate && gate.decision !== 'none' && allowedToolNames.has(gate.decision.tool) && !isWriteTool(gate.decision.tool) ? gate.decision.tool : null,
           gatePrefetch: gate && gate.decision !== 'none' && gate.decision.mode === 'prefetch' && gate.decision.args ? gate.decision.args : null,
+          // #740: the chat frame's kind the condense op hands the reasoner (prefetchTool's `frame`).
+          reasonerKind: reasonerOnPrefetch ? chatFrame.kind : null,
           // #272/#546: the skill state the executor's checks start from; the checks themselves are core's bridges.
           skills: project ? { loaded: [...loadedSkills].map(([file, s]) => ({ file, hash: s.hash, name: s.name })),
             enabled: instructionSkills.list(project).filter((s) => s.status === 'enabled').map((s) => ({ file: s.file, hash: s.hash, name: s.name })),

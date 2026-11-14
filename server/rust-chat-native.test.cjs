@@ -506,6 +506,54 @@ test('a framed chat with the framing reasoner on hands off unless the tool gate 
   assert.notEqual(kept.events.at(-1).type, 'prepared');
   assert.ok(logged.includes('[chat] native executor not used for this turn: framing-reasoner'), logged.join('|'));
   assert.ok(logged.includes('[chat] native executor would also need: tool-gate'), logged.join('|'));
+  assert.equal(condensed.length, 1, 'Node condensed its own prefetch');
+  condensed.length = 0;
+  // A front naming `reasoner` and `tool-gate` gets it, with the frame's kind for the condense op (R15).
+  const both = await runTurn(t, { requested: true, caps: ['tool-gate', 'reasoner'], frames: answer, project: framed, deps: gated });
+  assert.equal(both.events.at(-1).type, 'prepared');
+  assert.deepEqual(both.events.at(-1).reasoner, { kind: 'search' });
+  assert.equal(condensed.length, 0, 'nothing condensed before the cut');
+  // Without a gate decision: no key, even for a front naming `reasoner`.
+  const plainHanded = await runTurn(t, { requested: true, caps: ['reasoner'], frames: answer, project: framed, deps: reasoner });
+  assert.equal('reasoner' in plainHanded.events.at(-1), false);
+});
+
+test('the condense op asks the framing reasoner as prefetchTool does; reasoner-trace appends the opt-in trace (#740, R15)', async () => {
+  const asked = [];
+  const reasoner = (out) => ({ condense: async (input) => { asked.push(input); return out; } });
+  const p = `${native.NATIVE_PREFIX}condense`;
+  const body = { user: 'qa-user', kind: 'search', message: 'QA find the plan', tool: 'drive_read_file', resultText: 'QA plan text.', model: 'qa-model' };
+  const packet = { facts: [{ text: 'QA fact', source: 'drive_read_file' }] };
+  const ok = { ok: true, packet, rendered: 'QA rendered packet', timings: { reasonerMs: 12 } };
+  const { call } = bridge({ framingReasoner: reasoner(ok), isWriteTool: (n) => n === 'drive_create_file' });
+  const r = await call(p, body);
+  assert.equal(r.status, 200);
+  assert.deepEqual(r.body, { rendered: 'QA rendered packet', trace: { kind: 'search', tool: 'drive_read_file', packet, timings: { reasonerMs: 12 } } });
+  const seen = asked[0];
+  assert.deepEqual({ ...seen, isWriteTool: typeof seen.isWriteTool, signal: typeof seen.signal },
+    { frame: { kind: 'search', confirmed: true }, message: 'QA find the plan', tool: 'drive_read_file', resultText: 'QA plan text.', isWriteTool: 'function', answerModel: 'qa-model', answerIsLocal: true, signal: 'object' });
+  assert.equal(seen.isWriteTool('drive_create_file'), true, 'the guard reads core\'s own write list');
+  // A skip, or no reasoner at all: null (the raw result goes on).
+  assert.deepEqual((await bridge({ framingReasoner: reasoner({ ok: false, reason: 'budget' }) }).call(p, body)).body, { rendered: null });
+  assert.deepEqual((await bridge().call(p, body)).body, { rendered: null });
+  for (const bad of [{ kind: 7 }, { tool: '' }, { message: null }, { resultText: 3 }, { model: 'm'.repeat(401) }]) {
+    assert.equal((await call(p, { ...body, ...bad })).status, 400, JSON.stringify(bad));
+  }
+  // The trace: appended only when the person opted in, in their own workspace dir.
+  const appended = [];
+  const traces = (on) => ({ enabled: (dir) => { appended.push(['enabled', dir]); return on; }, append: (dir, entry) => appended.push(['append', dir, entry]) });
+  const t = `${native.NATIVE_PREFIX}reasoner-trace`;
+  const trace = { kind: 'search', tool: 'drive_read_file', packet, timings: { reasonerMs: 12 } };
+  const on = bridge({ reasoningTraces: traces(true), currentWorkspace: () => ({ dir: '/qa/ws', userId: 'qa-user' }) });
+  assert.equal((await on.call(t, { user: 'qa-user', trace, answerChars: 42, answerMs: 7 })).status, 204);
+  assert.deepEqual(appended, [['enabled', '/qa/ws'], ['append', '/qa/ws', { kind: 'search', tool: 'drive_read_file', packet, timings: { reasonerMs: 12, answerMs: 7 }, answerChars: 42 }]]);
+  appended.length = 0;
+  const off = bridge({ reasoningTraces: traces(false), currentWorkspace: () => ({ dir: '/qa/ws', userId: 'qa-user' }) });
+  assert.equal((await off.call(t, { user: 'qa-user', trace, answerChars: 42, answerMs: 7 })).status, 204);
+  assert.deepEqual(appended, [['enabled', '/qa/ws']]);
+  for (const bad of [{ trace: null }, { trace: { ...trace, timings: 1 } }, { answerChars: -1 }, { answerChars: 1.5 }, { answerMs: 'x' }]) {
+    assert.equal((await on.call(t, { user: 'qa-user', trace, answerChars: 42, answerMs: 7, ...bad })).status, 400, JSON.stringify(bad));
+  }
 });
 
 test('a tool gate decision hands off to a front naming tool-gate with the tool (and a prefetch its arguments) (R15)', async (t) => {

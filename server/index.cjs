@@ -1002,6 +1002,7 @@ const chatStepSupervision = require('./step-supervision.cjs').createStepSupervis
   provider: {decide:(...args)=>{const backend=decisionSettings.backend();if(!backend)throw Error('Decision service unavailable');return backend.supervise(...args);}}, deadlineMs:1500,
 });
 const chatNativeTools = require('./rust-chat-native.cjs').createToolBridge({ secret: FRONT_SECRET, json, readJson, asUser: chatNativeAsUser, skillLedger: chatSkillLedger, stepSupervision: chatStepSupervision, toolGate,
+  framingReasoner, reasoningTraces, isWriteTool: (name) => isWriteTool(name),
   getProject: (id) => getProject(id), executeToolCall: (...args) => executeToolCall(...args), writeTargetFor: chatWriteTargetFor, editStorageAccount: chatEditStorageAccount,
   recordToolUse: (...args) => recordToolUse(...args), currentWorkspace: () => currentWorkspace(), currentUser: () => requestScope.getStore()?.authn?.user || null,
   recordUsage: (...args) => recordUsage(...args), recordSample: (...args) => prefill.recordSample(...args),
