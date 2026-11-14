@@ -10,7 +10,17 @@ const ID = 'offline-wikipedia';
 const decode = (s) => String(s).replace(/<!\[CDATA\[([\s\S]*?)\]\]>/g, '$1').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&#39;|&apos;/g, "'").replace(/&amp;/g, '&');
 const tag = (xml, name) => { const m = xml.match(new RegExp(`<${name}[^>]*>([\\s\\S]*?)</${name}>`)); return m ? decode(m[1]).trim() : ''; };
 
-function createKiwixTools({ baseUrl, fetchImpl = fetch, cap = 8000, timeoutMs = 10000 }) {
+/** Track R5: what the model is told when the Rust front could not run an Offline Wikipedia tool (both only read). */
+const NATIVE_UNAVAILABLE = 'ERROR: offline Wikipedia is unavailable right now. Try again in a moment.';
+/** How long a 404 (a front that runs no Offline Wikipedia tools) keeps this process running them itself. */
+const NATIVE_RECHECK_MS = 60 * 1000;
+
+/**
+ * @param {{ enabled(): boolean, tool(payload): Promise<{ status, body }> }} [native] track R5: the Rust front's
+ *   Offline Wikipedia tools (`POST /v1/kiwix/tool`, noevia-rs kiwix_tools.rs). While `enabled()`
+ *   (NOEVIA_RUST_KIWIX_TOOLS=1) a call is the front's; a 404 (a front that runs none) leaves it to this process.
+ */
+function createKiwixTools({ baseUrl, fetchImpl = fetch, cap = 8000, timeoutMs = 10000, native = null, now = Date.now, warn = console.warn }) {
   const base = new URL(baseUrl);
   if (!['http:', 'https:'].includes(base.protocol) || base.username || base.password || base.search) throw Error('KIWIX_URL must be a plain http(s) origin');
   const origin = base.origin + base.pathname.replace(/\/+$/, '');
@@ -48,12 +58,31 @@ function createKiwixTools({ baseUrl, fetchImpl = fetch, cap = 8000, timeoutMs = 
     }
     return undefined;
   }
+  let nativeOffUntil = 0;
+  const nativeOn = () => !!native && now() >= nativeOffUntil && native.enabled();
+  const NOT_NATIVE = Symbol('not native');
+  /** The front's answer: its text, undefined for a name that is not one of its tools, or NOT_NATIVE after a 404. */
+  async function viaFront(name, args) {
+    let answer;
+    try { answer = await native.tool({ name, arguments: args, cap }); } catch { return NATIVE_UNAVAILABLE; }
+    if (answer && answer.status === 404) {
+      warn('[kiwix] NOEVIA_RUST_KIWIX_TOOLS is on here, but the front runs no Offline Wikipedia tools: this process runs them for a minute');
+      nativeOffUntil = now() + NATIVE_RECHECK_MS;
+      return NOT_NATIVE;
+    }
+    if (!answer || answer.status !== 200 || !answer.body || typeof answer.body !== 'object') return NATIVE_UNAVAILABLE;
+    const { text } = answer.body;
+    return typeof text === 'string' ? text : text === null ? undefined : NATIVE_UNAVAILABLE;
+  }
   return {
     box: { id: ID, label: 'Offline Wikipedia', description: 'Search and read the offline Wikipedia copy on this server. Read-only.', source: 'builtin', tools: schemas, reads: schemas.map((s) => s.function.name) },
     names: new Set(schemas.map((s) => s.function.name)),
-    execute: async (name, args) => { try { return await execute(name, args); } catch (e) { return `ERROR: ${String(e.message || e).slice(0, 200)}`; } },
+    execute: async (name, args) => {
+      if (nativeOn()) { const r = await viaFront(name, args); if (r !== NOT_NATIVE) return r; }
+      try { return await execute(name, args); } catch (e) { return `ERROR: ${String(e.message || e).slice(0, 200)}`; }
+    },
   };
 }
 function decodeURIComponentSafe(s) { try { return decodeURIComponent(s); } catch { return s; } }
 
-module.exports = { createKiwixTools, ID };
+module.exports = { createKiwixTools, ID, NATIVE_UNAVAILABLE, NATIVE_RECHECK_MS };
