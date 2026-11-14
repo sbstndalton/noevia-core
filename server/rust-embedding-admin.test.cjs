@@ -328,3 +328,36 @@ test('reread: the seeded-address guard does not say "in use" when a damaged file
   assert.equal(lines.some((l) => /in use/.test(l)), false, lines.join('\n'));
   assert.match(config.damaged, /cannot be read/);
 });
+
+test('seeded-address guard: the next address is reported in use when it comes back, even beside a refused active one', async () => {
+  const { guardSeededAddresses } = require('./embedding-address.cjs');
+  const config = createEmbeddingConfig({ env: { EMBEDDING_MODEL: 'qa-embed-a', EMBEDDING_BASE_URL: 'http://8.8.8.8:8080', EMBEDDING_NEXT_MODEL: 'qa-embed-b', EMBEDDING_NEXT_BASE_URL: 'http://qa-embed-next.invalid:8080' }, log() {} });
+  const lines = [];
+  const answers = { 'http://8.8.8.8:8080': { ok: false, transient: false, reason: 'qa public' }, 'http://qa-embed-next.invalid:8080': { ok: false, transient: true, reason: 'qa not resolved yet' } };
+  const pending = [];
+  await guardSeededAddresses(config, { check: async (url) => answers[url], log: (l) => lines.push(l), sleep: async () => {}, schedule: (fn) => { pending.push(fn); }, retryDelaysMs: [], recheckMs: 1 });
+  assert.equal(config.next(), null);
+  answers['http://qa-embed-next.invalid:8080'] = { ok: true };
+  for (const fn of pending.splice(0)) await fn();
+  assert.equal(config.next().model, 'qa-embed-b');
+  assert.ok(lines.some((l) => /EMBEDDING_NEXT_BASE_URL .* in use/.test(l)), lines.join('\n'));
+});
+
+test('reread: the seeded-address guard does not say "in use" when a saved file arrives while it waits on DNS', async (t) => {
+  const f = fixture(); t.after(f.cleanup);
+  const { guardSeededAddresses } = require('./embedding-address.cjs');
+  const config = createEmbeddingConfig({ env: { EMBEDDING_MODEL: 'qa-embed-a', EMBEDDING_BASE_URL: 'http://qa-embed.invalid' }, stateFile: f.file, reread: true, log() {} });
+  const lines = [];
+  let resolved = false;
+  let again = null;
+  const check = async () => {
+    if (!resolved) return { ok: false, transient: true, reason: 'qa not resolved yet' };
+    frontWrites(f.file, { active: target('qa-embed-b', { baseUrl: 'http://10.0.0.9:8080' }), next: null, previous: null });
+    return { ok: true };
+  };
+  await guardSeededAddresses(config, { check, log: (l) => lines.push(l), sleep: async () => {}, schedule: (fn) => { again = fn; }, retryDelaysMs: [], recheckMs: 1 });
+  resolved = true;
+  await again();
+  assert.equal(lines.some((l) => /in use/.test(l)), false, lines.join('\n'));
+  assert.equal(config.active().model, 'qa-embed-b');
+});

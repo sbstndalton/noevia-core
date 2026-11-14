@@ -73,8 +73,14 @@ async function guardSeededAddresses(config, { check = checkEmbeddingAddress, log
       if (config.get().source !== 'environment') return; // an administrator has chosen since: the seed no longer matters
       try {
         const next = await check(url);
-        // Not "in use" when the release changed nothing (a saved or damaged file decides now: track R11's reread).
-        if (next.ok) { config.releaseSeeded(which); if (!config.damaged) log(`[embedding] ${label} resolves to this network now; in use.`); return; }
+        // "In use" only when the release put the value back: not when a saved or damaged file decides now (track R11's
+        // reread can bring one in while this check waits on DNS).
+        if (next.ok) {
+          const before = JSON.stringify(config.get()[which] ?? null);
+          const after = config.releaseSeeded(which);
+          if (after?.source === 'environment' && JSON.stringify(after[which] ?? null) !== before) log(`[embedding] ${label} resolves to this network now; in use.`);
+          return;
+        }
         if (!next.transient) {
           log(`[embedding] ${label} refused: ${next.reason}. The embeddings server must be on this network.`);
           config.refuseSeeded({ [which]: `${label} refused: ${next.reason}` });
