@@ -45,9 +45,9 @@ const DRIVE_TOOL_WAIT_MS = 330000;
 /** Track R14: one project text write on the front, which may wait 30 s for the project's source lock and then write to storage. */
 const TEXT_WRITE_WAIT_MS = 330000;
 const REPLY_CAP = 2 * 32 * 1024 * 1024 + 64 * 1024;
+const TEXT_WRITE_OPTIONS = ['expectName', 'expectContent', 'expectAttachment', 'adoptTo', 'adoptAccount'];
 // providers.json (sbstndalton/noevia#2190 round 6) is the account's private provider rows: the Rust
 // front's routes are its writer; Node saves only its seal-on-load migration here.
-const TEXT_WRITE_OPTIONS = ['expectName', 'expectContent', 'expectAttachment', 'adoptTo', 'adoptAccount'];
 const FILES = new Set(['projects.json', 'free-chats.json', 'providers.json']);
 const PRESET_BASELINE_OPS = new Set(['session', 'begin', 'settle', 'invalidate', 'verdict', 'router-text']);
 
@@ -279,11 +279,19 @@ function createClient({ port, token, fetchImpl = globalThis.fetch, timeoutMs = T
     async textWrite(user, project, name, text, options = {}) {
       const body = { user, project, name, text };
       for (const key of TEXT_WRITE_OPTIONS) if (options && options[key] !== undefined) body[key] = options[key];
-      const { status, body: reply } = await call('projects/text-write', body, TEXT_WRITE_WAIT_MS);
+      // After the request left, only the front's own answer says what happened: a timeout, a reset, a
+      // 5xx it did not answer itself or an unreadable 200 may follow a write that landed
+      // (`TEXT_WRITE_UNKNOWN`). The front's refusals before any write (400, 401, its 503, an empty 404
+      // from a front without the op) are `TEXT_WRITE_NOT_TAKEN`.
+      const unknown = () => Object.assign(new Error('the project store did not confirm the write'), { code: 'TEXT_WRITE_UNKNOWN' });
+      let status, reply;
+      try { ({ status, body: reply } = await call('projects/text-write', body, TEXT_WRITE_WAIT_MS)); }
+      catch (err) { if (err && err.name === 'AbortError') throw err; throw unknown(); }
       if (status === 200 && reply && reply.file && typeof reply.file === 'object') return reply.file;
-      if (status === 200 && reply && typeof reply.error === 'string') throw new Error(reply.error);
-      if (status === 404) throw Object.assign(new Error('account no longer exists'), { status: 410 });
-      throw failure(status, reply);
+      if (status === 200 && reply && typeof reply.error === 'string') throw Object.assign(new Error(reply.error), { code: 'TEXT_WRITE_REFUSED' });
+      if (status === 404 && reply && reply.error === 'no such account') throw Object.assign(new Error('account no longer exists'), { status: 410 });
+      if ([400, 401, 404, 503].includes(status)) return Promise.reject(Object.assign(failure(status, reply), { code: 'TEXT_WRITE_NOT_TAKEN' }));
+      throw unknown();
     },
     /** sbstndalton/noevia#2190 round 6: re-seals the provider keys in the files the front alone
      *  writes, in one pass per file under its lock (`scope`: `user`, `shared` or `all`), with the

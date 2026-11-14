@@ -622,8 +622,30 @@ function createProjectStore({
       const options = {};
       for (const key of Object.keys(given)) if (given[key] !== undefined) options[key] = given[key];
       return withSourceLock(project, async () => {
-        const file = await nativeTextWrite(currentWorkspace().userId, project.id, name, text, options);
-        currentWorkspace().refreshChatLists?.();
+        const workspace = currentWorkspace();
+        // The front wrote projects.json: take it in before anything here reads the list (the cleanup
+        // after the lock prunes uploads by it). A refresh is skipped while one of this workspace's
+        // own saves is queued, so those settle first; a refresh that fails never turns a landed
+        // write into an error.
+        const settle = async () => {
+          for (let i = 0; i < 5; i += 1) {
+            const pending = typeof workspace.pendingStoreWrites === 'function' ? workspace.pendingStoreWrites() : null;
+            if (!pending) break;
+            try { await pending; } catch { /* the workspace logs and drops its failed save */ }
+          }
+          try { workspace.refreshChatLists?.(); } catch (err) { console.warn('[projects] could not take in the project list after a text write:', err.message); }
+        };
+        let file;
+        try { file = await nativeTextWrite(workspace.userId, project.id, name, text, options); }
+        catch (err) {
+          await settle();
+          if (err && err.code === 'TEXT_WRITE_UNKNOWN') {
+            const what = typeof options.adoptTo === 'string' && options.adoptTo ? options.adoptTo : typeof options.expectName === 'string' && options.expectName ? options.expectName : name;
+            throw new Error(`The connection to noevia's project store failed while saving "${what}", so noevia cannot tell whether it was saved. Outcome unknown: sync this project's Sources to check whether it was saved before trying again.`);
+          }
+          throw err;
+        }
+        await settle();
         return file;
       });
     }

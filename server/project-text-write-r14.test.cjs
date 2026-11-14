@@ -47,19 +47,21 @@ test('textWrite with no options sends the four base keys only', async () => {
   assert.deepEqual(calls[0].payload, { user: 'qa-user', project: 'qa-project', name: 'qa.md', text: '' });
 });
 
-test('textWrite maps 200 error, 404, 503 and other statuses', async () => {
+test('textWrite maps the front\'s answers: refused, account gone, not taken, unknown', async () => {
   await assert.rejects(client(200, { error: '"qa.md" changed while this edit was being made; nothing was saved.' }).c.textWrite('u', 'p', 'qa.md', 't'),
-    (err) => err.message === '"qa.md" changed while this edit was being made; nothing was saved.' && err.status === undefined);
+    (err) => err.message === '"qa.md" changed while this edit was being made; nothing was saved.' && err.code === 'TEXT_WRITE_REFUSED');
   await assert.rejects(client(404, { error: 'no such account' }).c.textWrite('u', 'p', 'qa.md', 't'),
     (err) => err.status === 410 && err.message === 'account no longer exists');
-  await assert.rejects(client(503, { code: 'PROJECTS_BUSY' }).c.textWrite('u', 'p', 'qa.md', 't'),
-    (err) => err.status === 503 && err.code === 'PROJECTS_BUSY');
-  for (const status of [400, 401, 500]) {
-    await assert.rejects(client(status, { error: 'nope' }).c.textWrite('u', 'p', 'qa.md', 't'),
-      (err) => err.status === 500 && err.code === 'PROJECT_STORE_FAILED' && err.message.includes(String(status)));
+  // An empty 404 is a front without the op (a pairing fault), never "account gone".
+  await assert.rejects(client(404, {}).c.textWrite('u', 'p', 'qa.md', 't'), (err) => err.code === 'TEXT_WRITE_NOT_TAKEN' && err.status !== 410);
+  for (const status of [400, 401, 503]) {
+    await assert.rejects(client(status, { error: 'unavailable' }).c.textWrite('u', 'p', 'qa.md', 't'), (err) => err.code === 'TEXT_WRITE_NOT_TAKEN');
   }
-  // A 200 with neither a file nor an error is a failure, not a silent success.
-  await assert.rejects(client(200, {}).c.textWrite('u', 'p', 'qa.md', 't'), (err) => err.code === 'PROJECT_STORE_FAILED');
+  // After the request left: the outcome is unknown.
+  await assert.rejects(client(500, { error: 'internal error' }).c.textWrite('u', 'p', 'qa.md', 't'), (err) => err.code === 'TEXT_WRITE_UNKNOWN');
+  await assert.rejects(client(200, {}).c.textWrite('u', 'p', 'qa.md', 't'), (err) => err.code === 'TEXT_WRITE_UNKNOWN');
+  const reset = createClient({ port: 12345, token: TOKEN, fetchImpl: async () => { throw new TypeError('fetch failed'); } });
+  await assert.rejects(reset.textWrite('u', 'p', 'qa.md', 't'), (err) => err.code === 'TEXT_WRITE_UNKNOWN');
 });
 
 function storeWith(nativeTextWrite) {
@@ -67,7 +69,8 @@ function storeWith(nativeTextWrite) {
   const touched = [];
   const refreshed = [];
   const guard = (name) => new Proxy({}, { get(_t, prop) { touched.push(`${name}.${String(prop)}`); return () => { throw new Error(`${name} must not be used`); }; } });
-  const workspace = { userId: 'qa-user', projects: [project], freeChats: [], revoked: false, assertActive() {}, refreshChatLists() { refreshed.push(true); } };
+  const workspace = { userId: 'qa-user', projects: [project], freeChats: [], revoked: false, assertActive() {}, pending: null,
+    pendingStoreWrites() { return this.pending; }, refreshChatLists() { refreshed.push(this.pending === null ? 'settled' : 'early'); if (this.failRefresh) throw new Error('refresh failed'); } };
   const store = createProjectStore({
     fs, path, reasoningEffort: { validEffort: () => true }, projectAppearance: () => ({}), rag: guard('rag'),
     storageClient: guard('storageClient'), documentSources: { prune() {} }, authService: guard('authService'),
@@ -76,7 +79,7 @@ function storeWith(nativeTextWrite) {
     createProjectFolder: async () => null, projectSweep: { afterDelete: async () => {} },
     ...(nativeTextWrite === undefined ? {} : { nativeTextWrite }),
   });
-  return { store, project, touched, refreshed };
+  return { store, project, touched, refreshed, workspace };
 }
 
 test('writeProjectTextFile with nativeTextWrite hands over the defined options, returns its file and touches nothing else', async () => {
@@ -94,7 +97,7 @@ test('writeProjectTextFile with nativeTextWrite hands over the defined options, 
   assert.deepEqual(calls[1][4], {});
 });
 
-test('writeProjectTextFile with nativeTextWrite keeps core\'s source lock and does not refresh after a refusal', async () => {
+test('writeProjectTextFile with nativeTextWrite keeps core\'s source lock', async () => {
   const order = [];
   let release;
   const gate = new Promise((r) => { release = r; });
@@ -114,7 +117,30 @@ test('writeProjectTextFile with nativeTextWrite keeps core\'s source lock and do
   assert.deepEqual(order, ['start qa-first.md', 'end qa-first.md', 'other source operation']);
   assert.equal(refreshed.length, 1);
   await assert.rejects(store.writeProjectTextFile(project, 'qa-bad.md', 'b'), /refusal for the model/);
-  assert.equal(refreshed.length, 1);
+});
+
+test('after a native write core takes the front\'s list in once its own queued saves settled, and a failed refresh is not the write\'s failure', async () => {
+  let release;
+  const { store, project, refreshed, workspace } = storeWith(async () => {
+    workspace.pending = new Promise((r) => { release = () => { workspace.pending = null; r(); }; });
+    setImmediate(() => release());
+    return { name: 'qa.md' };
+  });
+  await store.writeProjectTextFile(project, 'qa.md', 't');
+  assert.deepEqual(refreshed, ['settled']);
+  workspace.failRefresh = true;
+  const file = await store.writeProjectTextFile(project, 'qa.md', 't');
+  assert.deepEqual(file, { name: 'qa.md' });
+});
+
+test('a write whose outcome is unknown says so (and still takes the list in); a refusal passes unchanged', async () => {
+  const { store, project, refreshed } = storeWith(async (_u, _p, name) => {
+    throw Object.assign(new Error(name === 'qa-gone.md' ? 'x' : 'refusal text'), { code: name === 'qa-gone.md' ? 'TEXT_WRITE_UNKNOWN' : 'TEXT_WRITE_REFUSED' });
+  });
+  await assert.rejects(store.writeProjectTextFile(project, 'qa-gone.md', 't', { expectName: 'Text/qa-gone.md' }),
+    /^Error: The connection to noevia's project store failed while saving "Text\/qa-gone\.md".*Outcome unknown/);
+  await assert.rejects(store.writeProjectTextFile(project, 'qa-other.md', 't'), /^Error: refusal text$/);
+  assert.equal(refreshed.length, 2);
 });
 
 test('without nativeTextWrite (null or absent) writeProjectTextFile takes its own path', async () => {
