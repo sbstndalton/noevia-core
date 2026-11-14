@@ -37,6 +37,14 @@ test('publication payload preserves lone surrogates as data, not a command selec
  const s=service(),token=s.modelScanSnapshot().token;assert.equal((await bridge({op:'publish',ask:{token,bodyJson:'{"models":["m\\ud800"]}'},s})).body.applied,true);
  assert.equal(s.modelScanCache.get('models').body.models[0],'m\ud800');assert.equal((await bridge({ask:{url:'http://other'}})).status,400);
 });
+test('clear (#2550) starts a new generation for the front: the cached scan goes, an older token cannot publish, extra keys are refused',async()=>{
+ const s=service();s.modelScanCache.set('models',{at:1,body:{models:['old']}});const before=s.modelScanSnapshot().token;
+ assert.deepEqual(await bridge({op:'clear',s}),{status:200,body:{cleared:true}});
+ assert.equal(s.modelScanCache.get('models'),undefined);assert.equal(s.modelScanCache.generation(),1);
+ assert.equal(s.publishModelScan({models:['stale']},before).applied,false);
+ assert.equal((await bridge({op:'clear',ask:{token:'0'.repeat(64)},s})).status,400);assert.equal(s.modelScanCache.generation(),1);
+ assert.equal((await bridge({op:'clear',peer:'192.0.2.1',s})).status,404);assert.equal(s.modelScanCache.generation(),1);
+});
 test('public refusal owns only exact GET, leaving HEAD, other methods and prefix paths alone',()=>{
  const {refuseOwned}=require('./rust-model-manager-scan.cjs');let sent;
  const deps={parseRequestUrl:req=>new URL(req.url,'http://synthetic'),json:(_r,status,body)=>{sent={status,body};}};
