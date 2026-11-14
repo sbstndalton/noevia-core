@@ -444,6 +444,8 @@ const FREE_CHATS = arrayProxy('freeChats');
 
 // Usage accounting (daily rollups per tenant) lives in usage.cjs; its routes in routes/usage.cjs.
 const { USAGE_RETENTION_DAYS, usageDayKey, readUsage, recordUsage, recordToolUse } = require('./usage.cjs');
+// Track R12: NOEVIA_RUST_USAGE_WRITES=1 (off by default) makes the Rust front the usage file's only writer.
+if (process.env.NOEVIA_RUST_USAGE_WRITES === '1') require('./usage.cjs').useFront((user, record) => PROJECT_STORE.usageRecord(user, record));
 
 // D9: read-only offline Wikipedia box, only with features.kiwix and an internal KIWIX_URL.
 // Track R5: NOEVIA_RUST_KIWIX_TOOLS=1 (off by default) hands the Offline Wikipedia tools to the Rust front.
@@ -518,6 +520,7 @@ const projectStore = require('./projects.cjs').createProjectStore({
   fs, path, reasoningEffort, projectAppearance, rag, storageClient, documentSources, authService, currentWorkspace,
   PROJECTS, FREE_CHATS, sanitizeToolboxes: (boxes) => sanitizeToolboxes(boxes), defaultToolboxes: () => DEFAULT_TOOLBOXES,
   PROJECT_ROOT_FOLDER, createProjectFolder, projectSweep, onProjectsChanged: (userId) => projectsChangedElsewhere(userId),
+  nativeTextWrite: process.env.NOEVIA_RUST_PROJECT_WRITE === '1' ? (user, projectId, name, text, options) => PROJECT_STORE.textWrite(user, projectId, name, text, options) : null,
 });
 const {
   saveProjects, getProject, sanitizeChats, loadChats, saveChats, deleteChat, saveFreeChats, deleteFreeChat, createProject,

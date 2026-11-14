@@ -42,9 +42,12 @@ const MCP_START_WAIT_MS = 120000;
 const MCP_CALL_WAIT_MS = 330000;
 /** Track R5: one Drive tool on the front, which gives each call 300 s in all and then answers itself. */
 const DRIVE_TOOL_WAIT_MS = 330000;
+/** Track R14: one project text write on the front, which may wait 30 s for the project's source lock and then write to storage. */
+const TEXT_WRITE_WAIT_MS = 330000;
 // Track R5: the front's Offline Wikipedia fetch stops at 10 s; this waits a little longer than that.
 const KIWIX_TOOL_WAIT_MS = 30000;
 const REPLY_CAP = 2 * 32 * 1024 * 1024 + 64 * 1024;
+const TEXT_WRITE_OPTIONS = ['expectName', 'expectContent', 'expectAttachment', 'adoptTo', 'adoptAccount'];
 // providers.json (sbstndalton/noevia#2190 round 6) is the account's private provider rows: the Rust
 // front's routes are its writer; Node saves only its seal-on-load migration here.
 const FILES = new Set(['projects.json', 'free-chats.json', 'providers.json']);
@@ -270,6 +273,30 @@ function createClient({ port, token, fetchImpl = globalThis.fetch, timeoutMs = T
       if (status === 200 && body && typeof body.saved === 'boolean') return { saved: body.saved };
       throw failure(status, body);
     },
+    /** Track R14: the internal project tools' text write (project_create_file, project_append_file,
+     *  project_replace_text) as one store op on the front. `options` carries expectName, expectContent,
+     *  expectAttachment, adoptTo and adoptAccount; a key is sent only when its value is not undefined
+     *  (null stays null). The front answers { file } (the source record as saved) or { error } (a
+     *  message written for the model, thrown unchanged); 404 is a removed account. */
+    async textWrite(user, project, name, text, options = {}) {
+      const body = { user, project, name, text };
+      for (const key of TEXT_WRITE_OPTIONS) if (options && options[key] !== undefined) body[key] = options[key];
+      // After the request left, only the front's own answer says what happened: a timeout, a reset, a
+      // 5xx it did not answer itself or an unreadable 200 may follow a write that landed
+      // (`TEXT_WRITE_UNKNOWN`). The front's refusals before any write (400, 401, its 503, an empty 404
+      // from a front without the op) are `TEXT_WRITE_NOT_TAKEN`.
+      const unknown = () => Object.assign(new Error('the project store did not confirm the write'), { code: 'TEXT_WRITE_UNKNOWN' });
+      const notTaken = (status) => Object.assign(new Error(`noevia's project store could not take this write right now (${status}); nothing was saved. Try again shortly.`), { status: 503, code: 'TEXT_WRITE_NOT_TAKEN' });
+      let status, reply;
+      try { ({ status, body: reply } = await call('projects/text-write', body, TEXT_WRITE_WAIT_MS)); }
+      // A refused connection never reached the front: nothing was written.
+      catch (err) { if (err && err.cause && err.cause.cause && err.cause.cause.code === 'ECONNREFUSED') throw notTaken(503); throw unknown(); }
+      if (status === 200 && reply && reply.file && typeof reply.file === 'object') return reply.file;
+      if (status === 200 && reply && typeof reply.error === 'string') throw Object.assign(new Error(reply.error), { code: 'TEXT_WRITE_REFUSED' });
+      if (status === 404 && reply && reply.error === 'no such account') throw Object.assign(new Error('account no longer exists'), { status: 410 });
+      if ([400, 401, 404, 503].includes(status)) throw notTaken(status);
+      throw unknown();
+    },
     /** sbstndalton/noevia#2190 round 6: re-seals the provider keys in the files the front alone
      *  writes, in one pass per file under its lock (`scope`: `user`, `shared` or `all`), with the
      *  current and the previous key. { ok: true, tables, failures } (counts per file; a row that
@@ -403,6 +430,17 @@ function createClient({ port, token, fetchImpl = globalThis.fetch, timeoutMs = T
     async gdriveDisconnect(user, admin) {
       const { status, body } = await call('gdrive/disconnect', { user, admin: admin === true }, CHATGPT_WAIT_MS);
       return status === 200 && body?.ok === true ? { ok: true } : chatgptRefusal(status, body);
+    },
+    /** Track R12 (NOEVIA_RUST_USAGE_WRITES=1, usage.cjs useFront): one usage record for `user`, made by the
+     *  front, the file's only writer then. `{ kind: 'reply', model, usage }` or `{ kind: 'tool', name }`.
+     *  Resolves to what the front did ('written', 'nothing', 'skipped'), or 'unsupported' for a front without the op;
+     *  throws when it could not be asked. */
+    async usageRecord(user, record) {
+      const { status, body } = await call('usage/record', { user, ...record });
+      if (status === 200 && body && body.ok === true) return body.recorded;
+      // A front without the op (older than this core): the caller writes the record itself.
+      if (status === 404) return 'unsupported';
+      throw failure(status, body);
     },
     /** secrets:rotate (round 7 review): the front re-seals every account's token file under the current
      *  secrets.key, under its own fence. { ok: true, counts: { current, rotated, empty, failed } } or a refusal
