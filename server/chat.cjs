@@ -1691,12 +1691,16 @@ function createChatHandler({
         // What more_tools would widen to (below, in the round loop), for a front that runs it: the project's whole
         // selection, resolved now. `asked`: each name the resolution read the account's policy for (`blocked`), in
         // order, with its answer, so the executor makes the same reads when the model widens.
+        // A resolution that throws keeps the turn here ('refusal-input'), the other reasons still logged.
+        let widenFailed = false;
         if (routing.narrowed && handoffCaps.has('more-tools')) {
-          const asked = [];
-          const full = resolveTools(asSelection(selectedBoxes), model, (n) => { const b = blocked(n) === true; asked.push([n, isWriteTool(n) === true, b]); return b; }, ...measuredOn());
-          const fullNames = full.tools.map((t) => t.function?.name).filter((n) => typeof n === 'string');
-          widen = { tools: full.tools, routes: [...(full.routes || [])], writes: fullNames.filter((n) => isWriteTool(n)), public: fullNames.filter((n) => isPublicTool(n)),
-            editTools: fullNames.filter((n) => projectEditTool(n)), onceTools: fullNames.filter((n) => specialistPageSave.neverStanding(n)), asked };
+          try {
+            const asked = [];
+            const full = resolveTools(asSelection(selectedBoxes), model, (n) => { const b = blocked(n) === true; asked.push([n, isWriteTool(n) === true, b]); return b; }, ...measuredOn());
+            const fullNames = full.tools.map((t) => t.function?.name).filter((n) => typeof n === 'string');
+            widen = { tools: full.tools, routes: [...(full.routes || [])], writes: fullNames.filter((n) => isWriteTool(n)), public: fullNames.filter((n) => isPublicTool(n)),
+              editTools: fullNames.filter((n) => projectEditTool(n)), onceTools: fullNames.filter((n) => specialistPageSave.neverStanding(n)), asked };
+          } catch { widen = null; widenFailed = true; }
         }
         // The tools the turn may offer: the list as sent, and what more_tools widens to.
         const mayOffer = widen ? [...activeTools, ...widen.tools] : activeTools;
@@ -1723,7 +1727,7 @@ function createChatHandler({
           // does not run it yet. It answers for a call that cannot parse only when it is on and the tool has a schema.
           streamGuard: mayOffer.some((t) => egressRules.validateToolArguments(t.function?.name, '\u0000') !== null),
         };
-        why = native.refusal(refusalInput);
+        why = native.refusal(refusalInput) || (widenFailed ? 'refusal-input' : null);
       } catch (error) {
         why = 'refusal-input';
         console.warn(`[chat] native executor refusal inputs could not be read: ${String(error?.message || error).slice(0, 200)}`);

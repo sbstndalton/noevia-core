@@ -54,7 +54,7 @@ async function runTurn(t, { handoff = null, requested = false, caps = [], superv
     autoRoles: () => null, lastLoadedModel: () => null, classifyFastOrSmart: async () => 'fast', servedCatalogue: async () => [], modelsInstalled: async () => [],
     missingRoles: () => [], staleRolesError: () => null, visionProbe: async () => ({ supported: false, reason: 'none' }), visionDescriptions: new Map(), skillsIndexFor: () => [],
     chatSkillRouter: { select: async () => ({ loaded: [] }) }, chatToolRouter: { select: async (ids) => ({ ids, routed: false }) },
-    ...toolbox, oauthServerIds: () => new Set(), accountReady: () => true,
+    ...toolbox, ...(typeof deps.wrapResolve === 'function' ? { resolveTools: deps.wrapResolve(toolbox.resolveTools) } : {}), oauthServerIds: () => new Set(), accountReady: () => true,
     grantContext: async (raw) => grantFixture.context(raw, { holder: { kind: 'absent' } }), chatWideApproved: () => false, awaitApproval: async () => 'approve',
     recordUsage() {}, recordToolUse() {}, sourceWaitMs: 0,
     nativeHandoff: handoff || (requested ? { requested: () => true, capabilities: () => new Set(caps), supervising: () => supervising } : null),
@@ -430,6 +430,22 @@ test('a turn whose routed tools were narrowed hands off only to a front naming m
   finally { console.log = log; egress.setToolArgumentSchema('drive_read_file', null); egress.__setStreamGuardEnabledForTests(false); }
   assert.equal(guarded.requests.length, 1, 'Node ran the turn');
   assert.ok(guardLog.includes('[chat] native executor not used for this turn: stream-guard'));
+  // A resolution of the widened list that throws keeps the turn here; the other reasons are still logged.
+  // (The preparation resolves the routed list once; the widened list is the next resolution.)
+  let resolutions = 0;
+  const failing = { ...narrow, wrapResolve: (real) => (...a) => { resolutions += 1; if (resolutions === 2) throw new Error('QA resolve'); return real(...a); } };
+  const failLog = [];
+  console.log = (line) => failLog.push(String(line));
+  let failed;
+  try { failed = await runTurn(t, { requested: true, caps: ['more-tools'], frames: answer, deps: failing }); } finally { console.log = log; }
+  assert.equal(resolutions >= 2, true);
+  assert.equal(failed.requests.length, 1, 'Node ran the turn');
+  assert.ok(failLog.includes('[chat] native executor not used for this turn: refusal-input'), failLog.join('|'));
+  resolutions = 0;
+  const failBoth = [];
+  console.log = (line) => failBoth.push(String(line));
+  try { await runTurn(t, { requested: true, caps: ['more-tools'], supervising: true, frames: answer, deps: failing }); } finally { console.log = log; }
+  assert.ok(failBoth.includes('[chat] native executor not used for this turn: step-supervision'), failBoth.join('|'));
   // Not narrowed (or the router off): no `widen` key, the frame earlier executors read.
   const plain = await runTurn(t, { requested: true, caps: ['more-tools'], frames: answer });
   assert.equal(plain.events.at(-1).type, 'prepared');
