@@ -994,7 +994,17 @@ const chatNativeAsUser = require('./rust-chat-native.cjs').createAsUser({
 // #546: the skill ledger (every skill version put in front of a model, per account), one per process: chat.cjs and the
 // native executor's skill bridges record into and scrub from the same one.
 const chatSkillLedger = require('./skill-history.cjs').createSkillHistory({ fs, path });
-const chatNativeTools = require('./rust-chat-native.cjs').createToolBridge({ secret: FRONT_SECRET, json, readJson, asUser: chatNativeAsUser, skillLedger: chatSkillLedger,
+// Step supervision (features.stepSupervision): the one supervisor chat.cjs asks after a tool round, and the native
+// turn asks through the bridge (R15). Its functions read the settings when called.
+const chatStepSupervision = require('./step-supervision.cjs').createStepSupervision({
+  enabled: () => features.enabled('stepSupervision'),
+  log: (entry) => recordDecision('supervise', entry),
+  getDeadlineMs:()=>decisionSettings.get().timeoutMs,
+  provider: {decide:(...args)=>{const backend=decisionSettings.backend();if(!backend)throw Error('Decision service unavailable');return backend.supervise(...args);}}, deadlineMs:1500,
+});
+const chatNativeTools = require('./rust-chat-native.cjs').createToolBridge({ secret: FRONT_SECRET, json, readJson, asUser: chatNativeAsUser, skillLedger: chatSkillLedger, stepSupervision: chatStepSupervision, toolGate,
+  // chat.cjs's write test: the coworker page save is always a write there (#2446).
+  framingReasoner, reasoningTraces, isWriteTool: (name) => require('./specialist-page-save.cjs').neverStanding(name) || isWriteTool(name),
   getProject: (id) => getProject(id), executeToolCall: (...args) => executeToolCall(...args), writeTargetFor: chatWriteTargetFor, editStorageAccount: chatEditStorageAccount,
   recordToolUse: (...args) => recordToolUse(...args), currentWorkspace: () => currentWorkspace(), currentUser: () => requestScope.getStore()?.authn?.user || null,
   recordUsage: (...args) => recordUsage(...args), recordSample: (...args) => prefill.recordSample(...args),
@@ -1019,12 +1029,7 @@ afterNativeReady(() => { for (const f of features.describe()) {
 let sensitivityBackend = null, sensitivityDecisions = null;
 // ── Chat: the loop lives in chat.cjs; everything it needs is handed over here ──
 const { handleChat } = require('./chat.cjs').createChatHandler({
-  stepSupervision: require('./step-supervision.cjs').createStepSupervision({
-    enabled: () => features.enabled('stepSupervision'),
-    log: (entry) => recordDecision('supervise', entry),
-    getDeadlineMs:()=>decisionSettings.get().timeoutMs,
-    provider: {decide:(...args)=>{const backend=decisionSettings.backend();if(!backend)throw Error('Decision service unavailable');return backend.supervise(...args);}}, deadlineMs:1500,
-  }),
+  stepSupervision: chatStepSupervision,
   recordOutcome: (entry) => recordDecision('outcome', entry),
   chatMachines,
   codeTasksFor: (project) => codeService.list(currentWorkspace(), project),
