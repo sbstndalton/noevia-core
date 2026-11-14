@@ -26,11 +26,39 @@ const DETAIL_CODE = /^[a-z][a-z0-9-]{0,39}$/;
 const str = (v) => (typeof v === 'string' ? v : '');
 const count = (v) => (typeof v === 'number' && Number.isFinite(v) ? v : undefined);
 
+// The largest array index (2^32 - 2): a larger integer key is an ordinary property of an Array.
+const MAX_ARRAY_INDEX = 4294967294;
+
+/** #2544: an Array's element/property behaviour for the tool steps, without its holes. */
+function createSteps() {
+  const elements = new Map();
+  const properties = new Map();
+  let length = 0;
+  const sorted = () => [...elements.keys()].sort((a, b) => a - b);
+  return {
+    length: () => length,
+    get: (at) => (at <= MAX_ARRAY_INDEX ? elements.get(at) : properties.get(at)),
+    set(at, step) {
+      if (at > MAX_ARRAY_INDEX) { properties.set(at, step); return; }
+      elements.set(at, step);
+      if (at >= length) length = at + 1;
+    },
+    // `array.findIndex(fn)` over the elements (a hole never matches): the index, or -1.
+    findIndex(fn) { for (const at of sorted()) if (fn(elements.get(at))) return at; return -1; },
+    // `array.filter(Boolean)`: the elements in index order (a step is always an object).
+    listed: () => sorted().map((at) => elements.get(at)),
+  };
+}
+
 /** Follows one reply's stream events and builds the transcript entry the client would have saved. */
 function createTurnRecord({ now = Date.now } = {}) {
   const startedAt = now();
   let content = '', reasoning = '', narration = '', model, routingDecision, routeTarget, sources, stats, paused, failed = false;
-  const tools = [];
+  // #2544: the tool steps by the event's array index. Kept in a Map, not an Array: an index a provider sends as
+  // 4294967294 made the array sparse with a length of about 4.3 billion, and every listing walked its holes and
+  // stalled the process. Same rules as the array it replaces: an index up to 2^32-2 is an element (counted in the
+  // length, listed in index order); a larger one is a property of the array, never listed or counted.
+  const tools = createSteps();
   function observe(ev) {
     if (!ev || typeof ev !== 'object') return;
     switch (ev.type) {
@@ -64,23 +92,23 @@ function createTurnRecord({ now = Date.now } = {}) {
         content += str(ev.text);
         break;
       case 'tool': {
-        const at = Number.isInteger(ev.index) && ev.index >= 0 ? ev.index : tools.length;
-        tools[at] = { name: str(ev.name) || 'tool', args: str(ev.args), status: 'running' };
+        const at = Number.isInteger(ev.index) && ev.index >= 0 ? ev.index : tools.length();
+        tools.set(at, { name: str(ev.name) || 'tool', args: str(ev.args), status: 'running' });
         break;
       }
       case 'tool_pending': {
-        const at = Number.isInteger(ev.index) && ev.index >= 0 ? ev.index : Math.max(0, tools.length - 1);
-        tools[at] = { name: str(ev.name) || 'tool', args: str(ev.args), status: 'pending',
+        const at = Number.isInteger(ev.index) && ev.index >= 0 ? ev.index : Math.max(0, tools.length() - 1);
+        tools.set(at, { name: str(ev.name) || 'tool', args: str(ev.args), status: 'pending',
           ...(str(ev.target) ? { target: ev.target } : {}),
-          ...(ev.targetKind === 'drive' || ev.targetKind === 'drive-new' ? { targetKind: ev.targetKind } : {}) };
+          ...(ev.targetKind === 'drive' || ev.targetKind === 'drive-new' ? { targetKind: ev.targetKind } : {}) });
         break;
       }
       case 'tool_result': {
-        let at = Number.isInteger(ev.index) && ev.index >= 0 ? ev.index : tools.findIndex((t) => t && t.name === ev.name);
-        if (at < 0) at = tools.length;
-        const previous = tools[at];
+        let at = Number.isInteger(ev.index) && ev.index >= 0 ? ev.index : tools.findIndex((t) => t.name === ev.name);
+        if (at < 0) at = tools.length();
+        const previous = tools.get(at);
         const target = str(ev.target) || previous?.target;
-        tools[at] = {
+        tools.set(at, {
           name: str(ev.name) || previous?.name || 'tool',
           args: previous ? previous.args : '',
           result: str(ev.text).slice(0, TOOL_RESULT_LIMIT),
@@ -88,7 +116,7 @@ function createTurnRecord({ now = Date.now } = {}) {
           ...(target ? { target } : {}),
           ...(previous?.targetKind ? { targetKind: previous.targetKind } : {}),
           ...(ev.applied === true ? { applied: true } : {}),
-        };
+        });
         break;
       }
       case 'paused': {
@@ -111,7 +139,7 @@ function createTurnRecord({ now = Date.now } = {}) {
   /** The reply as it stood when the client went away, or null when there is nothing to keep. */
   function assistantEntry() {
     // Nothing still runs or waits for approval once the request is gone (settleToolCalls in the client).
-    const calls = tools.filter(Boolean).map((c) => (c.status === 'done' || c.status === 'denied' ? c : { ...c, status: 'stopped' }));
+    const calls = tools.listed().map((c) => (c.status === 'done' || c.status === 'denied' ? c : { ...c, status: 'stopped' }));
     const applied = calls.filter((c) => c.applied === true).length;
     if (failed) {
       // A failed reply is not kept, except as the record of the changes it saved (#658).
