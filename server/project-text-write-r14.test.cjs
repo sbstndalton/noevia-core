@@ -53,7 +53,7 @@ test('textWrite maps the front\'s answers: refused, account gone, not taken, unk
   await assert.rejects(client(404, { error: 'no such account' }).c.textWrite('u', 'p', 'qa.md', 't'),
     (err) => err.status === 410 && err.message === 'account no longer exists');
   // An empty 404 is a front without the op (a pairing fault), never "account gone".
-  await assert.rejects(client(404, {}).c.textWrite('u', 'p', 'qa.md', 't'), (err) => err.code === 'TEXT_WRITE_NOT_TAKEN' && err.status !== 410);
+  await assert.rejects(client(404, {}).c.textWrite('u', 'p', 'qa.md', 't'), (err) => err.code === 'TEXT_WRITE_NOT_TAKEN' && err.status !== 410 && /nothing was saved/.test(err.message));
   for (const status of [400, 401, 503]) {
     await assert.rejects(client(status, { error: 'unavailable' }).c.textWrite('u', 'p', 'qa.md', 't'), (err) => err.code === 'TEXT_WRITE_NOT_TAKEN');
   }
@@ -62,24 +62,28 @@ test('textWrite maps the front\'s answers: refused, account gone, not taken, unk
   await assert.rejects(client(200, {}).c.textWrite('u', 'p', 'qa.md', 't'), (err) => err.code === 'TEXT_WRITE_UNKNOWN');
   const reset = createClient({ port: 12345, token: TOKEN, fetchImpl: async () => { throw new TypeError('fetch failed'); } });
   await assert.rejects(reset.textWrite('u', 'p', 'qa.md', 't'), (err) => err.code === 'TEXT_WRITE_UNKNOWN');
+  // A refused connection never reached the front.
+  const refused = createClient({ port: 12345, token: TOKEN, fetchImpl: async () => { throw new TypeError('fetch failed', { cause: Object.assign(new Error('connect ECONNREFUSED'), { code: 'ECONNREFUSED' }) }); } });
+  await assert.rejects(refused.textWrite('u', 'p', 'qa.md', 't'), (err) => err.code === 'TEXT_WRITE_NOT_TAKEN' && /nothing was saved/.test(err.message));
 });
 
 function storeWith(nativeTextWrite) {
   const project = { id: 'qa-project', name: 'QA Project', files: [], chats: [] };
   const touched = [];
   const refreshed = [];
+  const prunes = [];
   const guard = (name) => new Proxy({}, { get(_t, prop) { touched.push(`${name}.${String(prop)}`); return () => { throw new Error(`${name} must not be used`); }; } });
   const workspace = { userId: 'qa-user', projects: [project], freeChats: [], revoked: false, assertActive() {}, pending: null,
-    pendingStoreWrites() { return this.pending; }, refreshChatLists() { refreshed.push(this.pending === null ? 'settled' : 'early'); if (this.failRefresh) throw new Error('refresh failed'); } };
+    pendingStoreWrites() { return this.pending; }, refreshChatLists() { refreshed.push(this.pending === null ? 'settled' : 'early'); if (this.onRefresh) this.onRefresh(); if (this.failRefresh) throw new Error('refresh failed'); } };
   const store = createProjectStore({
     fs, path, reasoningEffort: { validEffort: () => true }, projectAppearance: () => ({}), rag: guard('rag'),
-    storageClient: guard('storageClient'), documentSources: { prune() {} }, authService: guard('authService'),
+    storageClient: guard('storageClient'), documentSources: { prune(_w, live) { prunes.push((live.files || []).map((f) => f.name)); } }, authService: guard('authService'),
     currentWorkspace: () => workspace, PROJECTS: workspace.projects, FREE_CHATS: workspace.freeChats,
     sanitizeToolboxes: (b) => b, defaultToolboxes: () => ['core'], PROJECT_ROOT_FOLDER: 'root',
     createProjectFolder: async () => null, projectSweep: { afterDelete: async () => {} },
     ...(nativeTextWrite === undefined ? {} : { nativeTextWrite }),
   });
-  return { store, project, touched, refreshed, workspace };
+  return { store, project, touched, refreshed, workspace, prunes };
 }
 
 test('writeProjectTextFile with nativeTextWrite hands over the defined options, returns its file and touches nothing else', async () => {
@@ -138,9 +142,30 @@ test('a write whose outcome is unknown says so (and still takes the list in); a 
     throw Object.assign(new Error(name === 'qa-gone.md' ? 'x' : 'refusal text'), { code: name === 'qa-gone.md' ? 'TEXT_WRITE_UNKNOWN' : 'TEXT_WRITE_REFUSED' });
   });
   await assert.rejects(store.writeProjectTextFile(project, 'qa-gone.md', 't', { expectName: 'Text/qa-gone.md' }),
-    /^Error: The connection to noevia's project store failed while saving "Text\/qa-gone\.md".*Outcome unknown/);
+    /^Error: noevia's project store did not confirm saving "Text\/qa-gone\.md".*Outcome unknown/);
   await assert.rejects(store.writeProjectTextFile(project, 'qa-other.md', 't'), /^Error: refusal text$/);
   assert.equal(refreshed.length, 2);
+});
+
+test('the cleanup after a native write prunes by the front\'s list, and is skipped once after an unconfirmed write', async () => {
+  let unknown = false;
+  const { store, project, prunes, workspace } = storeWith(async (_u, _p, name) => {
+    if (unknown) throw Object.assign(new Error('x'), { code: 'TEXT_WRITE_UNKNOWN' });
+    return { name };
+  });
+  workspace.onRefresh = () => { workspace.projects[0] = { ...project, files: [{ name: 'Text/qa-new.md', attachment: { id: 'a'.repeat(64) } }] }; };
+  await store.writeProjectTextFile(project, 'qa-new.md', 't');
+  await new Promise((r) => setImmediate(r));
+  assert.deepEqual(prunes, [['Text/qa-new.md']]);
+  unknown = true;
+  await assert.rejects(store.writeProjectTextFile(project, 'qa-two.md', 't', { expectName: 'qa-two.md', adoptTo: 'Root/Text/qa-two.md' }),
+    /did not confirm saving "Root\/Text\/qa-two\.md"/);
+  await new Promise((r) => setImmediate(r));
+  assert.equal(prunes.length, 1, 'no cleanup after an unconfirmed write');
+  unknown = false;
+  await store.writeProjectTextFile(project, 'qa-three.md', 't');
+  await new Promise((r) => setImmediate(r));
+  assert.equal(prunes.length, 2, 'the next one cleans up');
 });
 
 test('without nativeTextWrite (null or absent) writeProjectTextFile takes its own path', async () => {

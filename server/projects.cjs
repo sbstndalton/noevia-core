@@ -546,6 +546,9 @@ function createProjectStore({
   }
   function pruneDocumentsNow(project) {
     if (sourceOperations.has(sourceLockKey(project))) return;
+    // Track R14: a front-side text write whose outcome is unknown may still be storing its original;
+    // this cleanup would delete it as unlisted. The next source operation's cleanup runs as usual.
+    if (unconfirmedTextWrites.delete(sourceLockKey(project))) return;
     const workspace = currentWorkspace();
     // The live record for this id, not the (possibly superseded) object the caller held: a
     // rebuilt project list must not make a stale reference look deleted and prune everything.
@@ -614,6 +617,8 @@ function createProjectStore({
   // PUT is create-only with If-None-Match, so a file appearing in between is not overwritten).
   // `adoptAccount` is the storage account (project-edit-target.storageAccount) the move was approved
   // for; with any other account connected now the write is refused.
+  // Projects (source-lock keys) whose last front-side text write was not confirmed (see pruneDocumentsNow).
+  const unconfirmedTextWrites = new Set();
   function writeProjectTextFile(project, name, text, { expectName, expectContent, expectAttachment, adoptTo, adoptAccount } = {}) {
     // Track R14 (NOEVIA_RUST_PROJECT_WRITE=1): the front does the whole write; core keeps its own
     // lock around it so its other source operations still wait, then re-reads the lists the front wrote.
@@ -628,11 +633,14 @@ function createProjectStore({
         // own saves is queued, so those settle first; a refresh that fails never turns a landed
         // write into an error.
         const settle = async () => {
+          let settled = false;
           for (let i = 0; i < 5; i += 1) {
             const pending = typeof workspace.pendingStoreWrites === 'function' ? workspace.pendingStoreWrites() : null;
-            if (!pending) break;
+            if (!pending) { settled = true; break; }
             try { await pending; } catch { /* the workspace logs and drops its failed save */ }
           }
+          // Still queued: the refresh below is skipped, and the queued save merges the front's list in.
+          if (!settled) console.warn('[projects] saves were still queued after a text write; the project list is taken in by the next one');
           try { workspace.refreshChatLists?.(); } catch (err) { console.warn('[projects] could not take in the project list after a text write:', err.message); }
         };
         let file;
@@ -640,8 +648,9 @@ function createProjectStore({
         catch (err) {
           await settle();
           if (err && err.code === 'TEXT_WRITE_UNKNOWN') {
+            unconfirmedTextWrites.add(sourceLockKey(project));
             const what = typeof options.adoptTo === 'string' && options.adoptTo ? options.adoptTo : typeof options.expectName === 'string' && options.expectName ? options.expectName : name;
-            throw new Error(`The connection to noevia's project store failed while saving "${what}", so noevia cannot tell whether it was saved. Outcome unknown: sync this project's Sources to check whether it was saved before trying again.`);
+            throw new Error(`noevia's project store did not confirm saving "${what}", so noevia cannot tell whether it was saved. Outcome unknown: sync this project's Sources to check whether it was saved before trying again.`);
           }
           throw err;
         }

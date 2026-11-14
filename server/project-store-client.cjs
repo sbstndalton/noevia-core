@@ -284,13 +284,15 @@ function createClient({ port, token, fetchImpl = globalThis.fetch, timeoutMs = T
       // (`TEXT_WRITE_UNKNOWN`). The front's refusals before any write (400, 401, its 503, an empty 404
       // from a front without the op) are `TEXT_WRITE_NOT_TAKEN`.
       const unknown = () => Object.assign(new Error('the project store did not confirm the write'), { code: 'TEXT_WRITE_UNKNOWN' });
+      const notTaken = (status) => Object.assign(new Error(`noevia's project store could not take this write right now (${status}); nothing was saved. Try again shortly.`), { status: 503, code: 'TEXT_WRITE_NOT_TAKEN' });
       let status, reply;
       try { ({ status, body: reply } = await call('projects/text-write', body, TEXT_WRITE_WAIT_MS)); }
-      catch (err) { if (err && err.name === 'AbortError') throw err; throw unknown(); }
+      // A refused connection never reached the front: nothing was written.
+      catch (err) { if (err && err.cause && err.cause.cause && err.cause.cause.code === 'ECONNREFUSED') throw notTaken(503); throw unknown(); }
       if (status === 200 && reply && reply.file && typeof reply.file === 'object') return reply.file;
       if (status === 200 && reply && typeof reply.error === 'string') throw Object.assign(new Error(reply.error), { code: 'TEXT_WRITE_REFUSED' });
       if (status === 404 && reply && reply.error === 'no such account') throw Object.assign(new Error('account no longer exists'), { status: 410 });
-      if ([400, 401, 404, 503].includes(status)) return Promise.reject(Object.assign(failure(status, reply), { code: 'TEXT_WRITE_NOT_TAKEN' }));
+      if ([400, 401, 404, 503].includes(status)) throw notTaken(status);
       throw unknown();
     },
     /** sbstndalton/noevia#2190 round 6: re-seals the provider keys in the files the front alone
