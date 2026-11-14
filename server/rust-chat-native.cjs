@@ -96,9 +96,10 @@
 //   POST /internal/chat/native/tool-used         {user, name}          -> 204              recordToolUse (track R13): a
 //        tool call the front answered itself (read_project_file behind NOEVIA_RUST_READ_FILE) is counted here, as the
 //        execute bridge counts a call it runs; core stays the usage store's single writer.
-//   POST /internal/chat/native/runtime           {user}                -> 200 {node, icu, tz} this process's
-//        process.versions (track R5): the front answers get_current_time itself (NOEVIA_RUST_CURRENT_TIME) only
-//        while this Node's ICU and tz data are the ones its recording was made with.
+//   POST /internal/chat/native/runtime           {user}                -> 200 {node, icu, tz, zone} this
+//        process's process.versions and its resolved zone (Intl.DateTimeFormat().resolvedOptions().timeZone, ''
+//        when none) (track R5): the front answers get_current_time itself (NOEVIA_RUST_CURRENT_TIME) only while
+//        this Node's ICU and tz data are the ones its recording was made with, in the zone this process uses.
 //        the facts the turn reads of the local model manager, the engine's template and the chat lists, through
 //        the same functions chat.cjs calls, while those still live here. health and load answer 409 {enabled:false}
 //        when the local model manager is off; the executor never calls them then (the prepared frame's
@@ -479,7 +480,9 @@ function createToolBridge({ secret, json, readJson, asUser, getProject, executeT
     }
     if (op === 'runtime') {
       const v = (k) => (typeof process.versions[k] === 'string' ? process.versions[k] : null);
-      return json(res, 200, { node: v('node'), icu: v('icu'), tz: v('tz') });
+      let zone = '';
+      try { zone = String(Intl.DateTimeFormat().resolvedOptions().timeZone ?? ''); } catch { zone = ''; }
+      return json(res, 200, { node: v('node'), icu: v('icu'), tz: v('tz'), zone });
     }
     if (op === 'tool-used') {
       const name = text(body?.name, TOOL_NAME_CAP);
