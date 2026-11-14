@@ -1690,11 +1690,30 @@ function createChatHandler({
     if (handoff) {
       const native = require('./rust-chat-native.cjs');
       // Reading what the refusal looks at must never fail the turn: an input that throws keeps the turn here.
-      let why, refusalInput = null, provenanceOn = false;
+      let why, refusalInput = null, provenanceOn = false, widen = null, supervisingNow = false;
+      // #740: a framed chat whose gate decided to prefetch: prefetchTool hands the read to the framing reasoner.
+      const reasonerOnPrefetch = !!(framingReasoner && chatFrame && gate && gate.decision !== 'none' && gate.decision.mode === 'prefetch');
       try {
+        supervisingNow = nativeHandoff.supervising() === true;
         if (provenancePolicy) { try { provenanceOn = provenancePolicy.enabled() === true; } catch { provenanceOn = true; } }
         const diaryTurn = (typeof spaceId === 'string' && spaceId.startsWith('diary')) || project?.id === diaryExtras?.PROJECT_ID;
         const egressRules = require('./provider-egress.cjs');
+        // What more_tools would widen to (below, in the round loop), for a front that runs it: the project's whole
+        // selection, resolved now. `asked`: each name the resolution read the account's policy for (`blocked`), in
+        // order, with its answer, so the executor makes the same reads when the model widens.
+        // A resolution that throws keeps the turn here ('refusal-input'), the other reasons still logged.
+        let widenFailed = false;
+        if (routing.narrowed && handoffCaps.has('more-tools')) {
+          try {
+            const asked = [];
+            const full = resolveTools(asSelection(selectedBoxes), model, (n) => { const b = blocked(n) === true; asked.push([n, isWriteTool(n) === true, b]); return b; }, ...measuredOn());
+            const fullNames = full.tools.map((t) => t.function?.name).filter((n) => typeof n === 'string');
+            widen = { tools: full.tools, routes: [...(full.routes || [])], writes: fullNames.filter((n) => isWriteTool(n)), public: fullNames.filter((n) => isPublicTool(n)),
+              editTools: fullNames.filter((n) => projectEditTool(n)), onceTools: fullNames.filter((n) => specialistPageSave.neverStanding(n)), asked };
+          } catch { widen = null; widenFailed = true; }
+        }
+        // The tools the turn may offer: the list as sent, and what more_tools widens to.
+        const mayOffer = widen ? [...activeTools, ...widen.tools] : activeTools;
         refusalInput = {
           // A chat deleted while this turn was prepared: the cleanup below runs at the cut, the executor would write it back.
           chatIdNotText: chatId !== null && typeof chatId !== 'string',
@@ -1702,19 +1721,31 @@ function createChatHandler({
           diary: diaryTurn, compactOnly: body.compactOnly === true,
           providerId: provider.id, defaultProviderId: DEFAULT_PROVIDER_ID, machine: !!provider.machine, external: !!externalProvider, chatgpt: !!chatgptProvider, routeTarget: !!routeTarget,
           authorized: !!upstreamHeaders?.Authorization,
-          retrievedImages: retrievedImages.length > 0, messages: wire,
+          // #1726: the retrieved images are settled above (notes, captions, parts on the last user message, the
+          // warning); a front naming `retrieved-images` carries them as it carries attached images (R15).
+          retrievedImages: retrievedImages.length > 0 && !handoffCaps.has('retrieved-images'), messages: wire,
           skills: (loadedSkills.size > 0 || (!!project && instructionSkills.list(project).length > 0)) && !handoffCaps.has('skills'),
           // #769: the front's executor runs the policy's write checks when it names the `provenance` capability (R15).
-          provenance: provenanceOn && !handoffCaps.has('provenance'), framingReasoner: !!(framingReasoner && chatFrame),
-          narrowed: !!routing.narrowed, gate: !!(gate && gate.decision !== 'none'),
-          supervision: nativeHandoff.supervising(),
+          provenance: provenanceOn && !handoffCaps.has('provenance'),
+          // #740: the framing reasoner acts after the cut only on the tool gate's prefetch (prefetchTool's condense and
+          // its trace): the front's executor asks it through the condense op when it names `reasoner` (R15).
+          framingReasoner: reasonerOnPrefetch && !handoffCaps.has('reasoner'),
+          // The routed list's more_tools (Roadmap E): the front's executor widens with the list below when it names
+          // the `more-tools` capability (R15).
+          narrowed: !!routing.narrowed && !handoffCaps.has('more-tools'),
+          // The tool gate's decision is the executor's (tool_choice and one retry; a prefetch runs the read before the
+          // model) for a front naming `tool-gate` (R15). A prefetch the framing reasoner would condense stays here
+          // ('framing-reasoner' above).
+          gate: !!(gate && gate.decision !== 'none') && !handoffCaps.has('tool-gate'),
+          // Step supervision: the front's executor asks the supervisor through the bridge when it names `supervise` (R15).
+          supervision: supervisingNow && !handoffCaps.has('supervise'),
           injected: injectedEntries.some((e) => e && e.kind === 'file' && typeof e.file !== 'string'),
-          pageSave: activeTools.some((t) => specialistPageSave.neverStanding(t.function?.name)) && !handoffCaps.has('once'),
+          pageSave: mayOffer.some((t) => specialistPageSave.neverStanding(t.function?.name)) && !handoffCaps.has('once'),
           // #516: the stream guard's schema check runs before every call (egressToolRefusal) once it is on; the executor
           // does not run it yet. It answers for a call that cannot parse only when it is on and the tool has a schema.
-          streamGuard: activeTools.some((t) => egressRules.validateToolArguments(t.function?.name, '\u0000') !== null),
+          streamGuard: mayOffer.some((t) => egressRules.validateToolArguments(t.function?.name, '\u0000') !== null),
         };
-        why = native.refusal(refusalInput);
+        why = native.refusal(refusalInput) || (widenFailed ? 'refusal-input' : null);
       } catch (error) {
         why = 'refusal-input';
         console.warn(`[chat] native executor refusal inputs could not be read: ${String(error?.message || error).slice(0, 200)}`);
@@ -1742,7 +1773,13 @@ function createChatHandler({
             firstMessage: chatTitleLib.firstUserMessage(history, message), firstReply: chatTitleLib.firstReply(history), enabled: !!chatTitles },
           message, spaceId, projectId: project?.id, declineEndsReply: !spaceId?.startsWith('diary'), record: !!record, streamIdleMs, compactOnly: body.compactOnly === true,
           sources: native.injectedSources({ injected: injectedEntries, placed: placedEntries, readable: readableFiles, reply: replySources }),
-          provenance: provenanceOn,
+          provenance: provenanceOn, widen, supervise: supervisingNow,
+          // The tool chat.cjs would force below (forcedTool: an offered read the gate decided on), and the arguments
+          // it would prefetch it with (a prefetch decision with arguments).
+          gateTool: gate && gate.decision !== 'none' && allowedToolNames.has(gate.decision.tool) && !isWriteTool(gate.decision.tool) ? gate.decision.tool : null,
+          gatePrefetch: gate && gate.decision !== 'none' && gate.decision.mode === 'prefetch' && gate.decision.args ? gate.decision.args : null,
+          // #740: the chat frame's kind the condense op hands the reasoner (prefetchTool's `frame`).
+          reasonerKind: reasonerOnPrefetch ? chatFrame.kind : null,
           // #272/#546: the skill state the executor's checks start from; the checks themselves are core's bridges.
           skills: project ? { loaded: [...loadedSkills].map(([file, s]) => ({ file, hash: s.hash, name: s.name })),
             enabled: instructionSkills.list(project).filter((s) => s.status === 'enabled').map((s) => ({ file: s.file, hash: s.hash, name: s.name })),
