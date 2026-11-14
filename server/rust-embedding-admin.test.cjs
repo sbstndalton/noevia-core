@@ -195,7 +195,7 @@ function serviceFixture(t, { intent = true } = {}) {
     nativeOwner: { snapshot: () => snapshot, kick() {} }, fetchJson: async () => { throw Error('no network in tests'); }, intentFile: intent ? intentFile : null });
   const write = (body) => { fs.writeFileSync(`${intentFile}.tmp`, JSON.stringify(body)); fs.renameSync(`${intentFile}.tmp`, intentFile); };
   const announce = (models, done, at = clock) => write({ protocol: 'rust-embedding-service-intent-v1', start: 'qa-start', at, models, done });
-  return { service, intentFile, write, announce, now: () => clock, advance: (ms) => { clock += ms; }, seen: (models) => { snapshot = { serviceAt: clock, service: { managed: true, enabled: true, models, running: { loaded: models.map((m) => m.model) } } }; } };
+  return { service, intentFile, write, announce, now: () => clock, advance: (ms) => { clock += ms; }, set: (snap) => { snapshot = snap; }, seen: (models) => { snapshot = { serviceAt: clock, service: { managed: true, enabled: true, models, running: { loaded: models.map((m) => m.model) } } }; } };
 }
 const OLD = { model: 'qa-embed-old', file: '/models/qa-embed-old.gguf' }, NEW = { model: 'qa-embed-new', file: '/models/qa-embed-new.gguf' };
 
@@ -229,6 +229,23 @@ test('intent: once done, a native GET from before the change cannot clear its pr
   assert.equal(s.service.protectionKnown(), true);
   s.advance(1000); s.seen([]); // later answers are not overridden by the old intent
   assert.deepEqual([...s.service.protectedNames()], []);
+});
+
+test('intent: a change nobody read while it ran is still protected once done, until a later native answer', (t) => {
+  const s = serviceFixture(t);
+  s.seen([OLD]); s.service.protectedNames();
+  s.announce([NEW], false); // nothing asks while the PUT runs
+  s.advance(2000); s.announce([NEW], true);
+  s.advance(3000); s.seen([OLD]); // inside the 6 s fence
+  assert.ok(s.service.protectedNames().has('qa-embed-new'));
+  assert.ok(s.service.protectedNames().has('/models/qa-embed-new.gguf'));
+  s.advance(5000);
+  s.set({ serviceAt: s.now() + 5000, service: { managed: true, enabled: true, models: [OLD] } }); // ahead of this clock: not adopted
+  assert.ok(s.service.protectedNames().has('qa-embed-new'));
+  s.set({ serviceAt: s.now() }); // no service in it: not adopted either
+  assert.ok(s.service.protectedNames().has('qa-embed-new'));
+  s.seen([OLD]); // a real answer past the fence decides
+  assert.deepEqual([...s.service.protectedNames()].sort(), ['/models/qa-embed-old.gguf', 'qa-embed-old']);
 });
 
 test('intent: a change still open after its deadline, another start, a bad file or no switch count for nothing', (t) => {

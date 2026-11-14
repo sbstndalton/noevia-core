@@ -71,7 +71,8 @@ function createEmbeddingService({ nativeOwner = null, env = process.env, fetchJs
     if (intentPending) { remember({ models }); return; }
     if (!i.done) return;
     if (i.at > mutationAt) mutationAt = i.at;
-    if (!(s && Number.isFinite(s.serviceAt) && s.serviceAt > i.at + 6000)) remember({ models });
+    // Only a snapshot observeNative() would adopt (a service, not ahead of this clock) past the 6 s fence ends it.
+    if (!(s?.service && Number.isFinite(s.serviceAt) && s.serviceAt <= now() && s.serviceAt > i.at + 6000)) remember({ models });
   }
   function observeNative() {
     if (!nativeOwner) return;
