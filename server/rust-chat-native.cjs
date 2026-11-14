@@ -503,10 +503,11 @@ function createToolBridge({ secret, json, readJson, asUser, getProject, executeT
       // chat.cjs's step supervision after a tool round (step-supervision.cjs superviseNextStep), for a native turn:
       // `outputs` the round's last tool and assistant messages as the supervisor reads them ({role, content}: at
       // most 8, each at most 1500 units), `goal` the turn's message, `wrote` whether a write was about to run in
-      // the round. Answers the supervisor's action: continue, verify (the executor adds the check note) or
-      // escalate (the executor pauses the reply). Its log and the decision service stay here.
+      // the round, `goal` the turn's message as the supervisor reads it (its first 1500 units). Answers the
+      // supervisor's action: continue, verify (the executor adds the check note) or escalate (the executor pauses
+      // the reply). Its log and the decision service stay here.
       const round = Number.isSafeInteger(body?.round) && body.round >= 0 && body.round <= 3 ? body.round : null;
-      const goal = text(body?.goal, chatBodyCap);
+      const goal = text(body?.goal, 1500);
       const outputs = Array.isArray(body?.outputs) && body.outputs.length <= 8 && body.outputs.every((m) => plain(m)
         && (m.role === 'tool' || m.role === 'assistant') && text(m.content, 1500) !== null) ? body.outputs.map((m) => ({ role: m.role, content: m.content })) : null;
       if (round === null || goal === null || !outputs || typeof body?.wrote !== 'boolean') return json(res, 400, { error: 'round, goal, outputs and wrote are required.' });

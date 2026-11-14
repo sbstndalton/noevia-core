@@ -481,7 +481,7 @@ test('step supervision: a supervised turn hands off only to a front naming super
   assert.deepEqual((await bridge().call(p, body)).body, { action: 'continue' });
   asked.length = 0;
   const { call } = bridge({ stepSupervision: supervisor({ action: 'verify' }) });
-  for (const bad of [{ ...body, round: 4 }, { ...body, goal: 7 }, { ...body, wrote: 'yes' }, { ...body, outputs: [{ role: 'user', content: 'x' }] },
+  for (const bad of [{ ...body, round: 4 }, { ...body, goal: 7 }, { ...body, goal: 'g'.repeat(1501) }, { ...body, wrote: 'yes' }, { ...body, outputs: [{ role: 'user', content: 'x' }] },
     { ...body, outputs: Array(9).fill({ role: 'tool', content: 'x' }) }, { ...body, outputs: [{ role: 'tool', content: 'x'.repeat(1501) }] }]) {
     assert.equal((await call(p, bad)).status, 400, JSON.stringify(bad).slice(0, 80));
   }
