@@ -515,6 +515,7 @@ const projectStore = require('./projects.cjs').createProjectStore({
   fs, path, reasoningEffort, projectAppearance, rag, storageClient, documentSources, authService, currentWorkspace,
   PROJECTS, FREE_CHATS, sanitizeToolboxes: (boxes) => sanitizeToolboxes(boxes), defaultToolboxes: () => DEFAULT_TOOLBOXES,
   PROJECT_ROOT_FOLDER, createProjectFolder, projectSweep, onProjectsChanged: (userId) => projectsChangedElsewhere(userId),
+  nativeTextWrite: process.env.NOEVIA_RUST_PROJECT_WRITE === '1' ? (user, projectId, name, text, options) => PROJECT_STORE.textWrite(user, projectId, name, text, options) : null,
 });
 const {
   saveProjects, getProject, sanitizeChats, loadChats, saveChats, deleteChat, saveFreeChats, deleteFreeChat, createProject,

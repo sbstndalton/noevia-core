@@ -33,6 +33,8 @@ const { nameMaxLength: PROJECT_NAME_MAX_LENGTH } = require('../contracts/project
  * @param {string} deps.PROJECT_ROOT_FOLDER
  * @param {(storage, connection, root, project) => Promise<string>} deps.createProjectFolder
  * @param {{ afterDelete: (args:object) => Promise<any> }} deps.projectSweep
+ * @param {(userId:string, projectId:string, name:string, text:string, options:object) => Promise<object>} [deps.nativeTextWrite]
+ *   the front's text write (NOEVIA_RUST_PROJECT_WRITE=1); null keeps writeProjectTextFile's own path
  * @param {(userId:string) => void} [deps.onProjectsChanged]  workspace.cjs's nudge (the chat vault
  *   mirror) when a refresh took in another writer's change
  */
@@ -40,6 +42,7 @@ function createProjectStore({
   fs, path, reasoningEffort, projectAppearance, rag, storageClient, documentSources, authService, currentWorkspace,
   PROJECTS, FREE_CHATS, sanitizeToolboxes, defaultToolboxes, PROJECT_ROOT_FOLDER, createProjectFolder, projectSweep,
   onProjectsChanged = () => {},
+  nativeTextWrite = null,
 }) {
   // ── Projects config: instructions, files, memories, model ─────────────────
 
@@ -612,6 +615,18 @@ function createProjectStore({
   // `adoptAccount` is the storage account (project-edit-target.storageAccount) the move was approved
   // for; with any other account connected now the write is refused.
   function writeProjectTextFile(project, name, text, { expectName, expectContent, expectAttachment, adoptTo, adoptAccount } = {}) {
+    // Track R14 (NOEVIA_RUST_PROJECT_WRITE=1): the front does the whole write; core keeps its own
+    // lock around it so its other source operations still wait, then re-reads the lists the front wrote.
+    if (nativeTextWrite) {
+      const given = { expectName, expectContent, expectAttachment, adoptTo, adoptAccount };
+      const options = {};
+      for (const key of Object.keys(given)) if (given[key] !== undefined) options[key] = given[key];
+      return withSourceLock(project, async () => {
+        const file = await nativeTextWrite(currentWorkspace().userId, project.id, name, text, options);
+        currentWorkspace().refreshChatLists?.();
+        return file;
+      });
+    }
     return withSourceLock(project, async () => {
       if (getProject(project.id) !== project) throw new Error('the project changed while writing; nothing was saved');
       const uploads = require('./uploads.cjs');

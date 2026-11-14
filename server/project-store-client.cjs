@@ -42,9 +42,12 @@ const MCP_START_WAIT_MS = 120000;
 const MCP_CALL_WAIT_MS = 330000;
 /** Track R5: one Drive tool on the front, which gives each call 300 s in all and then answers itself. */
 const DRIVE_TOOL_WAIT_MS = 330000;
+/** Track R14: one project text write on the front, which may wait 30 s for the project's source lock and then write to storage. */
+const TEXT_WRITE_WAIT_MS = 330000;
 const REPLY_CAP = 2 * 32 * 1024 * 1024 + 64 * 1024;
 // providers.json (sbstndalton/noevia#2190 round 6) is the account's private provider rows: the Rust
 // front's routes are its writer; Node saves only its seal-on-load migration here.
+const TEXT_WRITE_OPTIONS = ['expectName', 'expectContent', 'expectAttachment', 'adoptTo', 'adoptAccount'];
 const FILES = new Set(['projects.json', 'free-chats.json', 'providers.json']);
 const PRESET_BASELINE_OPS = new Set(['session', 'begin', 'settle', 'invalidate', 'verdict', 'router-text']);
 
@@ -267,6 +270,20 @@ function createClient({ port, token, fetchImpl = globalThis.fetch, timeoutMs = T
       const { status, body } = await call('storage/legacy-webdav', { user, baseUrl: String(baseUrl), username: String(username), secret: String(secret), corpusRoot: String(corpusRoot) });
       if (status === 200 && body && typeof body.saved === 'boolean') return { saved: body.saved };
       throw failure(status, body);
+    },
+    /** Track R14: the internal project tools' text write (project_create_file, project_append_file,
+     *  project_replace_text) as one store op on the front. `options` carries expectName, expectContent,
+     *  expectAttachment, adoptTo and adoptAccount; a key is sent only when its value is not undefined
+     *  (null stays null). The front answers { file } (the source record as saved) or { error } (a
+     *  message written for the model, thrown unchanged); 404 is a removed account. */
+    async textWrite(user, project, name, text, options = {}) {
+      const body = { user, project, name, text };
+      for (const key of TEXT_WRITE_OPTIONS) if (options && options[key] !== undefined) body[key] = options[key];
+      const { status, body: reply } = await call('projects/text-write', body, TEXT_WRITE_WAIT_MS);
+      if (status === 200 && reply && reply.file && typeof reply.file === 'object') return reply.file;
+      if (status === 200 && reply && typeof reply.error === 'string') throw new Error(reply.error);
+      if (status === 404) throw Object.assign(new Error('account no longer exists'), { status: 410 });
+      throw failure(status, reply);
     },
     /** sbstndalton/noevia#2190 round 6: re-seals the provider keys in the files the front alone
      *  writes, in one pass per file under its lock (`scope`: `user`, `shared` or `all`), with the
