@@ -431,6 +431,17 @@ function createClient({ port, token, fetchImpl = globalThis.fetch, timeoutMs = T
       const { status, body } = await call('gdrive/disconnect', { user, admin: admin === true }, CHATGPT_WAIT_MS);
       return status === 200 && body?.ok === true ? { ok: true } : chatgptRefusal(status, body);
     },
+    /** Track R12 (NOEVIA_RUST_USAGE_WRITES=1, usage.cjs useFront): one usage record for `user`, made by the
+     *  front, the file's only writer then. `{ kind: 'reply', model, usage }` or `{ kind: 'tool', name }`.
+     *  Resolves to what the front did ('written', 'nothing', 'skipped'), or 'unsupported' for a front without the op;
+     *  throws when it could not be asked. */
+    async usageRecord(user, record) {
+      const { status, body } = await call('usage/record', { user, ...record });
+      if (status === 200 && body && body.ok === true) return body.recorded;
+      // A front without the op (older than this core): the caller writes the record itself.
+      if (status === 404) return 'unsupported';
+      throw failure(status, body);
+    },
     /** secrets:rotate (round 7 review): the front re-seals every account's token file under the current
      *  secrets.key, under its own fence. { ok: true, counts: { current, rotated, empty, failed } } or a refusal
      *  (a 404 is an older front without the op). Counts only: no name, id or token. */
