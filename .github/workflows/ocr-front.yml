@@ -5,6 +5,13 @@ on:
   pull_request:
 permissions:
   contents: read
+# A newer push to a pull request cancels its superseded run. Push runs (main only) share one group per
+# workflow without cancelling: the running main check finishes, and a newer merge replaces a main run
+# that is still waiting.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   ocr-front:
     name: Required native OCR front contracts
