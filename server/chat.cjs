@@ -1719,11 +1719,14 @@ function createChatHandler({
           // #769: the front's executor runs the policy's write checks when it names the `provenance` capability (R15).
           provenance: provenanceOn && !handoffCaps.has('provenance'),
           // #740: the framing reasoner acts after the cut only on the tool gate's prefetch (prefetchTool's condense and
-          // its trace), so it keeps a turn here only when the gate decided (which keeps it here anyway, 'tool-gate').
-          framingReasoner: !!(framingReasoner && chatFrame && gate && gate.decision !== 'none'),
+          // its trace), so it keeps a turn here only when the gate decided to prefetch (which keeps it here anyway).
+          framingReasoner: !!(framingReasoner && chatFrame && gate && gate.decision !== 'none' && gate.decision.mode === 'prefetch'),
           // The routed list's more_tools (Roadmap E): the front's executor widens with the list below when it names
           // the `more-tools` capability (R15).
-          narrowed: !!routing.narrowed && !handoffCaps.has('more-tools'), gate: !!(gate && gate.decision !== 'none'),
+          narrowed: !!routing.narrowed && !handoffCaps.has('more-tools'),
+          // The tool gate: a `require` decision is the executor's (tool_choice, one retry) for a front naming `tool-gate`
+          // (R15); a `prefetch` decision (the read run before the model) stays here.
+          gate: !!(gate && gate.decision !== 'none') && !(handoffCaps.has('tool-gate') && gate.decision.mode === 'require'),
           // Step supervision: the front's executor asks the supervisor through the bridge when it names `supervise` (R15).
           supervision: supervisingNow && !handoffCaps.has('supervise'),
           injected: injectedEntries.some((e) => e && e.kind === 'file' && typeof e.file !== 'string'),
@@ -1761,6 +1764,8 @@ function createChatHandler({
           message, spaceId, projectId: project?.id, declineEndsReply: !spaceId?.startsWith('diary'), record: !!record, streamIdleMs, compactOnly: body.compactOnly === true,
           sources: native.injectedSources({ injected: injectedEntries, placed: placedEntries, readable: readableFiles, reply: replySources }),
           provenance: provenanceOn, widen, supervise: supervisingNow,
+          // The tool chat.cjs would force below (forcedTool): an offered read the gate required.
+          gateTool: gate && gate.decision !== 'none' && gate.decision.mode === 'require' && allowedToolNames.has(gate.decision.tool) && !isWriteTool(gate.decision.tool) ? gate.decision.tool : null,
           // #272/#546: the skill state the executor's checks start from; the checks themselves are core's bridges.
           skills: project ? { loaded: [...loadedSkills].map(([file, s]) => ({ file, hash: s.hash, name: s.name })),
             enabled: instructionSkills.list(project).filter((s) => s.status === 'enabled').map((s) => ({ file: s.file, hash: s.hash, name: s.name })),

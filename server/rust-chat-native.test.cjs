@@ -497,7 +497,7 @@ test('a framed chat with the framing reasoner on hands off unless the tool gate 
   assert.equal(handed.events.at(-1).type, 'prepared', 'no gate decision: nothing of the reasoner runs after the cut');
   assert.equal(condensed.length, 0);
   // With a gate decision the turn stays here (the reasoner condenses the gate's prefetch in Node).
-  const gated = { ...reasoner, toolGate: { evaluate: async () => ({ decision: { tool: 'drive_read_file', mode: 'require' } }), record() {} } };
+  const gated = { ...reasoner, toolGate: { evaluate: async () => ({ decision: { tool: 'drive_read_file', mode: 'prefetch', args: { fileId: 'qa-file' } } }), record() {} } };
   const logged = [];
   const log = console.log;
   console.log = (line) => logged.push(String(line));
@@ -506,6 +506,35 @@ test('a framed chat with the framing reasoner on hands off unless the tool gate 
   assert.notEqual(kept.events.at(-1).type, 'prepared');
   assert.ok(logged.includes('[chat] native executor not used for this turn: framing-reasoner'), logged.join('|'));
   assert.ok(logged.includes('[chat] native executor would also need: tool-gate'), logged.join('|'));
+});
+
+test('a tool gate require decision hands off to a front naming tool-gate with the tool; prefetch stays here (R15)', async (t) => {
+  const gated = (decision) => ({ toolGate: { evaluate: async () => ({ decision }), record() {} } });
+  const require1 = gated({ tool: 'drive_read_file', mode: 'require' });
+  const kept = await runTurn(t, { requested: true, caps: ['supervise'], frames: answer, deps: require1 });
+  // Node ran the turn: the required tool named on the first request, and (the model answering without it) one retry.
+  assert.equal(kept.requests.length, 2);
+  assert.deepEqual(kept.requests[0].tool_choice, { type: 'function', function: { name: 'drive_read_file' } });
+  const handed = await runTurn(t, { requested: true, caps: ['tool-gate'], frames: answer, deps: require1 });
+  assert.deepEqual(handed.events.at(-1).gate, { tool: 'drive_read_file' });
+  // A write is never forced (chat.cjs): handed off, no gate.
+  const write = await runTurn(t, { requested: true, caps: ['tool-gate'], frames: answer, deps: gated({ tool: 'drive_create_file', mode: 'require' }) });
+  assert.equal(write.events.at(-1).type, 'prepared');
+  assert.equal('gate' in write.events.at(-1), false);
+  // No decision: no key.
+  const none = await runTurn(t, { requested: true, caps: ['tool-gate'], frames: answer, deps: gated('none') });
+  assert.equal('gate' in none.events.at(-1), false);
+  // Prefetch: Node runs the read before the model; the turn stays here.
+  const prefetch = await runTurn(t, { requested: true, caps: ['tool-gate'], frames: answer, deps: gated({ tool: 'drive_read_file', mode: 'prefetch', args: { fileId: 'qa-file' } }) });
+  assert.notEqual(prefetch.events.at(-1).type, 'prepared');
+  // The op: the gate's log, a retry or a miss only.
+  const recorded = [];
+  const { call } = bridge({ toolGate: { record: (event, entry) => recorded.push([event, entry]) } });
+  const p = `${native.NATIVE_PREFIX}gate-record`;
+  assert.equal((await call(p, { user: 'qa-user', event: 'gate.retry', tool: 'drive_read_file' })).status, 204);
+  assert.equal((await call(p, { user: 'qa-user', event: 'gate.miss', tool: 'drive_read_file' })).status, 204);
+  for (const bad of [{ event: 'decision', tool: 'x' }, { event: 'gate.miss' }, { event: 'gate.miss', tool: 7 }]) assert.equal((await call(p, { user: 'qa-user', ...bad })).status, 400);
+  assert.deepEqual(recorded, [['gate.retry', { tool: 'drive_read_file' }], ['gate.miss', { tool: 'drive_read_file' }]]);
 });
 
 test('frameTooLarge refuses a prepared line longer than the front reads (PREPARED_CAP bytes of UTF-8)', () => {

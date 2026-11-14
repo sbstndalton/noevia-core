@@ -33,11 +33,12 @@
 // chat.cjs does with them happens before the cut (the system note, captions or the images' own text, the image
 // parts and their label on the last user message, the warning), so the frame's messages carry them and the
 // executor sends them as it sends attached images; `supervise` (R15) step supervision after a tool round (the
-// supervise op below; the frame says `supervise: true`).
+// supervise op below; the frame says `supervise: true`); `tool-gate` (R15) the tool gate's `require` decision (the frame
+// names the tool in `gate`; its log through the gate-record op), a `prefetch` decision stays here.
 // Without it a turn whose project has instruction skills stays here ('skills'), a coworker turn offering the page
 // save too ('page-save'), every turn while the provenance policy is on ('provenance'), a turn whose tools were
-// narrowed by routing ('narrowed-tools'), one with retrieved images ('retrieved-images'), and every turn while step
-// supervision is on ('step-supervision'). The header is removed either way.
+// narrowed by routing ('narrowed-tools'), one with retrieved images ('retrieved-images'), every turn while step
+// supervision is on ('step-supervision'), and one whose tool gate decided ('tool-gate'). The header is removed either way.
 //
 //   POST /internal/chat/tools/execute  {user, projectId, name, args, allowed, routes, chatKey, exchangeKey, editTarget?, grant?}
 //        -> 200 {text, failed} | {text, failed, notRun: true} | {redeem: 'refused' | 'unavailable' | 'aborted'}
@@ -176,7 +177,7 @@ const SCOPE_CAP = 200;
 const USAGE_PATH = '/internal/chat/usage';
 const PREFILL_PATH = '/internal/chat/prefill';
 const NATIVE_PREFIX = '/internal/chat/native/';
-const NATIVE_OPS = new Set(['health', 'load', 'tools-allowed', 'tools-unsupported', 'busy', 'title-auto-named', 'title-save', 'tool-used', 'supervise']);
+const NATIVE_OPS = new Set(['health', 'load', 'tools-allowed', 'tools-unsupported', 'busy', 'title-auto-named', 'title-save', 'tool-used', 'supervise', 'gate-record']);
 const SKILLS_PREFIX = '/internal/chat/skills/';
 const SKILL_OPS = new Set(['revoked', 'read', 'scrub']);
 const SHA256 = /^[a-f0-9]{64}$/;
@@ -340,6 +341,9 @@ function preparedTurn(t) {
     // Step supervision is on (features.stepSupervision, R15): after a tool round the executor asks the supervise
     // bridge as chat.cjs asks superviseNextStep. Only present when on, and only for a front naming `supervise`.
     ...(t.supervise === true ? { supervise: true } : {}),
+    // The tool gate required this read (features.toolGate, `require` mode, R15): the executor names it in tool_choice
+    // on the first model turn and retries once on a miss. Only present then, and only for a front naming `tool-gate`.
+    ...(typeof t.gateTool === 'string' && t.gateTool ? { gate: { tool: t.gateTool } } : {}),
     // Roadmap E (R15): what more_tools widens to, on a turn whose routed list was narrowed (absent otherwise): the
     // tools, their MCP routes, and which of them are writes, public, project edits or once-only, as for `tools`.
     ...(t.widen && typeof t.widen === 'object' ? { widen: {
@@ -405,7 +409,7 @@ function createAsUser({ userRow, runAs, currentWorkspace }) {
  */
 function createToolBridge({ secret, json, readJson, asUser, getProject, executeToolCall, writeTargetFor, recordToolUse, currentWorkspace, currentUser,
   editStorageAccount = () => null, recordUsage = () => {}, recordSample = () => {}, modelManager = null, templateToolsGate = null, chatTitles = null, chatBodyCap = CHAT_BODY_CAP,
-  skillLedger = null, chatWideApproved = null, redeemChatGrant = null, revokeChatGrant = null, stepSupervision = null, now = () => Date.now(),
+  skillLedger = null, chatWideApproved = null, redeemChatGrant = null, revokeChatGrant = null, stepSupervision = null, toolGate = null, now = () => Date.now(),
   log = (line) => console.warn(line) }) {
   // Execute calls in progress by `${user}\u0000${exchangeKey}`: the abort bridge aborts their signals.
   const running = new Map();
@@ -497,6 +501,14 @@ function createToolBridge({ secret, json, readJson, asUser, getProject, executeT
       const name = text(body?.name, TOOL_NAME_CAP);
       if (!name) return json(res, 400, { error: 'name is required.' });
       recordToolUse(currentWorkspace(), name);
+      return noContent(res);
+    }
+    if (op === 'gate-record') {
+      // The tool gate's log for a native turn's required tool (chat.cjs toolGate.record: a retry or a miss).
+      const event = body?.event === 'gate.retry' || body?.event === 'gate.miss' ? body.event : null;
+      const name = text(body?.tool, TOOL_NAME_CAP);
+      if (!event || !name) return json(res, 400, { error: 'event (gate.retry or gate.miss) and tool are required.' });
+      try { if (typeof toolGate?.record === 'function') toolGate.record(event, { tool: name }); } catch { /* a log only */ }
       return noContent(res);
     }
     if (op === 'supervise') {
