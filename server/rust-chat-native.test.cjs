@@ -157,6 +157,35 @@ test('a turn whose attached image the answering model can see hands off with the
   assert.deepEqual(statusIds(handed.events), ['readingImages', 'generating']);
 });
 
+// #1726: a project image retrieval found (multimodal RAG), not attached by the turn (turnImageIds names none).
+const retrievedProject = { ...imageProject, files: [{ name: 'qa-image.png', attachment: { id: 'qa-att-1' }, content: 'QA chart: 3 bars.' }] };
+const retrievedHit = { file: 'qa-image.png', hash: 'img:qa-att-1', score: 0.9, meta: { assetId: 'qa-asset-1' } };
+const retrieving = (supported) => ({ multimodalEnabled: () => true, visionProbe: async () => (supported ? { supported: true } : { supported: false, reason: 'QA engine has no image input.' }),
+  rag: { filesContext: async (_id, _readable, _question, _user, onPlaced, options) => { onPlaced([], []); options?.onImages?.({ hits: [retrievedHit], indexed: [retrievedHit] }); return null; } } });
+
+test('a turn with retrieved images hands off only to a front naming retrieved-images, the images already on the wire (#1726, R15)', async (t) => {
+  for (const supported of [true, false]) {
+    const deps = retrieving(supported);
+    const body = { turnImageIds: [] };
+    const plain = await runTurn(t, { frames: answer, project: retrievedProject, before: withImage(), deps, body });
+    const logged = [];
+    const log = console.log;
+    console.log = (line) => logged.push(String(line));
+    let kept;
+    try { kept = await runTurn(t, { requested: true, caps: ['skills', 'once', 'provenance', 'more-tools'], frames: answer, project: retrievedProject, before: withImage(), deps, body }); } finally { console.log = log; }
+    assert.equal(kept.requests.length, 1, 'Node ran the turn');
+    assert.ok(logged.includes('[chat] native executor not used for this turn: retrieved-images'), String(supported));
+    const handed = await runTurn(t, { requested: true, caps: ['retrieved-images'], frames: answer, project: retrievedProject, before: withImage(), deps, body });
+    const last = handed.events.at(-1);
+    assert.equal(last.type, 'prepared');
+    assert.equal(handed.requests.length, 0);
+    assert.deepEqual(last.messages, plain.requests[0].messages, 'the wire is what the engine got without the hand-off');
+    const content = JSON.stringify(last.messages);
+    if (supported) assert.ok(content.includes('(Retrieved images: ') && content.includes(`data:image/png;base64,${QA_PNG.toString('base64')}`), 'the image parts are on the wire');
+    else assert.ok(!content.includes('data:image/png') && content.includes('qa-image.png'), 'the model that cannot see gets text, not the image');
+  }
+});
+
 test('a turn whose attached image the model cannot see hands off without it, with the warning and the note sent before the cut', async (t) => {
   const deps = { visionProbe: async () => ({ supported: false, reason: 'QA engine has no image input.' }) };
   const plain = await runTurn(t, { frames: answer, project: imageProject, before: withImage(), deps });

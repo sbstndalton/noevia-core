@@ -1707,7 +1707,9 @@ function createChatHandler({
           diary: diaryTurn, compactOnly: body.compactOnly === true,
           providerId: provider.id, defaultProviderId: DEFAULT_PROVIDER_ID, machine: !!provider.machine, external: !!externalProvider, chatgpt: !!chatgptProvider, routeTarget: !!routeTarget,
           authorized: !!upstreamHeaders?.Authorization,
-          retrievedImages: retrievedImages.length > 0, messages: wire,
+          // #1726: the retrieved images are settled above (notes, captions, parts on the last user message, the
+          // warning); a front naming `retrieved-images` carries them as it carries attached images (R15).
+          retrievedImages: retrievedImages.length > 0 && !handoffCaps.has('retrieved-images'), messages: wire,
           skills: (loadedSkills.size > 0 || (!!project && instructionSkills.list(project).length > 0)) && !handoffCaps.has('skills'),
           // #769: the front's executor runs the policy's write checks when it names the `provenance` capability (R15).
           provenance: provenanceOn && !handoffCaps.has('provenance'), framingReasoner: !!(framingReasoner && chatFrame),

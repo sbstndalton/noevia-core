@@ -29,10 +29,14 @@
 // `tool.provenance`; the prepared frame says `provenance: true` when the policy is on for the turn); `more-tools`
 // (Roadmap E, R15) the routed list's more_tools call: the prepared frame's `widen` (only on a routed turn whose list
 // was narrowed) is the project's whole selection as the round loop would resolve it, and the executor answers
-// more_tools from it as chat.cjs does.
+// more_tools from it as chat.cjs does; `retrieved-images` (#1726, R15) a turn with retrieved images: everything
+// chat.cjs does with them happens before the cut (the system note, captions or the images' own text, the image
+// parts and their label on the last user message, the warning), so the frame's messages carry them and the
+// executor sends them as it sends attached images.
 // Without it a turn whose project has instruction skills stays here ('skills'), a coworker turn offering the page
-// save too ('page-save'), every turn while the provenance policy is on ('provenance'), and a turn whose tools were
-// narrowed by routing ('narrowed-tools'). The header is removed either way.
+// save too ('page-save'), every turn while the provenance policy is on ('provenance'), a turn whose tools were
+// narrowed by routing ('narrowed-tools'), and one with retrieved images ('retrieved-images'). The header is removed
+// either way.
 //
 //   POST /internal/chat/tools/execute  {user, projectId, name, args, allowed, routes, chatKey, exchangeKey, editTarget?, grant?}
 //        -> 200 {text, failed} | {text, failed, notRun: true} | {redeem: 'refused' | 'unavailable' | 'aborted'}
