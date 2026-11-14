@@ -1,6 +1,6 @@
 'use strict';
-// Track R11: the inference budget and idle unload PUTs are the Rust front's under NOEVIA_RUST_MODEL_WRITES=rust; unset,
-// Node answers them as before.
+// Track R11: the three model PUTs, the MTP artifact check and the pull are the Rust front's under
+// NOEVIA_RUST_MODEL_WRITES=rust; unset, Node answers them as before.
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
@@ -14,7 +14,7 @@ const ask = (method, url, env) => {
   return { refused, seen };
 };
 
-test('only the switch set to rust hands the three PUTs to the front', () => {
+test('only the switch set to rust hands the PUTs, the MTP check and the pull to the front', () => {
   assert.deepEqual([...OWNED_PATHS], ['/api/models/inference-budget', '/api/models/idle-unload', '/api/models/preset']);
   assert.equal(SWITCH, 'NOEVIA_RUST_MODEL_WRITES');
   for (const env of [{}, { [SWITCH]: '' }, { [SWITCH]: 'on' }, { [SWITCH]: 'Rust' }, { [SWITCH]: 'node' }]) {
@@ -33,9 +33,9 @@ test('only the switch set to rust hands the three PUTs to the front', () => {
   assert.equal(ROUTE_REFUSAL.code, 'RUST_MODEL_WRITES_OWNED');
 });
 
-test('everything beside the three PUTs stays where it was', () => {
+test('everything beside them stays where it was', () => {
   const env = { [SWITCH]: 'rust' };
-  for (const [m, p] of [['GET', '/api/models/inference-budget'], ['POST', '/api/models/idle-unload'], ['GET', '/api/models/preset'], ['PUT', '/api/models/presets/reload'], ['GET', '/api/models/pull'], ['POST', '/api/models/pull/'], ['POST', '/api/models/mtp-artifact'], ['GET', '/api/models/mtp-artifact/'], ['GET', '/api/models/inference-budget'],
+  for (const [m, p] of [['GET', '/api/models/inference-budget'], ['POST', '/api/models/idle-unload'], ['GET', '/api/models/preset'], ['PUT', '/api/models/presets/reload'], ['GET', '/api/models/pull'], ['POST', '/api/models/pull/'], ['POST', '/api/models/mtp-artifact'], ['GET', '/api/models/mtp-artifact/'],
     ['PUT', '/api/models/inference-budget/'], ['PUT', '/api/model-manager/idle-unload'], ['DELETE', '/api/models/idle-unload']]) {
     assert.equal(owned(m, p), false, `${m} ${p}`);
     assert.deepEqual(ask(m, p, env), { refused: false, seen: [] }, `${m} ${p}`);

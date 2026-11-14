@@ -3,10 +3,11 @@
 // answers PUT /api/models/inference-budget, PUT /api/models/idle-unload and PUT /api/models/preset (noevia-rs
 // bins/noevia-server model_writes_routes.rs over crates/model-writes and its model maintenance): it saves the budget's
 // settings row and audit record, runs the idle unload time's model manager write and router reload under the maintenance
-// hold, applies the preset editor's profile under the same hold, and runs the MTP artifact check
-// (GET /api/models/mtp-artifact, administrators only there). This process then refuses those requests
-// before authentication, so a direct request on its port cannot write beside the front. Unset (the default), nothing here
-// changes anything: routes/models.cjs answers both as before.
+// hold and applies the preset editor's profile under the same hold. It also runs the MTP artifact check
+// (GET /api/models/mtp-artifact, administrators only there) and the pull (POST /api/models/pull, model_pull_routes.rs),
+// whose download it records in this process's tracker (rust-model-downloads-bridge.cjs). This process then refuses those
+// requests before authentication, so a direct request on its port cannot write beside the front. Unset (the default),
+// nothing here changes anything: routes/models.cjs answers them all as before.
 //
 // The budget this process enforces is read from the settings row on every use (inference-budget.cjs), so the front's save
 // takes effect here at once.
@@ -16,7 +17,7 @@ const OWNED_PATHS = Object.freeze(['/api/models/inference-budget', '/api/models/
 const OWNED_GETS = Object.freeze(['/api/models/mtp-artifact']);
 // The pull (the front records its download in this process's tracker: rust-model-downloads-bridge.cjs).
 const OWNED_POSTS = Object.freeze(['/api/models/pull']);
-const ROUTE_REFUSAL = Object.freeze({ error: 'The inference budget, idle unload and preset writes are owned by the Rust front.', code: 'RUST_MODEL_WRITES_OWNED' });
+const ROUTE_REFUSAL = Object.freeze({ error: 'The model writes, MTP artifact check and pull are owned by the Rust front.', code: 'RUST_MODEL_WRITES_OWNED' });
 
 /** Whether the front answers the two PUTs (the switch is exactly `rust`). */
 const frontOwns = (env = process.env) => env[SWITCH] === 'rust';
