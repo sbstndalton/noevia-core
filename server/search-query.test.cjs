@@ -29,3 +29,17 @@ test('#1523: only a search tool\'s string query is cleaned; other arguments and 
   assert.equal(cleanSearchArgs('tavily_search', '{"query":["a"]}'), '{"query":["a"]}', 'a non-string query is left alone');
   assert.equal(cleanSearchArgs('tavily_search', '{"query":"clean query"}'), '{"query":"clean query"}', 'an unchanged query keeps the original bytes');
 });
+
+test('#2545: arguments nested past the stack go on unchanged instead of throwing', () => {
+  const deep = (n) => `${'['.repeat(n)}1${']'.repeat(n)}`;
+  // The cleaned form, written without JSON.stringify of the nested value (the query is the first key).
+  const cleaned = (raw, query) => raw.replace(JSON.stringify(query), JSON.stringify(cleanSearchQuery(query)));
+  const raw = `{"query":"Search the web: QA stack","x":${deep(10000)}}`;
+  // An engine whose JSON.stringify runs out of stack gives the arguments back as they came; one that can write them
+  // gives the cleaned form. Never a throw.
+  const out = cleanSearchArgs('qa_web_search', raw);
+  assert.ok(out === raw || out === cleaned(raw, 'Search the web: QA stack'), out.slice(0, 80));
+  const shallow = `{"query":"Search the web: QA nested","x":${deep(50)}}`;
+  assert.notEqual(cleaned(shallow, 'Search the web: QA nested'), shallow);
+  assert.equal(cleanSearchArgs('qa_web_search', shallow), cleaned(shallow, 'Search the web: QA nested'), 'a nesting that fits is still cleaned');
+});

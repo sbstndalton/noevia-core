@@ -10,6 +10,9 @@ const { isChatGenerationModel } = require('./chat-model-kind.cjs');
 const { isInAppBox } = require('./toolbox-flags.cjs');
 const editTargets = require('./project-edit-target.cjs');
 const specialistPageSave = require('./specialist-page-save.cjs');
+
+// #2595: an asset id read as a file of the project's asset directory: a plain, well-formed name only.
+const plainAssetName = (id) => typeof id === 'string' && id !== '' && id !== '.' && id !== '..' && !/[/\\\0]/.test(id) && id.isWellFormed();
 const { readCappedText, readCappedJson, discardBody } = require('./http.cjs');
 // A provider's error body is only shown as a short message; a summary reply is a few KB of JSON.
 // Both are capped so a provider streaming an endless body cannot be buffered whole (#903).
@@ -533,7 +536,7 @@ function createChatHandler({
       }
       // Diary tools reach only accounts with the Diary add-on on, whether the project or the turn
       // asked for them (the same predicate the permitted catalogue uses to mark Diary unavailable).
-      if (!(chatUser && authService && typeof authService.diaryEnabled === 'function' && authService.diaryEnabled(chatUser.id))) { const k = selectedBoxes.indexOf('diary'); if (k >= 0) selectedBoxes.splice(k, 1); }
+      if (!(chatUser && authService && typeof authService.diaryEnabled === 'function' && authService.diaryEnabled(chatUser.id))) { for (let k = selectedBoxes.length - 1; k >= 0; k--) if (selectedBoxes[k] === 'diary') selectedBoxes.splice(k, 1); }
       // A sign-in server's tools reach only the accounts that signed in to it themselves.
       { const oauthIds = oauthServerIds(); for (let k = selectedBoxes.length - 1; k >= 0; k--) if (oauthIds.has(selectedBoxes[k]) && !accountReady(chatUser?.id, selectedBoxes[k])) selectedBoxes.splice(k, 1); }
       return selectedBoxes;
@@ -568,7 +571,8 @@ function createChatHandler({
     // neither honoured nor created, and "Allow for this chat" approves just that call. Read at gate
     // time, so a move during the turn is seen. Chats no list holds yet (a first turn) are unaffected.
     const writeGrantScope = project ? `${body.projectId ? 'project' : 'context'}:${project.id}` : `space:${typeof spaceId === 'string' && spaceId ? spaceId : 'free'}`;
-    const expectedGrantHolder = body.projectId ? { kind: 'project', id: project.id } : { kind: 'free' };
+    // #2587: a `diary` space request never loads the project it may name; its holder is the free one.
+    const expectedGrantHolder = body.projectId && project ? { kind: 'project', id: project.id } : { kind: 'free' };
     const permissionContext = async () => {
       if (!chatId) return null; // No reusable identity for id-less requests.
       const value = grantContexts.validate(chatId, await grantContext(chatId));
@@ -901,6 +905,10 @@ function createChatHandler({
       const dir = currentWorkspace().assetDir(project.id);
       for (const asset of projectImages.filter((a) => !namedImageIds || namedImageIds.has(a.id))) {
         try {
+          // #2595: only a plain file name of the asset directory is read (uploads.cjs mints `img-<hex>`); any other
+          // id (empty, `.`, `..`, a path, a NUL, a lone surrogate, not text) is a missing image, exactly as a file
+          // that is gone, and never a file elsewhere.
+          if (!plainAssetName(asset.id)) throw new Error('not a file name');
           const bytes = fs.readFileSync(path.join(dir, asset.id));
           loadedImageNames.push(asset.name);
           attachedImages.push({
