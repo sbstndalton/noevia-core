@@ -1683,8 +1683,9 @@ function createChatHandler({
     if (handoff) {
       const native = require('./rust-chat-native.cjs');
       // Reading what the refusal looks at must never fail the turn: an input that throws keeps the turn here.
-      let why, refusalInput = null, provenanceOn = false, widen = null;
+      let why, refusalInput = null, provenanceOn = false, widen = null, supervisingNow = false;
       try {
+        supervisingNow = nativeHandoff.supervising() === true;
         if (provenancePolicy) { try { provenanceOn = provenancePolicy.enabled() === true; } catch { provenanceOn = true; } }
         const diaryTurn = (typeof spaceId === 'string' && spaceId.startsWith('diary')) || project?.id === diaryExtras?.PROJECT_ID;
         const egressRules = require('./provider-egress.cjs');
@@ -1716,7 +1717,8 @@ function createChatHandler({
           // The routed list's more_tools (Roadmap E): the front's executor widens with the list below when it names
           // the `more-tools` capability (R15).
           narrowed: !!routing.narrowed && !handoffCaps.has('more-tools'), gate: !!(gate && gate.decision !== 'none'),
-          supervision: nativeHandoff.supervising(),
+          // Step supervision: the front's executor asks the supervisor through the bridge when it names `supervise` (R15).
+          supervision: supervisingNow && !handoffCaps.has('supervise'),
           injected: injectedEntries.some((e) => e && e.kind === 'file' && typeof e.file !== 'string'),
           pageSave: mayOffer.some((t) => specialistPageSave.neverStanding(t.function?.name)) && !handoffCaps.has('once'),
           // #516: the stream guard's schema check runs before every call (egressToolRefusal) once it is on; the executor
@@ -1751,7 +1753,7 @@ function createChatHandler({
             firstMessage: chatTitleLib.firstUserMessage(history, message), firstReply: chatTitleLib.firstReply(history), enabled: !!chatTitles },
           message, spaceId, projectId: project?.id, declineEndsReply: !spaceId?.startsWith('diary'), record: !!record, streamIdleMs, compactOnly: body.compactOnly === true,
           sources: native.injectedSources({ injected: injectedEntries, placed: placedEntries, readable: readableFiles, reply: replySources }),
-          provenance: provenanceOn, widen,
+          provenance: provenanceOn, widen, supervise: supervisingNow,
           // #272/#546: the skill state the executor's checks start from; the checks themselves are core's bridges.
           skills: project ? { loaded: [...loadedSkills].map(([file, s]) => ({ file, hash: s.hash, name: s.name })),
             enabled: instructionSkills.list(project).filter((s) => s.status === 'enabled').map((s) => ({ file: s.file, hash: s.hash, name: s.name })),

@@ -436,6 +436,42 @@ test('a turn whose routed tools were narrowed hands off only to a front naming m
   assert.equal('widen' in plain.events.at(-1), false);
 });
 
+test('step supervision: a supervised turn hands off only to a front naming supervise; the supervise op answers the supervisor (R15)', async (t) => {
+  const kept = await runTurn(t, { requested: true, caps: ['skills', 'once', 'provenance', 'more-tools', 'retrieved-images'], supervising: true, frames: answer });
+  assert.equal(kept.requests.length, 1, 'Node ran the turn');
+  const handed = await runTurn(t, { requested: true, caps: ['supervise'], supervising: true, frames: answer });
+  assert.equal(handed.events.at(-1).type, 'prepared');
+  assert.equal(handed.events.at(-1).supervise, true);
+  const off = await runTurn(t, { requested: true, caps: ['supervise'], frames: answer });
+  assert.equal('supervise' in off.events.at(-1), false, 'no key while supervision is off');
+  // The op: the supervisor sees what chat.cjs's superviseNextStep hands it, and its action comes back.
+  const asked = [];
+  const supervisor = (answer) => require('./step-supervision.cjs').createStepSupervision({ enabled: () => true, log: () => {},
+    provider: { decide: async (input) => { asked.push(input); return answer; } } });
+  const p = `${native.NATIVE_PREFIX}supervise`;
+  const outputs = [{ role: 'assistant', content: '' }, { role: 'tool', content: 'QA tool result.' }];
+  const body = { user: 'qa-user', round: 0, goal: 'QA goal', outputs, wrote: false };
+  for (const [answer, action] of [[{ action: 'continue' }, 'continue'], [{ action: 'verify' }, 'verify'],
+    [{ action: 'escalate', scores: { continue: 0.1, verify: 0.1, escalate: 0.8 } }, 'escalate'],
+    // A weak escalation after a read-only round carries on (#1456); after a write it stops.
+    [{ action: 'escalate', scores: { continue: 0.3, verify: 0.2, escalate: 0.5 } }, 'continue']]) {
+    const { call } = bridge({ stepSupervision: supervisor(answer) });
+    assert.deepEqual((await call(p, body)).body, { action }, JSON.stringify(answer));
+  }
+  assert.deepEqual(asked[0], { round: 0, goal: 'QA goal', outputs, choices: ['continue', 'verify', 'escalate'] });
+  const weak = { action: 'escalate', scores: { continue: 0.3, verify: 0.2, escalate: 0.5 } };
+  assert.deepEqual((await bridge({ stepSupervision: supervisor(weak) }).call(p, { ...body, wrote: true })).body, { action: 'escalate' });
+  // Without a supervisor (or a round past the checks): continue. Bad input: 400, the supervisor not asked.
+  assert.deepEqual((await bridge().call(p, body)).body, { action: 'continue' });
+  asked.length = 0;
+  const { call } = bridge({ stepSupervision: supervisor({ action: 'verify' }) });
+  for (const bad of [{ ...body, round: 4 }, { ...body, goal: 7 }, { ...body, wrote: 'yes' }, { ...body, outputs: [{ role: 'user', content: 'x' }] },
+    { ...body, outputs: Array(9).fill({ role: 'tool', content: 'x' }) }, { ...body, outputs: [{ role: 'tool', content: 'x'.repeat(1501) }] }]) {
+    assert.equal((await call(p, bad)).status, 400, JSON.stringify(bad).slice(0, 80));
+  }
+  assert.equal(asked.length, 0);
+});
+
 test('frameTooLarge refuses a prepared line longer than the front reads (PREPARED_CAP bytes of UTF-8)', () => {
   assert.equal(native.PREPARED_CAP, 40 * 1024 * 1024);
   assert.equal(native.frameTooLarge('x'.repeat(native.PREPARED_CAP)), false);

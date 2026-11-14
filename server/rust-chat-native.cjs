@@ -32,11 +32,12 @@
 // more_tools from it as chat.cjs does; `retrieved-images` (#1726, R15) a turn with retrieved images: everything
 // chat.cjs does with them happens before the cut (the system note, captions or the images' own text, the image
 // parts and their label on the last user message, the warning), so the frame's messages carry them and the
-// executor sends them as it sends attached images.
+// executor sends them as it sends attached images; `supervise` (R15) step supervision after a tool round (the
+// supervise op below; the frame says `supervise: true`).
 // Without it a turn whose project has instruction skills stays here ('skills'), a coworker turn offering the page
 // save too ('page-save'), every turn while the provenance policy is on ('provenance'), a turn whose tools were
-// narrowed by routing ('narrowed-tools'), and one with retrieved images ('retrieved-images'). The header is removed
-// either way.
+// narrowed by routing ('narrowed-tools'), one with retrieved images ('retrieved-images'), and every turn while step
+// supervision is on ('step-supervision'). The header is removed either way.
 //
 //   POST /internal/chat/tools/execute  {user, projectId, name, args, allowed, routes, chatKey, exchangeKey, editTarget?, grant?}
 //        -> 200 {text, failed} | {text, failed, notRun: true} | {redeem: 'refused' | 'unavailable' | 'aborted'}
@@ -175,7 +176,7 @@ const SCOPE_CAP = 200;
 const USAGE_PATH = '/internal/chat/usage';
 const PREFILL_PATH = '/internal/chat/prefill';
 const NATIVE_PREFIX = '/internal/chat/native/';
-const NATIVE_OPS = new Set(['health', 'load', 'tools-allowed', 'tools-unsupported', 'busy', 'title-auto-named', 'title-save', 'tool-used']);
+const NATIVE_OPS = new Set(['health', 'load', 'tools-allowed', 'tools-unsupported', 'busy', 'title-auto-named', 'title-save', 'tool-used', 'supervise']);
 const SKILLS_PREFIX = '/internal/chat/skills/';
 const SKILL_OPS = new Set(['revoked', 'read', 'scrub']);
 const SHA256 = /^[a-f0-9]{64}$/;
@@ -336,6 +337,9 @@ function preparedTurn(t) {
     // as on): the executor takes each round's untrusted text in and checks every write's arguments against it. Only
     // present when on, and only for a front naming the `provenance` capability (else the turn stays here).
     ...(t.provenance === true ? { provenance: true } : {}),
+    // Step supervision is on (features.stepSupervision, R15): after a tool round the executor asks the supervise
+    // bridge as chat.cjs asks superviseNextStep. Only present when on, and only for a front naming `supervise`.
+    ...(t.supervise === true ? { supervise: true } : {}),
     // Roadmap E (R15): what more_tools widens to, on a turn whose routed list was narrowed (absent otherwise): the
     // tools, their MCP routes, and which of them are writes, public, project edits or once-only, as for `tools`.
     ...(t.widen && typeof t.widen === 'object' ? { widen: {
@@ -401,7 +405,7 @@ function createAsUser({ userRow, runAs, currentWorkspace }) {
  */
 function createToolBridge({ secret, json, readJson, asUser, getProject, executeToolCall, writeTargetFor, recordToolUse, currentWorkspace, currentUser,
   editStorageAccount = () => null, recordUsage = () => {}, recordSample = () => {}, modelManager = null, templateToolsGate = null, chatTitles = null, chatBodyCap = CHAT_BODY_CAP,
-  skillLedger = null, chatWideApproved = null, redeemChatGrant = null, revokeChatGrant = null, now = () => Date.now(),
+  skillLedger = null, chatWideApproved = null, redeemChatGrant = null, revokeChatGrant = null, stepSupervision = null, now = () => Date.now(),
   log = (line) => console.warn(line) }) {
   // Execute calls in progress by `${user}\u0000${exchangeKey}`: the abort bridge aborts their signals.
   const running = new Map();
@@ -494,6 +498,21 @@ function createToolBridge({ secret, json, readJson, asUser, getProject, executeT
       if (!name) return json(res, 400, { error: 'name is required.' });
       recordToolUse(currentWorkspace(), name);
       return noContent(res);
+    }
+    if (op === 'supervise') {
+      // chat.cjs's step supervision after a tool round (step-supervision.cjs superviseNextStep), for a native turn:
+      // `outputs` the round's last tool and assistant messages as the supervisor reads them ({role, content}: at
+      // most 8, each at most 1500 units), `goal` the turn's message, `wrote` whether a write was about to run in
+      // the round. Answers the supervisor's action: continue, verify (the executor adds the check note) or
+      // escalate (the executor pauses the reply). Its log and the decision service stay here.
+      const round = Number.isSafeInteger(body?.round) && body.round >= 0 && body.round <= 3 ? body.round : null;
+      const goal = text(body?.goal, chatBodyCap);
+      const outputs = Array.isArray(body?.outputs) && body.outputs.length <= 8 && body.outputs.every((m) => plain(m)
+        && (m.role === 'tool' || m.role === 'assistant') && text(m.content, 1500) !== null) ? body.outputs.map((m) => ({ role: m.role, content: m.content })) : null;
+      if (round === null || goal === null || !outputs || typeof body?.wrote !== 'boolean') return json(res, 400, { error: 'round, goal, outputs and wrote are required.' });
+      const signal = callerGone(req, res);
+      const r = await require('./step-supervision.cjs').superviseNextStep(stepSupervision, { round, messages: outputs, signal, goal, wrote: body.wrote });
+      return json(res, 200, { action: r.pause ? 'escalate' : r.decision?.action === 'verify' ? 'verify' : 'continue' });
     }
     if (op === 'busy') {
       let busy = false;
