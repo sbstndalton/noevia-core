@@ -15,7 +15,8 @@ const ask = (method, url, env) => {
 const PROXIED = [['GET', '/api/model-manager/benchmark/sweep'], ['POST', '/api/model-manager/benchmark/sweep/cancel'], ['POST', '/api/model-manager/benchmark/sweep%zz'], ['GET', '/api/model-manager/status'], ['PUT', '/api/model-manager/models-ini'], ['DELETE', '/api/model-manager/sections/qa'],
   ['POST', '/api/model-manager/sections/qa/rename'], ['POST', '/api/model-manager/models/delete'], ['POST', '/api/model-manager/benchmark/start'],
   ['GET', '/api/model-manager/benchmark/runs/3'], ['POST', '/api/model-manager/models'], ['GET', '/api/model-manager/sections/qa/autoconfig?x=1'],
-  ['PATCH', '/api/model-manager/']];
+  ['PATCH', '/api/model-manager/'], ['POST', '/api/model-manager/benchmark%2Fsweep'], ['POST', '/api/model-manager/benchmark%5Csweep'],
+  ['HEAD', '/api/model-manager/models'], ['POST', '/api/model-manager/models']];
 
 test('only the switch set to rust hands the proxy to the front', () => {
   assert.equal(SWITCH, 'NOEVIA_RUST_MODEL_MANAGER');

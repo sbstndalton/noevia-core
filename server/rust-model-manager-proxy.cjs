@@ -15,8 +15,13 @@ const ROUTE_REFUSAL = Object.freeze({ error: 'The model manager proxy is owned b
 /** Whether the front answers the proxy (the switch is exactly `rust`). */
 const frontOwns = (env = process.env) => env[SWITCH] === 'rust';
 
-/** The path as routes/models.cjs judges it: each segment decoded (a segment that does not decode is kept as it is). */
-const decoded = (pathname) => pathname.split('/').map((s) => { try { return decodeURIComponent(s); } catch { return s; } }).join('/');
+/** The path as routes/models.cjs judges it: each segment decoded (a segment that does not decode is kept as it is). A
+ *  segment that decodes to a path separator is no path at all here (core answers it 400 Invalid path, the front refuses it
+ *  itself): it never reads as the sweep. */
+const decoded = (pathname) => pathname.split('/').map((s) => {
+  let d; try { d = decodeURIComponent(s); } catch { return s; }
+  return /[/\\]/.test(d) ? `\u0000${s}` : d;
+}).join('/');
 
 /** True for a request the front answers under the switch (routes/models.cjs tests `p.startsWith('/api/model-manager/')`).
  *  The sweep is kept by its decoded path, as the front relays it (benchmark/sw%65ep is the sweep too). */
