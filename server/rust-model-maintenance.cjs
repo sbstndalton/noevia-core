@@ -21,7 +21,8 @@
 // this process's memory): /api/model-manager/* (the folder scan cache, the loader proxy), /api/models/
 // load, unload, delete, pull, downloads (chat roles, last-loaded model, leases, the load gate),
 // /api/models/preset (GET and PUT: the budget refusal and the preset editor), machines, reranker,
-// assignments, idle-unload, prune-missing (all chat-bound), inference-budget PUT (the boot-time cache of the saved budget).
+// assignments, idle-unload, prune-missing (all chat-bound), inference-budget PUT (the audit; with NOEVIA_RUST_MODEL_WRITES=rust
+// that PUT and the idle-unload PUT are the front's, rust-model-writes.cjs).
 //
 // The Rust front is the single writer of the reload guard state file (native-preset-reload-<hash>.json) for
 // the reloads it makes. This process still makes reloads (the folder sync, delete, prune, idle-unload, the

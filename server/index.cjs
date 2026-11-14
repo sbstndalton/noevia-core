@@ -1295,6 +1295,8 @@ async function handleRequestInner(req, res) {
   if (await autoRolesWriteBridge(req, res)) return;
   if (await modelStateBridge(req, res)) return;
   if (require('./rust-tool-approvals.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
+  // Track R11: the two PUTs are the front's under NOEVIA_RUST_MODEL_WRITES=rust (rust-model-writes.cjs).
+  if (require('./rust-model-writes.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   if (require('./rust-idle-unload-read.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   if (await idleUnloadFacts(req, res)) return;
   if (require('./rust-model-downloads-read.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;

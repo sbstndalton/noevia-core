@@ -83,6 +83,30 @@ test('#2266: a failed boot read is diagnosed without leaking the row or error', 
   assert.equal(logs.length, 1);
 });
 
+test('track R11: a figure the front saves in the settings row is enforced without a restart', () => {
+  const store = memStore(), logs = [];
+  const b = createInferenceBudget({ store, env: { INFERENCE_MEMORY_BUDGET_GIB: '12' }, readMeminfo: meminfo(64), log: m => logs.push(m) });
+  assert.equal(b.budgetGib(), 12);
+  store.set('inference:memory-budget', JSON.stringify({ budgetGib: 20.5 }));
+  assert.deepEqual([b.budgetGib(), b.get().source], [20.5, 'admin']);
+  store.m.delete('inference:memory-budget');
+  assert.deepEqual([b.budgetGib(), b.get().source], [12, 'deployment']);
+  // A read that fails keeps the last figure read, once logged, without the row.
+  store.set('inference:memory-budget', JSON.stringify({ budgetGib: 9 }));
+  assert.equal(b.budgetGib(), 9);
+  store.set('inference:memory-budget', '{not json');
+  assert.deepEqual([b.budgetGib(), b.budgetGib()], [9, 9]);
+  assert.equal(logs.length, 1);
+  assert.match(logs[0], /could not be read; using the last known figure/);
+  assert.doesNotMatch(logs[0], /not json|9/);
+  // A good read re-arms the log: the next outage is reported again.
+  store.set('inference:memory-budget', JSON.stringify({ budgetGib: 10 }));
+  assert.equal(b.budgetGib(), 10);
+  store.set('inference:memory-budget', '{again not json');
+  assert.equal(b.budgetGib(), 10);
+  assert.equal(logs.length, 2);
+});
+
 // ── Prompt cache limits ─────────────────────────────────────────────────────
 
 test('cache-ram limits default to a 1024 MiB cap and a 2048 MiB hard maximum', () => {
