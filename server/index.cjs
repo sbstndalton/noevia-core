@@ -444,6 +444,8 @@ const FREE_CHATS = arrayProxy('freeChats');
 
 // Usage accounting (daily rollups per tenant) lives in usage.cjs; its routes in routes/usage.cjs.
 const { USAGE_RETENTION_DAYS, usageDayKey, readUsage, recordUsage, recordToolUse } = require('./usage.cjs');
+// Track R12: NOEVIA_RUST_USAGE_WRITES=1 (off by default) makes the Rust front the usage file's only writer.
+if (process.env.NOEVIA_RUST_USAGE_WRITES === '1') require('./usage.cjs').useFront((user, record) => PROJECT_STORE.usageRecord(user, record));
 
 // D9: read-only offline Wikipedia box, only with features.kiwix and an internal KIWIX_URL.
 const kiwixTools = featureConstruction.kiwix && process.env.KIWIX_URL ? require('./kiwix.cjs').createKiwixTools({ baseUrl: process.env.KIWIX_URL, cap: TOOL_RESULT_CAP }) : null;

@@ -24,6 +24,16 @@ function usageDayKey(at = new Date()) {
   return `${y}-${m}-${d}`;
 }
 
+// Track R12: with NOEVIA_RUST_USAGE_WRITES=1 (index.cjs), the Rust front makes every record (noevia-rs
+// crates/server-usage write.rs, usage_writes.rs) and is the file's only writer; `front(user, record)` asks it.
+// Unset, this process writes the file, as before.
+let front = null;
+function useFront(record) { front = typeof record === 'function' ? record : null; }
+function toFront(workspace, record) {
+  if (workspace.revoked) return;
+  Promise.resolve().then(() => front(workspace.userId, record)).catch((err) => console.warn('[usage] the Rust front could not record:', err?.message || err));
+}
+
 function readUsage(workspace) {
   try {
     const parsed = JSON.parse(fs.readFileSync(workspace.usagePath(), 'utf8'));
@@ -39,6 +49,7 @@ function readUsage(workspace) {
 // anything the client sends.
 function recordUsage(workspace, model, usage) {
   if (!workspace || !usage) return;
+  if (front) return toFront(workspace, { kind: 'reply', model, usage });
   const input = Number(usage.promptTokens) || 0;
   const output = Number(usage.completionTokens) || 0;
   if (!Number.isFinite(input) || !Number.isFinite(output) || input<0 || output<0 || (!input && !output)) return;
@@ -80,6 +91,7 @@ function recordUsage(workspace, model, usage) {
 // keeps erroring is exactly what this number should show.
 function recordToolUse(workspace, name) {
   if (!workspace || !name) return;
+  if (front) return toFront(workspace, { kind: 'tool', name });
   try {
     const store = readUsage(workspace);
     const key = usageDayKey();
@@ -96,4 +108,4 @@ function recordToolUse(workspace, name) {
   }
 }
 
-module.exports = { USAGE_RETENTION_DAYS, usageDayKey, readUsage, recordUsage, recordToolUse };
+module.exports = { USAGE_RETENTION_DAYS, usageDayKey, readUsage, recordUsage, recordToolUse, useFront };
