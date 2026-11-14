@@ -54,7 +54,7 @@ async function runTurn(t, { handoff = null, requested = false, caps = [], superv
     autoRoles: () => null, lastLoadedModel: () => null, classifyFastOrSmart: async () => 'fast', servedCatalogue: async () => [], modelsInstalled: async () => [],
     missingRoles: () => [], staleRolesError: () => null, visionProbe: async () => ({ supported: false, reason: 'none' }), visionDescriptions: new Map(), skillsIndexFor: () => [],
     chatSkillRouter: { select: async () => ({ loaded: [] }) }, chatToolRouter: { select: async (ids) => ({ ids, routed: false }) },
-    ...toolbox, oauthServerIds: () => new Set(), accountReady: () => true,
+    ...toolbox, ...(typeof deps.wrapResolve === 'function' ? { resolveTools: deps.wrapResolve(toolbox.resolveTools) } : {}), oauthServerIds: () => new Set(), accountReady: () => true,
     grantContext: async (raw) => grantFixture.context(raw, { holder: { kind: 'absent' } }), chatWideApproved: () => false, awaitApproval: async () => 'approve',
     recordUsage() {}, recordToolUse() {}, sourceWaitMs: 0,
     nativeHandoff: handoff || (requested ? { requested: () => true, capabilities: () => new Set(caps), supervising: () => supervising } : null),
@@ -155,6 +155,35 @@ test('a turn whose attached image the answering model can see hands off with the
     { type: 'image_url', image_url: { url: `data:image/png;base64,${QA_PNG.toString('base64')}` } }] });
   assert.deepEqual(handed.events.slice(0, -1).map((e) => e.type), ['meta', 'telemetry', 'status', 'status', 'tools_scope']);
   assert.deepEqual(statusIds(handed.events), ['readingImages', 'generating']);
+});
+
+// #1726: a project image retrieval found (multimodal RAG), not attached by the turn (turnImageIds names none).
+const retrievedProject = { ...imageProject, files: [{ name: 'qa-image.png', attachment: { id: 'qa-att-1' }, content: 'QA chart: 3 bars.' }] };
+const retrievedHit = { file: 'qa-image.png', hash: 'img:qa-att-1', score: 0.9, meta: { assetId: 'qa-asset-1' } };
+const retrieving = (supported) => ({ multimodalEnabled: () => true, visionProbe: async () => (supported ? { supported: true } : { supported: false, reason: 'QA engine has no image input.' }),
+  rag: { filesContext: async (_id, _readable, _question, _user, onPlaced, options) => { onPlaced([], []); options?.onImages?.({ hits: [retrievedHit], indexed: [retrievedHit] }); return null; } } });
+
+test('a turn with retrieved images hands off only to a front naming retrieved-images, the images already on the wire (#1726, R15)', async (t) => {
+  for (const supported of [true, false]) {
+    const deps = retrieving(supported);
+    const body = { turnImageIds: [] };
+    const plain = await runTurn(t, { frames: answer, project: retrievedProject, before: withImage(), deps, body });
+    const logged = [];
+    const log = console.log;
+    console.log = (line) => logged.push(String(line));
+    let kept;
+    try { kept = await runTurn(t, { requested: true, caps: ['skills', 'once', 'provenance', 'more-tools'], frames: answer, project: retrievedProject, before: withImage(), deps, body }); } finally { console.log = log; }
+    assert.equal(kept.requests.length, 1, 'Node ran the turn');
+    assert.ok(logged.includes('[chat] native executor not used for this turn: retrieved-images'), String(supported));
+    const handed = await runTurn(t, { requested: true, caps: ['retrieved-images'], frames: answer, project: retrievedProject, before: withImage(), deps, body });
+    const last = handed.events.at(-1);
+    assert.equal(last.type, 'prepared');
+    assert.equal(handed.requests.length, 0);
+    assert.deepEqual(last.messages, plain.requests[0].messages, 'the wire is what the engine got without the hand-off');
+    const content = JSON.stringify(last.messages);
+    if (supported) assert.ok(content.includes('(Retrieved images: ') && content.includes(`data:image/png;base64,${QA_PNG.toString('base64')}`), 'the image parts are on the wire');
+    else assert.ok(!content.includes('data:image/png') && content.includes('qa-image.png'), 'the model that cannot see gets text, not the image');
+  }
 });
 
 test('a turn whose attached image the model cannot see hands off without it, with the warning and the note sent before the cut', async (t) => {
@@ -365,6 +394,208 @@ test('a provenance policy turn hands off only to a front naming provenance, and 
   assert.equal(supervised.requests.length, 1);
 });
 
+test('a turn whose routed tools were narrowed hands off only to a front naming more-tools, with what more_tools widens to (R15)', async (t) => {
+  // The router keeps the first selected box only (chat-tool-routing.cjs answers narrowed when it drops some).
+  const narrow = { chatToolRouter: { select: async (ids) => ({ ids: ids.slice(0, 1), routed: true, narrowed: ids.length > 1 }) } };
+  const logged = [];
+  const log = console.log;
+  console.log = (line) => logged.push(String(line));
+  let kept;
+  try { kept = await runTurn(t, { requested: true, caps: ['skills', 'once', 'provenance'], frames: answer, deps: narrow }); } finally { console.log = log; }
+  assert.equal(kept.requests.length, 1, 'Node ran the turn');
+  assert.ok(logged.includes('[chat] native executor not used for this turn: narrowed-tools'));
+  assert.ok(kept.requests[0].tools.some((tool) => tool.function.name === 'more_tools'));
+  const handed = await runTurn(t, { requested: true, caps: ['more-tools'], frames: answer, deps: narrow });
+  const frame = handed.events.at(-1);
+  assert.equal(frame.type, 'prepared');
+  const offered = frame.tools.map((tool) => tool.function.name);
+  assert.ok(offered.includes('more_tools'), 'the narrowed list carries more_tools');
+  assert.ok(!offered.some((n) => n.startsWith('drive_')), 'the Drive box was routed away');
+  const widened = frame.widen.tools.map((tool) => tool.function.name);
+  assert.ok(widened.includes('drive_read_file') && widened.includes('drive_create_file') && !widened.includes('more_tools'));
+  assert.deepEqual(frame.widen.writes, widened.filter((n) => ['drive_create_file', 'drive_update_file', 'drive_trash_file'].includes(n)));
+  assert.deepEqual(Object.keys(frame.widen), ['tools', 'routes', 'writes', 'public', 'editTools', 'onceTools', 'asked']);
+  // Every name the resolution read the policy for, in order, with its write class and answer (none blocked here).
+  assert.deepEqual(frame.widen.asked.map(([n]) => n), widened);
+  assert.ok(frame.widen.asked.every(([n, write, blocked]) => write === frame.widen.writes.includes(n) && blocked === false));
+  assert.deepEqual(frame.widen.routes, []);
+  // A tool only the widened list offers counts for the checks on what the turn may offer (here the stream guard's).
+  const egress = require('./provider-egress.cjs');
+  egress.__setStreamGuardEnabledForTests(true);
+  egress.setToolArgumentSchema('drive_read_file', { type: 'object' });
+  const guardLog = [];
+  console.log = (line) => guardLog.push(String(line));
+  let guarded;
+  try { guarded = await runTurn(t, { requested: true, caps: ['more-tools'], frames: answer, deps: narrow }); }
+  finally { console.log = log; egress.setToolArgumentSchema('drive_read_file', null); egress.__setStreamGuardEnabledForTests(false); }
+  assert.equal(guarded.requests.length, 1, 'Node ran the turn');
+  assert.ok(guardLog.includes('[chat] native executor not used for this turn: stream-guard'));
+  // A resolution of the widened list that throws keeps the turn here; the other reasons are still logged.
+  // (The preparation resolves the routed list once; the widened list is the next resolution.)
+  let resolutions = 0;
+  const failing = { ...narrow, wrapResolve: (real) => (...a) => { resolutions += 1; if (resolutions === 2) throw new Error('QA resolve'); return real(...a); } };
+  const failLog = [];
+  console.log = (line) => failLog.push(String(line));
+  let failed;
+  try { failed = await runTurn(t, { requested: true, caps: ['more-tools'], frames: answer, deps: failing }); } finally { console.log = log; }
+  assert.equal(resolutions >= 2, true);
+  assert.equal(failed.requests.length, 1, 'Node ran the turn');
+  assert.ok(failLog.includes('[chat] native executor not used for this turn: refusal-input'), failLog.join('|'));
+  resolutions = 0;
+  const failBoth = [];
+  console.log = (line) => failBoth.push(String(line));
+  try { await runTurn(t, { requested: true, caps: ['more-tools'], supervising: true, frames: answer, deps: failing }); } finally { console.log = log; }
+  assert.ok(failBoth.includes('[chat] native executor not used for this turn: step-supervision'), failBoth.join('|'));
+  // Not narrowed (or the router off): no `widen` key, the frame earlier executors read.
+  const plain = await runTurn(t, { requested: true, caps: ['more-tools'], frames: answer });
+  assert.equal(plain.events.at(-1).type, 'prepared');
+  assert.equal('widen' in plain.events.at(-1), false);
+});
+
+test('step supervision: a supervised turn hands off only to a front naming supervise; the supervise op answers the supervisor (R15)', async (t) => {
+  const kept = await runTurn(t, { requested: true, caps: ['skills', 'once', 'provenance', 'more-tools', 'retrieved-images'], supervising: true, frames: answer });
+  assert.equal(kept.requests.length, 1, 'Node ran the turn');
+  const handed = await runTurn(t, { requested: true, caps: ['supervise'], supervising: true, frames: answer });
+  assert.equal(handed.events.at(-1).type, 'prepared');
+  assert.equal(handed.events.at(-1).supervise, true);
+  const off = await runTurn(t, { requested: true, caps: ['supervise'], frames: answer });
+  assert.equal('supervise' in off.events.at(-1), false, 'no key while supervision is off');
+  // The op: the supervisor sees what chat.cjs's superviseNextStep hands it, and its action comes back.
+  const asked = [];
+  const supervisor = (answer) => require('./step-supervision.cjs').createStepSupervision({ enabled: () => true, log: () => {},
+    provider: { decide: async (input) => { asked.push(input); return answer; } } });
+  const p = `${native.NATIVE_PREFIX}supervise`;
+  const outputs = [{ role: 'assistant', content: '' }, { role: 'tool', content: 'QA tool result.' }];
+  const body = { user: 'qa-user', round: 0, goal: 'QA goal', outputs, wrote: false };
+  for (const [answer, action] of [[{ action: 'continue' }, 'continue'], [{ action: 'verify' }, 'verify'],
+    [{ action: 'escalate', scores: { continue: 0.1, verify: 0.1, escalate: 0.8 } }, 'escalate'],
+    // A weak escalation after a read-only round carries on (#1456); after a write it stops.
+    [{ action: 'escalate', scores: { continue: 0.3, verify: 0.2, escalate: 0.5 } }, 'continue']]) {
+    const { call } = bridge({ stepSupervision: supervisor(answer) });
+    assert.deepEqual((await call(p, body)).body, { action }, JSON.stringify(answer));
+  }
+  assert.deepEqual(asked[0], { round: 0, goal: 'QA goal', outputs, choices: ['continue', 'verify', 'escalate'] });
+  const weak = { action: 'escalate', scores: { continue: 0.3, verify: 0.2, escalate: 0.5 } };
+  assert.deepEqual((await bridge({ stepSupervision: supervisor(weak) }).call(p, { ...body, wrote: true })).body, { action: 'escalate' });
+  // Without a supervisor (or a round past the checks): continue. Bad input: 400, the supervisor not asked.
+  assert.deepEqual((await bridge().call(p, body)).body, { action: 'continue' });
+  asked.length = 0;
+  const { call } = bridge({ stepSupervision: supervisor({ action: 'verify' }) });
+  for (const bad of [{ ...body, round: 4 }, { ...body, goal: 7 }, { ...body, goal: 'g'.repeat(1501) }, { ...body, wrote: 'yes' }, { ...body, outputs: [{ role: 'user', content: 'x' }] },
+    { ...body, outputs: Array(9).fill({ role: 'tool', content: 'x' }) }, { ...body, outputs: [{ role: 'tool', content: 'x'.repeat(1501) }] }]) {
+    assert.equal((await call(p, bad)).status, 400, JSON.stringify(bad).slice(0, 80));
+  }
+  assert.equal(asked.length, 0);
+});
+
+test('a framed chat with the framing reasoner on hands off unless the tool gate decided (#740, R15)', async (t) => {
+  // A confirmed search frame stored on the chat (chat-frame-steering.cjs storedFrame) and the reasoner configured.
+  const framed = { chats: [{ id: 'qa-chat-1', frame: { kind: 'search', confirmed: true, projectId: 'qa-project', source: 'user' } }] };
+  const condensed = [];
+  const reasoner = { chatFramingEnabled: () => true, framingReasoner: { condense: async (input) => { condensed.push(input); return { ok: false }; } } };
+  const handed = await runTurn(t, { requested: true, frames: answer, project: framed, deps: reasoner });
+  assert.equal(handed.events.at(-1).type, 'prepared', 'no gate decision: nothing of the reasoner runs after the cut');
+  assert.equal(condensed.length, 0);
+  // With a gate decision the turn stays here (the reasoner condenses the gate's prefetch in Node).
+  const gated = { ...reasoner, toolGate: { evaluate: async () => ({ decision: { tool: 'drive_read_file', mode: 'prefetch', args: { fileId: 'qa-file' } } }), record() {} } };
+  const logged = [];
+  const log = console.log;
+  console.log = (line) => logged.push(String(line));
+  let kept;
+  try { kept = await runTurn(t, { requested: true, frames: answer, project: framed, deps: gated }); } finally { console.log = log; }
+  assert.notEqual(kept.events.at(-1).type, 'prepared');
+  assert.ok(logged.includes('[chat] native executor not used for this turn: framing-reasoner'), logged.join('|'));
+  assert.ok(logged.includes('[chat] native executor would also need: tool-gate'), logged.join('|'));
+  assert.equal(condensed.length, 1, 'Node condensed its own prefetch');
+  condensed.length = 0;
+  // A front naming `reasoner` and `tool-gate` gets it, with the frame's kind for the condense op (R15).
+  const both = await runTurn(t, { requested: true, caps: ['tool-gate', 'reasoner'], frames: answer, project: framed, deps: gated });
+  assert.equal(both.events.at(-1).type, 'prepared');
+  assert.deepEqual(both.events.at(-1).reasoner, { kind: 'search' });
+  assert.equal(condensed.length, 0, 'nothing condensed before the cut');
+  // Without a gate decision: no key, even for a front naming `reasoner`.
+  const plainHanded = await runTurn(t, { requested: true, caps: ['reasoner'], frames: answer, project: framed, deps: reasoner });
+  assert.equal('reasoner' in plainHanded.events.at(-1), false);
+});
+
+test('the condense op asks the framing reasoner as prefetchTool does; reasoner-trace appends the opt-in trace (#740, R15)', async () => {
+  const asked = [];
+  const reasoner = (out) => ({ condense: async (input) => { asked.push(input); return out; } });
+  const p = `${native.NATIVE_PREFIX}condense`;
+  const body = { user: 'qa-user', kind: 'search', message: 'QA find the plan', tool: 'drive_read_file', resultText: 'QA plan text.', model: 'qa-model' };
+  const packet = { packet_schema: 1, goal: 'QA find the plan', facts: [{ text: 'QA fact', source: { kind: 'tool', ref: 'drive_read_file' } }], constraints: [], open_questions: [] };
+  const ok = { ok: true, packet, rendered: 'QA rendered packet', timings: { reasonerMs: 12 } };
+  const { call } = bridge({ framingReasoner: reasoner(ok), isWriteTool: (n) => n === 'drive_create_file' });
+  const r = await call(p, body);
+  assert.equal(r.status, 200);
+  assert.deepEqual(r.body, { rendered: 'QA rendered packet', trace: { kind: 'search', tool: 'drive_read_file', packet, timings: { reasonerMs: 12 } } });
+  const seen = asked[0];
+  assert.deepEqual({ ...seen, isWriteTool: typeof seen.isWriteTool, signal: typeof seen.signal },
+    { frame: { kind: 'search', confirmed: true }, message: 'QA find the plan', tool: 'drive_read_file', resultText: 'QA plan text.', isWriteTool: 'function', answerModel: 'qa-model', answerIsLocal: true, signal: 'object' });
+  assert.equal(seen.isWriteTool('drive_create_file'), true, 'the guard reads core\'s own write list');
+  // A skip, or no reasoner at all: null (the raw result goes on).
+  assert.deepEqual((await bridge({ framingReasoner: reasoner({ ok: false, reason: 'budget' }) }).call(p, body)).body, { rendered: null });
+  assert.deepEqual((await bridge().call(p, body)).body, { rendered: null });
+  for (const bad of [{ kind: 7 }, { tool: '' }, { message: null }, { resultText: 3 }, { model: 'm'.repeat(401) }]) {
+    assert.equal((await call(p, { ...body, ...bad })).status, 400, JSON.stringify(bad));
+  }
+  // The trace: appended only when the person opted in, in their own workspace dir.
+  const appended = [];
+  const traces = (on) => ({ enabled: (dir) => { appended.push(['enabled', dir]); return on; }, append: (dir, entry) => appended.push(['append', dir, entry]) });
+  const t = `${native.NATIVE_PREFIX}reasoner-trace`;
+  const trace = { kind: 'search', tool: 'drive_read_file', packet, timings: { reasonerMs: 12 } };
+  const on = bridge({ reasoningTraces: traces(true), currentWorkspace: () => ({ dir: '/qa/ws', userId: 'qa-user' }) });
+  assert.equal((await on.call(t, { user: 'qa-user', trace, answerChars: 42, answerMs: 7 })).status, 204);
+  assert.deepEqual(appended, [['enabled', '/qa/ws'], ['append', '/qa/ws', { kind: 'search', tool: 'drive_read_file', packet, timings: { reasonerMs: 12, answerMs: 7 }, answerChars: 42 }]]);
+  appended.length = 0;
+  const off = bridge({ reasoningTraces: traces(false), currentWorkspace: () => ({ dir: '/qa/ws', userId: 'qa-user' }) });
+  assert.equal((await off.call(t, { user: 'qa-user', trace, answerChars: 42, answerMs: 7 })).status, 204);
+  assert.deepEqual(appended, [['enabled', '/qa/ws']]);
+  appended.length = 0;
+  for (const bad of [{ trace: null }, { trace: { ...trace, timings: 1 } }, { trace: { ...trace, timings: { reasonerMs: 'x' } } }, { trace: { ...trace, packet: { goal: 'not a packet' } } },
+    { answerChars: -1 }, { answerChars: 1.5 }, { answerMs: 'x' }]) {
+    assert.equal((await on.call(t, { user: 'qa-user', trace, answerChars: 42, answerMs: 7, ...bad })).status, 400, JSON.stringify(bad));
+  }
+  assert.deepEqual(appended, [], 'nothing asked or written for a refused trace');
+  // A revoked workspace, or one that is not the relayed user's: nothing is read or written.
+  for (const ws of [{ dir: '/qa/ws', userId: 'qa-user', revoked: true }, { dir: '/qa/other', userId: 'qa-other' }]) {
+    const b = bridge({ reasoningTraces: traces(true), currentWorkspace: () => ws });
+    assert.equal((await b.call(t, { user: 'qa-user', trace, answerChars: 42, answerMs: 7 })).status, 204);
+  }
+  assert.deepEqual(appended, []);
+});
+
+test('a tool gate decision hands off to a front naming tool-gate with the tool (and a prefetch its arguments) (R15)', async (t) => {
+  const gated = (decision) => ({ toolGate: { evaluate: async () => ({ decision }), record() {} } });
+  const require1 = gated({ tool: 'drive_read_file', mode: 'require' });
+  const kept = await runTurn(t, { requested: true, caps: ['supervise'], frames: answer, deps: require1 });
+  // Node ran the turn: the required tool named on the first request, and (the model answering without it) one retry.
+  assert.equal(kept.requests.length, 2);
+  assert.deepEqual(kept.requests[0].tool_choice, { type: 'function', function: { name: 'drive_read_file' } });
+  const handed = await runTurn(t, { requested: true, caps: ['tool-gate'], frames: answer, deps: require1 });
+  assert.deepEqual(handed.events.at(-1).gate, { tool: 'drive_read_file' });
+  // A write is never forced (chat.cjs): handed off, no gate.
+  const write = await runTurn(t, { requested: true, caps: ['tool-gate'], frames: answer, deps: gated({ tool: 'drive_create_file', mode: 'require' }) });
+  assert.equal(write.events.at(-1).type, 'prepared');
+  assert.equal('gate' in write.events.at(-1), false);
+  // No decision: no key.
+  const none = await runTurn(t, { requested: true, caps: ['tool-gate'], frames: answer, deps: gated('none') });
+  assert.equal('gate' in none.events.at(-1), false);
+  // Prefetch: the executor runs the read before the model, with the decision's arguments.
+  const prefetch = await runTurn(t, { requested: true, caps: ['tool-gate'], frames: answer, deps: gated({ tool: 'drive_read_file', mode: 'prefetch', args: { fileId: 'qa-file' } }) });
+  assert.deepEqual(prefetch.events.at(-1).gate, { tool: 'drive_read_file', prefetch: { fileId: 'qa-file' } });
+  assert.equal(prefetch.requests.length, 0);
+  // The op: the gate's log, a retry or a miss only.
+  const recorded = [];
+  const { call } = bridge({ toolGate: { record: (event, entry) => recorded.push([event, entry]) } });
+  const p = `${native.NATIVE_PREFIX}gate-record`;
+  assert.equal((await call(p, { user: 'qa-user', event: 'gate.retry', tool: 'drive_read_file' })).status, 204);
+  assert.equal((await call(p, { user: 'qa-user', event: 'gate.miss', tool: 'drive_read_file' })).status, 204);
+  assert.equal((await call(p, { user: 'qa-user', event: 'prefetch.failed', tool: 'drive_read_file' })).status, 204);
+  for (const bad of [{ event: 'decision', tool: 'x' }, { event: 'gate.miss' }, { event: 'gate.miss', tool: 7 }]) assert.equal((await call(p, { user: 'qa-user', ...bad })).status, 400);
+  assert.deepEqual(recorded, [['gate.retry', { tool: 'drive_read_file' }], ['gate.miss', { tool: 'drive_read_file' }], ['prefetch.failed', { tool: 'drive_read_file' }]]);
+});
+
 test('frameTooLarge refuses a prepared line longer than the front reads (PREPARED_CAP bytes of UTF-8)', () => {
   assert.equal(native.PREPARED_CAP, 40 * 1024 * 1024);
   assert.equal(native.frameTooLarge('x'.repeat(native.PREPARED_CAP)), false);
@@ -547,6 +778,18 @@ test('the tool-used bridge counts a call the front answered, as the user (track 
   assert.equal((await call(p, { user: 'qa-user', name: 'read_project_file' }, { trusted: false })).status, 404);
   const gone = bridge({ asUser: async () => { throw Object.assign(Error('no such account'), { status: 404 }); } });
   assert.deepEqual(await gone.call(p, { user: 'qa-gone', name: 'read_project_file' }), { handled: true, status: 404, body: { error: 'no such account' } });
+});
+
+test('the runtime bridge reports this Node\'s versions, as the user (track R5)', async () => {
+  const p = `${native.NATIVE_PREFIX}runtime`;
+  const { call, calls } = bridge();
+  const zone = Intl.DateTimeFormat().resolvedOptions().timeZone ?? '';
+  assert.deepEqual(await call(p, { user: 'qa-user' }), { handled: true, status: 200, body: { node: process.versions.node, icu: process.versions.icu, tz: process.versions.tz, zone } });
+  assert.deepEqual(calls, [['asUser', 'qa-user']]);
+  assert.equal((await call(p, {})).status, 400);
+  assert.equal((await call(p, { user: 'qa-user' }, { trusted: false })).status, 404);
+  const gone = bridge({ asUser: async () => { throw Object.assign(Error('no such account'), { status: 404 }); } });
+  assert.deepEqual(await gone.call(p, { user: 'qa-gone' }), { handled: true, status: 404, body: { error: 'no such account' } });
 });
 
 test('a fact bridge refuses a gone account, says when the manager is off, and never sends a failure\'s detail', async () => {
