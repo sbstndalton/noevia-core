@@ -238,7 +238,9 @@ const embeddingOwner = embeddingBackground.createOwner({ env: process.env, front
   }),
 });
 const embeddingConfig = require('./embedding-config.cjs').install(require('./embedding-config.cjs').loadEmbeddingConfig({
-  env: process.env, nativeOwner: embeddingOwner, stateFile: path.join(DATA_DIR, 'embedding-config.json') }));
+  env: process.env, nativeOwner: embeddingOwner, stateFile: path.join(DATA_DIR, 'embedding-config.json'),
+  // Track R11: the front writes the file under NOEVIA_RUST_EMBEDDING_ADMIN=rust; read it again when it changes.
+  reread: require('./rust-embedding-admin.cjs').frontOwns() }));
 rag.init({ dataDir: DATA_DIR, inferenceUrl: INFERENCE_BASE, headersFn: () => inferenceHeaders(), userDataDirFn: workspaceStore.userDir,
   userActive: (userId) => !workspaceStore.isRemoved(userId), inferenceGuard: () => modelManager.enterInference?.() || (() => {}),
   embeddingConfig, listUserIds: () => authService.db.prepare('SELECT id FROM users').all().map((r) => r.id) });
@@ -1302,6 +1304,8 @@ async function handleRequestInner(req, res) {
   if (require('./rust-tool-approvals.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   // Track R11: the model writes, MTP artifact check and pull are the front's under NOEVIA_RUST_MODEL_WRITES=rust (rust-model-writes.cjs).
   if (require('./rust-model-writes.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
+  // Track R11: /api/embedding is the front's under NOEVIA_RUST_EMBEDDING_ADMIN=rust (rust-embedding-admin.cjs).
+  if (require('./rust-embedding-admin.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   if (require('./rust-idle-unload-read.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   if (await idleUnloadFacts(req, res)) return;
   if (require('./rust-model-downloads-read.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
