@@ -13,18 +13,22 @@ const record = (events) => {
   return r;
 };
 
+const HUGE = [
+  { type: 'tool', index: 4294967294, name: 'qa_last', args: '{}' },
+  { type: 'tool', index: 0, name: 'qa_first', args: '{"q":1}' },
+  { type: 'tool_result', index: 4294967294, name: 'qa_last', text: 'QA done' },
+];
+
 test('#2544: a huge tool-call index is listed in index order without walking holes', () => {
-  const started = process.hrtime.bigint();
-  const r = record([
-    { type: 'tool', index: 4294967294, name: 'qa_last', args: '{}' },
-    { type: 'tool', index: 0, name: 'qa_first', args: '{"q":1}' },
-    { type: 'tool_result', index: 4294967294, name: 'qa_last', text: 'QA done' },
-  ]);
-  const entry = r.assistantEntry();
-  r.partialEntry();
-  const ms = Number(process.hrtime.bigint() - started) / 1e6;
-  assert.ok(ms < 1000, `listing took ${ms} ms`);
-  assert.deepEqual(entry.toolCalls.map((c) => [c.name, c.status]), [['qa_first', 'stopped'], ['qa_last', 'done']]);
+  // In a child process with a deadline: the old Array stalled synchronously, which no in-process timer can stop.
+  const script = `const r = require(${JSON.stringify(require.resolve('./chat-interrupted-turn.cjs'))}).createTurnRecord({ now: () => 0 });
+    for (const ev of ${JSON.stringify(HUGE)}) r.observe(ev);
+    r.partialEntry();
+    process.stdout.write(JSON.stringify(r.assistantEntry().toolCalls.map((c) => [c.name, c.status])));`;
+  const out = require('node:child_process').spawnSync(process.execPath, ['-e', script], { encoding: 'utf8', timeout: 10000 });
+  assert.equal(out.error?.code, undefined, 'the listing finished within 10 s');
+  assert.equal(out.status, 0, out.stderr);
+  assert.deepEqual(JSON.parse(out.stdout), [['qa_first', 'stopped'], ['qa_last', 'done']]);
 });
 
 test('#2544: an index past the largest array index is a property, never listed or counted (as in an Array)', () => {
@@ -50,4 +54,14 @@ test('#2544: steps without an index follow the Array rules (length, last element
   assert.deepEqual(r.assistantEntry().toolCalls.map((c) => [c.name, c.status, c.args]), [
     ['qa_a', 'stopped', '1'], ['qa_b', 'done', '2'], ['qa_c', 'stopped', '3'], ['qa_missing', 'done', ''],
   ]);
+});
+
+test('#2544: a result without an index never matches a step kept as a property', () => {
+  const r = record([
+    { type: 'tool', index: 4294967294, name: 'qa_last' },
+    { type: 'tool', index: 4294967295, name: 'qa_property', args: 'p' },
+    // findIndex sees elements only: no match, so it lands at length (2^32 - 1), the property itself.
+    { type: 'tool_result', name: 'qa_property', text: 'QA p' },
+  ]);
+  assert.deepEqual(r.assistantEntry().toolCalls.map((c) => c.name), ['qa_last']);
 });

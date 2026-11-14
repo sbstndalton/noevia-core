@@ -34,12 +34,15 @@ function createSteps() {
   const elements = new Map();
   const properties = new Map();
   let length = 0;
-  const sorted = () => [...elements.keys()].sort((a, b) => a - b);
+  // The element indices in order, kept until a new index arrives (a listing runs every 4 s during a reply).
+  let order = null;
+  const sorted = () => (order ||= [...elements.keys()].sort((a, b) => a - b));
   return {
     length: () => length,
     get: (at) => (at <= MAX_ARRAY_INDEX ? elements.get(at) : properties.get(at)),
     set(at, step) {
       if (at > MAX_ARRAY_INDEX) { properties.set(at, step); return; }
+      if (!elements.has(at)) order = null;
       elements.set(at, step);
       if (at >= length) length = at + 1;
     },
