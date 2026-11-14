@@ -99,6 +99,12 @@ test('track R11: a figure the front saves in the settings row is enforced withou
   assert.equal(logs.length, 1);
   assert.match(logs[0], /could not be read; using the last known figure/);
   assert.doesNotMatch(logs[0], /not json|9/);
+  // A good read re-arms the log: the next outage is reported again.
+  store.set('inference:memory-budget', JSON.stringify({ budgetGib: 10 }));
+  assert.equal(b.budgetGib(), 10);
+  store.set('inference:memory-budget', '{again not json');
+  assert.equal(b.budgetGib(), 10);
+  assert.equal(logs.length, 2);
 });
 
 // ── Prompt cache limits ─────────────────────────────────────────────────────

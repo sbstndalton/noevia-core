@@ -464,7 +464,8 @@ function createModelRoutes({ servedEmbeddingModels = (target) => require('../rag
     // Sizing-method residuals are refused at the front ownership boundary.
 
     // #697: the inference memory budget (admin setting). The GET is the Rust front's (#2262, rust-model-state-reads.cjs); the
-    // PUT stays here with the figure this process enforces and the audit.
+    // PUT stays here with the audit, unless NOEVIA_RUST_MODEL_WRITES=rust hands it to the front (rust-model-writes.cjs refuses
+    // it before this). Either way this process enforces the figure it reads from the settings row on every use.
     if (p === '/api/models/inference-budget') {
       if(authn.user.role!=='admin')return json(res,403,{error:'Administrator required for shared model profiles'});
       if(!inferenceBudget)return json(res,404,{error:'The inference memory budget is unavailable'});
