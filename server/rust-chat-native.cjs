@@ -531,6 +531,8 @@ function createToolBridge({ secret, json, readJson, asUser, getProject, executeT
       // when the executor hands on the raw framed result exactly as before. The frame is the chat's confirmed one
       // (storedFrame only returns confirmed frames); the answer model is the turn's local one.
       const kind = text(body?.kind, 40), tool = text(body?.tool, TOOL_NAME_CAP), model = text(body?.model, MODEL_CAP);
+      // Bounded by the bridge's body cap (BODY_CAP): a message past it answers 400, so its raw result goes on (named
+      // difference: Node would condense; the reasoner reads only its first 2000 units).
       const message = text(body?.message, CHAT_BODY_CAP), resultText = text(body?.resultText, CHAT_BODY_CAP);
       if (!kind || !tool || model === null || message === null || resultText === null) return json(res, 400, { error: 'kind, tool, model, message and resultText are required.' });
       if (!framingReasoner || typeof framingReasoner.condense !== 'function') return json(res, 200, { rendered: null });
@@ -542,13 +544,17 @@ function createToolBridge({ secret, json, readJson, asUser, getProject, executeT
     }
     if (op === 'reasoner-trace') {
       // chat.cjs after the reply (#740): the person's own opt-in trace of a handed-on packet, in their workspace dir.
-      // Packet, answer length, timings only; a trace never changes the reply.
+      // Packet, answer length, timings only; a trace never changes the reply. The packet is one the reasoner could
+      // have handed on (task-packet.cjs validatePacket), so nothing else is written into the trace file.
       const trace = body?.trace;
       const ok = plain(trace) && text(trace.kind, 40) && text(trace.tool, TOOL_NAME_CAP) && plain(trace.timings)
+        && Object.values(trace.timings).every((v) => Number.isFinite(v)) && Object.keys(trace.timings).length <= 8
+        && require('./task-packet.cjs').validatePacket(trace.packet).ok === true
         && Number.isSafeInteger(body?.answerChars) && body.answerChars >= 0 && Number.isFinite(body?.answerMs) && body.answerMs >= 0;
       if (!ok) return json(res, 400, { error: 'trace, answerChars and answerMs are required.' });
       try {
-        const dir = currentWorkspace()?.dir;
+        const ws = currentWorkspace();
+        const dir = ws && !ws.revoked && ws.userId === who ? ws.dir : null;
         if (reasoningTraces && dir && reasoningTraces.enabled(dir)) {
           reasoningTraces.append(dir, { kind: trace.kind, tool: trace.tool, packet: trace.packet, timings: { ...trace.timings, answerMs: body.answerMs }, answerChars: body.answerChars });
         }

@@ -523,7 +523,7 @@ test('the condense op asks the framing reasoner as prefetchTool does; reasoner-t
   const reasoner = (out) => ({ condense: async (input) => { asked.push(input); return out; } });
   const p = `${native.NATIVE_PREFIX}condense`;
   const body = { user: 'qa-user', kind: 'search', message: 'QA find the plan', tool: 'drive_read_file', resultText: 'QA plan text.', model: 'qa-model' };
-  const packet = { facts: [{ text: 'QA fact', source: 'drive_read_file' }] };
+  const packet = { packet_schema: 1, goal: 'QA find the plan', facts: [{ text: 'QA fact', source: { kind: 'tool', ref: 'drive_read_file' } }], constraints: [], open_questions: [] };
   const ok = { ok: true, packet, rendered: 'QA rendered packet', timings: { reasonerMs: 12 } };
   const { call } = bridge({ framingReasoner: reasoner(ok), isWriteTool: (n) => n === 'drive_create_file' });
   const r = await call(p, body);
@@ -551,9 +551,18 @@ test('the condense op asks the framing reasoner as prefetchTool does; reasoner-t
   const off = bridge({ reasoningTraces: traces(false), currentWorkspace: () => ({ dir: '/qa/ws', userId: 'qa-user' }) });
   assert.equal((await off.call(t, { user: 'qa-user', trace, answerChars: 42, answerMs: 7 })).status, 204);
   assert.deepEqual(appended, [['enabled', '/qa/ws']]);
-  for (const bad of [{ trace: null }, { trace: { ...trace, timings: 1 } }, { answerChars: -1 }, { answerChars: 1.5 }, { answerMs: 'x' }]) {
+  appended.length = 0;
+  for (const bad of [{ trace: null }, { trace: { ...trace, timings: 1 } }, { trace: { ...trace, timings: { reasonerMs: 'x' } } }, { trace: { ...trace, packet: { goal: 'not a packet' } } },
+    { answerChars: -1 }, { answerChars: 1.5 }, { answerMs: 'x' }]) {
     assert.equal((await on.call(t, { user: 'qa-user', trace, answerChars: 42, answerMs: 7, ...bad })).status, 400, JSON.stringify(bad));
   }
+  assert.deepEqual(appended, [], 'nothing asked or written for a refused trace');
+  // A revoked workspace, or one that is not the relayed user's: nothing is read or written.
+  for (const ws of [{ dir: '/qa/ws', userId: 'qa-user', revoked: true }, { dir: '/qa/other', userId: 'qa-other' }]) {
+    const b = bridge({ reasoningTraces: traces(true), currentWorkspace: () => ws });
+    assert.equal((await b.call(t, { user: 'qa-user', trace, answerChars: 42, answerMs: 7 })).status, 204);
+  }
+  assert.deepEqual(appended, []);
 });
 
 test('a tool gate decision hands off to a front naming tool-gate with the tool (and a prefetch its arguments) (R15)', async (t) => {
