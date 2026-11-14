@@ -10,6 +10,10 @@
 # line and containment decision, used only with SANDBOX_BRIDGE_IMPL=rust. sandbox-bridge.lock pins the
 # noevia-rs ref, its tarball sha256 and the module sha256; the tarball is checked before anything is
 # built and the module after (the same recipe as the web image's dav-parse.wasm).
+# Which tool checks the native verifier's reviewed source before anything is built from it: python (the
+# default, verify-native-source.py) or rust (bins/reviewed-source, its native port: same digest, same
+# refusals, no interpreter). Both extract nothing unless NATIVE_VERIFIER_SOURCE_SHA256 matches.
+ARG NATIVE_VERIFIER_SOURCE_CHECK=python
 FROM node:22-bookworm-slim AS sandbox-bridge-src
 COPY sandbox-bridge.lock /lock
 RUN set -e; eval "$(grep -E '^(NOEVIA_RS_REF|NOEVIA_RS_SHA256)=[0-9a-f]+$' /lock)"; \
@@ -52,11 +56,41 @@ RUN cargo build --locked --release -p code-sandbox-supervisor --bins \
 # The verifier source pin is a canonical Git-export content digest. It is
 # independent of codeload gzip timestamps; the bounded validator checks every
 # path/type/executable bit/content before extracting any build input.
-FROM python:3.12-slim-bookworm AS native-verifier-src
+FROM python:3.12-slim-bookworm AS native-verifier-src-python
 ARG NATIVE_VERIFIER_RS_REF=e21b92a219c5266429d8d3cff1fe9df76003ce3c
 ARG NATIVE_VERIFIER_SOURCE_SHA256=a4dd45eb2e475a9762efbaf568c398b60bfe4fb1fa9ce5b6afae4385ad64ffe3
 COPY verify-native-source.py /verify-native-source.py
 RUN python3 /verify-native-source.py fetch "$NATIVE_VERIFIER_RS_REF" "$NATIVE_VERIFIER_SOURCE_SHA256" /verifier-rs
+
+# NATIVE_VERIFIER_SOURCE_CHECK=rust: the checker is built from its own sha256-pinned noevia-rs tarball
+# (council candidate pin; re-pin to a noevia-rs main commit before selecting it). The verifier archive is
+# fetched unchecked and handed to the checker, which reads at most 64 MiB, validates every entry and the
+# reviewed digest, and only then writes /verifier-rs. The verifier pins are repeated from the python stage.
+FROM node:22-bookworm-slim AS reviewed-source-src
+ARG REVIEWED_SOURCE_RS_REF=58ed2f92e9ba318f5b801f4a0ea058172e68b0ec
+ARG REVIEWED_SOURCE_RS_SHA256=7cfbd63839cb669b3f94d1ee50004abd91666bb641f6c736638866ad30d9cb25
+ARG NATIVE_VERIFIER_RS_REF=e21b92a219c5266429d8d3cff1fe9df76003ce3c
+RUN set -eu; \
+    printf '%s\n' "$REVIEWED_SOURCE_RS_REF" "$NATIVE_VERIFIER_RS_REF" | grep -Eqvx '[0-9a-f]{40}' && exit 1; \
+    printf '%s\n' "$REVIEWED_SOURCE_RS_SHA256" | grep -Eqx '[0-9a-f]{64}'; \
+    get() { node -e 'fetch(process.argv[1]).then(r=>{if(!r.ok)throw new Error("HTTP "+r.status);return r.arrayBuffer()}).then(b=>require("fs").writeFileSync(process.argv[2],Buffer.from(b))).catch(e=>{console.error(e.message);process.exit(1)})' "https://codeload.github.com/sbstndalton/noevia-rs/tar.gz/$1" "$2"; }; \
+    get "$REVIEWED_SOURCE_RS_REF" /checker-rs.tgz; \
+    echo "$REVIEWED_SOURCE_RS_SHA256  /checker-rs.tgz" | sha256sum -c -; \
+    mkdir /checker-rs && tar -xzf /checker-rs.tgz --strip-components=1 -C /checker-rs && rm /checker-rs.tgz; \
+    get "$NATIVE_VERIFIER_RS_REF" /verifier-rs.tgz
+
+FROM rust:1.99-slim-bookworm AS native-verifier-src-rust
+ARG NATIVE_VERIFIER_RS_REF=e21b92a219c5266429d8d3cff1fe9df76003ce3c
+ARG NATIVE_VERIFIER_SOURCE_SHA256=a4dd45eb2e475a9762efbaf568c398b60bfe4fb1fa9ce5b6afae4385ad64ffe3
+ENV RUSTUP_TOOLCHAIN=1.99.0 CARGO_TERM_COLOR=never CARGO_BUILD_JOBS=2
+COPY --from=reviewed-source-src /checker-rs /checker
+COPY --from=reviewed-source-src /verifier-rs.tgz /verifier-rs.tgz
+WORKDIR /checker
+RUN cargo build --locked --release -p reviewed-source \
+ && target/release/reviewed-source extract-ref /verifier-rs.tgz "$NATIVE_VERIFIER_RS_REF" "$NATIVE_VERIFIER_SOURCE_SHA256" /verifier-rs \
+ && rm /verifier-rs.tgz
+
+FROM native-verifier-src-${NATIVE_VERIFIER_SOURCE_CHECK} AS native-verifier-src
 
 FROM rust:1.99-slim-bookworm AS native-verifier
 ENV RUSTUP_TOOLCHAIN=1.99.0 CARGO_TERM_COLOR=never CARGO_BUILD_JOBS=2
