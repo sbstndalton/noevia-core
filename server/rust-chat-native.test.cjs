@@ -390,6 +390,17 @@ test('a turn whose routed tools were narrowed hands off only to a front naming m
   assert.deepEqual(frame.widen.asked.map(([n]) => n), widened);
   assert.ok(frame.widen.asked.every(([n, write, blocked]) => write === frame.widen.writes.includes(n) && blocked === false));
   assert.deepEqual(frame.widen.routes, []);
+  // A tool only the widened list offers counts for the checks on what the turn may offer (here the stream guard's).
+  const egress = require('./provider-egress.cjs');
+  egress.__setStreamGuardEnabledForTests(true);
+  egress.setToolArgumentSchema('drive_read_file', { type: 'object' });
+  const guardLog = [];
+  console.log = (line) => guardLog.push(String(line));
+  let guarded;
+  try { guarded = await runTurn(t, { requested: true, caps: ['more-tools'], frames: answer, deps: narrow }); }
+  finally { console.log = log; egress.setToolArgumentSchema('drive_read_file', null); egress.__setStreamGuardEnabledForTests(false); }
+  assert.equal(guarded.requests.length, 1, 'Node ran the turn');
+  assert.ok(guardLog.includes('[chat] native executor not used for this turn: stream-guard'));
   // Not narrowed (or the router off): no `widen` key, the frame earlier executors read.
   const plain = await runTurn(t, { requested: true, caps: ['more-tools'], frames: answer });
   assert.equal(plain.events.at(-1).type, 'prepared');

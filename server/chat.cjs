@@ -1688,6 +1688,18 @@ function createChatHandler({
         if (provenancePolicy) { try { provenanceOn = provenancePolicy.enabled() === true; } catch { provenanceOn = true; } }
         const diaryTurn = (typeof spaceId === 'string' && spaceId.startsWith('diary')) || project?.id === diaryExtras?.PROJECT_ID;
         const egressRules = require('./provider-egress.cjs');
+        // What more_tools would widen to (below, in the round loop), for a front that runs it: the project's whole
+        // selection, resolved now. `asked`: each name the resolution read the account's policy for (`blocked`), in
+        // order, with its answer, so the executor makes the same reads when the model widens.
+        if (routing.narrowed && handoffCaps.has('more-tools')) {
+          const asked = [];
+          const full = resolveTools(asSelection(selectedBoxes), model, (n) => { const b = blocked(n) === true; asked.push([n, isWriteTool(n) === true, b]); return b; }, ...measuredOn());
+          const fullNames = full.tools.map((t) => t.function?.name).filter((n) => typeof n === 'string');
+          widen = { tools: full.tools, routes: [...(full.routes || [])], writes: fullNames.filter((n) => isWriteTool(n)), public: fullNames.filter((n) => isPublicTool(n)),
+            editTools: fullNames.filter((n) => projectEditTool(n)), onceTools: fullNames.filter((n) => specialistPageSave.neverStanding(n)), asked };
+        }
+        // The tools the turn may offer: the list as sent, and what more_tools widens to.
+        const mayOffer = widen ? [...activeTools, ...widen.tools] : activeTools;
         refusalInput = {
           // A chat deleted while this turn was prepared: the cleanup below runs at the cut, the executor would write it back.
           chatIdNotText: chatId !== null && typeof chatId !== 'string',
@@ -1704,22 +1716,12 @@ function createChatHandler({
           narrowed: !!routing.narrowed && !handoffCaps.has('more-tools'), gate: !!(gate && gate.decision !== 'none'),
           supervision: nativeHandoff.supervising(),
           injected: injectedEntries.some((e) => e && e.kind === 'file' && typeof e.file !== 'string'),
-          pageSave: activeTools.some((t) => specialistPageSave.neverStanding(t.function?.name)) && !handoffCaps.has('once'),
+          pageSave: mayOffer.some((t) => specialistPageSave.neverStanding(t.function?.name)) && !handoffCaps.has('once'),
           // #516: the stream guard's schema check runs before every call (egressToolRefusal) once it is on; the executor
           // does not run it yet. It answers for a call that cannot parse only when it is on and the tool has a schema.
-          streamGuard: activeTools.some((t) => egressRules.validateToolArguments(t.function?.name, '\u0000') !== null),
+          streamGuard: mayOffer.some((t) => egressRules.validateToolArguments(t.function?.name, '\u0000') !== null),
         };
         why = native.refusal(refusalInput);
-        // What more_tools would widen to (below, in the round loop): the project's whole selection, resolved now.
-        // `asked`: each name the resolution read the account's policy for (`blocked`), in order, with its answer,
-        // so the executor reads the same policies again when the model widens and sees whether one changed.
-        if (!why && routing.narrowed) {
-          const asked = [];
-          const full = resolveTools(asSelection(selectedBoxes), model, (n) => { const b = blocked(n) === true; asked.push([n, isWriteTool(n) === true, b]); return b; }, ...measuredOn());
-          const fullNames = full.tools.map((t) => t.function?.name).filter((n) => typeof n === 'string');
-          widen = { tools: full.tools, routes: [...(full.routes || [])], writes: fullNames.filter((n) => isWriteTool(n)), public: fullNames.filter((n) => isPublicTool(n)),
-            editTools: fullNames.filter((n) => projectEditTool(n)), onceTools: fullNames.filter((n) => specialistPageSave.neverStanding(n)), asked };
-        }
       } catch (error) {
         why = 'refusal-input';
         console.warn(`[chat] native executor refusal inputs could not be read: ${String(error?.message || error).slice(0, 200)}`);
