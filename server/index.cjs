@@ -238,7 +238,9 @@ const embeddingOwner = embeddingBackground.createOwner({ env: process.env, front
   }),
 });
 const embeddingConfig = require('./embedding-config.cjs').install(require('./embedding-config.cjs').loadEmbeddingConfig({
-  env: process.env, nativeOwner: embeddingOwner, stateFile: path.join(DATA_DIR, 'embedding-config.json') }));
+  env: process.env, nativeOwner: embeddingOwner, stateFile: path.join(DATA_DIR, 'embedding-config.json'),
+  // Track R11: the front writes the file under NOEVIA_RUST_EMBEDDING_ADMIN=rust; read it again when it changes.
+  reread: require('./rust-embedding-admin.cjs').frontOwns() }));
 rag.init({ dataDir: DATA_DIR, inferenceUrl: INFERENCE_BASE, headersFn: () => inferenceHeaders(), userDataDirFn: workspaceStore.userDir,
   userActive: (userId) => !workspaceStore.isRemoved(userId), inferenceGuard: () => modelManager.enterInference?.() || (() => {}),
   embeddingConfig, listUserIds: () => authService.db.prepare('SELECT id FROM users').all().map((r) => r.id) });
@@ -1200,6 +1202,8 @@ const storageRoutes = require('./routes/storage.cjs').createStorageRoutes({ json
 const idleUnloadFacts = require('./rust-idle-unload-read-facts.cjs').createIdleUnloadFacts({
   secret: FRONT_SECRET, json, effectiveSeconds: () => idleUnload?.effectiveSeconds(),
 });
+// Track R11: the front's native pull records its download in this process's tracker (rust-model-downloads-bridge.cjs).
+const modelDownloadsBridge = require('./rust-model-downloads-bridge.cjs').createDownloadsBridge({ secret: FRONT_SECRET, json, readJson, modelManager });
 const modelDownloadsFacts = require('./rust-model-downloads-read-facts.cjs').createModelDownloadsFacts({
   secret: FRONT_SECRET, json, manager: () => modelManager,
 });
@@ -1303,12 +1307,15 @@ async function handleRequestInner(req, res) {
   if (await autoRolesWriteBridge(req, res)) return;
   if (await modelStateBridge(req, res)) return;
   if (require('./rust-tool-approvals.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
-  // Track R11: the two PUTs are the front's under NOEVIA_RUST_MODEL_WRITES=rust (rust-model-writes.cjs).
+  // Track R11: the model writes, MTP artifact check and pull are the front's under NOEVIA_RUST_MODEL_WRITES=rust (rust-model-writes.cjs).
   if (require('./rust-model-writes.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
+  // Track R11: /api/embedding is the front's under NOEVIA_RUST_EMBEDDING_ADMIN=rust (rust-embedding-admin.cjs).
+  if (require('./rust-embedding-admin.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   if (require('./rust-idle-unload-read.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   if (await idleUnloadFacts(req, res)) return;
   if (require('./rust-model-downloads-read.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   if (await modelDownloadsFacts(req, res)) return;
+  if (await modelDownloadsBridge(req, res)) return;
   if (require('./rust-autotune-read.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   if (await embeddingOwner.handleSourceChanged(req, res, json)) return;
   if (embeddingOwner.handle(req, res, json)) return;

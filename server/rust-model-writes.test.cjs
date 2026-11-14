@@ -1,11 +1,11 @@
 'use strict';
-// Track R11: the inference budget and idle unload PUTs are the Rust front's under NOEVIA_RUST_MODEL_WRITES=rust; unset,
-// Node answers them as before.
+// Track R11: the three model PUTs, the MTP artifact check and the pull are the Rust front's under
+// NOEVIA_RUST_MODEL_WRITES=rust; unset, Node answers them as before.
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 const test = require('node:test');
-const { SWITCH, OWNED_PATHS, OWNED_GETS, ROUTE_REFUSAL, frontOwns, owned, refuseOwned } = require('./rust-model-writes.cjs');
+const { SWITCH, OWNED_PATHS, OWNED_GETS, OWNED_POSTS, ROUTE_REFUSAL, frontOwns, owned, refuseOwned } = require('./rust-model-writes.cjs');
 
 const parseRequestUrl = (req, base = 'http://localhost') => { try { return new URL(req.url, base); } catch { return null; } };
 const ask = (method, url, env) => {
@@ -14,7 +14,7 @@ const ask = (method, url, env) => {
   return { refused, seen };
 };
 
-test('only the switch set to rust hands the three PUTs to the front', () => {
+test('only the switch set to rust hands the PUTs, the MTP check and the pull to the front', () => {
   assert.deepEqual([...OWNED_PATHS], ['/api/models/inference-budget', '/api/models/idle-unload', '/api/models/preset']);
   assert.equal(SWITCH, 'NOEVIA_RUST_MODEL_WRITES');
   for (const env of [{}, { [SWITCH]: '' }, { [SWITCH]: 'on' }, { [SWITCH]: 'Rust' }, { [SWITCH]: 'node' }]) {
@@ -27,12 +27,15 @@ test('only the switch set to rust hands the three PUTs to the front', () => {
   assert.deepEqual([...OWNED_GETS], ['/api/models/mtp-artifact']);
   assert.deepEqual(ask('GET', '/api/models/mtp-artifact?repo=qa/x&variant=q', env), { refused: true, seen: [[503, ROUTE_REFUSAL]] });
   assert.deepEqual(ask('GET', '/api/models/mtp-artifact', {}), { refused: false, seen: [] });
+  assert.deepEqual([...OWNED_POSTS], ['/api/models/pull']);
+  assert.deepEqual(ask('POST', '/api/models/pull', env), { refused: true, seen: [[503, ROUTE_REFUSAL]] });
+  assert.deepEqual(ask('POST', '/api/models/pull', {}), { refused: false, seen: [] });
   assert.equal(ROUTE_REFUSAL.code, 'RUST_MODEL_WRITES_OWNED');
 });
 
-test('everything beside the three PUTs stays where it was', () => {
+test('everything beside them stays where it was', () => {
   const env = { [SWITCH]: 'rust' };
-  for (const [m, p] of [['GET', '/api/models/inference-budget'], ['POST', '/api/models/idle-unload'], ['GET', '/api/models/preset'], ['PUT', '/api/models/presets/reload'], ['POST', '/api/models/pull'], ['POST', '/api/models/mtp-artifact'], ['GET', '/api/models/mtp-artifact/'], ['GET', '/api/models/inference-budget'],
+  for (const [m, p] of [['GET', '/api/models/inference-budget'], ['POST', '/api/models/idle-unload'], ['GET', '/api/models/preset'], ['PUT', '/api/models/presets/reload'], ['GET', '/api/models/pull'], ['POST', '/api/models/pull/'], ['POST', '/api/models/mtp-artifact'], ['GET', '/api/models/mtp-artifact/'],
     ['PUT', '/api/models/inference-budget/'], ['PUT', '/api/model-manager/idle-unload'], ['DELETE', '/api/models/idle-unload']]) {
     assert.equal(owned(m, p), false, `${m} ${p}`);
     assert.deepEqual(ask(m, p, env), { refused: false, seen: [] }, `${m} ${p}`);
