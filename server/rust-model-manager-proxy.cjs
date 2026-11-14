@@ -15,9 +15,13 @@ const ROUTE_REFUSAL = Object.freeze({ error: 'The model manager proxy is owned b
 /** Whether the front answers the proxy (the switch is exactly `rust`). */
 const frontOwns = (env = process.env) => env[SWITCH] === 'rust';
 
-/** True for a request the front answers under the switch (routes/models.cjs tests `p.startsWith('/api/model-manager/')`). */
+/** The path as routes/models.cjs judges it: each segment decoded (a segment that does not decode is kept as it is). */
+const decoded = (pathname) => pathname.split('/').map((s) => { try { return decodeURIComponent(s); } catch { return s; } }).join('/');
+
+/** True for a request the front answers under the switch (routes/models.cjs tests `p.startsWith('/api/model-manager/')`).
+ *  The sweep is kept by its decoded path, as the front relays it (benchmark/sw%65ep is the sweep too). */
 const owned = (method, pathname) => typeof pathname === 'string' && pathname.startsWith(PREFIX)
-  && !KEPT.includes(`${method} ${pathname}`) && !(method === 'GET' && pathname === '/api/model-manager/models');
+  && !KEPT.includes(`${method} ${decoded(pathname)}`) && !(method === 'GET' && pathname === '/api/model-manager/models');
 
 /** Runs before authentication (index.cjs). An unparseable target falls through. */
 function refuseOwned(req, res, { parseRequestUrl, json, env = process.env }) {
