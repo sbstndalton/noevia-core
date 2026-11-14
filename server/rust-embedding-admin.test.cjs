@@ -42,6 +42,7 @@ test('index.cjs mounts the refusal before authentication and reads the switch fo
   assert.ok(at > 0);
   assert.ok(at > index.indexOf('async function handleRequestInner('));
   assert.ok(at < index.indexOf('await embeddingRoutes(req, res'));
+  assert.ok(at < index.indexOf('const preAuth = requestAuth.authenticate(req)'));
   assert.match(index, /reread: require\('\.\/rust-embedding-admin\.cjs'\)\.frontOwns\(\)/);
 });
 
@@ -133,4 +134,53 @@ test('unset: the file is read at start-up only, as before', (t) => {
     assert.equal(config.active().model, 'qa-embed-a');
     assert.equal(config.version(), v);
   }
+});
+
+test('reread: a file that is there but cannot be read is damaged, retried, and recovers', (t) => {
+  const f = fixture(); t.after(f.cleanup);
+  frontWrites(f.file, { active: target('qa-embed-a'), next: null, previous: null });
+  const lines = [];
+  const config = createEmbeddingConfig({ env: {}, stateFile: f.file, reread: true, log: (l) => lines.push(l) });
+  assert.equal(config.active().model, 'qa-embed-a');
+  fs.rmSync(f.file); fs.mkdirSync(f.file); // EISDIR on read, even as root
+  assert.equal(config.active().profile, 'unavailable');
+  assert.match(config.damaged, /cannot be read/);
+  assert.deepEqual(config.modelNames(), ['qa-embed-a']);
+  config.get(); config.active(); // retried, logged once
+  assert.equal(lines.length, 1);
+  fs.rmdirSync(f.file);
+  frontWrites(f.file, { active: target('qa-embed-b'), next: null, previous: null });
+  assert.equal(config.active().model, 'qa-embed-b');
+  assert.equal(config.damaged, undefined);
+});
+
+test('reread: a damaged file is not undone by the seeded-address guard releasing its hold', (t) => {
+  const f = fixture(); t.after(f.cleanup);
+  const config = createEmbeddingConfig({ env: { EMBEDDING_MODEL: 'qa-embed-a', EMBEDDING_BASE_URL: 'http://qa-embed.invalid' }, stateFile: f.file, reread: true, log() {} });
+  config.refuseSeeded({ active: 'qa not resolved yet' }, { transient: true });
+  fs.writeFileSync(`${f.file}.bad`, '{"version":2}'); fs.renameSync(`${f.file}.bad`, f.file);
+  config.releaseSeeded('active');
+  assert.equal(config.active().profile, 'unavailable');
+  assert.match(config.damaged, /cannot be read/);
+});
+
+test('reread: a file damaged at start-up starts embedding off and recovers once a readable file replaces it', (t) => {
+  const f = fixture(); t.after(f.cleanup);
+  fs.writeFileSync(f.file, '{damaged');
+  const lines = [];
+  const config = loadEmbeddingConfig({ env: { EMBEDDING_MODEL: 'qa-embed-env' }, stateFile: f.file, reread: true, log: (l) => lines.push(l) });
+  assert.deepEqual(config.active(), { baseUrl: null, model: 'unavailable', profile: 'unavailable' });
+  assert.equal(config.get().source, 'environment');
+  assert.match(config.damaged, /cannot be read/);
+  assert.throws(() => config.setNext(target('qa-embed-x')), (e) => e.code === 'badState' && e.status === 409);
+  assert.equal(lines.length, 1);
+  frontWrites(f.file, { active: target('qa-embed-b'), next: null, previous: null });
+  assert.equal(config.active().model, 'qa-embed-b');
+  assert.equal(config.get().source, 'saved');
+  assert.equal(config.damaged, undefined);
+  // Unset: the start-up stand-in stays off until a restart, as before.
+  fs.writeFileSync(`${f.file}.bad`, '{damaged'); fs.renameSync(`${f.file}.bad`, f.file);
+  const old = loadEmbeddingConfig({ env: {}, stateFile: f.file, log() {} });
+  frontWrites(f.file, { active: target('qa-embed-c'), next: null, previous: null });
+  assert.equal(old.active().model, 'unavailable');
 });

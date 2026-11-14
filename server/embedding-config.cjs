@@ -23,9 +23,10 @@
 // the runtime changes and writes `stateFile` (tmp + rename, as persist() does). This process then reads the file again
 // whenever its identity (inode, size, mtime) changes, before every read of the configuration, so retrieval, the delete
 // guard and the status follow the front's change at once. A file that cannot be read at runtime switches embedding off,
-// fail closed, as a damaged file does at start-up, until a readable one replaces it. A file removed at runtime leaves
-// the configuration as it was (the environment seeds only at start-up). A file already damaged at start-up still turns
-// embedding off until a restart (loadEmbeddingConfig), as before: the front refuses every change to it meanwhile.
+// fail closed, as a damaged file does at start-up, until a readable one replaces it; so does a file damaged at start-up
+// (without `reread` that one waits for a restart, as before). A file that is there but cannot be read counts as damaged.
+// A file removed at runtime leaves the configuration as it was (the environment seeds only at start-up, after its address
+// guard; the front and the native worker fall back to the seed at once, a named difference while the switch is set).
 
 const fs = require('node:fs');
 const path = require('node:path');
@@ -85,10 +86,15 @@ function fileIdentity(file) {
   try { const s = fs.statSync(file); return `${s.ino}:${s.size}:${s.mtimeMs}`; } catch (err) { return err?.code === 'ENOENT' ? 'absent' : null; }
 }
 
-function readState(stateFile) {
+// `strict` (track R11 `reread`): a file that is there but cannot be read (permissions, a directory, no free file
+// descriptor) is damaged rather than absent, as the native worker reads it.
+function readState(stateFile, { strict = false } = {}) {
   if (!stateFile) return null;
   let raw;
-  try { raw = fs.readFileSync(stateFile, 'utf8'); } catch { return null; }
+  try { raw = fs.readFileSync(stateFile, 'utf8'); } catch (err) {
+    if (!strict || err?.code === 'ENOENT') return null;
+    throw Object.assign(Error(`The saved embedding configuration ${stateFile} cannot be read (${err.message}). Fix or delete it.`), { code: 'badState', retry: true });
+  }
   try {
     const s = JSON.parse(raw);
     if (s?.version !== 1) throw Error('unknown version');
@@ -115,10 +121,19 @@ function createEmbeddingConfig({ env = process.env, stateFile = null, fallbackMo
   let inHold = false;
   // Taken before the first read: a file replaced between the two is read again on the next refresh().
   let seen = reread && stateFile ? fileIdentity(stateFile) : null;
-  const saved = readState(stateFile);
-  let savedNow = !!saved; // the configuration came from stateFile (at start-up, or re-read since)
-  let state = saved || seedFromEnv(env, fallbackModel, log);
-  let locked = null; // set by refuseSeeded: changes are refused until the operator fixes the environment
+  // With `reread` a file damaged at start-up does not end here: embedding starts off and the next readable file
+  // brings it back (loadEmbeddingConfig's stand-in, without `reread`, waits for a restart).
+  let startDamaged = null;
+  let saved = null;
+  try { saved = readState(stateFile, { strict: reread }); } catch (err) {
+    if (!reread || err?.code !== 'badState') throw err;
+    startDamaged = err.message;
+    if (err.retry) seen = null;
+  }
+  let savedNow = !!saved; // the configuration came from stateFile (at start-up, or re-read since): `source`
+  let fromFile = !!saved || !!startDamaged; // stateFile decides, damaged or not: the seeded-address guard stands aside
+  let state = saved || (startDamaged ? { active: { baseUrl: null, model: 'unavailable', profile: 'unavailable' }, next: null, previous: null } : seedFromEnv(env, fallbackModel, log));
+  let locked = startDamaged; // set by refuseSeeded: changes are refused until the operator fixes the environment
   const held = {}; // 'active' | 'next' -> { reason, transient, target }: seeded values refused at start-up
   const source = saved ? 'saved' : 'environment';
   let version = 0;
@@ -151,23 +166,34 @@ function createEmbeddingConfig({ env = process.env, stateFile = null, fallbackMo
     return get();
   }
   // Track R11 (`reread`): the front's change to stateFile, read before the configuration is.
+  // Fail closed: embedding off (an unknown profile refuses every embed call), changes locked, logged once.
+  function damage(message) {
+    fromFile = true;
+    if (api.damaged === message) return;
+    log(`[embedding] ${message} Embeddings are off until then.`);
+    state = { ...state, active: { ...state.active, profile: 'unavailable' } };
+    locked = message; api.damaged = message;
+    bump();
+  }
   function refresh() {
     if (!reread || !stateFile || inHold) return;
     const now = fileIdentity(stateFile);
     if (now === seen) return;
     seen = now;
-    if (now === 'absent' || now === null) return; // removed (or not stat-able): keep what is in use
+    // Removed: keep what is in use. The front and the native worker fall back to the environment's seed then; this
+    // process does not, because the start-up address guard (embedding-address.cjs) checked that seed only at start-up.
+    if (now === 'absent') return;
     let next;
-    try { next = readState(stateFile); } catch (err) {
-      if (api.damaged === err.message) return;
-      log(`[embedding] ${err.message} Embeddings are off until then.`);
-      state = { ...state, active: { ...state.active, profile: 'unavailable' } };
-      locked = err.message; api.damaged = err.message;
-      bump();
+    try {
+      if (now === null) throw Object.assign(Error(`The saved embedding configuration ${stateFile} cannot be read (it cannot be examined). Fix or delete it.`), { code: 'badState', retry: true });
+      next = readState(stateFile, { strict: true });
+    } catch (err) {
+      if (err?.retry) seen = null; // a read that failed (not the content): try again on the next read
+      damage(err.message);
       return;
     }
     if (!next) return;
-    state = next; savedNow = true; locked = null; delete api.damaged;
+    state = next; savedNow = true; fromFile = true; locked = null; delete api.damaged;
     for (const which of Object.keys(held)) delete held[which];
     bump();
   }
@@ -193,6 +219,8 @@ function createEmbeddingConfig({ env = process.env, stateFile = null, fallbackMo
     /** Every model name this process may embed with now or after a switch or rollback. */
     modelNames() { refresh(); return [state.active, state.next, state.previous].filter(Boolean).map((t) => t.model); },
     setNext(target) {
+      refresh();
+      if (reread && api.damaged) throw Object.assign(Error(api.damaged), { status: 409, code: 'badState' }); // as the start-up stand-in
       const t = normalizeTarget(target);
       if (sameTarget(t, state.active)) throw Object.assign(Error('That model, profile and address are already active.'), { status: 409, code: 'alreadyActive' });
       return change({ ...state, next: t });
@@ -226,7 +254,7 @@ function createEmbeddingConfig({ env = process.env, stateFile = null, fallbackMo
      */
     refuseSeeded(reasons = {}, { transient = false } = {}) {
       refresh();
-      if (savedNow || savedChange) return get();
+      if (fromFile || savedChange) return get();
       for (const which of ['active', 'next']) {
         const reason = reasons?.[which];
         if (!reason) continue;
@@ -244,13 +272,14 @@ function createEmbeddingConfig({ env = process.env, stateFile = null, fallbackMo
     releaseSeeded(which) {
       const h = held[which];
       refresh();
-      if (!h || !h.transient || savedNow || savedChange) return get();
+      if (!h || !h.transient || fromFile || savedChange) return get();
       delete held[which];
       if (which === 'next') { if (!state.next) state = { ...state, next: h.target }; } // not over an administrator's own choice
       else { state = { ...state, active: h.target }; locked = null; delete api.damaged; }
       return bump();
     },
   };
+  if (startDamaged) { api.damaged = startDamaged; log(`[embedding] ${startDamaged} Embeddings are off until then.`); }
   return api;
 }
 
