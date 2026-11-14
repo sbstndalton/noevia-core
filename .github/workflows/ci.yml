@@ -8,6 +8,13 @@ on:
 permissions:
   contents: read
 
+# A newer push to a pull request cancels its superseded run. Push runs (main only) share one group per
+# workflow without cancelling: the running main check finishes, and a newer merge replaces a main run
+# that is still waiting.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   server:
     name: Server tests
@@ -216,6 +223,8 @@ jobs:
           DAV_PARSE_WASM_REQUIRED: '1'
       - run: node --test tools/qualification/guard.test.cjs
         working-directory: self
+      - run: node --test tools/ci/workflow-policy.test.cjs
+        working-directory: self
       # Native verifier identity/cleanup qualification runs only in its dedicated
       # isolated container below. Never run the retired UID-wide verifier on the host.
       # The release build sets STAMP_VERSION (#317); re-run the stamp test with a SHA-shaped value.
@@ -367,7 +376,8 @@ jobs:
           load: true
           tags: noevia-code-sandbox:ci
           cache-from: type=gha,scope=code-sandbox
-          cache-to: type=gha,mode=max,scope=code-sandbox
+          # Only main writes the build cache: pull-request entries are scoped to their PR and evicted main's (10 GB repo cap).
+          cache-to: ${{ github.event_name == 'push' && 'type=gha,mode=max,scope=code-sandbox' || '' }}
       - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6 (v6.19.2)
         with:
           context: self/code-sandbox
@@ -493,7 +503,8 @@ jobs:
           load: true
           tags: noevia-web:ci
           cache-from: type=gha
-          cache-to: type=gha,mode=max
+          # Only main writes the build cache: pull-request entries are scoped to their PR and evicted main's (10 GB repo cap).
+          cache-to: ${{ github.event_name == 'push' && 'type=gha,mode=max' || '' }}
       # noevia #990: the differential tests compare Node's own decoders (TextDecoder windows-1252,
       # base64url) with the Rust module. The image build runs the tests on the alpine build stage;
       # this runs the upload-sniff, secret-envelope (and its #1071 retirement corpus), storage-path (likewise), mcp-frame, s3-sign, stream-guard, gguf-meta, policy-leaves, code-review-verdict, tool-exchange, mcp-servers, decision, code-net-guard, role-context, completeness-report, task-lifecycle, llamacpp-autoconfig, code-actions, project-file-names, provider-egress, browser-policy, tool-gate, toolboxes-permitted and llamacpp-presets (JSON.parse, String#trim and Number() white space, non-Unicode RegExp \s/\b//i, String#normalize NFKD, toLowerCase/toUpperCase,, String#trim, URL, /\s/, Number#toString, utf8 decoding,
