@@ -50,9 +50,23 @@ function clampCacheRam(value, { hardMaxMib } = cacheRamLimits()) {
   return n < 0 || n > hardMaxMib ? String(hardMaxMib) : String(n);
 }
 
+// Track R11: the saved figure is read from the store on every use, not only at startup, so a save made
+// by the Rust front (which owns the settings database too) is enforced here at once. A read that fails
+// keeps the last figure this process read or saved (none: the deployment limit) and is logged once until
+// a read succeeds again, without the row or the error.
 function createInferenceBudget({ store, env = process.env, readMeminfo, audit = () => {}, log = (m) => console.warn(m) } = {}) {
-  let saved = null;
-  try { const v = Number(JSON.parse(store?.get(KEY) || 'null')?.budgetGib); saved = v > 0 ? v : null; } catch { saved = null; log('[inference-budget] saved budget could not be read at startup; using deployment limit.'); }
+  let lastKnown = null, unreadableLogged = false;
+  function savedGib(when = '') {
+    try {
+      const v = Number(JSON.parse(store?.get(KEY) || 'null')?.budgetGib);
+      lastKnown = v > 0 ? v : null;
+      unreadableLogged = false;
+    } catch {
+      if (!unreadableLogged) { unreadableLogged = true; log(`[inference-budget] saved budget could not be read${when}; using ${lastKnown == null ? 'deployment limit' : 'the last known figure'}.`); }
+    }
+    return lastKnown;
+  }
+  savedGib(' at startup');
   function range() {
     const host = hostRamGib(readMeminfo);
     const maxGib = host ? Math.max(MIN_BUDGET_GIB, Math.floor(host - HOST_HEADROOM_GIB)) : FALLBACK_MAX_GIB;
@@ -61,6 +75,7 @@ function createInferenceBudget({ store, env = process.env, readMeminfo, audit = 
   const defaultGib = () => positive(env.INFERENCE_MEMORY_BUDGET_GIB, DEFAULT_BUDGET_GIB);
   function get() {
     const r = range();
+    const saved = savedGib();
     const raw = saved ?? defaultGib();
     // A host with less RAM than when the figure was saved still gets a budget it can hold.
     const budgetGib = Math.min(r.maxGib, Math.max(r.minGib, raw));
@@ -73,7 +88,7 @@ function createInferenceBudget({ store, env = process.env, readMeminfo, audit = 
       throw Object.assign(Error(`Enter a budget from ${r.minGib} to ${r.maxGib} GiB, in steps of 0.1.`), { status: 400, messageId: 'invalidBudget', minGib: r.minGib, maxGib: r.maxGib });
     }
     store.set(KEY, JSON.stringify({ budgetGib: n }));
-    saved = n;
+    lastKnown = n;
     audit('inference.budget', actor, { budgetGib: n });
     return get();
   }

@@ -49,3 +49,55 @@ test('configuration must be a plain origin', () => {
   assert.throws(() => createKiwixTools({ baseUrl: 'ftp://kiwix' }));
   assert.throws(() => createKiwixTools({ baseUrl: 'http://kiwix:8080/?x=1' }));
 });
+
+// Track R5: NOEVIA_RUST_KIWIX_TOOLS=1 hands the two tools to the Rust front (POST /v1/kiwix/tool).
+const { NATIVE_UNAVAILABLE, NATIVE_RECHECK_MS } = require('./kiwix.cjs');
+function nativeKiwix(answers, enabled = () => true) {
+  const asked = [];
+  let next = 0;
+  const native = { enabled, tool: async (payload) => { asked.push(payload); const a = answers[Math.min(next++, answers.length - 1)]; if (a instanceof Error) throw a; return a; } };
+  return { native, asked };
+}
+
+test('with the switch on, the front runs the tools and its text is the answer', async (t) => {
+  const k = await fakeKiwix(t);
+  const { native, asked } = nativeKiwix([{ status: 200, body: { text: 'QA answer from the front' } }, { status: 200, body: { text: null } }]);
+  const tools = createKiwixTools({ baseUrl: k.url, cap: 300, native });
+  assert.equal(await tools.execute('wikipedia_search', { query: 'Zephyr' }), 'QA answer from the front');
+  assert.deepEqual(asked, [{ name: 'wikipedia_search', arguments: { query: 'Zephyr' }, cap: 300 }]);
+  assert.equal(await tools.execute('wikipedia_other', {}), undefined, 'not one of the tools: as this process answers it');
+  assert.deepEqual(k.seen, [], 'this process fetched nothing');
+});
+
+test('a front that cannot answer gives the unavailable text; a 404 hands the tools back for a minute', async (t) => {
+  const k = await fakeKiwix(t);
+  for (const answer of [new Error('ECONNREFUSED'), { status: 503, body: { error: 'unavailable' } }, { status: 200, body: null }, { status: 200, body: { text: 7 } }]) {
+    const { native } = nativeKiwix([answer]);
+    assert.equal(await createKiwixTools({ baseUrl: k.url, native }).execute('wikipedia_search', { query: 'Zephyr' }), NATIVE_UNAVAILABLE);
+  }
+  assert.deepEqual(k.seen, []);
+  let clock = 1000;
+  const warned = [];
+  const { native, asked } = nativeKiwix([{ status: 404, body: { error: 'not found' } }, { status: 200, body: { text: 'QA again' } }]);
+  const tools = createKiwixTools({ baseUrl: k.url, native, now: () => clock, warn: (m) => warned.push(m) });
+  assert.match(await tools.execute('wikipedia_search', { query: 'Zephyr cell' }), /Zephyr & cells/);
+  assert.equal(warned.length, 1);
+  assert.match(await tools.execute('wikipedia_search', { query: 'Zephyr cell' }), /Zephyr & cells/);
+  assert.equal(asked.length, 1, 'not asked again within the minute');
+  clock += NATIVE_RECHECK_MS;
+  assert.equal(await tools.execute('wikipedia_search', { query: 'Zephyr cell' }), 'QA again');
+  assert.equal(asked.length, 2);
+});
+
+test('with the switch off, the front is never asked', async (t) => {
+  const k = await fakeKiwix(t);
+  const { native, asked } = nativeKiwix([{ status: 200, body: { text: 'never' } }], () => false);
+  assert.match(await createKiwixTools({ baseUrl: k.url, native }).execute('wikipedia_search', { query: 'Zephyr cell' }), /Zephyr & cells/);
+  assert.deepEqual(asked, []);
+});
+
+test('index.cjs reads NOEVIA_RUST_KIWIX_TOOLS once and asks the store client', () => {
+  const index = require('node:fs').readFileSync(require('node:path').join(__dirname, 'index.cjs'), 'utf8');
+  assert.match(index, /const RUST_KIWIX_TOOLS = process\.env\.NOEVIA_RUST_KIWIX_TOOLS === '1';/);
+  assert.match(index, /native: \{ enabled: \(\) => RUST_KIWIX_TOOLS, tool: \(payload\) => PROJECT_STORE\.kiwixTool\(payload\) \}/);
+});
