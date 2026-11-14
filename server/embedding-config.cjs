@@ -18,6 +18,14 @@
 // to start a re-index). Once a change is made at runtime (embedding-migration.cjs, the one path
 // that changes the model or the endpoint) it is saved to `stateFile` and that file wins over the
 // environment on the next start. Deleting the file returns to the environment's values.
+//
+// Rust port track R11: with `reread` (NOEVIA_RUST_EMBEDDING_ADMIN=rust, rust-embedding-admin.cjs) the Rust front makes
+// the runtime changes and writes `stateFile` (tmp + rename, as persist() does). This process then reads the file again
+// whenever its identity (inode, size, mtime) changes, before every read of the configuration, so retrieval, the delete
+// guard and the status follow the front's change at once. A file that cannot be read at runtime switches embedding off,
+// fail closed, as a damaged file does at start-up, until a readable one replaces it. A file removed at runtime leaves
+// the configuration as it was (the environment seeds only at start-up). A file already damaged at start-up still turns
+// embedding off until a restart (loadEmbeddingConfig), as before: the front refuses every change to it meanwhile.
 
 const fs = require('node:fs');
 const path = require('node:path');
@@ -72,6 +80,11 @@ function seedFromEnv(env = process.env, fallbackModel = 'default', log = () => {
   return { active, next: next && !sameTarget(next, active) ? next : null, previous: null };
 }
 
+// Which file is at `file` now: 'absent', null when it cannot be stat-ed, else inode:size:mtime (a rename changes the inode).
+function fileIdentity(file) {
+  try { const s = fs.statSync(file); return `${s.ino}:${s.size}:${s.mtimeMs}`; } catch (err) { return err?.code === 'ENOENT' ? 'absent' : null; }
+}
+
 function readState(stateFile) {
   if (!stateFile) return null;
   let raw;
@@ -98,9 +111,12 @@ function readState(stateFile) {
  * @param {string} [o.fallbackModel]  model when the environment names none
  * @param {(line:string) => void} [o.log]  seeding warnings
  */
-function createEmbeddingConfig({ env = process.env, stateFile = null, fallbackModel = 'default', log = (line) => console.warn(line), nativeOwner = null } = {}) {
+function createEmbeddingConfig({ env = process.env, stateFile = null, fallbackModel = 'default', log = (line) => console.warn(line), nativeOwner = null, reread = false } = {}) {
   let inHold = false;
+  // Taken before the first read: a file replaced between the two is read again on the next refresh().
+  let seen = reread && stateFile ? fileIdentity(stateFile) : null;
   const saved = readState(stateFile);
+  let savedNow = !!saved; // the configuration came from stateFile (at start-up, or re-read since)
   let state = saved || seedFromEnv(env, fallbackModel, log);
   let locked = null; // set by refuseSeeded: changes are refused until the operator fixes the environment
   const held = {}; // 'active' | 'next' -> { reason, transient, target }: seeded values refused at start-up
@@ -116,6 +132,7 @@ function createEmbeddingConfig({ env = process.env, stateFile = null, fallbackMo
     const tmp = `${stateFile}.${process.pid}.tmp`;
     fs.writeFileSync(tmp, JSON.stringify({ version: 1, ...state }, null, 2), { mode: 0o600 });
     fs.renameSync(tmp, stateFile);
+    if (reread) seen = fileIdentity(stateFile); // this process's own write is not a change to read back
   }
   function change(next) {
     if (nativeOwner && stateFile && !inHold) throw Error('Embedding configuration requires the publication lock');
@@ -133,8 +150,30 @@ function createEmbeddingConfig({ env = process.env, stateFile = null, fallbackMo
     for (const fn of listeners) { try { fn(get()); } catch { /* a listener never blocks a change */ } }
     return get();
   }
+  // Track R11 (`reread`): the front's change to stateFile, read before the configuration is.
+  function refresh() {
+    if (!reread || !stateFile || inHold) return;
+    const now = fileIdentity(stateFile);
+    if (now === seen) return;
+    seen = now;
+    if (now === 'absent' || now === null) return; // removed (or not stat-able): keep what is in use
+    let next;
+    try { next = readState(stateFile); } catch (err) {
+      if (api.damaged === err.message) return;
+      log(`[embedding] ${err.message} Embeddings are off until then.`);
+      state = { ...state, active: { ...state.active, profile: 'unavailable' } };
+      locked = err.message; api.damaged = err.message;
+      bump();
+      return;
+    }
+    if (!next) return;
+    state = next; savedNow = true; locked = null; delete api.damaged;
+    for (const which of Object.keys(held)) delete held[which];
+    bump();
+  }
   function get() {
-    return { active: copy(state.active), next: copy(state.next), previous: copy(state.previous), source: savedChange || saved ? 'saved' : source, version };
+    refresh();
+    return { active: copy(state.active), next: copy(state.next), previous: copy(state.previous), source: savedChange || savedNow ? 'saved' : source, version };
   }
   const api = {
     withLock(action) {
@@ -146,13 +185,13 @@ function createEmbeddingConfig({ env = process.env, stateFile = null, fallbackMo
       });
     },
     get,
-    active: () => copy(state.active),
-    next: () => copy(state.next),
-    previous: () => copy(state.previous),
-    version: () => version,
+    active: () => { refresh(); return copy(state.active); },
+    next: () => { refresh(); return copy(state.next); },
+    previous: () => { refresh(); return copy(state.previous); },
+    version: () => { refresh(); return version; },
     onChange(fn) { listeners.add(fn); return () => listeners.delete(fn); },
     /** Every model name this process may embed with now or after a switch or rollback. */
-    modelNames() { return [state.active, state.next, state.previous].filter(Boolean).map((t) => t.model); },
+    modelNames() { refresh(); return [state.active, state.next, state.previous].filter(Boolean).map((t) => t.model); },
     setNext(target) {
       const t = normalizeTarget(target);
       if (sameTarget(t, state.active)) throw Object.assign(Error('That model, profile and address are already active.'), { status: 409, code: 'alreadyActive' });
@@ -186,7 +225,8 @@ function createEmbeddingConfig({ env = process.env, stateFile = null, fallbackMo
      * be undone by releaseSeeded; anything else stays until the process restarts.
      */
     refuseSeeded(reasons = {}, { transient = false } = {}) {
-      if (saved || savedChange) return get();
+      refresh();
+      if (savedNow || savedChange) return get();
       for (const which of ['active', 'next']) {
         const reason = reasons?.[which];
         if (!reason) continue;
@@ -203,7 +243,8 @@ function createEmbeddingConfig({ env = process.env, stateFile = null, fallbackMo
     /** Takes back a transient refusal once the address resolves to this network. */
     releaseSeeded(which) {
       const h = held[which];
-      if (!h || !h.transient || saved || savedChange) return get();
+      refresh();
+      if (!h || !h.transient || savedNow || savedChange) return get();
       delete held[which];
       if (which === 'next') { if (!state.next) state = { ...state, next: h.target }; } // not over an administrator's own choice
       else { state = { ...state, active: h.target }; locked = null; delete api.damaged; }
@@ -219,9 +260,9 @@ function createEmbeddingConfig({ env = process.env, stateFile = null, fallbackMo
  * unknown, so every embed call refuses and retrieval reports degraded, and nothing is saved over
  * the damaged file until an operator fixes or deletes it.
  */
-function loadEmbeddingConfig({ env = process.env, stateFile = null, nativeOwner = null, log = (line) => console.error(line) } = {}) {
+function loadEmbeddingConfig({ env = process.env, stateFile = null, nativeOwner = null, reread = false, log = (line) => console.error(line) } = {}) {
   try {
-    return createEmbeddingConfig({ env, stateFile, log, nativeOwner });
+    return createEmbeddingConfig({ env, stateFile, log, nativeOwner, reread });
   } catch (err) {
     if (err?.code !== 'badState') throw err;
     log(`[embedding] ${err.message} Embeddings are off until then.`);
