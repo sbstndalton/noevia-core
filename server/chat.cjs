@@ -10,6 +10,9 @@ const { isChatGenerationModel } = require('./chat-model-kind.cjs');
 const { isInAppBox } = require('./toolbox-flags.cjs');
 const editTargets = require('./project-edit-target.cjs');
 const specialistPageSave = require('./specialist-page-save.cjs');
+
+// #2595: an asset id read as a file of the project's asset directory: a plain, well-formed name only.
+const plainAssetName = (id) => typeof id === 'string' && id !== '' && id !== '.' && id !== '..' && !/[/\\\0]/.test(id) && id.isWellFormed();
 const { readCappedText, readCappedJson, discardBody } = require('./http.cjs');
 // A provider's error body is only shown as a short message; a summary reply is a few KB of JSON.
 // Both are capped so a provider streaming an endless body cannot be buffered whole (#903).
@@ -900,6 +903,13 @@ function createChatHandler({
     if (projectImages.length) {
       const dir = currentWorkspace().assetDir(project.id);
       for (const asset of projectImages.filter((a) => !namedImageIds || namedImageIds.has(a.id))) {
+        // #2595: only a plain file name of the asset directory is read (uploads.cjs mints `img-<hex>`); any other
+        // id (empty, `.`, `..`, a path, a NUL, a lone surrogate) is a missing image, never a file elsewhere.
+        if (!plainAssetName(asset.id)) {
+          missingImages.push(asset.name);
+          console.warn(`[assets] an image on project ${project.id} has an id that is not a file name; not read`);
+          continue;
+        }
         try {
           const bytes = fs.readFileSync(path.join(dir, asset.id));
           loadedImageNames.push(asset.name);
