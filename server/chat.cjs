@@ -1717,7 +1717,10 @@ function createChatHandler({
           retrievedImages: retrievedImages.length > 0 && !handoffCaps.has('retrieved-images'), messages: wire,
           skills: (loadedSkills.size > 0 || (!!project && instructionSkills.list(project).length > 0)) && !handoffCaps.has('skills'),
           // #769: the front's executor runs the policy's write checks when it names the `provenance` capability (R15).
-          provenance: provenanceOn && !handoffCaps.has('provenance'), framingReasoner: !!(framingReasoner && chatFrame),
+          provenance: provenanceOn && !handoffCaps.has('provenance'),
+          // #740: the framing reasoner acts after the cut only on the tool gate's prefetch (prefetchTool's condense and
+          // its trace), so it keeps a turn here only when the gate decided (which keeps it here anyway, 'tool-gate').
+          framingReasoner: !!(framingReasoner && chatFrame && gate && gate.decision !== 'none'),
           // The routed list's more_tools (Roadmap E): the front's executor widens with the list below when it names
           // the `more-tools` capability (R15).
           narrowed: !!routing.narrowed && !handoffCaps.has('more-tools'), gate: !!(gate && gate.decision !== 'none'),

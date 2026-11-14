@@ -488,6 +488,26 @@ test('step supervision: a supervised turn hands off only to a front naming super
   assert.equal(asked.length, 0);
 });
 
+test('a framed chat with the framing reasoner on hands off unless the tool gate decided (#740, R15)', async (t) => {
+  // A confirmed search frame stored on the chat (chat-frame-steering.cjs storedFrame) and the reasoner configured.
+  const framed = { chats: [{ id: 'qa-chat-1', frame: { kind: 'search', confirmed: true, projectId: 'qa-project', source: 'user' } }] };
+  const condensed = [];
+  const reasoner = { chatFramingEnabled: () => true, framingReasoner: { condense: async (input) => { condensed.push(input); return { ok: false }; } } };
+  const handed = await runTurn(t, { requested: true, frames: answer, project: framed, deps: reasoner });
+  assert.equal(handed.events.at(-1).type, 'prepared', 'no gate decision: nothing of the reasoner runs after the cut');
+  assert.equal(condensed.length, 0);
+  // With a gate decision the turn stays here (the reasoner condenses the gate's prefetch in Node).
+  const gated = { ...reasoner, toolGate: { evaluate: async () => ({ decision: { tool: 'drive_read_file', mode: 'require' } }), record() {} } };
+  const logged = [];
+  const log = console.log;
+  console.log = (line) => logged.push(String(line));
+  let kept;
+  try { kept = await runTurn(t, { requested: true, frames: answer, project: framed, deps: gated }); } finally { console.log = log; }
+  assert.notEqual(kept.events.at(-1).type, 'prepared');
+  assert.ok(logged.includes('[chat] native executor not used for this turn: framing-reasoner'), logged.join('|'));
+  assert.ok(logged.includes('[chat] native executor would also need: tool-gate'), logged.join('|'));
+});
+
 test('frameTooLarge refuses a prepared line longer than the front reads (PREPARED_CAP bytes of UTF-8)', () => {
   assert.equal(native.PREPARED_CAP, 40 * 1024 * 1024);
   assert.equal(native.frameTooLarge('x'.repeat(native.PREPARED_CAP)), false);
