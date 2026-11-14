@@ -5,7 +5,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 const test = require('node:test');
-const { SWITCH, OWNED_PATHS, ROUTE_REFUSAL, frontOwns, owned, refuseOwned } = require('./rust-model-writes.cjs');
+const { SWITCH, OWNED_PATHS, OWNED_GETS, ROUTE_REFUSAL, frontOwns, owned, refuseOwned } = require('./rust-model-writes.cjs');
 
 const parseRequestUrl = (req, base = 'http://localhost') => { try { return new URL(req.url, base); } catch { return null; } };
 const ask = (method, url, env) => {
@@ -14,7 +14,8 @@ const ask = (method, url, env) => {
   return { refused, seen };
 };
 
-test('only the switch set to rust hands the two PUTs to the front', () => {
+test('only the switch set to rust hands the three PUTs to the front', () => {
+  assert.deepEqual([...OWNED_PATHS], ['/api/models/inference-budget', '/api/models/idle-unload', '/api/models/preset']);
   assert.equal(SWITCH, 'NOEVIA_RUST_MODEL_WRITES');
   for (const env of [{}, { [SWITCH]: '' }, { [SWITCH]: 'on' }, { [SWITCH]: 'Rust' }, { [SWITCH]: 'node' }]) {
     assert.equal(frontOwns(env), false, JSON.stringify(env));
@@ -23,12 +24,15 @@ test('only the switch set to rust hands the two PUTs to the front', () => {
   const env = { [SWITCH]: 'rust' };
   assert.equal(frontOwns(env), true);
   for (const p of OWNED_PATHS) assert.deepEqual(ask('PUT', `${p}?x=1`, env), { refused: true, seen: [[503, ROUTE_REFUSAL]] }, p);
+  assert.deepEqual([...OWNED_GETS], ['/api/models/mtp-artifact']);
+  assert.deepEqual(ask('GET', '/api/models/mtp-artifact?repo=qa/x&variant=q', env), { refused: true, seen: [[503, ROUTE_REFUSAL]] });
+  assert.deepEqual(ask('GET', '/api/models/mtp-artifact', {}), { refused: false, seen: [] });
   assert.equal(ROUTE_REFUSAL.code, 'RUST_MODEL_WRITES_OWNED');
 });
 
-test('everything beside the two PUTs stays where it was', () => {
+test('everything beside the three PUTs stays where it was', () => {
   const env = { [SWITCH]: 'rust' };
-  for (const [m, p] of [['GET', '/api/models/inference-budget'], ['POST', '/api/models/idle-unload'], ['PUT', '/api/models/preset'],
+  for (const [m, p] of [['GET', '/api/models/inference-budget'], ['POST', '/api/models/idle-unload'], ['GET', '/api/models/preset'], ['PUT', '/api/models/presets/reload'], ['POST', '/api/models/pull'], ['POST', '/api/models/mtp-artifact'], ['GET', '/api/models/mtp-artifact/'], ['GET', '/api/models/inference-budget'],
     ['PUT', '/api/models/inference-budget/'], ['PUT', '/api/model-manager/idle-unload'], ['DELETE', '/api/models/idle-unload']]) {
     assert.equal(owned(m, p), false, `${m} ${p}`);
     assert.deepEqual(ask(m, p, env), { refused: false, seen: [] }, `${m} ${p}`);

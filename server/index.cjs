@@ -520,6 +520,7 @@ const projectStore = require('./projects.cjs').createProjectStore({
   fs, path, reasoningEffort, projectAppearance, rag, storageClient, documentSources, authService, currentWorkspace,
   PROJECTS, FREE_CHATS, sanitizeToolboxes: (boxes) => sanitizeToolboxes(boxes), defaultToolboxes: () => DEFAULT_TOOLBOXES,
   PROJECT_ROOT_FOLDER, createProjectFolder, projectSweep, onProjectsChanged: (userId) => projectsChangedElsewhere(userId),
+  nativeTextWrite: process.env.NOEVIA_RUST_PROJECT_WRITE === '1' ? (user, projectId, name, text, options) => PROJECT_STORE.textWrite(user, projectId, name, text, options) : null,
 });
 const {
   saveProjects, getProject, sanitizeChats, loadChats, saveChats, deleteChat, saveFreeChats, deleteFreeChat, createProject,
@@ -1407,6 +1408,8 @@ async function handleRequestInner(req, res) {
   if (req.url?.startsWith('/internal/inference-machines/') && await inferenceMachineRoutes(req, res)) return;
   if (require('./rust-calibration-routes.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   if (await calibrationRoutesBridge(req, res)) return;
+  // Track R11: the model manager proxy is the front's under NOEVIA_RUST_MODEL_MANAGER=rust (rust-model-manager-proxy.cjs).
+  if (require('./rust-model-manager-proxy.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   if (require('./rust-model-manager-scan.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
   if (await modelManagerScanCache(req, res)) return;
   if (require('./rust-autotune-cancel.cjs').refuseOwned(req, res, { parseRequestUrl, json })) return;
