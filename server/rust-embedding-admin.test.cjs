@@ -274,3 +274,57 @@ test('index.cjs hands the intent file to the service only under the switch', () 
   const index = fs.readFileSync(path.join(__dirname, 'index.cjs'), 'utf8');
   assert.match(index, /intentFile: require\('\.\/rust-embedding-admin\.cjs'\)\.frontOwns\(\) \? path\.join\(DATA_DIR, 'embedding-service-intent\.json'\) : null/);
 });
+
+test('reread: a read that failed (not the content) is tried again on the next read, without the file changing', (t) => {
+  const f = fixture(); t.after(f.cleanup);
+  frontWrites(f.file, { active: target('qa-embed-a'), next: null, previous: null });
+  const lines = [];
+  const config = createEmbeddingConfig({ env: {}, stateFile: f.file, reread: true, log: (l) => lines.push(l) });
+  assert.equal(config.active().model, 'qa-embed-a');
+  frontWrites(f.file, { active: target('qa-embed-b'), next: null, previous: null });
+  const read = fs.readFileSync;
+  const failing = t.mock.method(fs, 'readFileSync', function (file, ...rest) {
+    if (file === f.file) throw Object.assign(Error('too many open files'), { code: 'EMFILE' });
+    return read.call(fs, file, ...rest);
+  });
+  assert.equal(config.active().profile, 'unavailable');
+  config.get();
+  assert.equal(lines.length, 1);
+  failing.mock.restore(); // the same file, untouched: only the retry can bring it back
+  assert.equal(config.active().model, 'qa-embed-b');
+  assert.equal(config.damaged, undefined);
+  const stat = fs.statSync;
+  frontWrites(f.file, { active: target('qa-embed-c'), next: null, previous: null });
+  const unseen = t.mock.method(fs, 'statSync', function (file, ...rest) {
+    if (file === f.file) throw Object.assign(Error('permission denied'), { code: 'EACCES' });
+    return stat.call(fs, file, ...rest);
+  });
+  assert.equal(config.active().profile, 'unavailable');
+  unseen.mock.restore();
+  assert.equal(config.active().model, 'qa-embed-c');
+});
+
+test('reread: a damaged file refuses any next as badState, before the target is read', (t) => {
+  const f = fixture(); t.after(f.cleanup);
+  frontWrites(f.file, { active: target('qa-embed-a'), next: null, previous: null });
+  const config = createEmbeddingConfig({ env: {}, stateFile: f.file, reread: true, log() {} });
+  fs.writeFileSync(`${f.file}.bad`, '{damaged'); fs.renameSync(`${f.file}.bad`, f.file);
+  assert.throws(() => config.setNext({ model: 'bad model' }), (e) => e.code === 'badState' && e.status === 409);
+});
+
+test('reread: the seeded-address guard does not say "in use" when a damaged file decides', async (t) => {
+  const f = fixture(); t.after(f.cleanup);
+  const { guardSeededAddresses } = require('./embedding-address.cjs');
+  const config = createEmbeddingConfig({ env: { EMBEDDING_MODEL: 'qa-embed-a', EMBEDDING_BASE_URL: 'http://qa-embed.invalid' }, stateFile: f.file, reread: true, log() {} });
+  const lines = [];
+  let answer = { ok: false, transient: true, reason: 'qa not resolved yet' };
+  let again = null;
+  await guardSeededAddresses(config, { check: async () => answer, log: (l) => lines.push(l), sleep: async () => {}, schedule: (fn) => { again = fn; }, retryDelaysMs: [], recheckMs: 1 });
+  assert.equal(config.active().profile, 'unavailable');
+  fs.writeFileSync(`${f.file}.bad`, '{"version":2}'); fs.renameSync(`${f.file}.bad`, f.file);
+  config.get();
+  answer = { ok: true };
+  await again();
+  assert.equal(lines.some((l) => /in use/.test(l)), false, lines.join('\n'));
+  assert.match(config.damaged, /cannot be read/);
+});
