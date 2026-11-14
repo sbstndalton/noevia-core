@@ -56,3 +56,34 @@ test('without the front, this process writes the file as before', () => {
   assert.equal(day.input, 2);
   assert.equal(day.models['qa-model'].replies, 1);
 });
+
+test('a front without the op: the record is written here; a skipped one is warned about', async (t) => {
+  t.after(() => usage.useFront(null));
+  const warned = [];
+  const warn = console.warn;
+  console.warn = (...a) => warned.push(a.join(' '));
+  t.after(() => { console.warn = warn; });
+  usage.useFront(async () => 'unsupported');
+  const ws = workspace();
+  usage.recordUsage(ws, 'qa-model', { promptTokens: 5, completionTokens: 0 });
+  usage.recordToolUse(ws, 'qa_tool');
+  await settle(); await settle();
+  const [day] = Object.values(JSON.parse(fs.readFileSync(ws.usagePath(), 'utf8')).days);
+  assert.equal(day.input, 5);
+  assert.equal(day.tools.qa_tool, 1);
+  usage.useFront(async () => 'skipped');
+  usage.recordToolUse(workspace(), 'qa_tool');
+  await settle(); await settle();
+  assert.match(warned.join('\n'), /left a record unwritten/);
+});
+
+test('an infinite token count never leaves the process', async (t) => {
+  const sent = [];
+  usage.useFront(async (user, record) => { sent.push(record); return 'written'; });
+  t.after(() => usage.useFront(null));
+  usage.recordUsage(workspace(), 'qa-model', { promptTokens: Infinity, completionTokens: 1 });
+  usage.recordUsage(workspace(), 'qa-model', { promptTokens: 'Infinity', completionTokens: 1 });
+  usage.recordUsage(workspace(), 'qa-model', { promptTokens: -1, completionTokens: 1 });
+  await settle();
+  assert.deepEqual(sent, []);
+});

@@ -29,9 +29,15 @@ function usageDayKey(at = new Date()) {
 // Unset, this process writes the file, as before.
 let front = null;
 function useFront(record) { front = typeof record === 'function' ? record : null; }
-function toFront(workspace, record) {
+/** One record to the front; `here()` writes it in this process instead when the front is too old to have the op
+ *  (its store answers 404: such a front never writes usage.json, so this process stays the only writer). */
+function toFront(workspace, record, here) {
   if (workspace.revoked) return;
-  Promise.resolve().then(() => front(workspace.userId, record)).catch((err) => console.warn('[usage] the Rust front could not record:', err?.message || err));
+  Promise.resolve().then(() => front(workspace.userId, record)).then((recorded) => {
+    if (recorded === 'unsupported') here();
+    // A file the front left alone (unusual shape, too large, a link, a failed write): say so, as a failed local write did.
+    else if (recorded === 'skipped') console.warn('[usage] the Rust front left a record unwritten');
+  }).catch((err) => console.warn('[usage] the Rust front could not record:', err?.message || err));
 }
 
 function readUsage(workspace) {
@@ -49,7 +55,17 @@ function readUsage(workspace) {
 // anything the client sends.
 function recordUsage(workspace, model, usage) {
   if (!workspace || !usage) return;
-  if (front) return toFront(workspace, { kind: 'reply', model, usage });
+  if (front) {
+    // This function's own early return, before anything leaves the process (an Infinity would reach the front as null).
+    const input = Number(usage.promptTokens) || 0;
+    const output = Number(usage.completionTokens) || 0;
+    if (!Number.isFinite(input) || !Number.isFinite(output) || input < 0 || output < 0 || (!input && !output)) return;
+    return toFront(workspace, { kind: 'reply', model, usage }, () => recordUsageHere(workspace, model, usage));
+  }
+  return recordUsageHere(workspace, model, usage);
+}
+
+function recordUsageHere(workspace, model, usage) {
   const input = Number(usage.promptTokens) || 0;
   const output = Number(usage.completionTokens) || 0;
   if (!Number.isFinite(input) || !Number.isFinite(output) || input<0 || output<0 || (!input && !output)) return;
@@ -91,7 +107,11 @@ function recordUsage(workspace, model, usage) {
 // keeps erroring is exactly what this number should show.
 function recordToolUse(workspace, name) {
   if (!workspace || !name) return;
-  if (front) return toFront(workspace, { kind: 'tool', name });
+  if (front) return toFront(workspace, { kind: 'tool', name }, () => recordToolUseHere(workspace, name));
+  return recordToolUseHere(workspace, name);
+}
+
+function recordToolUseHere(workspace, name) {
   try {
     const store = readUsage(workspace);
     const key = usageDayKey();
